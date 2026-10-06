@@ -55,9 +55,13 @@ missing `MC` is caught up front; the rest degrade silently:
   longer filtered on its mate's alignment quality.
 - `fgumi simplex` and `fgumi duplex` clip the bases at each read's 3' end that run past its
   mate — read-through past the fragment boundary, which is adapter rather than template — and
-  they locate that boundary from the read's own `MC` tag. A read with no `MC` tag gets no clip,
-  so those read-through bases are called into the consensus, silently and without a warning.
-  (`fgumi codec` is unaffected: it reads the boundary from the mate record in hand.)
+  they locate that boundary from the read's own `MC` tag. A read with no `MC` tag takes the mate
+  CIGAR from its mate in the same UMI group instead, as fgbio does; if that mate is mapped to
+  the same reference on the opposite strand but is not in the group, the run fails with an
+  error naming the read, once that read would reach a consensus (see the
+  [fgbio migration guide](migration-from-fgbio.md)). An `MC` tag that is present is trusted as
+  written, so a stale `MC` still mis-places the boundary silently. (`fgumi codec` reads the
+  boundary from the mate record in hand and never consults `MC`.)
 
 Correct mate tags are necessary but not sufficient: `fgumi group` and `fgumi dedup` also
 constrain the sort order, and `fgumi dedup` requires a tag that no mate-fixing tool writes.

@@ -46,6 +46,11 @@ Because of the nature of duplex sequencing, this tool does not support fragment 
 input they are ignored. Similarly, read pairs for which consensus reads cannot be generated for one or
 other read (R1 or R2) are omitted from the output.
 
+Bases at a read's 3' end that extend past its mate (read-through into adapter) are trimmed before consensus
+calling. The mate's alignment comes from the read's MC tag or, when MC is absent, from its mate in the same group;
+a read lacking MC whose mate is mapped to the same reference on the opposite strand but is not in the group is an
+error when the read is in a group that passes the --min-reads and strand-orientation checks.
+
 The consensus reads produced are unaligned, due to the difficulty and error-prone nature of inferring the consensus
 alignment. Consensus reads should therefore be aligned after, which should not be too expensive as likely there
 are far fewer consensus reads than input raw reads.

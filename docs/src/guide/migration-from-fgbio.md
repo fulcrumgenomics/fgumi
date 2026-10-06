@@ -176,6 +176,30 @@ Use the `--metrics PREFIX` flag to write all three files in one step.
 fgumi's `simplex` and `duplex` stats output uses the same three-column key-value format as
 fgbio's `CallMolecularConsensusReads`, allowing direct comparison with `fgumi compare metrics`.
 
+### Mate CIGAR (`MC`) Handling in Consensus Calling
+
+Like fgbio, `simplex` and `duplex` need each read's mate CIGAR to clip read-through bases past
+the mate, and fill it in from the read's mate in the same UMI group when the `MC` tag is absent.
+Four edge cases differ:
+
+- fgbio overwrites the `MC` of **both** reads of a template whenever either one lacks it; fgumi
+  keeps an `MC` that is present and fills in only the missing one.
+- fgbio fails with a `MatchError` when a read name lacking `MC` does not appear exactly twice in
+  the group. fgumi fails only when a read lacking `MC` has no mate in the group, with an error
+  naming the read; when a name appears more than twice, the first mate found is used.
+- fgbio backfills, and so can fail on, only pairs it judges FR, which it infers from `TLEN`.
+  fgumi requires the mate for any read lacking `MC` whose mate is mapped to the same reference
+  on the opposite strand, RF pairs included, because `TLEN` misclassifies dovetailed FR pairs.
+  An RF pair lacking `MC` whose mate is missing from the group is therefore an error in fgumi
+  but not in fgbio.
+- fgbio backfills every group before any filtering, so a missing mate fails the run even when
+  the group would produce no consensus. fgumi fails only for a read that can still reach a
+  consensus. In `simplex` that is a read in an emitted consensus, so a read whose end falls
+  below `--min-reads`, that is dropped as a minority alignment or by `--max-reads`, or whose
+  single-end consensus is an orphan is rejected as usual. In `duplex` it is any read of a group
+  that passes the `--min-reads` checks and the strand-orientation (potential UMI collision)
+  check.
+
 ### Sort Orders
 
 fgumi's `sort` command supports the same sort orders as fgbio:

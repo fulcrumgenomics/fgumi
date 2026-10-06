@@ -25,6 +25,9 @@ pub mod simple_umi;
 pub mod tags;
 
 #[cfg(feature = "simplex")]
+pub(crate) mod mate_clip;
+
+#[cfg(feature = "simplex")]
 pub mod vanilla_caller;
 
 #[cfg(feature = "duplex")]

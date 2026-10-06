@@ -205,6 +205,7 @@ use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, RejectionReason, clamp_combined_error_to_fgbio_short,
     clamp_per_base_to_fgbio_short, consensus_read_name_too_long_context, write_consensus_read_name,
 };
+use crate::mate_clip::{MateClipper, missing_mate_error};
 use crate::methylation::ConversionPattern;
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
@@ -213,7 +214,7 @@ use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{ReadType, SourceRead};
-use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
 use std::collections::HashSet;
 
@@ -2164,12 +2165,19 @@ impl DuplexConsensusCaller {
         // (#792). Collect the dropped raws — tagged with their index in the X/Y
         // partition so their group ordinal can be recovered — and hand them to the sub-caller so
         // they drain through the same statistics/rejects path as its alignment-filter rejections.
+        //
+        // Read-through clipping looks up the mate of a read lacking `MC` across the whole group:
+        // its mate always lands in the other R1/R2 partition. It is set up only now, after the
+        // whole-group rejections above, so a read whose needed mate is missing fails the run only
+        // in a group that passed its minimum-reads and strand-orientation checks.
+        let mut mate_clipper =
+            MateClipper::new(a_records.iter().chain(b_records.iter()).map(AsRef::as_ref));
         let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
         let mut x_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
 
         let mut x_sources: Vec<SourceRead> = Vec::with_capacity(x_raws.len());
         for (i, r) in x_raws.iter().enumerate() {
-            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            let mate_clip = mate_clipper.clip(r).ok_or_else(|| missing_mate_error(r))?;
             match ss_caller.create_source_read(r, i, mate_clip)? {
                 Some(source) => x_sources.push(source),
                 None => x_zero_length.push((i, *r)),
@@ -2180,7 +2188,7 @@ impl DuplexConsensusCaller {
         let mut y_zero_length: Vec<(usize, &RawRecord)> = Vec::new();
         let mut y_sources: Vec<SourceRead> = Vec::with_capacity(y_raws.len());
         for (i, r) in y_raws.iter().enumerate() {
-            let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+            let mate_clip = mate_clipper.clip(r).ok_or_else(|| missing_mate_error(r))?;
             match ss_caller.create_source_read(r, i, mate_clip)? {
                 Some(source) => y_sources.push(source),
                 None => y_zero_length.push((i, *r)),
@@ -2750,6 +2758,9 @@ impl ConsensusCaller for DuplexConsensusCaller {
 )]
 mod tests {
     use super::*;
+    use crate::mate_clip::read_through_fixture::{
+        McTags, READ_THROUGH_ADAPTER, READ_THROUGH_INSERT, read_through_pair,
+    };
     use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
     use rstest::rstest;
@@ -4162,6 +4173,151 @@ mod tests {
             r1.bases,
             r1.quals
         );
+        Ok(())
+    }
+
+    /// Duplex caller (`--min-reads min_reads`) for the mate-CIGAR backfill tests.
+    fn backfill_caller(min_reads: Vec<usize>) -> Result<DuplexConsensusCaller> {
+        DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "A".to_string(),
+            min_reads,
+            10,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )
+    }
+
+    /// Port of fgbio test: "add the mate cigar when not present before consensus calling"
+    /// (`VanillaUmiConsensusCallerTest.scala:818`), applied to the duplex caller and extended to
+    /// assert the effect of the backfill.
+    ///
+    /// fgbio's `UmiConsensusCaller.updateMateCigars` (`UmiConsensusCaller.scala:328-343`, called
+    /// at `:356`) runs for `CallDuplexConsensusReads` too, filling each read's `MC` from its
+    /// mate before any read-through trim. Three AB and three BA read-through pairs (80 bp insert,
+    /// 20 bp adapter) must therefore yield 80 bp duplex consensus reads with depths
+    /// `aD=3 bD=3 cD=6`, whether or not the input carries `MC`. A pair that already carries `MC`
+    /// is used as-is, even when stale (fgumi does not mirror fgbio's overwrite of an existing
+    /// `MC`).
+    ///
+    /// The `forward_reads_missing_mc` case drops `MC` from every forward-strand read (AB-R1 and
+    /// BA-R2), which together form the duplex R1. Dropping it from only one of them would not
+    /// test the backfill: the duplex is trimmed to the shorter single-strand consensus, so the
+    /// trimmed partner would mask the untrimmed one.
+    #[rstest]
+    #[case::both_mc_present(McTags::Both, false)]
+    #[case::neither_mc_backfilled(McTags::Neither, false)]
+    #[case::forward_reads_missing_mc_backfilled(McTags::ForwardMissing, false)]
+    #[case::stale_mc_is_used_not_overwritten(McTags::StaleBoth, true)]
+    fn test_duplex_mate_cigar_backfilled_before_consensus_trims_read_through(
+        #[case] mc: McTags,
+        #[case] r1_keeps_adapter: bool,
+    ) -> Result<()> {
+        let mut reads = Vec::new();
+        for i in 0..3 {
+            let (r1, r2) = read_through_pair(format!("ab{i}").as_bytes(), b"1/A", mc, true);
+            reads.push(r1);
+            reads.push(r2);
+        }
+        for i in 0..3 {
+            let (r1, r2) = read_through_pair(format!("ba{i}").as_bytes(), b"1/B", mc, false);
+            reads.push(r1);
+            reads.push(r2);
+        }
+
+        let mut caller = backfill_caller(vec![1])?;
+        let output = caller.consensus_reads(reads)?;
+
+        assert_eq!(output.count, 2, "one duplex consensus read per end");
+        let consensus = ParsedBamRecord::parse_all(&output.data);
+        let r1 = consensus.iter().find(|r| r.flag & flags::FIRST_SEGMENT != 0).expect("R1");
+        let r2 = consensus.iter().find(|r| r.flag & flags::LAST_SEGMENT != 0).expect("R2");
+
+        // R1 combines the forward reads (AB-R1 + BA-R2): the adapter is their 3' end. R2 combines
+        // the reverse reads and is emitted in sequencing orientation, so the insert appears
+        // reverse-complemented. With the stale `100M` mate CIGAR the forward reads see a mate that
+        // ends 20 bp past the insert and keep their adapter (as fgbio does), while the reverse
+        // reads' clip depends only on the mate start and is unaffected.
+        let mut expected_r1 = READ_THROUGH_INSERT.to_vec();
+        if r1_keeps_adapter {
+            expected_r1.extend_from_slice(READ_THROUGH_ADAPTER);
+        }
+        assert_eq!(
+            String::from_utf8(r1.bases.clone())?,
+            String::from_utf8(expected_r1)?,
+            "R1 duplex consensus bases"
+        );
+        assert_eq!(
+            String::from_utf8(r2.bases.clone())?,
+            String::from_utf8(fgumi_dna::dna::reverse_complement(READ_THROUGH_INSERT))?,
+            "R2 duplex consensus bases"
+        );
+        for r in [r1, r2] {
+            assert_eq!(r.get_int_tag(SamTag::AD), Some(3));
+            assert_eq!(r.get_int_tag(SamTag::BD), Some(3));
+            assert_eq!(r.get_int_tag(SamTag::CD), Some(6));
+        }
+        Ok(())
+    }
+
+    /// Port of the fgbio behavior at `UmiConsensusCaller.scala:328-343` (`updateMateCigars`)
+    /// exercised by `VanillaUmiConsensusCallerTest.scala:818`, for the duplex caller: a read with
+    /// no `MC` whose mate is not in the group cannot have its mate CIGAR backfilled. fgbio throws
+    /// (a `MatchError`); fgumi must stop with an error that names the read.
+    #[test]
+    fn test_duplex_missing_mate_without_mc_errors_naming_the_read() -> Result<()> {
+        let mut reads = Vec::new();
+        let (orphan_r1, _orphan_r2) =
+            read_through_pair(b"ab_orphan", b"1/A", McTags::Neither, true);
+        reads.push(orphan_r1);
+        let (ba_r1, ba_r2) = read_through_pair(b"ba0", b"1/B", McTags::Neither, false);
+        reads.push(ba_r1);
+        reads.push(ba_r2);
+
+        let mut caller = backfill_caller(vec![1])?;
+        let err = caller
+            .consensus_reads(reads)
+            .err()
+            .expect("a read lacking MC whose mate is absent must be an error");
+
+        assert_eq!(
+            format!("{err:#}"),
+            "Mate cigar (MC SAM tag) needed for read 'ab_orphan': the read has no MC tag and \
+             its primary mate is not in the same group. Add MC tags (e.g. with fgumi zipper or \
+             samtools fixmate), or keep both reads of each template in the same group."
+        );
+        Ok(())
+    }
+
+    /// A read lacking `MC` whose mate is missing fails the run only in a group that passes the
+    /// duplex whole-group rejections. Here the AB R1 lacks `MC` and its R2 is absent, but the
+    /// group is rejected first, so it is counted as rejected rather than failing the run:
+    /// - `potential_collision`: the BA template is on the AB orientation (its R1 forward), so the
+    ///   duplex R1 holds both a forward and a reverse read;
+    /// - `too_few_reads`: `--min-reads 2` needs two R1s on each strand, and each strand has one.
+    #[rstest]
+    #[case::potential_collision(vec![1], true, RejectionReason::PotentialCollision)]
+    #[case::too_few_reads(vec![2], false, RejectionReason::InsufficientReads)]
+    fn test_duplex_missing_mate_is_not_an_error_in_a_rejected_group(
+        #[case] min_reads: Vec<usize>,
+        #[case] ba_r1_forward: bool,
+        #[case] expected_reason: RejectionReason,
+    ) -> Result<()> {
+        let (orphan_r1, _) = read_through_pair(b"ab_orphan", b"1/A", McTags::Neither, true);
+        let (ba_r1, ba_r2) = read_through_pair(b"ba0", b"1/B", McTags::Neither, ba_r1_forward);
+
+        let mut caller = backfill_caller(min_reads)?;
+        let output = caller.consensus_reads(vec![orphan_r1, ba_r1, ba_r2])?;
+
+        assert_eq!(output.count, 0);
+        let rejections: Vec<(RejectionReason, usize)> =
+            caller.stats.rejection_reasons.iter().map(|(reason, n)| (*reason, *n)).collect();
+        assert_eq!(rejections, vec![(expected_reason, 3)]);
         Ok(())
     }
 

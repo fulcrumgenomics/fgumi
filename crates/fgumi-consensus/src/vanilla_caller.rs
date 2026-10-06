@@ -9,6 +9,7 @@ use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
     consensus_read_name_too_long_context, select_lowest_ranking, write_consensus_read_name,
 };
+use crate::mate_clip::{MateClipper, missing_mate_error};
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
@@ -1390,14 +1391,21 @@ impl VanillaUmiConsensusCaller {
         // Sub-group by read type
         let (fragment_reads, r1_reads, r2_reads) = self.subgroup_reads(reads);
 
+        // Read-through clipping looks up the mate of a read lacking `MC` across both ends of the
+        // pair: its mate lands in the other subgroup. Fragments are unpaired, so they never need
+        // one.
+        let mut clipper =
+            MateClipper::new(r1_reads.iter().chain(&r2_reads).map(|(_, raw)| raw.as_ref()));
+
         let mut output = ConsensusOutput::default();
 
         // Process fragment subgroup
-        let (fragment_ok, _, _) = self.process_subgroup(
+        let (fragment_ok, _, _, _) = self.process_subgroup(
             &mut output,
             umi,
             ReadType::Fragment,
-            fragment_reads,
+            &fragment_reads,
+            &mut clipper,
             &mut group_rejects,
         )?;
         if fragment_ok {
@@ -1406,20 +1414,36 @@ impl VanillaUmiConsensusCaller {
 
         // Process R1/R2 subgroups
         let mut r1r2_output = ConsensusOutput::default();
-        let (r1_ok, r1_surviving_count, r1_surviving_reads) = self.process_subgroup(
-            &mut r1r2_output,
-            umi,
-            ReadType::R1,
-            r1_reads,
-            &mut group_rejects,
-        )?;
-        let (r2_ok, r2_surviving_count, r2_surviving_reads) = self.process_subgroup(
-            &mut r1r2_output,
-            umi,
-            ReadType::R2,
-            r2_reads,
-            &mut group_rejects,
-        )?;
+        let (r1_ok, r1_surviving_count, r1_surviving_reads, r1_missing_mate) = self
+            .process_subgroup(
+                &mut r1r2_output,
+                umi,
+                ReadType::R1,
+                &r1_reads,
+                &mut clipper,
+                &mut group_rejects,
+            )?;
+        let (r2_ok, r2_surviving_count, r2_surviving_reads, r2_missing_mate) = self
+            .process_subgroup(
+                &mut r1r2_output,
+                umi,
+                ReadType::R2,
+                &r2_reads,
+                &mut clipper,
+                &mut group_rejects,
+            )?;
+
+        // A read whose read-through clip needs a mate missing from the group fails the run only
+        // when it reaches an emitted consensus; one the group rejects anyway (too few reads,
+        // a minority alignment, downsampled, or an orphan end) does not.
+        if r1_ok && r2_ok {
+            let missing = r1_missing_mate
+                .map(|idx| &r1_reads[idx].1)
+                .or_else(|| r2_missing_mate.map(|idx| &r2_reads[idx].1));
+            if let Some(raw) = missing {
+                return Err(missing_mate_error(raw.as_ref()));
+            }
+        }
 
         match (r1_ok, r2_ok) {
             (true, true) => {
@@ -1466,6 +1490,11 @@ impl VanillaUmiConsensusCaller {
     /// - `bool` — whether a consensus was produced
     /// - `usize` — count of reads that survived all internal filtering (not rejected)
     /// - `Vec<Vec<u8>>` — the surviving raw reads as bytes (only populated when `self.track_rejects`)
+    /// - `Option<usize>` — when a consensus was produced, the index in `group_reads` of the first
+    ///   read in it whose read-through clip needs a mate that is not in the group (see
+    ///   [`MateClipper::clip`]). Such a read is clipped by 0 until then, so that whether it
+    ///   reaches the consensus is decided by the usual filters; the caller fails the run only if
+    ///   the group's consensus is emitted.
     ///
     /// The return type's third element is `Vec<(usize, Vec<u8>)>` (not
     /// `Vec<RawRecord>`) because orphan-consensus rejections are forwarded to the
@@ -1475,43 +1504,42 @@ impl VanillaUmiConsensusCaller {
     /// restore input order — `group_rejects` collects every non-orphan rejection
     /// with that same position.
     #[allow(clippy::too_many_lines, clippy::type_complexity)]
-    fn process_subgroup(
+    fn process_subgroup<'a, I>(
         &mut self,
         output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
-        group_reads: Vec<(usize, RawRecord)>,
+        group_reads: &[(usize, RawRecord)],
+        clipper: &mut MateClipper<'a, I>,
         group_rejects: &mut Vec<(usize, Vec<u8>)>,
-    ) -> Result<(bool, usize, Vec<(usize, Vec<u8>)>)> {
-        use fgumi_raw_bam as bam_fields;
-
+    ) -> Result<(bool, usize, Vec<(usize, Vec<u8>)>, Option<usize>)>
+    where
+        I: Iterator<Item = &'a [u8]> + Clone,
+    {
         if group_reads.is_empty() {
-            return Ok((false, 0, Vec::new()));
+            return Ok((false, 0, Vec::new(), None));
         }
 
         if group_reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, group_reads.len());
             if self.track_rejects {
-                group_rejects
-                    .extend(group_reads.into_iter().map(|(pos, raw)| (pos, raw.into_inner())));
+                group_rejects.extend(group_reads.iter().map(|(pos, raw)| (*pos, raw.to_vec())));
             }
-            return Ok((false, 0, Vec::new()));
+            return Ok((false, 0, Vec::new(), None));
         }
-
-        // Calculate mate overlap clips from raw bytes
-        let mate_overlap_clips: Vec<usize> = group_reads
-            .iter()
-            .map(|(_, raw)| bam_fields::num_bases_extending_past_mate_raw(raw.as_ref()))
-            .collect();
 
         // Create SourceReads from raw bytes. `idx` indexes `group_reads` (this
         // subgroup); `group_reads[idx].0` recovers the group-input position.
         let mut source_reads: Vec<SourceRead> = Vec::new();
         let mut zero_length_indices: Vec<usize> = Vec::new();
+        // Reads whose mate CIGAR is needed but unavailable; see the return value.
+        let mut missing_mate_indices: HashSet<usize> = HashSet::new();
 
-        for (idx, ((_, raw), &mate_clip)) in
-            group_reads.iter().zip(mate_overlap_clips.iter()).enumerate()
-        {
+        for (idx, (_, raw)) in group_reads.iter().enumerate() {
+            let mate_clip = clipper.clip(raw.as_ref()).unwrap_or_else(|| {
+                missing_mate_indices.insert(idx);
+                0
+            });
             if let Some(sr) = self.create_source_read(raw.as_ref(), idx, mate_clip)? {
                 source_reads.push(sr);
             } else {
@@ -1542,7 +1570,7 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok((false, 0, Vec::new()));
+            return Ok((false, 0, Vec::new(), None));
         }
 
         // Filter by alignment
@@ -1569,7 +1597,7 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok((false, 0, Vec::new()));
+            return Ok((false, 0, Vec::new(), None));
         }
 
         // Apply the per-end `--max-reads` cap (fgumi#723). fgbio applies `--max-reads`
@@ -1614,13 +1642,21 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok((false, 0, Vec::new()));
+            return Ok((false, 0, Vec::new(), None));
         }
 
         // Capture surviving count and reads before building consensus. The
         // orphan-consensus path rejects survivors, so they too carry their
         // group-input position.
         let surviving_count = filtered_source_reads.len();
+        let missing_mate = if missing_mate_indices.is_empty() {
+            None
+        } else {
+            filtered_source_reads
+                .iter()
+                .map(|sr| sr.original_idx)
+                .find(|idx| missing_mate_indices.contains(idx))
+        };
         let surviving_reads = if self.track_rejects {
             filtered_source_reads
                 .iter()
@@ -1665,7 +1701,7 @@ impl VanillaUmiConsensusCaller {
             methylation.as_ref(),
         )?;
 
-        Ok((true, surviving_count, surviving_reads))
+        Ok((true, surviving_count, surviving_reads, missing_mate))
     }
 
     /// Creates consensus from `SourceReads` (which already have transformed bases/quals).
@@ -1965,6 +2001,9 @@ pub(crate) enum ReadType {
 )]
 mod tests {
     use super::*;
+    use crate::mate_clip::read_through_fixture::{
+        McTags, READ_THROUGH_ADAPTER, READ_THROUGH_INSERT, read_through_pair,
+    };
     use fgumi_raw_bam::{
         ParsedBamRecord, SamBuilder, encode_op, num_bases_extending_past_mate_raw,
     };
@@ -5555,7 +5594,9 @@ mod tests {
     // =========================================================================
 
     /// Port of fgbio test: "add the mate cigar when not present before consensus calling"
-    /// Tests that consensus calling works even when MC tag is missing
+    /// (`VanillaUmiConsensusCallerTest.scala:818`). Tests that consensus calling works even when
+    /// the MC tag is missing; the effect of the backfill on the read-through trim is asserted by
+    /// [`test_mate_cigar_backfilled_before_consensus_trims_read_through`].
     #[test]
     fn test_mate_cigar_handling() {
         let len = 10;
@@ -5847,6 +5888,181 @@ mod tests {
             Some(2),
             "both deletion reads are rejected as a minority alignment"
         );
+    }
+
+    /// Port of fgbio test: "add the mate cigar when not present before consensus calling"
+    /// (`VanillaUmiConsensusCallerTest.scala:818`), extended to assert the effect of the backfill.
+    ///
+    /// fgbio's `UmiConsensusCaller.updateMateCigars` (`UmiConsensusCaller.scala:328-343`, called
+    /// at `:356`) copies each mate's CIGAR into the other read's `MC` before any read is
+    /// converted to a `SourceRead`, so the read-through trim in `toSourceRead` always sees the
+    /// mate CIGAR. The scala test only counts the consensus reads; here the pair reads through
+    /// the 80 bp insert into 20 bp of adapter, so a backfilled mate CIGAR must trim both
+    /// consensus reads to the 80 bp insert. A pair that already carries `MC` is used as-is, even
+    /// when it is stale (fgumi deliberately does not mirror fgbio's overwrite of an existing
+    /// `MC`).
+    #[rstest]
+    #[case::both_mc_present(McTags::Both, false)]
+    #[case::neither_mc_backfilled(McTags::Neither, false)]
+    #[case::forward_r1_missing_mc_backfilled(McTags::ForwardMissing, false)]
+    #[case::stale_mc_is_used_not_overwritten(McTags::StaleBoth, true)]
+    fn test_mate_cigar_backfilled_before_consensus_trims_read_through(
+        #[case] mc: McTags,
+        #[case] r1_keeps_adapter: bool,
+    ) {
+        let mut records = Vec::new();
+        for i in 0..3 {
+            let name = format!("t{i}");
+            let (r1, r2) = read_through_pair(name.as_bytes(), b"1", mc, true);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let mut caller = VanillaUmiConsensusCaller::new("c".to_string(), "1".to_string(), options);
+        let output = consensus_reads_from_raw(&mut caller, records)
+            .expect("read-through pairs must produce consensus reads");
+
+        assert_eq!(output.count, 2, "one consensus read per end");
+        let consensus = ParsedBamRecord::parse_all(&output.data);
+        let r1 = consensus.iter().find(|r| r.flag & flags::FIRST_SEGMENT != 0).expect("R1");
+        let r2 = consensus.iter().find(|r| r.flag & flags::LAST_SEGMENT != 0).expect("R2");
+
+        // R1 is the forward read: the adapter is its 3' end. R2 is emitted in sequencing
+        // orientation, so the insert appears reverse-complemented. With the stale `100M` mate
+        // CIGAR, R1 sees a mate that ends 20 bp past the insert and so keeps its adapter (as
+        // fgbio does), while R2's clip depends only on the mate start and is unaffected.
+        let mut expected_r1 = READ_THROUGH_INSERT.to_vec();
+        if r1_keeps_adapter {
+            expected_r1.extend_from_slice(READ_THROUGH_ADAPTER);
+        }
+        assert_eq!(
+            String::from_utf8(r1.bases.clone()).expect("ASCII bases"),
+            String::from_utf8(expected_r1).expect("ASCII bases"),
+            "R1 consensus bases"
+        );
+        assert_eq!(
+            String::from_utf8(r2.bases.clone()).expect("ASCII bases"),
+            String::from_utf8(reverse_complement(READ_THROUGH_INSERT)).expect("ASCII bases"),
+            "R2 consensus bases"
+        );
+        assert_eq!(r1.get_int_tag(SamTag::CD), Some(3));
+        assert_eq!(r2.get_int_tag(SamTag::CD), Some(3));
+    }
+
+    /// Calls simplex consensus (`--min-reads min_reads`) on `records`, returning the outcome and
+    /// the rejection counts, sorted by reason name so comparisons do not depend on hash-map
+    /// iteration order.
+    fn call_simplex(
+        records: Vec<RawRecord>,
+        min_reads: usize,
+    ) -> (anyhow::Result<ConsensusOutput>, Vec<(RejectionReason, usize)>) {
+        let options = VanillaUmiConsensusOptions { min_reads, ..Default::default() };
+        let mut caller = VanillaUmiConsensusCaller::new("c".to_string(), "1".to_string(), options);
+        let output = consensus_reads_from_raw(&mut caller, records);
+        let mut rejections: Vec<(RejectionReason, usize)> =
+            caller.stats.rejection_reasons.iter().map(|(reason, n)| (*reason, *n)).collect();
+        rejections.sort_by_key(|&(reason, _)| format!("{reason:?}"));
+        (output, rejections)
+    }
+
+    /// `count` read-through pairs `t0`, `t1`, ... with the given `MC` tags, R1 then R2.
+    fn read_through_family(count: usize, mc: McTags) -> Vec<RawRecord> {
+        (0..count)
+            .flat_map(|i| {
+                let (r1, r2) = read_through_pair(format!("t{i}").as_bytes(), b"1", mc, true);
+                [r1, r2]
+            })
+            .collect()
+    }
+
+    /// Port of the fgbio behavior at `UmiConsensusCaller.scala:328-343` (`updateMateCigars`)
+    /// exercised by `VanillaUmiConsensusCallerTest.scala:818` ("add the mate cigar when not
+    /// present before consensus calling"): a read with no `MC` whose mate is not in the group
+    /// cannot have its mate CIGAR backfilled. fgbio throws (a `MatchError`); fgumi must stop
+    /// with an error that names the read rather than silently skipping the read-through trim,
+    /// here because the read reaches the emitted R1 consensus.
+    #[test]
+    fn test_missing_mate_without_mc_errors_naming_the_read() {
+        let mut records = read_through_family(2, McTags::Neither);
+        let (orphan, _) = read_through_pair(b"orphan_read", b"1", McTags::Neither, true);
+        records.push(orphan);
+
+        let err = call_simplex(records, 1)
+            .0
+            .err()
+            .expect("a read lacking MC whose mate is absent must be an error");
+        assert_eq!(
+            format!("{err:#}"),
+            "Mate cigar (MC SAM tag) needed for read 'orphan_read': the read has no MC tag and \
+             its primary mate is not in the same group. Add MC tags (e.g. with fgumi zipper or \
+             samtools fixmate), or keep both reads of each template in the same group."
+        );
+    }
+
+    /// A read lacking `MC` whose mate is missing fails the run only if it would reach an emitted
+    /// consensus. Each group here is rejected or filtered by the usual checks, and must be handled
+    /// exactly as when every read carries `MC`:
+    /// - `end_below_min_reads`: with `--min-reads 2`, one pair plus a lone R1 give an R2 end of
+    ///   one read, so no consensus pair can be built (the R1 consensus is an orphan). fgbio, which
+    ///   backfills before any filtering, would fail here.
+    /// - `minority_alignment`: the lone R1 carries an insertion its family lacks, so it is
+    ///   dropped as a minority alignment and the family's consensus pair is still emitted.
+    #[rstest]
+    #[case::end_below_min_reads(
+        1,
+        2,
+        false,
+        0,
+        &[(RejectionReason::InsufficientReads, 1), (RejectionReason::OrphanConsensus, 2)]
+    )]
+    #[case::minority_alignment(2, 1, true, 2, &[(RejectionReason::MinorityAlignment, 1)])]
+    fn test_missing_mate_is_not_an_error_for_a_read_that_reaches_no_consensus(
+        #[case] pairs: usize,
+        #[case] min_reads: usize,
+        #[case] lone_read_is_minority_alignment: bool,
+        #[case] expected_count: usize,
+        #[case] expected_rejections: &[(RejectionReason, usize)],
+    ) {
+        // The lone R1 carries `MC` exactly when the rest of the group does.
+        let group = |mc: McTags| {
+            let mut records = read_through_family(pairs, mc);
+            let (mut lone, _) = read_through_pair(b"lone", b"1", mc, true);
+            if lone_read_is_minority_alignment {
+                let mut b = SamBuilder::new();
+                b.read_name(b"lone")
+                    .ref_id(0)
+                    .pos(1000)
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                    .mate_ref_id(0)
+                    .mate_pos(1000)
+                    .sequence(&[READ_THROUGH_INSERT, READ_THROUGH_ADAPTER].concat())
+                    .qualities(&[40; 100])
+                    .cigar_ops(&[
+                        encode_op(0, 40),
+                        encode_op(1, 2),
+                        encode_op(0, 38),
+                        encode_op(4, 20),
+                    ])
+                    .add_string_tag(SamTag::MI, b"1");
+                if matches!(mc, McTags::Both) {
+                    b.add_string_tag(SamTag::MC, b"20S80M");
+                }
+                lone = b.build();
+            }
+            records.push(lone);
+            records
+        };
+
+        let (with_mc, with_mc_rejections) = call_simplex(group(McTags::Both), min_reads);
+        let (without_mc, without_mc_rejections) = call_simplex(group(McTags::Neither), min_reads);
+
+        let with_mc = with_mc.expect("the group with MC is valid");
+        let without_mc = without_mc.expect("a read that reaches no consensus needs no mate");
+        assert_eq!(without_mc.count, expected_count);
+        assert_eq!(without_mc.data, with_mc.data, "output must match the input with MC");
+        assert_eq!(without_mc_rejections, expected_rejections);
+        assert_eq!(without_mc_rejections, with_mc_rejections);
     }
 
     // =========================================================================

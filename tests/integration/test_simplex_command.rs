@@ -925,6 +925,99 @@ fn test_simplex_indel_at_overlap_boundary_still_calls_a_consensus() {
     }
 }
 
+/// [`indel_readthrough_family`] with every `MC` tag removed.
+fn indel_readthrough_family_without_mc(depth: usize) -> Vec<fgumi_raw_bam::RawRecord> {
+    indel_readthrough_family(depth)
+        .into_iter()
+        .map(|mut record| {
+            fgumi_raw_bam::remove_tag(record.as_mut_vec(), SamTag::MC);
+            record
+        })
+        .collect()
+}
+
+/// The `simplex` arguments for the mate-CIGAR backfill tests, with `--threads` when given.
+fn backfill_args<'a>(input: &'a Path, output: &'a Path, threads: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec![
+        "simplex",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend(["--threads", threads]);
+    }
+    args
+}
+
+/// A read with no `MC` tag takes its mate CIGAR from its mate in the same group, as fgbio's
+/// `UmiConsensusCaller.updateMateCigars` (`UmiConsensusCaller.scala:328-343`, called at `:356`)
+/// does, so the read-through family is trimmed exactly as when it carries `MC`: both consensus
+/// reads keep 127 of their 129 bases. Checked on the single-worker and the multi-worker chain.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_simplex_backfills_a_missing_mate_cigar_from_the_mate(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let with_mc = temp_dir.path().join("with_mc.bam");
+    let without_mc = temp_dir.path().join("without_mc.bam");
+    create_grouped_bam(&with_mc, vec![("1", indel_readthrough_family(3))]);
+    create_grouped_bam(&without_mc, vec![("1", indel_readthrough_family_without_mc(3))]);
+
+    let with_mc_out = temp_dir.path().join("with_mc.out.bam");
+    let without_mc_out = temp_dir.path().join("without_mc.out.bam");
+    for (input, output) in [(&with_mc, &with_mc_out), (&without_mc, &without_mc_out)] {
+        Simplex::try_parse_from(backfill_args(input, output, threads))
+            .expect("failed to parse simplex args")
+            .execute("fgumi simplex")
+            .expect("simplex run failed");
+    }
+
+    let (_, expected) = read_bam_output(&with_mc_out);
+    let (_, actual) = read_bam_output(&without_mc_out);
+    let lengths: Vec<usize> = actual.iter().map(|r| r.sequence().len()).collect();
+    assert_eq!(lengths, vec![127, 127], "both ends trimmed by the 2 bases past the mate");
+    assert_eq!(actual, expected, "output without MC must match output with MC");
+}
+
+/// A read with no `MC` tag whose mate is missing from its group cannot be trimmed at the mate's
+/// end, so `simplex` fails naming the read rather than calling the read-through bases into the
+/// consensus (fgbio fails too, in `UmiConsensusCaller.updateMateCigars`,
+/// `UmiConsensusCaller.scala:328-343`). The error, naming the molecule and the read, must
+/// surface from the multi-worker chain too.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_simplex_fails_naming_a_read_whose_missing_mate_cigar_cannot_be_backfilled(
+    #[case] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    // Drop the R2 of template `rt_0`, the second record of the family.
+    let mut family = indel_readthrough_family_without_mc(3);
+    family.remove(1);
+    create_grouped_bam(&input, vec![("1", family)]);
+
+    let err = Simplex::try_parse_from(backfill_args(&input, &output, threads))
+        .expect("failed to parse simplex args")
+        .execute("fgumi simplex")
+        .expect_err("a read lacking MC whose mate is absent must fail the run");
+
+    // Both paths run the consensus as a pipeline step, which flattens the caller's error into
+    // one message prefixed with the step and the molecule.
+    assert_eq!(
+        err.root_cause().to_string(),
+        "Pipeline::run: step \"SimplexConsensus\" failed: Consensus error for MI 1\t: Mate cigar \
+         (MC SAM tag) needed for read 'rt_0': the read has no MC tag and its primary mate is not \
+         in the same group. Add MC tags (e.g. with fgumi zipper or samtools fixmate), or keep both \
+         reads of each template in the same group."
+    );
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Chain-path worker-count determinism tests
 //
