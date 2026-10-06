@@ -49,6 +49,11 @@ use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::steps::tuning::BamPipelineTuning;
 
+/// Nominal decompressed size of one BGZF block, used to turn the
+/// `blocks_per_batch` tuning knob into the byte target of a queryname-cut batch
+/// (see `ChainBuilder::queryname_min_emit_bytes`).
+pub(crate) const DECOMPRESSED_BLOCK_BYTES: usize = 64 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PendingSource — opened input held between new() and add_source().
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1656,7 +1661,6 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
     fn queryname_min_emit_bytes(&self) -> usize {
-        const DECOMPRESSED_BLOCK_BYTES: usize = 64 * 1024;
         self.tuning.blocks_per_batch.saturating_mul(DECOMPRESSED_BLOCK_BYTES)
     }
 

@@ -2699,9 +2699,10 @@ mod tests {
         record.name().map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
     }
 
-    /// Run filter command with specified number of threads
+    /// Build a template-mode filter command, without `--rejects`, with the specified
+    /// number of threads.
     #[allow(clippy::too_many_arguments)]
-    fn run_filter_command(
+    fn build_filter_command(
         input: &std::path::Path,
         output: &std::path::Path,
         reference: &std::path::Path,
@@ -2710,8 +2711,8 @@ mod tests {
         max_read_error_rate: Vec<f64>,
         max_base_error_rate: Vec<f64>,
         min_base_quality: Option<u8>,
-    ) -> Result<()> {
-        let cmd = Filter {
+    ) -> Filter {
+        Filter {
             io: BamIoOptions {
                 input: input.to_path_buf(),
                 output: output.to_path_buf(),
@@ -2740,8 +2741,32 @@ mod tests {
             methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
-        };
-        cmd.execute("test")
+        }
+    }
+
+    /// Run filter command with specified number of threads
+    #[allow(clippy::too_many_arguments)]
+    fn run_filter_command(
+        input: &std::path::Path,
+        output: &std::path::Path,
+        reference: &std::path::Path,
+        threads: usize,
+        min_reads: Vec<usize>,
+        max_read_error_rate: Vec<f64>,
+        max_base_error_rate: Vec<f64>,
+        min_base_quality: Option<u8>,
+    ) -> Result<()> {
+        build_filter_command(
+            input,
+            output,
+            reference,
+            threads,
+            min_reads,
+            max_read_error_rate,
+            max_base_error_rate,
+            min_base_quality,
+        )
+        .execute("test")
     }
 
     #[test]
@@ -3399,9 +3424,11 @@ mod tests {
 
     /// Non-template filtering through the *multi-threaded* chain. With
     /// `filter_by_template: false`, the chain's single-read filter step filters
-    /// each record independently (no queryname grouping). Every other
-    /// non-template execution test runs the chain at a single worker, so this
-    /// pins the `> 1`-thread configuration of that single-read step.
+    /// each record independently (no queryname grouping). Apart from the
+    /// multi-batch output-order tests, every other non-template execution test
+    /// runs the chain at a single worker, so this pins the `> 1`-thread
+    /// configuration of that single-read step, including its output order, on a
+    /// single small batch.
     #[test]
     fn test_filter_execute_non_template_mode_multithreaded() -> Result<()> {
         let dir = TempDir::new()?;
@@ -3509,14 +3536,431 @@ mod tests {
         cmd.execute("test")?;
 
         let records = read_bam_records(&output_path)?;
-        // Reads with depth >= 5 pass: r0(10), r2(8), r4(6). Order is not asserted
-        // (the multi-threaded path does not preserve input order).
+        // Reads with depth >= 5 pass: r0(10), r2(8), r4(6). The multi-threaded
+        // path reorders worker output back into input order, so the survivors
+        // keep their input order.
+        let names: Vec<String> = records.iter().filter_map(get_read_name).collect();
         assert_eq!(
-            records.len(),
-            3,
-            "non-template multi-threaded filter must keep exactly the depth>=5 reads"
+            names,
+            vec!["r0".to_string(), "r2".to_string(), "r4".to_string()],
+            "non-template multi-threaded filter must keep exactly the depth>=5 reads, in input order"
         );
 
+        Ok(())
+    }
+
+    /// Number of templates in the multi-batch output-order tests.
+    const ORDER_TEST_TEMPLATES: usize = 15_000;
+
+    /// Read length of every record in the multi-batch output-order tests.
+    const ORDER_TEST_READ_LEN: usize = 150;
+
+    /// `--min-reads` of the multi-batch output-order tests.
+    const ORDER_TEST_MIN_READS: u8 = 5;
+
+    /// Minimum number of batch-size targets the order-test input must span. A
+    /// queryname-cut batch (template filtering) closes at the first template boundary
+    /// after reaching its target, so it can overshoot the target by up to one read batch
+    /// of the same size; spanning eight targets therefore still guarantees at least four
+    /// batches on every path.
+    const ORDER_TEST_MIN_BATCH_TARGETS: usize = 8;
+
+    /// Input encoding for the multi-batch output-order tests. Single-record filtering
+    /// of a BAM runs on the decode-free `RecordBatch` fast path, while a SAM runs on
+    /// the decoded-record path; template filtering decodes either way.
+    #[derive(Debug, Clone, Copy)]
+    enum OrderTestInput {
+        Bam,
+        Sam,
+    }
+
+    /// Segment of an order-test record.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OrderTestSegment {
+        R1,
+        R2,
+        /// An unpaired read, which fgbio and fgumi both treat as an R1.
+        Fragment,
+    }
+
+    /// Alignment role of an order-test record.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OrderTestRole {
+        Primary,
+        Supplementary,
+        Secondary,
+    }
+
+    /// One input record of the multi-batch output-order tests.
+    #[derive(Debug, Clone)]
+    struct OrderTestRecord {
+        name: String,
+        segment: OrderTestSegment,
+        role: OrderTestRole,
+        /// 1-based alignment start; distinguishes records that share a name, segment
+        /// and role.
+        pos: usize,
+        /// Per-read and per-base depth; the record passes on its own when this is at
+        /// least [`ORDER_TEST_MIN_READS`].
+        depth: u8,
+    }
+
+    impl OrderTestRecord {
+        fn new(
+            name: &str,
+            segment: OrderTestSegment,
+            role: OrderTestRole,
+            pos: usize,
+            depth: u8,
+        ) -> Self {
+            Self { name: name.to_string(), segment, role, pos, depth }
+        }
+
+        /// Whether this record passes the per-record filter on its own.
+        fn passes(&self) -> bool {
+            self.depth >= ORDER_TEST_MIN_READS
+        }
+
+        /// Rank of this record within its template in template-mode output, which
+        /// follows fgbio: R1 (or fragment), R2, then R1 supplementary, R2
+        /// supplementary, R1 secondary and R2 secondary records
+        /// (`FilterConsensusReads.scala:211-219`; `Template.allSupplementaryAndSecondary`
+        /// at `Bams.scala:72-73`).
+        fn template_rank(&self) -> u8 {
+            let r2 = u8::from(self.segment == OrderTestSegment::R2);
+            match self.role {
+                OrderTestRole::Primary => r2,
+                OrderTestRole::Supplementary => 2 + r2,
+                OrderTestRole::Secondary => 4 + r2,
+            }
+        }
+
+        fn label(&self) -> String {
+            order_test_label(&self.name, self.segment, self.role, self.pos)
+        }
+
+        fn to_raw(&self) -> RawRecord {
+            let mut rec = create_simplex_consensus_record(
+                &self.name,
+                i32::try_from(self.pos).expect("order-test position fits in i32"),
+                &[b'A'; ORDER_TEST_READ_LEN],
+                &[30; ORDER_TEST_READ_LEN],
+                self.depth,
+                0.01,
+                &[i16::from(self.depth); ORDER_TEST_READ_LEN],
+                &[0; ORDER_TEST_READ_LEN],
+            );
+            let segment = match self.segment {
+                OrderTestSegment::R1 => flags::PAIRED | flags::FIRST_SEGMENT,
+                OrderTestSegment::R2 => flags::PAIRED | flags::LAST_SEGMENT,
+                OrderTestSegment::Fragment => 0,
+            };
+            let role = match self.role {
+                OrderTestRole::Primary => 0,
+                OrderTestRole::Supplementary => flags::SUPPLEMENTARY,
+                OrderTestRole::Secondary => flags::SECONDARY,
+            };
+            rec.set_flags(segment | role);
+            rec
+        }
+    }
+
+    /// Label of an order-test record: read name, `/1`, `/2` or `/F` for R1, R2 or an
+    /// unpaired fragment, a `sup` or `sec` marker for a supplementary or secondary
+    /// record, and the alignment start. Every record of the input has a distinct
+    /// label, so any reordering of records, within or across templates, is caught.
+    fn order_test_label(
+        name: &str,
+        segment: OrderTestSegment,
+        role: OrderTestRole,
+        pos: usize,
+    ) -> String {
+        let segment = match segment {
+            OrderTestSegment::R1 => "1",
+            OrderTestSegment::R2 => "2",
+            OrderTestSegment::Fragment => "F",
+        };
+        let role = match role {
+            OrderTestRole::Primary => "",
+            OrderTestRole::Supplementary => " sup",
+            OrderTestRole::Secondary => " sec",
+        };
+        format!("{name}/{segment}{role}@{pos}")
+    }
+
+    /// Label (see [`order_test_label`]) of a record read back from filter output.
+    fn order_test_label_of(rec: &RecordBuf) -> Result<String> {
+        use anyhow::Context;
+
+        let name = get_read_name(rec).context("order-test output record has no name")?;
+        let rec_flags = rec.flags();
+        let segment = if !rec_flags.is_segmented() {
+            OrderTestSegment::Fragment
+        } else if rec_flags.is_first_segment() {
+            OrderTestSegment::R1
+        } else {
+            OrderTestSegment::R2
+        };
+        let role = if rec_flags.is_secondary() {
+            OrderTestRole::Secondary
+        } else if rec_flags.is_supplementary() {
+            OrderTestRole::Supplementary
+        } else {
+            OrderTestRole::Primary
+        };
+        let pos = rec.alignment_start().context("order-test output record is unmapped")?;
+        Ok(order_test_label(&name, segment, role, usize::from(pos)))
+    }
+
+    /// Template names of the multi-batch output-order input, in input order. Name `i`
+    /// is `i * 7919 % ORDER_TEST_TEMPLATES`: 7919 is prime and coprime to 15000, so
+    /// this is a permutation that is neither sorted nor reverse-sorted, and sorting by
+    /// name cannot reproduce input order.
+    fn order_test_template_names() -> Vec<String> {
+        (0..ORDER_TEST_TEMPLATES)
+            .map(|i| format!("q{:05}", (i * 7919) % ORDER_TEST_TEMPLATES))
+            .collect()
+    }
+
+    /// Primary `(R1, R2)` read depths of the template at input index `i`: every third
+    /// template fails on both mates, every fifth of the rest fails on R2 only, and all
+    /// others pass on both mates. The R2-only failures are what separate the two modes:
+    /// template filtering drops the whole template, single-record filtering drops only
+    /// R2. A fragment uses the R1 depth.
+    fn order_test_mate_depths(i: usize) -> (u8, u8) {
+        if i.is_multiple_of(3) {
+            (2, 2)
+        } else if i.is_multiple_of(5) {
+            (10, 2)
+        } else {
+            (10, 10)
+        }
+    }
+
+    /// The records of the template at input index `i`, in input order. The moduli are
+    /// coprime to each other and to those of [`order_test_mate_depths`], so every
+    /// shape below meets every depth pattern many times:
+    ///
+    /// - `i % 11 == 2`: a pair with supplementary and secondary records, all
+    ///   interleaved and starting with R2's secondary, so template order differs from
+    ///   input order on every rank. The middle one of its three R1 supplementary
+    ///   records fails on its own, so the two that pass still pin their relative order.
+    /// - `i % 13 == 3`: an unpaired fragment, preceded by a supplementary record when
+    ///   `i` is even.
+    /// - `i % 7 == 1`: a pair whose R2 comes first.
+    /// - otherwise: a pair whose R1 comes first.
+    fn order_test_template(i: usize, name: &str) -> Vec<OrderTestRecord> {
+        use OrderTestRole::{Primary, Secondary, Supplementary};
+        use OrderTestSegment::{Fragment, R1, R2};
+
+        let (r1_depth, r2_depth) = order_test_mate_depths(i);
+        let rec = |segment, role, pos, depth| OrderTestRecord::new(name, segment, role, pos, depth);
+        if i % 11 == 2 {
+            vec![
+                rec(R2, Secondary, 600, 10),
+                rec(R2, Primary, 100, r2_depth),
+                rec(R1, Supplementary, 300, 10),
+                rec(R1, Primary, 100, r1_depth),
+                rec(R2, Supplementary, 200, 10),
+                rec(R1, Supplementary, 500, 2),
+                rec(R1, Secondary, 400, 10),
+                rec(R1, Supplementary, 700, 10),
+            ]
+        } else if i % 13 == 3 {
+            let fragment = rec(Fragment, Primary, 100, r1_depth);
+            if i.is_multiple_of(2) {
+                vec![rec(Fragment, Supplementary, 300, 10), fragment]
+            } else {
+                vec![fragment]
+            }
+        } else if i % 7 == 1 {
+            vec![rec(R2, Primary, 100, r2_depth), rec(R1, Primary, 100, r1_depth)]
+        } else {
+            vec![rec(R1, Primary, 100, r1_depth), rec(R2, Primary, 100, r2_depth)]
+        }
+    }
+
+    /// Every template of the multi-batch output-order input, in input order.
+    fn order_test_templates() -> Vec<Vec<OrderTestRecord>> {
+        order_test_template_names()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| order_test_template(i, name))
+            .collect()
+    }
+
+    /// Labels of the records the filter keeps (`rejected = false`) or rejects
+    /// (`rejected = true`), in the order the filter must write them.
+    ///
+    /// Single-record filtering keeps or rejects each record on its own and writes it in
+    /// input order.
+    ///
+    /// Template filtering writes templates in input order, but within a template writes
+    /// R1, R2, then supplementary and secondary records, whatever their input order
+    /// (fgbio `FilterConsensusReads.scala:211-219`). Within each of the four non-primary
+    /// groups records come in reverse input order, because fgbio's `Template.apply`
+    /// prepends each one to a list (`Bams.scala:157-168`). The template is kept when
+    /// all its primaries pass; a kept template's non-primary records are then kept only
+    /// when they pass on their own. Every record not kept is rejected, in the same order.
+    fn order_test_expected_labels(filter_by_template: bool, rejected: bool) -> Vec<String> {
+        let mut labels = Vec::new();
+        for template in order_test_templates() {
+            if filter_by_template {
+                let template_passes = template
+                    .iter()
+                    .filter(|r| r.role == OrderTestRole::Primary)
+                    .all(OrderTestRecord::passes);
+                let mut ordered: Vec<(usize, &OrderTestRecord)> =
+                    template.iter().enumerate().collect();
+                ordered.sort_by_key(|&(idx, r)| (r.template_rank(), std::cmp::Reverse(idx)));
+                for (_, r) in ordered {
+                    let kept = template_passes && (r.role == OrderTestRole::Primary || r.passes());
+                    if kept != rejected {
+                        labels.push(r.label());
+                    }
+                }
+            } else {
+                for r in &template {
+                    if r.passes() != rejected {
+                        labels.push(r.label());
+                    }
+                }
+            }
+        }
+        labels
+    }
+
+    /// Writes the multi-batch output-order input as `input`, runs `filter` over it,
+    /// and returns the record labels (see [`order_test_label`]) of the passing output
+    /// and (when `with_rejects`) of the rejects output, each in file order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input does not span [`ORDER_TEST_MIN_BATCH_TARGETS`] batch-size
+    /// targets at `threads`, so a change to the batch sizing cannot silently turn the
+    /// test into a single-batch test that cannot detect reordering.
+    fn run_filter_order_scenario(
+        input: OrderTestInput,
+        filter_by_template: bool,
+        threads: usize,
+        with_rejects: bool,
+    ) -> Result<(Vec<String>, Option<Vec<String>>)> {
+        use crate::pipeline::chains::builder::DECOMPRESSED_BLOCK_BYTES;
+        use crate::pipeline::steps::BamPipelineTuning;
+        use noodles::sam::alignment::io::Write as AlignmentWrite;
+
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let output_path = dir.path().join("output.bam");
+        let rejects_path = dir.path().join("rejects.bam");
+
+        let records: Vec<RawRecord> =
+            order_test_templates().iter().flatten().map(OrderTestRecord::to_raw).collect();
+
+        // The largest batch on any path is the queryname cut's coalescing target. The
+        // BAM encoding is the smaller of the two, so it bounds the input from below for
+        // both the BAM and the SAM batch cuts.
+        let batch_target_bytes =
+            BamPipelineTuning::auto_tuned(threads).blocks_per_batch * DECOMPRESSED_BLOCK_BYTES;
+        let input_bam_bytes: usize = records.iter().map(|r| 4 + r.as_ref().len()).sum();
+        assert!(
+            input_bam_bytes >= ORDER_TEST_MIN_BATCH_TARGETS * batch_target_bytes,
+            "order-test input ({input_bam_bytes} BAM bytes) must span at least \
+             {ORDER_TEST_MIN_BATCH_TARGETS} batch targets of {batch_target_bytes} bytes at \
+             --threads {threads}; grow ORDER_TEST_TEMPLATES"
+        );
+
+        // Each template's records are adjacent and the names are unique, so the input
+        // is query-grouped by construction. The names are deliberately not sorted, so
+        // the header advertises `GO:query` rather than `SO:queryname`.
+        let header = fgumi_sam::header_as_query_grouped(&test_bam_header());
+        let (input_path, mut writer): (_, Box<dyn AlignmentWrite>) = match input {
+            OrderTestInput::Bam => {
+                let path = dir.path().join("input.bam");
+                let writer = noodles::bam::io::writer::Builder.build_from_path(&path)?;
+                (path, Box::new(writer))
+            }
+            OrderTestInput::Sam => {
+                let path = dir.path().join("input.sam");
+                let writer = noodles::sam::io::writer::Builder::default().build_from_path(&path)?;
+                (path, Box::new(writer))
+            }
+        };
+        writer.write_alignment_header(&header)?;
+        for rec in records {
+            writer.write_alignment_record(&header, &to_record_buf_default(rec))?;
+        }
+        writer.finish(&header)?;
+        drop(writer);
+
+        let cmd = Filter {
+            filter_by_template,
+            rejects: with_rejects.then(|| rejects_path.clone()),
+            ..build_filter_command(
+                &input_path,
+                &output_path,
+                &ref_path,
+                threads,
+                vec![usize::from(ORDER_TEST_MIN_READS)],
+                vec![0.1],
+                vec![0.3],
+                Some(10),
+            )
+        };
+        cmd.execute("test")?;
+
+        let read_labels = |path: &std::path::Path| -> Result<Vec<String>> {
+            read_bam_records(path)?.iter().map(order_test_label_of).collect()
+        };
+        let passed = read_labels(&output_path)?;
+        let rejected = if with_rejects { Some(read_labels(&rejects_path)?) } else { None };
+        Ok((passed, rejected))
+    }
+
+    /// Pins the record order of `filter` output, and of the `--rejects` output when
+    /// requested, on every path (BAM fast path and SAM decoded path, template and
+    /// single-record filtering, multi-threaded) across many pipeline batches:
+    ///
+    /// - Single-record filtering keeps strict input record order.
+    /// - Template filtering keeps templates in input order, but writes each template as
+    ///   R1, R2, then supplementary and secondary records, whatever their input order,
+    ///   as fgbio does. So an R2-first pair comes out R1 first.
+    ///
+    /// The input mixes R1-first pairs, R2-first pairs, pairs with interleaved
+    /// supplementary and secondary records, and unpaired fragments (see
+    /// [`order_test_template`]); [`order_test_expected_labels`] gives the expected order.
+    ///
+    /// `--threads 1` is deliberately not in the matrix: a single worker processes
+    /// batches in sequence and cannot reorder them, so those cases could not detect a
+    /// reordering regression and only add runtime. The multi-threaded paths are the
+    /// ones that reorder worker output back into input order.
+    ///
+    /// fgbio `FilterConsensusReads` requires query-grouped input and, without
+    /// `--sort-order`, streams templates to the output in input order
+    /// (`FilterConsensusReads.scala:181-189`), writing each kept template as above
+    /// (`:211-219`); fgbio pins template order for two paired templates in
+    /// `FilterConsensusReadsTest.scala:324` (queryname input) and `:334` (query-grouped,
+    /// not name-sorted input). This extends that contract to multi-batch,
+    /// multi-threaded input, and pins single-record filtering, which fgbio lacks.
+    #[rstest]
+    fn test_filter_output_order_multi_batch(
+        #[values(OrderTestInput::Bam, OrderTestInput::Sam)] input: OrderTestInput,
+        #[values(false, true)] filter_by_template: bool,
+        #[values(2, 8)] threads: usize,
+        #[values(false, true)] with_rejects: bool,
+    ) -> Result<()> {
+        let (passed, rejected) =
+            run_filter_order_scenario(input, filter_by_template, threads, with_rejects)?;
+        assert_eq!(
+            passed,
+            order_test_expected_labels(filter_by_template, false),
+            "passing records are out of order"
+        );
+        assert_eq!(
+            rejected,
+            with_rejects.then(|| order_test_expected_labels(filter_by_template, true)),
+            "rejected records are out of order"
+        );
         Ok(())
     }
 
