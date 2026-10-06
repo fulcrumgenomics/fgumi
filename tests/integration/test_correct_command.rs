@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{
-    create_family_with_tag, create_minimal_header, create_umi_family, to_record_buf,
+    create_family_with_tag, create_family_with_tags, create_minimal_header, create_umi_family,
+    to_record_buf,
 };
 use crate::helpers::read_bam_output;
 
@@ -1350,4 +1351,129 @@ fn test_correct_refuses_rejects_aliasing_umi_file() {
         "expected the aliasing error, got:\n{stderr}"
     );
     assert_eq!(fs::read(&umis).unwrap(), before, "the whitelist must be left untouched");
+}
+
+/// A `--umi-files` FIFO (or process-substitution path such as `<(...)`) is read
+/// exactly once: `ChainBuilder::new` resolves the UMI set before the input is
+/// opened and hands it to `add_correct`, which does not open the drained FIFO
+/// again.
+///
+/// This is a regression guard, not a test of the change that added it: before
+/// the set was resolved up front, `add_correct` was the only reader, so the
+/// FIFO was also read once and this test passes on that code too. It fails if a
+/// later change reads the set in both places.
+///
+/// A second open of a FIFO blocks (there is no writer left), so the command is
+/// run on its own thread under a time bound: a regression to two reads fails
+/// with a named assertion instead of hanging the suite. The stuck thread is left
+/// behind deliberately; the harness reaps it when the process exits.
+#[cfg(unix)]
+#[test]
+fn correct_reads_a_umi_fifo_exactly_once() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let fifo = temp_dir.path().join("umis.fifo");
+    create_umi_bam(&input_bam, vec![create_umi_family("ACGTACGA", 3, "fam", "AAAAGGGG", 30)]);
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed for {}", fifo.display());
+
+    // Opening the write end blocks until the command opens the read end, so the
+    // UMIs are delivered to that first open and the write end then closes.
+    let fifo_path = fifo.clone();
+    let feeder = std::thread::spawn(move || {
+        let Ok(mut sink) = fs::File::create(&fifo_path) else { return };
+        let _ = std::io::Write::write_all(&mut sink, b"ACGTACGT\nTTTTCCCC\n");
+    });
+
+    let cmd = CorrectUmis::try_parse_from([
+        "correct",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--umi-files",
+        fifo.to_str().unwrap(),
+        "--max-mismatches",
+        "1",
+        "--min-distance",
+        "1",
+    ])
+    .expect("failed to parse correct args");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.execute("fgumi correct").map_err(|e| format!("{e:#}")));
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("correct did not finish within 60s; it likely opened the UMI FIFO a second time")
+    });
+    result.expect("correct must succeed when its UMI file is a FIFO");
+    feeder.join().expect("FIFO feeder panicked");
+
+    let records = records_by_name(&output_bam, &[SamTag::RX]);
+    assert_eq!(records.len(), 3, "every input record must be written");
+    assert!(
+        records.values().all(|tags| tags[0].as_deref() == Some("ACGTACGT")),
+        "every UMI must be corrected against the FIFO's set, got {records:?}"
+    );
+}
+
+/// The correct stage's UMI set is resolved only when the chain runs the correct
+/// stage: correct options carried by a chain without it (here a simplex chain
+/// with a mixed-length set and an unreadable UMI file) are never read, so they
+/// cannot fail an otherwise valid build.
+#[test]
+fn test_build_for_ignores_correct_options_without_a_correct_stage() {
+    use fgumi_lib::commands::correct::CorrectOptions;
+    use fgumi_lib::commands::simplex::Simplex;
+    use fgumi_lib::pipeline::chains::{
+        BuiltPipeline, ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let family = create_family_with_tags(
+        &[(SamTag::RX, b"ACGT".as_slice()), (SamTag::MI, b"1".as_slice())],
+        3,
+        "fam1",
+        "ACGTACGT",
+        30,
+    );
+    create_umi_bam(&input_bam, vec![family]);
+
+    let cmd = Simplex::try_parse_from([
+        "simplex",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ])
+    .expect("failed to parse simplex args");
+    let ctx = SingleStageContext {
+        io: &cmd.io,
+        threading: &cmd.threading,
+        compression: &cmd.compression,
+        scheduler: &cmd.scheduler_opts,
+        queue_memory: &cmd.queue_memory,
+        command_line: "test",
+    };
+    let correct_opts = CorrectOptions {
+        umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
+        umi_files: vec![temp_dir.path().join("missing-umis.txt")],
+        ..Default::default()
+    };
+    let stage_opts = StageOptionsBag {
+        simplex: Some(cmd.to_simplex_options()),
+        correct: Some(correct_opts),
+        ..Default::default()
+    };
+    let spec = ChainSpec::single_stage(Stage::Simplex, stage_opts, &ctx);
+
+    build_for(spec)
+        .and_then(BuiltPipeline::run)
+        .expect("correct options must be ignored by a chain without the correct stage");
+    assert!(output_bam.exists(), "the simplex chain must write its output");
 }

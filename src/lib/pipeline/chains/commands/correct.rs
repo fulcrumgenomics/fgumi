@@ -42,12 +42,33 @@ use anyhow::Result;
 use log::{error, info};
 
 use crate::commands::correct::{
-    CollectedCorrectMetrics, CorrectOptions, EncodedUmiSet, check_min_corrected, merge_umi_counts,
+    CollectedCorrectMetrics, CorrectOptions, EncodedUmiSet, ResolvedUmiSet, check_min_corrected,
+    merge_umi_counts,
 };
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::pipeline::chains::FinalizeHook;
+use crate::pipeline::chains::{ChainSpec, FinalizeHook, Stage};
+
+/// Resolves the correct stage's known-UMI set for `spec` before the chain opens
+/// its input, or returns `None` when the chain does not run the correct stage.
+///
+/// Called by `ChainBuilder::new` ahead of `open_source`, so a bad set (none,
+/// an empty `--umis` value, or mixed lengths) is reported even when the input
+/// is empty or unreadable, as fgbio checks the UMIs at the top of
+/// `CorrectUmis.execute` before opening `SamSource` (`CorrectUmis.scala:168-176`,
+/// `:190`). Correct options carried by a chain without the correct stage are
+/// never read. Options missing from the bag are left for `add_correct` to report.
+///
+/// # Errors
+///
+/// Returns any error from [`CorrectOptions::resolve_umi_set`].
+pub(crate) fn resolve_chain_umi_set(spec: &ChainSpec) -> Result<Option<ResolvedUmiSet>> {
+    if !spec.stages.contains(&Stage::Correct) {
+        return Ok(None);
+    }
+    spec.stage_opts.correct.as_ref().map(CorrectOptions::resolve_umi_set).transpose()
+}
 
 /// Aggregated per-thread totals shared by [`CorrectFinalizeHook`]'s summary
 /// and [`CorrectMetricsFinalizeHook`]'s `--min-corrected` gate. Extracted into
