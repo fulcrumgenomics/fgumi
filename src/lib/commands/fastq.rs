@@ -437,7 +437,7 @@ const MISSING_QUALITY_ASCII: u8 = b'B';
 /// per-byte mapping (a genuinely malformed record, not the "no quality" sentinel).
 pub(crate) fn encode_quality_into(quals: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    if !quals.is_empty() && quals.iter().all(|&q| q == 0xFF) {
+    if fgumi_raw_bam::is_missing_quality(quals) {
         out.resize(quals.len(), MISSING_QUALITY_ASCII);
     } else {
         out.extend(quals.iter().map(|&s| QUAL_TO_ASCII[s as usize]));

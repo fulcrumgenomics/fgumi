@@ -278,6 +278,24 @@ pub fn quality_scores_slice(bam: &[u8]) -> &[u8] {
     &bam[off..off + l]
 }
 
+/// Returns `true` when `quals` is a BAM record's missing `QUAL` (`*`).
+///
+/// BAM has no separate "absent" marker for `QUAL`: the SAM spec stores a missing `QUAL` as one
+/// 0xFF byte per base. So the qualities are missing exactly when the slice is **non-empty and
+/// every byte is 0xFF**.
+///
+/// - An empty slice returns `false`. It is the qualities of a record with no bases (`SEQ` `*`),
+///   which has nothing to weight rather than missing qualities; callers that treat it specially
+///   (for example, rendering it as `*`) must check `is_empty()` themselves.
+/// - A slice with only some 0xFF bytes returns `false`. This deliberately differs from
+///   htslib/htsjdk, which look at the first byte alone; a partly-0xFF slice is a malformed record,
+///   not the spec's sentinel.
+#[inline]
+#[must_use]
+pub fn is_missing_quality(quals: &[u8]) -> bool {
+    !quals.is_empty() && quals.iter().all(|&q| q == 0xFF)
+}
+
 /// Mutable zero-copy access to quality scores in a BAM record.
 #[inline]
 pub fn quality_scores_slice_mut(bam: &mut [u8]) -> &mut [u8] {
@@ -338,6 +356,16 @@ impl<'a> RawRecordView<'a> {
     #[must_use]
     pub fn quality_scores(&self) -> &'a [u8] {
         quality_scores_slice(self.as_bytes())
+    }
+
+    /// Returns `true` when this record has bases but no base qualities (`QUAL` `*`).
+    ///
+    /// See [`is_missing_quality`] for the exact rule: non-empty and every quality byte 0xFF. A
+    /// record with no bases (`SEQ` `*`) returns `false`.
+    #[inline]
+    #[must_use]
+    pub fn has_missing_quality(&self) -> bool {
+        is_missing_quality(self.quality_scores())
     }
 
     /// Returns the raw Phred quality score at `position`.
@@ -564,6 +592,34 @@ mod tests {
         rec[so] = 0x80; // T(8)
         let seq = extract_sequence(&rec);
         assert_eq!(seq, b"T");
+    }
+
+    // ========================================================================
+    // is_missing_quality / has_missing_quality tests
+    // ========================================================================
+
+    /// `QUAL` is `*` only when there is at least one quality byte and every byte is 0xFF. The
+    /// `first_byte_only` and `single_*` cases separate this rule from htsjdk/htslib's first-byte
+    /// check (`quals[0] == 0xFF`), and `empty` pins that a record with no bases (`SEQ` `*`) is not
+    /// reported as missing qualities.
+    #[rstest::rstest]
+    #[case::empty(&[], false)]
+    #[case::single_missing(&[0xFF], true)]
+    #[case::single_present(&[30], false)]
+    #[case::all_missing(&[0xFF, 0xFF, 0xFF, 0xFF], true)]
+    #[case::all_present(&[30, 30, 30, 30], false)]
+    #[case::first_byte_only(&[0xFF, 30, 30, 30], false)]
+    #[case::last_byte_only(&[30, 30, 30, 0xFF], false)]
+    #[case::middle_byte_only(&[30, 0xFF, 30, 30], false)]
+    #[case::all_but_last(&[0xFF, 0xFF, 0xFF, 30], false)]
+    #[case::max_phred(&[93, 93, 93, 93], false)]
+    fn test_is_missing_quality(#[case] quals: &[u8], #[case] expected: bool) {
+        assert_eq!(is_missing_quality(quals), expected);
+
+        // The record-view method applies the same rule to the record's QUAL bytes.
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], quals.len(), -1, -1, &[]);
+        quality_scores_slice_mut(&mut rec).copy_from_slice(quals);
+        assert_eq!(RawRecordView::new(&rec).has_missing_quality(), expected);
     }
 
     // ========================================================================

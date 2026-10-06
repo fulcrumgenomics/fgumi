@@ -446,10 +446,12 @@ pub(crate) fn get_core_fields_raw(raw: &[u8], header: &noodles::sam::Header) -> 
 
     // Quality scores in raw BAM are 0-based Phred. Per SAM/BAM spec, absent QUAL is
     // signaled by ALL bytes being 0xFF — match that exactly to avoid mis-classifying
-    // malformed records with a stray 0xFF. Saturate the Phred→ASCII conversion at '~'
-    // (Phred 93) to avoid u8 wraparound for any remaining out-of-range bytes.
+    // malformed records with a stray 0xFF. An empty QUAL (a record with no bases) also
+    // renders as `*`, which `is_missing_quality` deliberately does not cover. Saturate the
+    // Phred→ASCII conversion at '~' (Phred 93) to avoid u8 wraparound for any remaining
+    // out-of-range bytes.
     let qual_bytes = fgumi_raw_bam::quality_scores_slice(raw);
-    let qual = if qual_bytes.is_empty() || qual_bytes.iter().all(|&q| q == 0xFF) {
+    let qual = if qual_bytes.is_empty() || fgumi_raw_bam::is_missing_quality(qual_bytes) {
         "*".to_string()
     } else {
         qual_bytes.iter().map(|&q| (q.saturating_add(33).min(b'~')) as char).collect()

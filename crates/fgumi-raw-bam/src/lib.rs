@@ -111,8 +111,8 @@ pub use raw_bam_record::{
 // -- sequence --
 pub use sequence::{
     BAM_BASE_TO_ASCII, extract_sequence, extract_sequence_into, get_base, get_qual, is_base_n,
-    mask_base, pack_sequence_into, quality_scores_slice, quality_scores_slice_mut, set_base,
-    set_qual,
+    is_missing_quality, mask_base, pack_sequence_into, quality_scores_slice,
+    quality_scores_slice_mut, set_base, set_qual,
 };
 
 // -- sort --
