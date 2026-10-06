@@ -119,7 +119,9 @@ pub fn build_program_record(
 /// This function:
 /// 1. Finds the last program in the existing @PG chain
 /// 2. Creates a unique ID (appending .1, .2 if "fgumi" exists)
-/// 3. Adds the new @PG with PP pointing to the previous program
+/// 3. Adds exactly one new @PG with PP pointing to the previous program, even when the
+///    header holds several program chains (noodles' `Programs::add` would add one copy
+///    per chain leaf)
 ///
 /// # Arguments
 ///
@@ -138,7 +140,7 @@ pub fn add_pg_record(mut header: Header, version: &str, command_line: &str) -> R
     let unique_id = make_unique_program_id(&header, "fgumi");
     let pg_record = build_program_record(version, command_line, previous_program.as_deref())?;
 
-    header.programs_mut().add(BString::from(unique_id), pg_record)?;
+    header.programs_mut().as_mut().insert(BString::from(unique_id), pg_record);
 
     Ok(header)
 }
@@ -369,6 +371,80 @@ mod tests {
             pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"bwa".as_slice())
         );
+    }
+
+    fn program_with_pp(pp: &str) -> Map<Program> {
+        Map::<Program>::builder()
+            .insert(tag::PREVIOUS_PROGRAM_ID, pp)
+            .build()
+            .expect("building program map should succeed")
+    }
+
+    fn previous_program(header: &Header, id: &str) -> Option<String> {
+        header
+            .programs()
+            .as_ref()
+            .get(id.as_bytes())
+            .and_then(|pg| pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID))
+            .map(ToString::to_string)
+    }
+
+    /// Two root programs, as in a header merged from an aligned and an unaligned BAM.
+    fn header_with_two_chains() -> Header {
+        Header::builder()
+            .add_program("bwa-mem3", Map::<Program>::default())
+            .add_program("samtools", Map::<Program>::default())
+            .build()
+    }
+
+    #[test]
+    fn test_add_pg_record_single_chain_chains_to_leaf() {
+        let header = Header::builder()
+            .add_program("bwa", Map::<Program>::default())
+            .add_program("samtools", program_with_pp("bwa"))
+            .build();
+
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+        assert_eq!(result.programs().as_ref().len(), 3);
+        assert_eq!(previous_program(&result, "fgumi").as_deref(), Some("samtools"));
+    }
+
+    #[test]
+    fn test_add_pg_record_adds_one_record_with_multiple_chains() {
+        let header = header_with_two_chains();
+        let expected_pp = get_last_program_id(&header);
+
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi zipper").expect("add_pg_record should succeed");
+
+        let ids: Vec<String> = result.programs().as_ref().keys().map(ToString::to_string).collect();
+        assert_eq!(ids, ["bwa-mem3", "samtools", "fgumi"]);
+        assert_eq!(previous_program(&result, "fgumi"), expected_pp);
+    }
+
+    #[test]
+    fn test_add_pg_record_repeated_adds_grow_by_one() {
+        let mut header = header_with_two_chains();
+
+        for i in 0..6 {
+            let expected_id = if i == 0 { "fgumi".to_string() } else { format!("fgumi.{i}") };
+            let before = header.programs().as_ref().len();
+
+            header =
+                add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+            let programs = header.programs();
+            assert_eq!(programs.as_ref().len(), before + 1, "each add must insert one @PG");
+            let (last_id, _) = programs.as_ref().last().expect("header has programs");
+            assert_eq!(last_id.to_string(), expected_id);
+            let pp = previous_program(&header, &expected_id).expect("new @PG must carry PP");
+            assert!(programs.as_ref().contains_key(pp.as_bytes()), "PP must name an existing @PG");
+        }
+
+        assert_eq!(header.programs().as_ref().len(), 8);
+        assert_eq!(header.programs().leaves().expect("no cycles").count(), 2);
     }
 
     #[test]
