@@ -95,3 +95,35 @@ fn repeated_template_chunks_of_one_variant_accumulate() {
     }
     assert_eq!(chunks.total_len(), 3, "all three chunks are retained");
 }
+
+/// A dispatch that popped input reports `Progress` whatever the emit after it
+/// reports: the pop freed a slot on the input edge, and the plan's reverse wake
+/// to an upstream producer holding an item for it runs only on `Progress`. Here
+/// the dispatch absorbs a spill slot's announcement and the final
+/// `AllAnnounced`, completes the setup, and the first merge pass stalls at once
+/// (the slot has no decompressed block yet), which the emit reports as
+/// `Contention`; the dispatch must still be `Progress`.
+#[test]
+fn a_dispatch_that_absorbed_setup_input_is_progress() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let mut step = SortMerge::<RecordBatchOutput>::new(SortOrder::Coordinate, 1 << 20);
+    let probe = StepProbe::new(&step);
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        std::io::BufReader::new(tempfile::tempfile().unwrap()),
+        fgumi_sort::SpillCodec::Bgzf,
+    ));
+    probe.push_input(SortPhase2Event::SpillReady {
+        slot,
+        path: std::path::PathBuf::from("spill-0"),
+        records_ingested_so_far: 1,
+    });
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 1,
+        memory_chunk_count: 0,
+        total_records: 1,
+    });
+    let outcome = probe.try_run(&mut step).expect("try_run");
+    assert!(probe.input_is_empty(), "both announcements were absorbed");
+    assert_eq!(outcome, StepOutcome::Progress, "a dispatch that took input is not idle");
+}

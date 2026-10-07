@@ -1,37 +1,40 @@
 //! Runtime: per-worker step storage, chain contexts, drain coordination,
 //! worker pool, worker loop body. Built on top of Phase 1's trait surface.
 
-pub mod contexts;
-pub mod detached;
-pub mod drain;
-pub mod driver;
+pub(crate) mod contexts;
+pub(crate) mod detached;
+pub(crate) mod drain;
+pub(crate) mod driver;
 pub mod event_count;
-pub mod fused;
-pub mod live;
+pub(crate) mod fused;
+pub(crate) mod live;
 pub mod metrics;
-pub mod pool;
+pub(crate) mod pool;
 pub mod sampler;
 pub mod scheduler;
 pub mod stats;
-pub mod storage;
+pub(crate) mod storage;
 pub mod telemetry;
+pub(crate) mod wake;
 pub(crate) mod wake_slot;
-pub mod worker_core;
+pub(crate) mod worker_core;
 pub mod worker_state;
 
-pub use contexts::{ChainContexts, StepCounters, build_chain_contexts, build_chain_contexts_fused};
-pub use detached::{
-    DetachedDriverGroup, build_driver_storage, extract_detached_steps, run_detached_driver,
-};
-pub use drain::StepDrainCounter;
-pub use driver::run_worker_loop;
+pub use contexts::StepCounters;
+pub(crate) use contexts::build_chain_contexts;
+pub(crate) use detached::extract_detached_steps;
+pub(crate) use detached::run_detached_driver;
+pub(crate) use drain::StepDrainCounter;
+pub(crate) use driver::run_worker_loop;
 pub use event_count::{NotifyOutcome, PoolEventCount, WaitKey, WaitOutcome};
-pub use fused::{is_fusible_chain, run_fused_single_thread, should_fuse_single_thread};
-pub use live::LiveSteps;
-pub use pool::{assign_exclusive_owners, assign_sticky_owners};
+pub(crate) use fused::{run_fused_single_thread, should_fuse_single_thread};
+pub(crate) use pool::{assign_exclusive_owners, assign_sticky_owners};
 pub use scheduler::{
     ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, Scheduler, WalkDirection,
 };
 pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot};
-pub use storage::{WorkerStepEntry, build_worker_storage};
-pub use worker_core::{BackoffPolicy, WorkerCore, WorkerRole};
+pub(crate) use storage::build_worker_storage;
+pub(crate) use worker_core::WorkerCore;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use worker_core::{TestBackoff, TestBackoffTarget};

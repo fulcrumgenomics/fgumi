@@ -317,6 +317,59 @@ fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
     );
 }
 
+/// Parse the integer in column `column` (by its header name, e.g. `gated_off`)
+/// of the first `wake` table's row for `step`. The stats table is logged twice
+/// (by `fgumi_pipeline_core::builder` and by `commands::common`); both copies
+/// are identical, and the first is used.
+fn wake_column(stderr: &str, step: &str, column: &str) -> Option<u64> {
+    let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
+    let header_at = bodies
+        .iter()
+        .position(|b| b.trim_start().starts_with("wake ") && b.contains("gated_off"))?;
+    let column = bodies[header_at].split_whitespace().position(|h| h == column)?;
+    bodies[header_at + 1..]
+        .iter()
+        .take_while(|b| !b.trim_start().starts_with("worker"))
+        .find(|b| b.split_whitespace().next() == Some(step))
+        .and_then(|b| b.split_whitespace().nth(column))
+        .and_then(|t| t.parse().ok())
+}
+
+/// On a multi-source sort the Detached `SpillWrite` producer is push-gated
+/// (most of its `Progress` dispatches push nothing to the decompress edge), the
+/// pool producers unpark the drivers, and `SortMerge` parks carry the
+/// unparked/timed-out split. (Standalone `fgumi sort` arms the deadlock monitor,
+/// which attaches the stats collector, so the stats tables — this one included
+/// — are logged on every run; there is no stats-off CLI path to contrast with.)
+#[test]
+fn sort_stats_render_the_wake_table_under_pipeline_stats() {
+    let stderr = sort_shuffled(20_000, "512K", &["--threads", "4"]);
+    let sources =
+        merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(sources > 1, "the fixture must merge more than one source (got {sources}):\n{stderr}");
+    let has_table = stderr
+        .lines()
+        .map(log_body)
+        .any(|b| b.trim_start().starts_with("wake ") && b.contains("gated_off"));
+    assert!(has_table, "the wake table must be rendered:\n{stderr}");
+    let gated_off = wake_column(&stderr, "SpillWrite", "gated_off").expect("SpillWrite gated_off");
+    let notify = wake_column(&stderr, "SpillWrite", "notify").expect("SpillWrite notify");
+    assert!(
+        gated_off > 0 && notify < gated_off,
+        "SpillWrite must be push-gated: notify={notify} gated_off={gated_off}\n{stderr}"
+    );
+    let unparks = wake_column(&stderr, "BgzfCompress", "unpark").expect("BgzfCompress unpark");
+    assert!(unparks > 0, "BgzfCompress → WriteBgzfFile is a Driver target\n{stderr}");
+    let (parks, unparked, timed_out) =
+        detached_parks(&stderr, "SortMerge").expect("SortMerge park split");
+    assert_eq!(unparked + timed_out, parks, "every SortMerge park ended one way:\n{stderr}");
+    let group_parks: u64 = ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"]
+        .iter()
+        .map(|s| detached_parks(&stderr, s).map_or(0, |p| p.0))
+        .sum();
+    assert!(group_parks > 0, "the coordination driver parked at least once:\n{stderr}");
+}
+
 /// `--sort-stats` gates the `SortMerge` k-way-merge diagnostic line on a
 /// spilling sort: absent by default, present when passed.
 #[rstest]

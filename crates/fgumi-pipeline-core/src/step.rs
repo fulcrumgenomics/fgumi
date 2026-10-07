@@ -6,7 +6,7 @@
 //!   `try_run` once its input edges are drained (empty + upstream closed) and
 //!   it holds no buffered output. The framework then closes the step's output
 //!   edges (`mark_outputs_drained`) and drops it from the worklist.
-//! - `try_run` returns `Progress` when it pushed or held an item, `NoProgress`
+//! - `try_run` returns `Progress` when it took, pushed or newly held an item, `NoProgress`
 //!   when there's nothing useful to do this call (input empty but not drained,
 //!   no held items), `Contention` when a Serial-step mutex is held by another
 //!   worker, and `Capped` when a `Parallel` step's shared [`PhaseCap`] refused
@@ -184,22 +184,61 @@ pub struct StepProfile {
 /// return `Finished` on EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepOutcome {
-    /// Step did useful work (pushed an item or held one for later).
+    /// Step did useful work: it took an item from its input, pushed one, or
+    /// newly held one.
+    ///
+    /// The runtime wakes whoever can now run: in a chain without a `Detached`
+    /// step, one parked pool worker; otherwise the thread that consumes what
+    /// was pushed, plus any thread holding an item this step's pops made room
+    /// for (see `runtime::wake`).
+    ///
+    /// A dispatch that took an input item must report `Progress` even if it
+    /// pushed nothing. The plan's reverse wake, which releases a producer
+    /// holding an item for the room that pop made, runs on that `Progress`.
     ///
     /// Only a *new* hold counts: a retry of an already-held item that is still
     /// rejected moved nothing, so report it as `NoProgress` (or `Contention`).
     /// The round-robin walk restarts after a non-sticky step's `Progress`, so a
     /// step that keeps reporting it while stuck is revisited forever and the
     /// consumer that would drain its output is never reached.
+    ///
+    /// In a chain with a `Detached` step (Directed wakes) a successful `retry`
+    /// does not by itself require `Progress`; without one (Legacy)
+    /// the flushed push's wake is delivered only on `Progress`, and an idle
+    /// outcome leaves the consumer to its idle deadline as before. Returning
+    /// `Progress` after a flush remains correct in both.
     Progress,
     /// Step had nothing to do this call (input empty, no held work).
+    ///
+    /// May follow a flushed held retry (the flush-first preamble finding an
+    /// empty input). In a chain with a `Detached` step (Directed wakes) the
+    /// framework still delivers that push's forward wake
+    /// (`BranchOutputHandle::retry` marks the dispatch); without one (Legacy)
+    /// it does not, and the consumer recovers on its idle deadline
+    /// as before. Returning `Progress` after a flush remains correct in both.
     NoProgress,
-    /// Step's Serial-step mutex was contended; scheduler reroutes.
+    /// Step's Serial-step mutex was contended; scheduler reroutes. A step may
+    /// also report it for a held retry that was rejected again (see
+    /// `Progress`).
+    ///
+    /// May follow a flushed held retry (a multi-branch step that flushed one
+    /// branch while another is still refused). In a chain with a `Detached`
+    /// step (Directed wakes) the framework still delivers that push's forward
+    /// wake; without one (Legacy) it does not, and the consumer
+    /// recovers on its idle deadline as before. Returning `Progress` after a
+    /// flush remains correct in both.
     Contention,
     /// Work may exist, but the step's shared [`PhaseCap`] refused this worker
     /// admission (see [`crate::admission`]). Scheduled exactly like
     /// `Contention`; counted separately so a deliberately binding cap is not
     /// reported as mutex thrash.
+    ///
+    /// May follow a flushed held retry (the Process-family preamble retries,
+    /// flushes, then is refused a permit). In a chain with a `Detached` step
+    /// (Directed wakes) the framework still delivers that push's forward wake;
+    /// without one (Legacy) it does not, and the consumer recovers
+    /// on its idle deadline as before. Returning `Progress` after a flush
+    /// remains correct in both.
     Capped,
     /// The step has drained all its input and holds no buffered output — it
     /// will never push again. The framework marks its output queues drained

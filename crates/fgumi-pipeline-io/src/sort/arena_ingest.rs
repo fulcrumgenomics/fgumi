@@ -599,13 +599,14 @@ impl ReadBlocks {
                     // backpressure until the prior run's chunk is consumed and its
                     // arena returns.  (Mid-run admits never fail — the arena is
                     // already acquired — so this is the cross-run boundary case.)
-                    // If we already admitted this batch, that IS progress.
+                    // The pop took an input item, so this is `Progress` (the
+                    // `StepOutcome::Progress` contract): it freed a slot on the
+                    // input edge, and only a `Progress` delivers the reverse wake
+                    // to an upstream producer holding an item for that slot. The
+                    // next call finds the deferred block and reports `NoProgress`
+                    // until the arena returns, without popping.
                     self.deferred_block = Some(b);
-                    return Ok(if admitted_any {
-                        StepOutcome::Progress
-                    } else {
-                        StepOutcome::NoProgress
-                    });
+                    return Ok(StepOutcome::Progress);
                 }
             }
             admitted_any = true;
@@ -1993,6 +1994,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // ReadBlocks unit tests
     // -----------------------------------------------------------------------
+
+    /// A dispatch that pops a block reports `Progress` even when the arena pool
+    /// is exhausted and the block is deferred: the pop freed a slot on the
+    /// input edge, and the plan's reverse wake to an upstream producer holding
+    /// an item for it runs only on `Progress`. The next dispatch pops nothing
+    /// and is idle until the arena returns, then admits the deferred block.
+    #[test]
+    fn a_popped_block_deferred_on_an_exhausted_pool_is_progress() {
+        use fgumi_pipeline_core::testing::StepProbe;
+        let payload = b"deferred-block-payload";
+        let bytes = make_test_bgzf_block(payload);
+        let isz = u32::try_from(uncompressed_size_of(&bytes)).unwrap();
+        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let probe = StepProbe::new(&step);
+        let stolen = step.pool.try_acquire().expect("the pool's one arena");
+        probe.push_input(BgzfBlock { batch_serial: 0, bytes, uncompressed_size: isz, index: None });
+        assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+        assert!(probe.input_is_empty(), "the block was popped");
+        assert!(step.deferred_block.is_some(), "...and deferred, not dropped");
+        assert_eq!(
+            probe.try_run(&mut step).expect("try_run"),
+            StepOutcome::NoProgress,
+            "the arena is still out: idle, and nothing popped"
+        );
+        drop(stolen);
+        assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+        assert!(step.deferred_block.is_none(), "the arena returned: the block is admitted");
+    }
 
     /// Two synthetic BGZF blocks are admitted; after freeze the emitted
     /// `ArenaBlock`s must carry contiguous offsets starting at `FRONT_REGION`,

@@ -40,7 +40,7 @@ pub mod topology;
 #[cfg(test)]
 mod tests;
 
-pub use admission::{CapPermit, PhaseCap, WholeCap, admit_input};
+pub use admission::{CapPermit, CapWaker, MAX_PHASE_CAPS, PhaseCap, WholeCap, admit_input};
 pub use builder::{
     BuildError, Chain, DEFAULT_DEADLOCK_TIMEOUT_SECS, InstrumentationLevel, MultiChain2,
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
@@ -60,6 +60,14 @@ pub use outputs::{
 };
 pub use queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, UnboundedQueue};
 pub use reorder::{BranchOrdering, ReorderStage, Sequenced};
+// The real wake protocols, for `tests/loom_wake.rs` (`wake_slot` itself stays
+// crate-private).
+#[cfg(loom)]
+#[doc(hidden)]
+pub use runtime::{
+    wake::{DriverIdx, WakeEdges, WakePlan},
+    wake_slot::{HolderSet, ThreadSlots, current_thread, delivery_fence},
+};
 pub use signal::{CancelHandle, PipelineError, PipelineSignal};
 pub use step::{
     Affinity, CounterSpec, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny, Step, Step2,

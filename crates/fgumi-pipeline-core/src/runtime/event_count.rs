@@ -57,7 +57,14 @@
 //! sharded liveness counter already does) so an idling worker's
 //! increment/decrement of `waiters` never false-shares with a producer's load.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+// The fence pair is loom's under `--cfg loom`, so `tests/loom_wake.rs` drives
+// the real `notify_one` as the producer half of the direct-park protocol. The
+// counters stay std atomics: the models never wait on the event-count.
+#[cfg(loom)]
+use loom::sync::atomic::fence;
+#[cfg(not(loom))]
+use std::sync::atomic::fence;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
@@ -73,8 +80,11 @@ const CACHE_LINE: usize = 128;
 /// A Vyukov event-count over a `parking_lot` `Mutex`/`Condvar`.
 ///
 /// Shared by all pool workers of one pipeline via `Arc`. Only present when
-/// `n_threads > 1`; the fused and scheduled single-thread paths pass `None` and
-/// keep their existing sleep-backoff idle.
+/// `n_threads > 1`. The scheduled single-thread path passes `None`: its lone
+/// worker idles on `park_timeout` (`BackoffPolicy::ParkedSleep`), where a
+/// Directed `WakePlan` unparks it as `Worker(0)`. The fused path builds no
+/// event-count and keeps its fixed sleep between idle passes: it is the run's
+/// only thread, so nothing else could wake it.
 pub struct PoolEventCount {
     /// Number of workers currently *armed or blocked* (between `prepare_wait`
     /// and the matching `wait`/`cancel_wait`). Read by `notify_one` on the hot

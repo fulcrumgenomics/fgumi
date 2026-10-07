@@ -164,7 +164,7 @@ pub trait ErasedStep: Send + 'static {
     /// Input arity. Default `1` for single-input
     /// [`crate::step::Step`] impls; multi-input
     /// adapters (`TypedStep2`, future `StepN`) override to return their
-    /// arity. Used by [`crate::runtime::contexts`]
+    /// arity. Used by `crate::runtime::contexts`
     /// to decide which input-construction path to take.
     fn input_arity(&self) -> usize {
         1
@@ -259,7 +259,7 @@ pub trait ErasedStep: Send + 'static {
     /// queue bound.
     ///
     /// Used only by the single-thread *fused* driver
-    /// ([`crate::runtime::run_fused_single_thread`]). At one worker, FIFO push
+    /// (`crate::runtime::run_fused_single_thread`). At one worker, FIFO push
     /// order is already the correct order, so the reorder stage is dead weight.
     /// The count/byte bound stays: the fused driver runs a producer before its
     /// consumer in each pass, so a step emitting more items per `try_run` than

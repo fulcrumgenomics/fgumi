@@ -1607,6 +1607,11 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             return Ok(StepOutcome::Contention);
         }
 
+        // Whether this dispatch popped input (the setup absorb): if so it must
+        // report `Progress` whatever the emit below reports, so the plan's
+        // reverse wake reaches an upstream producer holding an item for the slot
+        // the pop freed (the `StepOutcome::Progress` contract).
+        let mut took_input = false;
         if matches!(&self.state, SortMergeState::WaitingForSetup { .. }) {
             // Drain the input queue unbounded: the setup absorb is cheap (it just
             // moves `Arc`s/`Vec`s into the setup state) and the upstream queue is
@@ -1614,6 +1619,7 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             // on a consumer-side drain cap. A cap here would cycle a full upstream
             // queue through repeated partial drains and add producer contention.
             let absorbed = self.absorb_events_into_setup(ctx)?;
+            took_input = absorbed > 0;
             if !self.is_ready_to_merge() {
                 if absorbed > 0 {
                     return Ok(StepOutcome::Progress);
@@ -1671,7 +1677,14 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             }
         };
         ctx.counters.add(RECORDS, records_this_call);
-        outcome
+        match outcome {
+            Ok(StepOutcome::NoProgress | StepOutcome::Contention | StepOutcome::Capped)
+                if took_input =>
+            {
+                Ok(StepOutcome::Progress)
+            }
+            other => other,
+        }
     }
 }
 

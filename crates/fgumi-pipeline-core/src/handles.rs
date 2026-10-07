@@ -50,7 +50,9 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use super::item::{HeapSize, Ordered};
 use super::outputs::Single;
-use super::queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, UnboundedQueue};
+use super::queues::{
+    ByteBoundedQueue, CountBoundedQueue, HolderOnlyHandle, ItemQueue, QueueSpec, UnboundedQueue,
+};
 use super::reorder::{
     BranchOrdering, DEFAULT_REORDER_OVERFLOW_BYTES, ReorderCapHandle, ReorderStage, Sequenced,
 };
@@ -125,7 +127,10 @@ pub struct Unpushed<T: Send + HeapSize + 'static> {
 pub enum HeldRetry {
     /// The held slot was empty — nothing to retry.
     WasEmpty,
-    /// A held item was retried and accepted; the slot is now empty.
+    /// A held item was retried and accepted; the slot is now empty. The
+    /// dispatch is marked flushed (see [`BranchOutputHandle::retry`]), so in a
+    /// chain with a `Detached` step the push's forward wake runs whatever the
+    /// step then reports.
     Flushed,
     /// A held item was retried, still rejected by backpressure, and put back
     /// in the slot. The caller must yield (return `NoProgress`/`Contention`
@@ -149,7 +154,9 @@ impl<T: Send + HeapSize + 'static> Unpushed<T> {
     /// pre-allocated ordinal (if any). After calling this, **do not** push
     /// the item back into an ordered branch — the missing ordinal will
     /// stall the consumer's `ReorderStage`. Use only when abandoning the
-    /// item entirely (e.g., during cancellation).
+    /// item entirely (e.g., during cancellation). Re-pushing the item with
+    /// `push` is not a flush (only [`BranchOutputHandle::retry`] marks the
+    /// dispatch flushed); a step that does so must report `Progress` for it.
     pub fn into_item(self) -> T {
         self.item
     }
@@ -183,6 +190,14 @@ impl<T: Send + HeapSize + 'static> BranchOutputHandle<T> {
     /// ordered branches so the consumer's `ReorderStage` sees a contiguous
     /// sequence.
     ///
+    /// A successful retry marks the current dispatch as flushed: a held item
+    /// left this producer, so its consumer must be woken even if the step goes
+    /// on to report `NoProgress`, `Contention` or `Capped` (the flush-first
+    /// preamble finding an empty input). The dispatcher delivers that wake in a
+    /// chain with a `Detached` step (Directed wakes). Every output shape and
+    /// arity retries through here, so this is the one place the mark is set. A
+    /// fresh `push` does not set it: it is covered by the `Progress` contract.
+    ///
     /// # Errors
     ///
     /// Returns `Err(Unpushed<T>)` if the queue still applied backpressure;
@@ -198,6 +213,18 @@ impl<T: Send + HeapSize + 'static> BranchOutputHandle<T> {
     /// stage to desynchronize — so it panics only in debug builds and drops
     /// the stray ordinal in release.
     pub fn retry(&self, unpushed: Unpushed<T>) -> Result<(), Unpushed<T>> {
+        let r = self.retry_inner(unpushed);
+        if r.is_ok() {
+            // A held item left this producer: its consumer must be woken even if
+            // the dispatch goes on to report no progress.
+            crate::runtime::wake_slot::note_flushed();
+        }
+        r
+    }
+
+    /// The re-push behind [`Self::retry`], without the flushed mark.
+    #[inline]
+    fn retry_inner(&self, unpushed: Unpushed<T>) -> Result<(), Unpushed<T>> {
         let Unpushed { item, ordinal } = unpushed;
         match (&self.inner, ordinal) {
             (BranchOutputInner::Direct(q), None) => {
@@ -305,6 +332,9 @@ impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
             BranchInputInner::Ordered(stage) => stage.try_pop_in_order_reporting_blocked(),
             BranchInputInner::AlwaysDrained(_) => (None, false),
         };
+        if item.is_some() {
+            crate::runtime::wake_slot::note_popped();
+        }
         if let Some(m) = &self.metrics {
             if let Some(it) = &item {
                 // Bytes only on a byte-bounded edge — see `record_item_bytes`.
@@ -379,10 +409,17 @@ pub(crate) struct BranchBudgetHandles {
 /// these (across every branch in the chain) into a registry that the
 /// budget pass + optional queue-memory rebalancer use to set/redistribute
 /// budget. `None` for `CountBounded` / `Unbounded` branches.
+///
+/// `holder_only_handle` is `Some` iff the branch can refuse a push but has no
+/// byte budget: a `CountBoundedQueue` (direct or ordered), or the
+/// `UnboundedQueue` behind a reorder stage (whose stash cap refuses). Its only
+/// consumer is wake tracking. The two handles are never both `Some`; a direct
+/// `Unbounded` branch has neither, since nothing can refuse it.
 pub(crate) struct Branch<T: Send + HeapSize + 'static> {
     pub(crate) output: BranchOutputHandle<T>,
     pub(crate) input: BranchInputHandle<T>,
     pub(crate) bounded_queue_handle: Option<BranchBudgetHandles>,
+    pub(crate) holder_only_handle: Option<Arc<dyn crate::queues::HolderOnlyHandle>>,
     /// `Some` on an instrumented edge — the shared `EdgeMetrics` (also held by
     /// the transport queue for push counts and the input handle for pop counts).
     /// Collected into the edge registry by `contexts.rs` Pass 1.5.
@@ -414,24 +451,26 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
     match (spec, ordering) {
         (QueueSpec::CountBounded { capacity }, BranchOrdering::None) => {
             let m = edge_metrics(level);
-            let q: Arc<dyn ItemQueue<T>> =
-                Arc::new(CountBoundedQueue::<T>::maybe_instrumented(capacity, m.clone()));
-            direct_branch(q, None, m)
+            let q = Arc::new(CountBoundedQueue::<T>::maybe_instrumented(capacity, m.clone()));
+            let holder_only: Arc<dyn HolderOnlyHandle> = Arc::clone(&q) as _;
+            let q: Arc<dyn ItemQueue<T>> = q;
+            direct_branch(q, None, Some(holder_only), m)
         }
         (QueueSpec::CountBounded { capacity }, BranchOrdering::ByOrdinal) => {
             let m = edge_metrics(level);
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(CountBoundedQueue::<Sequenced<T>>::maybe_instrumented(
-                    // Ordered transport is NOT instrumented: push/reject are recorded
-                    // at the ReorderStage boundary (a stash turns a full-transport
-                    // `Err` into an accepted `Ok`). Pop side is on the input handle.
-                    capacity, None,
-                ));
+            let transport = Arc::new(CountBoundedQueue::<Sequenced<T>>::maybe_instrumented(
+                // Ordered transport is NOT instrumented: push/reject are recorded
+                // at the ReorderStage boundary (a stash turns a full-transport
+                // `Err` into an accepted `Ok`). Pop side is on the input handle.
+                capacity, None,
+            ));
+            let holder_only: Arc<dyn HolderOnlyHandle> = Arc::clone(&transport) as _;
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 None,
+                Some(holder_only),
                 m,
             )
         }
@@ -439,19 +478,22 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
             let m = edge_metrics(level);
             let q: Arc<dyn ItemQueue<T>> =
                 Arc::new(UnboundedQueue::<T>::maybe_instrumented(m.clone()));
-            direct_branch(q, None, m)
+            // Nothing can refuse a direct unbounded push: no holder-only handle.
+            direct_branch(q, None, None, m)
         }
         (QueueSpec::Unbounded, BranchOrdering::ByOrdinal) => {
             let m = edge_metrics(level);
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                // Ordered transport is NOT instrumented — push/reject recorded at
-                // the ReorderStage boundary (see the count-bounded note above).
-                Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(None));
+            // Ordered transport is NOT instrumented — push/reject recorded at
+            // the ReorderStage boundary (see the count-bounded note above).
+            let transport = Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(None));
+            // The stage's stash cap can refuse a push into this transport.
+            let holder_only: Arc<dyn HolderOnlyHandle> = Arc::clone(&transport) as _;
             ordered_branch(
                 transport,
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 None,
+                Some(holder_only),
                 m,
             )
         }
@@ -490,32 +532,35 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
     match (spec, ordering) {
         (QueueSpec::CountBounded { capacity }, BranchOrdering::ByItemOrdinal) => {
             let m = edge_metrics(level);
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                Arc::new(CountBoundedQueue::<Sequenced<T>>::maybe_instrumented(
-                    // Ordered transport is NOT instrumented: push/reject are recorded
-                    // at the ReorderStage boundary (a stash turns a full-transport
-                    // `Err` into an accepted `Ok`). Pop side is on the input handle.
-                    capacity, None,
-                ));
+            let transport = Arc::new(CountBoundedQueue::<Sequenced<T>>::maybe_instrumented(
+                // Ordered transport is NOT instrumented: push/reject are recorded
+                // at the ReorderStage boundary (a stash turns a full-transport
+                // `Err` into an accepted `Ok`). Pop side is on the input handle.
+                capacity, None,
+            ));
+            let holder_only: Arc<dyn HolderOnlyHandle> = Arc::clone(&transport) as _;
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 None,
+                Some(holder_only),
                 m,
             )
         }
         (QueueSpec::Unbounded, BranchOrdering::ByItemOrdinal) => {
             let m = edge_metrics(level);
-            let transport: Arc<dyn ItemQueue<Sequenced<T>>> =
-                // Ordered transport is NOT instrumented — push/reject recorded at
-                // the ReorderStage boundary (see the count-bounded note above).
-                Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(None));
+            // Ordered transport is NOT instrumented — push/reject recorded at
+            // the ReorderStage boundary (see the count-bounded note above).
+            let transport = Arc::new(UnboundedQueue::<Sequenced<T>>::maybe_instrumented(None));
+            // The stage's stash cap can refuse a push into this transport.
+            let holder_only: Arc<dyn HolderOnlyHandle> = Arc::clone(&transport) as _;
             ordered_branch(
                 transport,
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 None,
+                Some(holder_only),
                 m,
             )
         }
@@ -546,7 +591,7 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
             let q = Arc::new(ByteBoundedQueue::<T>::maybe_instrumented(limit_bytes, m.clone()));
             let handle: Arc<dyn BoundedQueueHandle> = Arc::clone(&q) as Arc<dyn BoundedQueueHandle>;
             let q_dyn: Arc<dyn ItemQueue<T>> = q;
-            direct_branch(q_dyn, Some(handle), m)
+            direct_branch(q_dyn, Some(handle), None, m)
         }
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::ByOrdinal) => {
             let m = edge_metrics(level);
@@ -573,6 +618,7 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 Some(handle),
+                None,
                 m,
             )
         }
@@ -593,6 +639,7 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
                 OrdinalSource::ItemSerial(|item: &T| item.ordinal()),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 Some(handle),
+                None,
                 m,
             )
         }
@@ -632,7 +679,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
             let q = Arc::new(ByteBoundedQueue::<T>::maybe_instrumented(limit_bytes, m.clone()));
             let handle: Arc<dyn BoundedQueueHandle> = Arc::clone(&q) as Arc<dyn BoundedQueueHandle>;
             let q_dyn: Arc<dyn ItemQueue<T>> = q;
-            direct_branch(q_dyn, Some(handle), m)
+            direct_branch(q_dyn, Some(handle), None, m)
         }
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::ByOrdinal) => {
             let m = edge_metrics(level);
@@ -651,6 +698,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
                 OrdinalSource::Allocated(Arc::new(AtomicU64::new(0))),
                 DEFAULT_REORDER_OVERFLOW_BYTES,
                 Some(handle),
+                None,
                 m,
             )
         }
@@ -667,6 +715,7 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
 fn direct_branch<T: Send + HeapSize + 'static>(
     q: Arc<dyn ItemQueue<T>>,
     transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
+    holder_only_handle: Option<Arc<dyn HolderOnlyHandle>>,
     metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 ) -> Branch<T> {
     // A byte-bounded direct edge carries a `transport_handle`; count/unbounded
@@ -685,6 +734,7 @@ fn direct_branch<T: Send + HeapSize + 'static>(
             record_item_bytes,
         },
         bounded_queue_handle,
+        holder_only_handle,
         metrics,
     }
 }
@@ -703,6 +753,7 @@ fn ordered_branch<T: Send + HeapSize + 'static>(
     ordinal_source: OrdinalSource<T>,
     max_overflow_bytes: u64,
     transport_handle: Option<Arc<dyn crate::queues::BoundedQueueHandle>>,
+    holder_only_handle: Option<Arc<dyn HolderOnlyHandle>>,
     metrics: Option<Arc<crate::runtime::metrics::EdgeMetrics>>,
 ) -> Branch<T> {
     // A byte-bounded ordered edge carries a `transport_handle`; count/unbounded
@@ -731,6 +782,7 @@ fn ordered_branch<T: Send + HeapSize + 'static>(
             record_item_bytes,
         },
         bounded_queue_handle,
+        holder_only_handle,
         metrics,
     }
 }
@@ -757,6 +809,13 @@ pub(crate) struct BranchEntry {
     /// builder collects these into a registry so the budget pass +
     /// optional queue-memory rebalancer can set/reallocate budget.
     pub(crate) bounded_queue_handle: Option<BranchBudgetHandles>,
+    /// `Some` iff this branch can refuse a push but has no byte budget (see
+    /// [`Branch`]); collected into `ChainContexts::holder_only_queues` by
+    /// `contexts.rs` Pass 1.5 for wake tracking. Every builder must forward it:
+    /// a dropped handle leaves the edge out of the wake plan with no runtime
+    /// signal, and its holder waits on its timer. Cleared (`None`) by
+    /// `take_typed_input`'s placeholder.
+    pub(crate) holder_only_handle: Option<Arc<dyn HolderOnlyHandle>>,
     /// `Some` iff this edge is instrumented (`--pipeline-trace`); the shared
     /// `EdgeMetrics` (also held by the transport for push counts and the input
     /// handle for pop counts). Collected into the edge registry by `contexts.rs`
@@ -788,7 +847,12 @@ impl OutputQueueSet {
     ) -> BranchInputHandle<T> {
         let entry = std::mem::replace(
             &mut self.branches[branch_idx],
-            BranchEntry { input_handle: Box::new(()), bounded_queue_handle: None, metrics: None },
+            BranchEntry {
+                input_handle: Box::new(()),
+                bounded_queue_handle: None,
+                holder_only_handle: None,
+                metrics: None,
+            },
         );
         let handle: Box<BranchInputHandle<T>> =
             entry.input_handle.downcast::<BranchInputHandle<T>>().unwrap_or_else(|_| {
@@ -1002,7 +1066,8 @@ pub(crate) struct UnitOutputsView;
 /// flush-first preambles so each step doesn't re-implement the take/retry/put-back
 /// dance (a copy that forgot the put-back would silently drop a final batch).
 /// **Never spins** — the caller maps `StillHeld` to a yield (`NoProgress`/`Contention`)
-/// and retries on the next dispatch.
+/// and retries on the next dispatch. A `Flushed` result went through
+/// [`BranchOutputHandle::retry`], so the dispatch is marked flushed.
 #[inline]
 fn retry_held_impl<T: Send + HeapSize + 'static>(
     held: &mut crate::held::HeldSlot<Unpushed<T>>,
@@ -1043,7 +1108,8 @@ impl<T: Send + HeapSize + 'static> OutputHandles<Single<T>> {
         view.primary.push(item)
     }
 
-    /// Retry a previously-rejected push.
+    /// Retry a previously-rejected push. A success marks the dispatch flushed
+    /// ([`BranchOutputHandle::retry`]).
     ///
     /// # Errors
     ///
@@ -1097,7 +1163,8 @@ impl<T: Send + HeapSize + Ordered + 'static> OutputHandles<crate::outputs::Order
         view.primary.push(item)
     }
 
-    /// Retry a previously-rejected push on the heap-aware ordered output.
+    /// Retry a previously-rejected push on the heap-aware ordered output. A
+    /// success marks the dispatch flushed ([`BranchOutputHandle::retry`]).
     ///
     /// # Errors
     ///
@@ -1462,6 +1529,7 @@ pub(crate) fn build_single_queues<T: Send + HeapSize + 'static>(
     let queue_set = OutputQueueSet::new(vec![BranchEntry {
         input_handle: Box::new(branch.input),
         bounded_queue_handle: branch.bounded_queue_handle,
+        holder_only_handle: branch.holder_only_handle,
         metrics: branch.metrics,
     }]);
     (queue_set, outputs_view)
@@ -1483,6 +1551,7 @@ pub(crate) fn build_single_queues_ordered_bytes<T: Send + HeapSize + Ordered + '
     let queue_set = OutputQueueSet::new(vec![BranchEntry {
         input_handle: Box::new(branch.input),
         bounded_queue_handle: branch.bounded_queue_handle,
+        holder_only_handle: branch.holder_only_handle,
         metrics: branch.metrics,
     }]);
     (queue_set, outputs_view)
@@ -1518,11 +1587,13 @@ where
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            holder_only_handle: ba.holder_only_handle,
             metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            holder_only_handle: bb.holder_only_handle,
             metrics: bb.metrics,
         },
     ]);
@@ -1554,11 +1625,13 @@ where
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            holder_only_handle: ba.holder_only_handle,
             metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            holder_only_handle: bb.holder_only_handle,
             metrics: bb.metrics,
         },
     ]);
@@ -1597,16 +1670,19 @@ where
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            holder_only_handle: ba.holder_only_handle,
             metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            holder_only_handle: bb.holder_only_handle,
             metrics: bb.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bc.input),
             bounded_queue_handle: bc.bounded_queue_handle,
+            holder_only_handle: bc.holder_only_handle,
             metrics: bc.metrics,
         },
     ]);
@@ -1640,16 +1716,19 @@ where
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            holder_only_handle: ba.holder_only_handle,
             metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            holder_only_handle: bb.holder_only_handle,
             metrics: bb.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bc.input),
             bounded_queue_handle: bc.bounded_queue_handle,
+            holder_only_handle: bc.holder_only_handle,
             metrics: bc.metrics,
         },
     ]);
@@ -1690,21 +1769,25 @@ where
         BranchEntry {
             input_handle: Box::new(ba.input),
             bounded_queue_handle: ba.bounded_queue_handle,
+            holder_only_handle: ba.holder_only_handle,
             metrics: ba.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bb.input),
             bounded_queue_handle: bb.bounded_queue_handle,
+            holder_only_handle: bb.holder_only_handle,
             metrics: bb.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bc.input),
             bounded_queue_handle: bc.bounded_queue_handle,
+            holder_only_handle: bc.holder_only_handle,
             metrics: bc.metrics,
         },
         BranchEntry {
             input_handle: Box::new(bd.input),
             bounded_queue_handle: bd.bounded_queue_handle,
+            holder_only_handle: bd.holder_only_handle,
             metrics: bd.metrics,
         },
     ]);
@@ -2242,6 +2325,366 @@ mod handle_tests {
             crate::builder::InstrumentationLevel::Off,
         );
         let _input: BranchInputHandle<u32> = set.take_typed_input::<u32>(0);
+    }
+
+    /// Every `QueueSpec` × `BranchOrdering` arm, through the one entry point
+    /// that reaches them all (`build_branch_ordered_bytes` handles the
+    /// byte-bounded ordered arms and falls through `build_branch_ordered` to
+    /// `build_branch`): the holder-only handle is set exactly on the five arms
+    /// that can refuse but have no byte budget, the byte handle exactly on the
+    /// byte arms, and each holder-only handle installs its set.
+    #[rstest]
+    #[case::cb_direct(QueueSpec::CountBounded { capacity: 2 }, BranchOrdering::None, true)]
+    #[case::cb_by_ordinal(QueueSpec::CountBounded { capacity: 2 }, BranchOrdering::ByOrdinal, true)]
+    #[case::cb_by_item(
+        QueueSpec::CountBounded { capacity: 2 },
+        BranchOrdering::ByItemOrdinal,
+        true
+    )]
+    #[case::unbounded_direct(QueueSpec::Unbounded, BranchOrdering::None, false)]
+    #[case::unbounded_by_ordinal(QueueSpec::Unbounded, BranchOrdering::ByOrdinal, true)]
+    #[case::unbounded_by_item(QueueSpec::Unbounded, BranchOrdering::ByItemOrdinal, true)]
+    #[case::bytes_direct(QueueSpec::ByteBounded { limit_bytes: 64 }, BranchOrdering::None, false)]
+    #[case::bytes_by_ordinal(
+        QueueSpec::ByteBounded { limit_bytes: 64 },
+        BranchOrdering::ByOrdinal,
+        false
+    )]
+    #[case::bytes_by_item(
+        QueueSpec::ByteBounded { limit_bytes: 64 },
+        BranchOrdering::ByItemOrdinal,
+        false
+    )]
+    fn holder_only_handle_is_set_exactly_on_the_holder_only_arms(
+        #[case] spec: QueueSpec,
+        #[case] ordering: BranchOrdering,
+        #[case] holder_only: bool,
+    ) {
+        let b = build_branch_ordered_bytes::<OrdItem>(
+            spec,
+            ordering,
+            crate::builder::InstrumentationLevel::Off,
+        );
+        assert_eq!(b.holder_only_handle.is_some(), holder_only);
+        // Exactly one registry per bounded edge: never both handles.
+        assert_eq!(b.bounded_queue_handle.is_some(), matches!(spec, QueueSpec::ByteBounded { .. }));
+        if let Some(h) = &b.holder_only_handle {
+            assert!(!h.is_tracked(), "built untracked");
+            h.enable_holder_tracking(2);
+            assert!(h.is_tracked(), "the handle installs a holder set");
+        }
+    }
+
+    /// The count-bounded sibling of `byte_bounded_accepted_on_every_fan_out_branch`,
+    /// over the seven builders that construct every `BranchEntry` literal: each
+    /// forwards the holder-only handle on every branch (a dropped handle has no
+    /// runtime signal; the holder just waits on its timer).
+    #[rstest]
+    #[case::single(1, false)]
+    #[case::single_ordered_bytes(1, true)]
+    #[case::tuple2(2, false)]
+    #[case::tuple2_ordered_bytes(2, true)]
+    #[case::tuple3(3, false)]
+    #[case::tuple3_ordered_bytes(3, true)]
+    #[case::tuple4(4, false)]
+    fn holder_only_handle_is_forwarded_on_every_fan_out_branch(
+        #[case] n_branches: usize,
+        #[case] ordered_bytes: bool,
+    ) {
+        let specs = vec![QueueSpec::CountBounded { capacity: 2 }; n_branches];
+        // The `_ordered_bytes` builders also take the `build_branch_ordered` arm.
+        let ordering =
+            if ordered_bytes { BranchOrdering::ByItemOrdinal } else { BranchOrdering::None };
+        let orderings = vec![ordering; n_branches];
+        let level = crate::builder::InstrumentationLevel::Off;
+        let (queue_set, _view) = match (n_branches, ordered_bytes) {
+            (1, false) => build_single_queues::<Bytes>(&specs, &orderings, level),
+            (1, true) => build_single_queues_ordered_bytes::<OrdItem>(&specs, &orderings, level),
+            (2, false) => build_tuple2_queues::<Bytes, Bytes>(&specs, &orderings, level),
+            (2, true) => {
+                build_tuple2_queues_ordered_bytes::<OrdItem, OrdItem>(&specs, &orderings, level)
+            }
+            (3, false) => build_tuple3_queues::<Bytes, Bytes, Bytes>(&specs, &orderings, level),
+            (3, true) => build_tuple3_queues_ordered_bytes::<OrdItem, OrdItem, OrdItem>(
+                &specs, &orderings, level,
+            ),
+            (4, false) => {
+                build_tuple4_queues::<Bytes, Bytes, Bytes, Bytes>(&specs, &orderings, level)
+            }
+            other => panic!("unhandled case {other:?}"),
+        };
+        assert_eq!(queue_set.n_branches(), n_branches);
+        for (i, e) in queue_set.branches.iter().enumerate() {
+            assert!(
+                e.holder_only_handle.is_some(),
+                "branch {i} must forward its holder-only handle"
+            );
+            assert!(e.bounded_queue_handle.is_none(), "branch {i} is not byte-bounded");
+        }
+    }
+
+    /// The output shape and branch under test in
+    /// `a_successful_retry_marks_the_dispatch_flushed`.
+    #[derive(Clone, Copy, Debug)]
+    enum RetryShape {
+        SingleDirect,
+        SingleRetryHeld,
+        Tuple2B,
+        Tuple3C,
+        Tuple4D,
+        SingleByOrdinal,
+        OrderedBytesSingle,
+        OrderedBytesSingleByItemOrdinal,
+        OrderedBytesTuple2B,
+        OrderedBytesTuple3C,
+    }
+
+    const CB1: QueueSpec = QueueSpec::CountBounded { capacity: 1 };
+    const NONE: BranchOrdering = BranchOrdering::None;
+
+    /// The ordered cases' stash cap set to 0 on `branch`, so the must-accept
+    /// stash refuses every non-next push and the second push is a real refusal
+    /// rather than a stash insert. Set after `build_queues`, before
+    /// `take_typed_input` (the take replaces the entry).
+    fn zero_stash_cap(queue_set: &OutputQueueSet, branch: usize) -> Arc<dyn ReorderCapHandle> {
+        let cap = Arc::clone(
+            queue_set.branches[branch]
+                .bounded_queue_handle
+                .as_ref()
+                .and_then(|h| h.reorder_cap.as_ref())
+                .expect("ordered byte-bounded branch"),
+        );
+        cap.set_max_overflow_bytes(0);
+        cap
+    }
+
+    /// The flushed-mark protocol on one branch: a fresh push, a refused push
+    /// and a refused retry do not mark the dispatch; a retry that lands does.
+    fn assert_retry_marks_flushed<T: Send + HeapSize + 'static>(
+        push: &dyn Fn(T) -> Result<(), Unpushed<T>>,
+        retry: &dyn Fn(Unpushed<T>) -> Result<(), Unpushed<T>>,
+        input: &BranchInputHandle<T>,
+        items: (T, T),
+        reorder_cap: Option<&dyn ReorderCapHandle>,
+    ) {
+        use crate::runtime::wake_slot::{flushed_pending, take_flushed};
+        let _ = take_flushed(); // start clear
+        assert!(push(items.0).is_ok(), "fills the one-item branch");
+        assert!(!flushed_pending(), "a fresh push is not a flush");
+        let u = push(items.1).expect_err("full");
+        assert!(!flushed_pending(), "a refused push is not a flush");
+        let u = retry(u).expect_err("still full");
+        assert!(!flushed_pending(), "a refused retry is not a flush");
+        if let Some(cap) = reorder_cap {
+            assert_eq!(cap.current_buffer_bytes(), 0, "refused by the stash cap, not stashed");
+        }
+        assert!(input.pop().is_some());
+        assert!(retry(u).is_ok(), "room: the retry lands");
+        assert!(take_flushed(), "a successful retry marks the dispatch");
+        assert!(input.pop().is_some(), "the retried item landed");
+    }
+
+    /// `BranchOutputHandle::retry` marks the dispatch flushed on success, and
+    /// only then, for every output shape and on the last branch of each tuple
+    /// (so a setter on branch `a`'s path alone is caught). Ordered cases use a
+    /// one-item byte-bounded branch with a zero stash cap: an ordered branch
+    /// otherwise accepts the second push into its must-accept stash.
+    #[rstest]
+    #[case::single_direct(RetryShape::SingleDirect)]
+    #[case::single_retry_held(RetryShape::SingleRetryHeld)]
+    #[case::tuple2_b(RetryShape::Tuple2B)]
+    #[case::tuple3_c(RetryShape::Tuple3C)]
+    #[case::tuple4_d(RetryShape::Tuple4D)]
+    #[case::single_by_ordinal(RetryShape::SingleByOrdinal)]
+    #[case::ordered_bytes_single(RetryShape::OrderedBytesSingle)]
+    #[case::ordered_bytes_single_by_item_ordinal(RetryShape::OrderedBytesSingleByItemOrdinal)]
+    #[case::ordered_bytes_tuple2_b(RetryShape::OrderedBytesTuple2B)]
+    #[case::ordered_bytes_tuple3_c(RetryShape::OrderedBytesTuple3C)]
+    #[allow(clippy::too_many_lines)] // one arm per output shape, each the same few lines
+    fn a_successful_retry_marks_the_dispatch_flushed(#[case] shape: RetryShape) {
+        use crate::held::HeldSlot;
+        use crate::outputs::{
+            OrderedBytesSingle, OrderedBytesTuple2, OrderedBytesTuple3, StepOutputs,
+        };
+        use crate::step::OutputHandles;
+        let level = crate::builder::InstrumentationLevel::Off;
+        let ord = |o: u64| OrdItem { ord: o, v: 0 };
+        let ord_bytes = QueueSpec::ByteBounded { limit_bytes: ord(0).heap_size() as u64 };
+        match shape {
+            RetryShape::SingleDirect | RetryShape::SingleRetryHeld => {
+                let (mut qs, view) =
+                    <Single<u32> as StepOutputs>::build_queues(&[CB1], &[NONE], level);
+                let out: OutputHandles<Single<u32>> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<u32>(0);
+                if matches!(shape, RetryShape::SingleDirect) {
+                    let retry = |u| out.retry(u);
+                    assert_retry_marks_flushed(&|v| out.push(v), &retry, &input, (1, 2), None);
+                } else {
+                    let retry_held = |u: Unpushed<u32>| {
+                        let mut held = HeldSlot::new();
+                        held.put(u);
+                        match out.retry_held(&mut held) {
+                            HeldRetry::Flushed => Ok(()),
+                            HeldRetry::StillHeld => Err(held.take().expect("re-held")),
+                            HeldRetry::WasEmpty => unreachable!("the slot was filled"),
+                        }
+                    };
+                    assert_retry_marks_flushed(&|v| out.push(v), &retry_held, &input, (1, 2), None);
+                }
+            }
+            RetryShape::Tuple2B => {
+                let (mut qs, view) =
+                    <(u32, u32) as StepOutputs>::build_queues(&[CB1, CB1], &[NONE, NONE], level);
+                let out: OutputHandles<(u32, u32)> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<u32>(1);
+                let v = out.view();
+                assert_retry_marks_flushed(
+                    &|x| v.b.push(x),
+                    &|u| v.b.retry(u),
+                    &input,
+                    (1, 2),
+                    None,
+                );
+            }
+            RetryShape::Tuple3C => {
+                let (mut qs, view) = <(u32, u32, u32) as StepOutputs>::build_queues(
+                    &[CB1, CB1, CB1],
+                    &[NONE, NONE, NONE],
+                    level,
+                );
+                let out: OutputHandles<(u32, u32, u32)> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<u32>(2);
+                let v = out.view();
+                assert_retry_marks_flushed(
+                    &|x| v.c.push(x),
+                    &|u| v.c.retry(u),
+                    &input,
+                    (1, 2),
+                    None,
+                );
+            }
+            RetryShape::Tuple4D => {
+                let (mut qs, view) = <(u32, u32, u32, u32) as StepOutputs>::build_queues(
+                    &[CB1, CB1, CB1, CB1],
+                    &[NONE, NONE, NONE, NONE],
+                    level,
+                );
+                let out: OutputHandles<(u32, u32, u32, u32)> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<u32>(3);
+                let v = out.view();
+                assert_retry_marks_flushed(
+                    &|x| v.d.push(x),
+                    &|u| v.d.retry(u),
+                    &input,
+                    (1, 2),
+                    None,
+                );
+            }
+            RetryShape::SingleByOrdinal => {
+                let (mut qs, view) = <Single<Bytes> as StepOutputs>::build_queues(
+                    &[QueueSpec::ByteBounded { limit_bytes: 8 }],
+                    &[BranchOrdering::ByOrdinal],
+                    level,
+                );
+                let cap = zero_stash_cap(&qs, 0);
+                let out: OutputHandles<Single<Bytes>> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<Bytes>(0);
+                let items = (Bytes(vec![0; 8]), Bytes(vec![0; 8]));
+                let retry = |u| out.retry(u);
+                assert_retry_marks_flushed(&|x| out.push(x), &retry, &input, items, Some(&*cap));
+            }
+            RetryShape::OrderedBytesSingle | RetryShape::OrderedBytesSingleByItemOrdinal => {
+                let ordering = if matches!(shape, RetryShape::OrderedBytesSingle) {
+                    BranchOrdering::ByOrdinal
+                } else {
+                    BranchOrdering::ByItemOrdinal
+                };
+                let (mut qs, view) = <OrderedBytesSingle<OrdItem> as StepOutputs>::build_queues(
+                    &[ord_bytes],
+                    &[ordering],
+                    level,
+                );
+                let cap = zero_stash_cap(&qs, 0);
+                let out: OutputHandles<OrderedBytesSingle<OrdItem>> = OutputHandles::new(view);
+                let input = qs.take_typed_input::<OrdItem>(0);
+                let retry = |u| out.retry(u);
+                assert_retry_marks_flushed(
+                    &|x| out.push(x),
+                    &retry,
+                    &input,
+                    (ord(0), ord(1)),
+                    Some(&*cap),
+                );
+            }
+            RetryShape::OrderedBytesTuple2B => {
+                let (mut qs, view) =
+                    <OrderedBytesTuple2<OrdItem, OrdItem> as StepOutputs>::build_queues(
+                        &[CB1, ord_bytes],
+                        &[NONE, BranchOrdering::ByItemOrdinal],
+                        level,
+                    );
+                let cap = zero_stash_cap(&qs, 1);
+                let out: OutputHandles<OrderedBytesTuple2<OrdItem, OrdItem>> =
+                    OutputHandles::new(view);
+                let input = qs.take_typed_input::<OrdItem>(1);
+                let v = out.view();
+                let retry = |u| v.b.retry(u);
+                assert_retry_marks_flushed(
+                    &|x| v.b.push(x),
+                    &retry,
+                    &input,
+                    (ord(0), ord(1)),
+                    Some(&*cap),
+                );
+            }
+            RetryShape::OrderedBytesTuple3C => {
+                let (mut qs, view) =
+                    <OrderedBytesTuple3<OrdItem, OrdItem, OrdItem> as StepOutputs>::build_queues(
+                        &[CB1, CB1, ord_bytes],
+                        &[NONE, NONE, BranchOrdering::ByOrdinal],
+                        level,
+                    );
+                let cap = zero_stash_cap(&qs, 2);
+                let out: OutputHandles<OrderedBytesTuple3<OrdItem, OrdItem, OrdItem>> =
+                    OutputHandles::new(view);
+                let input = qs.take_typed_input::<OrdItem>(2);
+                let v = out.view();
+                let retry = |u| v.c.retry(u);
+                assert_retry_marks_flushed(
+                    &|x| v.c.push(x),
+                    &retry,
+                    &input,
+                    (ord(0), ord(1)),
+                    Some(&*cap),
+                );
+            }
+        }
+    }
+
+    /// The control for the ordered fixture above: without the zero stash cap,
+    /// the same one-item ordered branch accepts the second push into its
+    /// must-accept stash. So the ordered cases' refusal comes from the stash
+    /// cap, not the transport, which refuses in both fixtures.
+    #[test]
+    fn an_ordered_refusal_needs_the_stash_cap() {
+        use crate::outputs::StepOutputs;
+        use crate::step::OutputHandles;
+        let (qs, view) = <Single<Bytes> as StepOutputs>::build_queues(
+            &[QueueSpec::ByteBounded { limit_bytes: 8 }],
+            &[BranchOrdering::ByOrdinal],
+            crate::builder::InstrumentationLevel::Off,
+        );
+        let cap = Arc::clone(
+            qs.branches[0]
+                .bounded_queue_handle
+                .as_ref()
+                .and_then(|h| h.reorder_cap.as_ref())
+                .expect("ordered byte-bounded branch"),
+        );
+        let out: OutputHandles<Single<Bytes>> = OutputHandles::new(view);
+        assert!(out.push(Bytes(vec![0; 8])).is_ok());
+        assert!(out.push(Bytes(vec![0; 8])).is_ok(), "the default stash accepts it");
+        assert_eq!(cap.current_buffer_bytes(), 8, "stashed: one item's heap size");
     }
 }
 

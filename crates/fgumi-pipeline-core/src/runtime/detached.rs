@@ -10,14 +10,16 @@
 //! while off-pool driver threads do the serial coordination + I/O, so neither
 //! steals a pool worker slot.
 //!
-//! ## The driver IS a 1-thread pool ([`run_detached_driver`])
+//! ## The driver IS a 1-thread pool (`run_detached_driver`)
 //!
 //! A driver thread does **not** have a bespoke drive loop. It runs the *same*
-//! [`run_worker_loop`] the pool uses — over a
+//! `run_worker_loop` the pool uses — over a
 //! purpose-built storage row where its group's steps are `Owned` and every other
 //! step is `Skip` ([`build_driver_storage`]) — with a
-//! [`WorkerCore::driver`](crate::runtime::WorkerCore) (Park backoff, off-pool
-//! stats attribution) and the [`DrainFirstScheduler`]. So a driver is literally a
+//! [`WorkerCore::driver`](crate::runtime::WorkerCore) (Park backoff — a
+//! 10 µs → 2 ms `park_timeout` ramp, ended early by the `unpark` every producer
+//! of its live steps delivers through the wake plan — off-pool stats
+//! attribution) and the [`DrainFirstScheduler`]. So a driver is literally a
 //! 1-thread (or, for a group, still 1-thread over several `Owned` steps) instance
 //! of the pool loop. Several detached steps sharing a
 //! [`DetachedGroup::Shared`](crate::step::DetachedGroup) label are driven by ONE
@@ -39,8 +41,9 @@
 //!      no lock held across the call) and pushes to its outputs (`try_push`,
 //!      likewise); a full output / empty input is reported back as `NoProgress` /
 //!      `Contention`. It never *blocks* inside `try_run`.
-//!   2. The only blocking a driver does is the loop's `WorkerCore::sleep_backoff`
-//!      (`park_timeout` under the Park policy), which holds NO queue lock.
+//!   2. The only blocking a driver does is the loop's timer park
+//!      (`park_timeout` of `WorkerCore::backoff_deadline`, the Park policy's
+//!      ramp), which holds NO queue lock.
 //!   3. The loop tries EVERY live step in a pass before it parks (round-robin,
 //!      park only after a full no-progress pass). So when one grouped step is
 //!      blocked, a sibling on the same driver still runs — a park-on-first-idle
@@ -160,7 +163,7 @@ impl ErasedStep for DetachedPlaceholder {
 
 /// One dedicated driver thread's worth of extracted detached steps, in chain
 /// (`StepIdx`) order. The caller spawns one OS thread per group and drives it
-/// with [`run_detached_driver`].
+/// with `run_detached_driver`.
 pub struct DetachedDriverGroup {
     /// The steps this one driver thread runs, in chain order. Always non-empty
     /// and all [`StepKind::Detached`]. Private so those invariants — enforced by
@@ -189,6 +192,11 @@ impl DetachedDriverGroup {
             "detached driver group may only contain Detached steps"
         );
         Self { steps }
+    }
+
+    /// The group's step indices in chain order (for `WakePlan::build`'s `driver_of`).
+    pub fn step_indices(&self) -> impl Iterator<Item = StepIdx> + '_ {
+        self.steps.iter().map(|(idx, _)| *idx)
     }
 
     /// The group's representative step (first in chain order). Used as the
@@ -238,39 +246,61 @@ impl DetachedDriverGroup {
 pub fn extract_detached_steps(steps: &mut [Box<dyn ErasedStep>]) -> Vec<DetachedDriverGroup> {
     // Accumulate each driver thread's steps as a raw vec, then wrap through
     // `DetachedDriverGroup::new` so the non-empty / all-Detached invariants are
-    // enforced in one place rather than trusting each construction site.
-    let mut group_steps: Vec<Vec<(StepIdx, Box<dyn ErasedStep>)>> = Vec::new();
-    // Shared(label) -> index into `group_steps`, for O(1) append. PerStep steps
-    // never share, so they are not indexed (each starts its own group).
-    let mut shared_index: HashMap<&'static str, usize> = HashMap::new();
-    for (idx, slot) in steps.iter_mut().enumerate() {
-        if slot.kind() != StepKind::Detached {
-            continue;
-        }
+    // enforced in one place rather than trusting each construction site. The
+    // grouping itself is `driver_index_of`'s, so the wake plan's routing and
+    // the driver threads cannot disagree.
+    let driver_of = driver_index_of(steps);
+    let n_groups = driver_of.iter().flatten().map(|d| d.0 + 1).max().unwrap_or(0);
+    let mut group_steps: Vec<Vec<(StepIdx, Box<dyn ErasedStep>)>> =
+        (0..n_groups).map(|_| Vec::new()).collect();
+    for (idx, (slot, driver)) in steps.iter_mut().zip(driver_of).enumerate() {
+        let Some(driver) = driver else { continue };
         let group = slot.detached_group();
         let placeholder: Box<dyn ErasedStep> =
             Box::new(DetachedPlaceholder { name: slot.name(), group });
         let real = std::mem::replace(slot, placeholder);
-        let entry = (StepIdx(idx), real);
-        match group {
-            DetachedGroup::PerStep => group_steps.push(vec![entry]),
-            DetachedGroup::Shared(label) => {
-                if let Some(&gi) = shared_index.get(label) {
-                    group_steps[gi].push(entry);
-                } else {
-                    shared_index.insert(label, group_steps.len());
-                    group_steps.push(vec![entry]);
-                }
-            }
-        }
+        group_steps[driver.0].push((StepIdx(idx), real));
     }
     group_steps.into_iter().map(DetachedDriverGroup::new).collect()
+}
+
+/// The driver thread each step runs on: `Some(d)` for a [`StepKind::Detached`]
+/// step, `None` otherwise. Every [`DetachedGroup::Shared`] label maps to ONE
+/// driver; each [`DetachedGroup::PerStep`] step gets its own. Drivers are
+/// numbered by first appearance in chain order — the order
+/// [`extract_detached_steps`] returns its groups in.
+#[must_use]
+pub(crate) fn driver_index_of(
+    steps: &[Box<dyn ErasedStep>],
+) -> Vec<Option<crate::runtime::wake::DriverIdx>> {
+    use crate::runtime::wake::DriverIdx;
+    let mut shared_index: HashMap<&'static str, usize> = HashMap::new();
+    let mut n_drivers = 0usize;
+    steps
+        .iter()
+        .map(|step| {
+            if step.kind() != StepKind::Detached {
+                return None;
+            }
+            let d = match step.detached_group() {
+                DetachedGroup::PerStep => {
+                    n_drivers += 1;
+                    n_drivers - 1
+                }
+                DetachedGroup::Shared(label) => *shared_index.entry(label).or_insert_with(|| {
+                    n_drivers += 1;
+                    n_drivers - 1
+                }),
+            };
+            Some(DriverIdx(d))
+        })
+        .collect()
 }
 
 /// Build a driver thread's storage row: a full-length `Vec<WorkerStepEntry>`
 /// (length `n_total_steps`, indexed by global `step_idx` like every other row)
 /// where each of `group_steps` is `Owned` and every other slot is `Skip`. The
-/// driver thread runs [`run_worker_loop`] over this row exactly as a pool worker
+/// driver thread runs `run_worker_loop` over this row exactly as a pool worker
 /// runs over its own row.
 ///
 /// # Panics
@@ -328,7 +358,7 @@ pub fn build_driver_storage(
 /// no-op. Detached drivers take slots after the pool workers (`threads..`), so
 /// their slot never collides with a pool worker's.
 #[allow(clippy::too_many_arguments)] // one driver's worth of shared state plus the telemetry board/slot
-pub fn run_detached_driver(
+pub(crate) fn run_detached_driver(
     group: DetachedDriverGroup,
     contexts: &Arc<ChainContexts>,
     drain_counters: &[Arc<StepDrainCounter>],
@@ -337,16 +367,18 @@ pub fn run_detached_driver(
     liveness: &crate::liveness::LivenessCounter,
     board: Option<&crate::runtime::worker_state::WorkerStateBoard>,
     state_slot: usize,
-    // The pool's event-count, so this driver's productive pushes wake parked
-    // pool workers (the notify seam in `dispatch_one_step`). Passed with
-    // `pinned = true` below so the driver itself keeps its `Park` backoff and
-    // never deep-parks on the shared event-count — it is a notifier, not a
-    // waiter (spec §5). `None` when the pool has no parker (`n_threads == 1`).
-    parker: Option<&crate::runtime::event_count::PoolEventCount>,
+    // The chain's wake plan; a driver is a notifier/unparker and is woken by
+    // `unpark`, never an event-count waiter. Passed with `pinned = true` below
+    // so the driver keeps its `Park` backoff and never deep-parks on the
+    // shared event-count.
+    wake: &crate::runtime::wake::WakePlan,
+    // A test override of this driver's idle-backoff bounds
+    // (`PipelineConfig::test_backoff`); `None` in every real run.
+    backoff_override: Option<u64>,
 ) {
     let primary = group.primary_step();
     let mut row = build_driver_storage(group.into_steps(), contexts.inputs.len());
-    let mut worker = WorkerCore::driver(primary);
+    let mut worker = WorkerCore::driver(primary).with_backoff_override(backoff_override);
     run_worker_loop(
         &mut worker,
         &mut row,
@@ -358,10 +390,10 @@ pub fn run_detached_driver(
         &DrainFirstScheduler,
         board,
         state_slot,
-        parker,
+        wake,
         // `pinned`: a detached driver is not a pool waiter. This routes its idle
-        // to the `Park` backoff (its existing behaviour) rather than the shared
-        // event-count wait, while still passing `parker` above for the notify.
+        // to the `Park` backoff rather than the shared event-count wait, while
+        // the plan above still routes its wakes.
         true,
     );
 }
@@ -479,6 +511,7 @@ mod tests {
             inputs: vec![Box::new(()), det_input, Box::new(())],
             outputs: vec![Box::new(()), det_outputs_any, Box::new(())],
             bounded_queues: vec![],
+            holder_only_queues: vec![],
             edges: vec![],
             step_counters: (0..3).map(|_| crate::runtime::StepCounters::disabled()).collect(),
         });
@@ -507,6 +540,7 @@ mod tests {
             &crate::liveness::LivenessCounter::new(1),
             None,
             0,
+            &crate::runtime::wake::WakePlan::legacy(None),
             None,
         );
     }
@@ -714,6 +748,37 @@ mod tests {
         }
         fn new_worker_copy(&self) -> Self {
             self.clone()
+        }
+    }
+
+    /// The wake plan's driver map agrees with the driver groups
+    /// `extract_detached_steps` builds.
+    #[test]
+    fn driver_index_of_agrees_with_extracted_groups() {
+        use crate::runtime::wake::DriverIdx;
+        let mut steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(SrcStub { capacity: 4 })),
+            Box::new(TypedStep::new(SharedDetached { label: "coord" })),
+            Box::new(TypedStep::new(PassThroughDetached { held: None })),
+            Box::new(TypedStep::new(SharedDetached { label: "coord" })),
+            Box::new(TypedStep::new(SharedDetached { label: "io" })),
+        ];
+        let driver_of = driver_index_of(&steps);
+        assert_eq!(
+            driver_of,
+            vec![
+                None,
+                Some(DriverIdx(0)),
+                Some(DriverIdx(1)),
+                Some(DriverIdx(0)),
+                Some(DriverIdx(2))
+            ]
+        );
+        let groups = extract_detached_steps(&mut steps);
+        for (d, g) in groups.iter().enumerate() {
+            for idx in g.step_indices() {
+                assert_eq!(driver_of[idx.0], Some(DriverIdx(d)), "step {}", idx.0);
+            }
         }
     }
 

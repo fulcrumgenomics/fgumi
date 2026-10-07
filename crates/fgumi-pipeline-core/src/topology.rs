@@ -108,7 +108,7 @@ impl ChainGraph {
     /// Wire a (producer, branch) → (consumer, consumer's input slot)
     /// link. Multi-input consumers (`Step2` / future `StepN`) record
     /// the consumer's input-slot index so
-    /// [`crate::runtime::contexts`] can
+    /// `crate::runtime::contexts` can
     /// route each edge to the right per-branch input handle.
     ///
     /// # Panics

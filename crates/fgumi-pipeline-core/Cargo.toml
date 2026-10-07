@@ -28,8 +28,9 @@ trybuild = { workspace = true }
 # loom is only compiled under `--cfg loom`. It is a *regular* (not dev)
 # dependency so `admission.rs` itself can swap its atomics and parking lock to
 # loom's under `#[cfg(loom)]` and have the REAL `PhaseCap` model-checked by
-# `tests/loom_admission.rs` (`#![cfg(loom)]` — empty under a normal build), as
-# `fgumi-sort` does for `merge_slots.rs`.
+# `tests/loom_admission.rs`, as `fgumi-sort` does for `merge_slots.rs`; the
+# same dependency serves `tests/loom_wake.rs`. Both are `#![cfg(loom)]` — empty
+# under a normal build.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
