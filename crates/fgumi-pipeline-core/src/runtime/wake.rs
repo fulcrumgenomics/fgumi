@@ -45,8 +45,10 @@
 //! drives one, except the loom models, through a `cfg(loom)` re-export.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::admission::PhaseCap;
+use crate::padded::Padded;
 use crate::queues::{BoundedQueueHandle, HolderQueue, SEALED};
 use crate::runtime::contexts::{RegisteredHolderOnlyQueue, RegisteredQueue};
 use crate::runtime::event_count::{NotifyOutcome, PoolEventCount};
@@ -188,6 +190,93 @@ fn reverse_edges<'a>(
         .filter(move |(p, b, _)| graph.consumer(*p, *b) == Some(step) && !same_thread(*p, step))
 }
 
+/// Why a `request_worker` did or did not wake anyone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolRequest {
+    /// A parked pool worker other than the requester was woken: an
+    /// event-count waiter (ungated by the ceiling), else a worker that armed
+    /// for a timer park, else one parked only because a phase cap refused it,
+    /// or — Directed mode at one thread — worker 0 was unparked. A cap-parked
+    /// worker is woken whatever its caps' occupancy (a request names no
+    /// step), so if the requested work sits behind a full cap that wake is
+    /// wasted: the worker is refused again and re-records on that cap.
+    Woken,
+    /// No other worker to wake: besides the requester itself, no event-count
+    /// waiter, no worker armed for a timer park, and no worker parked only
+    /// because a phase cap refused it. A worker idling on its timer without
+    /// arming (a Legacy chain's, or a pinned one between arms) is not reachable
+    /// here; it finds the work on its next pass.
+    AllAwake,
+    /// An earlier request woke an event-count waiter, and no worker has left
+    /// the event-count since: suppressed. At most one such request is in flight
+    /// per pipeline. The direct-parked fallback is not rate-limited this way:
+    /// each request claims (and so clears) one armed worker's bit, so it cannot
+    /// wake the same worker twice.
+    Pending,
+    /// No pool event-count and no registered worker 0 (the fused path, or
+    /// Legacy mode at one thread).
+    Unavailable,
+}
+
+/// Step-side view of the pool, handed to every `try_run` via the context.
+/// `Copy`; three words.
+///
+/// Call [`Self::request_worker`] only when this `try_run` is about to return
+/// `NoProgress`/`Contention` because it is waiting on work that a **pool** step
+/// produces and that reaches it **off any queue edge** (a decompressed block
+/// landing in a side-channel slot). For queue-edge inputs the wake plan already
+/// woke the consumer when the item was pushed. A step that calls it anyway is
+/// visible in `pool_requests_{woken,all_awake,pending}` and costs one fence
+/// and two loads while the pool is awake. The requester is never the worker a
+/// request targets: a worker armed on the event-count (its re-poll) is not
+/// counted as a waiter, and its own armed timer-park bit is skipped. An armed
+/// requester whose request does go to another event-count waiter still sees
+/// the generation that notify bumps: its own pending wait returns at once, so
+/// it makes one more pass instead of parking, and it acknowledges the request
+/// (clearing [`PoolRequest::Pending`]) whether or not the target has run yet.
+#[derive(Clone, Copy)]
+pub struct PoolHandle<'a> {
+    plan: &'a WakePlan,
+    stats: Option<&'a crate::runtime::stats::PipelineStats>,
+    step: StepIdx,
+}
+
+impl<'a> PoolHandle<'a> {
+    /// A handle for `step` over `plan`, counting outcomes into `stats` when present.
+    #[must_use]
+    pub(crate) fn new(
+        plan: &'a WakePlan,
+        stats: Option<&'a crate::runtime::stats::PipelineStats>,
+        step: StepIdx,
+    ) -> Self {
+        Self { plan, stats, step }
+    }
+
+    /// Ask for ONE parked pool worker, other than the caller, to run a pass
+    /// now. Never blocks, takes no queue lock and is safe from any thread. An
+    /// event-count wake is idempotent until a worker leaves the event-count
+    /// ([`PoolRequest::Pending`]); a direct-park wake claims one armed worker.
+    /// Cost when nobody is parked: one `SeqCst` fence, the waiter-count load
+    /// and one load per 64 workers of the direct-park bits.
+    #[inline]
+    #[must_use = "the outcome says whether a worker was woken"]
+    pub fn request_worker(&self) -> PoolRequest {
+        let r = self.plan.request_pool_worker();
+        if let Some(stats) = self.stats {
+            stats.record_pool_request(self.step, r);
+        }
+        r
+    }
+
+    /// Pool workers currently armed or parked on the event-count (diagnostics
+    /// only); 0 without a pool.
+    #[inline]
+    #[must_use]
+    pub fn parked_workers(&self) -> usize {
+        self.plan.pool.as_ref().map_or(0, |p| p.waiters())
+    }
+}
+
 /// The per-chain wake routing table. See the module docs.
 pub struct WakePlan {
     mode: WakeMode,
@@ -216,6 +305,10 @@ pub struct WakePlan {
     pool: Option<Arc<PoolEventCount>>,
     /// Edges `build` gates or reverse-wakes, by `(producer, branch)`.
     tracked: Box<[(StepIdx, BranchIdx)]>,
+    /// One unacknowledged `request_worker` in flight per pipeline; cleared by
+    /// any pool worker's return from its event-count wait. Its own cache line:
+    /// it is written by requesters and by every waking worker.
+    request_pending: Padded<AtomicBool>,
 }
 
 /// Each distinct cap among `caps` once, in step order, each told its index
@@ -271,6 +364,7 @@ impl WakePlan {
             distinct_caps: Box::new([]),
             pool,
             tracked: Box::new([]),
+            request_pending: Padded(AtomicBool::new(false)),
         })
     }
 
@@ -453,6 +547,7 @@ impl WakePlan {
             distinct_caps,
             pool,
             tracked: tracked.into_boxed_slice(),
+            request_pending: Padded(AtomicBool::new(false)),
         })
     }
 
@@ -894,6 +989,86 @@ impl WakePlan {
             NotifyOutcome::Woken => r.notified = r.notified.saturating_add(1),
             NotifyOutcome::NoWaiters => r.no_waiters = r.no_waiters.saturating_add(1),
             NotifyOutcome::Suppressed => r.suppressed = r.suppressed.saturating_add(1),
+        }
+    }
+
+    /// Semantics of [`PoolHandle::request_worker`]: at one thread, unpark the
+    /// lone worker (unless it is the caller); otherwise wake one parked worker
+    /// other than the caller: an event-count waiter (ungated by the ceiling;
+    /// `Pending` while an earlier such request is unacknowledged) or, when
+    /// there is none, one direct-parked worker, else one cap-parked worker
+    /// (see [`PoolRequest::Woken`] for when that wake is wasted). `AllAwake`
+    /// only when none exists.
+    #[inline]
+    #[must_use]
+    pub(crate) fn request_pool_worker(&self) -> PoolRequest {
+        let caller = crate::runtime::wake_slot::current_slot();
+        let Some(pool) = &self.pool else {
+            // One-thread Directed run: the lone worker is `Worker(0)`, and a
+            // request from worker 0 itself has no one else to wake.
+            if self.mode == WakeMode::Directed && caller == Some(0) {
+                return PoolRequest::AllAwake;
+            }
+            return if self.workers.unpark(0) {
+                PoolRequest::Woken
+            } else {
+                PoolRequest::Unavailable
+            };
+        };
+        // Producer half of both fence pairs: it orders the caller's publish (the
+        // off-edge work the requester is waiting on) before the census below and
+        // before the armed-bit read, pairing with `prepare_wait`'s fence and with
+        // `arm_direct`'s.
+        delivery_fence();
+        // A caller armed on the event-count (a step in its re-poll) is one of
+        // the waiters; it must not count as the worker to wake.
+        let own = usize::from(crate::runtime::wake_slot::ec_armed());
+        if pool.waiters() <= own {
+            return self.request_direct_parked(caller);
+        }
+        if self.request_pending.0.swap(true, Ordering::AcqRel) {
+            return PoolRequest::Pending;
+        }
+        match pool.notify_one_demand() {
+            NotifyOutcome::Woken => PoolRequest::Woken,
+            // The waiter left between the census and the notify: nothing
+            // pending, and a timer-parked worker may still be there.
+            NotifyOutcome::NoWaiters | NotifyOutcome::Suppressed => {
+                self.request_pending.0.store(false, Ordering::Release);
+                self.request_direct_parked(caller)
+            }
+        }
+    }
+
+    /// No other event-count waiter: unpark one worker that armed for a timer
+    /// park (a pinned worker, a holder), else one parked only because a phase
+    /// cap refused it, as a `Pool` forward wake for an uncapped consumer does
+    /// (the work requested comes off any queue edge, so no consumer cap is
+    /// known; a cap-parked worker woken for work behind a full cap is refused
+    /// again, a wasted wake), skipping the caller's own bit. The claim clears that worker's
+    /// bit, so a repeated request cannot wake it twice; it is not a pending
+    /// event-count request (that worker never returns from an event-count
+    /// wait), so `request_pending` is not set. The caller fenced after its
+    /// publish.
+    #[inline]
+    fn request_direct_parked(&self, caller: Option<usize>) -> PoolRequest {
+        let unpark = &mut |w| self.workers.unpark(w);
+        let woke = self.direct_parked.claim_one_except(caller, unpark)
+            || self.cap_parked.claim_one_except(caller, unpark);
+        if woke { PoolRequest::Woken } else { PoolRequest::AllAwake }
+    }
+
+    /// Worker side: called after **every** exit from the event-count (a return
+    /// from its wait, a productive arm→wait re-poll, or a re-poll that was
+    /// refused and leaves for the timer park), so one request is outstanding
+    /// until some worker wakes for any reason — bounding requests at ≤ one per
+    /// worker wake. A `Relaxed` load, plus a `Release` store only when a
+    /// request is pending, so waking workers do not all write the line when
+    /// no request exists.
+    #[inline]
+    pub(crate) fn acknowledge_request(&self) {
+        if self.request_pending.0.load(Ordering::Relaxed) {
+            self.request_pending.0.store(false, Ordering::Release);
         }
     }
 
@@ -1429,10 +1604,21 @@ mod tests {
         );
     }
 
+    /// Which pool wake `pool_wake_falls_back_to_a_direct_parked_worker` issues.
+    #[derive(Clone, Copy, Debug)]
+    enum PoolWake {
+        Progress,
+        RequestWorker,
+    }
+
     /// A pool wake that finds no event-count waiter unparks one direct-parked
-    /// worker. The worker is a real thread parked for 10 s.
-    #[test]
-    fn pool_wake_falls_back_to_a_direct_parked_worker() {
+    /// worker, whether it is a `Progress`'s forward wake or a step's explicit
+    /// `request_worker()`: a timer-parked worker is parked, so "every worker
+    /// is awake" would be false. The worker is a real thread parked for 10 s.
+    #[rstest]
+    #[case::progress(PoolWake::Progress)]
+    #[case::request_worker(PoolWake::RequestWorker)]
+    fn pool_wake_falls_back_to_a_direct_parked_worker(#[case] via: PoolWake) {
         let mut g = ChainGraph::new();
         let d = g.register_step("Det", 1);
         let p = g.register_step("Par", 0);
@@ -1460,12 +1646,27 @@ mod tests {
         });
         plan.register_worker(0, worker.thread().clone());
         armed_rx.recv().unwrap();
-        let r = plan.on_progress(d, &PushSnapshot::default()); // ungated (no queue): wakes Pool
-        assert_eq!((r.no_waiters, r.fallback), (1, 1));
+        let handle = PoolHandle::new(&plan, None, d);
+        match via {
+            PoolWake::Progress => {
+                // Ungated (no queue): wakes Pool.
+                let r = plan.on_progress(d, &PushSnapshot::default());
+                assert_eq!((r.no_waiters, r.fallback), (1, 1));
+            }
+            PoolWake::RequestWorker => {
+                assert_eq!(handle.request_worker(), PoolRequest::Woken, "the armed worker");
+            }
+        }
         assert!(worker.join().unwrap() < Duration::from_secs(5));
         // With nobody armed, the fallback finds nobody.
-        let r = plan.on_progress(d, &PushSnapshot::default());
-        assert_eq!(r.fallback, 0);
+        match via {
+            PoolWake::Progress => {
+                assert_eq!(plan.on_progress(d, &PushSnapshot::default()).fallback, 0);
+            }
+            PoolWake::RequestWorker => {
+                assert_eq!(handle.request_worker(), PoolRequest::AllAwake);
+            }
+        }
     }
 
     /// `host_mask` restricts only a consumer whose clones live on some of the
@@ -1630,6 +1831,172 @@ mod tests {
         assert_eq!(lines[10], "      wake: (sink); reverse: BgzfCompress (holder)");
         let legacy = WakePlan::legacy(None);
         assert_eq!(legacy.dag_lines(&g), vec!["      wake: Legacy (no Detached step)"; 11]);
+    }
+
+    /// Arm a pool waiter on its own thread; returns once `prepare_wait` ran.
+    fn armed_pool_waiter(pool: &Arc<PoolEventCount>) -> std::thread::JoinHandle<WaitOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let p = Arc::clone(pool);
+        let h = std::thread::spawn(move || {
+            let key = p.prepare_wait();
+            tx.send(()).unwrap();
+            p.wait(key, Duration::from_secs(30))
+        });
+        rx.recv().unwrap();
+        h
+    }
+
+    /// The four outcomes and the one-pending-request rule.
+    #[test]
+    fn request_worker_semantics() {
+        use crate::runtime::event_count::NotifyOutcome;
+        // No pool, Legacy: Unavailable.
+        let legacy = WakePlan::legacy(None);
+        assert_eq!(
+            PoolHandle::new(&legacy, None, StepIdx(0)).request_worker(),
+            PoolRequest::Unavailable
+        );
+
+        // Pool with nobody armed: AllAwake, and the generation does not move.
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = WakePlan::legacy(Some(Arc::clone(&pool)));
+        let h = PoolHandle::new(&plan, None, StepIdx(0));
+        assert_eq!(h.parked_workers(), 0);
+        assert_eq!(h.request_worker(), PoolRequest::AllAwake);
+        let key = pool.prepare_wait();
+        assert_eq!(
+            pool.wait(key, Duration::ZERO),
+            WaitOutcome::TimedOut,
+            "AllAwake must not bump the generation"
+        );
+
+        // One armed worker: Woken, and the waiter is released (not timed out).
+        let waiter = armed_pool_waiter(&pool);
+        assert_eq!(h.parked_workers(), 1);
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+
+        // A second request before any acknowledgement is Pending; after
+        // acknowledge → Woken again.
+        let waiter = armed_pool_waiter(&pool);
+        assert_eq!(h.request_worker(), PoolRequest::Pending, "first request still unacknowledged");
+        plan.acknowledge_request();
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+
+        // Ceiling 1 with one worker awake: `notify_one` is Suppressed, the demand
+        // path is ungated → Woken.
+        pool.set_ceiling(1);
+        plan.acknowledge_request();
+        let waiter = armed_pool_waiter(&pool);
+        assert_eq!(pool.notify_one(), NotifyOutcome::Suppressed);
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+    }
+
+    /// Directed mode at one worker: no pool, worker 0 registered → the request
+    /// unparks it and reports Woken; unregistered → Unavailable.
+    #[test]
+    fn request_worker_at_one_thread_unparks_worker_zero() {
+        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            None,
+            1,
+        );
+        let h = PoolHandle::new(&plan, None, StepIdx(8));
+        assert_eq!(h.request_worker(), PoolRequest::Unavailable);
+        plan.register_worker(0, std::thread::current());
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        // The token is pending on this thread: a park returns at once.
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_millis(500));
+        // From worker 0 itself there is nobody else to wake: no self-unpark.
+        let _slot = SlotGuard::enter(0);
+        assert_eq!(
+            h.request_worker(),
+            PoolRequest::AllAwake,
+            "the lone worker does not wake itself"
+        );
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_millis(200));
+        assert!(t.elapsed() >= Duration::from_millis(150), "no token was left on this thread");
+    }
+
+    /// With no event-count waiter and no direct-parked worker, a request wakes a
+    /// worker parked only because a phase cap refused it.
+    #[test]
+    fn a_request_reaches_a_cap_parked_worker() {
+        let (plan, _g) = tests_support::directed_plan_with_workers(2);
+        plan.register_worker(1, std::thread::current());
+        assert!(plan.arm_cap_parked(1));
+        assert_eq!(plan.request_pool_worker(), PoolRequest::Woken);
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(5), "worker 1 (this thread) was unparked");
+        assert_eq!(plan.request_pool_worker(), PoolRequest::AllAwake, "its bit was claimed");
+    }
+
+    /// A worker's request never wakes the worker itself: armed on the
+    /// event-count (a step in its re-poll) it is not counted as a waiter, and
+    /// its own armed timer-park bit is skipped. With nobody else parked the
+    /// request is `AllAwake`, and the requester's own wait is not cut short.
+    #[test]
+    fn a_request_never_wakes_the_requester() {
+        let (plan, _g) = tests_support::directed_plan_with_workers(2);
+        let pool = plan.pool().expect("two workers: an event-count");
+        let _slot = SlotGuard::enter(1);
+        plan.register_worker(1, std::thread::current());
+        // Armed on the event-count, as in the worker loop's re-poll.
+        let key = pool.prepare_wait();
+        crate::runtime::wake_slot::set_ec_armed(true);
+        assert_eq!(
+            plan.request_pool_worker(),
+            PoolRequest::AllAwake,
+            "the only waiter is the caller"
+        );
+        crate::runtime::wake_slot::set_ec_armed(false);
+        assert_eq!(pool.wait(key, Duration::from_millis(50)), WaitOutcome::TimedOut, "not woken");
+        // Armed for a timer park, as in the worker loop's direct-park re-poll.
+        assert!(plan.arm_direct(1));
+        assert_eq!(plan.request_pool_worker(), PoolRequest::AllAwake, "its own bit is skipped");
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_millis(200));
+        assert!(t.elapsed() >= Duration::from_millis(150), "no self-unpark token");
+        plan.disarm_direct(1);
+    }
+
+    /// Stats-on: each outcome lands in its per-step counter.
+    #[test]
+    fn request_worker_records_per_step_outcomes() {
+        let stats = crate::runtime::stats::PipelineStats::new(vec!["A", "B"]);
+        let legacy = WakePlan::legacy(None);
+        let h = PoolHandle::new(&legacy, Some(&stats), StepIdx(1));
+        assert_eq!(h.request_worker(), PoolRequest::Unavailable);
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = WakePlan::legacy(Some(Arc::clone(&pool)));
+        let h = PoolHandle::new(&plan, Some(&stats), StepIdx(1));
+        assert_eq!(h.request_worker(), PoolRequest::AllAwake);
+        // An armed waiter: the first request wakes it, a second one before any
+        // acknowledgement is pending.
+        let waiter = armed_pool_waiter(&pool);
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        assert_eq!(h.request_worker(), PoolRequest::Pending);
+        assert_eq!(h.request_worker(), PoolRequest::Pending);
+        assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+        let s = stats.snapshot().steps[1].1;
+        assert_eq!(
+            (s.pool_requests_woken, s.pool_requests_all_awake, s.pool_requests_pending),
+            (1, 1, 2),
+            "each outcome in its own counter; Unavailable is not counted"
+        );
+        assert_eq!(stats.snapshot().steps[0].1.pool_requests_woken, 0, "step A untouched");
     }
 
     /// A thread that parks for up to 10 s after telling the test it is about to,
@@ -2639,6 +3006,17 @@ pub(crate) mod tests_support {
     use crate::runtime::event_count::PoolEventCount;
     use crate::step::StepKind;
     use crate::topology::{BranchIdx, ChainGraph};
+
+    /// A pool handle over a process-wide Legacy plan with no pool, for tests
+    /// that build an `ErasedStepCtx` by hand.
+    pub(crate) fn legacy_pool_handle() -> super::PoolHandle<'static> {
+        static PLAN: std::sync::OnceLock<Arc<WakePlan>> = std::sync::OnceLock::new();
+        super::PoolHandle::new(
+            PLAN.get_or_init(|| WakePlan::legacy(None)),
+            None,
+            crate::topology::StepIdx(0),
+        )
+    }
 
     /// A Directed plan for `Det (driver 0) → Par` with `n` pool workers and a
     /// pool event-count.

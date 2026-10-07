@@ -144,6 +144,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
             outputs: merge_outputs_any.as_ref(),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         let outcome = sum_step.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -155,6 +156,7 @@ fn step2_typed_dispatch_pairs_both_branches() {
             outputs: merge_outputs_any.as_ref(),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         let outcome = sum_step.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -274,6 +276,7 @@ fn step2_build_two_input_handles_accepts_one_producer_with_distinct_branches() {
         outputs: merge_outputs_any.as_ref(),
         signal: &signal,
         counters: &no_counters,
+        pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
     };
     assert_eq!(sum_step.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
     assert_eq!(
@@ -1101,6 +1104,9 @@ fn crate_root_reexports_the_step_author_surface() {
     let _: fn() -> api::PoolPlacement = || api::PoolPlacement::ExcludeReader;
     let _: fn() -> api::QueueSpec = || api::QueueSpec::Unbounded;
     let _: fn() -> api::BranchOrdering = || api::BranchOrdering::None;
+    // `StepCtx::pool` and its `request_worker` outcome.
+    let _: fn() -> api::PoolRequest = || api::PoolRequest::Unavailable;
+    let _: PhantomData<api::PoolHandle<'static>> = PhantomData;
     // `StepOutputs::build_queues` names this in its public signature, so anyone
     // implementing that trait by hand has to be able to name it too.
     let _: fn() -> api::InstrumentationLevel = || api::InstrumentationLevel::Off;

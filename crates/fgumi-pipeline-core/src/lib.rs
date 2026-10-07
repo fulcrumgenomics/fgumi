@@ -60,6 +60,7 @@ pub use outputs::{
 };
 pub use queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, UnboundedQueue};
 pub use reorder::{BranchOrdering, ReorderStage, Sequenced};
+pub use runtime::wake::{PoolHandle, PoolRequest};
 // The real wake protocols, for `tests/loom_wake.rs` (`wake_slot` itself stays
 // crate-private).
 #[cfg(loom)]
