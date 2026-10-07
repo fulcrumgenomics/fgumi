@@ -16,12 +16,13 @@
 //! `new_worker_copy`).
 
 use std::io;
+use std::sync::Arc;
 
 use fgumi_sort::{SpillBlockCompressor, SpillCodec};
 
 use crate::sort::protocol::SpillBlockEvent;
 use fgumi_pipeline_core::{
-    HeldRetry, Unpushed,
+    HeldRetry, PhaseCap, Unpushed, admit_input,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -46,6 +47,9 @@ pub struct SpillBlockCompress {
     compressor: Option<SpillBlockCompressor>,
     held: HeldSlot<Unpushed<SpillBlockEvent>>,
     output_byte_limit: u64,
+    /// Admission cap shared with the other phase-1 pool steps (set by the
+    /// chain builder via `with_phase_cap`; `None` = uncapped).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl SpillBlockCompress {
@@ -53,7 +57,57 @@ impl SpillBlockCompress {
     /// byte-bounds the compressed-block output queue.
     #[must_use]
     pub fn new(codec: SpillCodec, compression: u32, output_byte_limit: u64) -> Self {
-        Self { codec, compression, compressor: None, held: HeldSlot::new(), output_byte_limit }
+        Self {
+            codec,
+            compression,
+            compressor: None,
+            held: HeldSlot::new(),
+            output_byte_limit,
+            cap: None,
+        }
+    }
+
+    /// Share a phase admission cap with the other pool steps of this phase. At
+    /// most `cap.max()` workers are inside any of those steps at once.
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// One `try_run` with the phase cap moved out of `self` (see `try_run`).
+    fn run_once(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        cap: Option<&PhaseCap>,
+    ) -> io::Result<StepOutcome> {
+        if !self.flush_held(ctx) {
+            return Ok(StepOutcome::Contention);
+        }
+
+        // Admission (see the pipeline-core `admission` module): a capped step
+        // takes its phase permit BEFORE popping (an empty poll takes none and
+        // is recorded as an empty pop), so a refused clone leaves the item for
+        // a clone that may run and reports `Capped`. Uncapped, this is a no-op
+        // and the pop below runs exactly as without a cap. The permit is held
+        // to the end of this call.
+        let _permit = match admit_input(ctx.input, cap) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        if let Some(event) = ctx.input.pop() {
+            let forwarded = self.compress_event(event)?;
+            if let Err(unpushed) = ctx.outputs.push(forwarded) {
+                self.held.put(unpushed);
+            }
+            return Ok(StepOutcome::Progress);
+        }
+
+        if ctx.input.is_drained() {
+            return Ok(StepOutcome::Finished);
+        }
+        Ok(StepOutcome::NoProgress)
     }
 
     fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
@@ -108,6 +162,7 @@ impl Clone for SpillBlockCompress {
             compressor: None,
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
+            cap: self.cap.clone(),
         }
     }
 }
@@ -127,26 +182,20 @@ impl Step for SpillBlockCompress {
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        if !self.flush_held(ctx) {
-            return Ok(StepOutcome::Contention);
-        }
-
-        if let Some(event) = ctx.input.pop() {
-            let forwarded = self.compress_event(event)?;
-            if let Err(unpushed) = ctx.outputs.push(forwarded) {
-                self.held.put(unpushed);
-            }
-            return Ok(StepOutcome::Progress);
-        }
-
-        if ctx.input.is_drained() {
-            return Ok(StepOutcome::Finished);
-        }
-        Ok(StepOutcome::NoProgress)
+        // Moved out for the call: the permit borrows the cap while `compress_event`
+        // needs `&mut self`. A move, so no reference-count traffic.
+        let cap = self.cap.take();
+        let outcome = self.run_once(ctx, cap.as_deref());
+        self.cap = cap;
+        outcome
     }
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 

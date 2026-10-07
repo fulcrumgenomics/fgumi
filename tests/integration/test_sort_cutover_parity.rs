@@ -968,7 +968,7 @@ fn cutover_honors_fgumi_tmp_dirs_env() {
 /// created.
 ///
 /// In practice this bails out of `resolve_memory_budget` inside
-/// `execute_sort`'s pre-chain setup (`self.memory_budget_threads()` returns 0
+/// `execute_sort`'s pre-chain setup (`PhaseThreads::memory_budget_threads()` returns 0
 /// verbatim for `--threads 0`, and `resolve_memory_budget` rejects a
 /// zero-thread budget with this exact message) -- the chain is never built
 /// for this case, so `ChainBuilder::new`'s own identical `num_threads == 0`

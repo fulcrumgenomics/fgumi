@@ -13,7 +13,7 @@ use fgumi_sort::{
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
 use crate::types::{DecompressedBlock, RecordBatch, RecordBatchBuilder};
 use fgumi_pipeline_core::{
-    HeapSize, HeldRetry, Ordered, Unpushed,
+    HeapSize, HeldRetry, Ordered, PhaseCap, Unpushed,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -787,6 +787,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// at the top of the next `try_run` before any new gather, preserving the
     /// dense ascending-ordinal emission the detached output edge requires.
     fast_pending: std::collections::VecDeque<O::Item>,
+    /// Phase-2 cap the parallel fast-path gather takes whole (`None` =
+    /// uncapped). The gather runs beside the output compressor that shares
+    /// this cap, so it holds every permit while it runs.
+    fast_path_cap: Option<Arc<PhaseCap>>,
 }
 
 /// Lever-2 diagnostic counters: is the serial merge starved on decompress
@@ -844,7 +848,20 @@ impl<O: MergeOutput> SortMerge<O> {
             fast_path_min_records: FAST_PATH_PARALLEL_MIN_RECORDS,
             fast_path_pool: None,
             fast_pending: std::collections::VecDeque::new(),
+            fast_path_cap: None,
         }
+    }
+
+    /// Make the parallel fast-path gather take its threads from the phase-2
+    /// cap (`--merge-threads`, whose count is the fast-path thread count)
+    /// shared with spill decompression and output compression: each gather
+    /// burst takes the whole cap ([`PhaseCap::acquire_whole`]) and runs on the
+    /// full fast-path pool, so gather + output compression stay within the
+    /// cap. `None` leaves the gather uncapped. Output is identical.
+    #[must_use]
+    pub fn with_fast_path_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.fast_path_cap = cap;
+        self
     }
 
     /// Set the worker budget for the in-memory fast-path parallel gather.
@@ -1311,7 +1328,32 @@ impl<O: MergeOutput> SortMerge<O> {
             return Ok(self.finish_fast_path(count));
         }
 
-        // 3. Gather the next window of blocks in parallel.
+        // 3. Capped: the parallel gather is phase-2 work beside the output
+        //    compressor, so it takes the whole phase-2 cap for the burst (see
+        //    `with_fast_path_cap`). This state is only entered for a gather that
+        //    really runs in parallel (`fast_path_threads > 1`, at least
+        //    `fast_path_min_records`, more than one block), so a serial gather
+        //    never stalls the pool. A cancelled run gives up before gathering.
+        let cap = self.fast_path_cap.clone();
+        let whole = match cap.as_deref() {
+            None => None,
+            Some(cap) => match cap.acquire_whole() {
+                None => return Ok(StepOutcome::NoProgress),
+                Some(whole) => {
+                    // The step-owned gather pool is sized once, from
+                    // `fast_path_threads`; the builder sets that to the
+                    // phase-2 count the cap was built with.
+                    debug_assert_eq!(
+                        whole.width(),
+                        self.fast_path_threads,
+                        "the phase-2 cap and the fast-path gather pool disagree on width"
+                    );
+                    Some(whole)
+                }
+            },
+        };
+
+        // 4. Gather the next window of blocks in parallel.
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         let initial_bytes = INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap);
         let target = self.target_batch_count;
@@ -1348,6 +1390,9 @@ impl<O: MergeOutput> SortMerge<O> {
                 None => run()?,
             }
         };
+        // Release the cap before pushing: the push is the step's own serial
+        // work, and output compression must be admitted to drain it.
+        drop(whole);
 
         let window_records: u64 = match &self.state {
             SortMergeState::FastPathParallel { blocks, .. } => {
@@ -1366,7 +1411,7 @@ impl<O: MergeOutput> SortMerge<O> {
             return Ok(StepOutcome::Progress); // downstream full mid-window
         }
 
-        // 4. Window pushed cleanly; finalize if that was the last one.
+        // 5. Window pushed cleanly; finalize if that was the last one.
         if window_end >= total_blocks {
             let count = match &self.state {
                 SortMergeState::FastPathParallel { blocks, .. } => blocks_total_records(blocks),
@@ -1551,6 +1596,10 @@ impl<O: MergeOutput> Step for SortMerge<O> {
     fn counters(&self) -> &'static [CounterSpec] {
         const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
         SPECS
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.fast_path_cap.as_deref()
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {

@@ -549,6 +549,25 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
         }
     }
 
+    /// True iff no in-order item is ready to pop: the transport is empty and
+    /// the next ordinal is not buffered. Lock-free (one queue check and one
+    /// atomic load); out-of-order items still buffered behind a missing
+    /// ordinal count as empty, since `try_pop_in_order` could not return them.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.transport.is_empty() && !self.next_serial_buffered.load(Ordering::Acquire)
+    }
+
+    /// Whether the reorder buffer holds any item (in order or not). With
+    /// [`Self::is_empty`] true this means "reorder-blocked": later ordinals
+    /// wait for a missing earlier one. Takes the state lock; its only caller
+    /// (`BranchInputHandle::note_empty_poll`) reaches it only on an
+    /// instrumented edge.
+    #[must_use]
+    pub(crate) fn has_buffered_items(&self) -> bool {
+        !self.state.lock().buffer.is_empty()
+    }
+
     /// True iff transport is drained, transport is empty, and the reorder
     /// buffer is empty. Sticky: once observed true, stays true.
     pub fn is_drained(&self) -> bool {
@@ -1001,6 +1020,25 @@ mod tests {
         let _ = s.try_pop_in_order().unwrap();
         let _ = s.try_pop_in_order().unwrap();
         assert!(s.is_drained());
+    }
+
+    /// `is_empty` means "nothing poppable now": an out-of-order item buffered
+    /// behind a missing ordinal is empty, a ready next ordinal (in transport or
+    /// in the buffer) is not.
+    #[test]
+    fn is_empty_tracks_whether_an_in_order_item_is_ready() {
+        let s = make_stage(4);
+        assert!(s.is_empty(), "fresh stage is empty");
+        s.try_push(1, 100).unwrap();
+        assert!(!s.is_empty(), "an item in transport is not provably blocked yet");
+        assert_eq!(s.try_pop_in_order(), None, "ordinal 0 is missing");
+        assert!(s.is_empty(), "ordinal 1 buffered behind 0 is not poppable");
+        s.try_push(0, 0).unwrap();
+        assert!(!s.is_empty());
+        assert_eq!(s.try_pop_in_order(), Some(0));
+        assert!(!s.is_empty(), "ordinal 1 is now the next serial and buffered");
+        assert_eq!(s.try_pop_in_order(), Some(100));
+        assert!(s.is_empty());
     }
 
     #[test]

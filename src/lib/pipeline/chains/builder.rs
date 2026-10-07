@@ -648,6 +648,17 @@ pub struct ChainBuilder<'a> {
     /// Default `false`.
     detached_writer: bool,
 
+    /// Phase-2 cap for the standalone sort's terminal `BgzfCompress`. Set by
+    /// `add_sort` beside `detached_writer`, consumed by `add_sink`; `None` on
+    /// every other chain so no other command's output compressor is capped.
+    sink_phase_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+
+    /// The sort's per-phase counts and caps, resolved once by
+    /// [`Self::sort_plan`] — by `add_source` when a SAM source's parse step is
+    /// sort ingest (sort-first), otherwise by `add_sort` — so every phase-1 step
+    /// shares one counter and nothing resolves the counts twice.
+    sort_plan: Option<SortPlan>,
+
     /// Spill-run accounting of the standalone sort (runs written, consolidations,
     /// merge fan-in), shared by `add_sort`'s `SpillWrite` with the sort summary
     /// and the `=== Sort Phase Timing ===` roll-up. `None` for every other chain.
@@ -817,6 +828,8 @@ impl<'a> ChainBuilder<'a> {
             // Pool-scheduled writer by default; add_sort opts the standalone
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
+            sink_phase_cap: None,
+            sort_plan: None,
             sort_spill_stats: None,
             created_outputs: CreatedOutputs::default(),
             fastq_encoding,
@@ -1264,11 +1277,19 @@ impl<'a> ChainBuilder<'a> {
                         // contract, not an optional extra.
                         let buf = sam_reader.into_inner();
                         let cut = self.source_batch_cut();
+                        // Sort-first: parsing is sort ingest, so it shares the
+                        // sort's phase-1 cap (`--sort-threads`).
+                        let parse_cap = if sort_is_first_intermediate {
+                            self.sort_plan().and_then(|plan| plan.caps.phase1)
+                        } else {
+                            None
+                        };
                         let tail = self.build_sam_parse_preamble(
                             buf,
                             self.header.clone(),
                             group_key_config,
                             cut,
+                            parse_cap,
                         );
                         self.current_tail = Some(tail);
                         self.chain_tail_kind = ChainTailKind::DecodedRecordBatch {
@@ -1358,6 +1379,7 @@ impl<'a> ChainBuilder<'a> {
                             hdr,
                             group_key_config,
                             crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+                            None,
                         )
                     }
                 };
@@ -1896,6 +1918,41 @@ impl<'a> ChainBuilder<'a> {
         self.pipeline.append_step(ParseBamRecords::new(self.tuning.per_step_byte_limit), tail)
     }
 
+    /// The sort's per-phase counts and caps, resolved once from the spec —
+    /// `--threads`, the chain's worker floor ([`chain_worker_floor`]) and the
+    /// sort overrides — and cached, so a step wired before `add_sort` (the
+    /// sort-first SAM parse) and the steps `add_sort` wires share the same
+    /// counters. A cap exists only for an explicit override (`--sort-threads`
+    /// for phase 1, `--merge-threads` for phase 2); an unset flag creates none,
+    /// so no step is capped, none reports a cap, and nothing takes a permit.
+    /// `None` when the chain has no sort stage.
+    fn sort_plan(&mut self) -> Option<SortPlan> {
+        if self.sort_plan.is_none() {
+            let sort = self.spec.stage_opts.sort.as_ref()?;
+            let threads = self.spec.threading.num_threads();
+            let pool = threads
+                .max(chain_worker_floor(&self.spec.stages, self.spec.stage_opts.aligner.as_ref()));
+            let phases = crate::commands::common::PhaseThreads::resolve_in_pool(
+                threads,
+                pool,
+                sort.sort_threads,
+                sort.merge_threads,
+            );
+            let caps = SortCaps {
+                phase1: sort
+                    .sort_threads
+                    .is_some()
+                    .then(|| fgumi_pipeline_core::PhaseCap::new("sort-phase1", phases.phase1)),
+                phase2: sort
+                    .merge_threads
+                    .is_some()
+                    .then(|| fgumi_pipeline_core::PhaseCap::new("sort-phase2", phases.phase2)),
+            };
+            self.sort_plan = Some(SortPlan { pool, phases, caps });
+        }
+        self.sort_plan.clone()
+    }
+
     /// Append the 2-step SAM parse preamble:
     /// `ReadSamChunks → ParseSamChunk`.
     ///
@@ -1912,6 +1969,7 @@ impl<'a> ChainBuilder<'a> {
         header: Header,
         group_key_config: fgumi_bam_io::GroupKeyConfig,
         cut: crate::pipeline::steps::boundaries::state::BatchCut,
+        parse_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
         use crate::pipeline::steps::boundaries::state::BatchCut;
@@ -1931,9 +1989,12 @@ impl<'a> ChainBuilder<'a> {
         } else {
             ReadSamChunks::new(buf, DEFAULT_SAM_CHUNK_BYTES, self.tuning.per_step_byte_limit)
         };
+        // Capped only when this parse is sort ingest (sort-first chain) under
+        // an explicit `--sort-threads`.
         let parse_step =
             ParseSamChunk::new(Arc::new(header), group_key_config, self.tuning.per_step_byte_limit)
-                .with_closed_batches(closed);
+                .with_closed_batches(closed)
+                .with_phase_cap(parse_cap);
         let tail = self.pipeline.append_source(read_step);
         self.pipeline.append_step(parse_step, tail)
     }
@@ -2206,6 +2267,9 @@ impl<'a> ChainBuilder<'a> {
             self.tuning.per_step_byte_limit,
             want_index,
         );
+        // Standalone-sort terminal: the output compressor shares the merge
+        // phase's cap. `sink_phase_cap` is `None` for every other chain.
+        let compress_step = compress_step.with_phase_cap(self.sink_phase_cap.take());
         let tail = self.pipeline.append_step(compress_step, tail);
 
         // When Stage::Align is in the chain, the merged output header is
@@ -3114,9 +3178,16 @@ impl<'a> ChainBuilder<'a> {
         // today's behavior. See `fold_align_wired_scheduling`'s doc comment for
         // the full rationale (it is unit-tested there without needing a real
         // backend).
+        // The floor comes from the same `stage_worker_floor` runall predicts
+        // with; it must agree with what the backend itself reports.
+        let align_floor = stage_worker_floor(Stage::Align, Some(align_opts));
+        debug_assert_eq!(
+            align_floor, wired.min_workers,
+            "stage_worker_floor disagrees with the align backend's min_workers"
+        );
         fold_align_wired_scheduling(
             num_threads,
-            wired.min_workers,
+            align_floor.max(wired.min_workers),
             wired.prefers_drain_first,
             &mut self.override_pipeline_threads,
             &mut self.use_drain_first_scheduler,
@@ -3209,7 +3280,7 @@ impl<'a> ChainBuilder<'a> {
         // 32-core box: a floored 4-worker pool beats a genuine 1/2/3-worker chain,
         // and a 1-worker chain loses to the serial process_raw path outright).
         let raw_threads = self.spec.threading.num_threads();
-        let num_threads = raw_threads.max(4);
+        let num_threads = raw_threads.max(stage_worker_floor(Stage::Zipper, None));
 
         // Recompute tuning with the floored thread count so that batch-sizing
         // parameters (template_batch_size, per_step_byte_limit) are consistent
@@ -3409,29 +3480,56 @@ impl<'a> ChainBuilder<'a> {
                 );
             }
             let num_threads = self.spec.threading.num_threads();
-            // Per-phase worker counts default to --threads; runall forwards
-            // --sort::sort-threads / --sort::merge-threads via SortOptions.
-            // Phase 1 caps the streaming sort/spill worker pool; Phase 2 caps
-            // concurrent spill-decompression (the k-way spill merge itself is
-            // serial; the in-memory fast-path gather is fanned across phase2).
-            let num_phase1_threads = resolve_phase_threads(sort.sort_threads, num_threads);
-            let num_phase2_threads = resolve_phase_threads(sort.merge_threads, num_threads);
-            if sort.sort_threads.is_some() || sort.merge_threads.is_some() {
+            // The per-phase contract (`PhaseThreads`), resolved once for the
+            // chain (`sort_plan`): the pool is the ceiling, each override is a
+            // cap within it, the budget follows the effective sort-phase count
+            // (never widened by the floor alone). Warnings are the command
+            // layer's job (`Sort::execute_sort`, runall's `Stage::Sort` arm);
+            // here we only report the split.
+            let SortPlan { pool, phases, caps } =
+                self.sort_plan().expect("add_sort runs only on a chain with a sort stage");
+            // The plan predicts the pool from the spec; the pool this chain
+            // actually runs is `--threads` raised by a preceding zipper /
+            // subprocess-aligner floor (both run before sort, so
+            // `override_pipeline_threads` is final here). They must agree.
+            debug_assert_eq!(
+                pool,
+                self.override_pipeline_threads.map_or(num_threads, |t| t.max(num_threads)),
+                "chain_worker_floor (used by runall's warning) disagrees with the built pool"
+            );
+            if sort.sort_threads.is_some() || sort.merge_threads.is_some() || pool > num_threads {
                 log::debug!(
-                    "streaming sort: per-phase thread split (phase1={num_phase1_threads}, \
-                     phase2={num_phase2_threads}); phase2 caps decompress \
-                     concurrency and sizes the in-memory fast-path parallel \
-                     gather, while the k-way spill merge stays serial"
+                    "streaming sort: per-phase thread split (phase1={}, phase2={}) within a \
+                     {pool}-worker pool (--threads {num_threads}); an explicit --sort-threads \
+                     caps inflate/spill-compress and the per-run sort, an explicit \
+                     --merge-threads caps decompress/output-compress and the in-memory \
+                     fast-path gather; memory budget x{}",
+                    phases.phase1,
+                    phases.phase2,
+                    phases.memory_budget_threads()
                 );
             }
-            // Reuse the same helper as the standalone path so `--sort::memory-per-thread`
-            // is honored (the previous inline `× num_threads` ignored it).
             let total_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
-                sort_budget_threads(num_threads, sort.sort_threads),
+                phases.memory_budget_threads(),
                 sort.memory_per_thread,
             )?;
+            // One shared cap per phase, and only for an explicit override: at
+            // most `phase1` workers inside ANY phase-1 step at once (likewise
+            // phase 2), and the phase's off-pool parallel work — the per-run
+            // sort, the fast-path gather — takes the whole cap while it runs
+            // (see `seal_under_cap`). The phases can overlap —
+            // `SortSpillDecompress` pre-fills slots of spills already written
+            // while phase 1 is still ingesting — and that is fine: the caps are
+            // separate counters. An unset flag creates no cap at all: no step is
+            // capped, none reports a cap on the DAG or in the summary.
+            let SortCaps { phase1: phase1_cap, phase2: phase2_cap } = caps;
+            if self.detached_writer {
+                // Standalone-sort terminal only (the flag is set above under
+                // exactly that condition): the output compressor is phase-2 work.
+                self.sink_phase_cap.clone_from(&phase2_cap);
+            }
 
             // Honor the requested order (standalone sort can request any of the
             // four; runall always passes `TemplateCoordinate`). The cell tag is
@@ -3453,7 +3551,7 @@ impl<'a> ChainBuilder<'a> {
             let buffer_config = fgumi_pipeline_io::sort::SortBufferConfig {
                 sort_order,
                 memory_limit: total_memory,
-                sort_threads: num_phase1_threads,
+                sort_threads: phases.phase1,
                 cell_tag,
                 key_types: sort.key_types.unwrap_or_default(),
             };
@@ -3492,12 +3590,11 @@ impl<'a> ChainBuilder<'a> {
                 file_granularity: sort.file_granularity,
                 block_batch: sort.block_batch,
             };
-            // `--merge-threads` (Phase-2) caps how many decompress workers run
-            // concurrently; the block-parallel path still does the work, but the
-            // admission counter bounds concurrency to `num_phase2_threads`.
+            // Phase-2 cap (`--merge-threads`): bounds concurrent spill
+            // decompression together with the terminal output compressor.
             let decompress =
                 SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
-                    .with_max_concurrency(Some(num_phase2_threads));
+                    .with_phase_cap(phase2_cap.clone());
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -3528,12 +3625,16 @@ impl<'a> ChainBuilder<'a> {
             // so this is the only path a SAM-sourced sort takes.
             let tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
                 use crate::pipeline::steps::templates_to_records::TemplatesToRecordBatch;
-                self.pipeline
-                    .append_step(TemplatesToRecordBatch::new(self.tuning.per_step_byte_limit), tail)
+                self.pipeline.append_step(
+                    TemplatesToRecordBatch::new(self.tuning.per_step_byte_limit)
+                        .with_phase_cap(phase1_cap.clone()),
+                    tail,
+                )
             } else if matches!(self.chain_tail_kind, ChainTailKind::DecodedRecordBatch { .. }) {
                 use crate::pipeline::steps::decoded_to_records::DecodedRecordBatchToRecordBatch;
                 self.pipeline.append_step(
-                    DecodedRecordBatchToRecordBatch::new(self.tuning.per_step_byte_limit),
+                    DecodedRecordBatchToRecordBatch::new(self.tuning.per_step_byte_limit)
+                        .with_phase_cap(phase1_cap.clone()),
                     tail,
                 )
             } else {
@@ -3579,7 +3680,7 @@ impl<'a> ChainBuilder<'a> {
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
                     // `total_memory` is the full in-memory budget (--max-memory ×
-                    // threads). ReadBlocks sizes its arena segment to hold one
+                    // the effective sort-phase thread count). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
                     let read_blocks = ReadBlocks::new(total_memory, byte_limit);
@@ -3587,12 +3688,12 @@ impl<'a> ChainBuilder<'a> {
                     // takes, so the chain's CRC policy has to reach it here --
                     // `BgzfDecompress` (which also honors `spec.verify_crc`) is
                     // never on this path.
-                    let inflate = InflateToArena::new_with_crc(byte_limit, self.spec.verify_crc);
-                    // Hand the resolved Phase-1 count (honoring `--sort-threads`,
-                    // else `--threads`) to the per-chunk sort so large chunks use
-                    // the parallel radix. Using the raw global `num_threads()` here
-                    // silently dropped the `--sort-threads` override.
-                    let sort_threads = num_phase1_threads;
+                    let inflate = InflateToArena::new_with_crc(byte_limit, self.spec.verify_crc)
+                        .with_phase_cap(phase1_cap.clone());
+                    // Phase-1 count sizes the per-run radix / comparator rayon
+                    // pools (`bounded_sort_pool`, `qname-sort`,
+                    // `sort_coordinate_refs`).
+                    let sort_threads = phases.phase1;
                     let t = self.pipeline.append_step(read_blocks, tail);
                     let t = self.pipeline.append_step(inflate, t);
                     let out = match sort_order {
@@ -3613,7 +3714,8 @@ impl<'a> ChainBuilder<'a> {
                                     TemplateStrategy::new(acc),
                                     sort_threads,
                                     byte_limit,
-                                ),
+                                )
+                                .with_phase_cap(phase1_cap.clone()),
                                 t,
                             )
                         }
@@ -3628,7 +3730,8 @@ impl<'a> ChainBuilder<'a> {
                                     ),
                                     sort_threads,
                                     byte_limit,
-                                ),
+                                )
+                                .with_phase_cap(phase1_cap.clone()),
                                 t,
                             )
                         }
@@ -3640,7 +3743,8 @@ impl<'a> ChainBuilder<'a> {
                                     ),
                                     sort_threads,
                                     byte_limit,
-                                ),
+                                )
+                                .with_phase_cap(phase1_cap.clone()),
                                 t,
                             )
                         }
@@ -3649,7 +3753,8 @@ impl<'a> ChainBuilder<'a> {
                                 CoordinateStrategy::new(n_ref),
                                 sort_threads,
                                 byte_limit,
-                            ),
+                            )
+                            .with_phase_cap(phase1_cap.clone()),
                             t,
                         ),
                     };
@@ -3659,9 +3764,10 @@ impl<'a> ChainBuilder<'a> {
                     self.use_drain_first_scheduler = true;
                     out
                 } else {
-                    let sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
+                    let mut sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
                         .with_affinity(affinity);
+                    sort_buffer = sort_buffer.with_phase_cap(phase1_cap.clone());
                     self.pipeline.append_step(sort_buffer, tail)
                 };
                 // `SpillGather` runs on the off-pool coordination driver
@@ -3669,7 +3775,8 @@ impl<'a> ChainBuilder<'a> {
                 // head, so it never contends a pool worker — the driver frames the
                 // just-sorted chunk into blocks while the pool inflates/compresses.
                 let serialize = SpillGather::new(byte_limit);
-                let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit);
+                let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit)
+                    .with_phase_cap(phase1_cap.clone());
                 // `--max-temp-files` bounds the live spill runs: `SpillWrite`
                 // consolidates runs (at the spill compression level) whenever the
                 // limit would be exceeded, so the merge never opens more files than
@@ -3712,12 +3819,13 @@ impl<'a> ChainBuilder<'a> {
                         // is gathered into output blocks in parallel instead of
                         // on the lone detached thread, removing the flat serial
                         // gather that otherwise floors the in-memory sort's wall
-                        // clock. Bounded to `num_phase2_threads` so it never
-                        // oversubscribes past `--threads`.
-                        .with_fast_path_threads(num_phase2_threads);
+                        // clock. Bounded to the effective phase-2 count
+                        // (`--merge-threads` within `--threads`).
+                        .with_fast_path_threads(phases.phase2);
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
+                merge = merge.with_fast_path_cap(phase2_cap.clone());
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
@@ -3748,6 +3856,7 @@ impl<'a> ChainBuilder<'a> {
                             spill_stats: self.sort_spill_stats.clone(),
                             output_path,
                             timer: crate::logging::OperationTimer::new("Sorting BAM"),
+                            phase_caps: phase1_cap.iter().chain(&phase2_cap).cloned().collect(),
                         },
                     ));
                 }
@@ -3762,7 +3871,7 @@ impl<'a> ChainBuilder<'a> {
                 // slot is `None`; no `with_stats_slot` call is needed. The
                 // merge-loop diagnostic still honors `--sort-stats` like the
                 // terminal branch, for a fused pipeline that ever exposes it.
-                let merge = SortMerge::<RecordBatchOutput>::new(
+                let mut merge = SortMerge::<RecordBatchOutput>::new(
                     sort_order,
                     self.tuning.per_step_byte_limit,
                 )
@@ -3770,8 +3879,10 @@ impl<'a> ChainBuilder<'a> {
                 // Same parallel fast-path gather as the terminal branch (see
                 // there): a large in-memory intermediate sort feeding
                 // group/consensus gathers its single sorted chunk in parallel
-                // rather than serially on the detached thread.
-                .with_fast_path_threads(num_phase2_threads);
+                // rather than serially on the detached thread. Bounded to the
+                // effective phase-2 count (`--merge-threads` within `--threads`).
+                .with_fast_path_threads(phases.phase2);
+                merge = merge.with_fast_path_cap(phase2_cap.clone());
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
@@ -6351,31 +6462,6 @@ impl<'a> ChainBuilder<'a> {
     }
 }
 
-/// Resolve a sort phase's worker-thread count.
-///
-/// A per-phase override (`--sort::sort-threads` / `--sort::merge-threads`, or
-/// the standalone `--sort-threads` / `--merge-threads`) is used as-is when
-/// present; otherwise the phase falls back to the chain's base sorter-thread
-/// count (`--threads`). The result is clamped to at least 1 so a `0` override
-/// never disables a phase. This is the single source of truth for both the
-/// sole-stage (`SortStepCaptures`) and streaming (`RawExternalSorter`) sort
-/// paths in `add_sort`.
-pub(crate) fn resolve_phase_threads(
-    override_threads: Option<usize>,
-    num_sorter_threads: usize,
-) -> usize {
-    override_threads.unwrap_or(num_sorter_threads).max(1)
-}
-
-/// Thread count for sizing the sort buffer, mirroring the owned engine's
-/// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads, sort_threads)`,
-/// but 0 when the pool is 0 so `resolve_memory_budget` still rejects a zero-thread run.
-fn sort_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
-    // Single source of truth shared with `Sort::memory_budget_threads` — see
-    // `commands::common::sort_memory_budget_threads` — so the two cannot drift.
-    crate::commands::common::sort_memory_budget_threads(num_threads, sort_threads)
-}
-
 /// Whether `stages` should have the Decode step cache the UMI (RX) value
 /// position (see [`ChainBuilder::bam_group_key_config`]).
 ///
@@ -6446,6 +6532,59 @@ fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bo
         (stage, position),
         (Stage::Group | Stage::Dedup | Stage::Clip, StagePosition::Terminal)
     )
+}
+
+/// The sort's resolved per-phase counts and caps (see `ChainBuilder::sort_plan`).
+#[derive(Clone)]
+struct SortPlan {
+    /// The worker pool the counts were resolved in.
+    pool: usize,
+    phases: crate::commands::common::PhaseThreads,
+    caps: SortCaps,
+}
+
+/// The sort's two shared admission caps; each exists only for an explicit
+/// override of its phase.
+#[derive(Clone)]
+struct SortCaps {
+    phase1: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    phase2: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+}
+
+/// Pool-worker floor `add_zipper` applies: the per-template merge fan-out
+/// only pays with at least this many workers (see `add_zipper`).
+pub(crate) const ZIPPER_MIN_WORKERS: usize = 4;
+
+/// The pool-worker floor one stage imposes on `--threads`: the zipper's
+/// [`ZIPPER_MIN_WORKERS`], the align backend's
+/// ([`min_workers_for`](crate::pipeline::steps::align::min_workers_for)),
+/// or 1. The single source of truth for the floor: `add_zipper` and
+/// `add_align` raise `override_pipeline_threads` through it, and
+/// [`chain_worker_floor`] predicts the whole chain's floor from it, so runall's
+/// clamp warning and the built pool cannot disagree.
+pub(crate) fn stage_worker_floor(
+    stage: Stage,
+    aligner: Option<&crate::pipeline::chains::options_bag::AlignOptions>,
+) -> usize {
+    match stage {
+        Stage::Zipper => ZIPPER_MIN_WORKERS,
+        Stage::Align => aligner.map_or(
+            crate::pipeline::steps::align::subprocess::SubprocessBackend::MIN_WORKERS,
+            |align| crate::pipeline::steps::align::min_workers_for(&align.aligner),
+        ),
+        _ => 1,
+    }
+}
+
+/// The pool-worker floor a chain's stages impose on `--threads` (the largest
+/// [`stage_worker_floor`]); 1 when no stage raises it. Lets `runall` resolve
+/// (and warn about) the sort's phase caps against the pool the chain will
+/// really run before the chain exists.
+pub(crate) fn chain_worker_floor(
+    stages: &[Stage],
+    aligner: Option<&crate::pipeline::chains::options_bag::AlignOptions>,
+) -> usize {
+    stages.iter().map(|&stage| stage_worker_floor(stage, aligner)).max().unwrap_or(1)
 }
 
 /// Folds an align backend's wiring result (`AlignWired::min_workers`,
@@ -6642,6 +6781,8 @@ mod tests {
             pending_header_transform: None,
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
+            sink_phase_cap: None,
+            sort_plan: None,
             sort_spill_stats: None,
             created_outputs: CreatedOutputs::default(),
             fastq_encoding: None,
@@ -6851,6 +6992,38 @@ mod tests {
             expected,
             "{stage:?} at {position:?}: drain-first opt-in mismatch"
         );
+    }
+
+    /// The chain floor runall predicts, against hard-coded expectations for
+    /// every stage combination that has one: a zipper's floor is 4, the
+    /// subprocess aligner's is 4, the in-process aligner's is 1, and a chain
+    /// with both takes the larger.
+    #[rstest::rstest]
+    #[case::sort_only(&[Stage::Sort], None, 1)]
+    #[case::sort_group(&[Stage::Sort, Stage::Group], None, 1)]
+    #[case::zipper_sort(&[Stage::Zipper, Stage::Sort], None, 4)]
+    #[case::align_subprocess_sort(&[Stage::Extract, Stage::Align, Stage::Sort], Some(false), 4)]
+    #[case::align_inproc_sort(&[Stage::Align, Stage::Sort], Some(true), 1)]
+    #[case::align_subprocess_zipper_sort(&[Stage::Align, Stage::Zipper, Stage::Sort], Some(false), 4)]
+    #[case::align_inproc_zipper_sort(&[Stage::Align, Stage::Zipper, Stage::Sort], Some(true), 4)]
+    fn chain_worker_floor_matches_the_stage_floors(
+        #[case] stages: &[Stage],
+        #[case] align_in_process: Option<bool>,
+        #[case] expected: usize,
+    ) {
+        let align = align_in_process.map(|in_process| {
+            let preset = in_process.then_some(crate::aligner::AlignerPreset::BwaMem3InProc);
+            crate::pipeline::chains::options_bag::AlignOptions {
+                aligner: crate::aligner::AlignerOptions {
+                    preset,
+                    command: preset.is_none().then(|| "bwa mem {ref} /dev/stdin".to_string()),
+                    ..crate::aligner::AlignerOptions::default()
+                },
+                reference: std::path::PathBuf::from("ref.fa"),
+                aligner_bin: None,
+            }
+        });
+        assert_eq!(chain_worker_floor(stages, align.as_ref()), expected);
     }
 
     /// Pin `fold_align_wired_scheduling` against the values the two align
@@ -7229,51 +7402,12 @@ mod tests {
         );
     }
 
-    /// Pin the per-phase thread resolution contract shared by the standalone and
-    /// streaming sort branches in `add_sort`: each phase falls back to the base
-    /// sorter-thread count when no explicit override is supplied, and is clamped
-    /// to at least 1. Exercises the production `resolve_phase_threads` helper
-    /// directly so it cannot drift from the code `add_sort` actually runs.
-    #[test]
-    fn sole_stage_sort_resolves_per_phase_threads() {
-        let num_sorter_threads = 8usize;
-
-        // Explicit overrides are used as-is (clamped ≥ 1).
-        assert_eq!(resolve_phase_threads(Some(1), num_sorter_threads), 1);
-        assert_eq!(resolve_phase_threads(Some(2), num_sorter_threads), 2);
-        // Zero is clamped to 1.
-        assert_eq!(resolve_phase_threads(Some(0), num_sorter_threads), 1);
-        // None falls back to num_sorter_threads.
-        assert_eq!(resolve_phase_threads(None, num_sorter_threads), 8);
-        // The `>= 1` clamp also applies to the fallback branch: a zero base
-        // sorter-thread count is clamped to 1, not passed through as 0. (Pins
-        // the fallback clamp so an impl that clamps only the override branch
-        // fails here.)
-        assert_eq!(resolve_phase_threads(None, 0), 1);
-        // And both zero at once still clamps to 1.
-        assert_eq!(resolve_phase_threads(Some(0), 0), 1);
-    }
-
-    /// Pin `sort_budget_threads` against the owned engine's
-    /// `Sort::memory_budget_threads` (sort.rs:607-616): `max(threads,
-    /// sort_threads)`, but 0 when `threads == 0` so `resolve_memory_budget`
-    /// still rejects a zero-thread run.
-    #[test]
-    fn sort_budget_threads_mirrors_owned_memory_budget_threads() {
-        assert_eq!(sort_budget_threads(2, Some(8)), 8); // sort_threads > threads → max
-        assert_eq!(sort_budget_threads(4, Some(2)), 4); // sort_threads < threads → threads
-        assert_eq!(sort_budget_threads(4, None), 4); // no override → threads (runall)
-        assert_eq!(sort_budget_threads(0, Some(8)), 0); // threads==0 → 0 (rejection preserved)
-    }
-
     /// `resolve_memory_budget` (the function `add_sort` feeds
-    /// `sort_budget_threads` into) scales a `Fixed` per-thread budget linearly
-    /// with the thread count, so a larger budget-thread count yields a larger
-    /// budget. This pins that scaling in isolation; that `add_sort` passes
-    /// `sort_budget_threads(num_threads, sort_threads)` (not the raw
-    /// `num_threads`) into it is guaranteed by the shared
-    /// `common::sort_memory_budget_threads` and pinned by
-    /// `sort_budget_threads_mirrors_owned_memory_budget_threads`.
+    /// `PhaseThreads::memory_budget_threads` into) scales a `Fixed` per-thread
+    /// budget linearly with the thread count, so a larger budget-thread count
+    /// yields a larger budget. This pins that scaling in isolation; the thread
+    /// count itself comes from `PhaseThreads::memory_budget_threads`, pinned by
+    /// the `phase_threads_*` tests in `commands::common`.
     /// `MemoryLimit::Auto` cannot be used here: it clamps to available memory, so
     /// both calls return ~available and integer division makes `b8 <= b2` — a
     /// false RED.

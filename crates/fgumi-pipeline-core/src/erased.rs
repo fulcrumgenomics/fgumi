@@ -32,6 +32,7 @@ use super::step::{
     Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind,
     StepOutcome, StepProfile,
 };
+use crate::admission::PhaseCap;
 use crate::runtime::contexts::StepCounters;
 
 /// The branch orderings the framework actually *builds* for a single-input
@@ -130,6 +131,13 @@ pub trait ErasedStep: Send + 'static {
     /// Defaults to `&[]` (adapters override to forward `inner.counters()`).
     fn counters(&self) -> &'static [CounterSpec] {
         &[]
+    }
+
+    /// Forward `Step::phase_cap` for `Pipeline::dag()` / diagnostics. Defaults
+    /// to `None`; the single-input adapter forwards `inner.phase_cap()`
+    /// (`Step2`/`StepK` steps have no pool cap today).
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        None
     }
 
     /// Dispatch `S::try_run` after downcasting queue handles.
@@ -535,6 +543,10 @@ where
 
     fn counters(&self) -> &'static [CounterSpec] {
         self.inner.counters()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.inner.phase_cap()
     }
 
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {

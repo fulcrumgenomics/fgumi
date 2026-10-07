@@ -1704,6 +1704,200 @@ pub(crate) fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> us
     }
 }
 
+/// Effective per-phase worker counts for a sort, resolved from `--threads`,
+/// `--sort-threads` and `--merge-threads`.
+///
+/// The ceiling is the pool: the number of workers the pipeline actually runs.
+/// That is `--threads`, except in a chain whose zipper or subprocess aligner
+/// raises the pool to a floor (see `chain_worker_floor`); a per-phase override
+/// is honoured only up to the pool (a larger value is clamped and
+/// [`Self::warn_if_clamped`] says so), and an unset override resolves to the
+/// whole pool. Each phase is clamped to at least 1 so a `0` override never
+/// disables a phase. Only an explicit override creates a phase cap (the chain
+/// builder's `sort_plan`); an unset one creates none, so it never binds.
+///
+/// The memory budget ([`Self::memory_budget_threads`]) follows the sort-phase
+/// count — the phase that fills the record buffer — so lowering `--sort-threads`
+/// lowers the budget and raising it past the pool no longer inflates it. A pool
+/// floor never enlarges the budget on its own: with `--sort-threads` unset the
+/// budget stays at `--threads`.
+///
+/// Single source of truth for the standalone `fgumi sort` banner, the `runall`
+/// `--sort::` validation and the chain builder's `add_sort`, so none of the
+/// three can drift from the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhaseThreads {
+    /// `--threads`, verbatim (including 0) so [`Self::memory_budget_threads`]
+    /// can preserve the zero-thread rejection.
+    threads: usize,
+    /// Workers the pipeline runs: `--threads`, or the chain's floor when that
+    /// is larger. The ceiling for both phases.
+    pool: usize,
+    /// The sort phase's worker count — inflate, the per-run radix sort and
+    /// spill compression: `min(--sort-threads, pool).max(1)`, or the whole pool
+    /// when `--sort-threads` is unset. Only an explicit `--sort-threads`
+    /// creates a cap at this count; unset, nothing in the phase is capped.
+    pub phase1: usize,
+    /// The merge phase's worker count — spill decompression, the in-memory
+    /// fast-path gather and the standalone sort's output compression:
+    /// `min(--merge-threads, pool).max(1)`, or the whole pool when
+    /// `--merge-threads` is unset. Only an explicit `--merge-threads` creates a
+    /// cap at this count; unset, nothing in the phase is capped.
+    pub phase2: usize,
+    /// `Some(requested)` iff `--sort-threads` exceeded the pool.
+    clamped_sort: Option<usize>,
+    /// `Some(requested)` iff `--merge-threads` exceeded the pool.
+    clamped_merge: Option<usize>,
+    /// `--sort-threads 0` was given (treated as 1).
+    zero_sort: bool,
+    /// `--merge-threads 0` was given (treated as 1).
+    zero_merge: bool,
+    /// See [`Self::memory_budget_threads`].
+    budget_threads: usize,
+    /// Whether `--sort-threads` (rather than `--threads`) set the budget.
+    budget_from_sort: bool,
+}
+
+impl PhaseThreads {
+    /// Resolve for a pool of exactly `--threads` workers (standalone sort).
+    #[must_use]
+    pub(crate) fn resolve(
+        threads: usize,
+        sort_threads: Option<usize>,
+        merge_threads: Option<usize>,
+    ) -> Self {
+        Self::resolve_in_pool(threads, threads, sort_threads, merge_threads)
+    }
+
+    /// Resolve for a pool of `pool` workers (taken as at least `threads`); see
+    /// the type docs for the contract.
+    #[must_use]
+    pub(crate) fn resolve_in_pool(
+        threads: usize,
+        pool: usize,
+        sort_threads: Option<usize>,
+        merge_threads: Option<usize>,
+    ) -> Self {
+        let pool = pool.max(threads);
+        let clamp = |requested: Option<usize>| match requested {
+            Some(n) if n > pool => (pool.max(1), Some(n)),
+            Some(n) => (n.max(1), None),
+            None => (pool.max(1), None),
+        };
+        let (phase1, clamped_sort) = clamp(sort_threads);
+        let (phase2, clamped_merge) = clamp(merge_threads);
+        // The budget is the sort-phase count, except that an unset
+        // `--sort-threads` keeps it at `--threads` even when a floor widened
+        // the pool; 0 when `--threads` is 0 so the budget resolver rejects it.
+        let budget_threads = match (threads, sort_threads) {
+            (0, _) => 0,
+            (_, Some(_)) => phase1,
+            (_, None) => phase1.min(threads),
+        };
+        Self {
+            threads,
+            pool,
+            phase1,
+            phase2,
+            clamped_sort,
+            clamped_merge,
+            zero_sort: sort_threads == Some(0),
+            zero_merge: merge_threads == Some(0),
+            budget_threads,
+            budget_from_sort: sort_threads.is_some() && budget_threads != threads,
+        }
+    }
+
+    /// Whether the record buffer is a fixed `--max-memory` multiplied per
+    /// thread: `--memory-per-thread` with a non-`auto` limit. An `auto` limit
+    /// is a whole-host total whatever `--memory-per-thread` says, so the sort
+    /// phase's thread count does not scale it. The one definition `fgumi sort`
+    /// and `runall` both use.
+    #[must_use]
+    pub(crate) fn budget_scales_per_thread(
+        max_memory: MemoryLimit,
+        memory_per_thread: bool,
+    ) -> bool {
+        memory_per_thread && matches!(max_memory, MemoryLimit::Fixed(_))
+    }
+
+    /// The count `--memory-per-thread` multiplies `--max-memory` by: the
+    /// effective sort-phase count, `--threads` when `--sort-threads` is unset
+    /// (a pool floor never enlarges it), and **0 when `--threads` is 0** so
+    /// [`resolve_memory_budget`] still rejects a zero-thread run instead of
+    /// being clamped up to 1 here.
+    #[must_use]
+    pub(crate) fn memory_budget_threads(&self) -> usize {
+        self.budget_threads
+    }
+
+    /// Which flag supplied [`Self::memory_budget_threads`], for the
+    /// `Max memory:` log line: `--sort-threads` only when it changed the count
+    /// from `--threads`; equal, clamped-to-`--threads` or absent is attributed
+    /// to `--threads`.
+    #[must_use]
+    pub(crate) fn memory_budget_threads_flag(&self) -> &'static str {
+        if self.budget_from_sort { "--sort-threads" } else { "--threads" }
+    }
+
+    /// Emit one `warn!` per clamped or zero override, naming the flags as the
+    /// user typed them: `flag_prefix` is `""` for `fgumi sort`
+    /// (`--sort-threads`) and `"sort::"` for `runall` (`--sort::sort-threads`).
+    /// Silent when `--threads` is 0 — that run is rejected next, and a clamp
+    /// message would only bury the real error. Call it exactly once per
+    /// command (the command layer, never the chain builder) so a run logs each
+    /// warning once.
+    ///
+    /// `budget_scales_per_thread` is [`Self::budget_scales_per_thread`] for
+    /// the command's memory flags; only when it holds does a `--sort-threads 0`
+    /// shrink the record buffer, so only then is that noted.
+    pub(crate) fn warn_if_clamped(&self, flag_prefix: &str, budget_scales_per_thread: bool) {
+        if self.threads == 0 {
+            return;
+        }
+        // The sort phase also sizes a per-thread memory budget, so a 0 there
+        // shrinks it.
+        let sort_zero_note = if budget_scales_per_thread {
+            " (so the record buffer is 1x the per-thread --max-memory)"
+        } else {
+            ""
+        };
+        for (flag, phase, requested, zero, effective, zero_note) in [
+            (
+                "sort-threads",
+                "sort",
+                self.clamped_sort,
+                self.zero_sort,
+                self.phase1,
+                sort_zero_note,
+            ),
+            ("merge-threads", "merge", self.clamped_merge, self.zero_merge, self.phase2, ""),
+        ] {
+            if let Some(requested) = requested {
+                let ceiling = if self.pool == self.threads {
+                    format!("--threads {}", self.threads)
+                } else {
+                    format!(
+                        "the {}-worker pool (--threads {}, raised to {} for this chain)",
+                        self.pool, self.threads, self.pool
+                    )
+                };
+                log::warn!(
+                    "--{flag_prefix}{flag} {requested} exceeds {ceiling}; the {phase} phase cannot \
+                     use more workers than the pool has, using {effective} (raise --threads to \
+                     widen the pool)"
+                );
+            }
+            if zero {
+                log::warn!(
+                    "--{flag_prefix}{flag} 0 is treated as 1: the {phase} phase needs at least \
+                     one worker{zero_note}"
+                );
+            }
+        }
+    }
+}
+
 /// Resolve a memory budget to a concrete byte count.
 ///
 /// For [`MemoryLimit::Auto`]: detects total host memory (cgroup-aware via
@@ -1717,19 +1911,6 @@ pub(crate) fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> us
 /// For [`MemoryLimit::Fixed`]: multiplies by `threads` when `per_thread` is set;
 /// the reserve and host size are ignored.
 ///
-/// The thread count that sizes a sort's per-thread memory budget: `--threads`
-/// is the floor, raised to `--sort-threads` when that override is larger, but
-/// **0 when `--threads` is 0** so `resolve_memory_budget` still rejects a
-/// zero-thread run rather than being clamped up here.
-///
-/// Single source of truth for both the owned-engine banner path
-/// (`Sort::memory_budget_threads`) and the chain builder's `add_sort`
-/// (`sort_budget_threads`), so the two cannot drift.
-#[must_use]
-pub(crate) fn sort_memory_budget_threads(num_threads: usize, sort_threads: Option<usize>) -> usize {
-    if num_threads == 0 { 0 } else { num_threads.max(sort_threads.unwrap_or(0)) }
-}
-
 /// Calls [`detect_total_memory`] exactly once (it invokes `sysinfo`, which is
 /// not free).
 pub(crate) fn resolve_memory_budget(
@@ -3973,5 +4154,230 @@ mod tests {
         let records = vec![vec![0x01u8]];
         serialize_raw_bam_records(&records, &mut output).unwrap();
         assert_eq!(output, vec![0xAA, 0xBB, 0x01, 0x00, 0x00, 0x00, 0x01]);
+    }
+
+    /// The contract: `--threads` is the ceiling for both phases, an override
+    /// above it is clamped (and remembered so the command layer can warn),
+    /// `0` is clamped up to 1, and `threads == 0` is preserved verbatim.
+    #[rstest]
+    #[case::defaults(16, None, None, 16, 16, None, None)]
+    #[case::sort_below(16, Some(4), None, 4, 16, None, None)]
+    #[case::sort_equal(16, Some(16), None, 16, 16, None, None)]
+    #[case::sort_above_clamps(16, Some(32), None, 16, 16, Some(32), None)]
+    #[case::merge_below(16, None, Some(4), 16, 4, None, None)]
+    #[case::merge_above_clamps(16, None, Some(32), 16, 16, None, Some(32))]
+    #[case::both_clamped(2, Some(8), Some(8), 2, 2, Some(8), Some(8))]
+    #[case::zero_override_is_one(16, Some(0), Some(0), 1, 1, None, None)]
+    #[case::threads_one(1, Some(4), Some(4), 1, 1, Some(4), Some(4))]
+    #[case::threads_zero_keeps_zero(0, Some(8), None, 1, 1, Some(8), None)]
+    fn phase_threads_resolve(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+        #[case] phase1: usize,
+        #[case] phase2: usize,
+        #[case] clamped_sort: Option<usize>,
+        #[case] clamped_merge: Option<usize>,
+    ) {
+        let phases = PhaseThreads::resolve(threads, sort_threads, merge_threads);
+        assert_eq!(phases.threads, threads, "--threads is kept verbatim");
+        assert_eq!(phases.phase1, phase1);
+        assert_eq!(phases.phase2, phase2);
+        assert_eq!(phases.clamped_sort, clamped_sort);
+        assert_eq!(phases.clamped_merge, clamped_merge);
+    }
+
+    /// The budget multiplier follows the *effective* sort-phase count: down
+    /// when `--sort-threads` is lower, never up past `--threads`, and 0 when
+    /// `--threads` is 0 so `resolve_memory_budget` still rejects that run.
+    #[rstest]
+    #[case::defaults(16, None, 16)]
+    #[case::sort_below(16, Some(4), 4)]
+    #[case::sort_equal(16, Some(16), 16)]
+    #[case::sort_above_clamps(16, Some(32), 16)]
+    #[case::sort_zero(16, Some(0), 1)]
+    #[case::threads_zero(0, Some(8), 0)]
+    #[case::threads_zero_no_override(0, None, 0)]
+    fn phase_threads_memory_budget_threads(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            PhaseThreads::resolve(threads, sort_threads, None).memory_budget_threads(),
+            expected
+        );
+    }
+
+    /// `Max memory:` names `--sort-threads` only when it lowered the count.
+    #[rstest]
+    #[case::defaults(16, None, "--threads")]
+    #[case::sort_below(16, Some(4), "--sort-threads")]
+    #[case::sort_equal(16, Some(16), "--threads")]
+    #[case::sort_above_clamps(16, Some(32), "--threads")]
+    #[case::sort_zero(16, Some(0), "--sort-threads")]
+    #[case::threads_zero(0, Some(8), "--threads")]
+    fn phase_threads_memory_budget_threads_flag(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            PhaseThreads::resolve(threads, sort_threads, None).memory_budget_threads_flag(),
+            expected
+        );
+    }
+
+    /// `--max-memory auto` is sized by the effective phase-1 count and still
+    /// rejects `--threads 0` through `memory_budget_threads()`.
+    #[test]
+    fn phase_threads_auto_memory_follows_phase1_and_keeps_zero_rejection() {
+        let total = 64 * 1024 * 1024 * 1024;
+        let reserve = MemoryReserve::Fixed(8 * 1024 * 1024 * 1024);
+        let clamped = PhaseThreads::resolve(16, Some(32), None);
+        let plain = PhaseThreads::resolve(16, None, None);
+        let a = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            reserve,
+            clamped.memory_budget_threads(),
+            true,
+            total,
+        )
+        .unwrap();
+        let b = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            reserve,
+            plain.memory_budget_threads(),
+            true,
+            total,
+        )
+        .unwrap();
+        assert_eq!(a, b, "a clamped --sort-threads must not change the auto budget");
+
+        let zero = PhaseThreads::resolve(0, Some(8), None);
+        let err = resolve_memory_budget_with_total(
+            MemoryLimit::Auto,
+            reserve,
+            zero.memory_budget_threads(),
+            true,
+            total,
+        )
+        .expect_err("--threads 0 must still be rejected");
+        assert!(err.to_string().contains("--threads must be at least 1"), "got: {err}");
+    }
+
+    /// The warning lines `warn_if_clamped` emits for one resolution.
+    fn clamp_warnings(phases: PhaseThreads, flag_prefix: &str) -> Vec<String> {
+        clamp_warnings_with(phases, flag_prefix, true)
+    }
+
+    /// [`clamp_warnings`] with an explicit per-thread-budget flag.
+    fn clamp_warnings_with(
+        phases: PhaseThreads,
+        flag_prefix: &str,
+        budget_scales_per_thread: bool,
+    ) -> Vec<String> {
+        let _session = test_log_capture::capture_logs();
+        phases.warn_if_clamped(flag_prefix, budget_scales_per_thread);
+        test_log_capture::captured_with_level()
+            .into_iter()
+            .filter(|(level, _)| *level == log::Level::Warn)
+            .map(|(_, msg)| msg)
+            .collect()
+    }
+
+    /// Exactly one warning line per clamped or zero flag, none otherwise, and
+    /// none at all for `--threads 0` (that run is rejected next).
+    #[rstest]
+    #[case::none_clamped(16, Some(4), Some(16), &[])]
+    #[case::sort_clamped(16, Some(32), None, &["--sort-threads 32 exceeds --threads 16; the sort phase cannot use more workers than the pool has, using 16 (raise --threads to widen the pool)"])]
+    #[case::merge_clamped(16, None, Some(32), &["--merge-threads 32 exceeds --threads 16; the merge phase cannot use more workers than the pool has, using 16 (raise --threads to widen the pool)"])]
+    #[case::both_clamped(2, Some(8), Some(8), &[
+        "--sort-threads 8 exceeds --threads 2; the sort phase cannot use more workers than the pool has, using 2 (raise --threads to widen the pool)",
+        "--merge-threads 8 exceeds --threads 2; the merge phase cannot use more workers than the pool has, using 2 (raise --threads to widen the pool)",
+    ])]
+    #[case::zero_sort(4, Some(0), None, &["--sort-threads 0 is treated as 1: the sort phase needs at least one worker (so the record buffer is 1x the per-thread --max-memory)"])]
+    #[case::zero_merge(4, None, Some(0), &["--merge-threads 0 is treated as 1: the merge phase needs at least one worker"])]
+    #[case::threads_zero_is_silent(0, Some(8), Some(0), &[])]
+    fn phase_threads_warn_if_clamped_emits_one_line_per_clamped_flag(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+        #[case] expected: &[&str],
+    ) {
+        let warnings =
+            clamp_warnings(PhaseThreads::resolve(threads, sort_threads, merge_threads), "");
+        assert_eq!(warnings, expected, "warn_if_clamped output");
+    }
+
+    /// The `--sort-threads 0` buffer note appears only when the buffer really
+    /// scales per thread — a fixed `--max-memory` with `--memory-per-thread` —
+    /// as decided from the real flag values by
+    /// [`PhaseThreads::budget_scales_per_thread`].
+    #[rstest]
+    #[case::fixed_per_thread(MemoryLimit::Fixed(1 << 30), true, true)]
+    #[case::fixed_total(MemoryLimit::Fixed(1 << 30), false, false)]
+    #[case::auto_per_thread(MemoryLimit::Auto, true, false)]
+    #[case::auto_total(MemoryLimit::Auto, false, false)]
+    fn sort_threads_zero_notes_the_buffer_only_when_it_scales_per_thread(
+        #[case] max_memory: MemoryLimit,
+        #[case] memory_per_thread: bool,
+        #[case] noted: bool,
+    ) {
+        let scales = PhaseThreads::budget_scales_per_thread(max_memory, memory_per_thread);
+        assert_eq!(scales, noted);
+        let warnings = clamp_warnings_with(PhaseThreads::resolve(4, Some(0), None), "", scales);
+        let base = "--sort-threads 0 is treated as 1: the sort phase needs at least one worker";
+        let expected = if noted {
+            format!("{base} (so the record buffer is 1x the per-thread --max-memory)")
+        } else {
+            base.to_owned()
+        };
+        assert_eq!(warnings, [expected]);
+    }
+
+    /// runall names the flags as the user typed them (`--sort::…`), and a pool
+    /// a zipper/aligner floor widened is named as such rather than as
+    /// `--threads`.
+    #[rstest]
+    #[case::runall_prefix(4, 4, Some(8), &["--sort::sort-threads 8 exceeds --threads 4; the sort phase cannot use more workers than the pool has, using 4 (raise --threads to widen the pool)"])]
+    #[case::floored_pool(2, 4, Some(8), &["--sort::sort-threads 8 exceeds the 4-worker pool (--threads 2, raised to 4 for this chain); the sort phase cannot use more workers than the pool has, using 4 (raise --threads to widen the pool)"])]
+    #[case::floored_pool_within(2, 4, Some(4), &[])]
+    fn phase_threads_runall_warnings_name_prefixed_flags_and_the_real_pool(
+        #[case] threads: usize,
+        #[case] pool: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] expected: &[&str],
+    ) {
+        let warnings = clamp_warnings(
+            PhaseThreads::resolve_in_pool(threads, pool, sort_threads, None),
+            "sort::",
+        );
+        assert_eq!(warnings, expected, "warn_if_clamped output");
+    }
+
+    /// A pool floor (zipper / subprocess aligner) is the ceiling for the
+    /// caps, so an unset override never binds, while the budget never grows
+    /// from the floor alone: unset keeps `--threads`, an explicit override is
+    /// honoured up to the pool.
+    #[rstest]
+    #[case::unset_threads_one(1, 4, None, None, 4, 4, 1)]
+    #[case::sort_override_within_pool(2, 4, Some(4), None, 4, 4, 4)]
+    #[case::sort_override_above_pool(1, 4, Some(8), None, 4, 4, 4)]
+    #[case::merge_override_within_pool(1, 4, None, Some(2), 4, 2, 1)]
+    #[case::pool_below_threads_is_threads(8, 4, None, None, 8, 8, 8)]
+    fn phase_threads_resolve_in_pool(
+        #[case] threads: usize,
+        #[case] pool: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] merge_threads: Option<usize>,
+        #[case] phase1: usize,
+        #[case] phase2: usize,
+        #[case] budget: usize,
+    ) {
+        let phases = PhaseThreads::resolve_in_pool(threads, pool, sort_threads, merge_threads);
+        assert_eq!((phases.phase1, phases.phase2), (phase1, phase2), "phase counts");
+        assert_eq!(phases.memory_budget_threads(), budget, "budget threads");
+        assert_eq!(phases.clamped_sort, sort_threads.filter(|&n| n > pool.max(threads)));
     }
 }

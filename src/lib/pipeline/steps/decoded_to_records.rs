@@ -19,6 +19,9 @@
 //! framework can clone this step across workers.
 
 use std::io;
+use std::sync::Arc;
+
+use crate::pipeline::core::{PhaseCap, admit_input};
 
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
@@ -37,18 +40,32 @@ use crate::pipeline::steps::types::{DecodedRecordBatch, RecordBatch, RecordBatch
 pub struct DecodedRecordBatchToRecordBatch {
     held: HeldSlot<Unpushed<RecordBatch>>,
     output_byte_limit: u64,
+    /// Phase-1 admission cap, set by the chain builder only when this step
+    /// is sort ingest (`None` = uncapped, every other chain).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl DecodedRecordBatchToRecordBatch {
+    /// Share the sort's phase-1 admission cap (see `ChainBuilder::add_sort`).
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
     #[must_use]
     pub fn new(output_byte_limit: u64) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit }
+        Self { held: HeldSlot::new(), output_byte_limit, cap: None }
     }
 }
 
 impl Clone for DecodedRecordBatchToRecordBatch {
     fn clone(&self) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit: self.output_byte_limit }
+        Self {
+            held: HeldSlot::new(),
+            output_byte_limit: self.output_byte_limit,
+            cap: self.cap.clone(),
+        }
     }
 }
 
@@ -82,6 +99,14 @@ impl Step for DecodedRecordBatchToRecordBatch {
             }
         }
 
+        // Phase-1 admission when the chain builder capped this step (sort
+        // ingest under `--sort-threads`); a no-op otherwise. See the
+        // pipeline-core `admission` module.
+        let _permit = match admit_input(ctx.input, self.cap.as_deref()) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
         let Some(batch) = ctx.input.pop() else {
             if ctx.input.is_drained() {
                 return Ok(StepOutcome::Finished);
@@ -112,6 +137,10 @@ impl Step for DecodedRecordBatchToRecordBatch {
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
@@ -169,5 +198,15 @@ mod tests {
         assert_eq!(rb.len(), 2, "2 records flattened from 2 decoded records");
         let actual_bytes: Vec<Vec<u8>> = rb.iter_record_bytes().map(<[u8]>::to_vec).collect();
         assert_eq!(actual_bytes, expected_bytes, "record bytes must survive verbatim");
+    }
+
+    /// Sort ingest under `--sort-threads`: the phase-1 admission contract.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        crate::pipeline::core::testing::assert_admission_contract(
+            "sort-phase1",
+            |cap| DecodedRecordBatchToRecordBatch::new(1 << 20).with_phase_cap(cap),
+            DecodedRecordBatch::new(0, vec![make_decoded_record(b"q1")]),
+        );
     }
 }

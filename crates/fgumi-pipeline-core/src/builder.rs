@@ -1036,6 +1036,20 @@ impl Pipeline {
         Arc::new(PipelineStats::new(names))
     }
 
+    /// Every capped step in chain order, as `(step name, its cap)`. Steps
+    /// without a [`crate::Step::phase_cap`] are skipped. The caps are the live
+    /// shared counters, so tests can check which steps share one (compare the
+    /// references with [`std::ptr::eq`]) or probe them with
+    /// [`crate::PhaseCap::try_acquire`]. Test support only.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn phase_caps(&self) -> Vec<(&'static str, &crate::PhaseCap)> {
+        self.steps
+            .iter()
+            .filter_map(|step| step.phase_cap().map(|cap| (step.profile().name, cap)))
+            .collect()
+    }
+
     /// Render the chain shape as a multi-line debug string. Lists each step
     /// in chain order with its profile (kind, sticky, branch count) and
     /// the consumer for each output branch. Used for diagnostics and for
@@ -1044,6 +1058,9 @@ impl Pipeline {
     /// The output isn't a stable serialization format — it's a developer-
     /// readable summary, intended to be `println!`'d during debugging or
     /// embedded in error messages.
+    ///
+    /// A step with a `phase_cap()` renders `cap=<name>(<max>)` after its
+    /// branch count.
     #[must_use]
     pub fn dag(&self) -> String {
         use std::fmt::Write as _;
@@ -1079,6 +1096,9 @@ impl Pipeline {
                 sticky = profile.sticky,
                 n_branches = n_branches,
             );
+            if let Some(cap) = step.phase_cap() {
+                let _ = write!(s, " cap={}", cap.describe());
+            }
             if n_branches == 0 {
                 let _ = writeln!(s, " (sink)");
             } else {
@@ -1143,6 +1163,14 @@ impl Pipeline {
         use super::topology::StepIdx;
 
         let Self { mut steps, graph, signal } = self;
+        // A whole-cap reservation (`PhaseCap::acquire_whole`) parks off the pool;
+        // bind this run's signal to every cap so a cancelled or failed run does
+        // not leave it parked.
+        for step in &steps {
+            if let Some(cap) = step.phase_cap() {
+                cap.bind_signal(&signal);
+            }
+        }
         let n_threads = config.threads;
         let stats_arc = config.stats;
         let deadlock_timeout_secs = config.deadlock_timeout_secs;
@@ -3319,6 +3347,57 @@ mod tests {
         assert!(dag.contains("→ SinkU32"), "DAG missing source→sink wiring: {dag}");
     }
 
+    /// A step that reports a `phase_cap()` renders it on its DAG line; one that
+    /// does not shows no `cap=` token.
+    #[test]
+    fn dag_renders_phase_cap_on_capped_steps() {
+        use crate::admission::PhaseCap;
+
+        // Mirrors `StubTransform` (u32 → u32 so it sits between `StubSource`
+        // and `StubSinkU32`); the pipeline is only built, never run.
+        struct CappedTransform(std::sync::Arc<PhaseCap>);
+        impl Step for CappedTransform {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "CappedTransform",
+                    kind: StepKind::Parallel,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::Unbounded],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn phase_cap(&self) -> Option<&PhaseCap> {
+                Some(&self.0)
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(StepOutcome::NoProgress)
+            }
+            fn new_worker_copy(&self) -> Self {
+                Self(std::sync::Arc::clone(&self.0))
+            }
+        }
+
+        let cap = PhaseCap::new("sort-phase1", 4);
+        let builder = PipelineBuilder::new();
+        builder.chain(StubSource).chain(CappedTransform(cap)).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let dag = pipeline.dag();
+        // Step header lines carry `branches=`; branch lines (`.0: ... → Consumer`)
+        // also name the consumer, so match on the header only.
+        let capped = dag
+            .lines()
+            .find(|l| l.contains("CappedTransform") && l.contains("branches="))
+            .expect("step line");
+        assert!(capped.contains("cap=sort-phase1(4)"), "missing cap token: {capped}");
+        let source = dag
+            .lines()
+            .find(|l| l.contains("Source") && l.contains("branches="))
+            .expect("source line");
+        assert!(!source.contains("cap="), "uncapped step must not render a cap token: {source}");
+    }
+
     #[test]
     fn dag_renders_effective_collapsed_ordering_for_serial_exclusive() {
         // `StubSource` is `Exclusive` and declares `BranchOrdering::ByOrdinal`,
@@ -4206,6 +4285,100 @@ mod tests {
 
         let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
         assert!(matches!(result, Err(PipelineError::Cancelled)));
+    }
+
+    /// A step parked in `PhaseCap::acquire_whole` (an off-pool sort waiting for
+    /// pool holders) is woken by the run's cancel: `Pipeline::run` binds the
+    /// run's signal to every step's cap, so the run returns `Cancelled`
+    /// promptly and leaves no reservation behind. Without that binding the wait
+    /// is untimed and never ends; the watchdog turns that into a failure.
+    #[test]
+    fn cancel_wakes_a_step_parked_for_the_whole_cap() {
+        use crate::admission::PhaseCap;
+
+        #[derive(Clone)]
+        struct WholeCapSource {
+            cap: Arc<PhaseCap>,
+        }
+        impl Step for WholeCapSource {
+            type Input = ();
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "WholeCapSource",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::CountBounded { capacity: 8 }],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+                match self.cap.acquire_whole() {
+                    Some(_whole) => Ok(StepOutcome::Progress),
+                    None => Ok(StepOutcome::NoProgress),
+                }
+            }
+            fn phase_cap(&self) -> Option<&PhaseCap> {
+                Some(&self.cap)
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        #[derive(Clone)]
+        struct DiscardSink;
+        impl Step for DiscardSink {
+            type Input = u32;
+            type Outputs = ();
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "DiscardSink",
+                    kind: StepKind::Parallel,
+                    sticky: false,
+                    output_queues: vec![],
+                    branch_ordering: vec![],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+                match ctx.input.pop() {
+                    Some(_) => Ok(StepOutcome::Progress),
+                    None => Ok(StepOutcome::NoProgress),
+                }
+            }
+            fn new_worker_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let cap = PhaseCap::new("whole-cap-cancel", 2);
+        // A pool holder that never releases: the step can only park.
+        let held = cap.try_acquire().expect("holder");
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(WholeCapSource { cap: Arc::clone(&cap) })
+            .chain(DiscardSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let cancel = pipeline.cancel_handle();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = pipeline.run(PipelineConfig { threads: 2, ..Default::default() });
+            let _ = tx.send(matches!(result, Err(PipelineError::Cancelled)));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cap.pending_reservations() == 0 {
+            assert!(std::time::Instant::now() < deadline, "the step never parked");
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+        let cancelled = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run must return promptly: the cancel wakes the parked step");
+        assert!(cancelled, "the run reports the cancel");
+        assert_eq!(cap.pending_reservations(), 0, "no reservation left behind");
+        drop(held);
     }
 
     #[test]

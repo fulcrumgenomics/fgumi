@@ -282,8 +282,10 @@ jobs:
           cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked --lib \
             -E 'test(bwa_mem3_engine_smoke_pair_emit)'
 
-  # `merge_slots.rs` swaps `std::sync` for `loom::sync` under `--cfg loom`, and
-  # `tests/loom_merge_slots.rs` is `#![cfg(loom)]`. Neither is built by any other
+  # `merge_slots.rs` (fgumi-sort) and `admission.rs` (fgumi-pipeline-core) swap
+  # their sync primitives for loom's under `--cfg loom`, and
+  # `tests/loom_merge_slots.rs` and `tests/loom_admission.rs`, which drive those
+  # real types, are `#![cfg(loom)]`. None is built by any other
   # job, so without this one a broken model — or a `cfg(loom)` build that stopped
   # compiling — is invisible: the test target compiles to an empty binary under a
   # normal build and reports success. That silence is the whole reason this job
@@ -292,9 +294,9 @@ jobs:
   # Per-PR rather than on a schedule, unlike `miri.yml` and `stress.yml`. Those
   # two are scheduled because they are non-deterministic in ways unrelated to a
   # given change (a nightly-toolchain regression; timing sensitivity). Loom
-  # explores a bounded state space deterministically — four of the five models
-  # under a preemption bound, see the test's "Preemption-bounded exploration"
-  # note — so the same input yields the same verdict with no flake, which is
+  # explores a bounded state space deterministically — every model in both
+  # files runs under a preemption bound (see `loom_merge_slots.rs`'s
+  # "Preemption-bounded exploration" note) — so the same input yields the same verdict with no flake, which is
   # what lets it gate a PR, and a gate is what stops it rotting.
   loom:
     runs-on: ubuntu-latest
@@ -312,6 +314,10 @@ jobs:
       # several times as long for the same verdict.
       - name: Loom model check (SortMergeSlot)
         run: cargo test -p fgumi-sort --test loom_merge_slots --release
+        env:
+          RUSTFLAGS: --cfg loom
+      - name: Loom model check (phase-cap whole-cap reservation)
+        run: cargo test -p fgumi-pipeline-core --test loom_admission --release
         env:
           RUSTFLAGS: --cfg loom
 

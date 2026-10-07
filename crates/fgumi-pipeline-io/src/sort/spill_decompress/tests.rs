@@ -1,7 +1,7 @@
 use super::*;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use fgumi_sort::{SortMergeSlot, SpillCodec};
 
@@ -19,61 +19,168 @@ fn zero_output_byte_limit_normalizes_reorder_window() {
     assert_eq!(nonzero.window_budget, 4 * 1024 * 1024, "nonzero budget passes through unchanged");
 }
 
+/// A fresh step is uncapped (the chain builder decides the phase), and
+/// `with_phase_cap` installs the cap on the seed and shares the same counter
+/// with every clone.
 #[test]
-fn admission_counter_caps_concurrency() {
-    let active = Arc::new(AtomicUsize::new(0));
-    let max = Some(2usize);
-    // Acquire up to the cap; hold the permits so the count accumulates.
-    let p1 = try_acquire(&active, max);
-    assert!(p1.is_some());
-    let p2 = try_acquire(&active, max);
-    assert!(p2.is_some());
-    assert!(try_acquire(&active, max).is_none()); // at cap
-    drop(p1); // releasing one permit frees a slot
-    assert!(try_acquire(&active, max).is_some()); // freed one slot
-    drop(p2);
+fn with_phase_cap_replaces_the_uncapped_default_on_seed_and_clones() {
+    use fgumi_pipeline_core::PhaseCap;
+    let plain = SortSpillDecompress::new(4096, SortDecompressTuning::default());
+    assert!(plain.phase_cap().is_none(), "uncapped by default");
+
+    let cap = PhaseCap::new("sort-phase2", 1);
+    let capped = plain.with_phase_cap(Some(Arc::clone(&cap)));
+    assert_eq!(capped.phase_cap().map(PhaseCap::describe).as_deref(), Some("sort-phase2(1)"));
+    let clone = capped.clone();
+    let _held = cap.try_acquire().expect("the only permit");
+    assert!(
+        clone.phase_cap().expect("capped").try_acquire().is_none(),
+        "the clone shares the exhausted counter"
+    );
 }
 
+/// The permit gates only the slot fill: with the only permit held elsewhere
+/// the step fills nothing and reports `Capped` while a slot is live; once the
+/// permit is released it fills (here: reads the empty spill to EOF).
 #[test]
-fn admission_counter_unbounded_when_none() {
-    let active = Arc::new(AtomicUsize::new(0));
-    for _ in 0..1000 {
-        assert!(try_acquire(&active, None).is_some());
-    }
+fn full_cap_refuses_the_fill_then_fills_after_release() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    use fgumi_pipeline_core::{PhaseCap, StepOutcome};
+    let cap = PhaseCap::new("sort-phase2", 1);
+    let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
+        .with_phase_cap(Some(Arc::clone(&cap)));
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        BufReader::new(tempfile::tempfile().expect("tempfile")),
+        SpillCodec::Zstd,
+    ));
+    step.registry.lock().push(RegisteredSpill { slot: Arc::clone(&slot) });
+    let probe = StepProbe::new(&step);
+
+    let held = cap.try_acquire().expect("the only permit");
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Capped);
+    assert!(!slot.queue_eof.load(Ordering::Acquire), "a refused clone must not fill the slot");
+
+    drop(held);
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+    assert!(slot.queue_eof.load(Ordering::Acquire), "the admitted clone fills the slot to EOF");
+    assert_eq!(cap.active(), 0, "the permit is released when try_run returns");
 }
 
-/// Under real thread contention, the shared counter never exceeds the cap and
-/// every acquired permit is released via `DecompressPermit::drop` (the counter
-/// returns to zero). Mirrors how `new_worker_copy` clones share one `active`.
+/// An idle scan takes no phase-2 permit: with no live slot and the only permit
+/// held elsewhere (by the output compressor, say), the step reports
+/// `NoProgress` — not `Capped` — and counts no refusal, so idle decompress
+/// clones can never crowd the output compressor out of the shared cap.
 #[test]
-fn admission_counter_concurrent_never_exceeds_cap() {
-    use std::thread;
+fn idle_scan_with_no_live_slot_takes_no_permit() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    use fgumi_pipeline_core::{PhaseCap, StepOutcome};
+    let cap = PhaseCap::new("sort-phase2", 1);
+    let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
+        .with_phase_cap(Some(Arc::clone(&cap)));
+    let probe = StepProbe::new(&step);
+    let held = cap.try_acquire().expect("the only permit");
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::NoProgress);
+    assert_eq!(cap.refused(), 0, "no slot to fill, so no admission attempt");
+    probe.close_input();
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Finished);
+    assert_eq!(cap.refused(), 0);
+    drop(held);
+}
 
-    let active = Arc::new(AtomicUsize::new(0));
-    let cap = 3usize;
-    let handles: Vec<_> = (0..16)
-        .map(|_| {
-            let active = Arc::clone(&active);
-            thread::spawn(move || {
-                for _ in 0..5000 {
-                    // The returned permit IS the ownership token; its Drop at the
-                    // end of the block exercises the decrement.
-                    if let Some(_permit) = try_acquire(&active, Some(cap)) {
-                        // Occupancy observed while holding a permit can never
-                        // exceed the cap: `try_acquire` only increments past a
-                        // CAS that checks `cur < cap`, and the count only drops
-                        // otherwise.
-                        let occupancy = active.load(Ordering::Acquire);
-                        assert!(occupancy <= cap, "occupancy {occupancy} exceeded cap {cap}");
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().expect("worker thread panicked");
+/// A live slot whose FIFO is full cannot be filled, so a capped poll takes no
+/// permit, is not a refusal, and reports `NoProgress`; once the merge drains a
+/// block the next poll is admitted.
+#[test]
+fn live_but_unfillable_slot_takes_no_permit() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    use fgumi_pipeline_core::{PhaseCap, StepOutcome};
+    let cap = PhaseCap::new("sort-phase2", 1);
+    let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
+        .with_phase_cap(Some(Arc::clone(&cap)));
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        BufReader::new(tempfile::tempfile().expect("tempfile")),
+        SpillCodec::Zstd,
+    ));
+    for _ in 0..fgumi_sort::PHASE2_DECOMP_CAP {
+        slot.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
     }
-    assert_eq!(active.load(Ordering::Acquire), 0, "every permit must be released on drop");
+    step.registry.lock().push(RegisteredSpill { slot: Arc::clone(&slot) });
+    let probe = StepProbe::new(&step);
+
+    let held = cap.try_acquire().expect("the only permit");
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::NoProgress);
+    assert_eq!(cap.refused(), 0, "an unfillable slot is not a refusal");
+    drop(held);
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::NoProgress);
+    assert_eq!(slot.fifo_len(), fgumi_sort::PHASE2_DECOMP_CAP, "nothing was read");
+
+    slot.decompressed.lock().expect("decompressed lock").pop_front();
+    let held = cap.try_acquire().expect("the only permit");
+    assert_eq!(
+        probe.try_run(&mut step).expect("try_run"),
+        StepOutcome::Capped,
+        "with room, the poll needs the permit"
+    );
+    assert_eq!(cap.refused(), 1);
+    drop(held);
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+}
+
+/// Uncapped, the step keeps its pre-cap behaviour: no registry scan before the
+/// fill, and a live slot that could not be filled (here: FIFO full) is
+/// contention, not idleness; with no live slot and input drained it finishes.
+#[test]
+fn uncapped_poll_keeps_the_atomic_only_liveness_check() {
+    use fgumi_pipeline_core::StepOutcome;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default());
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        BufReader::new(tempfile::tempfile().expect("tempfile")),
+        SpillCodec::Zstd,
+    ));
+    for _ in 0..fgumi_sort::PHASE2_DECOMP_CAP {
+        slot.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
+    }
+    step.registry.lock().push(RegisteredSpill { slot: Arc::clone(&slot) });
+    let probe = StepProbe::new(&step);
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Contention);
+    assert_eq!(slot.fifo_len(), fgumi_sort::PHASE2_DECOMP_CAP, "nothing was read");
+
+    slot.queue_eof.store(true, Ordering::Release);
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::NoProgress);
+    probe.close_input();
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Finished);
+}
+
+/// Forwarding input events to the merge is bookkeeping, not phase-2 work: it
+/// runs with the cap full and takes no permit, so the merge is never starved
+/// of announcements behind decompressing clones.
+#[test]
+fn input_events_are_forwarded_while_the_cap_is_full() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    use fgumi_pipeline_core::{InputHandle, PhaseCap, StepOutcome};
+    let cap = PhaseCap::new("sort-phase2", 1);
+    let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
+        .with_phase_cap(Some(Arc::clone(&cap)));
+    let mut probe = StepProbe::new(&step);
+    let out = probe.take_output::<SortPhase2Event>(0);
+    probe.push_input(SortPhase1Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    let held = cap.try_acquire().expect("the only permit");
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+    assert!(
+        matches!(out.pop(), Some(SortPhase2Event::AllAnnounced { .. })),
+        "the event is forwarded while the only permit is held elsewhere"
+    );
+    assert_eq!(cap.active(), 1, "forwarding took no permit");
+    assert_eq!(cap.refused(), 0);
+    drop(held);
 }
 
 // Most coverage for the decompress step lives in sort/tests.rs (the oracle parity

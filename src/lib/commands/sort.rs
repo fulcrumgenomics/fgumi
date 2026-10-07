@@ -290,9 +290,10 @@ pub struct Sort {
     /// resident index on top of this.
     ///
     /// The two budgets scale by different thread counts: the record buffer by
-    /// max(--threads, --sort-threads) (the sort phase fills it), the queue budget
-    /// by --threads (the width of the ingest/output plumbing), so their resolved
-    /// totals can differ for the same value when --sort-threads > --threads.
+    /// the effective sort-phase thread count, min(--threads, --sort-threads)
+    /// (the sort phase fills it), the queue budget by --threads (the width of
+    /// the ingest/output plumbing), so their resolved totals differ when
+    /// --sort-threads is below --threads.
     /// Raising this value does not raise the queues' per-stage backpressure marks,
     /// so a large or `auto` value bounds the queues at those marks, not the full
     /// total; only a value below them tightens the queues.
@@ -313,13 +314,13 @@ pub struct Sort {
     /// Scale memory limit by thread count (samtools behavior).
     ///
     /// When enabled (default), --max-memory specifies memory per thread. Total
-    /// memory = `max_memory` × the larger of --threads and --sort-threads, since
-    /// the sort phase is what fills the in-memory buffer. Disable for fixed total
-    /// memory.
+    /// memory = `max_memory` × the effective sort-phase thread count,
+    /// min(--threads, --sort-threads), since the sort phase is what fills the
+    /// in-memory buffer. Disable for fixed total memory.
     ///
     /// This formula is for the in-memory sort buffer. --max-memory also bounds
     /// the inter-stage queue budget (see its docs), which scales by --threads
-    /// alone, so the two totals differ when --sort-threads > --threads.
+    /// alone, so the two totals differ when --sort-threads is below --threads.
     #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 
@@ -340,35 +341,42 @@ pub struct Sort {
 
     /// Number of threads for parallel operations.
     ///
-    /// Used for parallel sorting of in-memory chunks and parallel temp-chunk
-    /// (BGZF or zstd) compression.
+    /// Pool workers for the whole run and the ceiling for both per-phase
+    /// counts: `--sort-threads` and `--merge-threads` can lower a phase's
+    /// share but never raise it past this.
     ///
-    /// This is also the floor for the `--max-memory --memory-per-thread`
-    /// multiplier: the sort runs on one global memory budget, sized by the larger
-    /// of this and `--sort-threads` (the phase that fills the buffer).
-    /// `--merge-threads` changes scheduling only and never resizes it.
+    /// Also the `--max-memory --memory-per-thread` multiplier unless
+    /// `--sort-threads` lowers the sort phase (the phase that fills the
+    /// buffer); `--merge-threads` never resizes it.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
-    /// Number of threads for the sort phase (accumulate, sort, spill).
+    /// Pool workers the sort phase may use, at most --threads (a larger value
+    /// warns and is clamped).
     ///
-    /// Defaults to `--threads`. Lower this to cede cores to an upstream
-    /// producer while keeping the merge wide -- with `-@ 8 --sort-threads 4`,
-    /// ingest contends with the producer over only 4 threads, while the merge
-    /// still uses 8 because it cannot start until the input is exhausted, by
-    /// which point the producer has finished writing.
-    ///
-    /// The output is byte-identical, but this is not purely a scheduling knob:
-    /// with --memory-per-thread enabled (default) the budget scales by the larger
-    /// of --threads and --sort-threads, so raising this above --threads raises
-    /// total memory by the same factor.
+    /// Lower it to cede cores to an upstream producer while keeping the merge
+    /// wide: with `-@ 8 --sort-threads 4` at most 4 workers inflate and
+    /// compress spills at any moment, while the merge still uses 8 because it
+    /// cannot start until the input is exhausted, by which point the producer
+    /// has finished writing. While a run's parallel sort runs it holds the
+    /// whole limit, so the capped pool steps (inflate, spill compression)
+    /// pause until it finishes; the serial coordination thread is not counted.
+    /// Unset, nothing is capped. Also sizes the memory budget
+    /// (`--memory-per-thread` multiplies by this count): a value below
+    /// --threads shrinks the buffer and spills sooner, and one above --threads
+    /// no longer raises it. The output is byte-identical either way.
     #[arg(long = "sort-threads")]
     pub sort_threads: Option<usize>,
 
-    /// Number of threads for the merge phase (k-way merge and output write).
+    /// Pool workers the merge phase may use, at most --threads (a larger value
+    /// warns and is clamped).
     ///
-    /// Defaults to `--threads`. This only changes scheduling; the output is
-    /// byte-identical.
+    /// Caps concurrent spill decompression, output compression and the
+    /// in-memory fast-path gather. While the parallel gather runs it holds the
+    /// whole limit, so the capped pool steps (decompression, output
+    /// compression) pause until it finishes; the serial merge thread is not
+    /// counted. Unset, nothing is capped. Never
+    /// resizes the memory budget; the output is byte-identical.
     #[arg(long = "merge-threads")]
     pub merge_threads: Option<usize>,
 
@@ -572,6 +580,12 @@ pub struct SortOptions {
     /// enabled (default).
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
+    ///
+    /// The two budgets scale by different thread counts: the record buffer by
+    /// the effective sort-phase thread count (the sort phase fills it) —
+    /// min(`--sort::sort-threads`, worker pool) when that flag is set, else
+    /// --threads — and the queue budget by --threads (the width of the
+    /// ingest/output plumbing), so their resolved totals can differ.
     #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
@@ -589,13 +603,15 @@ pub struct SortOptions {
     /// Scale memory limit by thread count (samtools behavior).
     ///
     /// When enabled (default), --max-memory specifies memory per thread. Total
-    /// memory = `max_memory` × the larger of --threads and --sort-threads, since
-    /// the sort phase is what fills the in-memory buffer. Disable for fixed total
-    /// memory.
+    /// memory = `max_memory` × the effective sort-phase thread count —
+    /// min(`--sort::sort-threads`, worker pool) when that flag is set, else
+    /// --threads — since the sort phase is what fills the in-memory buffer. A
+    /// `--sort::sort-threads` below --threads therefore shrinks the buffer.
+    /// Disable for fixed total memory.
     ///
     /// This formula is for the in-memory sort buffer. --max-memory also bounds
     /// the inter-stage queue budget (see its docs), which scales by --threads
-    /// alone, so the two totals differ when --sort-threads > --threads.
+    /// alone, so the two totals can differ.
     #[arg(long = "memory-per-thread", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub memory_per_thread: bool,
 
@@ -614,25 +630,31 @@ pub struct SortOptions {
     #[arg(short = 'T', long = "tmp-dir", action = clap::ArgAction::Append)]
     pub tmp_dirs: Vec<PathBuf>,
 
-    /// Number of threads for the sort phase (accumulate, sort, spill).
+    /// Workers the sort phase may use, at most the chain's worker pool:
+    /// --threads, raised to 4 when the chain has a zipper or subprocess-aligner
+    /// stage (a larger value warns and is clamped).
     ///
-    /// Defaults to `--threads`. Lower this to cede cores to an upstream
-    /// producer while keeping the merge wide -- with `-@ 8 --sort-threads 4`,
-    /// ingest contends with the producer over only 4 threads, while the merge
-    /// still uses 8 because it cannot start until the input is exhausted, by
-    /// which point the producer has finished writing.
-    ///
-    /// The output is byte-identical, but this is not purely a scheduling knob:
-    /// with --memory-per-thread enabled (default) the budget scales by the larger
-    /// of --threads and --sort-threads, so raising this above --threads raises
-    /// total memory by the same factor.
+    /// Bounds the sort ingest steps, spill compression and the per-run sort
+    /// together. While a run's parallel sort runs it holds the whole limit, so
+    /// the capped ingest and spill-compression steps pause until it finishes;
+    /// the serial coordination thread is not counted. Unset, nothing is capped.
+    /// Also sizes the memory budget (`--memory-per-thread`
+    /// multiplies by this count; unset, by --threads), so a value below
+    /// --threads shrinks the buffer and spills sooner. The output is
+    /// byte-identical either way.
     #[arg(long = "sort-threads")]
     pub sort_threads: Option<usize>,
 
-    /// Number of threads for the merge phase (k-way merge and output write).
+    /// Workers the merge phase may use, at most the chain's worker pool:
+    /// --threads, raised to 4 when the chain has a zipper or subprocess-aligner
+    /// stage (a larger value warns and is clamped).
     ///
-    /// Defaults to `--threads`. This only changes scheduling; the output is
-    /// byte-identical.
+    /// Caps concurrent spill decompression and the in-memory fast-path gather,
+    /// and output compression only when sort is the only runall stage
+    /// (--start-from sort --stop-after sort). While the parallel gather runs it
+    /// holds the whole limit, so the capped steps pause until it finishes; the
+    /// serial merge thread is not counted. Unset, nothing is capped.
+    /// Never resizes the memory budget; the output is byte-identical.
     #[arg(long = "merge-threads")]
     pub merge_threads: Option<usize>,
 
@@ -809,12 +831,13 @@ impl Sort {
     /// `--max-memory` shrank the record buffer while the queues stayed large.
     ///
     /// The two budgets do not resolve to the same *number*: the sorter scales by
-    /// `max(--threads, --sort-threads)` (`memory_budget_threads`, since the
-    /// sort phase is what fills the buffer), whereas the queue budget scales by
-    /// plain `--threads` (the width of the ingest/output plumbing the queues
-    /// track). So a run with `--sort-threads` > `--threads` resolves a larger
-    /// per-command sorter budget than queue budget for the same `--max-memory`;
-    /// that asymmetry is intentional, not a drift.
+    /// the effective sort-phase count (`PhaseThreads::memory_budget_threads`:
+    /// an explicit `--sort-threads` within the worker pool, else `--threads`),
+    /// since the sort phase is what fills the buffer, whereas the queue budget scales by plain `--threads`
+    /// (the width of the ingest/output plumbing the queues track). So a run with
+    /// `--sort-threads` < `--threads` resolves a smaller per-command sorter
+    /// budget than queue budget for the same `--max-memory`; that asymmetry is
+    /// intentional, not a drift.
     ///
     /// Two consequences of sharing the flag are deliberate and benign:
     /// - The default queue budget now follows `--max-memory`'s default (`"768M"`
@@ -897,7 +920,9 @@ impl Sort {
             },
             // The single `--max-memory` knob bounds the inter-stage queue budget too,
             // not just the sorter buffer (see `queue_memory_options`). The queue
-            // budget scales by `--threads`; the sorter's by max(threads, sort_threads).
+            // budget scales by `--threads`; the sorter's by the effective sort-phase
+            // count (`PhaseThreads::memory_budget_threads`: an explicit
+            // `--sort-threads` within the worker pool, else `--threads`).
             queue_memory: self.queue_memory_options(),
             async_reader: false,
             // Thread the sort command's --read-streams into the chain's BAM
@@ -1026,54 +1051,15 @@ impl Command for Sort {
 }
 
 impl Sort {
-    /// Thread count that `--memory-per-thread` multiplies `--max-memory` by.
-    ///
-    /// The budget sizes the in-memory accumulation buffer, which the sort phase
-    /// fills, so `--sort-threads` is the count that should drive it. It is
-    /// combined with `--threads` rather than replacing it: lowering only the sort
-    /// phase (`-@ 32 --sort-threads 4`) is the documented way to cede cores to an
-    /// upstream producer, and letting that shrink the buffer 8x would turn a
-    /// scheduling hint into a throughput cliff. Taking the larger of the two
-    /// raises the budget when the sort phase is the wider one -- the case where
-    /// `--threads` alone under-counts -- and never lowers it.
-    fn memory_budget_threads(&self) -> usize {
-        // Single source of truth shared with the chain builder's `add_sort`
-        // (`sort_budget_threads`) — see `common::sort_memory_budget_threads` — so
-        // the banner path and the chain path cannot drift. `--threads 0` still
-        // resolves to 0 there, so `resolve_memory_budget` rejects a zero-thread run.
-        crate::commands::common::sort_memory_budget_threads(self.threads, self.sort_threads)
-    }
-
-    /// The flag [`memory_budget_threads`](Self::memory_budget_threads) took its
-    /// count from, for the `Max memory:` log line.
-    ///
-    /// `--threads` is the floor, so it is the source unless `--sort-threads` was
-    /// set strictly above it. Reported so that line and the per-phase `Threads:`
-    /// line below it cannot be read as disagreeing.
-    fn memory_budget_threads_flag(&self) -> &'static str {
-        if self.sort_threads.is_some_and(|n| n > self.threads) {
-            "--sort-threads"
-        } else {
-            "--threads"
-        }
-    }
-
-    /// Effective Phase-1 (accumulate/sort/spill) worker count.
-    ///
-    /// Delegates to `pipeline::chains::builder::resolve_phase_threads`, the
-    /// same intra-crate resolver the chain uses to size the streaming sorter
-    /// in `add_sort` — so the banner reports exactly the per-phase counts the
-    /// chain will actually run with, rather than a separately maintained copy
-    /// of the formula. Kept honest by `test_phase_threads_match_sorters_formula`
-    /// (values) and `test_phase_threads_match_engine` (direct parity with
-    /// the engine's formula) here.
-    fn phase1_threads(&self) -> usize {
-        crate::pipeline::chains::builder::resolve_phase_threads(self.sort_threads, self.threads)
-    }
-
-    /// Effective Phase-2 (merge/write) worker count. See `phase1_threads`.
-    fn phase2_threads(&self) -> usize {
-        crate::pipeline::chains::builder::resolve_phase_threads(self.merge_threads, self.threads)
+    /// The effective per-phase thread counts for this run — the same resolver
+    /// the chain builder's `add_sort` sizes the chain with, so the banner
+    /// below reports exactly the counts the chain runs with.
+    fn phase_threads(&self) -> crate::commands::common::PhaseThreads {
+        crate::commands::common::PhaseThreads::resolve(
+            self.threads,
+            self.sort_threads,
+            self.merge_threads,
+        )
     }
 
     /// The spill-file consolidation limit this command will use.
@@ -1164,8 +1150,19 @@ impl Sort {
         // `OperationTimer::new("Sorting BAM")` there). execute_sort no longer
         // builds its own timer — doing so logged the identical start line twice.
 
-        // Resolve memory limit (auto-detect or fixed)
-        let budget_threads = self.memory_budget_threads();
+        // Resolve the per-phase thread contract once, warn about clamped
+        // overrides once (never in the chain builder, which runs once per
+        // command anyway), and size the budget by the effective sort-phase
+        // count.
+        let phases = self.phase_threads();
+        phases.warn_if_clamped(
+            "",
+            crate::commands::common::PhaseThreads::budget_scales_per_thread(
+                self.max_memory,
+                self.memory_per_thread,
+            ),
+        );
+        let budget_threads = phases.memory_budget_threads();
         let effective_memory = resolve_memory_budget(
             self.max_memory,
             self.memory_reserve,
@@ -1193,16 +1190,16 @@ impl Sort {
         if let MemoryLimit::Fixed(per_thread) = self.max_memory {
             if self.memory_per_thread {
                 // `resolve_memory_budget` sizes one global budget for the whole
-                // run, and the multiplier is the larger of `--threads` and
-                // `--sort-threads` -- never `--merge-threads`. Name the flag it
-                // came from so this line and the per-phase counts logged below
-                // cannot be read as disagreeing.
+                // run; the multiplier is the effective sort-phase count
+                // (`PhaseThreads::memory_budget_threads`) -- never `--merge-threads`.
+                // Name the flag it came from so this line and the per-phase
+                // counts below cannot be read as disagreeing.
                 info!(
                     "Max memory: {} ({}/thread x {} threads, from {})",
                     ByteSize(effective_memory as u64),
                     ByteSize(per_thread as u64),
                     budget_threads,
-                    self.memory_budget_threads_flag()
+                    phases.memory_budget_threads_flag()
                 );
             } else {
                 info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
@@ -1211,10 +1208,7 @@ impl Sort {
         // Report the effective per-phase thread counts (not the raw --threads,
         // which is only where --sort-threads/--merge-threads default from):
         // logging the flag alone reports 1 thread for a run that asked for more.
-        info!(
-            "Threads: {}",
-            fgumi_sort::format_thread_counts(self.phase1_threads(), self.phase2_threads())
-        );
+        info!("Threads: {}", fgumi_sort::format_thread_counts(phases.phase1, phases.phase2));
         info!("Temp compression level: {}", self.temp_compression);
         // The resolved max-temp-files the sort will actually consolidate at,
         // sourced the same way as the thread counts above so the banner cannot
@@ -1243,9 +1237,9 @@ impl Sort {
         // needed for either.
 
         // --- cutover: run via the chain instead of sorter.sort() ---
-        // (`phase1_threads`/`phase2_threads` above are retained only to source the
-        //  banner's thread numbers; the owned sorter is not constructed or executed
-        //  here. PR B removes the owned engine.)
+        // (The banner's thread numbers come from `phase_threads()` above, the
+        //  same resolver the chain builder uses; the owned sorter is not
+        //  constructed or executed here. PR B removes the owned engine.)
         //
         // `output` is already bound at the top of this method (validated in `execute`),
         // and `resolved_tmp_dirs` was resolved above for the banner; hand both to the
@@ -1889,165 +1883,80 @@ mod tests {
         assert!(bag_sort.file_granularity, "--file-granularity must reach the chain spec");
     }
 
-    /// The sorter-free phase thread helpers `Sort::phase1_threads` /
-    /// `Sort::phase2_threads` must match the engine's own formula, since
-    /// they replace the CLI's only other caller of `RawExternalSorter`'s
-    /// methods.
+    /// The command resolves its phase counts through `PhaseThreads`, the same
+    /// resolver `add_sort` sizes the chain with: `--threads` is the ceiling,
+    /// `0` clamps to 1, and an override above the ceiling is clamped.
     #[rstest]
-    #[case::defaults(None, None, 2, 2)]
-    #[case::narrow_sort(Some(1), Some(4), 1, 4)]
-    #[case::narrow_merge(Some(4), Some(1), 4, 1)]
-    #[case::sort_only(Some(3), None, 3, 2)]
-    #[case::merge_only(None, Some(3), 2, 3)]
-    fn test_phase_threads_match_sorters_formula(
+    #[case::defaults(2, None, None, 2, 2)]
+    #[case::narrow_sort(2, Some(1), Some(4), 1, 2)]
+    #[case::narrow_merge(2, Some(4), Some(1), 2, 1)]
+    #[case::sort_only(2, Some(3), None, 2, 2)]
+    #[case::merge_only(4, None, Some(3), 4, 3)]
+    #[case::zero_sort_override_clamps(4, Some(0), None, 1, 4)]
+    #[case::zero_merge_override_clamps(4, None, Some(0), 4, 1)]
+    fn test_phase_threads_follow_the_min_contract(
+        #[case] threads: usize,
         #[case] sort_threads: Option<usize>,
         #[case] merge_threads: Option<usize>,
         #[case] expected_phase1: usize,
         #[case] expected_phase2: usize,
     ) {
         let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = 2;
-        sort.sort_threads = sort_threads;
-        sort.merge_threads = merge_threads;
-
-        assert_eq!(sort.phase1_threads(), expected_phase1);
-        assert_eq!(sort.phase2_threads(), expected_phase2);
-    }
-
-    /// The CLI's `phase1_threads`/`phase2_threads` are hand-copied from
-    /// `RawExternalSorter`'s formula. Pin them against the engine directly so
-    /// the two copies cannot drift silently (both would otherwise stay green
-    /// against their own tables).
-    #[rstest]
-    #[case::defaults(2, None, None)]
-    #[case::narrow_sort(2, Some(1), Some(4))]
-    #[case::narrow_merge(2, Some(4), Some(1))]
-    #[case::sort_only(2, Some(3), None)]
-    #[case::merge_only(2, None, Some(3))]
-    #[case::zero_sort_override_clamps(4, Some(0), None)]
-    #[case::zero_merge_override_clamps(4, None, Some(0))]
-    fn test_phase_threads_match_engine(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-        #[case] merge_threads: Option<usize>,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
         sort.threads = threads;
         sort.sort_threads = sort_threads;
         sort.merge_threads = merge_threads;
-
-        let mut engine = fgumi_sort::RawExternalSorter::new(sort.order.into()).threads(threads);
-        if let Some(n) = sort_threads {
-            engine = engine.sort_threads(n);
-        }
-        if let Some(n) = merge_threads {
-            engine = engine.merge_threads(n);
-        }
-        assert_eq!(sort.phase1_threads(), engine.phase1_threads());
-        assert_eq!(sort.phase2_threads(), engine.phase2_threads());
+        let phases = sort.phase_threads();
+        assert_eq!(phases.phase1, expected_phase1);
+        assert_eq!(phases.phase2, expected_phase2);
     }
 
-    /// The per-thread budget sizes the buffer the sort phase fills, so it follows
-    /// `--sort-threads` upward. `--sort-threads 8` with `--threads` unset used to
-    /// resolve a one-thread budget for an eight-thread sort.
-    ///
-    /// It never follows `--sort-threads` downward: `-@ 32 --sort-threads 4` is the
-    /// documented way to cede cores to an upstream producer, and must keep the
-    /// 32-thread budget it resolves today.
+    /// The per-thread budget follows the *effective* sort-phase count: down
+    /// with a lower `--sort-threads`, never above `--threads`. `-@ 32
+    /// --sort-threads 4` therefore resolves a 4-thread budget (the one
+    /// user-visible consequence, printed as `from --sort-threads`), and
+    /// `--sort-threads 8` with `--threads` unset is clamped to 1.
     #[rstest]
-    #[case::defaults(1, None, 1)]
-    #[case::threads_only(4, None, 4)]
-    #[case::sort_above_threads(1, Some(8), 8)]
-    #[case::sort_below_threads(32, Some(4), 32)]
-    #[case::sort_equals_threads(4, Some(4), 4)]
-    #[case::zero_sort_override_keeps_threads(4, Some(0), 4)]
-    #[case::zero_threads_is_not_clamped(0, Some(8), 0)]
-    fn test_memory_budget_threads(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-        #[case] expected: usize,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = threads;
-        sort.sort_threads = sort_threads;
-
-        assert_eq!(sort.memory_budget_threads(), expected);
-    }
-
-    /// `memory_budget_threads` sizes the sort buffer for at least as many workers
-    /// as the sort phase runs. Guards that relationship (with `phase1_threads` now
-    /// delegating to the chain's resolver) so the two cannot silently diverge for
-    /// threads >= 1; at threads == 0 they intentionally differ (budget is 0).
-    #[rstest]
-    #[case::defaults(1, None)]
-    #[case::threads_only(4, None)]
-    #[case::sort_above_threads(1, Some(8))]
-    #[case::sort_below_threads(32, Some(4))]
-    #[case::sort_equals_threads(4, Some(4))]
-    #[case::zero_sort_override(4, Some(0))]
-    fn test_memory_budget_covers_phase1(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = threads;
-        sort.sort_threads = sort_threads;
-        assert_eq!(sort.memory_budget_threads(), sort.threads.max(sort.phase1_threads()));
-    }
-
-    /// The `Max memory:` line names whichever flag supplied the multiplier.
-    ///
-    /// `--threads` is the floor, so it stays the attributed source whenever it
-    /// ties or wins — including the `--sort-threads 0` case the engine clamps.
-    #[rstest]
-    #[case::defaults(1, None, "--threads")]
-    #[case::threads_only(4, None, "--threads")]
-    #[case::sort_above_threads(1, Some(8), "--sort-threads")]
-    #[case::sort_below_threads(32, Some(4), "--threads")]
-    #[case::sort_equals_threads(4, Some(4), "--threads")]
-    #[case::zero_sort_override(4, Some(0), "--threads")]
-    fn test_memory_budget_threads_flag(
-        #[case] threads: usize,
-        #[case] sort_threads: Option<usize>,
-        #[case] expected: &str,
-    ) {
-        let mut sort = make_sort(SortOrderArg::Coordinate);
-        sort.threads = threads;
-        sort.sort_threads = sort_threads;
-
-        assert_eq!(sort.memory_budget_threads_flag(), expected);
-    }
-
-    /// The budget the sort-phase count actually resolves to, end to end through
-    /// `resolve_memory_budget`.
-    ///
-    /// The `Max memory:` log line is printed from the same local that feeds
-    /// `resolve_memory_budget`, so the integration tests that assert on it cannot
-    /// tell a correctly wired budget from one that logs `budget_threads` and
-    /// resolves `self.threads`. This pins the resolved byte count instead.
-    #[rstest]
-    #[case::sort_above_threads(1, Some(8), 800_000_000)]
-    #[case::sort_below_threads(4, Some(2), 400_000_000)]
-    #[case::threads_only(4, None, 400_000_000)]
-    #[case::zero_sort_override_keeps_threads(4, Some(0), 400_000_000)]
-    fn test_memory_budget_threads_resolves_the_scaled_budget(
+    #[case::defaults(1, None, 100_000_000, "--threads")]
+    #[case::threads_only(4, None, 400_000_000, "--threads")]
+    #[case::sort_above_threads_clamps(1, Some(8), 100_000_000, "--threads")]
+    #[case::sort_below_threads_shrinks(32, Some(4), 400_000_000, "--sort-threads")]
+    #[case::sort_equals_threads(4, Some(4), 400_000_000, "--threads")]
+    #[case::zero_sort_override_shrinks_budget(4, Some(0), 100_000_000, "--sort-threads")]
+    fn test_memory_budget_follows_effective_phase1(
         #[case] threads: usize,
         #[case] sort_threads: Option<usize>,
         #[case] expected_bytes: usize,
+        #[case] expected_flag: &str,
     ) {
         let mut sort = make_sort(SortOrderArg::Coordinate);
         sort.threads = threads;
         sort.sort_threads = sort_threads;
-
+        let phases = sort.phase_threads();
         let resolved = resolve_memory_budget(
             MemoryLimit::Fixed(100_000_000),
             MemoryReserve::Auto,
-            sort.memory_budget_threads(),
+            phases.memory_budget_threads(),
             true,
         )
         .expect("budget should resolve");
-
         assert_eq!(resolved, expected_bytes);
+        assert_eq!(phases.memory_budget_threads_flag(), expected_flag);
+    }
+
+    /// `--threads 0` is still rejected by the budget resolver (not clamped up).
+    #[test]
+    fn test_zero_threads_is_rejected_by_the_budget() {
+        let mut sort = make_sort(SortOrderArg::Coordinate);
+        sort.threads = 0;
+        sort.sort_threads = Some(8);
+        let err = resolve_memory_budget(
+            MemoryLimit::Fixed(100_000_000),
+            MemoryReserve::Auto,
+            sort.phase_threads().memory_budget_threads(),
+            true,
+        )
+        .expect_err("--threads 0 must be rejected");
+        assert!(err.to_string().contains("--threads must be at least 1"), "got: {err}");
     }
 
     /// `--max-temp-files` parses onto the struct and defaults to `auto`, which
@@ -2838,6 +2747,65 @@ mod tests {
     struct PrefixedSort {
         #[command(flatten)]
         opts: MultiSortOptions,
+    }
+
+    /// The long help clap renders for `--<long>` on `command`.
+    fn long_help_of(command: &clap::Command, long: &str) -> String {
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(long))
+            .unwrap_or_else(|| panic!("--{long} is not an argument of `{}`", command.get_name()));
+        arg.get_long_help()
+            .or_else(|| arg.get_help())
+            .unwrap_or_else(|| panic!("--{long} has no help"))
+            .to_string()
+    }
+
+    /// The flag docs state the contract: both per-phase flags are caps within
+    /// `--threads`, and the budget follows the effective sort-phase count.
+    #[rstest]
+    #[case::sort_cap("sort-threads", "at most --threads")]
+    #[case::sort_warns("sort-threads", "a larger value warns and is clamped")]
+    #[case::merge_cap("merge-threads", "at most --threads")]
+    #[case::merge_never_resizes("merge-threads", "Never resizes the memory budget")]
+    #[case::threads_is_ceiling("threads", "ceiling for both")]
+    #[case::budget_follows_effective_phase1("max-memory", "min(--threads, --sort-threads)")]
+    #[case::sort_shrinks_budget("sort-threads", "below --threads shrinks the buffer")]
+    #[case::sort_no_longer_raises("sort-threads", "above --threads no longer raises it")]
+    fn test_sort_help_states_the_phase_cap_contract(#[case] long: &str, #[case] needle: &str) {
+        use clap::CommandFactory;
+        let help = long_help_of(&Sort::command(), long);
+        assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
+    }
+
+    /// The runall-side `--sort::` flags carry the same contract (generated from
+    /// `SortOptions`'s docs), naming the chain's worker pool (which a zipper
+    /// or aligner floor can raise above --threads) and saying output
+    /// compression is capped only when sort is the only runall stage.
+    #[rstest]
+    #[case::sort_cap("sort::sort-threads", "at most the chain's worker pool")]
+    #[case::sort_pool_floor("sort::sort-threads", "raised to 4 when the chain has a zipper")]
+    #[case::sort_shrinks_budget("sort::sort-threads", "below --threads shrinks the buffer")]
+    #[case::merge_cap("sort::merge-threads", "at most the chain's worker pool")]
+    #[case::merge_output_only_when_sole_stage(
+        "sort::merge-threads",
+        "only when sort is the only runall stage"
+    )]
+    #[case::budget_follows_effective_phase1(
+        "sort::max-memory",
+        "min(`--sort::sort-threads`, worker pool)"
+    )]
+    #[case::per_thread_budget(
+        "sort::memory-per-thread",
+        "min(`--sort::sort-threads`, worker pool)"
+    )]
+    fn test_prefixed_sort_help_states_the_phase_cap_contract(
+        #[case] long: &str,
+        #[case] needle: &str,
+    ) {
+        use clap::CommandFactory;
+        let help = long_help_of(&PrefixedSort::command(), long);
+        assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
     }
 
     /// The re-exposed `MultiSortOptions` defaults must equal the standalone
