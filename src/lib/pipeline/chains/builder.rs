@@ -606,6 +606,12 @@ pub struct ChainBuilder<'a> {
     /// [`WriteBgzfFile::new_with_handle`]: crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile::new_with_handle
     pending_header_handle: Option<crate::pipeline::core::header::HeaderHandle>,
 
+    /// Unmapped @PG IDs that zipper's output header renames, recorded by
+    /// [`Self::add_source`] for a `PairedBams` source while both input headers are at
+    /// hand, and consumed by [`Self::add_zipper`] so unmapped reads' `PG` tags (copied
+    /// onto merged reads or on unmapped-only reads) follow them.
+    zipper_pg_renames: Arc<crate::commands::zipper::ProgramIdRenames>,
+
     /// Rejects sinks added mid-build whose files are not created yet, each with
     /// the stage that owns it. Opened by [`Self::open_deferred_outputs`] as the
     /// last step of [`Self::build`], so a stage that fails to build creates no
@@ -809,6 +815,7 @@ impl<'a> ChainBuilder<'a> {
             use_drain_first_scheduler: false,
             align_refill: None,
             pending_header_handle: None,
+            zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
             // Initialise to the default; add_source will set the correct kind
@@ -1303,6 +1310,11 @@ impl<'a> ChainBuilder<'a> {
 
                 check_sort(&unmapped_header, &unmapped_path, "unmapped");
                 check_sort(&mapped_header, &mapped_path, "mapped");
+
+                self.zipper_pg_renames = Arc::new(crate::commands::zipper::program_id_renames(
+                    &unmapped_header,
+                    &mapped_header,
+                ));
 
                 // Warn if mapped input is BAM (SAM from aligner is the fast path).
                 if matches!(mapped, InputSource::Bam { .. }) {
@@ -3231,7 +3243,7 @@ impl<'a> ChainBuilder<'a> {
 
         let merge_cfg = build_zipper_merge_config(ZipperMergeCaptures {
             zipper_opts: zipper_opts.clone(),
-            output_header: Arc::new(self.header.clone()),
+            pg_renames: Arc::clone(&self.zipper_pg_renames),
             tuning: floored_tuning,
             missing_count: Arc::clone(&missing_count),
             records_emitted: Arc::clone(&records_emitted),
@@ -6638,6 +6650,7 @@ mod tests {
             use_drain_first_scheduler: false,
             align_refill: None,
             pending_header_handle: None,
+            zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },

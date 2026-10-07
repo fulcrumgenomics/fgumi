@@ -238,6 +238,21 @@ A record can carry no bases (`SEQ` `*`), as `bwa mem -a` writes secondary alignm
 
 With `--max-no-call-fraction` below 1.0, both tools reject a read with no bases.
 
+### Program Records (@PG)
+
+`fgumi zipper` writes the unmapped BAM's `@PG` records first, then the mapped BAM's (a record
+identical in both is written once, in its mapped position), and adds one `@PG` of its own
+chained to the aligner's program. fgbio `ZipperBams` adds no `@PG`.
+
+When both inputs hold an `@PG` with the same `ID`, fgbio keeps the mapped record if the two are
+identical and fails (htsjdk rejects the duplicate `ID`) if they differ. fgumi also writes an
+identical record once, but when the records differ it keeps both: the unmapped copy gets a fresh
+`ID` (e.g. `samtools` becomes `samtools.1`), and every `PP` in the unmapped records that named it
+is rewritten to the new `ID`, so both program chains keep their provenance. An unmapped read's
+`PG` tag is rewritten the same way, whether it is copied onto the merged read or written on an
+unmapped read with no mapped match. As in fgbio, the unmapped read's `PG` is copied only when the
+mapped read has none, and a mapped read's own `PG` is never changed.
+
 ### Boolean Flag Values
 
 fgumi boolean flags (e.g. `--output-per-base-tags`, `--trim`, `--require-single-strand-agreement`)

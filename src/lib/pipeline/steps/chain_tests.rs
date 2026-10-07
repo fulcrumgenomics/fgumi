@@ -980,8 +980,6 @@ fn zipper_split_matches_zippermergestep_bytes(
 ) {
     use std::sync::atomic::AtomicU64;
 
-    use noodles::sam::Header;
-
     use crate::commands::zipper::merge_step::{
         ZipperMerge, ZipperMergeConfig, ZipperMergeStep, ZipperZipStep,
     };
@@ -998,7 +996,7 @@ fn zipper_split_matches_zippermergestep_bytes(
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
         exclude_missing_reads: exclude_missing,
-        output_header: Arc::new(Header::default()),
+        pg_renames: Arc::default(),
         missing_count: Arc::new(AtomicU64::new(0)),
         records_emitted: Arc::new(AtomicU64::new(0)),
         target_batch_count: BATCH,
@@ -1165,13 +1163,11 @@ fn zipper_split_cfg(
     target_batch_count: usize,
     output_byte_limit: u64,
 ) -> crate::commands::zipper::merge_step::ZipperMergeConfig {
-    use noodles::sam::Header;
-
     crate::commands::zipper::merge_step::ZipperMergeConfig {
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
         exclude_missing_reads,
-        output_header: Arc::new(Header::default()),
+        pg_renames: Arc::default(),
         missing_count: Arc::new(AtomicU64::new(0)),
         records_emitted: Arc::new(AtomicU64::new(0)),
         target_batch_count,
