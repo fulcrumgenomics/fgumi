@@ -48,6 +48,13 @@ impl LiveSteps {
         Self { order }
     }
 
+    /// A worklist of exactly `order` (tests that need a live set without
+    /// building step storage).
+    #[cfg(test)]
+    pub(crate) fn from_order(order: Vec<StepIdx>) -> Self {
+        Self { order }
+    }
+
     /// The steps this worker can still dispatch, in chain order.
     #[must_use]
     pub fn order(&self) -> &[StepIdx] {

@@ -263,6 +263,7 @@ mod tests {
             u64::MAX
         }
         fn set_limit_bytes(&self, _new_limit: u64) {}
+        fn enable_tracking(&self, _t: crate::queues::EdgeTracking, _: crate::queues::Sealed) {}
     }
 
     fn registered(

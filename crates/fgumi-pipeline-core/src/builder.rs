@@ -1347,6 +1347,32 @@ impl Pipeline {
         let detached_steps = extract_detached_steps(&mut steps);
         let n_detached = detached_steps.len();
 
+        // Hold timing for `--pipeline-stats`: one clock per byte-bounded edge,
+        // keyed by the producer step. Absent when stats are off (no clock, no
+        // branch taken beyond the empty `OnceLock` check on each push). A
+        // `Parallel` producer's clones hold one item each, on their own threads,
+        // so its clock stamps per thread; any other producer holds one item per
+        // branch that any of its threads may flush, so its clock stamps per step.
+        let n_slots = n_threads + n_detached;
+        if let Some(stats) = &stats_arc {
+            for rq in &contexts.bounded_queues {
+                let step = rq.producer_step;
+                let clock = if steps[step.0].kind() == StepKind::Parallel {
+                    crate::runtime::wake_slot::HoldClock::per_thread(
+                        step,
+                        Arc::clone(stats),
+                        n_slots,
+                    )
+                } else {
+                    crate::runtime::wake_slot::HoldClock::per_step(step, Arc::clone(stats))
+                };
+                rq.handle.enable_tracking(
+                    crate::queues::EdgeTracking { clock: Some(clock) },
+                    crate::queues::SEALED,
+                );
+            }
+        }
+
         // 3b. Per-OS-thread state board for tick telemetry. Sized to cover every
         // pipeline thread: pool workers take slots `0..n_threads`, detached
         // drivers take `n_threads..`. Built ONLY when telemetry is on, so the
@@ -1623,6 +1649,7 @@ impl Pipeline {
                 thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
+                        let _slot = crate::runtime::wake_slot::SlotGuard::enter(state_slot);
                         // Catch a driver-thread panic so we can signal
                         // cancellation before unwinding — a wedged pool worker
                         // parked on this group's (now-dead) edge only exits on
@@ -1689,6 +1716,8 @@ impl Pipeline {
             // `AssertUnwindSafe` is sound: after a panic we never touch `worker`
             // or `entries_local` again — the run is shutting down.
             if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Scoped to the loop: the caller's thread leaves slot 0 when it returns.
+                let _slot = crate::runtime::wake_slot::SlotGuard::enter(0);
                 run_worker_loop(
                     &mut worker,
                     &mut entries_local,
@@ -1735,6 +1764,7 @@ impl Pipeline {
                 let handle = thread::Builder::new()
                     .name(format!("fgumi-worker-{worker_id}"))
                     .spawn(move || {
+                        let _slot = crate::runtime::wake_slot::SlotGuard::enter(worker_id);
                         let mut worker = WorkerCore::new(worker_id, exclusive_owner, sticky_owner);
                         let mut entries_local = entries;
                         // Catch a worker-loop panic so we can signal cancellation

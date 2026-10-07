@@ -161,7 +161,7 @@ impl PipelineSignal {
     /// dropped (all workers joined — nobody to wake).
     fn wake_parked_workers(&self) {
         if let Some(ec) = self.event_count.get().and_then(std::sync::Weak::upgrade) {
-            ec.notify_all();
+            let _ = ec.notify_all();
         }
         // Snapshot first: a cap's notify takes the cap's own lock, which must
         // never be taken while holding the registry's.

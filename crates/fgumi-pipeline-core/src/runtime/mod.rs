@@ -15,6 +15,7 @@ pub mod scheduler;
 pub mod stats;
 pub mod storage;
 pub mod telemetry;
+pub(crate) mod wake_slot;
 pub mod worker_core;
 pub mod worker_state;
 
@@ -24,7 +25,7 @@ pub use detached::{
 };
 pub use drain::StepDrainCounter;
 pub use driver::run_worker_loop;
-pub use event_count::{PoolEventCount, WaitKey, WaitOutcome};
+pub use event_count::{NotifyOutcome, PoolEventCount, WaitKey, WaitOutcome};
 pub use fused::{is_fusible_chain, run_fused_single_thread, should_fuse_single_thread};
 pub use live::LiveSteps;
 pub use pool::{assign_exclusive_owners, assign_sticky_owners};
