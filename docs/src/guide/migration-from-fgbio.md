@@ -159,6 +159,36 @@ Use the `--metrics PREFIX` flag to write all three files in one step.
 fgumi's `simplex` and `duplex` stats output uses the same three-column key-value format as
 fgbio's `CallMolecularConsensusReads`, allowing direct comparison with `fgumi compare metrics`.
 
+### Duplex UMI Orientation
+
+`duplex-metrics` pairs the two halves of each duplex UMI by strand family, as fgbio's
+`CollectDuplexSeqMetrics` does: one single-strand family's `RX` is used as written and the other's
+is swapped. fgumi takes the `/A` family (or an unsuffixed `MI`) first, uses it as written, and swaps
+the `/B` family; a lone `/B` family is used as written. This matches fgbio with its families sorted
+by `MI` (fulcrumgenomics/fgbio#1186). fgbio 4.1.1 and earlier take the two families in hash-map
+iteration order instead, so which one comes first depends on the `MI`. Against those versions the
+per-UMI counts in `umi_counts.txt` agree except in two cases:
+
+- A tied UMI position. Observations are summed in family order (`/A` then `/B`, each in file
+  order), and that order decides a tie, whether the tied bases are split between the families or
+  within them. This makes fgumi's call deterministic, but the winning base is not necessarily the
+  `/A` family's.
+- Halves of different lengths at one UMI position. fgumi uses the first family's first
+  observation; fgbio fails.
+
+With `--duplex-umi-counts`, both tools orient each duplex UMI the way it reads on an F1R2 read
+pair: it leads with the first family's half if any of that family's read 1s is on the positive
+strand, and with the second family's half otherwise. When one family's read 1 is on the positive
+strand and the other's on the negative strand, as for a normal FR read pair, that is the
+positive-strand family's `RX` as written whichever family comes first, so fgumi and fgbio agree on
+the orientation (the halves can still differ at tied positions, as above). When both families'
+read 1s are on the same strand (for example inversions, and inter-chromosomal chimeras whose mates
+map to the same strand), the result depends on which family comes first. fgumi, with `/A` first,
+prints the `/A` family's `RX` as written when both read 1s are on the positive strand and the `/B`
+family's `RX` as written when both are on the negative strand. In fgbio 4.1.1 and earlier the
+choice depends on hash-map iteration order, so its `duplex_umi_counts.txt` can list those duplex
+UMIs with the halves reversed.
+
 ### Sort Orders
 
 fgumi's `sort` command supports the same sort orders as fgbio:
