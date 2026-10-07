@@ -30,10 +30,10 @@ use crate::erased::ErasedStepCtx;
 use crate::liveness::LivenessCounter;
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
-use crate::runtime::event_count::PoolEventCount;
+use crate::runtime::event_count::{NotifyOutcome, PoolEventCount};
 use crate::runtime::live::LiveSteps;
 use crate::runtime::scheduler::{Scheduler, WalkDirection};
-use crate::runtime::stats::PipelineStats;
+use crate::runtime::stats::{PipelineStats, WakeCounts};
 use crate::runtime::storage::WorkerStepEntry;
 use crate::runtime::worker_core::{WorkerCore, WorkerRole};
 use crate::runtime::worker_state::WorkerStateBoard;
@@ -57,6 +57,51 @@ use crate::topology::StepIdx;
 /// with* round-robin declining to restart the walk on the sticky owner's
 /// `Progress`.
 const STICKY_BURST_LIMIT: usize = 1024;
+
+/// Per-thread diagnostic state carried across loop iterations.
+///
+/// A driver thread hosting a `Shared` group parks once for the whole group, so
+/// its idle must be booked to *one* step. Booking it to the group's first step
+/// made a merge's waiting show up as idle of the group's reader step while the
+/// merge reported "0 parks". The honest answer for a shared thread is the step
+/// that last made progress on it (exact when one step is live; the step the
+/// thread is actually driving otherwise), falling back to the primary before
+/// any progress. A step that has finished waits for nothing, so its group's
+/// later idle goes to a step that is still live. Pool workers do not attribute
+/// idle per step, so `note` is a single not-taken branch there.
+pub(crate) struct LoopDiag {
+    last_progress: Option<StepIdx>,
+    track: bool,
+}
+
+impl LoopDiag {
+    /// Diagnostic state for one thread; tracks progress only on a driver thread.
+    pub(crate) fn new(is_driver: bool) -> Self {
+        Self { last_progress: None, track: is_driver }
+    }
+
+    /// Record `step`'s dispatch outcome: a `Progress`/`Finished` on a driver
+    /// thread makes `step` the one this thread's next idle is booked to.
+    #[inline]
+    fn note(&mut self, step: StepIdx, result: &std::io::Result<StepOutcome>) {
+        if self.track && matches!(result, Ok(StepOutcome::Progress | StepOutcome::Finished)) {
+            self.last_progress = Some(step);
+        }
+    }
+
+    /// The step to book this thread's idle to: the step that last made
+    /// progress, else the group primary — whichever is still live, since a
+    /// finished step no longer waits for anything; else the first live step.
+    #[inline]
+    fn attributed(&self, primary: StepIdx, live: &LiveSteps) -> StepIdx {
+        let live_step = |s: StepIdx| live.contains(s).then_some(s);
+        self.last_progress
+            .and_then(live_step)
+            .or_else(|| live_step(primary))
+            .or_else(|| live.order().first().copied())
+            .unwrap_or(primary)
+    }
+}
 
 /// Run the worker loop for one worker thread.
 ///
@@ -124,6 +169,7 @@ pub fn run_worker_loop(
     // `dispatch_one_step`; a pool worker records aggregate busy by `thread_id`
     // below. Idle/park stay thread-level (keyed to the group's primary step).
     let is_driver = matches!(worker.role(), WorkerRole::Driver { .. });
+    let mut diag = LoopDiag::new(is_driver);
 
     loop {
         if signal.is_done() {
@@ -176,6 +222,7 @@ pub fn run_worker_loop(
                     board,
                     state_slot,
                     parker,
+                    &mut diag,
                 ) else {
                     break; // Skip
                 };
@@ -226,6 +273,7 @@ pub fn run_worker_loop(
                 board,
                 state_slot,
                 parker,
+                &mut diag,
             );
             did_work |= outcome.did_work;
             if outcome.removed_sticky_owner {
@@ -291,6 +339,7 @@ pub fn run_worker_loop(
                 board,
                 state_slot,
                 parker,
+                &mut diag,
             );
             if recheck.removed_sticky_owner {
                 sticky_live = false;
@@ -318,16 +367,18 @@ pub fn run_worker_loop(
                 // cannot hang longer than the cap, and the deadlock monitor
                 // still ticks. Re-poll on return regardless of outcome.
                 let deadline = worker.backoff_deadline();
-                let _ = ec.wait(key, deadline);
+                let outcome = ec.wait(key, deadline);
                 worker.increase_backoff();
 
                 if let (Some(stats), Some(ss)) = (stats, sleep_start) {
                     let ns = u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    stats.record_ec_wait(worker.thread_id, outcome);
                     match worker.role() {
                         WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
                         WorkerRole::Driver { primary_step } => {
-                            stats.record_detached_idle(primary_step, ns);
-                            stats.record_detached_park(primary_step);
+                            let step = diag.attributed(primary_step, &live);
+                            stats.record_detached_idle(step, ns);
+                            stats.record_detached_park(step);
                         }
                     }
                 }
@@ -338,16 +389,26 @@ pub fn run_worker_loop(
             if let Some(b) = board {
                 b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Parked, None);
             }
+            let deadline = worker.backoff_deadline();
             let sleep_start = stats.map(|_| Instant::now());
             worker.sleep_backoff();
             worker.increase_backoff();
             if let (Some(stats), Some(ss)) = (stats, sleep_start) {
-                let ns = u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let elapsed = ss.elapsed();
+                let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+                // A park that returned before its deadline was unparked (or woke
+                // spuriously); one that ran to it was fed by the timer.
+                let timed_out = elapsed >= deadline;
                 match worker.role() {
-                    WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
+                    WorkerRole::Pool => {
+                        stats.record_worker_idle(worker.thread_id, ns);
+                        stats.record_timer_park(worker.thread_id, timed_out);
+                    }
                     WorkerRole::Driver { primary_step } => {
-                        stats.record_detached_idle(primary_step, ns);
-                        stats.record_detached_park(primary_step);
+                        let step = diag.attributed(primary_step, &live);
+                        stats.record_detached_idle(step, ns);
+                        stats.record_detached_park(step);
+                        stats.record_detached_park_outcome(step, timed_out);
                     }
                 }
             }
@@ -420,6 +481,7 @@ fn round_robin_dispatch(
     board: Option<&WorkerStateBoard>,
     state_slot: usize,
     parker: Option<&PoolEventCount>,
+    diag: &mut LoopDiag,
 ) -> RoundRobinOutcome {
     let mut did_work = false;
     // Steps that finished this pass, removed from `live` after the walk. A
@@ -456,6 +518,7 @@ fn round_robin_dispatch(
             board,
             state_slot,
             parker,
+            diag,
         ) else {
             continue; // Skip (build-time placeholder; should not appear in `live`)
         };
@@ -570,6 +633,8 @@ fn dispatch_one_step(
     // (rather than the `BranchOutputHandle::push` site) captures the stash-then-
     // return-`Ok` reorder case without threading the parker through every queue.
     parker: Option<&PoolEventCount>,
+    // Per-thread diagnostic state; updated after the outcome is known.
+    diag: &mut LoopDiag,
 ) -> Option<DispatchInfo> {
     let outputs_any: &(dyn Any + Send + Sync) = contexts.outputs[step_idx.0].as_ref();
     let mut ctx = ErasedStepCtx {
@@ -674,6 +739,10 @@ fn dispatch_one_step(
         WorkerStepEntry::Skip => None,
     };
 
+    if let Some(i) = info.as_ref() {
+        diag.note(step_idx, &i.result);
+    }
+
     // Liveness first, and unconditionally: this is what the deadlock monitor
     // samples, so it must not depend on `stats` being attached. Only productive
     // outcomes count — a wedged pipeline still spins through `NoProgress` and
@@ -692,9 +761,24 @@ fn dispatch_one_step(
         // may be waiting on the drain latch) → wake all. When nobody is parked,
         // both are a single relaxed load (see `PoolEventCount`).
         if let Some(ec) = parker {
-            match i.result {
-                Ok(StepOutcome::Finished) => ec.notify_all(),
-                _ => ec.notify_one(),
+            let outcome = match i.result {
+                Ok(StepOutcome::Finished) => {
+                    let _ = ec.notify_all();
+                    None
+                }
+                _ => Some(ec.notify_one()),
+            };
+            if let (Some(stats), Some(o)) = (stats, outcome) {
+                let counts = match o {
+                    NotifyOutcome::NoWaiters => {
+                        WakeCounts { no_waiters: 1, ..WakeCounts::default() }
+                    }
+                    NotifyOutcome::Suppressed => {
+                        WakeCounts { suppressed: 1, ..WakeCounts::default() }
+                    }
+                    NotifyOutcome::Woken => WakeCounts { notified: 1, ..WakeCounts::default() },
+                };
+                stats.record_wake(step_idx, counts);
             }
         }
     }
@@ -1041,6 +1125,7 @@ mod tests {
                 None,
                 0,
                 None,
+                &mut LoopDiag::new(false),
             )
             .unwrap();
             assert!(matches!(info.result, Ok(StepOutcome::Finished)));
@@ -1086,6 +1171,7 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         )
         .unwrap();
         assert!(matches!(info1.result, Ok(StepOutcome::Finished)));
@@ -1108,6 +1194,7 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         )
         .unwrap();
         assert!(matches!(info2.result, Ok(StepOutcome::Finished)));
@@ -1166,6 +1253,7 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         )
         .unwrap();
 
@@ -1823,6 +1911,7 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         );
         let snap = stats.snapshot();
         assert!(
@@ -1853,11 +1942,454 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         );
         assert!(
             stats_pool.snapshot().detached.is_empty(),
             "pool dispatch must not record on the off-pool detached line"
         );
+    }
+
+    /// `u32 -> u32` pass-through used as a Detached group member: pops one item,
+    /// pushes it on (holds on backpressure), finishes on drained input.
+    struct PassDet {
+        name: &'static str,
+        held: Option<u32>,
+    }
+    impl Step for PassDet {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 64 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn detached_group(&self) -> crate::step::DetachedGroup {
+            crate::step::DetachedGroup::Shared("g")
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(v) = self.held.take() {
+                if let Err(u) = ctx.outputs.push(v) {
+                    self.held = Some(u.into_item());
+                    return Ok(StepOutcome::NoProgress);
+                }
+                return Ok(StepOutcome::Progress);
+            }
+            match ctx.input.pop() {
+                Some(v) => match ctx.outputs.push(v) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                },
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// `() -> u32` source with the same types and kind as `three_step_chain`'s
+    /// step 0: pushes one item and reports `Progress` on its first call,
+    /// `Finished` after.
+    #[derive(Default)]
+    struct OneShotProgress {
+        fired: bool,
+    }
+    impl Step for OneShotProgress {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "OneShot",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.fired {
+                return Ok(StepOutcome::Finished);
+            }
+            self.fired = true;
+            ctx.outputs.push(1).map_err(|_| io::Error::other("edge has room"))?;
+            Ok(StepOutcome::Progress)
+        }
+    }
+
+    /// Eight heap bytes, so an 8-byte byte-bounded edge holds exactly one.
+    #[derive(Debug)]
+    struct Item8;
+    impl crate::item::HeapSize for Item8 {
+        fn heap_size(&self) -> usize {
+            8
+        }
+    }
+
+    /// Emits `n` [`Item8`]s into a 1 MiB byte-bounded edge, so its pushes never
+    /// refuse.
+    struct Item8Source {
+        n: u32,
+    }
+    impl Step for Item8Source {
+        type Input = ();
+        type Outputs = Single<Item8>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Src",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.n == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            self.n -= 1;
+            ctx.outputs.push(Item8).map_err(|_| io::Error::other("the 1 MiB edge has room"))?;
+            Ok(StepOutcome::Progress)
+        }
+    }
+
+    /// A Parallel step behind a shared admission cap, shaped like the
+    /// Process-family adapters: re-push the held item first, then take a permit,
+    /// pop, hold the permit for `work`, and push; a refused push holds the item.
+    struct CappedHolder {
+        cap: Arc<crate::admission::PhaseCap>,
+        edge: QueueSpec,
+        work: std::time::Duration,
+        held: Option<crate::handles::Unpushed<Item8>>,
+    }
+    impl Step for CappedHolder {
+        type Input = Item8;
+        type Outputs = Single<Item8>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CappedHolder",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![self.edge],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
+            Some(&self.cap)
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(u) = self.held.take() {
+                return match ctx.outputs.retry(u) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u);
+                        Ok(StepOutcome::NoProgress)
+                    }
+                };
+            }
+            let _admission = match crate::admission::admit_input(ctx.input, Some(&self.cap)) {
+                Ok(a) => a,
+                Err(outcome) => return Ok(outcome),
+            };
+            match ctx.input.pop() {
+                Some(item) => {
+                    std::thread::sleep(self.work);
+                    if let Err(u) = ctx.outputs.push(item) {
+                        self.held = Some(u);
+                    }
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { cap: Arc::clone(&self.cap), edge: self.edge, work: self.work, held: None }
+        }
+    }
+
+    /// A Serial sink that sleeps `work` after each pop.
+    struct SlowSink {
+        work: std::time::Duration,
+    }
+    impl Step for SlowSink {
+        type Input = Item8;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "Sink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => {
+                    std::thread::sleep(self.work);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// A finished step is never booked a shared driver's idle: once the step
+    /// that last progressed (or the primary) has left the worklist, the idle
+    /// goes to a step that is still live.
+    #[test]
+    fn driver_idle_is_never_attributed_to_a_finished_step() {
+        let (a, b, c) = (StepIdx(1), StepIdx(2), StepIdx(3));
+        let mut diag = LoopDiag::new(true);
+        let all = LiveSteps::from_order(vec![a, b, c]);
+        assert_eq!(diag.attributed(a, &all), a, "before any progress: the primary");
+        diag.note(b, &Ok(StepOutcome::Progress));
+        assert_eq!(diag.attributed(a, &all), b, "the step that last progressed");
+        diag.note(b, &Ok(StepOutcome::Finished));
+        let without_b = LiveSteps::from_order(vec![a, c]);
+        assert_eq!(diag.attributed(a, &without_b), a, "b finished: back to the live primary");
+        let only_c = LiveSteps::from_order(vec![c]);
+        assert_eq!(diag.attributed(a, &only_c), c, "a and b finished: the live step");
+    }
+
+    /// A shared driver's park is booked to the step that last made progress
+    /// on that thread (B after an item flowed A→B), and to the group's primary
+    /// (A) before any progress. Pinned by driving `[A, B]` as one driver row and
+    /// pushing one item from the test thread between two idle windows.
+    #[test]
+    fn driver_idle_is_attributed_to_the_last_progressing_step() {
+        use crate::step::OutputHandles;
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("Src", 1);
+        let a = graph.register_step("A", 1);
+        let b = graph.register_step("B", 1);
+        let sink = graph.register_step("Sink", 0);
+        graph.wire(src, BranchIdx(0), a);
+        graph.wire(a, BranchIdx(0), b);
+        graph.wire(b, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(SrcFinished)),
+            Box::new(TypedStep::new(PassDet { name: "A", held: None })),
+            Box::new(TypedStep::new(PassDet { name: "B", held: None })),
+            Box::new(TypedStep::new(SinkStep)),
+        ];
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+            false,
+        ));
+        let stats = Arc::new(PipelineStats::new(vec!["Src", "A", "B", "Sink"]));
+        let signal = PipelineSignal::new();
+        let drain_counters: Vec<Arc<StepDrainCounter>> =
+            (0..4).map(|_| StepDrainCounter::new(1)).collect();
+
+        // Driver row: A and B Owned, everything else Skip.
+        let mut row: Vec<WorkerStepEntry> = (0..4).map(|_| WorkerStepEntry::Skip).collect();
+        let mut it = steps.into_iter();
+        let _src = it.next();
+        row[1] = WorkerStepEntry::Owned { step: it.next().unwrap() };
+        row[2] = WorkerStepEntry::Owned { step: it.next().unwrap() };
+
+        let driver = {
+            let contexts = Arc::clone(&contexts);
+            let signal = Arc::clone(&signal);
+            let stats = Arc::clone(&stats);
+            let drain_counters = drain_counters.clone();
+            std::thread::spawn(move || {
+                let mut worker = WorkerCore::driver(a);
+                run_worker_loop(
+                    &mut worker,
+                    &mut row,
+                    &contexts,
+                    &drain_counters,
+                    &signal,
+                    Some(&stats),
+                    &crate::liveness::LivenessCounter::new(1),
+                    &crate::runtime::scheduler::DrainFirstScheduler,
+                    None,
+                    0,
+                    None,
+                    true,
+                );
+            })
+        };
+
+        let producer = contexts.outputs[0].downcast_ref::<OutputHandles<Single<u32>>>().unwrap();
+        let sink_in = contexts.inputs[3].downcast_ref::<BranchInputHandle<u32>>().unwrap();
+        let parks = |snap: &crate::runtime::stats::StatsSnapshot, idx: usize| {
+            snap.detached.iter().find(|d| d.0 == idx).map_or(0, |d| d.4)
+        };
+        // Window 1: nothing pushed yet → parks booked to the primary (A). Wait
+        // for the first park instead of sleeping a fixed time.
+        // Every wait is bounded, so a missing attribution fails the test rather
+        // than hanging it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let wait_until = |what: &str, cond: &dyn Fn() -> bool| {
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::yield_now();
+            }
+        };
+        wait_until("A's first park", &|| parks(&stats.snapshot(), 1) > 0);
+        assert_eq!(parks(&stats.snapshot(), 2), 0, "B has not progressed yet");
+
+        // One item flows A → B; window 2: parks now booked to B.
+        assert!(producer.push(7).is_ok());
+        wait_until("the item at the sink", &|| sink_in.pop().is_some());
+        let mid = stats.snapshot();
+        wait_until("a park booked to B", &|| parks(&stats.snapshot(), 2) > parks(&mid, 2));
+        let after = stats.snapshot();
+        assert_eq!(
+            parks(&after, 1),
+            parks(&mid, 1),
+            "A gains no parks once B was the last to progress"
+        );
+
+        producer.mark_all_drained();
+        driver.join().expect("driver joins");
+    }
+
+    /// A step refused by an admission cap returns `Capped`. That is not a held
+    /// item: the input item is still queued, and the refusal never reaches a
+    /// transport push, so no hold or held retry is recorded (holds are measured
+    /// at the transport — see
+    /// `queues::tests::hold_clock_times_first_reject_to_next_push`).
+    ///
+    /// Run as a real two-worker pipeline with `--pipeline-stats`, so every edge
+    /// is byte-bounded and carries a hold clock. `cap_refusal` has the two
+    /// workers contend for one permit over roomy edges: many refusals, no
+    /// holds. `push_refusal` is the control on the same chain: an uncontended
+    /// cap and a one-item edge into a slow sink, so the hold clock does book
+    /// holds there — the `cap_refusal` zero is not a fixture that cannot count.
+    #[rstest::rstest]
+    #[case::cap_refusal(1, QueueSpec::ByteBounded { limit_bytes: 1 << 20 }, 200, 0, true)]
+    #[case::push_refusal(2, QueueSpec::ByteBounded { limit_bytes: 8 }, 0, 200, false)]
+    fn admission_refusal_is_not_a_hold(
+        #[case] permits: usize,
+        #[case] edge: QueueSpec,
+        #[case] capped_work_us: u64,
+        #[case] sink_work_us: u64,
+        #[case] cap_refuses: bool,
+    ) {
+        use std::time::Duration;
+
+        use crate::admission::PhaseCap;
+        use crate::builder::{Pipeline, PipelineConfig};
+        const N: u32 = 400;
+        let cap = PhaseCap::new("test-phase", permits);
+        let builder = Pipeline::builder();
+        builder
+            .chain(Item8Source { n: N })
+            .chain(CappedHolder {
+                cap: Arc::clone(&cap),
+                edge,
+                work: Duration::from_micros(capped_work_us),
+                held: None,
+            })
+            .chain(SlowSink { work: Duration::from_micros(sink_work_us) })
+            .into_sink_marker();
+        let pipeline = builder.build().expect("build");
+        let stats = pipeline.stats();
+        pipeline
+            .run(PipelineConfig { threads: 2, ..Default::default() }.with_stats(Arc::clone(&stats)))
+            .expect("run");
+        let snap = stats.snapshot();
+        let holds = |name: &str| {
+            let (_, s) = snap.steps.iter().find(|(n, _)| *n == name).expect("step row");
+            (s.holds, s.held_retries)
+        };
+        if cap_refuses {
+            assert!(cap.refused() > 0, "two workers on one permit must be refused: {snap:?}");
+            for name in ["Src", "CappedHolder", "Sink"] {
+                assert_eq!(holds(name), (0, 0), "a cap refusal is not a hold ({name})");
+            }
+        } else {
+            assert_eq!(cap.refused(), 0, "the control's holds come from push refusals only");
+            assert!(holds("CappedHolder").0 > 0, "a refused push into the full edge is a hold");
+        }
+    }
+
+    /// Every `Progress` issues exactly one `notify_one` and every `Finished` one
+    /// `notify_all`. Observed through the event-count itself (an armed key
+    /// reports `Woken` iff the generation moved), not through the stats the
+    /// same branch records.
+    #[test]
+    fn legacy_mode_notifies_exactly_as_before() {
+        use std::time::Duration;
+
+        use crate::runtime::event_count::WaitOutcome;
+        let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+            false,
+        ));
+        let stats = Arc::new(PipelineStats::new(vec!["Src", "Finish", "Sink"]));
+        let ec = Arc::new(PoolEventCount::new(2));
+        let signal = PipelineSignal::new();
+        let counter = StepDrainCounter::new(1);
+
+        // Finished → notify_all: an armed key sees the generation move.
+        let mut entry = WorkerStepEntry::Owned { step: steps[1].clone_boxed() };
+        let key = ec.prepare_wait();
+        let info = dispatch_one_step(
+            &mut entry,
+            StepIdx(1),
+            &contexts,
+            &counter,
+            &signal,
+            Some(&stats),
+            &LivenessCounter::new(1),
+            0,
+            false,
+            None,
+            0,
+            Some(&*ec),
+            &mut LoopDiag::new(false),
+        )
+        .unwrap();
+        assert!(matches!(info.result, Ok(StepOutcome::Finished)));
+        assert_eq!(ec.wait(key, Duration::ZERO), WaitOutcome::Woken, "Finished must notify_all");
+
+        // Progress → exactly one notify_one: one bump, and a second arm sees none.
+        let mut progress =
+            WorkerStepEntry::Owned { step: Box::new(TypedStep::new(OneShotProgress::default())) };
+        let key = ec.prepare_wait();
+        let info = dispatch_one_step(
+            &mut progress,
+            StepIdx(0),
+            &contexts,
+            &StepDrainCounter::new(1),
+            &signal,
+            Some(&stats),
+            &LivenessCounter::new(1),
+            0,
+            false,
+            None,
+            0,
+            Some(&*ec),
+            &mut LoopDiag::new(false),
+        )
+        .unwrap();
+        assert!(matches!(info.result, Ok(StepOutcome::Progress)));
+        assert_eq!(ec.wait(key, Duration::ZERO), WaitOutcome::Woken, "Progress must notify_one");
+        let key = ec.prepare_wait();
+        assert_eq!(
+            ec.wait(key, Duration::ZERO),
+            WaitOutcome::TimedOut,
+            "exactly one bump per Progress"
+        );
+        // Rendering check only (the oracle above is the behavioural one).
+        assert_eq!(stats.snapshot().steps[0].1.notifies_issued, 1);
     }
 
     #[test]
@@ -1896,6 +2428,7 @@ mod tests {
             Some(&board),
             0,
             None,
+            &mut LoopDiag::new(false),
         );
         assert_eq!(board.read(0), (WorkerState::Running, Some(StepIdx(0))));
     }
@@ -1932,6 +2465,7 @@ mod tests {
             None,
             0,
             None,
+            &mut LoopDiag::new(false),
         )
         .unwrap();
         assert!(matches!(info.result, Ok(StepOutcome::Finished)));

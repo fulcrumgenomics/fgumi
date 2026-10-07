@@ -420,15 +420,24 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
             let landed_next = ordinal == state.next_serial;
             let cap = self.max_overflow_bytes.load(Ordering::Relaxed);
             if !landed_next && cap != REORDER_OVERFLOW_UNBOUNDED && state.buffer_bytes >= cap {
+                // The item is now held by the calling thread; record it on the
+                // transport (it is released by a later push on the same
+                // transport, or a later stash insert).
+                self.transport.note_rejected_holder(crate::queues::SEALED);
                 let Sequenced { ordinal, item } = seq;
                 return Err((ordinal, item));
             }
-            match self.transport.try_push(seq) {
+            // A must-accept push cannot be refused (a transport refusal becomes
+            // a stash insert), so it books no refusal on the transport.
+            match self.transport.try_push_unlatched(seq, crate::queues::SEALED) {
                 Ok(()) => Ok(()),
                 Err(seq) => {
                     // Transport full: overflow into the stash. The cap was
                     // already checked above; `next_serial` is exempt either
-                    // way, so the must-accept liveness guarantee holds.
+                    // way, so the must-accept liveness guarantee holds. The
+                    // stash insert is an accepted push: a hold this producer
+                    // had open on the transport ends here.
+                    self.transport.note_stash_accepted(crate::queues::SEALED);
                     // `usize → u64` is a lossless widen on every supported
                     // (≤64-bit) target, so this cast never truncates.
                     let item_bytes = seq.item.heap_size() as u64;
@@ -1070,5 +1079,108 @@ mod tests {
         assert!(result.is_err(), "expected backpressure rejection");
         let (ord, item) = result.unwrap_err();
         assert_eq!((ord, item), (4, 400));
+    }
+
+    /// A reorder-stash-cap rejection is a hold too: it is recorded on the
+    /// transport (the cap sits above it), and released by the same thread's
+    /// next successful push into that transport. The transport holds one
+    /// `Sized8` (1-byte limit) and the stash one (8-byte cap): ordinal 1 lands
+    /// in the transport, 2 overflows into the stash (a must-accept insert: an
+    /// accepted push, no hold), 3 hits the stash cap (the hold starts). Once
+    /// ordinals 0 and 1 are popped in order, ordinal 3 is re-pushed and ends
+    /// the hold.
+    #[test]
+    fn stash_cap_rejection_is_a_timed_hold() {
+        use std::sync::mpsc::channel;
+
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, EdgeTracking};
+        use crate::runtime::stats::PipelineStats;
+        use crate::runtime::wake_slot::{HoldClock, SlotGuard};
+        use crate::topology::StepIdx;
+
+        #[derive(Debug, PartialEq)]
+        struct Sized8;
+        impl HeapSize for Sized8 {
+            fn heap_size(&self) -> usize {
+                8
+            }
+        }
+
+        let stats = Arc::new(PipelineStats::new(vec!["P", "C"]));
+        let transport = Arc::new(ByteBoundedQueue::<Sequenced<Sized8>>::new(1));
+        transport.enable_tracking(
+            EdgeTracking { clock: Some(HoldClock::per_thread(StepIdx(0), Arc::clone(&stats), 4)) },
+            crate::queues::SEALED,
+        );
+        let stage = Arc::new(ReorderStage::with_max_overflow_bytes(Arc::clone(&transport) as _, 8));
+        let (held_tx, held_rx) = channel::<()>();
+        let (popped_tx, popped_rx) = channel::<()>();
+        let stage_p = Arc::clone(&stage);
+        let producer = std::thread::spawn(move || {
+            let _slot = SlotGuard::enter(2);
+            stage_p.try_push(1, Sized8).unwrap(); // transport
+            stage_p.try_push(2, Sized8).unwrap(); // transport full → stash
+            assert!(stage_p.try_push(3, Sized8).is_err(), "stash at its cap: ordinal 3 is held");
+            held_tx.send(()).unwrap();
+            popped_rx.recv().unwrap();
+            stage_p.try_push(3, Sized8).unwrap(); // releases the hold
+        });
+        held_rx.recv().unwrap();
+        stage.try_push(0, Sized8).unwrap(); // next_serial: exempt from the cap
+        assert_eq!(stage.try_pop_in_order(), Some(Sized8));
+        assert_eq!(stage.try_pop_in_order(), Some(Sized8));
+        popped_tx.send(()).unwrap();
+        producer.join().unwrap();
+        let s = stats.snapshot().steps[0].1;
+        assert_eq!(
+            (s.holds, s.held_retries),
+            (1, 0),
+            "one hold, from the cap refusal; the stash insert is no hold"
+        );
+    }
+
+    /// A held item whose retry lands in the stash (the must-accept arm, with the
+    /// transport still full) was accepted: its hold ends at that insert, not at
+    /// the producer's next unrelated push. The transport holds one `Sized8`
+    /// (1-byte limit). Ordinal 1 fills the transport, 0 lands in the stash and
+    /// makes the fast path live, 2 is refused on the fast path (the hold
+    /// starts), the in-order pop of 0 frees no transport room, and the retry of
+    /// 2 is stashed.
+    #[test]
+    fn a_held_retry_stashed_by_the_must_accept_arm_ends_its_hold() {
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, EdgeTracking};
+        use crate::runtime::stats::PipelineStats;
+        use crate::runtime::wake_slot::{HoldClock, SlotGuard};
+        use crate::topology::StepIdx;
+
+        #[derive(Debug, PartialEq)]
+        struct Sized8;
+        impl HeapSize for Sized8 {
+            fn heap_size(&self) -> usize {
+                8
+            }
+        }
+
+        let _slot = SlotGuard::enter(1);
+        let stats = Arc::new(PipelineStats::new(vec!["P", "C"]));
+        let transport = Arc::new(ByteBoundedQueue::<Sequenced<Sized8>>::new(1));
+        transport.enable_tracking(
+            EdgeTracking { clock: Some(HoldClock::per_thread(StepIdx(0), Arc::clone(&stats), 2)) },
+            crate::queues::SEALED,
+        );
+        let stage = ReorderStage::new(Arc::clone(&transport) as _);
+        stage.try_push(1, Sized8).unwrap(); // transport
+        stage.try_push(0, Sized8).unwrap(); // transport full → stash (next_serial)
+        assert!(stage.try_push(2, Sized8).is_err(), "fast path: the transport refuses");
+        assert_eq!(stage.try_pop_in_order(), Some(Sized8), "0, from the stash");
+        stage.try_push(2, Sized8).unwrap(); // must-accept: transport still full → stash
+        let s = stats.snapshot().steps[0].1;
+        assert_eq!(
+            (s.holds, s.held_retries),
+            (1, 0),
+            "the stash insert of the held retry ends its hold"
+        );
     }
 }

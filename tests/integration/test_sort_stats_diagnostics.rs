@@ -199,6 +199,124 @@ fn assert_really_spilled(stderr: &str) {
     );
 }
 
+/// Strip `env_logger`'s `[<time> <LEVEL> <module>] ` prefix: every line `fgumi`
+/// logs through `log::info!` carries it (default `env_logger` format,
+/// `src/main.rs`), so column parsing must start after the first `"] "`.
+fn log_body(line: &str) -> &str {
+    line.split_once("] ").map_or(line, |(_, body)| body)
+}
+
+/// `SplitMix64`: a fixed, dependency-free mixer for seeded fixture shuffles.
+/// Deliberately not a `rand` generator: `StdRng`'s stream may change between
+/// `rand` releases, and the tests that need several merge sources or a
+/// parks/`gated_off` split must keep reading the same, reviewed input.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Writes a BAM of `families` three-read UMI families at seeded pseudo-random
+/// positions, in generation order, so the file is NOT coordinate-sorted. Every
+/// tenth family reuses the previous family's position, so equal coordinate keys
+/// exist across families. Names are hashed so name order is not index order either.
+fn write_shuffled_bam_fixture(path: &Path, families: usize, seed: u64) {
+    let header = create_minimal_header("chr1", 100_000);
+    let mut pos = 1usize;
+    let records: Vec<_> = (0..families)
+        .flat_map(|i| {
+            let h = splitmix64(seed ^ (i as u64));
+            if i % 10 != 9 {
+                pos = 1 + usize::try_from(h % 90_000).expect("fits");
+            }
+            create_umi_family_at_pos("ACGT", 3, &format!("fam_{h:016x}"), "ACGTACGTAC", 35, pos)
+        })
+        .collect();
+    write_bam(path, &header, &records);
+}
+
+/// Runs `fgumi sort --order coordinate` on the shuffled fixture at info
+/// verbosity with `FGUMI_PIPELINE_STATS=1`; returns stderr.
+fn sort_shuffled(families: usize, max_memory: &str, extra_args: &[&str]) -> String {
+    let tmp = TempDir::new().expect("tempdir");
+    let input: PathBuf = tmp.path().join("unsorted.bam");
+    write_shuffled_bam_fixture(&input, families, 0x5EED);
+    let output = tmp.path().join("sorted.bam");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.env("RUST_LOG", "info").env("FGUMI_PIPELINE_STATS", "1");
+    let result = cmd
+        .args(["sort", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--order", "coordinate", "-m", max_memory])
+        .args(extra_args)
+        .output()
+        .expect("run fgumi sort");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
+    stderr
+}
+
+/// `N` from the standalone-sort summary line `Merge sources: N`.
+fn merge_sources(stderr: &str) -> Option<u64> {
+    stderr
+        .lines()
+        .map(log_body)
+        .find_map(|b| b.trim().strip_prefix("Merge sources: "))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// Parse `(N, U, T)` from the first
+/// ``detached `<step>`: ... ; N parks (unparked U, timed out T, avg ...)`` line.
+fn detached_parks(stderr: &str, step: &str) -> Option<(u64, u64, u64)> {
+    let needle = format!("detached `{step}`:");
+    let line = stderr.lines().map(log_body).find(|l| l.contains(&needle))?;
+    let after = line.split("; ").nth(1)?; // "N parks (unparked U, timed out T, avg ..."
+    let n = after.split_whitespace().next()?.parse().ok()?;
+    let field = |label: &str| -> Option<u64> {
+        let rest = after.split_once(label)?.1;
+        rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    Some((n, field("(unparked ")?, field(", timed out ")?))
+}
+
+/// On a sort that merges several runs, the coordination driver's waits are
+/// booked to the step that last made progress on it, not to the first step of
+/// its group (`ReadBlocks`). Before the attribution fix every park of the
+/// shared `sort-coord` driver showed up under `ReadBlocks` and its other steps
+/// (`FindBoundariesAndSort`, `SpillGather`, `SortMerge`) all printed `0 parks`.
+/// Which of them parks depends on scheduling (the merge may never wait on a
+/// loaded host), so the check is on the group, not on one step.
+#[test]
+fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
+    let stderr = sort_shuffled(20_000, "512K", &["--threads", "4"]);
+    let sources =
+        merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(sources > 1, "the fixture must merge more than one source (got {sources}):\n{stderr}");
+    let parks = |step: &str| {
+        detached_parks(&stderr, step)
+            .unwrap_or_else(|| panic!("no `detached \\`{step}\\`` line:\n{stderr}"))
+    };
+    // Every park ended one of two ways, so each line's split must add up.
+    for step in ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"] {
+        let (n, unparked, timed_out) = parks(step);
+        assert_eq!(
+            unparked + timed_out,
+            n,
+            "`{step}`: unparked + timed out must equal its parks:\n{stderr}"
+        );
+    }
+    let booked_past_the_primary: u64 =
+        ["FindBoundariesAndSort", "SpillGather", "SortMerge"].iter().map(|s| parks(s).0).sum();
+    assert!(
+        booked_past_the_primary > 0,
+        "coord-driver parks must be booked to the step that last progressed, not all to \
+         ReadBlocks:\n{stderr}"
+    );
+}
+
 /// `--sort-stats` gates the `SortMerge` k-way-merge diagnostic line on a
 /// spilling sort: absent by default, present when passed.
 #[rstest]

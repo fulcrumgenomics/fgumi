@@ -419,6 +419,7 @@ mod tests {
             total_run_ns,
             first_progress_ns: u64::MAX,
             last_progress_ns: 0,
+            ..Default::default()
         }
     }
 
@@ -430,6 +431,7 @@ mod tests {
             workers: Vec::new(),
             detached: Vec::new(),
             edges: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -508,6 +510,7 @@ mod tests {
             workers: Vec::new(),
             detached: vec![(0, "WriteBgzfFile", 999_999, 0, 0)],
             edges: Vec::new(),
+            ..Default::default()
         };
         let phase_ns = summarize_sort_phases(&snap, 0);
         assert_eq!(
