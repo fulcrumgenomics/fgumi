@@ -327,6 +327,8 @@ pub struct ErasedStepCtx<'a> {
     /// The adapter forwards it into `StepCtx`/`StepCtx2` so the step body can
     /// bump its declared counters.
     pub counters: &'a StepCounters,
+    /// This step's pool-worker request handle, forwarded into the typed context.
+    pub pool: crate::runtime::wake::PoolHandle<'a>,
 }
 
 /// Adapter that wraps a concrete `Step` impl as an `ErasedStep`.
@@ -561,7 +563,7 @@ where
         let counters = ctx.counters;
         let input = self.resolve_input(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut step_ctx = StepCtx { input, outputs, counters };
+        let mut step_ctx = StepCtx { input, outputs, counters, pool: ctx.pool };
         self.inner.try_run(&mut step_ctx)
     }
 
@@ -836,7 +838,8 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
         let counters = ctx.counters;
         let inputs = self.resolve_inputs(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut typed_ctx = StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs, counters };
+        let mut typed_ctx =
+            StepCtx2::<S> { a: &inputs.a, b: &inputs.b, outputs, counters, pool: ctx.pool };
         self.inner.try_run(&mut typed_ctx)
     }
 
@@ -1143,7 +1146,7 @@ impl<S: StepK> ErasedStep for TypedStepK<S> {
         // possible later if a profile ever shows it.
         let refs: Vec<&dyn InputHandle<S::Input>> =
             inputs.as_slice().iter().map(|h| h as &dyn InputHandle<S::Input>).collect();
-        let mut typed_ctx = StepCtxK::<S> { inputs: &refs, outputs, counters };
+        let mut typed_ctx = StepCtxK::<S> { inputs: &refs, outputs, counters, pool: ctx.pool };
         self.inner.try_run(&mut typed_ctx)
     }
 
@@ -1527,6 +1530,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -1562,6 +1566,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         // First dispatch populates the cache; the second must hit it — and both
         // its unconditional box-address assert and the debug-only downcast
@@ -1608,6 +1613,7 @@ mod tests {
             outputs: outputs_any,
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
 
@@ -1617,6 +1623,7 @@ mod tests {
             outputs: outputs_any,
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         let _ = consumer.try_run_erased(&mut wrong_ctx);
     }
@@ -1638,6 +1645,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -1817,6 +1825,7 @@ mod tests {
             outputs: &splitter_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
+            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
         };
 
         let outcome = splitter.try_run_erased(&mut ctx).unwrap();

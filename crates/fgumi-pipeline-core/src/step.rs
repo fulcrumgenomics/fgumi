@@ -294,6 +294,7 @@ use crate::admission::PhaseCap;
 // it would be pure churn for a type whose construction and storage both live in
 // `runtime`.
 use crate::runtime::contexts::StepCounters;
+use crate::runtime::wake::PoolHandle;
 
 /// Static description of one domain counter a step declares.
 ///
@@ -533,6 +534,9 @@ pub trait Step: Send + Sized + 'static {
 pub struct StepCtx<'a, S: Step> {
     pub input: &'a dyn InputHandle<S::Input>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Pool-worker request handle — see [`PoolHandle::request_worker`] for when
+    /// (and when not) to call it.
+    pub pool: PoolHandle<'a>,
     /// Per-step domain counters (one atomic per [`Step::counters`] spec). Bump
     /// via `ctx.counters.add(slot, n)`; a no-op (one load + branch) when
     /// telemetry is off, so bumping unconditionally stays zero-cost off-path.
@@ -618,6 +622,8 @@ pub struct StepCtx2<'a, S: Step2> {
     pub a: &'a dyn InputHandle<S::InputA>,
     pub b: &'a dyn InputHandle<S::InputB>,
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Pool-worker request handle — see [`StepCtx::pool`].
+    pub pool: PoolHandle<'a>,
     /// Per-step domain counters — see [`StepCtx::counters`].
     pub counters: &'a StepCounters,
 }
@@ -721,6 +727,8 @@ pub struct StepCtxK<'a, S: StepK> {
     /// [`InputHandle`] over the shared `S::Input` type.
     pub inputs: &'a [&'a dyn InputHandle<S::Input>],
     pub outputs: &'a OutputHandles<S::Outputs>,
+    /// Pool-worker request handle — see [`StepCtx::pool`].
+    pub pool: PoolHandle<'a>,
     /// Per-step domain counters — see [`StepCtx::counters`].
     pub counters: &'a StepCounters,
 }

@@ -231,6 +231,24 @@ impl PoolEventCount {
         NotifyOutcome::Woken
     }
 
+    /// Demand-side wake: like [`Self::notify_one`] but **ungated by the
+    /// ceiling**. Used by `PoolHandle::request_worker` — a step asking for one
+    /// pool worker because it is about to park on work only the pool can
+    /// produce. The ceiling exists to stop the per-`Progress` cascade; a
+    /// demand request is the opposite case and must reach a parked worker even
+    /// when the pool is nominally "full enough".
+    #[inline]
+    pub fn notify_one_demand(&self) -> NotifyOutcome {
+        fence(Ordering::SeqCst);
+        if self.waiters.0.load(Ordering::Relaxed) == 0 {
+            return NotifyOutcome::NoWaiters;
+        }
+        let _guard = self.lock.lock();
+        self.generation.0.fetch_add(1, Ordering::Relaxed);
+        self.cvar.notify_one();
+        NotifyOutcome::Woken
+    }
+
     /// Producer side: wake *every* parked worker. Reserved for terminal /
     /// broadcast events (edge close, `Finished`, cancel/error) where more than
     /// one waiter may need to observe the transition. Same fence discipline as

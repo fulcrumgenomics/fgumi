@@ -38,7 +38,7 @@ use crate::runtime::live::LiveSteps;
 use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::{PipelineStats, WakeCounts};
 use crate::runtime::storage::WorkerStepEntry;
-use crate::runtime::wake::{PushSnapshot, WakePlan};
+use crate::runtime::wake::{PoolHandle, PushSnapshot, WakePlan};
 use crate::runtime::worker_core::{WorkerCore, WorkerRole};
 use crate::runtime::worker_state::WorkerStateBoard;
 use crate::signal::{PipelineError, PipelineSignal};
@@ -396,6 +396,10 @@ pub(crate) fn run_worker_loop(
                 // thread to the timer park instead, and only the cap-parked
                 // re-poll skips), so both are cheap no-ops kept for uniformity.
                 wake.start_pass();
+                // Until this arm is balanced, a `request_worker` from a step in
+                // the re-poll below must not count this worker as the parked
+                // worker to wake (it would wake only itself).
+                crate::runtime::wake_slot::set_ec_armed(true);
 
                 // Phase 2: re-poll the *real* condition — one full dispatch
                 // pass. One pass per park episode (amortised over the block),
@@ -428,6 +432,8 @@ pub(crate) fn run_worker_loop(
                     // down): do not block, and record no idle — the re-poll was
                     // productive. Balance the arm and re-ramp fresh.
                     ec.cancel_wait(key);
+                    crate::runtime::wake_slot::set_ec_armed(false);
+                    wake.acknowledge_request();
                     worker.reset_backoff();
                     continue;
                 }
@@ -441,6 +447,11 @@ pub(crate) fn run_worker_loop(
                     holding |= rejected;
                     cap_refused |= refused;
                     ec.cancel_wait(key);
+                    crate::runtime::wake_slot::set_ec_armed(false);
+                    // Every exit from the event-count acknowledges a pending
+                    // request, or one sent while this worker was armed stays
+                    // pending past it (timer-parked workers never acknowledge).
+                    wake.acknowledge_request();
                 } else {
                     // No progress remains: only now do we actually park. Stamp
                     // `Parked` and start the idle timer immediately before
@@ -462,6 +473,8 @@ pub(crate) fn run_worker_loop(
                     // deadlock monitor still ticks. Re-poll on return regardless.
                     let deadline = worker.backoff_deadline();
                     let outcome = ec.wait(key, deadline);
+                    crate::runtime::wake_slot::set_ec_armed(false);
+                    wake.acknowledge_request();
                     worker.increase_backoff();
 
                     if let (Some(stats), Some(ss)) = (stats, sleep_start) {
@@ -836,6 +849,7 @@ fn dispatch_one_step(
         outputs: outputs_any,
         signal,
         counters: &contexts.step_counters[step_idx.0],
+        pool: PoolHandle::new(wake, stats.map(|s| &**s), step_idx),
     };
 
     // Time the dispatch only when stats collection is on. `Instant::now()`
@@ -3454,6 +3468,247 @@ mod tests {
         );
         // Rendering check only (the oracle above is the behavioural one).
         assert_eq!(stats.snapshot().steps[0].1.notifies_issued, 1);
+    }
+
+    /// Slot-0 step for `an_event_count_exit_acknowledges_the_request`. Its
+    /// first call is idle, so the worker arms the event-count and re-polls. On
+    /// the re-poll it requests a pool worker (this worker is the armed waiter,
+    /// so the request is sent and becomes pending), then marks the thread as a
+    /// refused push (`note_held`) or a recording cap refusal
+    /// (`note_cap_refused`) would, so the worker leaves the event-count without
+    /// waiting. Its third call finishes.
+    struct RequestThenRefuse {
+        calls: u32,
+        cap_refused: bool,
+        requested: Arc<Mutex<Option<crate::runtime::wake::PoolRequest>>>,
+    }
+    impl Step for RequestThenRefuse {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "RequestThenRefuse",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            self.calls += 1;
+            match self.calls {
+                1 => Ok(StepOutcome::NoProgress),
+                2 => {
+                    *self.requested.lock() = Some(ctx.pool.request_worker());
+                    if self.cap_refused {
+                        crate::runtime::wake_slot::note_cap_refused();
+                    } else {
+                        crate::runtime::wake_slot::note_held();
+                    }
+                    Ok(StepOutcome::NoProgress)
+                }
+                _ => Ok(StepOutcome::Finished),
+            }
+        }
+    }
+
+    /// A worker that leaves the event-count after its re-poll was refused (it
+    /// is holding, or a cap recorded it) acknowledges any pending pool request,
+    /// as every other exit from the event-count does. Otherwise a request sent
+    /// while it was armed stays pending, and every later `request_worker`
+    /// reports `Pending` while timer-parked holders never acknowledge it. A
+    /// second worker armed on the event-count is the request's real target
+    /// (the requester itself is never one), and it is woken.
+    #[rstest::rstest]
+    #[case::holding(false)]
+    #[case::cap_refused(true)]
+    fn an_event_count_exit_acknowledges_the_request(#[case] cap_refused: bool) {
+        use crate::runtime::event_count::WaitOutcome;
+        use crate::runtime::wake::PoolRequest;
+        let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+            false,
+        ));
+        let (plan, _g) = crate::runtime::wake::tests_support::directed_plan_with_workers(2);
+        let requested = Arc::new(Mutex::new(None));
+        let mut row: Vec<WorkerStepEntry> = (0..3).map(|_| WorkerStepEntry::Skip).collect();
+        row[0] = WorkerStepEntry::Owned {
+            step: Box::new(TypedStep::new(RequestThenRefuse {
+                calls: 0,
+                cap_refused,
+                requested: Arc::clone(&requested),
+            })),
+        };
+        let drain_counters: Vec<Arc<StepDrainCounter>> =
+            (0..3).map(|_| StepDrainCounter::new(1)).collect();
+        let _ = crate::runtime::wake_slot::take_rejected();
+        let _ = crate::runtime::wake_slot::take_cap_refused();
+        // The other worker, armed on the event-count for up to 10 s.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+        let other = {
+            let plan = Arc::clone(&plan);
+            std::thread::spawn(move || {
+                let pool = plan.pool().expect("t2 has a pool");
+                let key = pool.prepare_wait();
+                armed_tx.send(()).unwrap();
+                let t = std::time::Instant::now();
+                // No acknowledgement here: only the worker loop's refused exit
+                // may clear the pending request this test is about.
+                let outcome = pool.wait(key, std::time::Duration::from_secs(10));
+                (outcome, t.elapsed())
+            })
+        };
+        armed_rx.recv().unwrap();
+        let _slot = crate::runtime::wake_slot::SlotGuard::enter(0);
+        let mut worker = WorkerCore::new(0, None);
+        run_worker_loop(
+            &mut worker,
+            &mut row,
+            &contexts,
+            &drain_counters,
+            &PipelineSignal::new(),
+            None,
+            &crate::liveness::LivenessCounter::new(1),
+            &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
+            &plan,
+            false,
+        );
+        assert_eq!(
+            *requested.lock(),
+            Some(PoolRequest::Woken),
+            "the request was sent while this worker was armed, to the other waiter"
+        );
+        let (outcome, waited) = other.join().expect("other worker");
+        assert_ne!(outcome, WaitOutcome::TimedOut, "the other worker was woken by the request");
+        assert!(waited < std::time::Duration::from_secs(5), "...promptly: {waited:?}");
+        // A new request with an armed waiter must be sent, not reported pending.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let plan_w = Arc::clone(&plan);
+        let waiter = std::thread::spawn(move || {
+            let pool = plan_w.pool().expect("t2 has a pool");
+            let key = pool.prepare_wait();
+            ready_tx.send(()).unwrap();
+            pool.wait(key, std::time::Duration::from_secs(10))
+        });
+        ready_rx.recv().unwrap();
+        let again = plan.request_pool_worker();
+        let _ = plan.pool().expect("t2 has a pool").notify_all(); // release the waiter regardless
+        let _ = waiter.join();
+        assert_eq!(again, PoolRequest::Woken, "the earlier request was acknowledged");
+    }
+
+    /// Slot-0 step for `a_re_polling_worker_is_not_its_own_request_target`:
+    /// idle on its first call (the worker arms the event-count and re-polls),
+    /// requests a pool worker twice on the re-poll, then finishes.
+    struct RequestOnRepoll {
+        calls: u32,
+        requested: Arc<Mutex<Vec<crate::runtime::wake::PoolRequest>>>,
+    }
+    impl Step for RequestOnRepoll {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "RequestOnRepoll",
+                kind: StepKind::Exclusive,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            self.calls += 1;
+            match self.calls {
+                1 => Ok(StepOutcome::NoProgress),
+                2 => {
+                    let mut requested = self.requested.lock();
+                    requested.push(ctx.pool.request_worker());
+                    requested.push(ctx.pool.request_worker());
+                    Ok(StepOutcome::NoProgress)
+                }
+                _ => Ok(StepOutcome::Finished),
+            }
+        }
+    }
+
+    /// The worker loop marks itself armed (`set_ec_armed`) around its
+    /// event-count re-poll, so a step that requests a worker during that
+    /// re-poll does not count its own worker as the parked waiter to wake.
+    /// Here the requester is the only event-count waiter and another worker is
+    /// armed for a timer park: the first request must claim that worker, not
+    /// notify the requester's own event-count wait. The second request tells
+    /// the two apart: with worker 1's bit claimed nobody else is parked
+    /// (`AllAwake`); a request sent to the requester's own wait would instead
+    /// leave a pending event-count request (`Pending`).
+    #[test]
+    fn a_re_polling_worker_is_not_its_own_request_target() {
+        use crate::runtime::wake::PoolRequest;
+        let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
+        let contexts = Arc::new(build_chain_contexts(
+            &steps,
+            &graph,
+            crate::builder::InstrumentationLevel::Off,
+            false,
+        ));
+        let (plan, _g) = crate::runtime::wake::tests_support::directed_plan_with_workers(2);
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let mut row: Vec<WorkerStepEntry> = (0..3).map(|_| WorkerStepEntry::Skip).collect();
+        row[0] = WorkerStepEntry::Owned {
+            step: Box::new(TypedStep::new(RequestOnRepoll {
+                calls: 0,
+                requested: Arc::clone(&requested),
+            })),
+        };
+        let drain_counters: Vec<Arc<StepDrainCounter>> =
+            (0..3).map(|_| StepDrainCounter::new(1)).collect();
+        let _ = crate::runtime::wake_slot::take_rejected();
+        let _ = crate::runtime::wake_slot::take_cap_refused();
+        // Worker 1, armed for a timer park for up to 10 s.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+        let other = {
+            let plan = Arc::clone(&plan);
+            std::thread::spawn(move || {
+                plan.register_worker(1, std::thread::current());
+                assert!(plan.arm_direct(1));
+                armed_tx.send(()).unwrap();
+                let t = std::time::Instant::now();
+                std::thread::park_timeout(std::time::Duration::from_secs(10));
+                plan.disarm_direct(1);
+                t.elapsed()
+            })
+        };
+        armed_rx.recv().unwrap();
+        let _slot = crate::runtime::wake_slot::SlotGuard::enter(0);
+        let mut worker = WorkerCore::new(0, None);
+        run_worker_loop(
+            &mut worker,
+            &mut row,
+            &contexts,
+            &drain_counters,
+            &PipelineSignal::new(),
+            None,
+            &crate::liveness::LivenessCounter::new(1),
+            &crate::runtime::scheduler::ChainOrderScheduler,
+            None,
+            0,
+            &plan,
+            false,
+        );
+        assert_eq!(
+            *requested.lock(),
+            vec![PoolRequest::Woken, PoolRequest::AllAwake],
+            "the first request claimed worker 1; nothing was left pending"
+        );
+        let parked_for = other.join().expect("worker 1");
+        assert!(
+            parked_for < std::time::Duration::from_secs(5),
+            "the request reached the timer-parked worker, not the requester: {parked_for:?}"
+        );
     }
 
     /// Slot-0 stand-in for a flush-first step: marks the dispatch flushed (as a

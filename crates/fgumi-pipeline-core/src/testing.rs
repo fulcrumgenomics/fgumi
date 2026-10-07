@@ -13,7 +13,9 @@ use crate::item::HeapSize;
 use crate::outputs::StepOutputs;
 use crate::queues::{ItemQueue, UnboundedQueue};
 use crate::runtime::contexts::StepCounters;
+use crate::runtime::wake::{PoolHandle, WakePlan};
 use crate::step::{InputHandle, OutputHandles, Step, StepCtx, StepOutcome};
+use crate::topology::StepIdx;
 
 /// One step's input queue and output queues, wired the way the builder would
 /// wire them (output queues from the step's own [`crate::StepProfile`]), with
@@ -24,6 +26,8 @@ pub struct StepProbe<S: Step> {
     outputs: OutputHandles<S::Outputs>,
     output_queues: OutputQueueSet,
     counters: StepCounters,
+    /// No pool: a probed step's `request_worker` reports `Unavailable`.
+    wake: Arc<WakePlan>,
 }
 
 impl<S: Step> StepProbe<S> {
@@ -46,6 +50,7 @@ impl<S: Step> StepProbe<S> {
             outputs: OutputHandles::new(view),
             output_queues,
             counters: StepCounters::disabled(),
+            wake: WakePlan::legacy(None),
         }
     }
 
@@ -87,8 +92,12 @@ impl<S: Step> StepProbe<S> {
     ///
     /// Whatever the step's `try_run` returns.
     pub fn try_run(&self, step: &mut S) -> io::Result<StepOutcome> {
-        let mut ctx =
-            StepCtx { input: &self.input, outputs: &self.outputs, counters: &self.counters };
+        let mut ctx = StepCtx {
+            input: &self.input,
+            outputs: &self.outputs,
+            counters: &self.counters,
+            pool: PoolHandle::new(&self.wake, None, StepIdx(0)),
+        };
         step.try_run(&mut ctx)
     }
 }

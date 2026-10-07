@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use super::contexts::build_chain_contexts_fused;
 use super::stats::PipelineStats;
+use super::wake::{PoolHandle, WakePlan};
 use crate::builder::InstrumentationLevel;
 use crate::erased::{ErasedStep, ErasedStepCtx};
 use crate::signal::{PipelineError, PipelineSignal};
@@ -274,6 +275,9 @@ pub fn run_fused_single_thread(
     // makes progress.
     let mut idle_since: Option<Instant> = None;
 
+    // The fused path has no pool and no other thread: a request reports
+    // `Unavailable`.
+    let wake = WakePlan::legacy(None);
     'drive: loop {
         // Bail promptly on an external cancel or a prior-pass error.
         if signal.is_done() {
@@ -290,6 +294,7 @@ pub fn run_fused_single_thread(
                 outputs: outputs_any,
                 signal,
                 counters: &contexts.step_counters[i],
+                pool: PoolHandle::new(&wake, stats.map(|s| &**s), StepIdx(i)),
             };
 
             // Time the dispatch only when stats collection is on (mirrors
@@ -775,6 +780,78 @@ mod tests {
             !should_fuse_single_thread(1, InstrumentationLevel::Off, false, &steps, &graph),
             "a chain with a Detached step must not fuse (overlap must be preserved)"
         );
+    }
+
+    /// A source that records what `ctx.pool.request_worker()` returned, then
+    /// finishes.
+    struct RequestingSource {
+        seen: Arc<Mutex<Option<crate::runtime::wake::PoolRequest>>>,
+    }
+    impl Step for RequestingSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "RequestingSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            *self.seen.lock().unwrap() = Some(ctx.pool.request_worker());
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// Drains its input; finishes when it is drained.
+    struct DrainSink;
+    impl Step for DrainSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DrainSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            while ctx.input.pop().is_some() {}
+            if ctx.input.is_drained() {
+                Ok(StepOutcome::Finished)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+    }
+
+    /// The fused single-thread path has no pool and no registered worker, so a
+    /// step's `request_worker` reports `Unavailable`. The chain is one the
+    /// policy fuses at one thread, and it is driven by the fused driver itself,
+    /// so the outcome is the fused path's, not the scheduled one-worker path's
+    /// (which a Legacy chain would also report as `Unavailable`).
+    #[test]
+    fn fused_path_request_worker_is_unavailable() {
+        let seen = Arc::new(Mutex::new(None));
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("RequestingSource", 1);
+        let sink = graph.register_step("DrainSink", 0);
+        graph.wire(src, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(RequestingSource { seen: Arc::clone(&seen) })),
+            Box::new(TypedStep::new(DrainSink)),
+        ];
+        assert!(
+            should_fuse_single_thread(1, InstrumentationLevel::Off, false, &steps, &graph),
+            "the chain is fused at one thread"
+        );
+        run_fused_single_thread(steps, &graph, &PipelineSignal::new(), None, None, 0)
+            .expect("clean run");
+        assert_eq!(*seen.lock().unwrap(), Some(crate::runtime::wake::PoolRequest::Unavailable));
     }
 
     // Capability pin: `is_fusible_chain` staying `true` for a detached chain is
