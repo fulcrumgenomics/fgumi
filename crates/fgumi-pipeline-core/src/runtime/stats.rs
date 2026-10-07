@@ -76,33 +76,44 @@ pub struct StepStats {
     /// Progress dispatch. Updated on every Progress (monotonic max).
     /// `0` if the step never made progress.
     pub last_progress_ns: AtomicU64,
-    /// `notify_one` calls issued on this step's `Progress` (any outcome).
+    /// `notify_one` calls issued on this step's `Progress` or flushed retry
+    /// (any outcome). A flushed retry issues them only in a Directed plan.
     pub notifies_issued: AtomicU64,
     /// Of those, calls that found no armed or parked event-count waiter.
     pub notifies_no_waiters: AtomicU64,
     /// Of those, calls that found a waiter but left it parked: the concurrency
     /// ceiling was reached (`NotifyOutcome::Suppressed`).
     pub notifies_suppressed: AtomicU64,
-    /// `Thread::unpark` calls issued on this step's `Progress` (driver / pinned-worker targets).
+    /// `Thread::unpark` calls issued on this step's `Progress` or flushed retry
+    /// (driver / pinned-worker targets, or the step's own thread, for a
+    /// same-thread consumer of a flushed retry).
     pub unparks_issued: AtomicU64,
     /// Holders this step's pops woke: threads whose push into this step's input
     /// was rejected, unparked directly when the pop made room.
     pub reverse_wakes: AtomicU64,
     /// `Pool` wakes that found no event-count waiter and unparked a worker that
-    /// was idling on its own timer (pinned, or holding an item) instead.
+    /// was idling on its own timer instead: one armed for a timer park
+    /// (pinned, or holding an item), else one parked only because a phase cap
+    /// refused it (when the consumer's cap has a free permit).
     pub direct_fallbacks: AtomicU64,
-    /// `Progress` dispatches on a gated branch that pushed nothing — the wake was skipped.
+    /// Gated output branches that pushed nothing on a `Progress` (or, in a
+    /// Directed plan, flushed-retry) dispatch, so their wake was skipped: one
+    /// per such branch, not per dispatch.
     pub gated_off: AtomicU64,
-    /// Items this step held and later pushed: a push into one of its output
-    /// edges was rejected and a later successful push into that edge (or a
-    /// reorder stash insert that accepted the item) released it. Measured at
-    /// the transport (`ByteBoundedQueue`) on every byte-bounded edge while
-    /// stats are on, so it counts every holding step — whatever slot type it
-    /// uses and whether its retry reports `NoProgress` or `Contention` — and
-    /// nothing that is not a transport rejection (an admission-cap refusal, a
-    /// Serial lock) is counted. A `Parallel` step's holds are timed per clone
-    /// (its thread); any other step's per step, so a `Serial` step's held item
-    /// flushed by a different worker ends its hold.
+    /// Items this step held and later pushed: a push into one of its
+    /// byte-bounded output edges was refused back to the step, and a later
+    /// successful push into that edge (or a reorder stash insert that accepted
+    /// the item) released it. A refusal is either the transport's (budget
+    /// reached) or, on an ordered branch, the reorder stash cap's. A transport
+    /// refusal that the reorder stage turns into a stash insert is an accepted
+    /// push and is not a hold. Measured at the `ByteBoundedQueue` transport
+    /// while stats are on, so it counts every holding step — whatever slot type
+    /// it uses and whether its retry reports `NoProgress` or `Contention` — and
+    /// nothing that is not a refusal (an admission-cap refusal, a Serial lock)
+    /// is counted. A `Parallel` step's holds are timed per clone (its thread);
+    /// any other step's per step, so a `Serial` step's held item flushed by a
+    /// different worker ends its hold. Count-bounded and unbounded edges carry
+    /// no hold clock.
     pub holds: AtomicU64,
     /// Retries of a held item that were rejected again.
     pub held_retries: AtomicU64,

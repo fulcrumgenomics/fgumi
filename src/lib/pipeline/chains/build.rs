@@ -93,7 +93,7 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
     // NOTE: `--threads 1` whole-chain fusion is NOT wired here. It is applied
     // generically by the runtime (`Pipeline::run` → `run_fused_single_thread`)
     // to ANY linear source→sink chain at one worker — see
-    // `pipeline::core::runtime::fused`. `build_for` therefore constructs the
+    // `run_fused_single_thread` in fgumi-pipeline-core. `build_for` therefore constructs the
     // same staged chain regardless of thread count; the runtime fuses it.
     //
     // Every chain — including the sole-`[Stage::Sort]` chain — runs through the

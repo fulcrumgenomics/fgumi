@@ -23,14 +23,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erased::ErasedStep;
 use crate::handles::{BranchInputHandle, OutputQueueSet};
-use crate::item::HeapSize;
 use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 
 /// Per-step domain counters: one shared atomic per counter the step declared
 /// via [`crate::step::Step::counters`].
 ///
 /// There is exactly ONE `StepCounters` per `step_idx` (stored in
-/// [`ChainContexts::step_counters`]); the driver hands every dispatch of that
+/// `ChainContexts::step_counters`); the driver hands every dispatch of that
 /// step — including all `Parallel` per-worker clones — the SAME
 /// `&StepCounters`, so their bumps aggregate into one shared atomic with no
 /// per-clone slots and no summing pass. The backing `Arc<[AtomicU64]>` lets a
@@ -108,8 +107,17 @@ pub struct ChainContexts {
     /// during `build_chain_contexts` from each `Branch`'s
     /// `bounded_queue_handle`. Empty when no byte-bounded queues
     /// exist (e.g. a chain composed entirely of `CountBounded` /
-    /// `Unbounded` steps).
+    /// `Unbounded` steps). Read by the budget pass, the rebalancer, the
+    /// scheduler, the deadlock monitor and the wake plan (push gates and
+    /// reverse wakes).
     pub bounded_queues: Vec<RegisteredQueue>,
+    /// Registry of every edge that can refuse a push but has no byte budget:
+    /// count-bounded transports (direct or ordered) and the unbounded
+    /// transports behind a reorder stage. Populated from each `Branch`'s
+    /// `holder_only_handle`, beside `bounded_queues`. Its only reader is the
+    /// wake plan, which reverse-wakes these edges' holders and never gates them
+    /// (there is no push counter). Crate-internal, like the wake plan.
+    pub(crate) holder_only_queues: Vec<RegisteredHolderOnlyQueue>,
     /// Registry of every instrumented edge (`--pipeline-trace`), with its
     /// `EdgeMetrics` + producer/consumer + (for byte-bounded edges) a depth
     /// source. Empty when instrumentation is `Off`. Read by the occupancy
@@ -170,6 +178,25 @@ pub struct RegisteredQueue {
     /// is sized from the same per-edge budget as `handle`. `None` for a direct
     /// (unordered) byte-bounded branch (no reorder stage).
     pub reorder_cap: Option<std::sync::Arc<dyn crate::reorder::ReorderCapHandle>>,
+}
+
+/// One holder-only edge's location in the chain and its tracking handle (see
+/// [`ChainContexts::holder_only_queues`]).
+pub(crate) struct RegisteredHolderOnlyQueue {
+    pub(crate) producer_step: StepIdx,
+    pub(crate) branch: BranchIdx,
+    pub(crate) handle: std::sync::Arc<dyn crate::queues::HolderOnlyHandle>,
+}
+
+impl ChainContexts {
+    /// Both registries the wake plan reads, by kind.
+    #[must_use]
+    pub(crate) fn wake_edges(&self) -> crate::runtime::wake::WakeEdges<'_> {
+        crate::runtime::wake::WakeEdges {
+            byte_bounded: &self.bounded_queues,
+            holder_only: &self.holder_only_queues,
+        }
+    }
 }
 
 /// Build the chain's per-step contexts.
@@ -350,12 +377,13 @@ fn build_chain_contexts_inner(
     // which Pass 2 uses consumer→producer). Empty when instrumentation is off.
     let consumer_of = build_consumer_map(steps, graph, level);
 
-    // Pass 1.5: collect byte-bounded queue handles into the registry.
-    // Must run before Pass 2 because `take_typed_input` (called via
-    // `build_input_handle`) replaces the `BranchEntry` with a fresh
-    // one whose `bounded_queue_handle` is `None` — by then the
-    // handles have been moved out of the chain.
+    // Pass 1.5: collect byte-bounded and holder-only queue handles into their
+    // registries. Must run before Pass 2 because `take_typed_input` (called
+    // via `build_input_handle`) replaces the `BranchEntry` with a fresh one
+    // whose handles are `None` — by then the handles have been moved out of
+    // the chain.
     let mut bounded_queues: Vec<RegisteredQueue> = Vec::new();
+    let mut holder_only_queues: Vec<RegisteredHolderOnlyQueue> = Vec::new();
     let mut edges: Vec<RegisteredEdge> = Vec::new();
     for (step_idx_usize, set) in output_sets.iter().enumerate() {
         for (branch_idx_usize, entry) in set.branches.iter().enumerate() {
@@ -366,6 +394,13 @@ fn build_chain_contexts_inner(
                     branch: BranchIdx(branch_idx_usize),
                     handle: std::sync::Arc::clone(&handles.transport),
                     reorder_cap: handles.reorder_cap.clone(),
+                });
+            }
+            if let Some(handle) = entry.holder_only_handle.as_ref() {
+                holder_only_queues.push(RegisteredHolderOnlyQueue {
+                    producer_step: StepIdx(step_idx_usize),
+                    branch: BranchIdx(branch_idx_usize),
+                    handle: std::sync::Arc::clone(handle),
                 });
             }
             // Instrumented edge: register its shared metrics + producer/consumer
@@ -418,7 +453,7 @@ fn build_chain_contexts_inner(
         steps.iter().map(|_| StepCounters::disabled()).collect()
     };
 
-    ChainContexts { inputs, outputs, bounded_queues, edges, step_counters }
+    ChainContexts { inputs, outputs, bounded_queues, holder_only_queues, edges, step_counters }
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source
@@ -515,22 +550,6 @@ fn find_all_producers(graph: &ChainGraph, consumer: StepIdx) -> Vec<(StepIdx, Br
             e.unwrap_or_else(|| panic!("consumer {consumer:?} input slot {slot} has no producer"))
         })
         .collect()
-}
-
-/// Convenience: borrow the typed `BranchInputHandle<T>` for a given step.
-///
-/// # Panics
-///
-/// Panics if the step's input handle doesn't downcast to `T` (a framework
-/// invariant violation).
-#[must_use]
-pub fn input_as<T: Send + HeapSize + 'static>(
-    contexts: &Arc<ChainContexts>,
-    step: StepIdx,
-) -> &BranchInputHandle<T> {
-    contexts.inputs[step.0]
-        .downcast_ref::<BranchInputHandle<T>>()
-        .expect("BranchInputHandle<T> downcast failed in input_as")
 }
 
 #[cfg(test)]

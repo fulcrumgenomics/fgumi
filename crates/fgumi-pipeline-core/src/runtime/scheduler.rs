@@ -1,6 +1,6 @@
 //! Pluggable per-worker dispatch-order policy for the round-robin pool driver.
 //!
-//! The worker loop ([`run_worker_loop`](crate::runtime::run_worker_loop)) walks
+//! The worker loop (`run_worker_loop`) walks
 //! each worker's *live* steps once per pass and runs the first that makes
 //! progress. A [`Scheduler`] decides the ORDER of that walk — the only thing it
 //! controls; it never changes which steps exist, the sticky source/sink
@@ -264,6 +264,15 @@ mod tests {
         }
         fn set_limit_bytes(&self, _new_limit: u64) {}
         fn enable_tracking(&self, _t: crate::queues::EdgeTracking, _: crate::queues::Sealed) {}
+        fn pushed_total(&self, _: crate::queues::Sealed) -> u64 {
+            0
+        }
+        fn take_holders(&self, _f: &mut dyn FnMut(usize), _: crate::queues::Sealed) -> usize {
+            0
+        }
+        fn is_tracked(&self, _: crate::queues::Sealed) -> bool {
+            false
+        }
     }
 
     fn registered(

@@ -120,8 +120,8 @@ impl InProcessBwaMem3Backend {
     /// subprocess backend's floor of 4
     /// ([`SubprocessAlignStep`](super::subprocess::SubprocessAlignStep)). This
     /// is also what keeps `--threads 1` eligible for the fused/inline path
-    /// (`should_fuse_single_thread`'s `n_threads == 1` precondition,
-    /// `crate::pipeline::core::runtime::fused`) — the subprocess backend's
+    /// (the `n_threads == 1` precondition of fgumi-pipeline-core's
+    /// `should_fuse_single_thread`) — the subprocess backend's
     /// floor of 4 forecloses that path unconditionally.
     pub(crate) const MIN_WORKERS: usize = 1;
     /// Whether this backend prefers the chain builder's drain-first scheduler:
