@@ -505,6 +505,19 @@ pub(crate) struct PermitPool {
     /// documented as a handoff that excludes compression.
     blocked_nanos: AtomicU64,
     blocked_waits: AtomicU64,
+    /// Serials issued to the producer by [`issue_serial`](Self::issue_serial),
+    /// i.e. the number of blocks submitted for compression.
+    ///
+    /// The I/O writer compares it with the blocks it wrote once its input
+    /// closes. A gap in the serials it receives already fails the write, but a
+    /// lost *final* block leaves no gap: if its job is abandoned (a pool
+    /// shutdown while the block is still queued or compressing, or a worker
+    /// panicking mid-compress), its result sender is dropped and the writer
+    /// sees a clean end of input. Only this count tells the two apart.
+    ///
+    /// Serials come only from here, so a block cannot be submitted without
+    /// being counted; the writer rejects any serial this pool did not issue.
+    submitted: AtomicU64,
 }
 
 impl PermitPool {
@@ -520,7 +533,24 @@ impl PermitPool {
             closed: AtomicBool::new(false),
             blocked_nanos: AtomicU64::new(0),
             blocked_waits: AtomicU64::new(0),
+            submitted: AtomicU64::new(0),
         }
+    }
+
+    /// Issue the serial for the next block submitted for compression, counting
+    /// it as submitted.
+    ///
+    /// The producer calls this before queueing the job, so the count is
+    /// published before the block's result can reach the I/O writer. A pool
+    /// is used by exactly one producer, whose serials are therefore `0..n`.
+    pub(crate) fn issue_serial(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Number of serials issued so far: the blocks submitted for compression,
+    /// and the serial the next block will be issued.
+    pub(crate) fn submitted(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
     }
 
     /// Acquire a permit, blocking until one is available.
