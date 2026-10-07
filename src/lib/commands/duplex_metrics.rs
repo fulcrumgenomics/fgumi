@@ -1056,12 +1056,16 @@ mod tests {
     /// segments (e.g. no dash) must be rejected with a clear error, matching fgbio
     /// (`split("-", -1)` + `case Array(u1, u2)` throws a `MatchError`) and fgumi's own
     /// `group`/`dedup`, which bail on non-2-segment paired UMIs — rather than being
-    /// silently skipped.
-    #[test]
-    fn test_malformed_duplex_umi_is_rejected() -> Result<()> {
+    /// silently skipped. This holds for every MI form, including ones without an `/A`,`/B`
+    /// suffix, whose UMIs were once silently dropped (and so never validated).
+    #[rstest]
+    #[case::ab_suffix("1/A")]
+    #[case::non_ab_suffix("1/C")]
+    #[case::unsuffixed_with_slash("sample/123")]
+    fn test_malformed_duplex_umi_is_rejected(#[case] mi: &str) -> Result<()> {
         let mut records = Vec::new();
         // RX "AAATTT" has no '-' delimiter → not a valid duplex UMI.
-        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAATTT", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAATTT", mi, true, false);
         records.push(r1);
         records.push(r2);
 
@@ -1251,6 +1255,125 @@ mod tests {
         assert_eq!(observed, vec![(expected_duplex_umi, 2, 0, 1)]);
 
         Ok(())
+    }
+
+    /// A family whose MI is not `<base>`, `<base>/A` or `<base>/B` must still contribute
+    /// its UMIs to `umi_counts.txt` / `duplex_umi_counts.txt`, not just its family sizes,
+    /// including the reads whose RX disagrees with the consensus. Such an MI (e.g. `1/C`,
+    /// or an unsuffixed `sample/123` from another grouper) is treated like an unsuffixed
+    /// MI: one AB-strand family. For a lone family like this, fgbio counts the same UMIs.
+    #[rstest]
+    #[case::non_ab_suffix("1/C")]
+    #[case::unsuffixed_with_slash("sample/123")]
+    fn test_umis_counted_for_mi_without_ab_suffix(#[case] mi: &str) -> Result<()> {
+        let mut records = Vec::new();
+        for (name, rx) in [("q1", "AAA-CAG"), ("q2", "AAA-CAG"), ("q3", "AAT-CAG")] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 200, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        // The family itself is counted: one DS family of size 3, all on the AB strand.
+        assert_eq!(families, vec![(3, 0, 1)]);
+        // ... and so are its UMIs, including the one mismatched read.
+        assert_eq!(umis, vec![("AAA".to_string(), 3, 1, 1), ("CAG".to_string(), 3, 0, 1)]);
+        assert_eq!(duplex_umis, vec![("AAA-CAG".to_string(), 3, 1, 1)]);
+
+        Ok(())
+    }
+
+    /// fgumi defines a double-stranded family by the MI with an exact `/A` or `/B` suffix
+    /// stripped, so `1/A` and `1/C` at the same coordinate are two separate AB-strand
+    /// families. This pins that behavior. It knowingly differs from fgbio, which keys the
+    /// family on the MI up to its first `/` (`CollectDuplexSeqMetrics.scala:369`) and so
+    /// merges them into one duplex family (ab=2, ba=2, a single `CCC-AAA` duplex UMI). No
+    /// fgumi or fgbio grouper writes such a mix; fgbio also fails outright on three or
+    /// more MIs sharing a first-`/` prefix.
+    #[test]
+    fn test_mi_without_ab_suffix_is_a_separate_family() -> Result<()> {
+        let mut records = Vec::new();
+        for (name, rx, mi) in [
+            ("a1", "AAA-CCC", "1/A"),
+            ("a2", "AAA-CCC", "1/A"),
+            ("c1", "CCC-AAA", "1/C"),
+            ("c2", "CCC-AAA", "1/C"),
+        ] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 200, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        assert_eq!(families, vec![(2, 0, 2)]);
+        assert_eq!(umis, vec![("AAA".to_string(), 4, 0, 2), ("CCC".to_string(), 4, 0, 2)]);
+        assert_eq!(
+            duplex_umis,
+            vec![("AAA-CCC".to_string(), 2, 0, 1), ("CCC-AAA".to_string(), 2, 0, 1)]
+        );
+
+        Ok(())
+    }
+
+    /// Runs `duplex-metrics --duplex-umi-counts` on `records` and returns, sorted:
+    /// `(ab_size, ba_size, count)` per duplex family size, and
+    /// `(umi, raw_observations, raw_observations_with_errors, unique_observations)` per
+    /// row of `umi_counts.txt` and of `duplex_umi_counts.txt`.
+    #[allow(clippy::type_complexity)]
+    fn run_duplex_metrics_with_umi_counts(
+        records: Vec<sam::alignment::RecordBuf>,
+    ) -> Result<(
+        Vec<(usize, usize, usize)>,
+        Vec<(String, usize, usize, usize)>,
+        Vec<(String, usize, usize, usize)>,
+    )> {
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: true,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let families: Vec<DuplexFamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let mut families: Vec<(usize, usize, usize)> =
+            families.iter().map(|m| (m.ab_size, m.ba_size, m.count)).collect();
+        families.sort_unstable();
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let umis: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        let mut umis: Vec<(String, usize, usize, usize)> = umis
+            .into_iter()
+            .map(|m| {
+                (m.umi, m.raw_observations, m.raw_observations_with_errors, m.unique_observations)
+            })
+            .collect();
+        umis.sort_unstable();
+
+        let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
+        let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
+        let mut duplex_umis: Vec<(String, usize, usize, usize)> = duplex_umis
+            .into_iter()
+            .map(|m| {
+                (m.umi, m.raw_observations, m.raw_observations_with_errors, m.unique_observations)
+            })
+            .collect();
+        duplex_umis.sort_unstable();
+
+        Ok((families, umis, duplex_umis))
     }
 
     /// A duplex family observed only on its `/B` strand still reports its UMI halves

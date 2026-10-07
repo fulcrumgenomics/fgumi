@@ -11,7 +11,6 @@ use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
 use crate::template::TemplateIterator;
-use crate::umi::extract_mi_base;
 use anyhow::{Context, Result};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_reader;
@@ -95,7 +94,11 @@ pub struct ReadInfoKey {
 pub struct TemplateMetadata<'a> {
     /// Reference to the underlying template info.
     pub template: &'a TemplateInfo,
-    /// MI tag value with strand suffix stripped (e.g. "1" from "1/A").
+    /// MI tag value with an exact `/A` or `/B` suffix stripped (e.g. "1" from "1/A");
+    /// any other MI is kept whole (`1/C` stays `1/C`). This is the double-stranded
+    /// family key. fgbio instead keys on the MI up to its first `/`, so the two agree
+    /// for MIs written by `fgumi group` / fgbio `GroupReadsByUmi` (`N`, `N/A`, `N/B`)
+    /// but not for other slash-containing MIs that share a prefix at one coordinate.
     pub base_umi: &'a str,
     /// `true` if this template belongs to the A strand.
     pub is_a_strand: bool,
@@ -616,7 +619,7 @@ pub(crate) fn record_duplex_coordinate_group(
             }
         }
 
-        for (base_umi, (a_count, b_count, family)) in &ds_groups {
+        for (a_count, b_count, family) in ds_groups.values() {
             let ds_size = a_count + b_count;
             collectors[idx].record_ds_family(ds_size);
 
@@ -634,7 +637,6 @@ pub(crate) fn record_duplex_coordinate_group(
                     &mut collectors[idx],
                     umi_consensus_caller,
                     family.as_slice(),
-                    base_umi,
                     duplex_umi_counts,
                 )?;
             }
@@ -645,9 +647,13 @@ pub(crate) fn record_duplex_coordinate_group(
 
 /// Updates UMI metrics for a duplex family
 ///
+/// `family` must hold exactly the templates of one double-stranded family, i.e. those
+/// sharing a [`TemplateMetadata::base_umi`]; every one of them contributes.
+///
 /// This method:
 /// 1. Uses RX tags (raw UMI sequences) to extract individual UMI observations
-/// 2. Separates by strand (/A and /B suffixes in MI tags), swapping UMI parts for B strand
+/// 2. Separates by strand (a `/B` MI suffix is the B strand, whose UMI parts are swapped;
+///    every other MI is the A strand)
 /// 3. Calls consensus for each UMI position
 /// 4. Records raw observations, errors, and unique observations for each individual UMI
 /// 5. Records duplex UMI metrics if enabled
@@ -658,13 +664,16 @@ pub(crate) fn record_duplex_coordinate_group(
 /// replaced by an explicit `duplex_umi_counts` parameter (the one
 /// `self.duplex_umi_counts` field the method needed) so the inline path can call
 /// this without a `DuplexMetrics` command-struct instance.
-pub(crate) fn record_duplex_umi_metrics(
+fn record_duplex_umi_metrics(
     collector: &mut DuplexMetricsCollector,
     umi_consensus_caller: &mut SimpleUmiConsensusCaller,
     family: &[&TemplateMetadata],
-    base_umi: &str,
     duplex_umi_counts: bool,
 ) -> Result<()> {
+    debug_assert!(
+        family.windows(2).all(|w| w[0].base_umi == w[1].base_umi),
+        "record_duplex_umi_metrics requires a single double-stranded family"
+    );
     // Collect the two UMI positions, paired up by single-strand family: umi1s holds
     // the `/A` reads' leading half and the `/B` reads' trailing half; umi2s the
     // reverse. Also track which strands have a positive-strand R1, to orient the
@@ -677,12 +686,6 @@ pub(crate) fn record_duplex_umi_metrics(
 
     for m in family {
         let (mi, rx) = (m.template.mi.as_str(), m.template.rx.as_str());
-        // Check if this MI tag belongs to the current base_umi family
-        let mi_base = extract_mi_base(mi);
-
-        if mi_base != base_umi {
-            continue;
-        }
 
         // Split the RX tag to get individual UMI parts. fgbio uses
         // `split("-", -1)`, which keeps a trailing empty field, and requires
@@ -708,8 +711,9 @@ pub(crate) fn record_duplex_umi_metrics(
         // halves in the opposite order, so swap them. Do NOT pair by R1 strand: a
         // duplex whose mates map in the same orientation (FF/RR — inversions, most
         // inter-chromosomal chimeras) has R1 on the same strand in both families,
-        // which would leave `/B` unswapped and mix the halves. An unsuffixed MI is
-        // treated as `/A`, matching the AB-strand counting above.
+        // which would leave `/B` unswapped and mix the halves. Any MI without a `/B`
+        // suffix (`/A`, unsuffixed, or another suffix such as `1/C`) is paired as
+        // `/A`, matching the AB-strand counting above.
         if m.is_b_strand {
             umi1s.push(parts[1].to_string());
             umi2s.push(parts[0].to_string());
@@ -775,12 +779,7 @@ pub(crate) fn record_duplex_umi_metrics(
         let total_raw = umi1s.len();
 
         // Count how many raw RX tags had errors (don't match either duplex orientation)
-        let error_count = family
-            .iter()
-            .filter(|m| {
-                extract_mi_base(&m.template.mi) == base_umi && !duplex_umis.contains(&m.template.rx)
-            })
-            .count();
+        let error_count = family.iter().filter(|m| !duplex_umis.contains(&m.template.rx)).count();
 
         collector.record_duplex_umi(duplex_umi, total_raw, error_count, true);
     }
