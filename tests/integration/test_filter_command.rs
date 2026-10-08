@@ -549,6 +549,70 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
     );
 }
 
+/// A template whose R1 fails a read-level check (`--min-reads 3`, R1 depth 1) and whose R2 has
+/// bases but no base qualities (`QUAL` `*`): `--filter-by-template` stops evaluating at R1, but
+/// R2 must still fail the run with the error naming it rather than be written to `--rejects`
+/// with the rejected template. Covers the standalone command (single worker and `--threads`) and
+/// the `runall` filter stage, which share the template filter.
+#[rstest]
+#[case::filter(&["filter"])]
+#[case::filter_threads(&["filter", "--threads", "4"])]
+#[case::runall(&["runall", "--start-from", "filter", "--stop-after", "filter"])]
+fn test_filter_template_errors_on_missing_base_qualities_after_failed_read(
+    #[case] command: &[&str],
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // Unmapped, so no `--ref` is needed (`runall` takes `--ref` only with `--methylation-mode`).
+    // An empty quality slice makes the builder write `0xFF` for every base (`QUAL` `*`).
+    let member = |flag: u16, depth: i32, quals: &[u8]| {
+        let per_base = u16::try_from(depth).unwrap();
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"t").flags(flag | flags::UNMAPPED).sequence(b"ACGTACGT").qualities(quals);
+        b.add_int_tag(SamTag::CD, depth).add_float_tag(SamTag::CE, 0.0_f32);
+        b.add_array_u16(SamTag::CD_BASES, &[per_base; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
+        b.build()
+    };
+    let r1 = member(flags::PAIRED | flags::FIRST_SEGMENT, 1, &[35; 8]);
+    let r2 = member(flags::PAIRED | flags::LAST_SEGMENT, 10, &[]);
+    create_consensus_bam(&input_bam, vec![r1, r2]);
+
+    let is_runall = command[0] == "runall";
+    let opt =
+        |name: &str| if is_runall { format!("--filter::{name}") } else { format!("--{name}") };
+    let mut args: Vec<String> = command.iter().map(|a| (*a).to_string()).collect();
+    args.extend([
+        "--input".to_string(),
+        input_bam.to_str().unwrap().to_string(),
+        "--output".to_string(),
+        output_bam.to_str().unwrap().to_string(),
+        opt("min-reads"),
+        "3".to_string(),
+        opt("filter-by-template"),
+        "true".to_string(),
+        opt("rejects"),
+        rejects_bam.to_str().unwrap().to_string(),
+    ]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(&args)
+        .output()
+        .expect("failed to spawn fgumi");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{args:?} must fail; stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "record 't' has bases but no base qualities (QUAL '*'); filter requires base \
+             qualities, so the run is stopped and the record is not written to the output or \
+             the rejects. Ensure the input carries base qualities (consensus reads from fgumi \
+             always do)."
+        ),
+        "unexpected stderr: {stderr}"
+    );
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Worker-count-independence tests: filter always runs on the declarative chain
 // builder (the legacy single-threaded path is retired), so a no-`--threads` run

@@ -343,12 +343,14 @@ struct TemplateFilterOutcome {
 /// passed, and each is then kept on its own result.
 ///
 /// A record left unevaluated is rejected as it was read, so a rejected template never errors on
-/// a later record that lacks the consensus tags. It gets only
-/// [`Filter::orient_per_base_tags`], the change every record gets, as fgbio reverses every read
-/// of the template before filtering (`:195-200`). Skipping it also skips the rest of
-/// [`process_record_raw_call`]: an unevaluated record is not checked against the "--ref is
-/// required for mapped reads" guard, and is neither counted in the methylation-filter skip
-/// warnings nor in the records they are out of ([`TemplateFilterOutcome::evaluated`]).
+/// a later record that lacks the consensus tags. It gets only [`Filter::ensure_base_qualities`],
+/// the check every record gets (a record with bases but no base qualities is an error whether or
+/// not it is evaluated), and [`Filter::orient_per_base_tags`], the change every record gets, as
+/// fgbio reverses every read of the template before filtering (`:195-200`). Leaving it
+/// unevaluated also skips the rest of [`process_record_raw_call`]: an unevaluated record is not
+/// checked against the "--ref is required for mapped reads" guard, and is neither counted in the
+/// methylation-filter skip warnings nor in the records they are out of
+/// ([`TemplateFilterOutcome::evaluated`]).
 ///
 /// # Errors
 ///
@@ -394,6 +396,7 @@ fn filter_template_records(
         for (idx, record) in records.iter_mut().enumerate() {
             let was_evaluated = is_primary_read(record) && idx <= failed;
             if !was_evaluated {
+                Filter::ensure_base_qualities(record).map_err(io::Error::other)?;
                 Filter::orient_per_base_tags(record, captures.should_reverse_tags)
                     .map_err(io::Error::other)?;
             }

@@ -274,6 +274,16 @@ fgumi boolean flags (e.g. `--output-per-base-tags`, `--trim`, `--require-single-
 accept the following values: `true`/`false`, `yes`/`no`, `y`/`n`, `t`/`f` (case-insensitive).
 fgbio uses standard true/false only.
 
+### Reads Without Base Qualities
+
+`filter` fails with an error naming the read when a record has bases but no base qualities
+(`QUAL` `*`). fgbio's `FilterConsensusReads` has no deliberate handling for this case: htsjdk
+decodes such qualities as an empty array, so fgbio rejects the read when `--min-mean-base-quality`
+is above 0 (the mean comes out as 0) or a read-level check fails first. Otherwise per-base masking
+throws an `ArrayIndexOutOfBoundsException` for every simplex read and for every duplex read with
+at least one non-N base; a duplex read whose bases are all N skips masking and is kept or rejected
+by the no-call check alone.
+
 ### Removed Options
 
 The `--sort-order` flag has been removed from `simplex` and `codec`. Output sort order for

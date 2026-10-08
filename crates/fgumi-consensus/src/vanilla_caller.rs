@@ -641,9 +641,8 @@ impl VanillaUmiConsensusCaller {
         }
 
         // Mirror `create_source_read`'s guard: absent qualities (0xFF per base) are not valid
-        // evidence, so drop such a read rather than treating it as high-quality. (`quals` is
-        // non-empty here, so `all` is not vacuously true.)
-        if quals.iter().all(|&q| q == 0xFF) {
+        // evidence, so drop such a read rather than treating it as high-quality.
+        if fgumi_raw_bam::is_missing_quality(&quals) {
             return None;
         }
 
@@ -1128,7 +1127,7 @@ impl VanillaUmiConsensusCaller {
         // A legal zero-length record (`SEQ=*`) has no bases and no qualities: it is not missing
         // qualities, it simply has nothing to weight. Route it as `ZeroLengthAfterTrimming`
         // (`Ok(None)`) before the quality checks below, which would otherwise treat the empty
-        // quality string as a length mismatch (and an empty `all(|&q| q == 0xFF)` is vacuously true).
+        // quality string as a length mismatch.
         if read_len == 0 {
             return Ok(None);
         }
@@ -1146,7 +1145,7 @@ impl VanillaUmiConsensusCaller {
         // structurally invalid input for a quality-weighted consensus — treating 0xFF as genuine
         // very-high-quality evidence would let unqualified reads dominate — so abort the run
         // (matching fgbio) rather than silently dropping the read and quietly degrading depth.
-        if quals.iter().all(|&q| q == 0xFF) {
+        if bam_fields::is_missing_quality(&quals) {
             bail!(
                 "input read is missing base qualities (BAM QUAL is '*'): {}",
                 String::from_utf8_lossy(view.read_name()),
