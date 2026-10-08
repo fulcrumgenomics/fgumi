@@ -157,6 +157,11 @@ pub struct Simplex {
     /// UMI counts, downsampling yield curve) — same numeric output as
     /// running `simplex-metrics` separately, computed inline during this
     /// call with no second BAM read.
+    ///
+    /// Each suffix is appended to the whole prefix, dots included (`out.v1` →
+    /// `out.v1.<suffix>`). A trailing path separator is dropped, so `out/` writes
+    /// `out.<suffix>` beside `out`, not inside it. The prefix must name a file, not
+    /// `.`, `..` or `/`.
     #[arg(long = "metrics")]
     pub metrics: Option<std::path::PathBuf>,
 
@@ -437,7 +442,7 @@ impl Command for Simplex {
         // `simplex_metrics_paths` derivation runall's collision guard uses, so
         // the two never drift. Kept in a local so `outputs` can borrow it.
         let metrics_artifacts: Vec<std::path::PathBuf> = match &self.metrics {
-            Some(prefix) => crate::inline_metrics_collector::simplex_metrics_paths(prefix),
+            Some(prefix) => crate::inline_metrics_collector::simplex_metrics_paths(prefix)?,
             None => Vec::new(),
         };
         let mut outputs: Vec<(&Path, &str)> = vec![(self.io.output.as_path(), "--output")];

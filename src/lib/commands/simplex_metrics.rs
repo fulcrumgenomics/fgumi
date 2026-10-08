@@ -10,6 +10,7 @@
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
+use crate::inline_metrics_collector::{SimplexMetricsPaths, write_simplex_metrics};
 use crate::logging::OperationTimer;
 use crate::metrics::simplex::SimplexMetricsCollector;
 use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
@@ -17,6 +18,7 @@ use crate::validation::validate_input_exists;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use super::command::Command;
@@ -92,6 +94,11 @@ pub struct SimplexMetrics {
     pub input: PathBuf,
 
     /// Output prefix for metrics files.
+    ///
+    /// Each suffix is appended to the whole prefix, dots included (`out.v1` →
+    /// `out.v1.<suffix>`). A trailing path separator is dropped, so `out/` writes
+    /// `out.<suffix>` beside `out`, not inside it. The prefix must name a file, not
+    /// `.`, `..` or `/`.
     #[arg(short = 'o', long = "output")]
     pub output: PathBuf,
 
@@ -191,6 +198,11 @@ impl Command for SimplexMetrics {
             anyhow::bail!("--min-reads must be >= 1 (got {})", self.min_reads);
         }
 
+        // Derive every output name up front, so a prefix that names no file fails here rather
+        // than after the whole BAM has been read (on either path).
+        let paths = SimplexMetricsPaths::new(&self.output)?;
+        let pdf_path = crate::commands::common::append_suffix(&self.output, "simplex_qc.pdf")?;
+
         // With `--threads`, run the parallel typed-step chain (parallel decode +
         // MI-grouping + per-thread metric accumulation). It writes the SAME TSV
         // files (family_sizes/umi_counts/simplex_yield_metrics) byte-identically
@@ -272,37 +284,29 @@ impl Command for SimplexMetrics {
         let main_collector =
             collectors.pop().expect("collectors is non-empty (always includes 100% fraction)");
 
-        // Generate and write metrics
+        // Write the metrics with the same writer and file names the `--threads` chain path's
+        // finalize hook uses, so both paths write identical files.
         info!("Writing metrics...");
-
-        // Family size metrics. Use `write_metrics_auto` (not a bare `DelimFile::write_tsv`)
-        // so an empty distribution still produces a header-only, fgbio-readable file.
-        let family_size_metrics = main_collector.family_size_metrics();
-        let family_size_path = format!("{}.family_sizes.txt", self.output.display());
-        crate::metrics::writer::write_metrics_auto(&family_size_path, &family_size_metrics)?;
-        info!("Wrote family size metrics to {family_size_path}");
-
-        // UMI metrics
-        let umi_metrics = main_collector.umi_metrics();
-        let umi_path = format!("{}.umi_counts.txt", self.output.display());
-        crate::metrics::writer::write_metrics_auto(&umi_path, &umi_metrics)?;
-        info!("Wrote UMI metrics to {umi_path}");
-
-        // Yield metrics
-        let yield_path = format!("{}.simplex_yield_metrics.txt", self.output.display());
-        crate::metrics::writer::write_metrics_auto(&yield_path, &yield_metrics)?;
-        info!("Wrote yield metrics to {yield_path}");
+        write_simplex_metrics(&main_collector, &yield_metrics, &paths)?;
+        info!("Wrote family size metrics to {}", paths.family_sizes.display());
+        info!("Wrote UMI metrics to {}", paths.umi_counts.display());
+        info!("Wrote yield metrics to {}", paths.yield_metrics.display());
 
         // Generate PDF plots using R script (optional)
-        let pdf_path = format!("{}.simplex_qc.pdf", self.output.display());
         if is_r_available() {
             let description = self.description.as_deref().unwrap_or("Sample");
             match execute_r_script(
                 R_SCRIPT,
-                &[&family_size_path, &yield_path, &umi_path, &pdf_path, description],
+                &[
+                    paths.family_sizes.as_os_str(),
+                    paths.yield_metrics.as_os_str(),
+                    paths.umi_counts.as_os_str(),
+                    pdf_path.as_os_str(),
+                    OsStr::new(description),
+                ],
                 "fgumi_CollectSimplexSeqMetrics.R",
             ) {
-                Ok(()) => info!("Generated PDF plots: {pdf_path}"),
+                Ok(()) => info!("Generated PDF plots: {}", pdf_path.display()),
                 Err(e) => {
                     log::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
                     log::warn!(
@@ -565,6 +569,52 @@ mod tests {
             let c = std::fs::read(format!("{}.{suffix}", chain.display()))?;
             assert_eq!(s, c, "{suffix} differs between the serial and --threads 4 chain paths");
         }
+        Ok(())
+    }
+
+    /// A prefix with a trailing path separator (`out/`) names the metrics files `out.*` beside
+    /// it, not hidden files inside an `out` directory, on both the serial and the `--threads`
+    /// chain path (the two must name their outputs identically).
+    #[rstest]
+    #[case::serial(None)]
+    #[case::chain(Some(2))]
+    fn trailing_separator_prefix_names_files_beside_it(
+        #[case] threads: Option<usize>,
+    ) -> Result<()> {
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "ACGT", "1/A");
+        let input = create_test_bam(vec![r1, r2])?;
+        let dir = TempDir::new()?;
+        let mut prefix = dir.path().join("out").into_os_string();
+        prefix.push("/");
+
+        let cmd = SimplexMetrics {
+            input: input.path().to_path_buf(),
+            output: std::path::PathBuf::from(prefix),
+            min_reads: 1,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        // The serial path may also write `out.simplex_qc.pdf` when R is installed.
+        let mut produced: Vec<String> = std::fs::read_dir(dir.path())?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| std::path::Path::new(name).extension().is_none_or(|ext| ext != "pdf"))
+            .collect();
+        produced.sort();
+        assert_eq!(
+            produced,
+            vec![
+                "out.family_sizes.txt".to_string(),
+                "out.simplex_yield_metrics.txt".to_string(),
+                "out.umi_counts.txt".to_string(),
+            ]
+        );
         Ok(())
     }
 

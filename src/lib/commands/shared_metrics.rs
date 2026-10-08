@@ -366,13 +366,18 @@ pub fn is_r_available() -> bool {
 /// # Arguments
 ///
 /// * `r_script_content` - The R script source code to execute
-/// * `args` - Command-line arguments to pass to the R script
+/// * `args` - Command-line arguments to pass to the R script; `OsStr`-like, so a
+///   non-UTF-8 output path reaches R unchanged
 /// * `temp_file_name` - Base name for the temporary R script file
 ///
 /// # Errors
 ///
 /// Returns an error if the script cannot be written or R execution fails.
-pub fn execute_r_script(r_script_content: &str, args: &[&str], temp_file_name: &str) -> Result<()> {
+pub fn execute_r_script<S: AsRef<std::ffi::OsStr>>(
+    r_script_content: &str,
+    args: &[S],
+    temp_file_name: &str,
+) -> Result<()> {
     use std::process::Command;
 
     // Write embedded R script to temp file

@@ -62,7 +62,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::commands::group::with_extension;
+use crate::commands::common::append_suffix;
 use crate::commands::shared_metrics::{
     DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, build_template_info,
     build_template_info_with_mi, overlaps_intervals, record_duplex_coordinate_group,
@@ -368,40 +368,161 @@ fn duplex_fallback_init() -> ConsensusMetricsSlot {
     ConsensusMetricsSlot::new_duplex(false)
 }
 
+/// The files a simplex metrics prefix names: the single source of these file names for the
+/// separate-pass `simplex-metrics` command, the inline `--metrics` writer, and every
+/// `--output` collision guard that must know them up front.
+pub(crate) struct SimplexMetricsPaths {
+    /// `<prefix>.family_sizes.txt`
+    pub(crate) family_sizes: PathBuf,
+    /// `<prefix>.umi_counts.txt`
+    pub(crate) umi_counts: PathBuf,
+    /// `<prefix>.simplex_yield_metrics.txt`
+    pub(crate) yield_metrics: PathBuf,
+}
+
+impl SimplexMetricsPaths {
+    /// Derive every simplex metrics file name from `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` does not name a file (see [`append_suffix`]).
+    pub(crate) fn new(prefix: &Path) -> Result<Self> {
+        Ok(Self {
+            family_sizes: append_suffix(prefix, "family_sizes.txt")?,
+            umi_counts: append_suffix(prefix, "umi_counts.txt")?,
+            yield_metrics: append_suffix(prefix, "simplex_yield_metrics.txt")?,
+        })
+    }
+}
+
 /// The canonical files `write_simplex_metrics_files` emits for `output_prefix`.
 ///
-/// Kept in lockstep with that writer so callers that must know the outputs
+/// Derived from [`SimplexMetricsPaths`], so callers that must know the outputs
 /// ahead of time — notably runall's `--output` collision guard — never drift
 /// from what is actually written.
-pub(crate) fn simplex_metrics_paths(output_prefix: &Path) -> Vec<PathBuf> {
-    ["family_sizes.txt", "umi_counts.txt", "simplex_yield_metrics.txt"]
-        .iter()
-        .map(|suffix| with_extension(output_prefix, suffix))
-        .collect()
+///
+/// # Errors
+///
+/// Returns an error if `output_prefix` does not name a file (see [`append_suffix`]).
+pub(crate) fn simplex_metrics_paths(output_prefix: &Path) -> Result<Vec<PathBuf>> {
+    let SimplexMetricsPaths { family_sizes, umi_counts, yield_metrics } =
+        SimplexMetricsPaths::new(output_prefix)?;
+    Ok(vec![family_sizes, umi_counts, yield_metrics])
+}
+
+/// The files a duplex metrics prefix names; the duplex counterpart of
+/// [`SimplexMetricsPaths`]. Codec consensus reuses the duplex metrics writer
+/// (`MetricsThresholds::Duplex`), so it shares this set.
+pub(crate) struct DuplexMetricsPaths {
+    /// `<prefix>.family_sizes.txt`
+    pub(crate) family_sizes: PathBuf,
+    /// `<prefix>.duplex_family_sizes.txt`
+    pub(crate) duplex_family_sizes: PathBuf,
+    /// `<prefix>.umi_counts.txt`
+    pub(crate) umi_counts: PathBuf,
+    /// `<prefix>.duplex_umi_counts.txt`, written only when duplex UMI counts are enabled
+    pub(crate) duplex_umi_counts: PathBuf,
+    /// `<prefix>.duplex_yield_metrics.txt`
+    pub(crate) yield_metrics: PathBuf,
+}
+
+impl DuplexMetricsPaths {
+    /// Derive every duplex metrics file name from `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` does not name a file (see [`append_suffix`]).
+    pub(crate) fn new(prefix: &Path) -> Result<Self> {
+        Ok(Self {
+            family_sizes: append_suffix(prefix, "family_sizes.txt")?,
+            duplex_family_sizes: append_suffix(prefix, "duplex_family_sizes.txt")?,
+            umi_counts: append_suffix(prefix, "umi_counts.txt")?,
+            duplex_umi_counts: append_suffix(prefix, "duplex_umi_counts.txt")?,
+            yield_metrics: append_suffix(prefix, "duplex_yield_metrics.txt")?,
+        })
+    }
 }
 
 /// The canonical files `write_duplex_metrics_files` may emit for `output_prefix`.
 ///
 /// Includes `duplex_umi_counts.txt`, which that writer emits only when duplex
 /// UMI counts are enabled; the collision guard registers the superset so a
-/// colliding `--output` is rejected regardless of that runtime flag. Codec
-/// consensus reuses the duplex metrics writer (`MetricsThresholds::Duplex`), so
-/// it shares this set. Kept in lockstep with `write_duplex_metrics_files`.
-pub(crate) fn duplex_metrics_paths(output_prefix: &Path) -> Vec<PathBuf> {
-    [
-        "family_sizes.txt",
-        "duplex_family_sizes.txt",
-        "umi_counts.txt",
-        "duplex_umi_counts.txt",
-        "duplex_yield_metrics.txt",
-    ]
-    .iter()
-    .map(|suffix| with_extension(output_prefix, suffix))
-    .collect()
+/// colliding `--output` is rejected regardless of that runtime flag. Derived
+/// from [`DuplexMetricsPaths`], so it cannot drift from the writer.
+///
+/// # Errors
+///
+/// Returns an error if `output_prefix` does not name a file (see [`append_suffix`]).
+pub(crate) fn duplex_metrics_paths(output_prefix: &Path) -> Result<Vec<PathBuf>> {
+    let DuplexMetricsPaths {
+        family_sizes,
+        duplex_family_sizes,
+        umi_counts,
+        duplex_umi_counts,
+        yield_metrics,
+    } = DuplexMetricsPaths::new(output_prefix)?;
+    Ok(vec![family_sizes, duplex_family_sizes, umi_counts, duplex_umi_counts, yield_metrics])
+}
+
+/// Write the simplex metrics file set from the 100% fraction collector and the
+/// per-fraction yield curve. Shared by the separate-pass `simplex-metrics`
+/// command and the inline `--metrics` writer, so both write identical files.
+///
+/// # Errors
+///
+/// Returns an error if any file cannot be written.
+pub(crate) fn write_simplex_metrics(
+    main_collector: &SimplexMetricsCollector,
+    yield_metrics: &[fgumi_metrics::simplex::SimplexYieldMetric],
+    paths: &SimplexMetricsPaths,
+) -> Result<()> {
+    // `write_metrics_auto` (not a bare `DelimFile::write_tsv`) so an empty distribution still
+    // produces a header-only, fgbio-readable file.
+    crate::metrics::writer::write_metrics_auto(
+        &paths.family_sizes,
+        &main_collector.family_size_metrics(),
+    )?;
+    crate::metrics::writer::write_metrics_auto(&paths.umi_counts, &main_collector.umi_metrics())?;
+    crate::metrics::writer::write_metrics_auto(&paths.yield_metrics, yield_metrics)?;
+    Ok(())
+}
+
+/// Write the duplex metrics file set from the 100% fraction collector and the
+/// per-fraction yield curve; `duplex_umi_counts.txt` only when
+/// `duplex_umi_counts` is set. Shared by the separate-pass `duplex-metrics`
+/// command and the inline `--metrics` writer, so both write identical files.
+///
+/// # Errors
+///
+/// Returns an error if any file cannot be written.
+pub(crate) fn write_duplex_metrics(
+    main_collector: &DuplexMetricsCollector,
+    yield_metrics: &[fgumi_metrics::duplex::DuplexYieldMetric],
+    duplex_umi_counts: bool,
+    paths: &DuplexMetricsPaths,
+) -> Result<()> {
+    crate::metrics::writer::write_metrics_auto(
+        &paths.family_sizes,
+        &main_collector.family_size_metrics(),
+    )?;
+    crate::metrics::writer::write_metrics_auto(
+        &paths.duplex_family_sizes,
+        &main_collector.duplex_family_size_metrics(),
+    )?;
+    let umi_metrics = main_collector.umi_metrics();
+    crate::metrics::writer::write_metrics_auto(&paths.umi_counts, &umi_metrics)?;
+    if duplex_umi_counts {
+        crate::metrics::writer::write_metrics_auto(
+            &paths.duplex_umi_counts,
+            &main_collector.duplex_umi_metrics(&umi_metrics),
+        )?;
+    }
+    crate::metrics::writer::write_metrics_auto(&paths.yield_metrics, yield_metrics)?;
+    Ok(())
 }
 
 /// Writes the same three files the separate-pass `simplex-metrics` command
-/// writes (`simplex_metrics.rs`'s `execute()` tail): `<prefix>.family_sizes.txt`,
+/// writes, via the shared [`write_simplex_metrics`]: `<prefix>.family_sizes.txt`,
 /// `<prefix>.umi_counts.txt`, `<prefix>.simplex_yield_metrics.txt`. The 100%
 /// fraction collector (the last slot) supplies the family-size and UMI
 /// metrics; the yield curve is built across all 20 fraction slots, each paired
@@ -418,8 +539,6 @@ pub(crate) fn write_simplex_metrics_files(
     // The 100% fraction is the last slot — matching `simplex_metrics.rs`'s
     // `collectors.pop()` (the final entry is always the 1.0 fraction).
     let main_collector = &collectors[DOWNSAMPLING_FRACTIONS.len() - 1];
-    let family_size_metrics = main_collector.family_size_metrics();
-    let umi_metrics = main_collector.umi_metrics();
     let yield_metrics: Vec<_> = collectors
         .iter()
         .zip(DOWNSAMPLING_FRACTIONS.iter())
@@ -428,24 +547,11 @@ pub(crate) fn write_simplex_metrics_files(
             collector.to_yield_metric(fraction, read_pairs, min_reads)
         })
         .collect();
-
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "family_sizes.txt"),
-        &family_size_metrics,
-    )?;
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "umi_counts.txt"),
-        &umi_metrics,
-    )?;
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "simplex_yield_metrics.txt"),
-        &yield_metrics,
-    )?;
-    Ok(())
+    write_simplex_metrics(main_collector, &yield_metrics, &SimplexMetricsPaths::new(output_prefix)?)
 }
 
-/// Writes the same file set the separate-pass `duplex-metrics` command writes
-/// (`duplex_metrics.rs`'s `execute()` tail): `<prefix>.family_sizes.txt`,
+/// Writes the same file set the separate-pass `duplex-metrics` command writes,
+/// via the shared [`write_duplex_metrics`]: `<prefix>.family_sizes.txt`,
 /// `<prefix>.duplex_family_sizes.txt`, `<prefix>.umi_counts.txt`, optionally
 /// `<prefix>.duplex_umi_counts.txt` (only when `duplex_umi_counts` is on), and
 /// `<prefix>.duplex_yield_metrics.txt`.
@@ -465,9 +571,6 @@ pub(crate) fn write_duplex_metrics_files(
         anyhow::bail!("internal error: Duplex thresholds passed to a Simplex-mode accumulator");
     };
     let main_collector = &collectors[DOWNSAMPLING_FRACTIONS.len() - 1];
-    let family_size_metrics = main_collector.family_size_metrics();
-    let duplex_family_size_metrics = main_collector.duplex_family_size_metrics();
-    let umi_metrics = main_collector.umi_metrics();
     let yield_metrics: Vec<_> = collectors
         .iter()
         .zip(DOWNSAMPLING_FRACTIONS.iter())
@@ -476,31 +579,12 @@ pub(crate) fn write_duplex_metrics_files(
             collector.to_yield_metric(fraction, read_pairs, min_ab_reads, min_ba_reads)
         })
         .collect();
-
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "family_sizes.txt"),
-        &family_size_metrics,
-    )?;
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "duplex_family_sizes.txt"),
-        &duplex_family_size_metrics,
-    )?;
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "umi_counts.txt"),
-        &umi_metrics,
-    )?;
-    if *duplex_umi_counts {
-        let duplex_umi_metrics = main_collector.duplex_umi_metrics(&umi_metrics);
-        crate::metrics::writer::write_metrics_auto(
-            with_extension(output_prefix, "duplex_umi_counts.txt"),
-            &duplex_umi_metrics,
-        )?;
-    }
-    crate::metrics::writer::write_metrics_auto(
-        with_extension(output_prefix, "duplex_yield_metrics.txt"),
+    write_duplex_metrics(
+        main_collector,
         &yield_metrics,
-    )?;
-    Ok(())
+        *duplex_umi_counts,
+        &DuplexMetricsPaths::new(output_prefix)?,
+    )
 }
 
 /// Re-pairs one `MiGroup`'s flat record list into R1/R2 pairs by read name,
@@ -1188,7 +1272,8 @@ mod consensus_metrics_finalize_hook_tests {
         };
         Box::new(hook).finalize().expect("finalize succeeds");
 
-        let family_sizes_path = with_extension(&output_prefix, "family_sizes.txt");
+        let family_sizes_path =
+            append_suffix(&output_prefix, "family_sizes.txt").expect("valid test prefix");
         let content = std::fs::read_to_string(&family_sizes_path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", family_sizes_path.display()));
         let mut lines = content.lines();

@@ -120,7 +120,8 @@ fn test_review_missing_input_files() {
 /// Test basic review execution with valid inputs.
 ///
 /// Creates minimal VCF, consensus BAM, grouped BAM, and reference files.
-/// Verifies the command completes and produces output files.
+/// Verifies the command completes and produces output files named by appending to the full
+/// (dotted) `--output` prefix, as fgbio does (`ReviewConsensusVariants.scala:186-187`).
 ///
 /// Parameterized over the input BAM naming so the index-lookup contract is pinned
 /// for the cases that distinguish the samtools sidecar convention from the old
@@ -138,7 +139,8 @@ fn test_review_basic_execution(#[case] consensus_name: &str, #[case] grouped_nam
     let consensus_bam = temp_dir.path().join(consensus_name);
     let grouped_bam = temp_dir.path().join(grouped_name);
     let ref_path = create_test_reference(temp_dir.path());
-    let output_prefix = temp_dir.path().join("review_out");
+    // A dotted prefix: outputs must append to it rather than replace its last component.
+    let output_prefix = temp_dir.path().join("review_out.v1");
 
     // Create VCF with one variant at chr1:100
     create_test_vcf(&vcf_path);
@@ -221,8 +223,18 @@ fn test_review_basic_execution(#[case] consensus_name: &str, #[case] grouped_nam
     cmd.execute("fgumi review").unwrap_or_else(|e| panic!("Review command failed: {e:#}"));
 
     // Verify output files were created
-    let consensus_out = output_prefix.with_extension("consensus.bam");
-    let grouped_out = output_prefix.with_extension("grouped.bam");
+    let consensus_out = temp_dir.path().join("review_out.v1.consensus.bam");
+    let grouped_out = temp_dir.path().join("review_out.v1.grouped.bam");
+    let review_out = temp_dir.path().join("review_out.v1.txt");
     assert!(consensus_out.exists(), "Consensus output BAM should exist");
     assert!(grouped_out.exists(), "Grouped output BAM should exist");
+    assert!(review_out.exists(), "Review text file should exist");
+    // The old `Path::with_extension` naming replaced the prefix's last dotted component;
+    // none of those names may appear.
+    for replaced in ["review_out.consensus.bam", "review_out.grouped.bam", "review_out.txt"] {
+        assert!(
+            !temp_dir.path().join(replaced).exists(),
+            "{replaced} must not be written for the dotted prefix"
+        );
+    }
 }
