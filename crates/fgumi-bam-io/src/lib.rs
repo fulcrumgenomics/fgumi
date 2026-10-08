@@ -18,6 +18,7 @@ pub mod header;
 pub mod library;
 pub mod mem_estimate;
 pub mod os_hints;
+pub mod output;
 pub mod paths;
 pub mod prefetch_reader;
 pub mod progress;
@@ -37,6 +38,7 @@ pub use grouping::{
 };
 pub use library::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 pub use mem_estimate::MemoryEstimate;
+pub use output::{OutputFile, OutputSink, close_buffered, open_output_sink, persist_after_close};
 pub use paths::{is_stdin_path, is_stdout_path};
 pub use progress::ProgressTracker;
 pub use reader::{

@@ -63,6 +63,10 @@ libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
 mach2 = "0.6"
 memchr = "2"
+# Built on every Unix target: `fgumi-bam-io` needs `unistd::close`, the only safe
+# checked close (std's `File` drop discards the error), to surface errors the OS
+# reports only when an output file is closed. Other members still scope it to
+# Linux for Linux-only APIs (`posix_fadvise`, ...).
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 # The noodles stack is held one minor behind (noodles 0.111 / noodles-bgzf 0.47 / noodles-csi
 # 0.56). noodles-bgzf 0.48 deprecates `MultithreadedReader::with_worker_count` and
@@ -81,9 +85,8 @@ rand = "0.10"
 # Chosen over the two syscall wrappers already in `fgumi-sort` on purpose:
 # `libc::getrlimit` is `unsafe` and the crate root is `#![deny(unsafe_code)]`,
 # and `nix` is scoped to `cfg(target_os = "linux")` there (its uses are
-# Linux-only APIs), so reaching for it would add a crate to macOS builds.
-# `rustix` is already compiled on every platform via `fs4` and `tempfile`, so it
-# costs nothing new. Declared here so the one member that calls it directly
+# Linux-only APIs). `rustix` is already compiled on every platform via `fs4` and
+# `tempfile`, so it costs nothing new. Declared here so the one member that calls it directly
 # cannot drift onto a different major version than those crates pull in. `std`
 # is named explicitly rather than inherited: it is on today only because `fs4`
 # and `tempfile` enable rustix's defaults, and a transitive change that stopped

@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
-use fgumi_bam_io::{BaiBuilder, open_output_writer, write_bai_index};
+use fgumi_bam_io::{BaiBuilder, OutputSink, close_buffered, open_output_writer, write_bai_index};
 use fgumi_bgzf::{BGZF_EOF, BGZF_MAX_BLOCK_SIZE, InlineBgzfCompressor};
 use noodles::sam::Header;
 use parking_lot::Mutex;
@@ -79,7 +79,7 @@ struct WriterState {
     /// Boxed rather than a concrete `File` so a `-`/stdout path (opened via
     /// [`open_output_writer`]) and a regular file share one type: stdout is
     /// non-seekable, so this can no longer be `BufWriter<File>`.
-    out: BufWriter<Box<dyn Write + Send>>,
+    out: BufWriter<Box<dyn OutputSink>>,
     pending_header: Option<PendingHeader>,
     /// Cumulative compressed bytes written so far, header included. Used to
     /// attribute each joined block's constituent BGZF blocks to their
@@ -122,8 +122,8 @@ impl WriteBgzfFile {
     /// Opens the sink through [`open_output_writer`], so `-`/`/dev/stdout`
     /// stream to the pipe rather than creating a regular file with that name
     /// (mirrors the owned sort engine's `PooledBamWriter::new_inner`, the only
-    /// other production BAM writer in the tree, and `WriteRawFile::new`'s `-`
-    /// handling for the FASTQ sink). `SinkSpec::BamWithIndex` still rejects
+    /// other production BAM writer in the tree, and `WriteRawFile::new`, which
+    /// opens the FASTQ sink through the same `open_output_sink`). `SinkSpec::BamWithIndex` still rejects
     /// stdout upstream in `add_sink` (`with_bai_index` requires a seekable
     /// sidecar path), so this only ever streams for the plain `SinkSpec::Bam`
     /// sink.
@@ -465,17 +465,28 @@ impl Step for WriteBgzfFile {
                     "WriteBgzfFile: input drained before HeaderHandle was resolved",
                 ));
             }
-            state.out.write_all(&BGZF_EOF)?;
-            state.out.flush()?;
-            if let Some(sink) = state.bai.take() {
-                let index = sink.bai.build(sink.num_refs).map_err(io::Error::other)?;
-                write_bai_index(&sink.sidecar_path, &index).map_err(io::Error::other)?;
-                log::info!("Wrote BAM index: {}", sink.sidecar_path.display());
-            }
-            let _ = guard.take();
+            let state = guard.take().expect("state is open: matched above");
+            Self::finish_stream(state)?;
             return Ok(StepOutcome::Finished);
         }
         Ok(StepOutcome::NoProgress)
+    }
+}
+
+impl WriteBgzfFile {
+    /// Terminate a drained stream: write the BGZF EOF marker, flush, sync and
+    /// close the output (see [`OutputSink::close`]), then write the inline BAI
+    /// sidecar, if any, so an index is only written for a BAM that closed
+    /// cleanly.
+    fn finish_stream(mut state: WriterState) -> io::Result<()> {
+        state.out.write_all(&BGZF_EOF)?;
+        close_buffered(state.out)?;
+        if let Some(sink) = state.bai {
+            let index = sink.bai.build(sink.num_refs).map_err(io::Error::other)?;
+            write_bai_index(&sink.sidecar_path, &index).map_err(io::Error::other)?;
+            log::info!("Wrote BAM index: {}", sink.sidecar_path.display());
+        }
+        Ok(())
     }
 }
 
@@ -504,9 +515,45 @@ impl Drop for WriteBgzfFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::test_support::{CLOSE_ERROR, CloseProbe};
 
     fn empty_header() -> Header {
         Header::default()
+    }
+
+    fn probe_state(probe: &CloseProbe, bai: Option<BaiSink>) -> WriterState {
+        WriterState {
+            out: BufWriter::new(Box::new(probe.clone())),
+            pending_header: None,
+            coffset: 0,
+            bai,
+        }
+    }
+
+    #[test]
+    fn finish_stream_writes_one_eof_and_closes_once() {
+        let probe = CloseProbe::default();
+        let mut state = probe_state(&probe, None);
+        state.out.write_all(b"payload").unwrap();
+        WriteBgzfFile::finish_stream(state).unwrap();
+
+        assert_eq!(probe.bytes(), [b"payload".as_slice(), &BGZF_EOF].concat());
+        assert_eq!(probe.closes(), 1);
+    }
+
+    /// A failed close fails the step, and the BAI sidecar is not written for a
+    /// BAM whose close failed.
+    #[test]
+    fn finish_stream_propagates_close_error_and_skips_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("out.bam.bai");
+        let probe = CloseProbe::failing_close();
+        let bai = BaiSink { bai: BaiBuilder::new(), next_block_no: 0, num_refs: 0, sidecar_path };
+        let state = probe_state(&probe, Some(bai));
+
+        let err = WriteBgzfFile::finish_stream(state).expect_err("close error must surface");
+        assert!(err.to_string().contains(CLOSE_ERROR), "{err}");
+        assert!(!dir.path().join("out.bam.bai").exists(), "no index for a failed BAM");
     }
 
     #[test]

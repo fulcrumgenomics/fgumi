@@ -8,6 +8,7 @@
 //! Output is valid gzip (concatenated gzip streams per RFC 1952).
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use fgumi_bam_io::OutputSink;
 use libdeflater::{CompressionLvl, Compressor};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -109,12 +110,16 @@ pub struct ParallelGzipWriter {
 impl ParallelGzipWriter {
     /// Create a new parallel gzip writer.
     ///
+    /// Once every block is written, the I/O thread closes `writer` (see
+    /// [`OutputSink::close`]), so a sync or close failure is returned by
+    /// [`Self::finish`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the compression level is invalid.
     pub fn new<W>(writer: W, config: &ParallelGzipConfig) -> io::Result<Self>
     where
-        W: Write + Send + 'static,
+        W: OutputSink + 'static,
     {
         let queue_size = config.effective_queue_size();
         let compression_level = CompressionLvl::new(i32::from(config.compression_level))
@@ -154,8 +159,10 @@ impl ParallelGzipWriter {
         drop(output_tx);
 
         // Spawn I/O writer thread
-        let io_handle =
-            thread::spawn(move || -> io::Result<()> { Self::io_writer_loop(writer, output_rx) });
+        let io_handle = thread::spawn(move || -> io::Result<()> {
+            let writer = Self::io_writer_loop(writer, output_rx)?;
+            Box::new(writer).close()
+        });
 
         Ok(Self {
             block_buffer: Vec::with_capacity(config.block_size),
@@ -170,7 +177,7 @@ impl ParallelGzipWriter {
     /// The I/O writer thread main loop.
     ///
     /// Writes compressed blocks in strict serial order, buffering any that
-    /// arrive early.
+    /// arrive early, then flushes and returns the writer for the caller to close.
     ///
     /// # Errors
     ///
@@ -182,7 +189,7 @@ impl ParallelGzipWriter {
     fn io_writer_loop<W: Write>(
         mut writer: W,
         output_rx: Receiver<CompressedBlock>,
-    ) -> io::Result<()> {
+    ) -> io::Result<W> {
         let mut next_expected: u64 = 0;
         let mut pending: BTreeMap<u64, CompressedBlock> = BTreeMap::new();
 
@@ -230,7 +237,7 @@ impl ParallelGzipWriter {
         }
 
         writer.flush()?;
-        Ok(())
+        Ok(writer)
     }
 
     /// Dispatch the current block buffer for compression.
@@ -353,6 +360,8 @@ impl Write for ParallelGzipWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulate::test_support::{CLOSE_ERROR, CloseProbe};
+    use fgumi_bam_io::OutputFile;
     use flate2::read::MultiGzDecoder;
     use std::fs::File;
     use std::io::Read;
@@ -421,6 +430,7 @@ mod tests {
 
         let sink = SharedSink::new();
         let err = ParallelGzipWriter::io_writer_loop(sink.clone(), rx)
+            .map(drop)
             .expect_err("a missing block must fail the write, not be skipped over");
 
         assert!(
@@ -447,7 +457,9 @@ mod tests {
         drop(tx);
 
         let sink = SharedSink::new();
-        ParallelGzipWriter::io_writer_loop(sink.clone(), rx).expect("a complete run must succeed");
+        ParallelGzipWriter::io_writer_loop(sink.clone(), rx)
+            .map(drop)
+            .expect("a complete run must succeed");
 
         assert_eq!(
             sink.decoded(),
@@ -467,6 +479,34 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    impl OutputSink for FailingSink {
+        fn close(self: Box<Self>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_finish_closes_the_sink_once() {
+        let probe = CloseProbe::default();
+        let mut writer =
+            ParallelGzipWriter::new(probe.clone(), &ParallelGzipConfig::with_threads(2))
+                .expect("writer construction");
+        writer.write_all(b"ACGT").expect("write");
+        writer.finish().expect("finish");
+        assert_eq!(probe.closes(), 1);
+        assert_eq!(probe.decoded(), b"ACGT");
+    }
+
+    #[test]
+    fn test_finish_reports_a_close_failure() {
+        let probe = CloseProbe::failing_close();
+        let mut writer = ParallelGzipWriter::new(probe, &ParallelGzipConfig::with_threads(2))
+            .expect("writer construction");
+        writer.write_all(b"ACGT").expect("write");
+        let err = writer.finish().expect_err("a failed close must surface");
+        assert!(err.to_string().contains(CLOSE_ERROR), "{err}");
     }
 
     /// A failing I/O thread must surface its error from `finish`, not hang.
@@ -554,7 +594,7 @@ mod tests {
 
         {
             let config = ParallelGzipConfig::with_threads(4);
-            let mut writer = ParallelGzipWriter::new(File::create(&path)?, &config)?;
+            let mut writer = ParallelGzipWriter::new(OutputFile::create(&path)?, &config)?;
             writer.write_all(&payload)?;
             // Deliberately no `finish()`: this is the path a `?` takes.
         }
@@ -571,7 +611,7 @@ mod tests {
         let path = temp.path().to_path_buf();
 
         {
-            let file = File::create(&path)?;
+            let file = OutputFile::create(&path)?;
             let config = ParallelGzipConfig::with_threads(2);
             let mut writer = ParallelGzipWriter::new(file, &config)?;
 
@@ -596,7 +636,7 @@ mod tests {
         let test_data = "ACGT".repeat(100_000); // ~400KB, multiple blocks
 
         {
-            let file = File::create(&path)?;
+            let file = OutputFile::create(&path)?;
             let config = ParallelGzipConfig {
                 compression_threads: 4,
                 block_size: 16384, // 16KB blocks for more parallelism
@@ -624,7 +664,7 @@ mod tests {
         let path = temp.path().to_path_buf();
 
         {
-            let file = File::create(&path)?;
+            let file = OutputFile::create(&path)?;
             let config = ParallelGzipConfig::with_threads(1);
             let mut writer = ParallelGzipWriter::new(file, &config)?;
 

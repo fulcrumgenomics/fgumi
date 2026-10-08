@@ -147,8 +147,11 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
         let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
         let pp = Arc::clone(&permit_pool);
-        let io_handle =
-            thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None));
+        // A spill chunk is read back by this process, so a lost write surfaces
+        // there as a decode error; its close is not checked.
+        let io_handle = thread::spawn(move || {
+            io_writer_loop(writer, result_rx, buffer_pool, pp, codec, None).map(drop)
+        });
 
         Ok(Self {
             // `CompressTarget::Spill`: every block this writer submits is a

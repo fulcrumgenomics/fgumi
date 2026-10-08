@@ -29,7 +29,9 @@ crossbeam-channel = { workspace = true }
 log = { workspace = true }
 tempfile = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# `unistd::close` (checked close of output files, all Unix) needs no feature;
+# `fs` (the workspace default) is for `posix_fadvise`, used on Linux only.
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
 [dev-dependencies]

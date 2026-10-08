@@ -27,6 +27,7 @@ use std::io::{self, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 
+use crate::output::{OutputFile, OutputSink};
 use crate::paths::is_stdout_path;
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
 
@@ -121,7 +122,7 @@ fn compute_end_vpos(
 
 /// Opaque wrapper over either a single- or multi-threaded BGZF writer.
 ///
-/// Uses `Box<dyn Write + Send>` to support both file and stdout output. The
+/// Uses `Box<dyn OutputSink>` to support both file and stdout output. The
 /// internal representation is intentionally private so that the choice of
 /// underlying multi-threaded BGZF writer is not part of the public API.
 pub struct BgzfWriterEnum {
@@ -129,16 +130,16 @@ pub struct BgzfWriterEnum {
 }
 
 enum BgzfWriterImpl {
-    SingleThreaded(BgzfWriter<Box<dyn Write + Send>>),
-    MultiThreaded(MultithreadedWriter<Box<dyn Write + Send>>),
+    SingleThreaded(BgzfWriter<Box<dyn OutputSink>>),
+    MultiThreaded(MultithreadedWriter<Box<dyn OutputSink>>),
 }
 
 impl BgzfWriterEnum {
-    pub(crate) fn single_threaded(writer: BgzfWriter<Box<dyn Write + Send>>) -> Self {
+    pub(crate) fn single_threaded(writer: BgzfWriter<Box<dyn OutputSink>>) -> Self {
         Self { inner: BgzfWriterImpl::SingleThreaded(writer) }
     }
 
-    pub(crate) fn multi_threaded(writer: MultithreadedWriter<Box<dyn Write + Send>>) -> Self {
+    pub(crate) fn multi_threaded(writer: MultithreadedWriter<Box<dyn OutputSink>>) -> Self {
         Self { inner: BgzfWriterImpl::MultiThreaded(writer) }
     }
 }
@@ -160,20 +161,16 @@ impl Write for BgzfWriterEnum {
 }
 
 impl BgzfWriterEnum {
-    /// Finish the stream: flush buffered data, write the BGZF EOF block, and
-    /// flush the underlying writer.
+    /// Finish the stream: flush buffered data, write the BGZF EOF block, then
+    /// flush and close the underlying sink (see [`OutputSink::close`]; a file is
+    /// synced to storage and its close checked).
     ///
     /// Always call this rather than dropping the writer: a drop also writes the
-    /// EOF block, but discards any error doing so.
-    ///
-    /// Only errors returned by `write` or `flush` are surfaced. The underlying
-    /// writer is dropped, not closed explicitly, so an error the OS reports only
-    /// when the file is closed (e.g. deferred write-back on a network
-    /// filesystem) is not checked.
+    /// EOF block, but discards any error doing so, and does not check the close.
     ///
     /// # Errors
-    /// Returns an error if flushing, writing the EOF block, or flushing the
-    /// underlying writer fails.
+    /// Returns an error if flushing, writing the EOF block, or flushing,
+    /// syncing, or closing the underlying sink fails.
     pub fn finish(self) -> io::Result<()> {
         let mut inner = match self.inner {
             // On error, noodles' `Drop` retries the EOF write (ignoring its
@@ -183,7 +180,8 @@ impl BgzfWriterEnum {
                 w.finish().map_err(|e| io::Error::other(e.to_string()))?
             }
         };
-        inner.flush()
+        inner.flush()?;
+        inner.close()
     }
 }
 
@@ -194,7 +192,7 @@ pub type BamWriter = noodles::bam::io::Writer<BgzfWriterEnum>;
 /// `threads`.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn make_bgzf_writer(
-    output: Box<dyn Write + Send>,
+    output: Box<dyn OutputSink>,
     threads: usize,
     compression_level: u32,
 ) -> BgzfWriterEnum {
@@ -900,7 +898,7 @@ fn reg2bin(start: Position, end: Position) -> usize {
 /// let index = writer.finish()?;  // Returns the BAI index
 /// ```
 pub struct IndexingBamWriter {
-    inner: MultithreadedWriter<File>,
+    inner: MultithreadedWriter<Box<dyn OutputSink>>,
     block_info_rx: BlockInfoRx,
     bai: BaiBuilder,
     num_refs: usize,
@@ -910,7 +908,7 @@ pub struct IndexingBamWriter {
 
 impl IndexingBamWriter {
     /// Create a new indexing BAM writer.
-    fn new(inner: MultithreadedWriter<File>, num_refs: usize) -> Self {
+    fn new(inner: MultithreadedWriter<Box<dyn OutputSink>>, num_refs: usize) -> Self {
         let block_info_rx = inner
             .block_info_receiver()
             .expect("block_info_receiver must be available for IndexingBamWriter")
@@ -987,10 +985,12 @@ impl IndexingBamWriter {
         self.bai.resolve()
     }
 
-    /// Finish writing, flush the BGZF stream, and return the index.
+    /// Finish writing, flush the BGZF stream, close the output file (synced to
+    /// storage, close checked), and return the index.
     ///
     /// # Errors
-    /// Returns an error if flushing, finalizing, or building the index fails.
+    /// Returns an error if flushing, finalizing, closing the output, or
+    /// building the index fails.
     pub fn finish(mut self) -> io::Result<bai::Index> {
         // Flush any remaining data
         self.inner.flush()?;
@@ -1005,8 +1005,10 @@ impl IndexingBamWriter {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Finish the writer (writes EOF marker)
-        let _ = self.inner.finish().map_err(|e| io::Error::other(e.to_string()))?;
+        // Finish the writer (writes EOF marker), then close the file it returns.
+        let mut output = self.inner.finish().map_err(|e| io::Error::other(e.to_string()))?;
+        output.flush()?;
+        output.close()?;
 
         // Final flush of any remaining entries
         self.flush_completed_blocks()?;
@@ -1053,9 +1055,19 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
             "Cannot create an indexing BAM writer for stdout (indexing requires a seekable file)"
         );
     }
-    let output_file = File::create(path_ref)
+    let output_file = OutputFile::create(path_ref)
         .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
+    indexing_bam_writer_from_sink(Box::new(output_file), header, compression_level, threads)
+        .with_context(|| format!("Failed to write header to: {}", path_ref.display()))
+}
 
+/// Build an [`IndexingBamWriter`] over an already-open sink and write `header`.
+fn indexing_bam_writer_from_sink(
+    output: Box<dyn OutputSink>,
+    header: &Header,
+    compression_level: u32,
+    threads: usize,
+) -> io::Result<IndexingBamWriter> {
     // Use multi-threaded writer with block position tracking
     let worker_count = NonZero::new(threads.max(1)).expect("threads.max(1) >= 1");
     let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
@@ -1065,13 +1077,11 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
         builder = builder.set_compression_level(cl);
     }
 
-    let bgzf_writer = builder.build_from_writer(output_file);
+    let bgzf_writer = builder.build_from_writer(output);
 
     let num_refs = header.reference_sequences().len();
     let mut writer = IndexingBamWriter::new(bgzf_writer, num_refs);
-    writer
-        .write_header(header)
-        .with_context(|| format!("Failed to write header to: {}", path_ref.display()))?;
+    writer.write_header(header)?;
 
     Ok(writer)
 }
@@ -1138,11 +1148,19 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 /// Returns an error if the file cannot be created or writing the index fails.
 ///
 /// The write is atomic: the serialized index is written to a temporary file in
-/// the destination directory and then renamed onto `path`, so a failure partway
-/// through never leaves a truncated or partial `.bai` at the final path (a
-/// half-written index parses as valid but silently mis-answers queries).
+/// the destination directory, synced and closed, and then renamed onto `path`,
+/// so a failure partway through never leaves a truncated or partial `.bai` at
+/// the final path (a half-written index parses as valid but silently
+/// mis-answers queries).
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
-    let path_ref = path.as_ref();
+    write_bai_index_with(path.as_ref(), index, |file| OutputFile::from(file).close())
+}
+
+/// [`write_bai_index`] with the temp's close supplied, so tests can make it fail.
+fn write_bai_index_with<F>(path_ref: &Path, index: &bai::Index, close: F) -> Result<()>
+where
+    F: FnOnce(File) -> io::Result<()>,
+{
     // `bai::io::Writer` serializes the index as a great many tiny fields (each
     // bin and chunk writes 8-byte virtual offsets), so writing straight to the
     // file issues one `write()` syscall per field. For a WGS-scale index (tens
@@ -1170,9 +1188,10 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
     // sidecar would otherwise be `0600` while the BAM it indexes is `0644`.
     crate::fs_mode::restamp_for_persist(tmp.as_file(), path_ref)
         .with_context(|| format!("Failed to set mode on index temp for: {}", path_ref.display()))?;
-    tmp.persist(path_ref)
-        .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))?;
-    Ok(())
+    // Sync and close the temp before the rename, so a write-back or close error
+    // fails the write rather than leaving a renamed but incomplete index.
+    crate::output::persist_after_close(tmp, path_ref, close)
+        .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))
 }
 
 /// Create a BAM writer and write the header in one operation.
@@ -1269,64 +1288,37 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 /// `-` and exits zero with an empty pipe — see the stdout axis in
 /// `tests/integration/test_input_source_matrix.rs`.
 ///
-/// Commands whose output is text rather than BAM (`fgumi fastq`) do not need the
-/// boxed writer and dispatch on [`is_stdout_path`] themselves, taking
-/// `stdout().lock()` directly.
+/// Text outputs use [`open_output_sink`](crate::output::open_output_sink),
+/// which this wraps with BAM-specific error messages.
 ///
 /// A stdout path yields a block-buffered handle — fd 1 duplicated into a
 /// [`File`] — rather than [`std::io::Stdout`], whose `LineWriter` would tear
 /// every BGZF flush at each `0x0a`.
 ///
+/// Finish the returned sink with [`OutputSink::close`]: a file is synced to
+/// storage and its close checked (see [`OutputFile`]); for stdout the
+/// duplicated descriptor is flushed and its close checked, but not synced.
+/// Dropping it instead discards any error the close would report.
+///
 /// # Errors
 ///
 /// Returns an error if `path` names a file that cannot be created, or if the
 /// stdout descriptor cannot be duplicated.
-pub fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
+pub fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn OutputSink>> {
     let path_ref = path.as_ref();
-    if is_stdout_path(path_ref) {
-        block_buffered_stdout()
-    } else {
-        let file = File::create(path_ref)
-            .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
-        Ok(Box::new(file))
-    }
-}
-
-/// A block-buffered handle on this process's stdout.
-///
-/// [`std::io::Stdout`] wraps a `LineWriter`, which splits every write at the last
-/// `\n` in the buffer and issues the two halves separately. BGZF blocks carry
-/// `0x0a` at arbitrary offsets, so a single large flush from the caller's
-/// `BufWriter` would be torn into many small `write` calls on the hot output
-/// path. Duplicating the descriptor into a [`File`] bypasses the line buffering
-/// and leaves batching to the caller's buffer, where it belongs.
-///
-/// The descriptor is duplicated rather than taken, so dropping the returned
-/// handle closes only the duplicate; fd 1 stays open for the rest of the process.
-#[cfg(unix)]
-fn block_buffered_stdout() -> Result<Box<dyn Write + Send>> {
-    use std::os::fd::AsFd;
-
-    let stdout = std::io::stdout()
-        .as_fd()
-        .try_clone_to_owned()
-        .map(File::from)
-        .context("Failed to duplicate stdout for BAM output")?;
-    Ok(Box::new(stdout))
-}
-
-/// A block-buffered handle on this process's stdout.
-///
-/// Fallback for targets without file descriptors, where the line-buffering
-/// concern described on the Unix variant cannot be worked around this way.
-#[cfg(not(unix))]
-fn block_buffered_stdout() -> Result<Box<dyn Write + Send>> {
-    Ok(Box::new(std::io::stdout()))
+    crate::output::open_output_sink(path_ref).with_context(|| {
+        if is_stdout_path(path_ref) {
+            "Failed to duplicate stdout for BAM output".to_string()
+        } else {
+            format!("Failed to create output BAM: {}", path_ref.display())
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::test_support::{CLOSE_ERROR, CloseProbe};
     use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     use std::num::NonZeroUsize;
     use tempfile::NamedTempFile;
@@ -1404,7 +1396,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_flush_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Write some data and flush
@@ -1418,7 +1410,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_flush_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
@@ -1438,7 +1430,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_finish_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Write some data
@@ -1454,7 +1446,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_finish_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
@@ -1476,7 +1468,8 @@ mod tests {
     /// An in-memory sink that records every byte written. With `fail_on_eof` it
     /// rejects the write carrying the BGZF EOF block, modelling a disk that fills
     /// up exactly at the end of the stream; with `fail_on_flush` it rejects
-    /// `flush`, modelling a buffered writer whose final flush fails.
+    /// `flush`, modelling a buffered writer whose final flush fails. Its close
+    /// always succeeds; close failures use [`CloseProbe`].
     #[derive(Clone, Default)]
     struct EofSink {
         written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1491,6 +1484,12 @@ mod tests {
 
         fn bytes(&self) -> Vec<u8> {
             self.written.lock().expect("sink lock").clone()
+        }
+    }
+
+    impl OutputSink for EofSink {
+        fn close(self: Box<Self>) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1567,9 +1566,94 @@ mod tests {
     }
 
     #[test]
+    fn test_bgzf_writer_finish_closes_sink_once() {
+        for threads in [1, 2] {
+            let sink = CloseProbe::default();
+            let mut writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            writer.write_all(b"test data").expect("write");
+            writer.finish().expect("finish");
+            assert_eq!(sink.closes(), 1, "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn test_bgzf_writer_finish_propagates_close_error() {
+        for threads in [1, 2] {
+            let sink = CloseProbe::failing_close();
+            let mut writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            writer.write_all(b"test data").expect("write");
+
+            let err = writer.finish().expect_err("a failed close must surface");
+            assert!(err.to_string().contains(CLOSE_ERROR), "threads={threads}: {err}");
+            // The stream itself was complete; only the close failed.
+            assert_eq!(count_eof_blocks(&sink.bytes()), 1, "threads={threads}");
+        }
+    }
+
+    /// Closing the output must not change its bytes: a BGZF stream written to a
+    /// file through `open_output_writer` matches the same stream in memory.
+    #[test]
+    fn test_bgzf_writer_file_output_matches_in_memory_output() -> Result<()> {
+        for threads in [1, 2] {
+            let temp_file = NamedTempFile::new()?;
+            let mut file_writer =
+                make_bgzf_writer(open_output_writer(temp_file.path())?, threads, 6);
+            let sink = EofSink::new(false);
+            let mut memory_writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            for i in 0..10_000 {
+                let line = format!("record {i}\n");
+                file_writer.write_all(line.as_bytes())?;
+                memory_writer.write_all(line.as_bytes())?;
+            }
+            file_writer.finish()?;
+            memory_writer.finish()?;
+
+            let on_disk = std::fs::read(temp_file.path())?;
+            assert_eq!(on_disk, sink.bytes(), "threads={threads}");
+            assert_eq!(count_eof_blocks(&on_disk), 1, "threads={threads}");
+        }
+        Ok(())
+    }
+
+    /// A stdout sink is flushed and its duplicate closed; finishing it must
+    /// succeed.
+    #[test]
+    fn test_open_output_writer_stdout_closes_cleanly() -> Result<()> {
+        for path in ["-", "/dev/stdout"] {
+            let mut sink = open_output_writer(path)?;
+            sink.flush()?;
+            sink.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_indexing_bam_writer_finish_closes_sink_once() -> Result<()> {
+        let sink = CloseProbe::default();
+        let mut writer =
+            indexing_bam_writer_from_sink(Box::new(sink.clone()), &create_test_header(), 6, 2)?;
+        writer.write_raw_record(&create_test_bam_record(0, 100, b"read1"))?;
+        writer.finish()?;
+        assert_eq!(sink.closes(), 1);
+        assert_eq!(count_eof_blocks(&sink.bytes()), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_indexing_bam_writer_finish_propagates_close_error() -> Result<()> {
+        let sink = CloseProbe::failing_close();
+        let mut writer =
+            indexing_bam_writer_from_sink(Box::new(sink.clone()), &create_test_header(), 6, 2)?;
+        writer.write_raw_record(&create_test_bam_record(0, 100, b"read1"))?;
+        let err = writer.finish().expect_err("a failed close must surface");
+        assert!(err.to_string().contains(CLOSE_ERROR), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn test_bgzf_writer_write_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::single_threaded(BgzfWriter::new(output_file));
 
         // Test writing via the Write trait
@@ -1582,7 +1666,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_write_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
+        let output_file: Box<dyn OutputSink> = Box::new(OutputFile::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::multi_threaded(MultithreadedWriter::with_worker_count(
@@ -2247,5 +2331,22 @@ mod tests {
             temp_leftovers.is_empty(),
             "temp file must be renamed away, found: {temp_leftovers:?}"
         );
+    }
+
+    /// The index temp is closed before it is renamed, and a failed close fails
+    /// the write: no `.bai` appears at the final path and no temp is left.
+    #[test]
+    fn write_bai_index_close_error_leaves_no_index() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("out.bam.bai");
+        let err = write_bai_index_with(&path, &bai::Index::default(), |_| {
+            assert!(!path.exists(), "the temp must be closed before it is renamed");
+            Err(io::Error::other(CLOSE_ERROR))
+        })
+        .expect_err("a failed close must fail the index write");
+        assert!(format!("{err:#}").contains(CLOSE_ERROR), "{err:#}");
+        assert!(!path.exists(), "no index may be renamed into place after a failed close");
+        let leftovers = std::fs::read_dir(dir.path()).expect("read temp dir").count();
+        assert_eq!(leftovers, 0, "the temp must be removed");
     }
 }

@@ -203,11 +203,14 @@ fn write_block_in_order<W: Write>(
 /// Releases one permit to `permit_pool` after each block is written out,
 /// unblocking the corresponding `StagingBuffer::flush()` call and bounding the
 /// number of in-flight compressed blocks to the pool capacity.
-/// Writes BGZF EOF marker and flushes when all blocks are received.
+/// Writes BGZF EOF marker and flushes when all blocks are received, then
+/// returns the writer so the caller decides how to close it: the sort's output
+/// is synced and its close checked (`fgumi_bam_io::close_buffered`), while a
+/// spill chunk, read back by this same process, is simply dropped.
 ///
 /// Generic over the sink rather than fixed to `File`: spill chunks are always
 /// files, but the sort's *output* may be stdout, which reaches here as the
-/// boxed writer `open_output_writer` hands back.
+/// boxed sink `open_output_writer` hands back.
 ///
 /// When `block_offset_tx` is `Some`, each written block's `(serial,
 /// compressed_start)` is emitted on it (in strict block order) for BAI virtual
@@ -227,7 +230,7 @@ pub(crate) fn io_writer_loop<W: Write>(
     permit_pool: Arc<PermitPool>,
     codec: SpillCodec,
     block_offset_tx: Option<Sender<BlockOffset>>,
-) -> Result<()> {
+) -> Result<BufWriter<W>> {
     let result = io_writer_loop_inner(
         &mut writer,
         &result_rx,
@@ -240,7 +243,7 @@ pub(crate) fn io_writer_loop<W: Write>(
         // Unblock any producers waiting on acquire() so they don't park forever.
         permit_pool.close();
     }
-    result
+    result.map(|()| writer)
 }
 
 fn io_writer_loop_inner<W: Write>(
@@ -668,6 +671,7 @@ mod tests {
             SpillCodec::Bgzf,
             None,
         )
+        .map(drop)
         .expect_err("a lost final block must fail the write");
         assert!(err.to_string().contains("missing compressed block 0 of 1"), "{err}");
         assert!(permit_pool.acquire().is_err(), "a failed writer must close the permit pool");
