@@ -3556,3 +3556,118 @@ fn simplex_allow_unmapped_is_not_exposed() {
         "expected clap to reject --simplex::allow-unmapped as unknown, got:\n{stderr}"
     );
 }
+
+/// `runall --start-from correct` rejects a mixed-length `--correct::umis` set
+/// before it opens the input, so the UMI error is reported even when the input
+/// is empty or not a BAM at all, and no output is written.
+///
+/// The runall counterpart of `correct`'s `test_validation_different_length_umis`
+/// (ported from fgbio `CorrectUmisTest.scala:106`, which runs on an empty
+/// `NoBam` input): runall applies the same check, with the same error text,
+/// after its input-exists and path-collision guards and before the chain opens
+/// its source. The mixed lengths are given inline or split across
+/// `--correct::umis` and `--correct::umi-files`.
+#[rstest::rstest]
+fn start_from_correct_rejects_mixed_length_umis_before_reading_input(
+    #[values(b"".as_slice(), b"not a BAM file\n".as_slice())] input_contents: &[u8],
+    #[values(false, true)] split_into_umi_file: bool,
+) {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("input.bam");
+    std::fs::write(&input, input_contents).unwrap();
+    let umi_file = tmp.path().join("umis.txt");
+    std::fs::write(&umi_file, "CCC\n").unwrap();
+    let out = tmp.path().join("out.bam");
+
+    let mut args = vec![
+        "runall",
+        "--start-from",
+        "correct",
+        "--stop-after",
+        "correct",
+        "-i",
+        p(&input),
+        "-o",
+        p(&out),
+        "--correct::min-distance",
+        "1",
+        "--correct::umis",
+        "AAAAAA",
+    ];
+    if split_into_umi_file {
+        args.extend(["--correct::umi-files", p(&umi_file)]);
+    } else {
+        args.extend(["--correct::umis", "CCC"]);
+    }
+
+    let output = fgumi(&args);
+    assert!(!output.status.success(), "a mixed-length UMI set must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A UMI file is checked line by line, so its error names the offending line.
+    let expected = if split_into_umi_file {
+        format!(
+            "Error: UMI file {} line 1: UMI CCC has length 3, but earlier UMIs have length 6; all \
+             UMIs from --umis / --umi-files must have the same length.",
+            umi_file.display()
+        )
+    } else {
+        "Error: All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6."
+            .to_string()
+    };
+    assert_eq!(
+        stderr.lines().last(),
+        Some(expected.as_str()),
+        "expected the UMI-length error, got:\n{stderr}"
+    );
+    assert!(!out.exists(), "no output may be written when the UMI set is rejected");
+}
+
+/// `runall --start-from extract` splices the correct stage in when
+/// `--correct::umis` is given; a mixed-length set is rejected before the FASTQs
+/// are opened, so unreadable FASTQs do not mask the UMI error and no output is
+/// written.
+#[test]
+fn start_from_extract_rejects_mixed_length_umis_before_reading_fastqs() {
+    let tmp = TempDir::new().unwrap();
+    let r1 = tmp.path().join("r1.fq.gz");
+    let r2 = tmp.path().join("r2.fq.gz");
+    std::fs::write(&r1, b"not a FASTQ\n").unwrap();
+    std::fs::write(&r2, b"not a FASTQ\n").unwrap();
+    let out = tmp.path().join("out.bam");
+
+    let output = fgumi([
+        "runall",
+        "--start-from",
+        "extract",
+        "--stop-after",
+        "correct",
+        "--extract::inputs",
+        p(&r1),
+        p(&r2),
+        "--extract::read-structures",
+        "6M+T",
+        "+T",
+        "--extract::sample",
+        "s1",
+        "--extract::library",
+        "lib1",
+        "--correct::min-distance",
+        "1",
+        "--correct::umis",
+        "AAAAAA",
+        "--correct::umis",
+        "CCC",
+        "-o",
+        p(&out),
+    ]);
+    assert!(!output.status.success(), "a mixed-length UMI set must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().last(),
+        Some(
+            "Error: All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6."
+        ),
+        "expected the UMI-length error, got:\n{stderr}"
+    );
+    assert!(!out.exists(), "no output may be written when the UMI set is rejected");
+}

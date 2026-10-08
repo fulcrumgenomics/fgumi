@@ -64,11 +64,11 @@ use crate::dna::reverse_complement_str;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::sam::SamTag;
 use ahash::AHashMap;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgumi_raw_bam;
 use fgumi_raw_bam::RawRecord;
-use log::{info, warn};
+use log::warn;
 use lru::LruCache;
 use std::path::Path;
 use std::path::PathBuf;
@@ -271,7 +271,7 @@ pub struct CorrectUmis {
     #[arg(short = 'u', long)]
     pub umis: Vec<String>,
 
-    /// Files containing UMI sequences, one per line.
+    /// Files containing UMI sequences, one per line (plain text or gzip-compressed).
     #[arg(short = 'U', long)]
     pub umi_files: Vec<PathBuf>,
 
@@ -352,7 +352,7 @@ pub struct CorrectOptions {
     /// Expected UMI sequences.
     #[arg(short = 'u', long)]
     pub umis: Vec<String>,
-    /// Files holding expected UMI sequences.
+    /// Files holding expected UMI sequences (plain text or gzip-compressed).
     #[arg(short = 'U', long)]
     pub umi_files: Vec<PathBuf>,
     /// Skip storing the original UMI.
@@ -427,41 +427,226 @@ impl CorrectUmis {
     }
 }
 
+/// A known-UMI set that has been read and validated: non-empty, upper-cased,
+/// de-duplicated, sorted, and of a single length.
+///
+/// Only [`CorrectOptions::resolve_umi_set`] constructs one, after running
+/// [`CorrectOptions::validate`], so holding a `ResolvedUmiSet` proves both the
+/// option checks and the set checks passed. The chain builder resolves the set
+/// once, before it opens the input, and hands this value to `add_correct`, which
+/// therefore neither re-validates nor re-reads any `--umi-files` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedUmiSet {
+    sequences: Vec<String>,
+    umi_length: usize,
+}
+
+impl ResolvedUmiSet {
+    /// The UMI sequences, upper-cased, de-duplicated and sorted.
+    pub(crate) fn sequences(&self) -> &[String] {
+        &self.sequences
+    }
+
+    /// The length shared by every UMI in the set.
+    pub(crate) fn umi_length(&self) -> usize {
+        self.umi_length
+    }
+}
+
+/// The advice every "this is not a UMI file" error ends with.
+const UMI_FILE_FORMAT_HINT: &str =
+    "--umi-files must be plain or gzip-compressed text with one UMI per line.";
+
+/// Streams the UMIs in a `--umi-files` path through `on_umi`.
+///
+/// The path is opened exactly once, so a FIFO or process-substitution path is
+/// safe. See [`for_each_umi_in_stream`] for how the content is read.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read, if a line is not
+/// text, or if `on_umi` rejects a UMI.
+fn for_each_umi_in_file(path: &Path, on_umi: impl FnMut(&str, usize) -> Result<()>) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to read UMI file {}", path.display()))?;
+    for_each_umi_in_stream(file, path, on_umi)
+}
+
+/// Streams the UMIs in `reader`, a `--umi-files` input named `path`, calling
+/// `on_umi` with each non-blank line, trimmed, and its 1-based line number.
+///
+/// Compression is detected from the content through
+/// [`fgumi_bam_io::classify_input`] rather than the file name, and gzip or BGZF
+/// is decompressed as it is read, as fgbio's `Io.readLines` does for `.gz`
+/// paths. Nothing is buffered beyond the current line, and the first invalid
+/// line ends the read: a line containing a control byte other than tab or
+/// carriage return (which is how a BAM, or any other binary file, shows itself
+/// on its first line), a line that is not UTF-8, or a UMI `on_umi` rejects. So
+/// memory follows the UMI set the caller keeps, not the size of the input.
+///
+/// # Errors
+///
+/// Returns an error if `reader` fails, if a line is not text, or if `on_umi`
+/// rejects a UMI.
+fn for_each_umi_in_stream<R: std::io::Read>(
+    mut reader: R,
+    path: &Path,
+    on_umi: impl FnMut(&str, usize) -> Result<()>,
+) -> Result<()> {
+    let mut prefix = [0u8; fgumi_bam_io::FORMAT_PREFIX_LEN];
+    let filled = fgumi_bam_io::read_prefix(&mut reader, &mut prefix)
+        .with_context(|| format!("Failed to read UMI file {}", path.display()))?;
+    let prefix = &prefix[..filled];
+    let replayed = fgumi_bam_io::ChainedReader::new(prefix.to_vec(), reader);
+    match fgumi_bam_io::classify_input(prefix) {
+        fgumi_bam_io::InputFormat::Bgzf | fgumi_bam_io::InputFormat::Gzip => for_each_umi_line(
+            std::io::BufReader::new(flate2::read::MultiGzDecoder::new(replayed)),
+            path,
+            on_umi,
+        ),
+        fgumi_bam_io::InputFormat::Text | fgumi_bam_io::InputFormat::Empty => {
+            for_each_umi_line(std::io::BufReader::new(replayed), path, on_umi)
+        }
+    }
+}
+
+/// Splits decoded UMI-file text into lines for [`for_each_umi_in_stream`].
+///
+/// Each chunk is checked for control bytes as it arrives, before it is appended
+/// to the current line, so a binary input with no newline still fails within
+/// one buffer rather than being accumulated whole.
+fn for_each_umi_line<B: std::io::BufRead>(
+    mut reader: B,
+    path: &Path,
+    mut on_umi: impl FnMut(&str, usize) -> Result<()>,
+) -> Result<()> {
+    let mut line: Vec<u8> = Vec::new();
+    let mut line_number = 1;
+    loop {
+        let (consumed, line_complete) = {
+            let buf = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to read UMI file {}", path.display())));
+                }
+            };
+            if buf.is_empty() {
+                break;
+            }
+            let newline = memchr::memchr(b'\n', buf);
+            let chunk = &buf[..newline.unwrap_or(buf.len())];
+            if let Some(&byte) =
+                chunk.iter().find(|&&b| b.is_ascii_control() && b != b'\t' && b != b'\r')
+            {
+                bail!(
+                    "UMI file {} line {line_number} is not text (found byte 0x{byte:02x}); \
+                     {UMI_FILE_FORMAT_HINT}",
+                    path.display()
+                );
+            }
+            line.extend_from_slice(chunk);
+            (newline.map_or(buf.len(), |i| i + 1), newline.is_some())
+        };
+        reader.consume(consumed);
+        if line_complete {
+            emit_umi_line(&line, line_number, path, &mut on_umi)?;
+            line.clear();
+            line_number += 1;
+        }
+    }
+    emit_umi_line(&line, line_number, path, &mut on_umi)
+}
+
+/// Hands one raw UMI-file line to `on_umi`, trimmed, unless it is blank.
+fn emit_umi_line(
+    line: &[u8],
+    line_number: usize,
+    path: &Path,
+    on_umi: &mut impl FnMut(&str, usize) -> Result<()>,
+) -> Result<()> {
+    let Ok(text) = std::str::from_utf8(line) else {
+        bail!(
+            "UMI file {} line {line_number} is not valid UTF-8; {UMI_FILE_FORMAT_HINT}",
+            path.display()
+        );
+    };
+    let umi = text.trim();
+    if umi.is_empty() { Ok(()) } else { on_umi(umi, line_number) }
+}
+
 impl CorrectOptions {
-    /// Loads the known-UMI set from `--umis` and `--umi-files`, upper-cased and
-    /// de-duplicated, and returns the sorted sequences plus their common length.
+    /// Validates these options, then reads and validates the known-UMI set from
+    /// `--umis` and `--umi-files`.
     ///
-    /// Shared by the non-chain [`CorrectUmis`] path and the chain builder, which
-    /// holds these tuning knobs directly.
-    pub(crate) fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
+    /// `--umis` values and `--umi-files` lines are trimmed and upper-cased. Blank
+    /// file lines are skipped, but an empty `--umis` value (e.g. `--umis ""`) is
+    /// an error, since it can never match a read. UMI files may be plain text or
+    /// gzip/BGZF-compressed (detected by content, as fgbio's `Io.readLines`
+    /// decompresses `.gz` paths); each is opened and read exactly once, so a FIFO
+    /// or process-substitution path is safe. UMI files are streamed and checked
+    /// line by line, so the first non-text line or length mismatch is reported by
+    /// file and line number without reading the rest of the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Self::validate`] fails, a `--umis` value is empty, a
+    /// UMI file cannot be read or is not text, no UMIs are found, or the UMIs
+    /// differ in length.
+    pub(crate) fn resolve_umi_set(&self) -> Result<ResolvedUmiSet> {
+        self.validate()?;
+
         let mut umi_set: std::collections::HashSet<String> =
-            self.umis.iter().map(|s| s.to_uppercase()).collect();
+            std::collections::HashSet::with_capacity(self.umis.len());
+        for umi in &self.umis {
+            let umi = umi.trim();
+            if umi.is_empty() {
+                bail!("--umis contains an empty UMI.");
+            }
+            umi_set.insert(umi.to_uppercase());
+        }
+
+        // `--umis` is already in memory, so its lengths are checked as a whole;
+        // UMI files are checked line by line as they are read, so a mismatch
+        // stops the read at the line that introduces it.
+        let umis_lengths: std::collections::BTreeSet<usize> =
+            umi_set.iter().map(String::len).collect();
+        if umis_lengths.len() > 1 {
+            let lengths: Vec<String> = umis_lengths.iter().map(ToString::to_string).collect();
+            bail!(
+                "All UMIs from --umis / --umi-files must have the same length; found lengths {}.",
+                lengths.join(", ")
+            );
+        }
+        let mut umi_length = umis_lengths.first().copied();
 
         for file in &self.umi_files {
-            let content = std::fs::read_to_string(file)?;
-            for line in content.lines() {
-                let umi = line.trim().to_uppercase();
-                if !umi.is_empty() {
-                    umi_set.insert(umi);
+            for_each_umi_in_file(file, |umi, line_number| {
+                let umi = umi.to_uppercase();
+                let expected = *umi_length.get_or_insert(umi.len());
+                if umi.len() != expected {
+                    bail!(
+                        "UMI file {} line {line_number}: UMI {umi} has length {}, but earlier \
+                         UMIs have length {expected}; all UMIs from --umis / --umi-files must \
+                         have the same length.",
+                        file.display(),
+                        umi.len()
+                    );
                 }
-            }
+                umi_set.insert(umi);
+                Ok(())
+            })?;
         }
 
-        if umi_set.is_empty() {
-            bail!("No UMIs provided.");
-        }
+        let Some(umi_length) = umi_length else {
+            bail!("No UMIs provided: --umis / --umi-files contain only blank lines.");
+        };
 
-        let mut umi_sequences: Vec<String> = umi_set.into_iter().collect();
-        umi_sequences.sort_unstable();
+        let mut sequences: Vec<String> = umi_set.into_iter().collect();
+        sequences.sort_unstable();
 
-        // Check all UMIs have the same length
-        let first_len = umi_sequences[0].len();
-        if !umi_sequences.iter().all(|u| u.len() == first_len) {
-            bail!("All UMIs must have the same length.");
-        }
-
-        info!("Loaded {} UMI sequences of length {}", umi_sequences.len(), first_len);
-        Ok((umi_sequences, first_len))
+        Ok(ResolvedUmiSet { sequences, umi_length })
     }
 
     /// Checks distances between UMI pairs and warns about ambiguities.
@@ -673,8 +858,10 @@ impl Command for CorrectUmis {
 
         // The declarative chain builder is the only execution path. `execute`
         // does the reader-free pre-flight above and then always dispatches:
-        // `execute_chain` → `add_correct` opens its own source and emits the
-        // timer, `Starting correct` banner, UMI-set load, distance check,
+        // `execute_chain` → `ChainBuilder::new` reads and validates the UMI set
+        // before it opens the input (see `CorrectOptions::resolve_umi_set`),
+        // then `add_correct` opens its own source and emits the timer, `Starting
+        // correct` banner, the "Loaded N UMI sequences" log, distance check,
         // threading logs, summary/warn banners, the `--metrics` TSV, and the
         // `--min-corrected` gate. Running any of those here first would
         // double-log and pre-consume stdin. Absent `--threads`, the chain runs
@@ -933,12 +1120,14 @@ impl CorrectUmis {
     /// Runs the correct stage via the declarative chain builder
     /// (`ChainSpec::single_stage(Stage::Correct, ...)` → `build_for(spec)?.run()`).
     ///
-    /// `add_correct` opens its own source, re-emits the timer/banner/threading
-    /// log lines, reloads the UMI set, and re-runs the distance check, so none
-    /// of those may run again here — only the CRC-verify status line, which
-    /// `add_correct` does not re-emit. The chain is the only execution path:
-    /// `execute` always dispatches here, with or without `--threads` (absent
-    /// `--threads` runs the chain at a single worker).
+    /// `ChainBuilder::new` reads and validates the UMI set before it opens the
+    /// input, and `add_correct` opens its own source, re-emits the
+    /// timer/banner/threading log lines, logs the loaded UMI set, and re-runs
+    /// the distance check, so none of those may run again here — only the
+    /// CRC-verify status line, which `add_correct` does not re-emit. The chain
+    /// is the only execution path: `execute` always dispatches here, with or
+    /// without `--threads` (absent `--threads` runs the chain at a single
+    /// worker).
     fn execute_chain(&self, command_line: &str) -> Result<()> {
         use crate::pipeline::chains::{
             ChainSpec, SingleStageContext, Stage, StageOptionsBag, build_for,
@@ -1726,15 +1915,55 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_validation_different_length_umis() {
-        let temp_input = NamedTempFile::new().expect("failed to create temp file");
-        let temp_output = NamedTempFile::new().expect("failed to create temp file");
+    /// A bad UMI set (mixed lengths, or no UMIs at all) is rejected before the
+    /// input is opened, so the error does not depend on the input's contents and
+    /// no output is written.
+    ///
+    /// Ported from fgbio `CorrectUmisTest.scala:106` ("throw an exception if all
+    /// the fixed umis are not the same length"), which passes `NoBam` (an empty
+    /// temp file from `makeTempFile`) as the input with fixed UMIs `AAAAAA` and
+    /// `CCC`, and expects a `ValidationException` (the `empty_input_like_fgbio_nobam`
+    /// case). fgbio does not check the message; this test asserts fgumi's exact
+    /// text so that an unrelated input error (e.g. the empty file failing to
+    /// parse as BAM) cannot satisfy it. The remaining cases are added guards: a
+    /// readable BAM yields the same error (`non_empty_input_guard`, which also
+    /// passed before the fix), mixed lengths split across `--umis` and
+    /// `--umi-files`, a `--umi-files` holding only blank lines, and an empty
+    /// `--umis` value (e.g. `--umis ""` from an unset shell variable), which
+    /// could never match a read.
+    #[rstest]
+    #[case::empty_input_like_fgbio_nobam(false, &["AAAAAA", "CCC"], None, "All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6.")]
+    #[case::non_empty_input_guard(true, &["AAAAAA", "CCC"], None, "All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6.")]
+    #[case::mixed_lengths_across_umis_and_file(false, &["AAAAAA"], Some("CCC\n"), "UMI file {umi_file} line 1: UMI CCC has length 3, but earlier UMIs have length 6; all UMIs from --umis / --umi-files must have the same length.")]
+    #[case::blank_only_umi_file(false, &[], Some("\n   \n"), "No UMIs provided: --umis / --umi-files contain only blank lines.")]
+    #[case::empty_umis_value(false, &[""], None, "--umis contains an empty UMI.")]
+    #[case::blank_umis_value_beside_valid_umis(false, &["ACGT", "  "], None, "--umis contains an empty UMI.")]
+    fn test_validation_different_length_umis(
+        #[case] write_records: bool,
+        #[case] umis: &[&str],
+        #[case] umi_file_contents: Option<&str>,
+        #[case] expected_error: &str,
+    ) -> Result<()> {
+        let input = if write_records {
+            create_test_bam(vec![("q1", Some("AAAAAA"))])?
+        } else {
+            NamedTempFile::new()?
+        };
+        let dir = TempDir::new()?;
+        let output = dir.path().join("output.bam");
+        let umi_files = match umi_file_contents {
+            Some(contents) => {
+                let path = dir.path().join("umis.txt");
+                std::fs::write(&path, contents)?;
+                vec![path]
+            }
+            None => Vec::new(),
+        };
 
         let corrector = CorrectUmis {
             io: BamIoOptions {
-                input: temp_input.path().to_path_buf(),
-                output: temp_output.path().to_path_buf(),
+                input: input.path().to_path_buf(),
+                output: output.clone(),
                 async_reader: false,
                 check_crc: false,
                 no_check_crc: false,
@@ -1744,8 +1973,8 @@ mod tests {
             target: Target::Umi,
             max_mismatches: 2,
             min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
-            umi_files: vec![],
+            umis: umis.iter().map(ToString::to_string).collect(),
+            umi_files,
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -1756,7 +1985,229 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert!(corrector.execute("test").is_err());
+        let expected_error = expected_error
+            .replace("{umi_file}", &dir.path().join("umis.txt").display().to_string());
+        let err = corrector.execute("test").expect_err("a bad UMI set must be rejected");
+        assert_eq!(err.to_string(), expected_error);
+        assert!(!output.exists(), "no output may be written when the UMI set is rejected");
+        Ok(())
+    }
+
+    /// `resolve_umi_set` merges `--umis` and `--umi-files` into one set,
+    /// trimmed, upper-cased, de-duplicated and sorted, with its common length.
+    #[test]
+    fn resolve_umi_set_merges_umis_and_umi_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        let umi_file = dir.path().join("umis.txt");
+        std::fs::write(&umi_file, " ggtt \n\nacgt\n")?;
+        let opts = CorrectOptions {
+            umis: vec![" ttaa".to_string(), "ACGT".to_string()],
+            umi_files: vec![umi_file],
+            ..CorrectOptions::default()
+        };
+
+        let resolved = opts.resolve_umi_set()?;
+
+        assert_eq!(resolved.sequences(), ["ACGT", "GGTT", "TTAA"]);
+        assert_eq!(resolved.umi_length(), 4);
+        Ok(())
+    }
+
+    /// A gzip- or BGZF-compressed `--umi-files` path is decompressed, as fgbio's
+    /// `Io.readLines` does for `.gz` paths. Compression is detected by content,
+    /// so the file name does not matter.
+    #[rstest]
+    #[case::gzip("umis.txt.gz", false)]
+    #[case::gzip_without_gz_extension("umis.txt", false)]
+    #[case::bgzf("umis.txt.bgz", true)]
+    fn resolve_umi_set_reads_a_compressed_umi_file(
+        #[case] file_name: &str,
+        #[case] bgzf: bool,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let umi_file = dir.path().join(file_name);
+        let text = b"acgtacgt\r\n\nTTTTCCCC\n";
+        let compressed = if bgzf {
+            let mut writer = noodles_bgzf::io::Writer::new(Vec::new());
+            writer.write_all(text)?;
+            writer.finish()?
+        } else {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(text)?;
+            encoder.finish()?
+        };
+        std::fs::write(&umi_file, compressed)?;
+        let opts = CorrectOptions { umi_files: vec![umi_file], ..CorrectOptions::default() };
+
+        let resolved = opts.resolve_umi_set()?;
+
+        assert_eq!(resolved.sequences(), ["ACGTACGT", "TTTTCCCC"]);
+        assert_eq!(resolved.umi_length(), 8);
+        Ok(())
+    }
+
+    /// An unreadable `--umi-files` path is reported by name, with the OS error as
+    /// its cause.
+    #[test]
+    fn resolve_umi_set_names_an_unreadable_umi_file() -> Result<()> {
+        let dir = TempDir::new()?;
+        let missing = dir.path().join("missing.txt");
+        let opts = CorrectOptions { umi_files: vec![missing.clone()], ..CorrectOptions::default() };
+
+        let err = opts.resolve_umi_set().expect_err("a missing UMI file must be rejected");
+
+        assert_eq!(err.to_string(), format!("Failed to read UMI file {}", missing.display()));
+        let cause = err
+            .chain()
+            .nth(1)
+            .and_then(|e| e.downcast_ref::<std::io::Error>())
+            .expect("the OS error must be kept as the cause");
+        assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// A UMI file is validated line by line as it is read, so a length mismatch
+    /// is reported at the line that introduces it, by file and line number.
+    #[test]
+    fn resolve_umi_set_names_the_umi_file_line_with_a_length_mismatch() -> Result<()> {
+        let dir = TempDir::new()?;
+        let umi_file = dir.path().join("umis.txt");
+        std::fs::write(&umi_file, "ACGT\n\nttgg\nAC\nCCCC\n")?;
+        let opts =
+            CorrectOptions { umi_files: vec![umi_file.clone()], ..CorrectOptions::default() };
+
+        let err = opts.resolve_umi_set().expect_err("a mixed-length UMI file must be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "UMI file {} line 4: UMI AC has length 2, but earlier UMIs have length 4; all \
+                 UMIs from --umis / --umi-files must have the same length.",
+                umi_file.display()
+            )
+        );
+        Ok(())
+    }
+
+    /// A BAM passed as `--umi-files` is rejected at its first line as not text,
+    /// rather than being decompressed and parsed as UMIs.
+    #[test]
+    fn resolve_umi_set_rejects_a_bam_passed_as_a_umi_file() -> Result<()> {
+        let bam = create_test_bam(vec![("q1", Some("AAAAAA"))])?;
+        let opts = CorrectOptions {
+            umi_files: vec![bam.path().to_path_buf()],
+            ..CorrectOptions::default()
+        };
+
+        let err = opts.resolve_umi_set().expect_err("a BAM is not a UMI file");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "UMI file {} line 1 is not text (found byte 0x01); --umi-files must be plain or \
+                 gzip-compressed text with one UMI per line.",
+                bam.path().display()
+            )
+        );
+        Ok(())
+    }
+
+    /// A reader that yields `head` once and then `tail` forever, counting the
+    /// bytes handed out.
+    struct EndlessReader {
+        head: std::io::Cursor<Vec<u8>>,
+        tail: &'static [u8],
+        offset: usize,
+        bytes_read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for EndlessReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut n = self.head.read(buf)?;
+            if n == 0 {
+                for byte in buf.iter_mut() {
+                    *byte = self.tail[self.offset];
+                    self.offset = (self.offset + 1) % self.tail.len();
+                }
+                n = buf.len();
+            }
+            self.bytes_read.set(self.bytes_read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// An invalid line ends the read at that line: the UMI stream is never
+    /// buffered whole, so an endless (or merely huge) input whose first line is
+    /// bad fails after reading a bounded prefix instead of exhausting memory.
+    #[rstest]
+    #[case::binary_first_line(b"BAM\x01\x00\x00\x00\x00".to_vec(), "UMI file umis.txt line 1 is not text (found byte 0x01); --umi-files must be plain or gzip-compressed text with one UMI per line.")]
+    #[case::non_utf8_first_line(b"AC\xffGT\n".to_vec(), "UMI file umis.txt line 1 is not valid UTF-8; --umi-files must be plain or gzip-compressed text with one UMI per line.")]
+    #[case::callback_rejects_line_two(b"ACGT\nTTTTTT\n".to_vec(), "line 2 rejected")]
+    fn for_each_umi_in_stream_stops_at_the_first_invalid_line(
+        #[case] head: Vec<u8>,
+        #[case] expected_error: &str,
+    ) {
+        let bytes_read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = EndlessReader {
+            head: std::io::Cursor::new(head),
+            tail: b"ACGT\n",
+            offset: 0,
+            bytes_read: std::rc::Rc::clone(&bytes_read),
+        };
+
+        let err = for_each_umi_in_stream(reader, Path::new("umis.txt"), |_umi, line_number| {
+            if line_number == 2 {
+                bail!("line 2 rejected");
+            }
+            Ok(())
+        })
+        .expect_err("the first invalid line must end the read");
+
+        assert_eq!(err.to_string(), expected_error);
+        assert!(
+            bytes_read.get() < 1024 * 1024,
+            "read {} bytes before failing; the stream must not be buffered whole",
+            bytes_read.get()
+        );
+    }
+
+    /// Plain, gzip and BGZF UMI streams yield the same trimmed, non-blank lines
+    /// with their 1-based line numbers.
+    #[rstest]
+    #[case::plain(None)]
+    #[case::gzip(Some(false))]
+    #[case::bgzf(Some(true))]
+    fn for_each_umi_in_stream_yields_trimmed_lines_with_line_numbers(
+        #[case] compression: Option<bool>,
+    ) -> Result<()> {
+        let text = b" acgt \r\n\n\tTTGG\nCCAA";
+        let bytes = match compression {
+            None => text.to_vec(),
+            Some(true) => {
+                let mut writer = noodles_bgzf::io::Writer::new(Vec::new());
+                writer.write_all(text)?;
+                writer.finish()?
+            }
+            Some(false) => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(text)?;
+                encoder.finish()?
+            }
+        };
+
+        let mut seen = Vec::new();
+        for_each_umi_in_stream(bytes.as_slice(), Path::new("umis.txt"), |umi, line_number| {
+            seen.push((umi.to_string(), line_number));
+            Ok(())
+        })?;
+
+        assert_eq!(
+            seen,
+            [("acgt".to_string(), 1), ("TTGG".to_string(), 3), ("CCAA".to_string(), 4)]
+        );
+        Ok(())
     }
 
     #[test]

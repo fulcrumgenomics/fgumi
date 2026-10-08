@@ -669,6 +669,12 @@ pub struct ChainBuilder<'a> {
     consensus_metrics_captures:
         Option<Arc<crate::inline_metrics_collector::ConsensusMetricsCaptures>>,
 
+    /// The correct stage's known-UMI set, resolved and validated by `new()`
+    /// before the input is opened (`None` when the chain has no correct
+    /// stage). `add_correct` takes it, so the set is read once and is not kept
+    /// alive past the build.
+    correct_umi_set: Option<crate::commands::correct::ResolvedUmiSet>,
+
     /// Every output file this build has created. Removed if the builder is
     /// dropped before [`Self::build`] succeeds, so a failed build leaves no
     /// header-only output behind. Declared last so it drops after `pipeline`,
@@ -728,9 +734,14 @@ impl<'a> ChainBuilder<'a> {
     /// and stores the reader in `pending_source` for [`Self::add_source`]
     /// to consume. Applies `@PG` injection; stores the output header.
     ///
+    /// When the chain runs the correct stage, first resolves and validates its
+    /// known-UMI set (reading each `umi_files` path once), so a bad set is
+    /// reported before the input is opened; `add_correct` then uses that set.
+    ///
     /// # Errors
     ///
-    /// Returns I/O errors from input file open or header parsing.
+    /// Returns a correct-stage option or UMI-set error, or I/O errors from input
+    /// file open or header parsing.
     pub fn new(spec: &'a ChainSpec) -> Result<Self> {
         let num_threads = spec.threading.num_threads();
         // Validate the thread count up front, before `add_sink` opens (and
@@ -744,6 +755,11 @@ impl<'a> ChainBuilder<'a> {
         }
         let tuning = BamPipelineTuning::auto_tuned(num_threads)
             .with_compression_level(spec.compression.compression_level);
+
+        // Resolve the correct stage's UMI set before the source is opened, so
+        // a bad set is reported regardless of the input's contents.
+        let correct_umi_set =
+            crate::pipeline::chains::commands::correct::resolve_chain_umi_set(spec)?;
 
         // Every chain — including the sole-`[Stage::Sort]` chain — opens its
         // source exactly once here (header read; the reader continues in
@@ -800,6 +816,7 @@ impl<'a> ChainBuilder<'a> {
             created_outputs: CreatedOutputs::default(),
             fastq_encoding,
             consensus_metrics_captures: None,
+            correct_umi_set,
         })
     }
 
@@ -2614,9 +2631,13 @@ impl<'a> ChainBuilder<'a> {
     /// `current_tail` for the `SerializeBamRecords` step and, after that, for
     /// `add_sink`.
     ///
-    /// Applies `correct_opts.validate()` for semantic option checks (UMI source
-    /// presence + numeric ranges). Loads UMI sequences and encodes them into
-    /// [`EncodedUmiSet`] up front.
+    /// Takes the UMI set that [`Self::new`] resolved before opening the input
+    /// (which also ran `CorrectOptions::validate`), logs it, and encodes it into
+    /// [`EncodedUmiSet`]; the set is neither re-validated nor re-read. Only a
+    /// direct caller that adds the correct stage to a spec whose `stages` omit
+    /// it reaches here without a resolved set, and the set is resolved here
+    /// instead. The step config and metrics hook keep only the encoded set, not
+    /// a second copy of the sequences.
     ///
     /// The `rejects_header` is the **input header verbatim** (PR #332 contract:
     /// rejects are raw-input records, so they carry the input's `@HD` sort
@@ -2639,8 +2660,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors if correct options are missing from the spec bag or if UMI
-    /// sequence loading fails.
+    /// Returns errors if correct options are missing from the spec bag or if the
+    /// fallback UMI-set resolution fails.
     ///
     /// [`EncodedUmiSet`]: crate::commands::correct::EncodedUmiSet
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
@@ -2674,8 +2695,12 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Correct options missing from StageOptionsBag"))?;
 
-        // Semantic option-level checks (UMI source presence + numeric ranges).
-        correct_opts.validate()?;
+        // `new()` resolved (and validated) the set for every spec whose stages
+        // include correct; resolve here only for a spec that omits it.
+        let umi_set = match self.correct_umi_set.take() {
+            Some(umi_set) => umi_set,
+            None => correct_opts.resolve_umi_set()?,
+        };
 
         let tail = self.current_tail.expect("add_correct called before add_source");
 
@@ -2689,11 +2714,12 @@ impl<'a> ChainBuilder<'a> {
         info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
 
-        // The UMI-set loading and distance check read only tuning knobs, which
-        // live directly on `CorrectOptions` — no `CorrectUmis` wrapper needed.
-        let (umi_sequences, umi_length) = correct_opts.load_umi_sequences()?;
-        let encoded_umi_set = Arc::new(EncodedUmiSet::new(&umi_sequences));
-        correct_opts.check_umi_distances(&umi_sequences);
+        let umi_length = umi_set.umi_length();
+        info!("Loaded {} UMI sequences of length {}", umi_set.sequences().len(), umi_length);
+        let encoded_umi_set = Arc::new(EncodedUmiSet::new(umi_set.sequences()));
+        correct_opts.check_umi_distances(umi_set.sequences());
+        // The encoded set is all the run needs; free the sequences now.
+        drop(umi_set);
         let unmatched_umi = "N".repeat(umi_length);
 
         let num_threads = self.spec.threading.num_threads();
@@ -6616,6 +6642,7 @@ mod tests {
             created_outputs: CreatedOutputs::default(),
             fastq_encoding: None,
             consensus_metrics_captures: None,
+            correct_umi_set: None,
         }
     }
 
