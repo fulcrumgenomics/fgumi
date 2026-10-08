@@ -306,7 +306,9 @@ fn clip_templates_in_batch(
 
         // Regenerate alignment tags for every record (always done to match fgbio). NM/UQ follow
         // the record's SEQ convention, as in `filter`: a simplex methylation consensus keeps the
-        // converted bases, so their conversions are not counted.
+        // converted bases, so their conversions are not counted. A mapped secondary or supplementary
+        // record with no bases (`SEQ` `*`) keeps its tags unchanged, where fgbio fails on it;
+        // `clip_template` has already rejected a mapped primary with no bases.
         for record in records.iter_mut() {
             let scoring = fgumi_consensus::filter::conversion_scoring_for_record(record);
             regenerate_alignment_tags_raw_with_scoring(

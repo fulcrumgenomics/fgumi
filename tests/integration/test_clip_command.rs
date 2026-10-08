@@ -824,6 +824,159 @@ fn test_clip_scores_nm_by_consensus_convention(#[case] duplex: bool, #[case] exp
     assert_eq!(md, "1C3C2", "MD is SAM-literal");
 }
 
+/// Writes a query-grouped BAM holding one paired template `read1`: an 8M R1 primary at (0-based)
+/// 96 and an 8M reverse R2 primary at 100, both matching the `ACGT`-repeat reference, plus one
+/// extra mapped R1 record with no bases (`SEQ` and `QUAL` `*`) at 499 carrying NM 7, UQ 70 and
+/// MD `8`, with `empty_flags` added to its flags. When `empty_flags` is 0 the empty record
+/// replaces the R1 primary instead.
+fn write_template_with_empty_sequence_record(path: &Path, empty_flags: u16) {
+    let primary = |segment: u16, orientation: u16, pos: i32, mate_pos: i32, tlen: i32| {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | segment | orientation)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(mate_pos)
+            .template_length(tlen);
+        b.build()
+    };
+    let r2 = primary(flags::LAST_SEGMENT, flags::REVERSE, 100, 96, -12);
+    let empty = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"")
+            .qualities(&[])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE | empty_flags)
+            .ref_id(0)
+            .pos(499)
+            .mapq(0)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(100)
+            .template_length(0);
+        b.add_int_tag(SamTag::NM, 7).add_int_tag(SamTag::UQ, 70).add_string_tag(SamTag::MD, b"8");
+        b.build()
+    };
+    let records = if empty_flags == 0 {
+        vec![empty, r2]
+    } else {
+        vec![primary(flags::FIRST_SEGMENT, flags::MATE_REVERSE, 96, 100, 12), r2, empty]
+    };
+
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+    for record in records {
+        writer.write_alignment_record(&header, &to_record_buf(&record)).expect("write record");
+    }
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
+/// Runs `fgumi clip --read-one-five-prime 1` with `extra_args` against `ref_path`.
+fn run_clip_read_one_five_prime(
+    input: &Path,
+    output: &Path,
+    ref_path: &Path,
+    extra_args: &[&str],
+) -> anyhow::Result<()> {
+    let mut args = vec![
+        "clip",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--read-one-five-prime",
+        "1",
+        "--compression-level",
+        "1",
+    ];
+    args.extend_from_slice(extra_args);
+    Clip::try_parse_from(args).expect("failed to parse clip args").execute("fgumi clip")
+}
+
+/// A mapped secondary or supplementary alignment written without bases (`SEQ` and `QUAL` `*`, as
+/// `bwa mem -a` writes secondaries) passes through clip unchanged: same position and CIGAR, and
+/// NM/UQ/MD left as they are, while its primaries are clipped and their tags regenerated.
+/// Recomputing the tags would walk a CIGAR that consumes bases the record does not carry. fgbio's
+/// `ClipBam` aborts on such a record instead.
+#[rstest]
+fn test_clip_passes_through_mapped_empty_sequence_non_primary(
+    #[values(flags::SECONDARY, flags::SUPPLEMENTARY)] empty_flags: u16,
+    #[values(&[] as &[&str], &["--threads", "2"])] extra_args: &[&str],
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    write_template_with_empty_sequence_record(&input_bam, empty_flags);
+
+    run_clip_read_one_five_prime(&input_bam, &output_bam, &ref_path, extra_args)
+        .expect("Clip command failed");
+
+    let records = read_output_record_bufs(&output_bam);
+    assert_eq!(records.len(), 3, "all three records are written");
+    let int_tag = |rec: &RecordBuf, tag: SamTag| {
+        rec.data()
+            .get(&tag.to_noodles_tag())
+            .and_then(noodles::sam::alignment::record_buf::data::field::Value::as_int)
+    };
+    let md_tag = |rec: &RecordBuf| match rec.data().get(&SamTag::MD.to_noodles_tag()) {
+        Some(noodles::sam::alignment::record_buf::data::field::Value::String(md)) => {
+            Some(md.to_string())
+        }
+        _ => None,
+    };
+    let is_non_primary = |r: &RecordBuf| r.flags().is_secondary() || r.flags().is_supplementary();
+
+    let empty = records.iter().find(|r| is_non_primary(r)).expect("non-primary record");
+    assert!(empty.sequence().as_ref().is_empty(), "keeps SEQ `*`");
+    assert_eq!(empty.alignment_start().map(usize::from), Some(500), "position unchanged");
+    let cigar: Vec<_> = empty.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect();
+    assert_eq!(cigar, [(CigarKind::Match, 8)], "CIGAR unchanged");
+    assert_eq!(int_tag(empty, SamTag::NM), Some(7), "NM unchanged");
+    assert_eq!(int_tag(empty, SamTag::UQ), Some(70), "UQ unchanged");
+    assert_eq!(md_tag(empty).as_deref(), Some("8"), "MD unchanged");
+
+    // The primary R1 was clipped by one base at its 5' end and its tags regenerated against the
+    // reference it matches.
+    let r1 = records
+        .iter()
+        .find(|r| r.flags().is_first_segment() && !is_non_primary(r))
+        .expect("primary R1");
+    assert_eq!(int_tag(r1, SamTag::NM), Some(0), "primary R1 NM regenerated");
+    assert_eq!(md_tag(r1).as_deref(), Some("7"), "primary R1 MD regenerated");
+}
+
+/// A mapped primary alignment with no bases (`SEQ` `*`) cannot be clipped, so clip fails with an
+/// error naming the read rather than silently skipping the requested clip. fgbio's `ClipBam` also
+/// aborts on it.
+#[rstest]
+#[case::single_worker(&[])]
+#[case::threaded(&["--threads", "2"])]
+fn test_clip_rejects_mapped_empty_sequence_primary(#[case] extra_args: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+    write_template_with_empty_sequence_record(&input_bam, 0);
+
+    let err = run_clip_read_one_five_prime(&input_bam, &output_bam, &ref_path, extra_args)
+        .expect_err("clip must fail on a mapped primary with no bases");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("read1") && message.contains("mapped primary alignment with no bases"),
+        "error names the read and the problem: {message}"
+    );
+}
+
 /// Build a query-grouped BAM of `count` overlapping paired templates. Each
 /// template is an 8M R1 at pos 99 and an 8M reverse R2 at pos 103 (mates overlap
 /// in [103,106]), so `--clip-overlapping-reads` plus fixed-end clipping both do
