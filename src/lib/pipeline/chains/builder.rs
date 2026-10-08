@@ -3827,11 +3827,7 @@ impl<'a> ChainBuilder<'a> {
         // (S5c2-003). These read the user-supplied `strategy`/`no_umi`/
         // `min_umi_length` (not the derived `effective_*`), matching
         // `GroupReadsByUmi::execute`.
-        if group.min_umi_length.is_some()
-            && matches!(group.strategy, crate::assigner::Strategy::Paired)
-        {
-            bail!("Paired strategy cannot be used with --min-umi-length");
-        }
+        crate::umi::validate_min_umi_length(group.min_umi_length, group.strategy)?;
         if group.no_umi && matches!(group.strategy, crate::assigner::Strategy::Paired) {
             bail!("--no-umi cannot be used with --strategy paired");
         }
@@ -6167,6 +6163,9 @@ impl<'a> ChainBuilder<'a> {
             .dedup
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Dedup options missing from StageOptionsBag"))?;
+
+        // Same `--min-umi-length` checks as standalone `fgumi dedup`.
+        crate::umi::validate_min_umi_length(dedup.min_umi_length, dedup.strategy)?;
 
         let tail = self.current_tail.expect("add_dedup called before add_source");
 

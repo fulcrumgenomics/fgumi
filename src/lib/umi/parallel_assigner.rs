@@ -15,12 +15,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ahash::{AHashMap, AHashSet};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 
 use crate::bitenc::BitEnc;
 use crate::template::MoleculeId;
 
-use fgumi_umi::assigner::assert_uniform_umi_length;
+use fgumi_umi::assigner::{check_uniform_single_umi_length, check_uniform_umi_length};
 
 use super::{Umi, UmiAssigner};
 
@@ -446,8 +447,9 @@ fn positional_hamming(a: &str, b: &str) -> usize {
 /// (`NgramIndex::new` / `BkTree::from_umis` return `None`), and every paired canonical form
 /// carries a `-`, so the sequential paired assigner never indexes and always falls to its
 /// reverse-aware linear scan. Only pools with at least one asymmetric-halves UMI take this path,
-/// plus orientation-prefixed pools whose prefixes do not rule out reverse matches (never the
-/// case for the keys `group` builds); the asymmetric gate is an `any()`, so a single asymmetric
+/// plus pools with a UMI over 32 bases in total (no `BitEnc` encoding) and orientation-prefixed
+/// pools whose prefixes do not rule out reverse matches (never the case for the keys `group`
+/// builds); the asymmetric gate is an `any()`, so a single asymmetric
 /// form routes the whole pool here (asymmetric dual UMIs are uncommon — most kits use
 /// symmetric halves, which keep the sub-quadratic `BitEnc` neighbour-generation path).
 #[must_use]
@@ -600,10 +602,14 @@ impl UmiAssigner for ParallelIdentityAssigner {
         self.counter.reset();
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn groups_identical_umis_only(&self) -> bool {
+        true
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
-        assignments
+        Ok(assignments)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -642,9 +648,9 @@ impl ParallelEditAssigner {
     /// Assign molecules numbered locally as `0..k` for this call alone.
     ///
     /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
-    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn assign_local(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Encode UMIs and count occurrences
@@ -668,14 +674,14 @@ impl ParallelEditAssigner {
         // (identical strings share), mirroring fgbio's per-string assignment and the sequential
         // edit assigner.
         if umi_counts.is_empty() {
-            return all_invalid_molecule_ids(raw_umis);
+            return Ok(all_invalid_molecule_ids(raw_umis));
         }
 
         // Convert to indexed list (order doesn't matter for Edit strategy)
         let unique_umis: Vec<(BitEnc, usize)> = umi_counts.into_iter().collect();
 
         // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
-        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
+        check_uniform_single_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
 
         let mut enc_to_idx: AHashMap<BitEnc, usize> =
             AHashMap::with_hasher(crate::hashing::deterministic_state());
@@ -722,7 +728,7 @@ impl ParallelEditAssigner {
             result.push(mol_id);
         }
 
-        result
+        Ok(result)
     }
 }
 
@@ -731,10 +737,14 @@ impl UmiAssigner for ParallelEditAssigner {
         self.counter.reset();
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
-        let mut assignments = self.assign_local(raw_umis);
+    fn groups_identical_umis_only(&self) -> bool {
+        self.max_mismatches == 0
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
+        let mut assignments = self.assign_local(raw_umis)?;
         self.counter.rebase(&mut assignments);
-        assignments
+        Ok(assignments)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -773,9 +783,9 @@ impl ParallelAdjacencyAssigner {
     /// Assign molecules numbered locally as `0..k` for this call alone.
     ///
     /// [`UmiAssigner::assign`] rebases the result onto a globally unique block.
-    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn assign_local(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Count unique UMIs
@@ -799,7 +809,7 @@ impl ParallelAdjacencyAssigner {
         // (identical strings share), mirroring fgbio's per-string assignment and the sequential
         // adjacency assigner.
         if sorted_umis.is_empty() {
-            return all_invalid_molecule_ids(raw_umis);
+            return Ok(all_invalid_molecule_ids(raw_umis));
         }
 
         // Sort by count descending, then by the case-folded UMI string for determinism.
@@ -814,7 +824,7 @@ impl ParallelAdjacencyAssigner {
             sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
 
         // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
-        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
+        check_uniform_single_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         let max_mismatches = self.max_mismatches;
@@ -882,7 +892,7 @@ impl ParallelAdjacencyAssigner {
         // join a valid molecule. See the cross-assigner parity note in the tests module.
         let mut invalid_to_id: AHashMap<String, MoleculeId> =
             AHashMap::with_hasher(crate::hashing::deterministic_state());
-        raw_umis
+        Ok(raw_umis
             .iter()
             .map(|umi| {
                 let upper = umi.to_uppercase();
@@ -894,7 +904,7 @@ impl ParallelAdjacencyAssigner {
                     })
                 })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -903,10 +913,14 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
         self.counter.reset();
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
-        let mut assignments = self.assign_local(raw_umis);
+    fn groups_identical_umis_only(&self) -> bool {
+        self.max_mismatches == 0
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
+        let mut assignments = self.assign_local(raw_umis)?;
         self.counter.rebase(&mut assignments);
-        assignments
+        Ok(assignments)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -915,10 +929,10 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
 }
 
 /// The reverse-spelling representation the paired strand pass consumes, tagging which
-/// strand routine runs for a pool: `BitEnc` reverses for unprefixed symmetric-halves pools,
-/// full-string reverses (compared position-for-position, prefixes and dash included) for
-/// asymmetric-halves pools (#586) and for orientation-prefixed pools. Both index parallel to
-/// the pool's sorted canonical forms.
+/// strand routine runs for a pool: `BitEnc` reverses for unprefixed symmetric-halves pools of
+/// at most 32 bases, full-string reverses (compared position-for-position, prefixes and dash
+/// included) for asymmetric-halves pools (#586), pools with a UMI over 32 bases, and
+/// orientation-prefixed pools. Both index parallel to the pool's sorted canonical forms.
 enum ReverseForms {
     Encoded(Vec<BitEnc>),
     Spelled(Vec<String>),
@@ -1022,6 +1036,27 @@ impl ParallelPairedAssigner {
         format!("{first}-{second}")
     }
 
+    /// Base length of a paired key with its dash and any orientation prefixes excluded, or `None`
+    /// if a half has a base other than `A`/`C`/`G`/`T` (either case) or more than 32 bases.
+    ///
+    /// This is the sequential `PairedUmiAssigner`'s rule (`underlying_umi_len`), which caps each
+    /// half rather than the pair, so both assigners group and length-check the same UMIs. A pair
+    /// over 32 bases in total passes it but has no single `BitEnc` encoding.
+    fn underlying_len(umi: &str) -> Option<usize> {
+        let (first, second) = umi.split_once('-').expect("validated paired UMI");
+        [first, second]
+            .into_iter()
+            .map(|half| {
+                let (_, seq) = Self::split_orientation_prefix(half);
+                let valid = seq.len() <= 32
+                    && seq
+                        .bytes()
+                        .all(|b| matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'));
+                valid.then_some(seq.len())
+            })
+            .sum()
+    }
+
     /// Whether every canonical key carries the same pair of equal-length orientation prefixes
     /// that differ in more than `max_mismatches` positions (as `group` builds them).
     ///
@@ -1054,14 +1089,16 @@ impl ParallelPairedAssigner {
     /// canonical strands → final per-UMI molecule/strand map); splitting it would hurt
     /// readability more than the length costs. Matches other assigner/pipeline sites.
     #[allow(clippy::too_many_lines)]
-    fn assign_local(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn assign_local(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Validate all are paired UMIs (consistent with sequential PairedUmiAssigner)
         for umi in raw_umis {
-            assert!(umi.split('-').count() == 2, "UMI {umi} is not a paired UMI");
+            if umi.split('-').count() != 2 {
+                bail!("UMI {umi} is not a paired UMI");
+            }
         }
 
         // Count unique UMIs using canonical form
@@ -1083,17 +1120,12 @@ impl ParallelPairedAssigner {
         // below.
         let oriented = raw_umis.iter().any(|umi| umi.contains(':'));
 
-        // Build sorted list with BitEnc encoding (using canonical forms)
-        let mut sorted_umis: Vec<(String, usize, BitEnc)> = canonical_counts
+        // Keep the canonical forms the sequential assigner keeps (every base `ACGT`, each half at
+        // most 32 bases; see `underlying_len`), with their base length.
+        let mut sorted_umis: Vec<(String, usize, usize)> = canonical_counts
             .iter()
             .filter_map(|(umi, &count)| {
-                // For paired UMIs, encode without the dash (and without orientation prefixes)
-                let encoded = if oriented {
-                    BitEnc::from_umi_str(&Self::strip_orientation_prefixes(umi))
-                } else {
-                    BitEnc::from_umi_str(umi)
-                };
-                encoded.map(|enc| (umi.clone(), count, enc))
+                Self::underlying_len(umi).map(|len| (umi.clone(), count, len))
             })
             .collect();
 
@@ -1101,19 +1133,30 @@ impl ParallelPairedAssigner {
         // (identical strings share), mirroring fgbio's per-string assignment, the main path
         // below, and the sequential paired assigner.
         if sorted_umis.is_empty() {
-            return all_invalid_molecule_ids(raw_umis);
+            return Ok(all_invalid_molecule_ids(raw_umis));
         }
 
         // Sort by count descending, then by UMI string for determinism
         sorted_umis.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        // Build indexed structures
-        let unique_umis: Vec<(BitEnc, usize)> =
-            sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
+        // Reject differing-length paired UMIs the way fgbio does, over the same UMIs and base
+        // lengths (dashes and prefixes excluded) as the sequential assigner.
+        check_uniform_umi_length(sorted_umis.iter().map(|(_, _, len)| *len))?;
 
-        // Reject differing-length paired UMIs the way fgbio (and the sequential assigner)
-        // does. `BitEnc::len` excludes the dash, so this compares base length.
-        assert_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()));
+        // The 2-bit encoding of each canonical form's bases (dash and prefixes dropped) and its
+        // count, for the `BitEnc` fast paths. `None` when some form has more than 32 bases in
+        // total: that pool takes the full-string path below, which needs no encoding.
+        let unique_umis: Option<Vec<(BitEnc, usize)>> = sorted_umis
+            .iter()
+            .map(|(umi, count, _)| {
+                let encoded = if oriented {
+                    BitEnc::from_umi_str(&Self::strip_orientation_prefixes(umi))
+                } else {
+                    BitEnc::from_umi_str(umi)
+                };
+                encoded.map(|enc| (enc, *count))
+            })
+            .collect();
 
         // The `BitEnc` fast path drops the `-`, so it can only represent SYMMETRIC-halves
         // canonical forms faithfully. With symmetric halves the dash sits at a fixed
@@ -1131,7 +1174,7 @@ impl ParallelPairedAssigner {
         // that compares the full dash-delimited canonical strings position-for-position --
         // exactly the sequential assigner's `matches_paired` relation -- so it never has to
         // fall back to the single-threaded sequential assigner (issue #586). Checked over
-        // `sorted_umis`: the encodable canonical forms that actually feed edge discovery.
+        // `sorted_umis`: the valid canonical forms that actually feed edge discovery.
         let has_asymmetric_halves = sorted_umis.iter().any(|(umi, _, _)| {
             let (left, right) = umi.split_once('-').expect("validated paired UMI");
             Self::split_orientation_prefix(left).1.len()
@@ -1142,7 +1185,11 @@ impl ParallelPairedAssigner {
         // reverse-orientation match (always the case for `group`'s prefixes); otherwise it is
         // grouped on the full prefixed strings like an asymmetric pool, which reproduces the
         // sequential relation exactly for any prefixes.
-        let compare_full_strings = has_asymmetric_halves
+        //
+        // A pool with a form over 32 bases in total (each half at most 32) has no `BitEnc`
+        // encoding, so it is also grouped on the full strings, as the sequential assigner does.
+        let compare_full_strings = unique_umis.is_none()
+            || has_asymmetric_halves
             || (oriented && {
                 let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
                 !Self::prefixes_block_reverse_matches(&canon, self.max_mismatches)
@@ -1159,8 +1206,8 @@ impl ParallelPairedAssigner {
         // one is reversed (GRP3-01). So we union the forward edges with a
         // reverse-orientation edge pass.
         //
-        // Three branches. The full-string branch (asymmetric halves, or prefixes that do not
-        // rule out reverse matches) compares the dash-delimited keys position-for-position and
+        // Three branches. The full-string branch (asymmetric halves, a form over 32 bases, or
+        // prefixes that do not rule out reverse matches) compares the dash-delimited keys position-for-position and
         // emits directed `(parent, child)` edges. The prefixed fast path emits forward edges on
         // the prefix-stripped bases only, since its prefixes rule out every reverse match. The
         // unprefixed fast path unions forward and reverse `BitEnc` edges. Both fast paths
@@ -1172,50 +1219,55 @@ impl ParallelPairedAssigner {
         // `String` (`reverse_strs`) otherwise. Exactly one is populated, selecting which
         // strand routine runs after the BFS.
         let max_mismatches = self.max_mismatches;
-        let (edges, reverse_forms): (Vec<(usize, usize)>, ReverseForms) = if compare_full_strings {
-            let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
-            let reverse_strs: Vec<String> = sorted_umis
-                .iter()
-                .map(|(umi, _, _)| Self::reverse_paired(umi).unwrap_or_else(|| umi.clone()))
-                .collect();
-            let edges = self.pool.install(|| {
-                let reverse_refs: Vec<&str> = reverse_strs.iter().map(String::as_str).collect();
-                discover_paired_edges_dash_aware(&canon, &reverse_refs, max_mismatches)
-            });
-            (edges, ReverseForms::Spelled(reverse_strs))
-        } else if oriented {
-            // Prefixed keys whose prefixes block every reverse match: forward edges on the
-            // prefix-stripped bases are the whole relation. Strands are still decided on the
-            // full prefixed strings, as the sequential assigner does.
-            let reverse_strs: Vec<String> = sorted_umis
-                .iter()
-                .map(|(umi, _, _)| Self::reverse_paired(umi).unwrap_or_else(|| umi.clone()))
-                .collect();
-            let edges =
-                self.pool.install(|| discover_edges_parallel_k(&unique_umis, max_mismatches));
-            (edges, ReverseForms::Spelled(reverse_strs))
-        } else {
-            // Encode the REVERSE of each canonical form (halves swapped) alongside it, so
-            // the reverse-orientation edge pass and the strand assignment can both use it.
-            let reverse_encs: Vec<BitEnc> = sorted_umis
-                .iter()
-                .map(|(umi, _, _)| {
-                    let reversed = Self::reverse_paired(umi).unwrap_or_else(|| umi.clone());
-                    BitEnc::from_umi_str(&reversed)
-                        .expect("canonical paired UMI reverses to a valid UMI")
-                })
-                .collect();
-            let edges = self.pool.install(|| {
-                let forward = discover_edges_parallel_k(&unique_umis, max_mismatches);
-                let reverse =
-                    discover_paired_reverse_edges(&unique_umis, &reverse_encs, max_mismatches);
-                // Dedup the forward/reverse union (they can overlap) before handing the
-                // undirected edge list to the reciprocating adjacency build below.
-                let mut set: AHashSet<(usize, usize)> = forward.into_iter().collect();
-                set.extend(reverse);
-                set.into_iter().collect::<Vec<_>>()
-            });
-            (edges, ReverseForms::Encoded(reverse_encs))
+        let fast_path_umis = if compare_full_strings { None } else { unique_umis.as_deref() };
+        let (edges, reverse_forms): (Vec<(usize, usize)>, ReverseForms) = match fast_path_umis {
+            None => {
+                let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
+                let reverse_strs: Vec<String> = sorted_umis
+                    .iter()
+                    .map(|(umi, _, _)| Self::reverse_paired(umi).unwrap_or_else(|| umi.clone()))
+                    .collect();
+                let edges = self.pool.install(|| {
+                    let reverse_refs: Vec<&str> = reverse_strs.iter().map(String::as_str).collect();
+                    discover_paired_edges_dash_aware(&canon, &reverse_refs, max_mismatches)
+                });
+                (edges, ReverseForms::Spelled(reverse_strs))
+            }
+            Some(unique_umis) if oriented => {
+                // Prefixed keys whose prefixes block every reverse match: forward edges on the
+                // prefix-stripped bases are the whole relation. Strands are still decided on the
+                // full prefixed strings, as the sequential assigner does.
+                let reverse_strs: Vec<String> = sorted_umis
+                    .iter()
+                    .map(|(umi, _, _)| Self::reverse_paired(umi).unwrap_or_else(|| umi.clone()))
+                    .collect();
+                let edges =
+                    self.pool.install(|| discover_edges_parallel_k(unique_umis, max_mismatches));
+                (edges, ReverseForms::Spelled(reverse_strs))
+            }
+            Some(unique_umis) => {
+                // Encode the REVERSE of each canonical form (halves swapped) alongside it, so
+                // the reverse-orientation edge pass and the strand assignment can both use it.
+                let reverse_encs: Vec<BitEnc> = sorted_umis
+                    .iter()
+                    .map(|(umi, _, _)| {
+                        let reversed = Self::reverse_paired(umi).unwrap_or_else(|| umi.clone());
+                        BitEnc::from_umi_str(&reversed)
+                            .expect("canonical paired UMI reverses to a valid UMI")
+                    })
+                    .collect();
+                let edges = self.pool.install(|| {
+                    let forward = discover_edges_parallel_k(unique_umis, max_mismatches);
+                    let reverse =
+                        discover_paired_reverse_edges(unique_umis, &reverse_encs, max_mismatches);
+                    // Dedup the forward/reverse union (they can overlap) before handing the
+                    // undirected edge list to the reciprocating adjacency build below.
+                    let mut set: AHashSet<(usize, usize)> = forward.into_iter().collect();
+                    set.extend(reverse);
+                    set.into_iter().collect::<Vec<_>>()
+                });
+                (edges, ReverseForms::Encoded(reverse_encs))
+            }
         };
 
         // Build adjacency list. `edges` is an `AHashSet` whose iteration order is seeded
@@ -1245,7 +1297,7 @@ impl ParallelPairedAssigner {
         // they reproduce the sequential assigner's directed BFS, which absorbs each child exactly
         // once from the first parent that reaches it and never re-parents an assigned node.
         let directed = compare_full_strings;
-        let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); unique_umis.len()];
+        let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); sorted_umis.len()];
         for (i, j) in edges {
             adj_list[i].push(j);
             if !directed {
@@ -1259,12 +1311,12 @@ impl ParallelPairedAssigner {
         // Phase 2: Sequential BFS with adjacency constraints. Track each molecule's
         // root canonical (the highest-count member, first in sorted order) so strand
         // can be assigned relative to it, matching the sequential assigner.
-        let mut assigned = vec![false; unique_umis.len()];
-        let mut mol_ids: Vec<u64> = vec![0; unique_umis.len()];
+        let mut assigned = vec![false; sorted_umis.len()];
+        let mut mol_ids: Vec<u64> = vec![0; sorted_umis.len()];
         let mut cluster_root: Vec<usize> = Vec::new();
         let mut next_mol_id: u64 = 0;
 
-        for root_idx in 0..unique_umis.len() {
+        for root_idx in 0..sorted_umis.len() {
             if assigned[root_idx] {
                 continue;
             }
@@ -1279,12 +1331,12 @@ impl ParallelPairedAssigner {
             mol_ids[root_idx] = mol_id;
 
             while let Some(idx) = queue.pop_front() {
-                let parent_count = unique_umis[idx].1;
+                let parent_count = sorted_umis[idx].1;
                 let max_child_count = parent_count / 2 + 1;
 
                 for &neighbor_idx in &adj_list[idx] {
                     if !assigned[neighbor_idx] {
-                        let neighbor_count = unique_umis[neighbor_idx].1;
+                        let neighbor_count = sorted_umis[neighbor_idx].1;
                         if neighbor_count <= max_child_count {
                             assigned[neighbor_idx] = true;
                             mol_ids[neighbor_idx] = mol_id;
@@ -1299,9 +1351,12 @@ impl ParallelPairedAssigner {
         // for the full-string branch and the prefixed fast path, `BitEnc`-based for the
         // unprefixed fast path. `reverse_forms` records which one applies.
         let canonical_strand = match &reverse_forms {
-            ReverseForms::Encoded(reverse_encs) => {
-                paired_canonical_strands(&unique_umis, reverse_encs, &mol_ids, &cluster_root)
-            }
+            ReverseForms::Encoded(reverse_encs) => paired_canonical_strands(
+                unique_umis.as_deref().expect("the encoded fast path has every encoding"),
+                reverse_encs,
+                &mol_ids,
+                &cluster_root,
+            ),
             ReverseForms::Spelled(reverse_strs) => {
                 let canon: Vec<&str> = sorted_umis.iter().map(|(umi, _, _)| umi.as_str()).collect();
                 let reverse_refs: Vec<&str> = reverse_strs.iter().map(String::as_str).collect();
@@ -1310,7 +1365,7 @@ impl ParallelPairedAssigner {
         };
 
         // Final pass: map each raw UMI back to its molecule + strand via `canonical_to_idx`;
-        // each distinct invalid (non-encodable) UMI instead gets its own `Single` molecule
+        // each distinct invalid UMI (see `underlying_len`) instead gets its own `Single` molecule
         // keyed by its raw uppercase string (no valid strand so never `PairedA`/`PairedB`; see
         // the tests-module parity note). Keying by the raw uppercase string -- not the canonical
         // form -- matches the sequential paired assigner (`assign_with_invalid_fallback`) and the
@@ -1326,7 +1381,7 @@ impl ParallelPairedAssigner {
             .extend(sorted_umis.iter().enumerate().map(|(i, (umi, _, _))| (umi.as_str(), i)));
         let mut invalid_to_id: AHashMap<String, MoleculeId> =
             AHashMap::with_hasher(crate::hashing::deterministic_state());
-        raw_umis
+        Ok(raw_umis
             .iter()
             .map(|umi| {
                 let canonical = Self::canonicalize(umi);
@@ -1348,7 +1403,7 @@ impl ParallelPairedAssigner {
                     })
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -1357,10 +1412,10 @@ impl UmiAssigner for ParallelPairedAssigner {
         self.counter.reset();
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
-        let mut assignments = self.assign_local(raw_umis);
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
+        let mut assignments = self.assign_local(raw_umis)?;
         self.counter.rebase(&mut assignments);
-        assignments
+        Ok(assignments)
     }
 
     fn split_templates_by_pair_orientation(&self) -> bool {
@@ -1540,7 +1595,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["AAAA", "AAAA", "TTTT"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Identical UMIs should be same molecule
         assert_eq!(assignments[0], assignments[1]);
@@ -1554,7 +1609,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["ACGT", "acgt", "AcGt"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All should be same molecule (case insensitive)
         assert_eq!(assignments[0], assignments[1]);
@@ -1565,7 +1620,7 @@ mod tests {
     fn test_parallel_identity_empty() {
         let assigner = ParallelIdentityAssigner::new(2);
         let umis: Vec<String> = vec![];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert!(assignments.is_empty());
     }
 
@@ -1573,7 +1628,7 @@ mod tests {
     fn test_parallel_identity_single() {
         let assigner = ParallelIdentityAssigner::new(2);
         let umis: Vec<String> = vec!["ACGT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(assignments.len(), 1);
     }
 
@@ -1587,8 +1642,8 @@ mod tests {
         let assigner1 = ParallelIdentityAssigner::new(2);
         let assigner2 = ParallelIdentityAssigner::new(4);
 
-        let result1 = assigner1.assign(&umis);
-        let result2 = assigner2.assign(&umis);
+        let result1 = assigner1.assign(&umis).expect("assign should succeed");
+        let result2 = assigner2.assign(&umis).expect("assign should succeed");
 
         assert_same_groupings(&result1, &result2);
     }
@@ -1601,7 +1656,7 @@ mod tests {
         umis.extend(std::iter::repeat_n("TTTTTT".to_string(), 100));
         umis.extend(std::iter::repeat_n("CCCCCC".to_string(), 100));
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All AAAAAA should be same
         for i in 1..100 {
@@ -1625,7 +1680,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["AAAA", "AAAT", "TTTT"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // AAAA and AAAT should be same molecule (1 edit apart)
         assert_eq!(assignments[0], assignments[1]);
@@ -1639,7 +1694,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["AAAA", "AATT", "TTTT"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // AAAA and AATT should be same molecule (2 edits apart)
         assert_eq!(assignments[0], assignments[1]);
@@ -1655,7 +1710,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["AAAA", "AAAT", "AATT"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All should be same molecule due to transitivity
         assert_eq!(assignments[0], assignments[1]);
@@ -1666,7 +1721,7 @@ mod tests {
     fn test_parallel_edit_empty() {
         let assigner = ParallelEditAssigner::new(1, 2);
         let umis: Vec<String> = vec![];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert!(assignments.is_empty());
     }
 
@@ -1674,7 +1729,7 @@ mod tests {
     fn test_parallel_edit_single() {
         let assigner = ParallelEditAssigner::new(1, 2);
         let umis: Vec<String> = vec!["ACGT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(assignments.len(), 1);
     }
 
@@ -1704,17 +1759,17 @@ mod tests {
     ) {
         let assigner = make();
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        let first = assigner.assign(&umis);
+        let first = assigner.assign(&umis).expect("assign should succeed");
         // Advance the block cursor with an extra batch (no reset here).
-        let _ = assigner.assign(&umis);
+        let _ = assigner.assign(&umis).expect("assign should succeed");
         // Without reset, the reused assigner's ids drift past the first block —
         // guards against a no-op `reset()` making the equality below pass
         // trivially.
-        let reused = assigner.assign(&umis);
+        let reused = assigner.assign(&umis).expect("assign should succeed");
         assert_ne!(reused, first, "reused parallel assign without reset must advance ids");
         // reset() must restore the initial local numbering.
         assigner.reset();
-        let after_reset = assigner.assign(&umis);
+        let after_reset = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(
             after_reset, first,
             "reset() must restore local `0..k` molecule numbering for the parallel assigner"
@@ -1725,23 +1780,149 @@ mod tests {
     // mismatch-based assigner must reject them the same way rather than silently
     // under-group (tracker GRP-01), matching the sequential assigners.
     #[rstest]
-    #[case::edit(|| Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>, &["AAAA", "AAA"])]
+    #[case::edit(
+        || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
+        &["AAAA", "AAA"],
+        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+    )]
     #[case::adjacency(
         || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
-        &["AAAA", "AAA"]
+        &["AAAA", "AAA"],
+        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
     )]
     #[case::paired(
         || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
-        &["ACT-ACT", "ACT-AC"]
+        &["ACT-ACT", "ACT-AC"],
+        "Multiple UMI lengths: 5, 6"
     )]
-    #[should_panic(expected = "Multiple UMI lengths")]
     fn test_parallel_assigner_rejects_differing_umi_lengths(
         #[case] make: fn() -> Box<dyn UmiAssigner>,
         #[case] umis: &[&str],
+        #[case] expected: &str,
     ) {
         let assigner = make();
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        let _ = assigner.assign(&umis);
+        let err = assigner.assign(&umis).expect_err("differing UMI lengths must be an error");
+        assert_eq!(err.to_string(), expected);
+    }
+
+    /// A paired key with halves of `left` and `right` bases (distinct, deterministic bases), with
+    /// `group`'s orientation prefixes (`aa:`/`bb:`, as built for `--edits 1`) when `prefixed`.
+    /// `mutate` changes the first base of the left half, for a one-mismatch neighbour.
+    fn long_paired_umi(left: usize, right: usize, prefixed: bool, mutate: bool) -> Umi {
+        let mut l: String = "ACGT".chars().cycle().take(left).collect();
+        let r: String = "TTGCA".chars().cycle().take(right).collect();
+        if mutate {
+            l.replace_range(0..1, "G");
+        }
+        if prefixed { format!("aa:{l}-bb:{r}") } else { format!("{l}-{r}") }
+    }
+
+    /// `underlying_len` must accept and measure exactly what the sequential
+    /// `PairedUmiAssigner::underlying_umi_len` does (the cases of its
+    /// `test_underlying_umi_len_matches_bitenc`), plus pairs over 32 bases in total.
+    #[rstest]
+    #[case::clean("ACGT-TGCA", Some(8))]
+    #[case::prefixed("aa:ACGT-bb:TTTT", Some(8))]
+    #[case::prefixed_upper("AA:ACGT-BB:TTTT", Some(8))]
+    #[case::lowercase_bases("acgt-tgca", Some(8))]
+    #[case::uneven_halves("ACG-TTTTT", Some(8))]
+    #[case::invalid_n("ACGN-TTTT", None)]
+    #[case::invalid_iupac("ACGT-TTTR", None)]
+    #[case::empty_half("ACGT-", Some(4))]
+    #[case::exactly_32("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-CCCC", Some(36))]
+    #[case::over_32_rejected("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-CCCC", None)]
+    #[case::both_halves_32(
+        "aa:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-bb:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        Some(64)
+    )]
+    fn test_parallel_paired_underlying_len(#[case] key: &str, #[case] expected: Option<usize>) {
+        assert_eq!(ParallelPairedAssigner::underlying_len(key), expected);
+    }
+
+    /// Paired UMIs whose halves each fit in 32 bases but whose total does not fit in one
+    /// `BitEnc`: the parallel paired assigner must length-check them exactly like the sequential
+    /// one (which caps each half, not the pair), so the mixed-length error does not depend on
+    /// `--threads`.
+    #[rstest]
+    #[case::halves_17_17_vs_17_16(&[(17, 17), (17, 16)], "Multiple UMI lengths: 33, 34")]
+    #[case::halves_16_16_vs_17_16(&[(16, 16), (17, 16)], "Multiple UMI lengths: 32, 33")]
+    #[case::halves_18_18_vs_16_16(&[(18, 18), (16, 16)], "Multiple UMI lengths: 32, 36")]
+    #[case::halves_32_32_vs_32_31(&[(32, 32), (32, 31)], "Multiple UMI lengths: 63, 64")]
+    fn test_parallel_paired_long_umis_mixed_lengths_match_sequential(
+        #[case] halves: &[(usize, usize)],
+        #[case] expected: &str,
+        #[values(false, true)] prefixed: bool,
+    ) {
+        let umis: Vec<Umi> =
+            halves.iter().map(|&(l, r)| long_paired_umi(l, r, prefixed, false)).collect();
+        let sequential = PairedUmiAssigner::new(1).assign(&umis).expect_err("mixed lengths");
+        assert_eq!(sequential.to_string(), expected);
+        for threads in [1, 4] {
+            let parallel =
+                ParallelPairedAssigner::new(1, threads).assign(&umis).expect_err("mixed lengths");
+            assert_eq!(parallel.to_string(), expected, "threads={threads}");
+        }
+    }
+
+    /// Same-length paired UMIs over 32 bases in total (each half at most 32) are grouped, with
+    /// strands, exactly as the sequential assigner groups them: a one-mismatch neighbour joins
+    /// the molecule and the swapped spelling is its other strand. A half over 32 bases cannot be
+    /// encoded, so both assigners give each such distinct UMI its own molecule.
+    #[rstest]
+    #[case::halves_17_17(17, 17)]
+    #[case::halves_18_18(18, 18)]
+    #[case::halves_32_32(32, 32)]
+    #[case::asymmetric_20_13(20, 13)]
+    #[case::half_over_32(33, 8)]
+    fn test_parallel_paired_long_umis_group_like_sequential(
+        #[case] left: usize,
+        #[case] right: usize,
+        #[values(false, true)] prefixed: bool,
+    ) {
+        let swap = |umi: Umi| -> Umi {
+            let (a, b) = umi.split_once('-').expect("paired UMI");
+            format!("{b}-{a}")
+        };
+        let umis: Vec<Umi> = vec![
+            long_paired_umi(left, right, prefixed, false),
+            long_paired_umi(left, right, prefixed, false),
+            long_paired_umi(left, right, prefixed, false),
+            long_paired_umi(left, right, prefixed, true),
+            swap(long_paired_umi(left, right, prefixed, false)),
+        ];
+        let sequential = PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
+        if left <= 32 && right <= 32 {
+            // Every UMI is in one molecule, with the swapped spelling on the other strand.
+            assert!(
+                sequential.iter().all(|id| !matches!(id, MoleculeId::Single(_))),
+                "sequential should pair every UMI: {sequential:?}"
+            );
+            assert_eq!(
+                sequential.iter().filter_map(MoleculeId::id).collect::<AHashSet<_>>().len(),
+                1
+            );
+        }
+        for threads in [1, 4, 16] {
+            let parallel = ParallelPairedAssigner::new(1, threads)
+                .assign(&umis)
+                .expect("assign should succeed");
+            assert!(
+                assignments_equivalent(&sequential, &parallel),
+                "threads={threads}\n  umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
+            );
+        }
+    }
+
+    /// Parallel counterpart of the sequential `test_paired_fails_if_supplied_non_paired_umis`
+    /// (fgbio `GroupReadsByUmiTest.scala:189`, "fail if supplied non-paired UMIs"): a UMI
+    /// without exactly one `-` is an error, not a panic.
+    #[test]
+    fn test_parallel_paired_fails_if_supplied_non_paired_umis() {
+        let umis = vec!["AAAAAAAA".to_string(), "GGGGGGGG".to_string()];
+        let assigner = ParallelPairedAssigner::new(1, 2);
+        let err = assigner.assign(&umis).expect_err("non-paired UMIs must be an error");
+        assert_eq!(err.to_string(), "UMI AAAAAAAA is not a paired UMI");
     }
 
     // Complement to `test_parallel_assigner_rejects_differing_umi_lengths`: a non-encodable
@@ -1749,7 +1930,7 @@ mod tests {
     // differing-length guard. The parallel assigners never feed non-encodable UMIs into the
     // length check (they are dropped during graph construction), so the mixed valid/invalid
     // GRP-01 parity scenario groups the valid UMIs together and gives the invalid one its own
-    // molecule instead of panicking. This mirrors the sequential
+    // molecule instead of failing. This mirrors the sequential
     // `test_sequential_assigner_excludes_invalid_umis_from_length_guard` and guards against a
     // future refactor moving the guard ahead of the encoding filter and silently reintroducing
     // the parity break. Cross-assigner grouping parity for invalid UMIs is enforced separately
@@ -1780,8 +1961,8 @@ mod tests {
     ) {
         let assigner = make();
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        // Must not panic despite the invalid UMI having a different length.
-        let ids = assigner.assign(&umis);
+        // Must not fail despite the invalid UMI having a different length.
+        let ids = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(ids.len(), umis.len());
         assert_eq!(ids[0], ids[1], "identical valid UMIs must share a molecule");
         assert_ne!(ids[0], ids[2], "invalid-base UMI must not join the valid molecule");
@@ -1798,7 +1979,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["ACGT", "ACGT", "ACGT"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All identical UMIs should have same molecule ID
         assert_eq!(assignments[0], assignments[1]);
@@ -1817,7 +1998,7 @@ mod tests {
             "GGGGGGGG-CCCCCCCC".to_string(), // Different, should be separate
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // First three should be same molecule (identical or 1 edit)
         assert_eq!(assignments[0], assignments[1], "Identical paired UMIs should have same ID");
@@ -1839,7 +2020,7 @@ mod tests {
             "ACGTACGT-TGCATGCT".to_string(), // 1 edit
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // With adjacency (count-based), the result depends on counts
         // But at minimum, identical UMIs should be grouped
@@ -1852,7 +2033,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["ACGT", "acgt", "AcGt"].into_iter().map(String::from).collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All should be same molecule (case insensitive)
         assert_eq!(assignments[0], assignments[1]);
@@ -1876,7 +2057,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Valid UMIs group together.
         assert_eq!(assignments[0], assignments[2], "identical valid UMIs must share a molecule");
@@ -1898,7 +2079,7 @@ mod tests {
         let umis: Vec<String> =
             vec!["AAAA", "AAAA", "AAAT"].into_iter().map(String::from).collect(); // AAAA count=2, AAAT count=1
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // AAAT (count=1) should be captured by AAAA (count=2) since 1 <= 2/2+1 = 2
         assert_eq!(assignments[0], assignments[1]); // Same UMI
@@ -1921,7 +2102,7 @@ mod tests {
         .map(String::from)
         .collect();
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Same UMIs should be same molecule
         assert_eq!(assignments[0], assignments[1]);
@@ -1945,7 +2126,7 @@ mod tests {
         umis.extend(std::iter::repeat_n("AAAT".to_string(), 4));
         umis.extend(std::iter::repeat_n("AATT".to_string(), 1));
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All should be captured by AAAA
         let first_mol = assignments[0];
@@ -1971,8 +2152,8 @@ mod tests {
         .map(String::from)
         .collect();
 
-        let assignments1 = assigner.assign(&umis);
-        let assignments2 = assigner.assign(&umis);
+        let assignments1 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments2 = assigner.assign(&umis).expect("assign should succeed");
 
         // Should be deterministic. Compare the induced partition, not the raw ids:
         // successive `assign()` calls draw from disjoint id blocks by design (see
@@ -2039,8 +2220,8 @@ mod tests {
         let to_umis = |xs: &[&str]| -> Vec<Umi> { xs.iter().map(|s| (*s).to_string()).collect() };
         let assigner = make_assigner();
 
-        let first = assigner.assign(&to_umis(first_umis));
-        let second = assigner.assign(&to_umis(second_umis));
+        let first = assigner.assign(&to_umis(first_umis)).expect("assign should succeed");
+        let second = assigner.assign(&to_umis(second_umis)).expect("assign should succeed");
 
         let first_ids: AHashSet<u64> = first.iter().filter_map(MoleculeId::id).collect();
         let second_ids: AHashSet<u64> = second.iter().filter_map(MoleculeId::id).collect();
@@ -2139,8 +2320,11 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let sequential = crate::umi::AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
-        let parallel = ParallelAdjacencyAssigner::new(1, 2).assign(&umis);
+        let sequential = crate::umi::AdjacencyUmiAssigner::new(1, 1, 100)
+            .assign(&umis)
+            .expect("assign should succeed");
+        let parallel =
+            ParallelAdjacencyAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         assert!(
             same_partition(&sequential, &parallel),
@@ -2165,8 +2349,11 @@ mod tests {
         // positions (case-sensitive), so the sequential assigner would split them.
         let umis: Vec<String> = vec!["ACGT", "acgt"].into_iter().map(String::from).collect();
 
-        let sequential = crate::umi::SimpleErrorUmiAssigner::new(1).assign(&umis);
-        let parallel = ParallelEditAssigner::new(1, 2).assign(&umis);
+        let sequential = crate::umi::SimpleErrorUmiAssigner::new(1)
+            .assign(&umis)
+            .expect("assign should succeed");
+        let parallel =
+            ParallelEditAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         assert!(
             same_partition(&sequential, &parallel),
@@ -2190,8 +2377,10 @@ mod tests {
         let umis: Vec<String> =
             vec!["ACGT-TGCA", "acgt-tgca", "TGCA-ACGT"].into_iter().map(String::from).collect();
 
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
-        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
+        let parallel =
+            ParallelPairedAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         assert!(
             same_partition(&sequential, &parallel),
@@ -2257,10 +2446,10 @@ mod tests {
     // `BitEnc` cannot represent `N`, so fgumi isolates such a UMI instead. Both fgumi assigners
     // agree on that isolation, which is what this harness pins.
     //
-    // These inputs are rare but reachable: fgumi (like fgbio, GroupReadsByUmi.scala:673) filters
-    // only *uppercase* `N` UMIs upstream (`validate_umi` -> `discarded_ns_in_umi`), so a UMI with
-    // a lowercase `n` or a non-ACGT IUPAC base passes the filter (as it does in fgbio) and reaches
-    // `assign()` as non-encodable. The two implementations must therefore agree on it.
+    // These inputs are rare but reachable: fgumi (like fgbio) filters only `N`/`n` UMIs upstream
+    // (`validate_umi` -> `discarded_ns_in_umi`), so a UMI with a non-ACGT IUPAC base passes the
+    // filter (as it does in fgbio) and reaches `assign()` as non-encodable, as does any UMI handed
+    // to the assigners directly. The two implementations must therefore agree on it.
     //
     // `same_partition` compares grouping structure only, ignoring concrete `MoleculeId`
     // labels, so it is robust to the two assigners numbering molecules in different orders.
@@ -2358,8 +2547,8 @@ mod tests {
         #[case] umis: &[&str],
     ) {
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        let sequential = make_sequential().assign(&umis);
-        let parallel = make_parallel().assign(&umis);
+        let sequential = make_sequential().assign(&umis).expect("assign should succeed");
+        let parallel = make_parallel().assign(&umis).expect("assign should succeed");
 
         assert_eq!(sequential.len(), umis.len());
         assert_eq!(parallel.len(), umis.len());
@@ -2383,8 +2572,10 @@ mod tests {
         let umis: Vec<String> =
             vec!["CAAA-GTTT", "ATTT-CAAA"].into_iter().map(String::from).collect();
 
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
-        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
+        let parallel =
+            ParallelPairedAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         // Sanity: the sequential assigner groups them into one molecule.
         assert_eq!(
@@ -2420,9 +2611,12 @@ mod tests {
     #[case::mixed_case(&["aa:acgt-bb:TTTT", "bb:tttt-aa:ACGT"])]
     fn test_parallel_paired_prefixed_keys_match_sequential(#[case] umis: &[&str]) {
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
         for threads in [2usize, 4] {
-            let parallel = ParallelPairedAssigner::new(1, threads).assign(&umis);
+            let parallel = ParallelPairedAssigner::new(1, threads)
+                .assign(&umis)
+                .expect("assign should succeed");
             assert!(
                 assignments_equivalent(&sequential, &parallel),
                 "threads={threads}\n  umis:       {umis:?}\n  sequential: {sequential:?}\n  \
@@ -2448,8 +2642,10 @@ mod tests {
         #[case] umis: &[&str],
     ) {
         let umis: Vec<Umi> = umis.iter().map(|s| (*s).to_string()).collect();
-        let sequential = crate::umi::PairedUmiAssigner::new(edits).assign(&umis);
-        let parallel = ParallelPairedAssigner::new(edits, 2).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(edits).assign(&umis).expect("assign should succeed");
+        let parallel =
+            ParallelPairedAssigner::new(edits, 2).assign(&umis).expect("assign should succeed");
         assert!(
             assignments_equivalent(&sequential, &parallel),
             "umis: {umis:?}\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
@@ -2462,7 +2658,7 @@ mod tests {
     #[test]
     fn test_parallel_paired_prefixed_identical_halves_split_strands() {
         let umis: Vec<Umi> = vec!["aa:ACGT-bb:ACGT".to_string(), "bb:ACGT-aa:ACGT".to_string()];
-        let ids = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        let ids = ParallelPairedAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
         match (ids[0], ids[1]) {
             (MoleculeId::PairedA(a), MoleculeId::PairedB(b)) => assert_eq!(a, b, "{ids:?}"),
             _ => panic!("expected one molecule with /A then /B, got {ids:?}"),
@@ -2511,8 +2707,10 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
-        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
+        let parallel =
+            ParallelPairedAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         // Sanity: the sequential (fgbio-faithful) partition keeps `ACG-TA` (index 5)
         // separate from the `AC-GTT`/`AC-GTA` molecule (indices 0-4).
@@ -2556,8 +2754,10 @@ mod tests {
         let umis: Vec<String> =
             vec!["A-AC", "A-AC", "A-CT"].into_iter().map(String::from).collect();
 
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
-        let parallel = ParallelPairedAssigner::new(1, 2).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
+        let parallel =
+            ParallelPairedAssigner::new(1, 2).assign(&umis).expect("assign should succeed");
 
         // Sanity: sequentially `A-CT` (index 2) is its own molecule, distinct from the
         // `A-AC` pair (indices 0-1) -- no forward-encoding collision is involved.
@@ -2598,9 +2798,13 @@ mod tests {
         #[case] umis: &[&str],
     ) {
         let umis: Vec<String> = umis.iter().map(|s| String::from(*s)).collect();
-        let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+        let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches)
+            .assign(&umis)
+            .expect("assign should succeed");
         for threads in [1usize, 4, 16] {
-            let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+            let parallel = ParallelPairedAssigner::new(max_mismatches, threads)
+                .assign(&umis)
+                .expect("assign should succeed");
             assert!(
                 assignments_equivalent(&sequential, &parallel),
                 "threads={threads}\n  sequential: {sequential:?}\n  parallel:   {parallel:?}"
@@ -2635,9 +2839,12 @@ mod tests {
             umis.iter().map(|u| ParallelPairedAssigner::canonicalize(u)).collect();
         assert!(uniq.len() >= 100, "need >= 100 unique canonical forms, got {}", uniq.len());
 
-        let sequential = crate::umi::PairedUmiAssigner::new(1).assign(&umis);
+        let sequential =
+            crate::umi::PairedUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
         for threads in [1usize, 4, 16] {
-            let parallel = ParallelPairedAssigner::new(1, threads).assign(&umis);
+            let parallel = ParallelPairedAssigner::new(1, threads)
+                .assign(&umis)
+                .expect("assign should succeed");
             assert!(
                 assignments_equivalent(&sequential, &parallel),
                 "threads={threads}: parallel must match sequential on a >=100-unique \
@@ -2777,10 +2984,14 @@ mod tests {
 
         // Both the sequential assigner AND the parallel assigner (at multiple thread
         // counts) must reproduce the independent fgbio oracle at the case's threshold.
-        let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+        let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches)
+            .assign(&umis)
+            .expect("assign should succeed");
         assert_matches_fgbio_oracle(&sequential, expected);
         for threads in [1usize, 4, 16] {
-            let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+            let parallel = ParallelPairedAssigner::new(max_mismatches, threads)
+                .assign(&umis)
+                .expect("assign should succeed");
             assert_matches_fgbio_oracle(&parallel, expected);
         }
     }
@@ -2789,7 +3000,7 @@ mod tests {
     fn test_parallel_adjacency_empty() {
         let assigner = ParallelAdjacencyAssigner::new(1, 2);
         let umis: Vec<String> = vec![];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert!(assignments.is_empty());
     }
 
@@ -2797,7 +3008,7 @@ mod tests {
     fn test_parallel_adjacency_single() {
         let assigner = ParallelAdjacencyAssigner::new(1, 2);
         let umis: Vec<String> = vec!["ACGT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(assignments.len(), 1);
     }
 
@@ -2811,7 +3022,7 @@ mod tests {
             "CCCC-AAAA".to_string(), // Bottom strand (same molecule!)
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Both should be same base molecule but different strands
         match (&assignments[0], &assignments[1]) {
@@ -2830,7 +3041,7 @@ mod tests {
             "AAAT-CCCC".to_string(), // 1 error in first half
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // All should be same molecule (error corrected)
         let base_id = match &assignments[0] {
@@ -2891,7 +3102,7 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let parallel_result = parallel.assign(&umis);
+        let parallel_result = parallel.assign(&umis).expect("assign should succeed");
 
         // Verify expected groupings
         // AAAAAA-AAAAAT-AAAATT form a chain
@@ -2950,8 +3161,8 @@ mod tests {
         let assigner1 = ParallelEditAssigner::new(1, 4);
         let assigner2 = ParallelEditAssigner::new(1, 4);
 
-        let result1 = assigner1.assign(&umis);
-        let result2 = assigner2.assign(&umis);
+        let result1 = assigner1.assign(&umis).expect("assign should succeed");
+        let result2 = assigner2.assign(&umis).expect("assign should succeed");
 
         assert_same_groupings(&result1, &result2);
     }
@@ -2968,8 +3179,8 @@ mod tests {
         let assigner1 = ParallelAdjacencyAssigner::new(1, 4);
         let assigner2 = ParallelAdjacencyAssigner::new(1, 4);
 
-        let result1 = assigner1.assign(&umis);
-        let result2 = assigner2.assign(&umis);
+        let result1 = assigner1.assign(&umis).expect("assign should succeed");
+        let result2 = assigner2.assign(&umis).expect("assign should succeed");
 
         assert_same_groupings(&result1, &result2);
     }
@@ -3041,9 +3252,9 @@ mod tests {
                 max_mismatches in 1u32..=2,
             ) {
                 let umis = build_pool(&molecules, &reads);
-                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis).expect("assign should succeed");
                 for threads in [1usize, 4, 16] {
-                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&sequential, &parallel),
                         "max_mismatches={max_mismatches} threads={threads}\n  umis={umis:?}\n  \
@@ -3056,7 +3267,7 @@ mod tests {
                     // against: without that sort, a threshold-boundary assignment could
                     // differ between these two runs.
                     let parallel_again =
-                        ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                        ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&parallel, &parallel_again),
                         "same-thread nondeterminism: max_mismatches={max_mismatches} \
@@ -3108,9 +3319,9 @@ mod tests {
                 max_mismatches in 1u32..=2,
             ) {
                 let umis = prefix_pool(&build_pool(&molecules, &reads), &r1_earlier, max_mismatches);
-                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis).expect("assign should succeed");
                 for threads in [1usize, 4, 16] {
-                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&sequential, &parallel),
                         "prefixed: max_mismatches={max_mismatches} threads={threads}\n  \
@@ -3192,16 +3403,16 @@ mod tests {
                 max_mismatches in 1u32..=2,
             ) {
                 let umis = build_pool_asymmetric(total_bases, &molecules, &reads);
-                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis).expect("assign should succeed");
                 for threads in [1usize, 4, 16] {
-                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&sequential, &parallel),
                         "asymmetric: max_mismatches={max_mismatches} threads={threads}\n  \
                          umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
                     );
                     let parallel_again =
-                        ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                        ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&parallel, &parallel_again),
                         "asymmetric same-thread nondeterminism: max_mismatches={max_mismatches} \
@@ -3232,12 +3443,82 @@ mod tests {
             ) {
                 let pool = build_pool_asymmetric(total_bases, &molecules, &reads);
                 let umis = prefix_pool(&pool, &r1_earlier, max_mismatches);
-                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis);
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis).expect("assign should succeed");
                 for threads in [1usize, 4, 16] {
-                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis);
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
                     prop_assert!(
                         assignments_equivalent(&sequential, &parallel),
                         "prefixed asymmetric: max_mismatches={max_mismatches} threads={threads}\n  \
+                         umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
+                    );
+                }
+            }
+        }
+
+        /// Build a pool of SYMMETRIC paired UMIs whose halves are `half_len` bases each, so the
+        /// pair does not fit in one 2-bit `BitEnc` (over 32 bases) once `half_len` exceeds 16.
+        /// Each half cycles its molecule's random bases; a read may change one base.
+        fn build_pool_long(
+            half_len: usize,
+            molecules: &[(Vec<u8>, Vec<u8>)],
+            reads: &[(usize, bool, Option<usize>)],
+        ) -> Vec<String> {
+            let half = |v: &[u8]| -> String {
+                (0..half_len).map(|i| BASES[v[i % v.len()] as usize]).collect()
+            };
+            let mols: Vec<(String, String)> =
+                molecules.iter().map(|(l, r)| (half(l), half(r))).collect();
+            reads
+                .iter()
+                .map(|&(mi, reversed, mutate)| {
+                    let (l, r) = &mols[mi % mols.len()];
+                    let mut chars: Vec<char> = if reversed {
+                        format!("{r}-{l}").chars().collect()
+                    } else {
+                        format!("{l}-{r}").chars().collect()
+                    };
+                    if let Some(ord) = mutate {
+                        // Mutate the `ord`-th base, skipping the dash.
+                        let base = ord % (2 * half_len);
+                        let idx = if base < half_len { base } else { base + 1 };
+                        let ci = BASES.iter().position(|&c| c == chars[idx]).unwrap_or(0);
+                        chars[idx] = BASES[(ci + 1) % 4];
+                    }
+                    chars.into_iter().collect()
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+            /// Parallel-vs-sequential PAIRED parity on paired UMIs longer than 32 bases in total
+            /// (each half at most 32), plain and with `group`'s orientation prefixes: these keys
+            /// do not fit in one `BitEnc`, so the parallel assigner must still group them, with
+            /// strands, exactly as the sequential assigner does rather than isolate them.
+            #[test]
+            fn prop_parallel_paired_long_matches_sequential(
+                half_len in 17usize..=32,
+                molecules in prop::collection::vec(
+                    (prop::collection::vec(0u8..4, 1..=8), prop::collection::vec(0u8..4, 1..=8)),
+                    1..=5,
+                ),
+                reads in prop::collection::vec(
+                    (0usize..5, any::<bool>(), prop::option::of(0usize..64)),
+                    1..=24,
+                ),
+                r1_earlier in prop::collection::vec(any::<bool>(), 1..=24),
+                max_mismatches in 1u32..=2,
+                prefixed in any::<bool>(),
+            ) {
+                let pool = build_pool_long(half_len, &molecules, &reads);
+                let umis =
+                    if prefixed { prefix_pool(&pool, &r1_earlier, max_mismatches) } else { pool };
+                let sequential = crate::umi::PairedUmiAssigner::new(max_mismatches).assign(&umis).expect("assign should succeed");
+                for threads in [1usize, 4] {
+                    let parallel = ParallelPairedAssigner::new(max_mismatches, threads).assign(&umis).expect("assign should succeed");
+                    prop_assert!(
+                        assignments_equivalent(&sequential, &parallel),
+                        "long: max_mismatches={max_mismatches} threads={threads}\n  \
                          umis={umis:?}\n  seq={sequential:?}\n  par={parallel:?}"
                     );
                 }

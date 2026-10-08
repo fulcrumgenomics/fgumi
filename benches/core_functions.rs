@@ -291,7 +291,8 @@ fn bench_adjacency_assigner(c: &mut Criterion) {
             |b, umis| {
                 let assigner = Strategy::Adjacency.new_assigner(1);
                 b.iter(|| {
-                    let result = assigner.assign(black_box(&umis.clone()));
+                    let result =
+                        assigner.assign(black_box(&umis.clone())).expect("assign should succeed");
                     black_box(result)
                 });
             },

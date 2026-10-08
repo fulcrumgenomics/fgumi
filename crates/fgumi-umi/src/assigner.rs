@@ -134,12 +134,13 @@
 //!     "ACTT".to_string(),  // Different - will not group with first
 //! ];
 //!
-//! let assignments = assigner.assign(&umis);
+//! let assignments = assigner.assign(&umis)?;
 //! // Returns a HashMap mapping each input UMI to its molecule ID
 //! // Two ACGT UMIs map to one ID, one ACTT UMI maps to a different ID
 //! use std::collections::HashSet;
 //! let unique_ids: HashSet<_> = assignments.iter().collect();
 //! assert_eq!(unique_ids.len(), 2); // Two unique molecule IDs
+//! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
 //! ### Error-Tolerant Assignment - Adjacency Strategy
@@ -157,10 +158,11 @@
 //!     "ACTT".to_string(),  // 1 mismatch from ACGT, low abundance
 //! ];
 //!
-//! let assignments = assigner.assign(&umis);
+//! let assignments = assigner.assign(&umis)?;
 //! // ACGT appears 3 times, ACTT appears 1 time
 //! // Since 1 < 3/2 + 1 = 2.5, ACTT will be captured by ACGT
 //! // All reads get the same molecule ID
+//! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
 //! ### Paired UMI Assignment - Duplex Sequencing
@@ -176,11 +178,12 @@
 //!     "CCCC-AAAA".to_string(),  // Bottom strand read (same molecule!)
 //! ];
 //!
-//! let assignments = assigner.assign(&umis);
+//! let assignments = assigner.assign(&umis)?;
 //! // Both UMIs get same base molecule ID but different suffixes:
 //! // "AAAA-CCCC" -> "0/A"
 //! // "CCCC-AAAA" -> "0/B"
 //! // This enables separate consensus calling per strand before duplex consensus
+//! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
 //! ## Performance Characteristics
@@ -222,7 +225,7 @@
 //!   are tagged with dual UMIs and you need strand-aware consensus calling.
 
 use ahash::AHashMap;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::any::Any;
@@ -742,7 +745,7 @@ pub fn count_mismatches(a: &str, b: &str) -> usize {
     a.as_bytes().iter().zip(b.as_bytes()).filter(|(x, y)| x != y).count()
 }
 
-/// Assert that every UMI in a position group shares the same length.
+/// Check that every UMI in a position group shares the same length.
 ///
 /// Mirrors fgbio's `require(orderedNodes.forall(_.umi.length == umiLength),
 /// "Multiple UMI lengths: ...")` in `GroupReadsByUmi` (and the `require` in
@@ -755,20 +758,39 @@ pub fn count_mismatches(a: &str, b: &str) -> usize {
 /// `lengths` are base counts (dashes in paired UMIs excluded). For the
 /// single-dash paired UMIs the `Paired` strategy enforces, the base count
 /// differs iff the full `A-B` string length differs, so this matches fgbio's
-/// string-length check.
+/// string-length check. Assigners that skip invalid UMIs should pass only the
+/// retained (encodable) UMIs' lengths, so the guard mirrors fgbio's per-group
+/// check over the UMIs it actually groups.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics with `"Multiple UMI lengths: {len} vs {expected}"` on the first UMI
-/// whose length differs from the first UMI's length. Assigners that skip
-/// invalid UMIs should pass only the retained (encodable) UMIs' lengths, so the
-/// guard mirrors fgbio's per-group check over the UMIs it actually groups.
-pub fn assert_uniform_umi_length(lengths: impl IntoIterator<Item = usize>) {
+/// Returns `"Multiple UMI lengths: {lengths}"` if any length differs from the
+/// first, where `{lengths}` lists every distinct length in ascending order (e.g.
+/// `"Multiple UMI lengths: 5, 6"`), so the message does not depend on the order
+/// the UMIs were counted in.
+pub fn check_uniform_umi_length(lengths: impl IntoIterator<Item = usize>) -> Result<()> {
     let mut lengths = lengths.into_iter();
-    let Some(expected) = lengths.next() else { return };
-    for len in lengths {
-        assert!(len == expected, "Multiple UMI lengths: {len} vs {expected}");
-    }
+    let Some(expected) = lengths.next() else { return Ok(()) };
+    let Some(differing) = lengths.by_ref().find(|&len| len != expected) else { return Ok(()) };
+    let distinct: BTreeSet<usize> = [expected, differing].into_iter().chain(lengths).collect();
+    let listed: Vec<String> = distinct.iter().map(ToString::to_string).collect();
+    bail!("Multiple UMI lengths: {}", listed.join(", "))
+}
+
+/// Hint appended to the mixed-length error for the single-UMI strategies (edit, adjacency).
+pub const MIN_UMI_LENGTH_HINT: &str = "(use --min-umi-length to truncate UMIs to a common length)";
+
+/// [`check_uniform_umi_length`] for the single-UMI strategies (edit, adjacency).
+///
+/// The message starts with fgbio's `"Multiple UMI lengths: ..."` wording and ends with
+/// [`MIN_UMI_LENGTH_HINT`]. The paired strategy calls [`check_uniform_umi_length`] directly,
+/// because `group` and `dedup` reject `--min-umi-length` for it.
+///
+/// # Errors
+///
+/// Returns `"Multiple UMI lengths: {lengths} {MIN_UMI_LENGTH_HINT}"` if any length differs.
+pub fn check_uniform_single_umi_length(lengths: impl IntoIterator<Item = usize>) -> Result<()> {
+    check_uniform_umi_length(lengths).map_err(|e| anyhow::anyhow!("{e} {MIN_UMI_LENGTH_HINT}"))
 }
 
 /// Build the per-input `MoleculeId` vector, resolving each raw UMI with `resolve` and falling
@@ -903,8 +925,15 @@ pub trait UmiAssigner: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Vec<MoleculeId>` where `result[i]` is the assignment for `raw_umis[i]`.
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId>;
+    /// `Ok(Vec<MoleculeId>)` where `result[i]` is the assignment for `raw_umis[i]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UMIs cannot be grouped together, e.g. when a
+    /// mismatch-based strategy is given UMIs of differing lengths (see
+    /// [`check_uniform_umi_length`]) or the paired strategy is given a UMI
+    /// without exactly one `-`.
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>>;
 
     /// Reset any internal per-run state (e.g. a monotonic molecule-id counter)
     /// so the assigner can be reused across batches within one chain run.
@@ -959,6 +988,17 @@ pub trait UmiAssigner: Send + Sync {
     /// `true` if templates should be split by orientation, `false` otherwise.
     fn split_templates_by_pair_orientation(&self) -> bool {
         true
+    }
+
+    /// Whether this assigner groups only identical UMIs: the identity strategy, or a
+    /// mismatch-based single-UMI strategy with zero edits.
+    ///
+    /// With `--min-umi-length`, `group` and `dedup` split such an assigner's UMIs by their
+    /// first `--min-umi-length` bases and truncate each split on its own, matching fgbio's
+    /// `GroupReadsByUmi.assignUmiGroups`. Default `false`. The paired strategy keeps the
+    /// default because it rejects `--min-umi-length`.
+    fn groups_identical_umis_only(&self) -> bool {
+        false
     }
 
     /// Downcast to concrete type (for pattern matching)
@@ -1019,9 +1059,13 @@ impl UmiAssigner for IdentityUmiAssigner {
         self.counter.store(0, Ordering::SeqCst);
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn groups_identical_umis_only(&self) -> bool {
+        true
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Uppercase each UMI once and collect unique canonicals
@@ -1039,7 +1083,7 @@ impl UmiAssigner for IdentityUmiAssigner {
             .collect();
 
         // Build result Vec indexed by input position
-        canonicals.iter().map(|c| canonical_to_id[c.as_str()]).collect()
+        Ok(canonicals.iter().map(|c| canonical_to_id[c.as_str()]).collect())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1281,9 +1325,13 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         self.counter.store(0, Ordering::SeqCst);
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn groups_identical_umis_only(&self) -> bool {
+        self.max_mismatches == 0
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Match case-insensitively, consistent with the parallel edit assigner (which
@@ -1297,13 +1345,15 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         let encodings: Vec<Option<BitEnc>> =
             upper_umis.iter().map(|umi| BitEnc::from_umi_str(umi)).collect();
 
-        // Reject differing-length UMIs the way fgbio does (see assert_uniform_umi_length),
+        // Reject differing-length UMIs the way fgbio does (see check_uniform_umi_length),
         // but only over the BitEnc-encodable UMIs — the same set the parallel edit assigner
         // length-checks (it drops non-encodable UMIs before its guard). Without this filter,
-        // mixed valid/invalid input such as ["AAAA", "NNN"] panics here on differing lengths
+        // mixed valid/invalid input such as ["AAAA", "NNN"] fails here on differing lengths
         // while the parallel path silently continues on the valid subset (GRP-01 parity).
         // Genuinely differing-length *valid* UMIs (e.g. ["AAAA", "CCC"]) still trip the guard.
-        assert_uniform_umi_length(encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())));
+        check_uniform_single_umi_length(
+            encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())),
+        )?;
 
         // Group the distinct UMIs into connected components under the
         // "within `max_mismatches`" relation, in a single pass over the records.
@@ -1439,11 +1489,11 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         // absent from `umi_to_id`; each distinct invalid string gets its own molecule (see
         // `assign_with_invalid_fallback`). Invalid UMIs never join a valid molecule because they
         // were excluded from matching above.
-        assign_with_invalid_fallback(
+        Ok(assign_with_invalid_fallback(
             &upper_umis,
             |_, umi| umi_to_id.get(umi).copied(),
             || MoleculeId::Single(self.next_id()),
-        )
+        ))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1954,9 +2004,13 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         self.counter.store(0, Ordering::SeqCst);
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn groups_identical_umis_only(&self) -> bool {
+        self.max_mismatches == 0
+    }
+
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Profiling: track time spent in each phase
@@ -2001,11 +2055,11 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Handle case where all UMIs had invalid characters: give each distinct invalid string
         // its own molecule (see `assign_with_invalid_fallback`).
         if umi_counts.is_empty() {
-            return assign_with_invalid_fallback(
+            return Ok(assign_with_invalid_fallback(
                 raw_umis,
                 |_, _| None,
                 || MoleculeId::Single(self.next_id()),
-            );
+            ));
         }
 
         #[cfg(feature = "profile-adjacency")]
@@ -2041,16 +2095,16 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             // (non-encodable) UMI gets its own instead (see `assign_with_invalid_fallback`).
             // Without this guard the fast path would tag an invalid UMI (e.g. one that bypassed
             // the upstream N filter) as part of the real molecule.
-            return assign_with_invalid_fallback(
+            return Ok(assign_with_invalid_fallback(
                 raw_umis,
                 |idx, _| encodings[idx].is_some().then_some(id),
                 || MoleculeId::Single(self.next_id()),
-            );
+            ));
         }
 
-        // Reject differing-length UMIs the way fgbio does (see assert_uniform_umi_length).
+        // Reject differing-length UMIs the way fgbio does (see check_uniform_umi_length).
         // `BitEnc::len` is the base count (dashes excluded), so this checks base length.
-        assert_uniform_umi_length(umi_counts.iter().map(|(enc, _, _)| enc.len()));
+        check_uniform_single_umi_length(umi_counts.iter().map(|(enc, _, _)| enc.len()))?;
 
         // Build adjacency graph using BitEnc-based matching
         let (nodes, roots) = self.build_adjacency_graph_bitenc(&umi_counts, raw_umis);
@@ -2103,7 +2157,7 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             );
         }
 
-        result
+        Ok(result)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2243,11 +2297,11 @@ impl PairedUmiAssigner {
     /// dash-delimited half is the text after the last `:` (and the whole half when no prefix
     /// was added, e.g. the clean UMIs the unit tests and the cross-assigner parity harness
     /// pass). Returns the summed base count of both halves (dashes excluded) when every base of
-    /// both halves is `ACGT`, matching the `BitEnc::len` the parallel paired assigner checks.
+    /// both halves is `ACGT` and neither half exceeds 32 bases.
     ///
-    /// This keeps the sequential paired assigner's invalid-UMI handling and differing-length
-    /// guard in agreement with the parallel paired assigner, which drops non-encodable UMIs
-    /// before grouping. Without stripping the prefix, every production key (which always carries
+    /// The parallel paired assigner applies the same rule, so both assigners group and
+    /// length-check the same UMIs. A pair over 32 bases in total passes it even though it has no
+    /// single `BitEnc` encoding. Without stripping the prefix, every production key (which always carries
     /// a `:`) would read as non-encodable, so a whole-key `BitEnc` check would either isolate
     /// every molecule (as a filter) or never fire (as the length guard).
     fn underlying_umi_len(key: &str) -> Option<usize> {
@@ -2514,9 +2568,9 @@ impl UmiAssigner for PairedUmiAssigner {
         self.adjacency.reset();
     }
 
-    fn assign(&self, raw_umis: &[Umi]) -> Vec<MoleculeId> {
+    fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Validate all are paired UMIs (exactly one '-'). Locate the first '-' and confirm no
@@ -2524,13 +2578,13 @@ impl UmiAssigner for PairedUmiAssigner {
         // on this per-UMI hot path.
         for umi in raw_umis {
             let bytes = umi.as_bytes();
-            assert!(
-                bytes
-                    .iter()
-                    .position(|&b| b == b'-')
-                    .is_some_and(|pos| !bytes[pos + 1..].contains(&b'-')),
-                "UMI {umi} is not a paired UMI"
-            );
+            let is_paired = bytes
+                .iter()
+                .position(|&b| b == b'-')
+                .is_some_and(|pos| !bytes[pos + 1..].contains(&b'-'));
+            if !is_paired {
+                bail!("UMI {umi} is not a paired UMI");
+            }
         }
 
         // Work on uppercased UMIs so counting, matching, and strand assignment are all
@@ -2577,22 +2631,21 @@ impl UmiAssigner for PairedUmiAssigner {
         // parallel paired assigner's `all_invalid_molecule_ids` and the other sequential
         // assigners' all-invalid branch.
         if umi_counts.is_empty() {
-            return assign_with_invalid_fallback(
+            return Ok(assign_with_invalid_fallback(
                 upper_umis,
                 |_, _| None,
                 || MoleculeId::Single(self.adjacency.next_id()),
-            );
+            ));
         }
 
-        // Reject differing-length paired UMIs the way fgbio does (see assert_uniform_umi_length),
-        // over the retained (encodable-underlying) UMIs — the same set the parallel paired
-        // assigner length-checks (it drops non-encodable UMIs before its guard). `underlying_umi_len`
-        // is the summed base count of both halves (dashes and the orientation prefix excluded),
-        // matching `BitEnc::len`. Because it strips the prefix, this guard now also fires on the
-        // prefixed production keys (a whole-key `BitEnc::from_umi_str` returned `None` for them, so
-        // the guard was previously a silent no-op in production). Genuinely differing-length *valid*
-        // paired UMIs still trip the guard.
-        assert_uniform_umi_length(umi_counts.iter().filter_map(|(_, _, len)| *len));
+        // Reject differing-length paired UMIs the way fgbio does (see check_uniform_umi_length),
+        // over the retained (encodable-underlying) UMIs. `underlying_umi_len` is the summed base
+        // count of both halves (dashes and the orientation prefix excluded), with each half capped
+        // at 32 bases, as in the parallel paired assigner. Because it strips the prefix, this
+        // guard also fires on the prefixed production keys (a whole-key `BitEnc::from_umi_str`
+        // returned `None` for them, so the guard was previously a silent no-op in production).
+        // Genuinely differing-length *valid* paired UMIs still trip the guard.
+        check_uniform_umi_length(umi_counts.iter().filter_map(|(_, _, len)| *len))?;
 
         if umi_counts.len() == 1 {
             let id = self.adjacency.next_id();
@@ -2602,7 +2655,7 @@ impl UmiAssigner for PairedUmiAssigner {
             // Only the single valid molecule's UMIs get a strand; each distinct invalid
             // (non-encodable) UMI gets its own `Single` (see `assign_with_invalid_fallback`),
             // matching the parallel paired assigner. Strand is by the UMI's own orientation.
-            return assign_with_invalid_fallback(
+            return Ok(assign_with_invalid_fallback(
                 upper_umis,
                 |idx, umi| {
                     underlying[idx]
@@ -2610,7 +2663,7 @@ impl UmiAssigner for PairedUmiAssigner {
                         .then(|| if Self::orientation_is_ab(umi) { ab } else { ba })
                 },
                 || MoleculeId::Single(self.adjacency.next_id()),
-            );
+            ));
         }
 
         // Build adjacency graph using the shared helper with our paired matcher
@@ -2660,11 +2713,11 @@ impl UmiAssigner for PairedUmiAssigner {
         // Build result Vec indexed by input position. Each distinct invalid (non-encodable) UMI
         // gets its own molecule (see `assign_with_invalid_fallback`), matching the parallel
         // paired assigner. An unencodable UMI has no valid strand, so it is a plain `Single`.
-        assign_with_invalid_fallback(
+        Ok(assign_with_invalid_fallback(
             upper_umis,
             |_, umi| umi_to_id.get(umi).copied(),
             || MoleculeId::Single(self.adjacency.next_id()),
-        )
+        ))
     }
 
     fn is_same_umi(&self, a: &str, b: &str) -> bool {
@@ -2780,7 +2833,7 @@ mod tests {
     /// The number of UMI bases in a (possibly paired) UMI string, excluding the
     /// `-` segment delimiter. Matches `BitEnc::len` for BitEnc-encoded UMIs
     /// (which also skips dashes), so string- and BitEnc-based assigners compute
-    /// the same length for `assert_uniform_umi_length`. Test-only reference for
+    /// the same length for `check_uniform_umi_length`. Test-only reference for
     /// that equivalence; production code length-checks via `BitEnc::len`.
     fn base_umi_length(umi: &str) -> usize {
         umi.bytes().filter(|&b| b != b'-').count()
@@ -2800,17 +2853,20 @@ mod tests {
     #[case::empty(vec![])]
     #[case::single(vec![4])]
     #[case::all_equal(vec![6, 6, 6])]
-    fn test_assert_uniform_umi_length_ok(#[case] lengths: Vec<usize>) {
-        // Should not panic when lengths are absent or uniform.
-        assert_uniform_umi_length(lengths);
+    fn test_check_uniform_umi_length_ok(#[case] lengths: Vec<usize>) {
+        check_uniform_umi_length(lengths).expect("absent or uniform lengths must pass");
     }
 
+    /// The error lists every distinct length in ascending order, so it does not depend on the
+    /// order the lengths arrive in (assigners feed them from hash-map iteration).
     #[rstest]
-    #[case::second_differs(vec![6, 5])]
-    #[case::later_differs(vec![6, 6, 5])]
-    #[should_panic(expected = "Multiple UMI lengths")]
-    fn test_assert_uniform_umi_length_panics(#[case] lengths: Vec<usize>) {
-        assert_uniform_umi_length(lengths);
+    #[case::second_differs(vec![6, 5], "Multiple UMI lengths: 5, 6")]
+    #[case::later_differs(vec![6, 6, 5], "Multiple UMI lengths: 5, 6")]
+    #[case::shorter_first(vec![5, 6], "Multiple UMI lengths: 5, 6")]
+    #[case::three_lengths(vec![4, 4, 6, 5, 4], "Multiple UMI lengths: 4, 5, 6")]
+    fn test_check_uniform_umi_length_errors(#[case] lengths: Vec<usize>, #[case] expected: &str) {
+        let err = check_uniform_umi_length(lengths).expect_err("differing lengths must fail");
+        assert_eq!(err.to_string(), expected);
     }
 
     /// fgbio's `GroupReadsByUmi` throws on UMIs of differing length
@@ -2820,16 +2876,29 @@ mod tests {
     /// (tracker GRP-01). `Identity` groups by exact match and has no length
     /// constraint, matching fgbio's identity assigner.
     #[rstest]
-    #[case::edit(crate::assigner::Strategy::Edit, vec!["AAAA".to_string(), "AAA".to_string()])]
-    #[case::adjacency(crate::assigner::Strategy::Adjacency, vec!["AAAA".to_string(), "AAA".to_string()])]
-    #[case::paired(crate::assigner::Strategy::Paired, vec!["ACT-ACT".to_string(), "ACT-AC".to_string()])]
-    #[should_panic(expected = "Multiple UMI lengths")]
+    #[case::edit(
+        crate::assigner::Strategy::Edit,
+        vec!["AAAA".to_string(), "AAA".to_string()],
+        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+    )]
+    #[case::adjacency(
+        crate::assigner::Strategy::Adjacency,
+        vec!["AAAA".to_string(), "AAA".to_string()],
+        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+    )]
+    #[case::paired(
+        crate::assigner::Strategy::Paired,
+        vec!["ACT-ACT".to_string(), "ACT-AC".to_string()],
+        "Multiple UMI lengths: 5, 6"
+    )]
     fn test_sequential_assigner_rejects_differing_umi_lengths(
         #[case] strategy: crate::assigner::Strategy,
         #[case] umis: Vec<Umi>,
+        #[case] expected: &str,
     ) {
         let assigner = strategy.new_assigner_full(1, 1, 100);
-        let _ = assigner.assign(&umis);
+        let err = assigner.assign(&umis).expect_err("differing UMI lengths must be an error");
+        assert_eq!(err.to_string(), expected);
     }
 
     /// GRP-01 parity: a non-`BitEnc`-encodable UMI (invalid bases) whose base length differs
@@ -2839,8 +2908,8 @@ mod tests {
     /// parallel assigner, and enforced by the cross-assigner parity harness
     /// `test_sequential_and_parallel_assigners_induce_same_partition`. Before this fix the
     /// sequential `Edit`/`Paired` paths panicked on `["AAAA", "NNN"]`-style input while the
-    /// parallel paths continued on the valid subset. Differing-length *valid* UMIs still panic
-    /// (see `test_sequential_assigner_rejects_differing_umi_lengths`).
+    /// parallel paths continued on the valid subset. Differing-length *valid* UMIs are still an
+    /// error (see `test_sequential_assigner_rejects_differing_umi_lengths`).
     ///
     /// Scoped to the `Edit` and `Paired` sequential paths this fix touched; the `Adjacency`
     /// path already length-checks over the encoded (encodable-only) set.
@@ -2869,9 +2938,9 @@ mod tests {
         #[case] strategy: crate::assigner::Strategy,
         #[case] umis: Vec<Umi>,
     ) {
-        // Must not panic on the mixed valid/invalid, differing-length input.
+        // Must not fail on the mixed valid/invalid, differing-length input.
         let assigner = strategy.new_assigner_full(1, 1, 100);
-        let ids = assigner.assign(&umis);
+        let ids = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(ids.len(), umis.len());
         // The two identical valid UMIs share a molecule; the invalid UMI gets its own.
         assert_eq!(ids[0], ids[1], "identical valid UMIs must share a molecule");
@@ -2920,18 +2989,18 @@ mod tests {
         #[case] umis: Vec<Umi>,
     ) {
         let assigner = strategy.new_assigner_full(edits, 1, 100);
-        let first = assigner.assign(&umis);
+        let first = assigner.assign(&umis).expect("assign should succeed");
         // Advance the internal counter with an extra batch (no reset here).
-        let _ = assigner.assign(&umis);
+        let _ = assigner.assign(&umis).expect("assign should succeed");
         // Without reset, the reused assigner's ids drift past the first block —
         // this guards against a no-op `reset()` making the assertion below pass
         // trivially.
-        let reused = assigner.assign(&umis);
+        let reused = assigner.assign(&umis).expect("assign should succeed");
         assert_ne!(reused, first, "reused assign without reset must advance ids for {strategy:?}");
         // reset() must restore the initial local numbering, so a reused
         // (reset) assigner is byte-identical to a fresh one per group.
         assigner.reset();
-        let after_reset = assigner.assign(&umis);
+        let after_reset = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(
             after_reset, first,
             "reset() must restore local `0..k` molecule numbering for {strategy:?}"
@@ -2953,7 +3022,7 @@ mod tests {
             "AAAAAA".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Count unique IDs
         let unique_ids: HashSet<_> = assignments.iter().collect();
@@ -2971,7 +3040,7 @@ mod tests {
             "AAAAAA".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let groups = group_assignments(&umis, &assignments, false);
 
         // Should create 3 groups: {AAAAAA}, {AAAAAT}, {ACGTAC}
@@ -3185,7 +3254,7 @@ mod tests {
         #[values(1, 2)] edits: u32,
     ) {
         let umis = umis_with_distinct(target_distinct, 8, 0x51ED ^ target_distinct as u64);
-        let ids = SimpleErrorUmiAssigner::new(edits).assign(&umis);
+        let ids = SimpleErrorUmiAssigner::new(edits).assign(&umis).expect("assign should succeed");
         assert_eq!(
             partition_from_ids(&umis, &ids),
             brute_force_components(&umis, edits),
@@ -3198,7 +3267,7 @@ mod tests {
     #[test]
     fn test_edit_ids_are_dense_and_ordered_by_group_minimum() {
         let umis = umis_with_distinct(300, 8, 0xA11CE);
-        let ids = SimpleErrorUmiAssigner::new(1).assign(&umis);
+        let ids = SimpleErrorUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
 
         let mut first_id_by_group_min: Vec<(Umi, String)> = Vec::new();
         let mut distinct_ids = std::collections::HashSet::new();
@@ -3261,7 +3330,7 @@ mod tests {
     #[case::n_containing(&["AAAAAAAA", "AAAAAAAN", "AAAAAAAC", "NNNNNNNN"])]
     fn test_edit_index_matches_scan(#[case] interesting: &[&str]) {
         let max_mismatches = 1;
-        // Filler shares the UMI length so `assert_uniform_umi_length` is happy,
+        // Filler shares the UMI length so `check_uniform_umi_length` is happy,
         // and is far from the interesting UMIs so it forms its own components.
         let mut umis: Vec<Umi> = interesting.iter().map(|u| (*u).to_string()).collect();
         umis.extend(umis_with_distinct(MERGE_DEFER_POINT * 2, 8, 0xF11E7));
@@ -3279,10 +3348,12 @@ mod tests {
             max_mismatches,
             IndexThreshold::Always,
         )
-        .assign(&umis);
+        .assign(&umis)
+        .expect("assign should succeed");
         let scanned =
             SimpleErrorUmiAssigner::new_with_index_threshold(max_mismatches, IndexThreshold::Never)
-                .assign(&umis);
+                .assign(&umis)
+                .expect("assign should succeed");
         assert_eq!(indexed, scanned, "index/scan divergence at {max_mismatches} mismatch(es)");
     }
 
@@ -3307,7 +3378,9 @@ mod tests {
         let plain: Vec<Umi> = umis_with_distinct(MERGE_DEFER_POINT, 8, 0xBEEF);
         let umis: Vec<Umi> = dashed.into_iter().chain(plain).collect();
 
-        let ids = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0).assign(&umis);
+        let ids = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0)
+            .assign(&umis)
+            .expect("assign should succeed");
         assert_eq!(partition_from_ids(&umis, &ids), brute_force_components(&umis, 1));
     }
 
@@ -3347,7 +3420,7 @@ mod tests {
             "case must reach EDIT_INDEX_THRESHOLD or the index is never attempted"
         );
 
-        let ids = SimpleErrorUmiAssigner::new(1).assign(&umis);
+        let ids = SimpleErrorUmiAssigner::new(1).assign(&umis).expect("assign should succeed");
         assert_eq!(partition_from_ids(&umis, &ids), brute_force_components(&umis, 1));
     }
 
@@ -3376,8 +3449,12 @@ mod tests {
             umis.push(String::from_utf8(neighbour).expect("ASCII"));
         }
 
-        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0).assign(&umis);
-        let scanned = SimpleErrorUmiAssigner::new_with_index_threshold(1, usize::MAX).assign(&umis);
+        let indexed = SimpleErrorUmiAssigner::new_with_index_threshold(1, 0)
+            .assign(&umis)
+            .expect("assign should succeed");
+        let scanned = SimpleErrorUmiAssigner::new_with_index_threshold(1, usize::MAX)
+            .assign(&umis)
+            .expect("assign should succeed");
         assert_eq!(indexed, scanned);
         // Sanity: the input really does form non-trivial components.
         let distinct_ids: std::collections::HashSet<_> = indexed.iter().collect();
@@ -3399,7 +3476,7 @@ mod tests {
             "GGCGGC".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Should create 3 groups
         let unique_ids: HashSet<_> = assignments.iter().collect();
@@ -3421,7 +3498,7 @@ mod tests {
             "GGCGGC".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let groups = group_assignments(&umis, &assignments, false);
 
         // Should create 3 groups
@@ -3455,7 +3532,7 @@ mod tests {
             "GGCGGC".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let groups = group_assignments(&umis, &assignments, false);
 
         // With edits=6, everything should be in one group
@@ -3466,7 +3543,7 @@ mod tests {
     fn test_simple_error_with_zero_edits() {
         let assigner = SimpleErrorUmiAssigner::new(0);
         let umis = vec!["AAAAAA".to_string(), "AAAAAA".to_string(), "AAAAAT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let groups = group_assignments(&umis, &assignments, false);
 
         // With 0 edits, should behave like identity
@@ -3477,7 +3554,7 @@ mod tests {
     fn test_adjacency_with_zero_edits() {
         let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
         let umis = vec!["AAAAAA".to_string(), "AAAAAA".to_string(), "AAAAAT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let groups = group_assignments(&umis, &assignments, false);
 
         // With 0 edits, only exact matches group together
@@ -3512,7 +3589,7 @@ mod tests {
         umis.extend(std::iter::repeat_n("GGGG".to_string(), 2));
         umis.extend(std::iter::repeat_n("ACAA".to_string(), 2));
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         // AAAA, CCAA, ACAA should all have same ID
@@ -3537,7 +3614,7 @@ mod tests {
         let assigner = PairedUmiAssigner::new(1);
         let umis = vec!["AAAA-CCCC".to_string(), "CCCC-AAAA".to_string()];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // Should have different suffixes but same base ID
         let ids: Vec<_> = assignments.iter().collect();
@@ -3552,7 +3629,7 @@ mod tests {
     fn test_paired_assigns_ab_and_ba_with_different_suffix() {
         let umis = vec!["AAAA-CCCC".to_string(), "CCCC-AAAA".to_string()];
         let assigner = PairedUmiAssigner::new(1);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // With strip_suffix=false, should be different groups
         let groups_no_strip = group_assignments(&umis, &assignments, false);
@@ -3574,7 +3651,7 @@ mod tests {
         umis.extend(std::iter::repeat_n("GGGG-AAGA".to_string(), 1));
 
         let assigner = PairedUmiAssigner::new(1);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // With strip_suffix=false, should be 4 groups (each UMI string is distinct)
         let groups_no_strip = group_assignments(&umis, &assignments, false);
@@ -3597,7 +3674,7 @@ mod tests {
         umis.extend(repeat_n("GTGT-TGAC".to_string(), 1));
 
         let assigner = PairedUmiAssigner::new(1);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // With strip_suffix=false
         let groups_no_strip = group_assignments(&umis, &assignments, false);
@@ -3634,8 +3711,8 @@ mod tests {
         umis2.extend(repeat_n("CCCG-AAAA".to_string(), 128));
 
         let assigner = PairedUmiAssigner::new(1);
-        let assignments1 = assigner.assign(&umis1);
-        let assignments2 = assigner.assign(&umis2);
+        let assignments1 = assigner.assign(&umis1).expect("assign should succeed");
+        let assignments2 = assigner.assign(&umis2).expect("assign should succeed");
 
         let groups1_strip = group_assignments(&umis1, &assignments1, true);
         let groups2_strip = group_assignments(&umis2, &assignments2, true);
@@ -3647,12 +3724,15 @@ mod tests {
         assert_eq!(groups2_strip.len(), 2);
     }
 
+    /// Port of fgbio `GroupReadsByUmiTest.scala:189` ("fail if supplied non-paired UMIs").
+    /// fgbio only asserts that an `IllegalStateException` is thrown; fgumi returns an error
+    /// naming the first offending UMI, pinned exactly here.
     #[test]
-    #[should_panic(expected = "is not a paired UMI")]
     fn test_paired_fails_if_supplied_non_paired_umis() {
         let umis = vec!["AAAAAAAA".to_string(), "GGGGGGGG".to_string()];
         let assigner = PairedUmiAssigner::new(1);
-        let _ = assigner.assign(&umis);
+        let err = assigner.assign(&umis).expect_err("non-paired UMIs must be an error");
+        assert_eq!(err.to_string(), "UMI AAAAAAAA is not a paired UMI");
     }
 
     // ========================================================================
@@ -3791,7 +3871,7 @@ mod tests {
             "TGCA-ACGN".to_string(), // reverse of the above: same bases, still invalid
         ];
 
-        let ids = assigner.assign(&umis);
+        let ids = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(ids.len(), umis.len());
 
         // The lone encodable UMI keeps its paired strand.
@@ -3998,7 +4078,7 @@ mod tests {
         // Low count intermediate: "ACAA-TTTT" - 1 edit from root AND 1 edit from target
         umis.extend(std::iter::repeat_n("ACAA-TTTT".to_string(), 2));
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         // Helper to extract base ID (before /A or /B suffix)
@@ -4035,7 +4115,7 @@ mod tests {
         let umis: Vec<Umi> =
             ["aa:ACGT-bb:TTTT", "aa:ACGN-bb:TTTT"].iter().map(|s| (*s).to_string()).collect();
 
-        let ids = assigner.assign(&umis);
+        let ids = assigner.assign(&umis).expect("assign should succeed");
 
         assert!(
             matches!(ids[0], MoleculeId::PairedA(_) | MoleculeId::PairedB(_)),
@@ -4060,7 +4140,7 @@ mod tests {
     fn test_empty_umi_list() {
         let assigner = IdentityUmiAssigner::new();
         let umis: Vec<String> = vec![];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(assignments.len(), 0);
     }
 
@@ -4068,7 +4148,7 @@ mod tests {
     fn test_single_umi() {
         let assigner = IdentityUmiAssigner::new();
         let umis = vec!["ACGTACGT".to_string()];
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         assert_eq!(assignments.len(), 1);
         // Every UMI gets an assignment (by index), verify it's not None
         assert_ne!(assignments[0], MoleculeId::None);
@@ -4078,7 +4158,7 @@ mod tests {
     fn test_all_identical_umis() {
         let assigner = IdentityUmiAssigner::new();
         let umis = repeat_n("ACGTACGT".to_string(), 100);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         let unique_ids: HashSet<_> = assignments.iter().collect();
         assert_eq!(unique_ids.len(), 1);
@@ -4088,7 +4168,7 @@ mod tests {
     fn test_umis_with_empty_parts_in_paired() {
         let umis = vec!["ACT-".to_string(), "-ACT".to_string(), "ACT-".to_string()];
         let assigner = PairedUmiAssigner::new(1);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         // ACT- and -ACT are reverses of each other
         let groups_strip = group_assignments(&umis, &assignments, true);
@@ -4130,7 +4210,7 @@ mod tests {
         fn prop_identity_assigns_duplicates_to_same_id(umi in umi_strategy()) {
             let assigner = IdentityUmiAssigner::new();
             let umis = vec![umi.clone(), umi.clone(), umi.clone()];
-            let assignments = assigner.assign(&umis);
+            let assignments = assigner.assign(&umis).expect("assign should succeed");
 
             // All three should have the same ID
             let ids: HashSet<_> = assignments.iter().collect();
@@ -4141,7 +4221,7 @@ mod tests {
         #[test]
         fn prop_every_umi_gets_assignment(umis in prop::collection::vec(umi_strategy(), 1..20)) {
             let assigner = IdentityUmiAssigner::new();
-            let assignments = assigner.assign(&umis);
+            let assignments = assigner.assign(&umis).expect("assign should succeed");
 
             // Every UMI should be in the assignments (assignments Vec has same length as input)
             assert_eq!(assignments.len(), umis.len(), "Assignments Vec should match input length");
@@ -4186,8 +4266,8 @@ mod tests {
             let identity_assigner = IdentityUmiAssigner::new();
             let adjacency_assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
 
-            let identity_assignments = identity_assigner.assign(&umis);
-            let adjacency_assignments = adjacency_assigner.assign(&umis);
+            let identity_assignments = identity_assigner.assign(&umis).expect("assign should succeed");
+            let adjacency_assignments = adjacency_assigner.assign(&umis).expect("assign should succeed");
 
             // Should have same number of unique molecule IDs
             let identity_ids: HashSet<_> = identity_assignments.iter().collect();
@@ -4330,9 +4410,9 @@ mod tests {
         ];
 
         // Run multiple times and ensure grouping patterns are identical
-        let assignments1 = assigner.assign(&umis);
-        let assignments2 = assigner.assign(&umis);
-        let assignments3 = assigner.assign(&umis);
+        let assignments1 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments2 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments3 = assigner.assign(&umis).expect("assign should succeed");
 
         assert!(
             assignments_structurally_equal(&umis, &assignments1, &umis, &assignments2),
@@ -4360,9 +4440,9 @@ mod tests {
             "TTTTTT".to_string(),
         ];
 
-        let assignments1 = assigner.assign(&umis);
-        let assignments2 = assigner.assign(&umis);
-        let assignments3 = assigner.assign(&umis);
+        let assignments1 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments2 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments3 = assigner.assign(&umis).expect("assign should succeed");
 
         assert!(
             assignments_structurally_equal(&umis, &assignments1, &umis, &assignments2),
@@ -4402,9 +4482,9 @@ mod tests {
             "TTTTTT".to_string(),
         ];
 
-        let assignments1 = assigner.assign(&umis);
-        let assignments2 = assigner.assign(&umis);
-        let assignments3 = assigner.assign(&umis);
+        let assignments1 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments2 = assigner.assign(&umis).expect("assign should succeed");
+        let assignments3 = assigner.assign(&umis).expect("assign should succeed");
 
         assert!(
             assignments_structurally_equal(&umis, &assignments1, &umis, &assignments2),
@@ -4435,7 +4515,7 @@ mod tests {
             "AAAAAC".to_string(), // count=1, within 1 edit of both AAAAAA and AAAGAC
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         // AAAAAA should capture AAAAAC (both get same MI) because AAAAAA < AAAGAC lexicographically
@@ -4456,7 +4536,9 @@ mod tests {
             "AAAGAC".to_string(),
             "AAAAAC".to_string(),
         ];
-        let assignments2 = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&umis2);
+        let assignments2 = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD)
+            .assign(&umis2)
+            .expect("assign should succeed");
         assert!(
             assignments_structurally_equal(&umis, &assignments, &umis2, &assignments2),
             "Equal-count adjacency grouping should be deterministic across runs"
@@ -4487,7 +4569,7 @@ mod tests {
             "AAAAAC".to_string(),
         ];
 
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         assert_eq!(
@@ -4518,10 +4600,12 @@ mod tests {
         }
 
         // With index (threshold = 100, so 200 UMIs will trigger indexing)
-        let indexed_assignments = AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
+        let indexed_assignments =
+            AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis).expect("assign should succeed");
 
         // Without index (threshold = 1000, so 200 UMIs will use linear scan)
-        let linear_assignments = AdjacencyUmiAssigner::new(1, 1, 1000).assign(&umis);
+        let linear_assignments =
+            AdjacencyUmiAssigner::new(1, 1, 1000).assign(&umis).expect("assign should succeed");
 
         // Both should produce structurally equivalent results
         assert!(
@@ -4538,7 +4622,8 @@ mod tests {
         umis.push("AAAAAAAC".to_string()); // Child with 1 read (1 < 10/2 + 1 = 6)
         umis.extend(vec!["TTTTTTTT".to_string(); 5]); // Distinct UMI
 
-        let assignments = AdjacencyUmiAssigner::new(1, 1, 0).assign(&umis);
+        let assignments =
+            AdjacencyUmiAssigner::new(1, 1, 0).assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         // Should still produce correct results
@@ -4566,7 +4651,7 @@ mod tests {
 
         // Using Adjacency strategy with custom threshold
         let assigner = UmiStrategy::Adjacency.new_assigner_full(1, 1, 100);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let map = build_assignment_map(&umis, &assignments);
 
         // Verify correct grouping behavior
@@ -4590,11 +4675,11 @@ mod tests {
 
         // new_assigner should use DEFAULT_INDEX_THRESHOLD
         let assigner1 = UmiStrategy::Adjacency.new_assigner(1);
-        let assignments1 = assigner1.assign(&umis);
+        let assignments1 = assigner1.assign(&umis).expect("assign should succeed");
 
         // new_assigner_full with explicit DEFAULT_INDEX_THRESHOLD should produce same result
         let assigner2 = UmiStrategy::Adjacency.new_assigner_full(1, 1, DEFAULT_INDEX_THRESHOLD);
-        let assignments2 = assigner2.assign(&umis);
+        let assignments2 = assigner2.assign(&umis).expect("assign should succeed");
 
         assert!(
             assignments_structurally_equal(&umis, &assignments1, &umis, &assignments2),
@@ -4611,7 +4696,7 @@ mod tests {
         umis.extend(vec!["TTTT-GGGG".to_string(); 5]); // Distinct UMI
 
         let assigner = PairedUmiAssigner::new_with_threads(1, 1, 100);
-        let assignments = assigner.assign(&umis);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
         let assignment_map = build_assignment_map(&umis, &assignments);
 
         // Should group the similar paired UMIs
@@ -4646,10 +4731,12 @@ mod tests {
         }
 
         // Run with indexing (threshold=100, we have 150 UMIs)
-        let assignments_indexed = AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
+        let assignments_indexed =
+            AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis).expect("assign should succeed");
 
         // Run without indexing (threshold > 150)
-        let assignments_linear = AdjacencyUmiAssigner::new(1, 1, 200).assign(&umis);
+        let assignments_linear =
+            AdjacencyUmiAssigner::new(1, 1, 200).assign(&umis).expect("assign should succeed");
 
         // Verify indexing produces same result as linear scan
         // (the actual number of groups depends on UMI edit distances)

@@ -89,10 +89,11 @@
 //!
 //! let assigner = IdentityUmiAssigner::default();
 //! let umis = vec!["ACGTACGT".to_string(), "ACGTACGT".to_string(), "TGCATGCA".to_string()];
-//! let assignments = assigner.assign(&umis);
+//! let assignments = assigner.assign(&umis)?;
 //! // With identity assignment, each unique UMI gets its own molecule ID
 //! // So we have 2 unique molecule IDs (ACGTACGT and TGCATGCA)
 //! assert_eq!(assignments.iter().collect::<std::collections::HashSet<_>>().len(), 2);
+//! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
 //! ## Feature Highlights
