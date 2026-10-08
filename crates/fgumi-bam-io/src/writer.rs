@@ -160,24 +160,30 @@ impl Write for BgzfWriterEnum {
 }
 
 impl BgzfWriterEnum {
-    /// Finish writing and close the writer properly.
-    /// This is especially important for multi-threaded writers to ensure
-    /// all data is flushed and the EOF marker is written.
+    /// Finish the stream: flush buffered data, write the BGZF EOF block, and
+    /// flush the underlying writer.
+    ///
+    /// Always call this rather than dropping the writer: a drop also writes the
+    /// EOF block, but discards any error doing so.
+    ///
+    /// Only errors returned by `write` or `flush` are surfaced. The underlying
+    /// writer is dropped, not closed explicitly, so an error the OS reports only
+    /// when the file is closed (e.g. deferred write-back on a network
+    /// filesystem) is not checked.
     ///
     /// # Errors
-    /// Returns an error if flushing or finalizing the writer fails.
+    /// Returns an error if flushing, writing the EOF block, or flushing the
+    /// underlying writer fails.
     pub fn finish(self) -> io::Result<()> {
-        match self.inner {
-            BgzfWriterImpl::SingleThreaded(mut w) => {
-                w.flush()?;
-                // Single-threaded writer writes EOF on drop
-                Ok(())
-            }
+        let mut inner = match self.inner {
+            // On error, noodles' `Drop` retries the EOF write (ignoring its
+            // result); the error returned here is what the caller sees.
+            BgzfWriterImpl::SingleThreaded(w) => w.finish()?,
             BgzfWriterImpl::MultiThreaded(mut w) => {
-                w.finish().map_err(|e| io::Error::other(e.to_string()))?;
-                Ok(())
+                w.finish().map_err(|e| io::Error::other(e.to_string()))?
             }
-        }
+        };
+        inner.flush()
     }
 }
 
@@ -1465,6 +1471,99 @@ mod tests {
         assert!(result.is_ok());
 
         Ok(())
+    }
+
+    /// An in-memory sink that records every byte written. With `fail_on_eof` it
+    /// rejects the write carrying the BGZF EOF block, modelling a disk that fills
+    /// up exactly at the end of the stream; with `fail_on_flush` it rejects
+    /// `flush`, modelling a buffered writer whose final flush fails.
+    #[derive(Clone, Default)]
+    struct EofSink {
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        fail_on_eof: bool,
+        fail_on_flush: bool,
+    }
+
+    impl EofSink {
+        fn new(fail_on_eof: bool) -> Self {
+            Self { fail_on_eof, ..Self::default() }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.written.lock().expect("sink lock").clone()
+        }
+    }
+
+    impl Write for EofSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_on_eof && buf == fgumi_bgzf::BGZF_EOF {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "no space left on device"));
+            }
+            self.written.lock().expect("sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_on_flush {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "no space left on device"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Count non-overlapping occurrences of the BGZF EOF block in `bytes`.
+    fn count_eof_blocks(bytes: &[u8]) -> usize {
+        bytes.windows(fgumi_bgzf::BGZF_EOF.len()).filter(|w| *w == fgumi_bgzf::BGZF_EOF).count()
+    }
+
+    #[test]
+    fn test_bgzf_writer_finish_propagates_eof_write_error() {
+        for threads in [1, 2] {
+            let sink = EofSink::new(true);
+            let mut writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            writer.write_all(b"test data").expect("write");
+
+            let err = writer.finish().expect_err("a failed EOF-block write must surface");
+            // The multi-threaded path re-wraps the error, so match on the message
+            // rather than the kind; it still identifies the injected failure.
+            assert!(
+                err.to_string().contains("no space left on device"),
+                "threads={threads}: {err}"
+            );
+            assert_eq!(count_eof_blocks(&sink.bytes()), 0, "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn test_bgzf_writer_finish_propagates_inner_flush_error() {
+        for threads in [1, 2] {
+            let sink = EofSink { fail_on_flush: true, ..EofSink::default() };
+            let mut writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            writer.write_all(b"test data").expect("write");
+
+            let err = writer.finish().expect_err("a failed final flush must surface");
+            assert!(
+                err.to_string().contains("no space left on device"),
+                "threads={threads}: {err}"
+            );
+            // The EOF block was written before the failing flush, so the error
+            // came from the final flush of the underlying writer.
+            assert_eq!(count_eof_blocks(&sink.bytes()), 1, "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn test_bgzf_writer_finish_writes_exactly_one_eof_block() {
+        for threads in [1, 2] {
+            let sink = EofSink::new(false);
+            let mut writer = make_bgzf_writer(Box::new(sink.clone()), threads, 6);
+            writer.write_all(b"test data").expect("write");
+            writer.finish().expect("finish");
+
+            let bytes = sink.bytes();
+            assert!(bytes.ends_with(&fgumi_bgzf::BGZF_EOF), "threads={threads}");
+            assert_eq!(count_eof_blocks(&bytes), 1, "threads={threads}");
+        }
     }
 
     #[test]
