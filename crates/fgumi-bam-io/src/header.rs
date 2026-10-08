@@ -14,7 +14,10 @@ use std::collections::HashSet;
 /// Get the ID of the last program in the @PG chain (for PP chaining).
 ///
 /// Finds the program that is not referenced by any other program's PP tag,
-/// i.e., the "leaf" of the chain.
+/// i.e., the "leaf" of the chain. When the header holds several chains, the
+/// leaf that appears last in header order is chosen, which is the newest one
+/// only when header order is chronological. When every program is referenced
+/// (a PP cycle), the last program in header order is returned.
 ///
 /// # Arguments
 ///
@@ -28,10 +31,6 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
     let programs = header.programs();
     let program_map = programs.as_ref();
 
-    if program_map.is_empty() {
-        return None;
-    }
-
     // Collect all program IDs that are referenced as PP by other programs
     let mut referenced: HashSet<&[u8]> = HashSet::new();
     for (_id, pg) in program_map {
@@ -40,15 +39,12 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
         }
     }
 
-    // Find a program that is NOT referenced (the leaf/end of chain)
-    for (id, _pg) in program_map {
-        if !referenced.contains(id.as_slice()) {
-            return Some(String::from_utf8_lossy(id).to_string());
-        }
-    }
-
-    // Fallback: return any program ID (shouldn't happen with valid headers)
-    program_map.keys().next().map(|id| String::from_utf8_lossy(id).to_string())
+    program_map
+        .keys()
+        .rev()
+        .find(|id| !referenced.contains(id.as_slice()))
+        .or_else(|| program_map.keys().next_back())
+        .map(|id| String::from_utf8_lossy(id).to_string())
 }
 
 /// Create a unique program ID by appending .1, .2, etc. if needed.
@@ -60,7 +56,7 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
 ///
 /// # Returns
 ///
-/// A unique program ID, either the base ID or with a numeric suffix.
+/// A program ID not already in the header, either the base ID or with a numeric suffix.
 #[must_use]
 pub fn make_unique_program_id(header: &Header, base_id: &str) -> String {
     let programs = header.programs();
@@ -71,16 +67,15 @@ pub fn make_unique_program_id(header: &Header, base_id: &str) -> String {
         return base_id.to_string();
     }
 
-    // Append numeric suffix until unique
-    for i in 1..=1000 {
-        let candidate = format!("{base_id}.{i}");
+    // Append numeric suffix until unique; the header is finite, so this terminates
+    let mut suffix = 1_usize;
+    loop {
+        let candidate = format!("{base_id}.{suffix}");
         if !program_map.contains_key(candidate.as_bytes()) {
             return candidate;
         }
+        suffix += 1;
     }
-
-    // Extremely unlikely fallback
-    format!("{base_id}.{}", std::process::id())
 }
 
 /// Build a @PG record with all standard fields.
@@ -117,9 +112,15 @@ pub fn build_program_record(
 /// Add a @PG record to an existing header with automatic PP chaining.
 ///
 /// This function:
-/// 1. Finds the last program in the existing @PG chain
+/// 1. Finds the last program in the existing @PG chain (see [`get_last_program_id`])
 /// 2. Creates a unique ID (appending .1, .2 if "fgumi" exists)
-/// 3. Adds the new @PG with PP pointing to the previous program
+/// 3. Adds exactly one new @PG with PP pointing to the previous program, even when the
+///    header holds several program chains
+///
+/// This intentionally differs from samtools (and noodles' `Programs::add`), which add
+/// one @PG per chain leaf: repeated steps would then grow the header exponentially.
+/// Existing @PG records are never modified, and a PP cycle or a PP naming a missing
+/// program is tolerated rather than rejected.
 ///
 /// # Arguments
 ///
@@ -132,13 +133,13 @@ pub fn build_program_record(
 /// The modified header with the new @PG record.
 /// # Errors
 ///
-/// Returns an error if the program record cannot be added to the header.
+/// Returns an error if the program record cannot be built.
 pub fn add_pg_record(mut header: Header, version: &str, command_line: &str) -> Result<Header> {
     let previous_program = get_last_program_id(&header);
     let unique_id = make_unique_program_id(&header, "fgumi");
     let pg_record = build_program_record(version, command_line, previous_program.as_deref())?;
 
-    header.programs_mut().add(BString::from(unique_id), pg_record)?;
+    header.programs_mut().as_mut().insert(BString::from(unique_id), pg_record);
 
     Ok(header)
 }
@@ -256,6 +257,23 @@ mod tests {
     }
 
     #[test]
+    fn test_get_last_program_id_multiple_chains_picks_newest_leaf() {
+        assert_eq!(get_last_program_id(&header_with_two_chains()), Some("bwa-mem3".to_string()));
+
+        let header = Header::builder()
+            .add_program("samtools", Map::<Program>::default())
+            .add_program("bwa-mem3", Map::<Program>::default())
+            .add_program("fgumi", program_with_pp("samtools"))
+            .build();
+        assert_eq!(get_last_program_id(&header), Some("fgumi".to_string()));
+    }
+
+    #[test]
+    fn test_get_last_program_id_cycle_picks_last_program() {
+        assert_eq!(get_last_program_id(&header_with_pp_cycle()), Some("b".to_string()));
+    }
+
+    #[test]
     fn test_make_unique_program_id_no_collision() {
         let header = Header::default();
         assert_eq!(make_unique_program_id(&header, "fgumi"), "fgumi");
@@ -369,6 +387,121 @@ mod tests {
             pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"bwa".as_slice())
         );
+    }
+
+    fn program_with_pp(pp: &str) -> Map<Program> {
+        Map::<Program>::builder()
+            .insert(tag::PREVIOUS_PROGRAM_ID, pp)
+            .build()
+            .expect("building program map should succeed")
+    }
+
+    fn previous_program(header: &Header, id: &str) -> Option<String> {
+        header
+            .programs()
+            .as_ref()
+            .get(id.as_bytes())
+            .and_then(|pg| pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID))
+            .map(ToString::to_string)
+    }
+
+    /// Two root programs, as in `zipper`'s merge of an unmapped and a mapped BAM header.
+    fn header_with_two_chains() -> Header {
+        Header::builder()
+            .add_program("samtools", Map::<Program>::default())
+            .add_program("bwa-mem3", Map::<Program>::default())
+            .build()
+    }
+
+    fn header_with_pp_cycle() -> Header {
+        Header::builder()
+            .add_program("a", program_with_pp("b"))
+            .add_program("b", program_with_pp("a"))
+            .build()
+    }
+
+    #[test]
+    fn test_add_pg_record_single_chain_chains_to_leaf() {
+        let header = Header::builder()
+            .add_program("bwa", Map::<Program>::default())
+            .add_program("samtools", program_with_pp("bwa"))
+            .build();
+
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+        assert_eq!(result.programs().as_ref().len(), 3);
+        assert_eq!(previous_program(&result, "fgumi").as_deref(), Some("samtools"));
+    }
+
+    #[test]
+    fn test_add_pg_record_adds_one_record_with_multiple_chains() {
+        let result = add_pg_record(header_with_two_chains(), "1.0.0", "fgumi zipper")
+            .expect("add_pg_record should succeed");
+
+        let ids: Vec<String> = result.programs().as_ref().keys().map(ToString::to_string).collect();
+        assert_eq!(ids, ["samtools", "bwa-mem3", "fgumi"]);
+        assert_eq!(previous_program(&result, "fgumi").as_deref(), Some("bwa-mem3"));
+    }
+
+    #[rstest::rstest]
+    #[case::pp_cycle(header_with_pp_cycle(), "b")]
+    #[case::dangling_pp(Header::builder().add_program("bwa", program_with_pp("missing")).build(), "bwa")]
+    fn test_add_pg_record_tolerates_malformed_chain(
+        #[case] header: Header,
+        #[case] expected_pp: &str,
+    ) {
+        let before = header.programs().clone();
+
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+        let after = result.programs().as_ref();
+        assert_eq!(after.len(), before.as_ref().len() + 1);
+        assert!(before.as_ref().iter().all(|(id, pg)| after.get(id) == Some(pg)));
+        assert_eq!(previous_program(&result, "fgumi").as_deref(), Some(expected_pp));
+    }
+
+    #[test]
+    fn test_add_pg_record_never_overwrites_existing_id() {
+        let mut builder = Header::builder().add_program("fgumi", Map::<Program>::default());
+        for i in 1..=1000 {
+            builder = builder.add_program(format!("fgumi.{i}"), Map::<Program>::default());
+        }
+        let header = builder.build();
+        let before = header.programs().clone();
+
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+        let after = result.programs().as_ref();
+        assert_eq!(after.len(), 1002);
+        assert!(before.as_ref().iter().all(|(id, pg)| after.get(id) == Some(pg)));
+        assert_eq!(previous_program(&result, "fgumi.1001").as_deref(), Some("fgumi.1000"));
+    }
+
+    #[test]
+    fn test_add_pg_record_repeated_adds_grow_by_one() {
+        let mut header = header_with_two_chains();
+        let mut expected_pp = "bwa-mem3".to_string();
+
+        for i in 0..6 {
+            let expected_id = if i == 0 { "fgumi".to_string() } else { format!("fgumi.{i}") };
+            let before = header.programs().as_ref().len();
+
+            header =
+                add_pg_record(header, "1.0.0", "fgumi sort").expect("add_pg_record should succeed");
+
+            let programs = header.programs();
+            assert_eq!(programs.as_ref().len(), before + 1, "each add must insert one @PG");
+            let (last_id, _) = programs.as_ref().last().expect("header has programs");
+            assert_eq!(last_id.to_string(), expected_id);
+            assert_eq!(previous_program(&header, &expected_id), Some(expected_pp));
+            expected_pp = expected_id;
+        }
+
+        assert_eq!(header.programs().as_ref().len(), 8);
+        assert_eq!(header.programs().leaves().expect("no cycles").count(), 2);
     }
 
     #[test]

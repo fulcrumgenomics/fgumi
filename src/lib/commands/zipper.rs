@@ -374,7 +374,8 @@ impl Zipper {
 /// - Reference sequences from the reference dictionary
 /// - Comments from both input files
 /// - Read groups from both inputs (mapped takes precedence)
-/// - Program records from both inputs (mapped takes precedence)
+/// - Program records from both inputs (mapped takes precedence), unmapped first so the
+///   aligner's program is the newest chain leaf for the @PG that zipper adds
 /// - Header lines from unmapped BAM
 ///
 /// # Arguments
@@ -420,15 +421,14 @@ pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path)
         }
     }
 
-    let mut pg_ids = HashSet::new();
-    for (id, pg) in mapped.programs().as_ref() {
-        header = header.add_program(id.clone(), pg.clone());
-        pg_ids.insert(id.clone());
-    }
+    let mapped_programs = mapped.programs();
     for (id, pg) in unmapped.programs().as_ref() {
-        if !pg_ids.contains(id) {
+        if !mapped_programs.as_ref().contains_key(id) {
             header = header.add_program(id.clone(), pg.clone());
         }
+    }
+    for (id, pg) in mapped_programs.as_ref() {
+        header = header.add_program(id.clone(), pg.clone());
     }
 
     if let Some(hdr) = unmapped.header() {
@@ -3775,6 +3775,74 @@ mod tests {
             chain_header.header(),
             "chain-path @HD header diverged from process_raw",
         );
+        Ok(())
+    }
+
+    /// The unmapped BAM's programs are listed before the mapped BAM's, so the @PG that
+    /// zipper adds chains to the aligner instead of orphaning it.
+    #[rstest]
+    fn test_output_header_chains_zipper_pg_to_aligner(
+        #[values(1, 4)] threads: usize,
+    ) -> Result<()> {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::Program;
+        use noodles::sam::header::record::value::map::program::tag;
+
+        let program = |command_line: &str| {
+            Map::<Program>::builder()
+                .insert(tag::COMMAND_LINE, command_line)
+                .build()
+                .expect("building program map should succeed")
+        };
+
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &HashMap::new());
+        mapped.add_pair_with_attrs("q1", Some(100), Some(200), true, true, &HashMap::new());
+
+        let unmapped_programs = unmapped.header.programs_mut().as_mut();
+        unmapped_programs.clear();
+        unmapped_programs.insert("samtools".into(), program("samtools import"));
+        let mapped_programs = mapped.header.programs_mut().as_mut();
+        mapped_programs.clear();
+        mapped_programs.insert("bwa-mem3".into(), program("bwa-mem3 mem"));
+
+        let dir = TempDir::new()?;
+        let unmapped_path = dir.path().join("unmapped.bam");
+        let mapped_path = dir.path().join("mapped.sam");
+        let output_path = dir.path().join("output.bam");
+        let dict_path = create_ref_dict(&dir, "chr1", REFERENCE_LENGTH)?;
+        unmapped.write(&unmapped_path)?;
+        mapped.write_sam(&mapped_path)?;
+
+        let zipper = Zipper {
+            input: mapped_path,
+            unmapped: unmapped_path,
+            reference: dict_path,
+            output: output_path.clone(),
+            tags_to_remove: vec![],
+            tags_to_reverse: vec![],
+            tags_to_revcomp: vec![],
+            buffer: 5000,
+            threads,
+            compression_level: Some(1),
+            bwa_chunk_size: 150_000_000,
+            exclude_missing_reads: false,
+            skip_tc_tags: false,
+            restore_unconverted_bases: false,
+        };
+        zipper.execute("fgumi zipper")?;
+
+        let header = read_bam_header(&output_path)?;
+        let programs = header.programs();
+        let ids: Vec<String> = programs.as_ref().keys().map(ToString::to_string).collect();
+        assert_eq!(ids, ["samtools", "bwa-mem3", "fgumi"]);
+        let previous_program = programs
+            .as_ref()
+            .get(b"fgumi".as_slice())
+            .and_then(|pg| pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID))
+            .map(ToString::to_string);
+        assert_eq!(previous_program.as_deref(), Some("bwa-mem3"));
         Ok(())
     }
 
