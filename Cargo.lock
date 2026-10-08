@@ -870,6 +870,7 @@ dependencies = [
  "fgumi-metrics",
  "fgumi-raw-bam",
  "fgumi-sam",
+ "itertools 0.14.0",
  "log",
  "noodles",
  "proptest",
