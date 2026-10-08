@@ -4068,6 +4068,103 @@ mod tests {
         Ok(())
     }
 
+    /// A degenerate position on both strands: each strand's R1-side reads observe `A`, `C` and
+    /// `G` at offset 0, all at Q0 and kept by `--min-input-base-quality 0` (duplex rejects a Q0
+    /// post-UMI rate, so this is the only route). Every observation has a `−∞` correct term, and
+    /// each single-strand builder calls the unobserved `T` with a `NaN` error probability.
+    ///
+    /// Expected values follow fgbio (`origin/main`). `ConsensusCaller.scala:173` maps the `NaN`
+    /// to `PhredScore.cap(0)` = Q2, and the single-strand caller is built with
+    /// `minConsensusBaseQuality = PhredScore.MinValue` (`DuplexConsensusCaller.scala:142`), so
+    /// `rawQual < minConsensusBaseQuality` (`VanillaUmiConsensusCaller.scala:354`) keeps `(T, Q2)`
+    /// on both strands. The strands agree, so `duplexConsensus` takes
+    /// `PhredScore.cap(aQual + bQual)` = Q4 (`DuplexConsensusCaller.scala:424`), which is not
+    /// `MinValue` and is not masked (`:431`). Before `ln_prob_to_phred` mapped `NaN` to Q2, each
+    /// strand was called at Q0, masked to `N`, and the duplex base was `(N, Q2)`.
+    #[test]
+    fn test_degenerate_position_on_both_strands_calls_duplex_t_at_q4() -> Result<()> {
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            0,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+
+        let cigar_10m = &[encode_op(0, 10)];
+        let clean_quals = &[20u8; 10];
+        let mut degenerate_quals = [20u8; 10];
+        degenerate_quals[0] = 0;
+        let mut b = SamBuilder::new();
+
+        let mut reads = Vec::new();
+        for (i, first_base) in [b'A', b'C', b'G'].into_iter().enumerate() {
+            let mut r1_bases = *b"AAAAAAAAAA";
+            r1_bases[0] = first_base;
+            let ab = format!("ab{i}");
+            let ba = format!("ba{i}");
+            reads.push(ab_r1(
+                &mut b,
+                ab.as_bytes(),
+                &r1_bases,
+                &degenerate_quals,
+                cigar_10m,
+                b"foo/A",
+                &[],
+            ));
+            reads.push(ab_r2(
+                &mut b,
+                ab.as_bytes(),
+                b"CCCCCCCCCC",
+                clean_quals,
+                cigar_10m,
+                b"foo/A",
+                &[],
+            ));
+            reads.push(ba_r1(
+                &mut b,
+                ba.as_bytes(),
+                b"CCCCCCCCCC",
+                clean_quals,
+                cigar_10m,
+                b"foo/B",
+                &[],
+            ));
+            reads.push(ba_r2(
+                &mut b,
+                ba.as_bytes(),
+                &r1_bases,
+                &degenerate_quals,
+                cigar_10m,
+                b"foo/B",
+                &[],
+            ));
+        }
+
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2);
+
+        let records = ParsedBamRecord::parse_all(&result.data);
+        let r1 = records
+            .iter()
+            .find(|rec| rec.flag & flags::FIRST_SEGMENT != 0)
+            .expect("a duplex R1 consensus");
+        assert_eq!(
+            (r1.bases[0], r1.quals[0]),
+            (b'T', 4),
+            "bases {:?} quals {:?}",
+            r1.bases,
+            r1.quals
+        );
+        Ok(())
+    }
+
     /// Builds one duplex molecule, optionally seeded with minority-alignment templates.
     ///
     /// Each strand gets `majority_templates` templates carrying `10M`. When `gapped_a` (or

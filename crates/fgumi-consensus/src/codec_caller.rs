@@ -2680,6 +2680,89 @@ mod tests {
         );
     }
 
+    /// A degenerate position: every template observes `A`, `C` or `G` there at Q0, kept by
+    /// `--min-input-base-quality 0` (codec rejects a Q0 post-UMI rate, so this is the only
+    /// route). Every observation has a `−∞` correct term, so each single-strand builder calls
+    /// the unobserved `T` (in reference orientation) with a `NaN` error probability, which
+    /// fgbio maps to `PhredScore.cap(0)` = Q2 (`ConsensusCaller.scala:173`). Templates are R1
+    /// at 1-30 forward and R2 at 11-40 reverse, so reference 11-30 is the duplex region.
+    ///
+    /// Expected values follow fgbio (`origin/main`). Codec inherits the duplex single-strand
+    /// caller, whose `minConsensusBaseQuality = PhredScore.MinValue`
+    /// (`DuplexConsensusCaller.scala:142`) keeps `(T, Q2)`, then pads each strand with `n` at
+    /// Q0 (`CodecConsensusCaller.scala:251-252`) and combines them in `duplexConsensus`:
+    ///
+    /// * `duplex`: reference 15 is degenerate on both strands. They agree, so the quality is
+    ///   `PhredScore.cap(2 + 2)` = Q4 (`DuplexConsensusCaller.scala:424`), not `MinValue`,
+    ///   so it is kept (`:431`): `(T, Q4)`. fgumi's codec single-strand caller does not mask,
+    ///   so before the `NaN` guard this was `(T, Q0 + Q0)` = `(T, Q0)`.
+    /// * `single_strand`: reference 3 is degenerate on R1 only, against R2's `n` padding at
+    ///   Q0. `aQual > bQual` gives `PhredScore.cap(2 - 0)` = `MinValue` (`:425`), which is
+    ///   masked: `(N, Q2)`. Before the guard fgumi emitted `(T, Q0)`.
+    #[rstest]
+    #[case::duplex(15, true, (b'T', 4))]
+    #[case::single_strand(3, false, (NO_CALL_BASE, MIN_PHRED))]
+    fn test_degenerate_position_matches_fgbio(
+        #[case] ref_pos: usize,
+        #[case] on_r2: bool,
+        #[case] expected: (u8, PhredScore),
+    ) {
+        const R1_START: usize = 1;
+        const R2_START: usize = 11;
+        let options = CodecConsensusOptions {
+            min_input_base_quality: 0,
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let mut reads = Vec::new();
+        for (i, base) in [b'A', b'C', b'G'].into_iter().enumerate() {
+            let mut pair = create_fr_pair(
+                &format!("read{i}"),
+                R1_START,
+                R2_START,
+                30,
+                35,
+                &[(Kind::Match, 30)],
+                &[(Kind::Match, 30)],
+                "hi",
+                Some("ACC-TGA"),
+                false,
+                true,
+            );
+            // Both records are fully aligned and store `SEQ` in reference orientation, so
+            // read offset `ref_pos - start` is reference position `ref_pos` on either strand.
+            let (r1, r2) = pair.split_at_mut(1);
+            assert!(r1[0].is_first_segment() && r2[0].is_last_segment());
+            r1[0].set_base(ref_pos - R1_START, base);
+            r1[0].set_qual(ref_pos - R1_START, 0);
+            if on_r2 {
+                r2[0].set_base(ref_pos - R2_START, base);
+                r2[0].set_qual(ref_pos - R2_START, 0);
+            }
+            reads.extend(pair);
+        }
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+        assert_eq!(output.count, 1);
+
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        assert_eq!(consensus.bases.len(), 40, "the consensus spans reference 1-40");
+        let index = ref_pos - R1_START;
+        assert_eq!(
+            (consensus.bases[index], consensus.quals[index]),
+            expected,
+            "bases {:?} quals {:?}",
+            consensus.bases,
+            consensus.quals
+        );
+    }
+
     /// Port of fgbio test: "make a consensus from two simple reads"
     ///
     /// Tests that a simple FR pair produces a consensus with correct structure

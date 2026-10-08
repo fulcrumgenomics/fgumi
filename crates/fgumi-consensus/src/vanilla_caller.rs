@@ -3230,6 +3230,56 @@ mod tests {
         assert_eq!(consensus.quals[6], 2, "Expected masked base qual to be 2");
     }
 
+    /// Pins the caller-level effect of mapping a `NaN` error probability to `MIN_PHRED`. At a
+    /// degenerate position (`A`, `C` and `G` observed, each with a `−∞` correct term from a Q0 on
+    /// either side of the two-trial error) the builder calls `(T, Q2)`, as fgbio does via
+    /// `PhredScore.cap` (`ConsensusCaller.scala:173`). With `--min-consensus-base-quality 2` the
+    /// base is now emitted; before the guard it was called at Q0 and masked to `N`. Duplex and
+    /// codec call the same builder through their single-strand callers but mask differently,
+    /// so the change differs per caller: duplex single-strand bases go from `N` to `T` and
+    /// combine to `(T, Q4)` when both strands are degenerate
+    /// (`test_degenerate_position_on_both_strands_calls_duplex_t_at_q4`); codec single-strand
+    /// qualities go from Q0 to Q2, giving `(T, Q4)` in the duplex region and `(N, Q2)` in a
+    /// single-strand region (`test_degenerate_position_matches_fgbio` in `codec_caller`).
+    #[rstest]
+    #[case::post_umi_q0(0, 30)]
+    #[case::input_base_q0(40, 0)]
+    fn test_degenerate_position_emits_min_phred_base(
+        #[case] error_rate_post_umi: u8,
+        #[case] degenerate_qual: u8,
+    ) {
+        let options = VanillaUmiConsensusOptions {
+            min_reads: 1,
+            min_input_base_quality: 0,
+            min_consensus_base_quality: 2,
+            error_rate_post_umi,
+            ..Default::default()
+        };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
+
+        let mut quals = vec![30u8; 7];
+        quals[0] = degenerate_qual;
+        let reads = [b"AATTACA", b"CATTACA", b"GATTACA"]
+            .iter()
+            .enumerate()
+            .map(|(i, bases)| create_consensus_test_read(&format!("r{i}"), *bases, &quals, "UMI1"))
+            .collect();
+
+        let output = consensus_reads_from_raw(&mut caller, reads)
+            .expect("consensus_reads_from_raw should succeed");
+
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        assert_eq!(consensus.bases[0], b'T', "degenerate position calls T: {:?}", consensus.bases);
+        assert_eq!(
+            consensus.quals[0], MIN_PHRED,
+            "degenerate position is Q2: {:?}",
+            consensus.quals
+        );
+    }
+
     /// Port of fgbio test: "apply the pre-umi-error-rate when it has probability zero"
     /// Tests that with max error rate, input qualities are preserved
     #[test]
