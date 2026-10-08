@@ -932,7 +932,9 @@ mod tests {
         records.push(r1);
         records.push(r2);
 
-        // /B reads: swap positions (200, 100) and use opposite strands to match fgbio's test setup
+        // /B reads on the opposite strand (R1 negative at 200, R2 positive at 100). fgbio's
+        // L76 gives the /B pair R1-positive strands; the port with those strands is
+        // `test_count_umis_once_per_read_pair_same_r1_strand`.
         let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "AAA-TTT/B", false, true);
         records.push(r1);
         records.push(r2);
@@ -1056,12 +1058,16 @@ mod tests {
     /// segments (e.g. no dash) must be rejected with a clear error, matching fgbio
     /// (`split("-", -1)` + `case Array(u1, u2)` throws a `MatchError`) and fgumi's own
     /// `group`/`dedup`, which bail on non-2-segment paired UMIs — rather than being
-    /// silently skipped.
-    #[test]
-    fn test_malformed_duplex_umi_is_rejected() -> Result<()> {
+    /// silently skipped. This holds for every MI form, including ones without an `/A`,`/B`
+    /// suffix, whose UMIs were once silently dropped (and so never validated).
+    #[rstest]
+    #[case::ab_suffix("1/A")]
+    #[case::non_ab_suffix("1/C")]
+    #[case::unsuffixed_with_slash("sample/123")]
+    fn test_malformed_duplex_umi_is_rejected(#[case] mi: &str) -> Result<()> {
         let mut records = Vec::new();
         // RX "AAATTT" has no '-' delimiter → not a valid duplex UMI.
-        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAATTT", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAATTT", mi, true, false);
         records.push(r1);
         records.push(r2);
 
@@ -1092,10 +1098,11 @@ mod tests {
     /// reading of the top strand, by the actual R1 strand — not the MI `/A`,`/B`
     /// suffix (which is not strand-reliable). The suffix still decides how the two
     /// UMI halves are paired up across strands (see
-    /// `test_duplex_umi_halves_paired_by_strand_family`); R1 strand only decides
-    /// which half the reported duplex UMI leads with. fgbio reports a read pair with UMI
-    /// `u1-u2` as `u1-u2` when R1 is on the positive strand, and as `u2-u1` when R1 is
-    /// on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
+    /// `test_duplex_umi_halves_paired_by_strand_family`); R1 strand decides which half
+    /// the reported duplex UMI leads with, except for FF/RR pairs, where the strand-family
+    /// order does (also `test_duplex_umi_halves_paired_by_strand_family`). fgbio reports a
+    /// read pair with UMI `u1-u2` as `u1-u2` when R1 is on the positive strand, and as
+    /// `u2-u1` when R1 is on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
     /// example `AAAA-GGGG`, R1 negative → `GGGG-AAAA`). Previously fgumi always led
     /// with the `/A` half, so a reverse-strand-first family was recorded in the wrong
     /// orientation.
@@ -1231,10 +1238,11 @@ mod tests {
             .collect();
         assert_eq!(observed, vec![("AAA", 2, 0, 1), ("CAG", 2, 0, 1)]);
 
-        // One duplex UMI, oriented to lead with the half a positive-strand R1 reads
-        // first. For FF/RR (`ff_*`/`rr_*`) neither strand family is F1R2-only, so
-        // fgbio's orientation depends on its MI hash order; the expected values pin
-        // fgumi's deterministic tie-break (`/A` leading half for FF, trailing for RR).
+        // One duplex UMI. Every expected value is fgbio's output on the same input with its
+        // single-strand families ordered by MI (fulcrumgenomics/fgbio#1186; released
+        // fgbio <= 4.1.1 orders them by hash, which flips `ff_*`/`rr_*` for MI `1`). For
+        // FF/RR neither strand family is F1R2-only, so the orientation follows that order:
+        // `1/A` first.
         let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
         let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
         let observed: Vec<(&str, usize, usize, usize)> = duplex_umis
@@ -1253,10 +1261,183 @@ mod tests {
         Ok(())
     }
 
-    /// A duplex family observed only on its `/B` strand still reports its UMI halves
-    /// un-swapped back to the `/A` pairing, and orients its duplex UMI to lead with
-    /// the half a positive-strand R1 reads first: the `/B` RX as-is when its R1 is
-    /// positive, swapped when its R1 is negative.
+    /// When a UMI position splits 2-vs-2 between the strands, the consensus is decided by
+    /// floating-point summation order, so the two strands' observations must be added in
+    /// one fixed order: every read of the single-strand family whose MI sorts first (`/A`),
+    /// then the other; within a family, reads stay in file order. Feeding reads in file
+    /// order across strands instead resolved the same tie differently depending on how the
+    /// strands' reads interleave, or no-called it as `N`. The result must not depend on the
+    /// MI's hash either: `0/A` and `1/A` hash in opposite orders relative to their `/B`,
+    /// which decided released fgbio's order (<= 4.1.1, before it sorted by MI).
+    ///
+    /// Two `/A` templates carry `a_rx` and two `/B` templates `b_rx`, so the leading
+    /// position of the consensus sees two of one base from each strand. The `/A` R1 is at
+    /// 1000 on the strand given by `a_r1_plus` (FR/RF pairs). Expected values are the
+    /// output of fgbio `CollectDuplexSeqMetrics --duplex-umi-counts true`, with its
+    /// single-strand families ordered by MI (fulcrumgenomics/fgbio#1186), on the same
+    /// input, for every `mi_base` and `order`. The `TAA-GGG`/`GGG-AAA` content pins the
+    /// strand order: sorting the UMIs instead would call `TAA` for both.
+    #[rstest]
+    #[case::a_aaa_r1_plus("AAA-GGG", "GGG-TAA", true, "TAA", "TAA-GGG")]
+    #[case::a_aaa_r1_minus("AAA-GGG", "GGG-TAA", false, "TAA", "GGG-TAA")]
+    #[case::a_taa_r1_plus("TAA-GGG", "GGG-AAA", true, "AAA", "AAA-GGG")]
+    #[case::a_taa_r1_minus("TAA-GGG", "GGG-AAA", false, "AAA", "GGG-AAA")]
+    fn test_umi_consensus_tie_is_independent_of_strand_interleaving_and_mi(
+        #[case] a_rx: &str,
+        #[case] b_rx: &str,
+        #[case] a_r1_plus: bool,
+        #[case] expected_tied_umi: &str,
+        #[case] expected_duplex_umi: &str,
+        #[values("0", "1")] mi_base: &str,
+        #[values("AABB", "BBAA", "ABAB", "BABA")] order: &str,
+    ) -> Result<()> {
+        let mut records = Vec::new();
+        for (i, strand) in order.chars().enumerate() {
+            let name = format!("q{i}");
+            let (r1, r2) = if strand == 'A' {
+                let mi = format!("{mi_base}/A");
+                build_test_pair(&name, 0, 1000, 1300, a_rx, &mi, a_r1_plus, !a_r1_plus)
+            } else {
+                let mi = format!("{mi_base}/B");
+                build_test_pair(&name, 0, 1300, 1000, b_rx, &mi, !a_r1_plus, a_r1_plus)
+            };
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (_, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        let mut expected =
+            vec![("GGG".to_string(), 4, 0, 1), (expected_tied_umi.to_string(), 4, 2, 1)];
+        expected.sort_unstable();
+        assert_eq!(umis, expected);
+        assert_eq!(duplex_umis, vec![(expected_duplex_umi.to_string(), 4, 2, 1)]);
+
+        Ok(())
+    }
+
+    /// A family whose MI is not `<base>`, `<base>/A` or `<base>/B` must still contribute
+    /// its UMIs to `umi_counts.txt` / `duplex_umi_counts.txt`, not just its family sizes,
+    /// including the reads whose RX disagrees with the consensus. Such an MI (e.g. `1/C`,
+    /// or an unsuffixed `sample/123` from another grouper) is treated like an unsuffixed
+    /// MI: one AB-strand family. For a lone family like this, fgbio counts the same UMIs.
+    #[rstest]
+    #[case::non_ab_suffix("1/C")]
+    #[case::unsuffixed_with_slash("sample/123")]
+    fn test_umis_counted_for_mi_without_ab_suffix(#[case] mi: &str) -> Result<()> {
+        let mut records = Vec::new();
+        for (name, rx) in [("q1", "AAA-CAG"), ("q2", "AAA-CAG"), ("q3", "AAT-CAG")] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 200, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        // The family itself is counted: one DS family of size 3, all on the AB strand.
+        assert_eq!(families, vec![(3, 0, 1)]);
+        // ... and so are its UMIs, including the one mismatched read.
+        assert_eq!(umis, vec![("AAA".to_string(), 3, 1, 1), ("CAG".to_string(), 3, 0, 1)]);
+        assert_eq!(duplex_umis, vec![("AAA-CAG".to_string(), 3, 1, 1)]);
+
+        Ok(())
+    }
+
+    /// fgumi defines a double-stranded family by the MI with an exact `/A` or `/B` suffix
+    /// stripped, so `1/A` and `1/C` at the same coordinate are two separate AB-strand
+    /// families. This pins that behavior. It knowingly differs from fgbio, which keys the
+    /// family on the MI up to its first `/` (`CollectDuplexSeqMetrics.scala:369`) and so
+    /// merges them into one duplex family (ab=2, ba=2, a single `CCC-AAA` duplex UMI). No
+    /// fgumi or fgbio grouper writes such a mix; fgbio also fails outright on three or
+    /// more MIs sharing a first-`/` prefix.
+    #[test]
+    fn test_mi_without_ab_suffix_is_a_separate_family() -> Result<()> {
+        let mut records = Vec::new();
+        for (name, rx, mi) in [
+            ("a1", "AAA-CCC", "1/A"),
+            ("a2", "AAA-CCC", "1/A"),
+            ("c1", "CCC-AAA", "1/C"),
+            ("c2", "CCC-AAA", "1/C"),
+        ] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 200, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        assert_eq!(families, vec![(2, 0, 2)]);
+        assert_eq!(umis, vec![("AAA".to_string(), 4, 0, 2), ("CCC".to_string(), 4, 0, 2)]);
+        assert_eq!(
+            duplex_umis,
+            vec![("AAA-CCC".to_string(), 2, 0, 1), ("CCC-AAA".to_string(), 2, 0, 1)]
+        );
+
+        Ok(())
+    }
+
+    /// Runs `duplex-metrics --duplex-umi-counts` on `records` and returns, sorted:
+    /// `(ab_size, ba_size, count)` per duplex family size, and
+    /// `(umi, raw_observations, raw_observations_with_errors, unique_observations)` per
+    /// row of `umi_counts.txt` and of `duplex_umi_counts.txt`.
+    #[allow(clippy::type_complexity)]
+    fn run_duplex_metrics_with_umi_counts(
+        records: Vec<sam::alignment::RecordBuf>,
+    ) -> Result<(
+        Vec<(usize, usize, usize)>,
+        Vec<(String, usize, usize, usize)>,
+        Vec<(String, usize, usize, usize)>,
+    )> {
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: true,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let families: Vec<DuplexFamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        let mut families: Vec<(usize, usize, usize)> =
+            families.iter().map(|m| (m.ab_size, m.ba_size, m.count)).collect();
+        families.sort_unstable();
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let umis: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        let mut umis: Vec<(String, usize, usize, usize)> = umis
+            .into_iter()
+            .map(|m| {
+                (m.umi, m.raw_observations, m.raw_observations_with_errors, m.unique_observations)
+            })
+            .collect();
+        umis.sort_unstable();
+
+        let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
+        let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
+        let mut duplex_umis: Vec<(String, usize, usize, usize)> = duplex_umis
+            .into_iter()
+            .map(|m| {
+                (m.umi, m.raw_observations, m.raw_observations_with_errors, m.unique_observations)
+            })
+            .collect();
+        duplex_umis.sort_unstable();
+
+        Ok((families, umis, duplex_umis))
+    }
+
+    /// A duplex family observed only on its `/B` strand is its own `ab` family: its RX is
+    /// read as-is, and its duplex UMI leads with the half a positive-strand R1 reads first
+    /// (the `/B` RX as-is when its R1 is positive, swapped when its R1 is negative).
     #[rstest]
     #[case::b_r1_positive(true, "CAG-AAA")]
     #[case::b_r1_negative(false, "AAA-CAG")]
@@ -1333,7 +1514,9 @@ mod tests {
         records.push(r1);
         records.push(r2);
 
-        // /B reads: swap positions (200, 100) to match fgbio's test setup
+        // /B reads on the opposite strand (R1 negative at 200). fgbio's L117 gives every pair
+        // R1-positive strands; the port with those strands is
+        // `test_count_unique_umi_observations_with_tag_families_same_r1_strand`.
         let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "1/B", false, true);
         records.push(r1);
         records.push(r2);
@@ -1397,6 +1580,179 @@ mod tests {
         let ggg = umi_metrics.iter().find(|m| m.umi == "GGG").expect("Should find GGG");
         assert_eq!(ggg.raw_observations, 1);
         assert_eq!(ggg.unique_observations, 1);
+
+        Ok(())
+    }
+
+    /// `CollectDuplexSeqMetricsTest.scala:76` — "count UMIs once per read-pair", ported
+    /// with fgbio's reads and strands unchanged. Unlike the strand-swapped
+    /// `test_count_umis_once_per_read_pair` above, the `/B` pair here keeps `addPair`'s
+    /// default strands (R1 `+`, R2 `-`) and the same start positions as the `/A` pair,
+    /// exactly as fgbio builds it: both families have R1 on the positive strand. fgbio pairs
+    /// UMI halves by `/A`-`/B` family (the `/B` half is swapped), so the two UMIs are `AAA`
+    /// and `TTT`, each with 2 raw observations and 1 unique observation. Pairing by R1 strand
+    /// instead mixes `AAA` and `TTT` into one position and calls a spurious `NNN` consensus.
+    ///
+    /// fgbio runs this without `--duplex-umi-counts`, which does not change `umi_counts.txt`;
+    /// it is enabled here to also pin the orientation when both families' R1 is on the
+    /// positive strand (FR pairs, not FF): the `/A` `RX` as written.
+    #[test]
+    fn test_count_umis_once_per_read_pair_same_r1_strand() -> Result<()> {
+        let mut records = Vec::new();
+        for (name, rx, mi) in [("q1", "AAA-TTT", "1/A"), ("q2", "TTT-AAA", "1/B")] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 200, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        assert_eq!(families, vec![(1, 1, 1)]);
+        // fgbio asserts `umiMetrics.size shouldBe 2`, `raw_observations shouldBe 2` and
+        // `unique_observations shouldBe 1` for each; zero errors is what fgbio produces.
+        assert_eq!(umis, vec![("AAA".to_string(), 2, 0, 1), ("TTT".to_string(), 2, 0, 1)]);
+        assert_eq!(duplex_umis, vec![("AAA-TTT".to_string(), 2, 0, 1)]);
+
+        Ok(())
+    }
+
+    /// `CollectDuplexSeqMetricsTest.scala:117` — "count unique UMI observations 1-to-1 with
+    /// tag families", ported with fgbio's reads unchanged (default R1 `+` / R2 `-` strands
+    /// for every pair, including the `/B` pair and the lone `3/B` family).
+    /// fgbio expects 4 UMIs: `AAA` 5/0/2, `TTT` 5/1/2, `CCC` 1/0/1 and `GGG` 1/0/1
+    /// (raw observations / raw observations with errors / unique observations). Pairing
+    /// halves by R1 strand instead folds the `/B` pair's `TTT` into the `AAA` position and
+    /// yields 5 UMIs including a phantom `NNN`.
+    ///
+    /// fgbio runs this without `--duplex-umi-counts`; it is enabled here to also pin each
+    /// family's orientation. Every R1 is on the positive strand, so each duplex UMI is the
+    /// `RX` of its first family (`/A`, or the lone `3/B`) as written.
+    #[test]
+    fn test_count_unique_umi_observations_with_tag_families_same_r1_strand() -> Result<()> {
+        let mut records = Vec::new();
+        for (name, pos1, pos2, rx, mi) in [
+            ("q1", 100, 200, "AAA-TTT", "1/A"),
+            ("q2", 100, 200, "TTT-AAA", "1/B"),
+            ("q3", 150, 250, "TTT-AAA", "2/A"),
+            ("q4", 150, 250, "TTT-AAA", "2/A"),
+            ("q5", 150, 250, "NTT-AAA", "2/A"),
+            ("q6", 250, 350, "CCC-GGG", "3/B"),
+        ] {
+            let (r1, r2) = build_test_pair(name, 0, pos1, pos2, rx, mi, true, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (_, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        assert_eq!(
+            umis,
+            vec![
+                ("AAA".to_string(), 5, 0, 2),
+                ("CCC".to_string(), 1, 0, 1),
+                ("GGG".to_string(), 1, 0, 1),
+                ("TTT".to_string(), 5, 1, 2),
+            ]
+        );
+        assert_eq!(
+            duplex_umis,
+            vec![
+                ("AAA-TTT".to_string(), 2, 0, 1),
+                ("CCC-GGG".to_string(), 1, 0, 1),
+                ("TTT-AAA".to_string(), 3, 1, 1),
+            ]
+        );
+
+        Ok(())
+    }
+
+    /// UMI halves are paired by `/A`-`/B` family (fgbio's `ab`/`ba` sets,
+    /// `CollectDuplexSeqMetrics.scala:407-408`), not by each read's own R1 strand, and the
+    /// `/A` family (or an unsuffixed MI, `ff_unsuffixed`) is the one used as written
+    /// whichever family is larger (`rr_b_larger`). Every case has `/A` reads (`GGG-TTT`) at
+    /// `1000`/`1300` and `/B` reads (`TTT-GGG`) at `1300`/`1000`, with both families' R1 on
+    /// the same strand, so every raw RX is a correct reading of the duplex and there must be
+    /// no errors and no `N` UMIs. (`test_duplex_umi_halves_paired_by_strand_family` covers
+    /// FR/RF and balanced one-read FF/RR families.)
+    ///
+    /// Duplex UMI orientation rule (fgbio's, `CollectDuplexSeqMetrics.scala:425`, with the
+    /// `/A` family first): lead with the `/A` family's leading half if any `/A` R1 is on the
+    /// positive strand, else with the `/B` family's. So FF prints the `/A` RX as written
+    /// (`GGG-TTT`) and RR prints the `/B` RX as written (`TTT-GGG`).
+    #[rstest]
+    #[case::ff("1/A", true, 3, 2, "GGG-TTT")]
+    #[case::ff_unsuffixed("1", true, 2, 2, "GGG-TTT")]
+    #[case::rr("1/A", false, 3, 2, "TTT-GGG")]
+    #[case::rr_b_larger("1/A", false, 2, 3, "TTT-GGG")]
+    fn test_duplex_umi_halves_pair_by_family_not_r1_strand(
+        #[case] a_mi: &str,
+        #[case] r1_plus: bool,
+        #[case] a_count: usize,
+        #[case] b_count: usize,
+        #[case] expected_duplex_umi: &str,
+    ) -> Result<()> {
+        let mut records = Vec::new();
+
+        // /A (or unsuffixed): R1 at 1000, R2 at 1300.
+        for i in 0..a_count {
+            let (r1, r2) =
+                build_test_pair(&format!("a{i}"), 0, 1000, 1300, "GGG-TTT", a_mi, r1_plus, r1_plus);
+            records.push(r1);
+            records.push(r2);
+        }
+        // /B: the opposite strand of the molecule, so R1 maps where /A's R2 does.
+        for i in 0..b_count {
+            let (r1, r2) = build_test_pair(
+                &format!("b{i}"),
+                0,
+                1300,
+                1000,
+                "TTT-GGG",
+                "1/B",
+                r1_plus,
+                r1_plus,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (families, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        let total = a_count + b_count;
+        assert_eq!(families, vec![(a_count.max(b_count), a_count.min(b_count), 1)]);
+        assert_eq!(umis, vec![("GGG".to_string(), total, 0, 1), ("TTT".to_string(), total, 0, 1)]);
+        assert_eq!(duplex_umis, vec![(expected_duplex_umi.to_string(), total, 0, 1)]);
+
+        Ok(())
+    }
+
+    /// Per-UMI errors stay at the UMI position they belong to under family pairing. An RR
+    /// duplex (both families' R1 on the negative strand) with two `/A` reads `GGG-TTT` and
+    /// three `/B` reads, one of which misreads its trailing half (`TTT-GGC`). The `/B` half
+    /// is swapped, so the error lands in the `GGG` position only: `GGG` 5/1/1, `TTT` 5/0/1,
+    /// and the duplex UMI has 1 raw observation with errors (the `TTT-GGC` read matches
+    /// neither orientation), as fgbio counts it (`CollectDuplexSeqMetrics.scala:430`). No
+    /// `/A` R1 is on the positive strand, so the duplex UMI leads with the `/B` family's
+    /// half: the `/B` RX as written, `TTT-GGG` (fgbio's rule at `:425`, `/A` first).
+    #[test]
+    fn test_duplex_umi_error_in_b_family_same_r1_strand() -> Result<()> {
+        let mut records = Vec::new();
+        for (name, pos1, pos2, rx, mi) in [
+            ("a0", 1000, 1300, "GGG-TTT", "1/A"),
+            ("a1", 1000, 1300, "GGG-TTT", "1/A"),
+            ("b0", 1300, 1000, "TTT-GGG", "1/B"),
+            ("b1", 1300, 1000, "TTT-GGG", "1/B"),
+            ("b2", 1300, 1000, "TTT-GGC", "1/B"),
+        ] {
+            let (r1, r2) = build_test_pair(name, 0, pos1, pos2, rx, mi, false, false);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (_, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        assert_eq!(umis, vec![("GGG".to_string(), 5, 1, 1), ("TTT".to_string(), 5, 0, 1)]);
+        assert_eq!(duplex_umis, vec![("TTT-GGG".to_string(), 5, 1, 1)]);
 
         Ok(())
     }
