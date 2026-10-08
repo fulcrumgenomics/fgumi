@@ -8,7 +8,8 @@
 //! only the read name (optionally, with `--remove-umi`) and the `RX` tag change.
 //!
 //! Unlike `extract` (which parses FASTQ read names during unmapped-BAM creation
-//! and uses fgbio's strict ≥8-field rule), `copy-umi` uses fgbio
+//! and follows fgbio's strict 7/8-field rule, except that it also takes the last
+//! field of a 9+-field name and treats an empty last field as no UMI), `copy-umi` uses fgbio
 //! `CopyUmiFromReadName`'s lenient rule: the UMI is simply the last delimited
 //! field, with no field-count requirement. The two commands share the
 //! normalization step (`crate::umi::read_name::normalize_read_name_umi`) but keep

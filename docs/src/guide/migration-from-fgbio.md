@@ -27,6 +27,23 @@ fgumi is the Rust successor to [fgbio](https://github.com/fulcrumgenomics/fgbio)
 
 fgbio's `ExtractUmisFromBam` takes an unmapped BAM as input. fgumi's `extract` takes FASTQ files directly, which is more common in practice and avoids an unnecessary BAM conversion step.
 
+### UMIs From Read Names
+
+`fgumi extract --extract-umis-from-read-names` follows fgbio `FastqToBam --extract-umis-from-read-names` for the read name itself and for most field counts:
+
+- The read name ends at the first whitespace character (such as a space or TAB), as in fgbio. A comment, such as `1:N:0:ACGT` or the TAB-separated tags written by `samtools fastq -T`, is dropped and never read as the UMI.
+- A name with exactly 7 `:`-separated fields carries no UMI.
+- A name with 8 fields takes its UMI from the last field.
+- A name with 6 or fewer fields is an error that names the read, with a message adapted from fgbio's: `Trying to extract UMI from read with <n> colon-separated fields; expected at least 7 (7 = no UMI, 8 or more = UMI in the last field). Check the read-name format, or omit --extract-umis-from-read-names if the read names carry no UMI. Read name: <name>`. fgbio's text says "(7-8 expected)", which does not hold for fgumi because it accepts 9 or more fields.
+
+When the name carries no UMI, `RX` holds only the UMI from the read structure's `M` segments, and is absent when there are none.
+
+fgumi differs from fgbio in three cases:
+
+- A name with 9 or more fields takes its UMI from the last field, because some demultiplexers add the sample index as an extra field. fgbio rejects these names.
+- An 8-field name whose last field is empty carries no UMI. fgbio extracts an empty UMI instead, so it writes an empty `RX`, or `-<read UMI>` when the read structure has `M` segments, where fgumi writes no `RX`, or the read UMI alone.
+- A header with no name before its first whitespace (such as `@\tRX:Z:ACGT` or `@ 1:N:0:ACGT`), or whose name is only a `/1` or `/2` suffix, is an error, with or without `--extract-umis-from-read-names`. fgbio writes these reads with an empty name, which the SAM spec does not allow.
+
 ### Streaming Pipeline
 
 fgumi supports Unix pipe-based streaming for the alignment workflow:

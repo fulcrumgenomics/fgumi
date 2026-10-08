@@ -10,7 +10,8 @@
 //!
 //! The split is done on **raw record bytes**, not parsed records: each 4-line
 //! FASTQ record is routed whole to its side, so the read name — including any
-//! trailing comment that carries a UMI — is preserved verbatim. Only 4-line
+//! trailing comment — is preserved verbatim (`extract` strips the comment later,
+//! and never reads a UMI from it). Only 4-line
 //! FASTQ is supported (one line each for header, sequence, `+`, and quality),
 //! which every modern sequencer and every tool that would pipe into extract
 //! emits.
@@ -168,9 +169,9 @@ impl<R: BufRead> Read for DeinterleavedReader<R> {
 ///
 /// Records alternate `R1, R2, R1, R2, …`; the first reader yields the R1 records
 /// (indices 0, 2, 4, …) and the second the R2 records (1, 3, 5, …). Each record's
-/// raw bytes are preserved exactly, so read-name comments (e.g. an inline UMI)
-/// survive. An odd number of records leaves the final R1 without an R2 mate,
-/// which downstream paired handling surfaces as an out-of-sync error.
+/// raw bytes are preserved exactly, so read-name comments survive verbatim. An
+/// odd number of records leaves the final R1 without an R2 mate, which downstream
+/// paired handling surfaces as an out-of-sync error.
 ///
 /// The two readers share the source behind a mutex and may be read concurrently
 /// from different threads.
@@ -232,8 +233,9 @@ mod tests {
 
     #[test]
     fn preserves_read_name_comments_verbatim() {
-        // The UMI-in-name use case: the comment after the space must survive so
-        // `--extract-umis-from-read-names` still sees it.
+        // The deinterleaver is byte-transparent: the comment after the space must survive
+        // verbatim. Comment stripping (and UMI extraction from the name itself, never the
+        // comment) happens downstream in `extract`.
         let blob = fastq(&[
             ("read1 1:N:0:ACGT+TGCA", "ACGT", "IIII"),
             ("read1 2:N:0:ACGT+TGCA", "TGCA", "JJJJ"),
