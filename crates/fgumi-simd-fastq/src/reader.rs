@@ -26,6 +26,12 @@ pub struct OwnedFastqRecord {
 /// Reads chunks from the underlying `BufRead`, finds record boundaries with
 /// [`find_record_offsets`](crate::find_record_offsets), and yields owned records.
 ///
+/// Errors do not stall iteration. A malformed record, including a truncated or
+/// unparseable tail at EOF, is consumed when its `InvalidData` error is returned,
+/// so the next call moves on (to `None` after a bad tail). An I/O error from the
+/// source keeps every byte already buffered, so a caller that retries resumes the
+/// stream where it stopped.
+///
 /// # Example
 ///
 /// ```
@@ -84,7 +90,8 @@ impl<R: BufRead> SimdFastqReader<R> {
 
     /// Fill the internal buffer, preserving any leftover bytes from incomplete records.
     ///
-    /// Returns `true` if new data was read (or there are still records to yield).
+    /// Returns `true` if the buffer holds any bytes for `next()` to consume: complete
+    /// records, or a final leftover at EOF that is yielded or reported as an error.
     fn fill_buffer(&mut self) -> io::Result<bool> {
         // Determine leftover: bytes from the last complete record offset to end of valid data.
         let leftover_start = if self.offsets.is_empty() {
@@ -102,6 +109,11 @@ impl<R: BufRead> SimdFastqReader<R> {
         } else if leftover_start >= self.valid {
             self.valid = 0;
         }
+        // The old offsets index the pre-compaction buffer. Drop them now, so that if the
+        // read below fails and the caller retries, the next fill treats all of
+        // `buffer[..valid]` as leftover instead of re-applying stale offsets to it.
+        self.offsets.clear();
+        self.next_record_idx = 0;
 
         // If the buffer is full of leftover (no complete records found), grow it
         // so we can read more data and find the end of the current record.
@@ -124,7 +136,13 @@ impl<R: BufRead> SimdFastqReader<R> {
                 }
                 Ok(n) => total_read += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Keep the bytes this fill already read, so a retry continues the
+                    // stream rather than skipping them.
+                    self.valid += total_read;
+                    self.buffer.truncate(self.valid);
+                    return Err(e);
+                }
             }
         }
 
@@ -135,8 +153,13 @@ impl<R: BufRead> SimdFastqReader<R> {
         self.offsets = parser::find_record_offsets(&self.buffer[..self.valid]);
         self.next_record_idx = 0;
 
-        // We have data if there are any complete records
-        Ok(self.offsets.len() > 1 || (!self.at_eof && self.valid > 0))
+        // Report data whenever there are complete records OR any buffered bytes. At EOF a
+        // non-empty buffer with no complete record is a final leftover, which `next()`
+        // must still see: it is either a complete-but-unterminated record (yielded) or a
+        // truncated one (an error). Returning `false` there would end iteration and drop
+        // that leftover silently, e.g. a lone record with no trailing newline, or a final
+        // record whose bytes all arrive in the last fill.
+        Ok(self.offsets.len() > 1 || self.valid > 0)
     }
 }
 
@@ -197,6 +220,9 @@ impl<R: BufRead> Iterator for SimdFastqReader<R> {
                         let borrowed = match try_parse_single_record(leftover) {
                             Ok(rec) => rec,
                             Err(e) => {
+                                // Consume the leftover so a caller that continues past
+                                // the error terminates rather than seeing it repeatedly.
+                                self.valid = leftover_start;
                                 return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
                             }
                         };
@@ -209,12 +235,13 @@ impl<R: BufRead> Iterator for SimdFastqReader<R> {
                         self.valid = leftover_start;
                         return Some(Ok(record));
                     }
+                    let leftover_len = self.valid - leftover_start;
+                    // Consume the leftover so a caller that continues past the error
+                    // terminates rather than seeing it repeatedly.
+                    self.valid = leftover_start;
                     return Some(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "Truncated FASTQ record at EOF ({} leftover bytes)",
-                            self.valid - leftover_start
-                        ),
+                        format!("Truncated FASTQ record at EOF ({leftover_len} leftover bytes)"),
                     )));
                 }
                 return None;
@@ -315,6 +342,9 @@ mod tests {
         let mut reader = SimdFastqReader::new(Cursor::new(data));
         let _ = reader.next().expect("first record").expect("first record parses");
         assert_next_is_invalid_data(&mut reader);
+        // The erroring leftover must be consumed, so a caller that continues past the
+        // error terminates instead of receiving the same error forever.
+        assert!(reader.next().is_none(), "reader must terminate after the EOF-leftover error");
     }
 
     #[test]
@@ -347,6 +377,71 @@ mod tests {
         assert!(reader.next().is_none());
     }
 
+    /// A final record with no trailing newline must be yielded even when no complete
+    /// (newline-terminated) record shares its buffer fill: either it is the only record
+    /// in the input (`lone`), or a buffer exactly one record wide leaves it alone in the
+    /// last fill (`after_buffer_boundary`, 16 bytes = `@r1\nACGT\n+\nIIII\n`). Both
+    /// were previously dropped silently, because `fill_buffer` reported no data at EOF.
+    #[rstest]
+    #[case::lone(b"@r2\nTTTT\n+\nJJJJ", DEFAULT_BUFFER_SIZE, &[])]
+    #[case::after_buffer_boundary(b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ", 16, &["r1"])]
+    fn reader_yields_unterminated_final_record_alone_in_last_fill(
+        #[case] data: &[u8],
+        #[case] capacity: usize,
+        #[case] leading_names: &[&str],
+    ) {
+        let mut reader = SimdFastqReader::with_capacity(Cursor::new(data), capacity);
+        for &name in leading_names {
+            let rec = reader.next().expect("leading record").expect("leading record parses");
+            assert_eq!(rec.name, name.as_bytes());
+        }
+        let rec = reader
+            .next()
+            .expect("unterminated final record must be yielded, not dropped")
+            .expect("unterminated final record must parse");
+        assert_eq!(
+            rec,
+            OwnedFastqRecord {
+                name: b"r2".to_vec(),
+                sequence: b"TTTT".to_vec(),
+                quality: b"JJJJ".to_vec(),
+            }
+        );
+        assert!(reader.next().is_none(), "reader must terminate after the last record");
+    }
+
+    /// A truncated leftover that is alone in the last buffer fill must be an error, not
+    /// silently dropped: the `lone` input has no complete record at all, and the
+    /// `after_buffer_boundary` input's truncated tail arrives on its own in the final fill.
+    #[rstest]
+    #[case::lone(b"@r2\nTTTT\n+", DEFAULT_BUFFER_SIZE, &[], 10)]
+    #[case::after_buffer_boundary(b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+", 16, &["r1"], 10)]
+    fn reader_errors_on_truncated_leftover_alone_in_last_fill(
+        #[case] data: &[u8],
+        #[case] capacity: usize,
+        #[case] leading_names: &[&str],
+        #[case] leftover_bytes: usize,
+    ) {
+        let mut reader = SimdFastqReader::with_capacity(Cursor::new(data), capacity);
+        for &name in leading_names {
+            let rec = reader.next().expect("leading record").expect("leading record parses");
+            assert_eq!(rec.name, name.as_bytes());
+        }
+        let err = reader
+            .next()
+            .expect("a truncated leftover must surface, not end iteration")
+            .expect_err("a truncated leftover must be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            format!("Truncated FASTQ record at EOF ({leftover_bytes} leftover bytes)")
+        );
+        assert!(
+            reader.next().is_none(),
+            "reader must terminate after the truncated-leftover error"
+        );
+    }
+
     // ── Malformed-record validation (mirrors fgbio's FastqSource throwing
     // behavior in FastqIoTest, adapted to fgumi's fallible `io::Result` item
     // contract: the streaming reader surfaces an `InvalidData` error rather than
@@ -370,6 +465,7 @@ mod tests {
     fn test_reader_rejects_malformed_record(#[case] data: &[u8]) {
         let mut reader = SimdFastqReader::new(Cursor::new(data));
         assert_next_is_invalid_data(&mut reader);
+        assert!(reader.next().is_none(), "reader must terminate after the malformed record");
     }
 
     #[test]
@@ -413,5 +509,56 @@ mod tests {
         assert_eq!(rec.quality, qual.as_bytes(), "quality mismatch across buffer refills");
 
         assert!(reader.next().is_none());
+    }
+    /// A source that replays a fixed script of reads: each `Ok` chunk is returned whole
+    /// by one `read` call, each `Err` is returned once, and the source is at EOF after.
+    struct ScriptedReader(std::collections::VecDeque<io::Result<Vec<u8>>>);
+
+    impl io::Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Err(e)) => Err(e),
+                Some(Ok(chunk)) => {
+                    assert!(chunk.len() <= buf.len(), "test chunk larger than the read buffer");
+                    buf[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+            }
+        }
+    }
+
+    /// An I/O error from the source must not lose or corrupt buffered bytes: a caller that
+    /// retries after the error must still receive every record, in order. `partial_read`
+    /// fails after a short read inside one fill (those bytes must be kept);
+    /// `after_leftover_compaction` fails on the fill that follows a buffer ending
+    /// mid-record (the compacted leftover `@r2\n` must survive the retry).
+    #[rstest]
+    #[case::partial_read(DEFAULT_BUFFER_SIZE)]
+    #[case::after_leftover_compaction(20)]
+    fn reader_recovers_after_source_io_error(#[case] capacity: usize) {
+        let data: &[u8] = b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ\n";
+        let script = vec![
+            Ok(data[..20].to_vec()),
+            Err(io::Error::other("transient read failure")),
+            Ok(data[20..].to_vec()),
+        ];
+        let source = io::BufReader::with_capacity(1, ScriptedReader(script.into()));
+        let reader = SimdFastqReader::with_capacity(source, capacity);
+
+        let mut names = Vec::new();
+        let mut errors = 0;
+        for item in reader {
+            match item {
+                Ok(rec) => names.push(String::from_utf8(rec.name).expect("ASCII name")),
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::Other, "unexpected error: {e}");
+                    errors += 1;
+                    assert!(errors <= 1, "the transient error must surface exactly once");
+                }
+            }
+        }
+        assert_eq!(errors, 1, "the transient error must surface");
+        assert_eq!(names, ["r1", "r2"]);
     }
 }

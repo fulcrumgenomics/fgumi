@@ -12,7 +12,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
 /// The standard 28-byte BGZF EOF marker block.
-const BGZF_EOF: [u8; 28] = [
+pub const BGZF_EOF: [u8; 28] = [
     0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -85,6 +85,38 @@ pub fn assert_bytes_have_bgzf_eof(bytes: &[u8], label: &str) {
 pub fn assert_has_bgzf_eof(path: &std::path::Path) {
     let data = std::fs::read(path).expect("Failed to read file for EOF check");
     assert_bytes_have_bgzf_eof(&data, &path.display().to_string());
+}
+
+/// Whether the file at `path` ends with the standard 28-byte BGZF EOF marker
+/// block. A missing file, or one shorter than the marker, does not.
+///
+/// # Panics
+///
+/// Panics if the file exists but cannot be read.
+pub fn ends_with_bgzf_eof(path: &std::path::Path) -> bool {
+    match std::fs::read(path) {
+        Ok(data) => data.ends_with(&BGZF_EOF),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("failed to read {} for EOF check: {e}", path.display()),
+    }
+}
+
+/// Asserts that the output a failed run left at `path` is absent or lacks the
+/// BGZF EOF block, so no downstream tool (`samtools quickcheck`, a BGZF reader
+/// that checks for truncation) can mistake it for a complete file.
+///
+/// `label` names the run in the failure.
+///
+/// # Panics
+///
+/// Panics if the file ends with the BGZF EOF block, or exists but cannot be read.
+pub fn assert_lacks_bgzf_eof(path: &std::path::Path, label: &str) {
+    assert!(
+        !ends_with_bgzf_eof(path),
+        "{label}: a failed run left {} ending in the BGZF EOF block, so it reads as a \
+         complete file",
+        path.display()
+    );
 }
 
 /// Asserts that a rejects BAM's `@HD` sort-order fields (`SO`, `GO`, `SS`)

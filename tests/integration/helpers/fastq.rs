@@ -1,12 +1,19 @@
-//! FASTQ-writing helpers shared by the `runall` integration tests.
+//! FASTQ-writing helpers shared by the `extract` and `runall` integration tests.
 //!
 //! `runall`'s extract-fusion tests (`test_runall_command.rs`,
 //! `test_runall_chain_transitions.rs`) both need to stage small gzip-compressed
-//! FASTQ fixtures; this used to be duplicated verbatim in both files.
+//! FASTQ fixtures; this used to be duplicated verbatim in both files. The
+//! [`FastqFlavor`] writers stage the same records as plain, gzip or BGZF FASTQ,
+//! for tests that run once per compression format.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use noodles_bgzf::io::Writer as BgzfWriter;
+use tempfile::TempDir;
 
 /// Write a gzip-compressed FASTQ from `(name, seq, qual)` records.
 pub fn write_gzip_fastq(path: &Path, records: &[(&str, &str, &str)]) {
@@ -50,4 +57,94 @@ fn bgzf_compress(data: &[u8]) -> Vec<u8> {
         writer.finish().expect("finish bgzf");
     }
     bytes
+}
+
+/// Create a plain (uncompressed) FASTQ file.
+pub fn create_plain_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
+    let path = dir.path().join(name);
+    let mut file = File::create(&path).unwrap();
+    for (name, seq, qual) in records {
+        writeln!(file, "@{name}").unwrap();
+        writeln!(file, "{seq}").unwrap();
+        writeln!(file, "+").unwrap();
+        writeln!(file, "{qual}").unwrap();
+    }
+    path
+}
+
+/// Create a gzip-compressed FASTQ file.
+pub fn create_gzip_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
+    let path = dir.path().join(name);
+    let file = File::create(&path).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    for (name, seq, qual) in records {
+        writeln!(encoder, "@{name}").unwrap();
+        writeln!(encoder, "{seq}").unwrap();
+        writeln!(encoder, "+").unwrap();
+        writeln!(encoder, "{qual}").unwrap();
+    }
+    encoder.finish().unwrap();
+    path
+}
+
+/// Create a BGZF-compressed FASTQ file.
+pub fn create_bgzf_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
+    let path = dir.path().join(name);
+    let file = File::create(&path).unwrap();
+    let mut writer = BgzfWriter::new(file);
+    for (name, seq, qual) in records {
+        writeln!(writer, "@{name}").unwrap();
+        writeln!(writer, "{seq}").unwrap();
+        writeln!(writer, "+").unwrap();
+        writeln!(writer, "{qual}").unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// The FASTQ compression formats `extract` dispatches on. Each selects a
+/// different source front: BGZF files take the block-decode split
+/// (`BlockParseFast`/`BlockMerge`), gzip and plain the fused reader
+/// (`FindBoundaries`/`Decode`).
+#[derive(Clone, Copy, Debug)]
+pub enum FastqFlavor {
+    Plain,
+    Gzip,
+    Bgzf,
+}
+
+impl FastqFlavor {
+    /// Write `records` as `dir/name` in this flavor's format.
+    pub fn write(self, dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
+        match self {
+            Self::Plain => create_plain_fastq(dir, name, records),
+            Self::Gzip => create_gzip_fastq(dir, name, records),
+            Self::Bgzf => create_bgzf_fastq(dir, name, records),
+        }
+    }
+
+    /// Write raw FASTQ `bytes` through this flavor's compressor. Unlike
+    /// [`Self::write`], the caller controls the exact bytes, so a file that does
+    /// not end in a newline can be produced.
+    pub fn write_bytes(self, dir: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.path().join(name);
+        let file = File::create(&path).unwrap();
+        match self {
+            Self::Plain => {
+                let mut file = file;
+                file.write_all(bytes).unwrap();
+            }
+            Self::Gzip => {
+                let mut encoder = GzEncoder::new(file, Compression::default());
+                encoder.write_all(bytes).unwrap();
+                encoder.finish().unwrap();
+            }
+            Self::Bgzf => {
+                let mut writer = BgzfWriter::new(file);
+                writer.write_all(bytes).unwrap();
+                writer.finish().unwrap();
+            }
+        }
+        path
+    }
 }

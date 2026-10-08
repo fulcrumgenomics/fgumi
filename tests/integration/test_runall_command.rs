@@ -39,7 +39,7 @@ use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
 use crate::helpers::cutover::decompressed_records_without_pg;
-use crate::helpers::fastq::write_bgzf_fastq_with_corrupt_last_crc;
+use crate::helpers::fastq::{FastqFlavor, write_bgzf_fastq_with_corrupt_last_crc};
 use crate::helpers::read_bam_output;
 use crate::helpers::{aligner_binary, build_aligner_index, write_gzip_fastq};
 
@@ -2648,6 +2648,87 @@ fn extract_async_reader_prefetches_stdin_fastq() {
         "stdin must be the only prefetch:\n{log}"
     );
     assert_bams_record_equivalent_nonempty(&from_stdin, &from_file);
+}
+
+/// The warning extract logs when it finishes without emitting a record.
+const EMPTY_INPUT_WARNING: &str = "Extract: no records were emitted (every input FASTQ was empty)";
+
+/// An empty FASTQ input writes a header-only BAM, and warns that nothing was
+/// emitted, through each extract source front: single-end through the fused
+/// reader (plain and gzip files), the BGZF block-decode split, and stdin's
+/// sample-then-replay reader; paired (two files, both empty) through the fused
+/// reader and the per-stream BGZF split. Interleaved input is covered by the
+/// in-process `extract_empty_input_writes_empty_output` unit test. fgbio
+/// `FastqToBam` (e51a661) likewise writes a header-only BAM: with nothing
+/// sampled, `QualityEncodingDetector.rankedCompatibleEncodings` returns every
+/// encoding, so `FastqToBam.scala:131` never reaches its `case Nil => fail(...)`.
+///
+/// The header must equal the one a populated run of the same invocation writes
+/// (`@PG CL` normalized), so the empty path cannot pass on a bare valid BAM, and
+/// the populated run must not warn.
+#[rstest::rstest]
+#[case::plain_file(FastqFlavor::Plain, false, false, None)]
+#[case::plain_file_threaded(FastqFlavor::Plain, false, false, Some("2"))]
+#[case::gzip_file(FastqFlavor::Gzip, false, false, None)]
+#[case::bgzf_file_split(FastqFlavor::Bgzf, false, false, None)]
+#[case::bgzf_file_split_threaded(FastqFlavor::Bgzf, false, false, Some("2"))]
+#[case::plain_stdin(FastqFlavor::Plain, false, true, None)]
+#[case::gzip_stdin_threaded(FastqFlavor::Gzip, false, true, Some("2"))]
+#[case::plain_paired(FastqFlavor::Plain, true, false, None)]
+#[case::gzip_paired_threaded(FastqFlavor::Gzip, true, false, Some("2"))]
+#[case::bgzf_paired_split(FastqFlavor::Bgzf, true, false, None)]
+#[case::bgzf_paired_split_threaded(FastqFlavor::Bgzf, true, false, Some("4"))]
+fn extract_empty_fastq_writes_header_only_bam(
+    #[case] flavor: FastqFlavor,
+    #[case] paired: bool,
+    #[case] via_stdin: bool,
+    #[case] threads: Option<&str>,
+) {
+    assert!(!(paired && via_stdin), "stdin carries a single stream");
+    let tmp = TempDir::new().unwrap();
+    // Runs extract over `records` (written to both mates when paired) and
+    // returns the output BAM and the run's stderr.
+    let run = |name: &str, records: &[(&str, &str, &str)]| -> (PathBuf, String) {
+        let mates: &[&str] = if paired { &["r1", "r2"] } else { &["r1"] };
+        let fastqs: Vec<PathBuf> = mates
+            .iter()
+            .map(|mate| flavor.write(&tmp, &format!("{name}.{mate}.fq"), records))
+            .collect();
+        let out = tmp.path().join(format!("{name}.bam"));
+        let mut args = vec!["runall", "--start-from", "extract", "--stop-after", "extract"];
+        args.push("--extract::inputs");
+        if via_stdin {
+            args.push("-");
+        } else {
+            args.extend(fastqs.iter().map(|fastq| p(fastq)));
+        }
+        args.push("--extract::read-structures");
+        args.extend(mates.iter().map(|_| "+T"));
+        args.extend(["--extract::sample", "s1", "--extract::library", "lib1", "-o", p(&out)]);
+        if let Some(threads) = threads {
+            args.extend(["--threads", threads]);
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+        command.env("RUST_LOG", "info").args(&args);
+        if via_stdin {
+            command.stdin(std::fs::File::open(&fastqs[0]).unwrap());
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "runall extract ({name}, {flavor:?}) failed: {stderr}");
+        (out, stderr)
+    };
+
+    let (populated, populated_log) = run("populated", &[("q1", "ACGTACGTAC", "IIIIIIIIII")]);
+    let (populated_header, populated_records) = read_bam_output(&populated);
+    assert_eq!(populated_records.len(), if paired { 2 } else { 1 });
+    assert_eq!(populated_log.matches(EMPTY_INPUT_WARNING).count(), 0, "{populated_log}");
+
+    let (empty, empty_log) = run("empty", &[]);
+    let (empty_header, empty_records) = read_bam_output(&empty);
+    assert_eq!(empty_records, Vec::new());
+    assert_eq!(empty_header, populated_header);
+    assert_eq!(empty_log.matches(EMPTY_INPUT_WARNING).count(), 1, "{empty_log}");
 }
 
 /// A BAM-source start without `-i` must still be told `--input` is missing,

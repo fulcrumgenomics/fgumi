@@ -9,13 +9,17 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use fgumi_lib::commands::command::Command;
 use fgumi_lib::commands::extract::Extract;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use noodles::bam;
 use noodles::sam::alignment::RecordBuf;
 use noodles_bgzf::io::Writer as BgzfWriter;
 use rstest::rstest;
 use tempfile::TempDir;
+
+use crate::helpers::assertions::{BGZF_EOF, assert_lacks_bgzf_eof};
+use crate::helpers::fastq::{
+    FastqFlavor, create_bgzf_fastq, create_gzip_fastq, create_plain_fastq,
+};
+use crate::helpers::read_bam_output;
 
 /// Type alias for FASTQ test records (name, sequence, quality).
 type FastqRecords = Vec<(&'static str, &'static str, &'static str)>;
@@ -23,49 +27,6 @@ type FastqRecords = Vec<(&'static str, &'static str, &'static str)>;
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Create a plain (uncompressed) FASTQ file.
-fn create_plain_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
-    let path = dir.path().join(name);
-    let mut file = File::create(&path).unwrap();
-    for (name, seq, qual) in records {
-        writeln!(file, "@{name}").unwrap();
-        writeln!(file, "{seq}").unwrap();
-        writeln!(file, "+").unwrap();
-        writeln!(file, "{qual}").unwrap();
-    }
-    path
-}
-
-/// Create a gzip-compressed FASTQ file.
-fn create_gzip_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
-    let path = dir.path().join(name);
-    let file = File::create(&path).unwrap();
-    let mut encoder = GzEncoder::new(file, Compression::default());
-    for (name, seq, qual) in records {
-        writeln!(encoder, "@{name}").unwrap();
-        writeln!(encoder, "{seq}").unwrap();
-        writeln!(encoder, "+").unwrap();
-        writeln!(encoder, "{qual}").unwrap();
-    }
-    encoder.finish().unwrap();
-    path
-}
-
-/// Create a BGZF-compressed FASTQ file.
-fn create_bgzf_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
-    let path = dir.path().join(name);
-    let file = File::create(&path).unwrap();
-    let mut writer = BgzfWriter::new(file);
-    for (name, seq, qual) in records {
-        writeln!(writer, "@{name}").unwrap();
-        writeln!(writer, "{seq}").unwrap();
-        writeln!(writer, "+").unwrap();
-        writeln!(writer, "{qual}").unwrap();
-    }
-    writer.finish().unwrap();
-    path
-}
 
 /// Read BAM records from a file.
 fn read_bam_records(path: &Path) -> Vec<RecordBuf> {
@@ -1616,51 +1577,6 @@ fn as_str_records(records: &[(String, String, String)]) -> Vec<(&str, &str, &str
     records.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect()
 }
 
-/// The FASTQ compression formats `extract` dispatches on. Each selects a
-/// different pipeline: BGZF uses `BlockParseFast`/`BlockMerge`, gzip and plain
-/// use `FindBoundaries`/`Decode`.
-#[derive(Clone, Copy, Debug)]
-enum FastqFlavor {
-    Plain,
-    Gzip,
-    Bgzf,
-}
-
-impl FastqFlavor {
-    fn write(self, dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
-        match self {
-            Self::Plain => create_plain_fastq(dir, name, records),
-            Self::Gzip => create_gzip_fastq(dir, name, records),
-            Self::Bgzf => create_bgzf_fastq(dir, name, records),
-        }
-    }
-
-    /// Write raw FASTQ `bytes` through this flavor's compressor. Unlike
-    /// [`Self::write`], the caller controls the exact bytes, so a file that does
-    /// not end in a newline can be produced.
-    fn write_bytes(self, dir: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
-        let path = dir.path().join(name);
-        let file = File::create(&path).unwrap();
-        match self {
-            Self::Plain => {
-                let mut file = file;
-                file.write_all(bytes).unwrap();
-            }
-            Self::Gzip => {
-                let mut encoder = GzEncoder::new(file, Compression::default());
-                encoder.write_all(bytes).unwrap();
-                encoder.finish().unwrap();
-            }
-            Self::Bgzf => {
-                let mut writer = BgzfWriter::new(file);
-                writer.write_all(bytes).unwrap();
-                writer.finish().unwrap();
-            }
-        }
-        path
-    }
-}
-
 /// Serialize `records` as FASTQ text, optionally omitting the newline after the
 /// final record. A file that does not end in a newline leaves its last record in
 /// `suffix_bytes` on the BGZF path, which is the shape the no-trailing-newline
@@ -1880,7 +1796,10 @@ fn test_extract_matched_pair_without_trailing_newline(
 /// dropping the surplus outright. In `whole_batches` the short stream ends on an
 /// exact batch boundary, so the first divergent batch index carries *only* the
 /// long stream — which the old code emitted as single-end fragments (gzip and
-/// plain) or parked in the block merger forever (BGZF).
+/// plain) or parked in the block merger forever (BGZF). `one_empty` is the
+/// zero-record edge of `whole_batches`: an empty FASTQ on its own is accepted
+/// (it yields a header-only BAM), so this pins that an empty file paired with a
+/// populated one is still rejected rather than treated as an empty input.
 ///
 /// The short length is a multiple of the pipeline's per-batch record count at
 /// every thread count under test (200 at 1 thread, 800 at 4+), which is what puts
@@ -1897,9 +1816,10 @@ fn test_extract_matched_pair_without_trailing_newline(
 #[case::bgzf_t4(FastqFlavor::Bgzf, 4)]
 fn test_extract_rejects_mismatched_fastq_pair(#[case] flavor: FastqFlavor, #[case] threads: usize) {
     /// `(shape, short_count, long_count)`. 800 is a whole number of batches at
-    /// both 200 and 800 records per batch; 850 leaves a partial one.
-    const SHAPES: [(&str, usize, usize); 2] =
-        [("within_batch", 850, 950), ("whole_batches", 800, 2_600)];
+    /// both 200 and 800 records per batch; 850 leaves a partial one; 0 is an
+    /// empty file.
+    const SHAPES: [(&str, usize, usize); 3] =
+        [("within_batch", 850, 950), ("whole_batches", 800, 2_600), ("one_empty", 0, 950)];
 
     for (shape, short_count, long_count) in SHAPES {
         // Run both orientations: the surplus in R1 and the surplus in R2.
@@ -1948,6 +1868,10 @@ fn test_extract_rejects_mismatched_fastq_pair(#[case] flavor: FastqFlavor, #[cas
                      found {emitted} record(s), long stream has {long_count}"
                 );
             }
+            // The count bound alone cannot tell a rejected run from a valid
+            // header-only success (`one_empty` emits no records either way), so also
+            // require the leftover to be unfinished: no BGZF EOF block.
+            assert_lacks_bgzf_eof(&output, &label);
         }
     }
 }
@@ -1975,6 +1899,7 @@ fn test_extract_single_threaded_rejects_mismatched_fastq_pair(#[case] flavor: Fa
         let Err(error) = run_extract_pair_single_threaded(&r1, &r2, &output) else {
             panic!("single-threaded extract accepted a mismatched FASTQ pair ({label})");
         };
+        assert_lacks_bgzf_eof(&output, &label);
 
         let message = format!("{error:#}");
         let expected_direction =
@@ -1986,6 +1911,104 @@ fn test_extract_single_threaded_rejects_mismatched_fastq_pair(#[case] flavor: Fa
         assert!(
             message.contains(expected_direction),
             "rejection must name the stream that ended first ({label}): {message}"
+        );
+    }
+}
+
+/// A paired input whose two files are both empty BGZF must extract to a header-only
+/// BAM on the multi-stream BGZF split — the path whose block merger hung in #773 —
+/// at one and four threads. The split is taken only when there are 2+ inputs, none
+/// interleaved, and every one sniffs as BGZF, so the precondition pins that each
+/// empty file is exactly the BGZF EOF block (a BGZF file, not a 0-byte plain one).
+/// The header must equal the one a populated pair writes at the same thread count.
+#[rstest]
+#[case::t1(1)]
+#[case::t4(4)]
+fn test_extract_empty_bgzf_pair_on_split_writes_header_only_bam(#[case] threads: usize) {
+    let tmp = TempDir::new().unwrap();
+
+    let records = numbered_records(3);
+    let populated_r1 = FastqFlavor::Bgzf.write(&tmp, "populated.r1.fq", &as_str_records(&records));
+    let populated_r2 = FastqFlavor::Bgzf.write(&tmp, "populated.r2.fq", &as_str_records(&records));
+    let populated = tmp.path().join("populated.bam");
+    run_extract_pair(&populated_r1, &populated_r2, &populated, threads)
+        .unwrap_or_else(|e| panic!("populated BGZF pair must extract (t{threads}): {e}"));
+    let (populated_header, populated_records) = read_bam_output(&populated);
+    assert_eq!(populated_records.len(), 2 * records.len());
+
+    let empty_r1 = FastqFlavor::Bgzf.write(&tmp, "empty.r1.fq", &[]);
+    let empty_r2 = FastqFlavor::Bgzf.write(&tmp, "empty.r2.fq", &[]);
+    for input in [&empty_r1, &empty_r2] {
+        assert_eq!(std::fs::read(input).unwrap(), BGZF_EOF, "{} must be BGZF", input.display());
+    }
+    let empty = tmp.path().join("empty.bam");
+    run_extract_pair(&empty_r1, &empty_r2, &empty, threads)
+        .unwrap_or_else(|e| panic!("empty BGZF pair must extract (t{threads}): {e}"));
+    let (empty_header, empty_records) = read_bam_output(&empty);
+    assert_eq!(empty_records, Vec::new());
+    assert_eq!(empty_header, populated_header);
+}
+
+/// Run single-end `fgumi extract --read-structures +T` over `input`.
+fn run_extract_single(input: &Path, output: &Path, threads: usize) -> anyhow::Result<()> {
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "--sample",
+        "test_sample",
+        "--library",
+        "test_library",
+        "--threads",
+        &threads.to_string(),
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse extract args");
+    cmd.execute("fgumi extract")
+}
+
+/// A FASTQ whose only record has no trailing newline must still drive quality
+/// encoding detection. The detection sampler used to drop such a record — at EOF
+/// with no complete (newline-terminated) record in its buffer it reported no data
+/// — so it saw nothing, defaulted to Phred+33, and the main pass (which does read
+/// the record) wrote Phred+64 qualities shifted up by 31. Here the qualities are
+/// all `h`, which is Q40 in Phred+64 and therefore detected as Illumina; the
+/// output must hold Q40 whether or not the file ends in a newline.
+#[rstest]
+#[case::plain_unterminated(FastqFlavor::Plain, false)]
+#[case::plain_terminated(FastqFlavor::Plain, true)]
+#[case::gzip_unterminated(FastqFlavor::Gzip, false)]
+#[case::bgzf_unterminated(FastqFlavor::Bgzf, false)]
+fn test_extract_detects_encoding_from_lone_unterminated_record(
+    #[case] flavor: FastqFlavor,
+    #[case] trailing_newline: bool,
+) {
+    const PHRED64_Q40: u8 = 64 + 40;
+    let bases = "ACGTACGTAC";
+    let quals: String = std::iter::repeat_n(char::from(PHRED64_Q40), bases.len()).collect();
+    let bytes = fastq_bytes(&[("q1", bases, quals.as_str())], trailing_newline);
+    assert_eq!(bytes.ends_with(b"\n"), trailing_newline);
+
+    for threads in [1, 4] {
+        let tmp = TempDir::new().unwrap();
+        let input = flavor.write_bytes(&tmp, "one.fq", &bytes);
+        let output = tmp.path().join("out.bam");
+        run_extract_single(&input, &output, threads).unwrap_or_else(|e| {
+            panic!("extract must accept the record ({flavor:?}, t{threads}): {e}")
+        });
+
+        let records = read_bam_records(&output);
+        assert_eq!(records.len(), 1, "{flavor:?}, t{threads}");
+        assert_eq!(records[0].sequence().as_ref(), bases.as_bytes(), "{flavor:?}, t{threads}");
+        assert_eq!(
+            records[0].quality_scores().as_ref(),
+            vec![40u8; bases.len()].as_slice(),
+            "Phred+64 qualities must be detected and converted ({flavor:?}, t{threads})"
         );
     }
 }
