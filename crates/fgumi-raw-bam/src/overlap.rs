@@ -8,7 +8,9 @@ use crate::tags::RawTagsView;
 /// Crate-internal per-record FR (forward-reverse) classification from raw BAM bytes.
 ///
 /// **Per-record, and not a gate for pair decisions.** The forward-strand arm derives the mate's
-/// 5' end from `TLEN`, which misclassifies dovetail FR pairs whose aligned ends coincide
+/// 5' end from `TLEN` (htsjdk 5.0.0's fallback when there is no `MC` tag), and `TLEN` can
+/// disagree with the mate's CIGAR: a leftmost-to-rightmost `TLEN` on a dovetail, or bwa's `TLEN`
+/// 0 at a 5' tie, makes the forward record report non-FR while the reverse record reports FR
 /// (htsjdk/samtools#1771). It is therefore crate-internal: it exists only as the reverse-arm
 /// building block for the correct, TLEN-independent gates. Callers that need to classify a pair
 /// must use `is_primary_fr_pair_raw` (both records in hand) or `is_fr_pair_with_mate_cigar_raw`
@@ -16,7 +18,11 @@ use crate::tags::RawTagsView;
 /// `record_utils::is_fr_pair_from_tags`.
 ///
 /// Returns `true` if the read is paired, both read and mate are mapped,
-/// on the same reference, and in FR orientation (positive strand 5' < negative strand 5').
+/// on the same reference, and in FR orientation (positive strand 5' `<=` negative strand 5').
+///
+/// The comparison is inclusive, as in htsjdk 5.0.0 `SamPairUtil.getPairOrientation`
+/// (`SamPairUtil.java:136`, htsjdk#1771), which fgbio pins: a pair whose two 5' ends coincide —
+/// a dovetail whose reverse read's aligned end equals the forward read's aligned start — is FR.
 #[must_use]
 pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
     let v = RawRecordView::new(bam);
@@ -46,25 +52,33 @@ pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
         return false;
     }
 
-    // Determine if FR or RF using htsjdk's logic:
+    // Determine if FR or RF using htsjdk 5.0.0's logic (TLEN fallback for the forward arm):
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
-    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
-    let alignment_start = v.pos() + 1; // 1-based
-    let m_start = mate_pos(bam) + 1; // 1-based
-    let insert_size = template_length(bam);
+    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd
+    //                                                    : CoordMath.getEnd(alignmentStart, insertSize)
+    //
+    // Widened to i64 so an extreme POS or TLEN cannot overflow.
+    let alignment_start = i64::from(v.pos()) + 1; // 1-based
+    let m_start = i64::from(mate_pos(bam)) + 1; // 1-based
+    let insert_size = i64::from(template_length(bam));
 
     let (positive_five_prime, negative_five_prime) = if is_reverse {
-        // This read is on reverse strand, mate is on positive strand
-        let ref_len = reference_length_from_raw_bam(bam);
-        let end = alignment_start + (ref_len - 1).max(0);
-        (m_start, end)
+        // This read is on reverse strand, mate is on positive strand. htsjdk's
+        // `getAlignmentEnd()` is `start + referenceLength - 1`, deliberately unclamped: a read
+        // with no reference-consuming ops ends at `start - 1`, so at its mate's start it is RF.
+        let ref_len = i64::from(reference_length_from_raw_bam(bam));
+        (m_start, alignment_start + ref_len - 1)
     } else {
-        // This read is on positive strand, mate is on reverse strand
-        (alignment_start, alignment_start + insert_size)
+        // This read is on positive strand, mate is on reverse strand. htsjdk's
+        // `CoordMath.getEnd(start, length)` is `start + length - 1`. With `<=` below this
+        // classifies exactly as the former `start + length` with `<` did (for integers,
+        // `a <= b - 1` iff `a < b`): it re-expresses htsjdk's formula and does not move the
+        // TLEN arm's FR/RF boundary.
+        (alignment_start, alignment_start + insert_size - 1)
     };
 
-    // FR if positive strand 5' < negative strand 5'
-    positive_five_prime < negative_five_prime
+    // FR if positive strand 5' <= negative strand 5' (htsjdk 5.0.0, htsjdk#1771): a 5' tie is FR.
+    positive_five_prime <= negative_five_prime
 }
 
 /// Symmetric per-pair FR classification for a template's two primary reads.
@@ -76,7 +90,13 @@ pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
 /// orientation from the **reverse-strand record only**. That branch of the orientation test is
 /// CIGAR-derived (`is_fr_pair_raw`'s reverse arm), so it is independent of TLEN and gives the
 /// same answer regardless of argument order — avoiding the htsjdk per-record asymmetry
-/// (samtools/htsjdk#1771) that mis-drops dovetail pairs whose aligned ends coincide.
+/// (samtools/htsjdk#1771) where a forward record's `TLEN` disagrees with its mate's CIGAR and
+/// mis-drops a dovetail FR pair.
+///
+/// The orientation test is inclusive, per htsjdk 5.0.0 `SamPairUtil.getPairOrientation`
+/// (`SamPairUtil.java:136`), which fgbio pins: FR iff positive-strand 5' `<=` negative-strand 5'.
+/// This is what keeps the HEK293T geometry this gate was written for (fgumi #505) — the reverse
+/// read's aligned end equal to the forward read's aligned start — classified FR.
 ///
 /// Returns `true` iff `(a, b)` is a single primary FR pair.
 #[must_use]
@@ -110,17 +130,20 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 /// FR classification for the MC-tag consensus path, evaluated per-*pair* rather than via the
 /// per-record TLEN arm of `is_fr_pair_raw`.
 ///
-/// `is_fr_pair_raw`'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which
-/// misclassifies dovetail FR pairs whose aligned ends coincide (htsjdk/samtools#1771) and zeroes
-/// the read-through clip for the forward read. The simplex/duplex callers hold the read plus its
+/// `is_fr_pair_raw`'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which can
+/// disagree with the mate's CIGAR on dovetail FR pairs (htsjdk/samtools#1771) and would zero the
+/// read-through clip for the forward read. The simplex/duplex callers hold the read plus its
 /// `MC` tag (mate CIGAR), so the reverse-strand record's CIGAR-derived orientation — the branch
 /// [`is_primary_fr_pair_raw`] evaluates — can be reconstructed for either strand:
 /// - a reverse-strand read *is* the reverse record, so its own CIGAR-based arm (exactly
 ///   `is_fr_pair_raw`) is already correct and TLEN-independent;
 /// - a forward-strand read's mate is the reverse record: its leftmost (5') is `mate_pos` and its
-///   inclusive alignment end is `mate_pos + mate_ref_len - 1` (from the `MC` CIGAR), and the pair
-///   is FR iff the forward read's own 5' (its leftmost) is `<` that end — the same
-///   `positive_five_prime < negative_five_prime` test `is_fr_pair_raw`'s reverse arm applies.
+///   inclusive alignment end is `mate_pos + mate_ref_len - 1` (from the `MC` CIGAR; htsjdk's
+///   `CoordMath.getEnd(mate_pos, mate_ref_len)`, unclamped, so a zero span ends at
+///   `mate_pos - 1`), and the pair is FR iff the forward read's own 5' (its leftmost) is `<=`
+///   that end — the same `positive_five_prime <= negative_five_prime` test `is_fr_pair_raw`'s
+///   reverse arm applies (htsjdk 5.0.0 `SamPairUtil.getPairOrientation`, whose forward arm
+///   likewise uses the `MC` CIGAR when present).
 ///
 /// `mate_ref_len` is the reference span of the mate's CIGAR (from the `MC` tag), clamped by
 /// [`saturating_reference_length`]. This matches `is_primary_fr_pair_raw(read, mate)` on dovetail
@@ -153,11 +176,14 @@ fn is_fr_pair_with_mate_cigar_raw(bam: &[u8], mate_ref_len: i32) -> bool {
     }
 
     // Forward read: evaluate the reverse mate's CIGAR-derived arm. positive strand 5' (this
-    // read's leftmost) < negative strand 5' (the mate's inclusive alignment end).
-    let this_start = v.pos() + 1; // 1-based
-    let mate_start = mate_pos(bam) + 1; // 1-based
-    let mate_end = mate_start.saturating_add((mate_ref_len - 1).max(0));
-    this_start < mate_end
+    // read's leftmost) <= negative strand 5' (the mate's inclusive alignment end); a 5' tie is FR
+    // (htsjdk 5.0.0, htsjdk#1771).
+    // The mate's end is htsjdk's `CoordMath.getEnd(mateStart, mateRefLength)` =
+    // `mateStart + mateRefLength - 1`, unclamped (a zero span ends at `mateStart - 1`), in i64.
+    let this_start = i64::from(v.pos()) + 1; // 1-based
+    let mate_start = i64::from(mate_pos(bam)) + 1; // 1-based
+    let mate_end = mate_start + i64::from(mate_ref_len) - 1;
+    this_start <= mate_end
 }
 
 /// Number of bases a read extends past its mate for FR pairs, taking the mate's alignment from
@@ -928,8 +954,8 @@ mod tests {
     fn test_is_fr_pair_raw_fr_positive_strand_read() {
         // FR pair: this read is forward, mate is reverse, on same reference
         // positive_five_prime = alignment_start = 101
-        // negative_five_prime = alignment_start + insert_size = 101 + 200 = 301
-        // 101 < 301 => FR => true
+        // negative_five_prime = alignment_start + insert_size - 1 = 101 + 200 - 1 = 300
+        // 101 <= 300 => FR => true
         let rec = make_bam_bytes_with_tlen(
             0,
             100,
@@ -971,8 +997,8 @@ mod tests {
         // RF pair: this read is forward, mate is reverse, but mate is upstream
         // Read at pos 200, mate at pos 100
         // positive_five_prime = alignment_start = 201
-        // negative_five_prime = alignment_start + insert_size = 201 + (-100) = 101
-        // 201 > 101 => NOT FR (it's RF) => false
+        // negative_five_prime = alignment_start + insert_size - 1 = 201 + (-100) - 1 = 100
+        // 201 > 100 => NOT FR (it's RF) => false
         let rec = make_bam_bytes_with_tlen(
             0,
             200,
@@ -996,9 +1022,9 @@ mod tests {
     fn test_is_primary_fr_pair_raw_symmetric_on_dovetail() {
         // A dovetail FR pair on which the *per-record* check disagrees:
         //  - forward read has TLEN = -90, so is_fr_pair_raw(fwd) uses the TLEN branch
-        //    (0 < -90 => false) and wrongly reports NOT FR (CODEC-01);
+        //    (101 <= 101 - 90 - 1 => false) and wrongly reports NOT FR (CODEC-01);
         //  - reverse read (100M @ 61..160, mate 5' at 101) uses the CIGAR branch
-        //    (101 < 160 => true) and reports FR.
+        //    (101 <= 160 => true) and reports FR.
         // is_primary_fr_pair_raw evaluates the reverse record only, so it is symmetric
         // and returns true regardless of argument order.
         let fwd = make_bam_bytes_with_tlen(
@@ -1118,6 +1144,276 @@ mod tests {
             &[],
         );
         assert!(!is_primary_fr_pair_raw(&fr_fwd, &xchrom), "cross-chromosomal is not FR");
+    }
+
+    /// The fgbio `CodecConsensusCallerTest` dovetail pair (`isPrimaryFrPair` test, ~line 359 on
+    /// fgbio main; same geometry as the ~line 210 consensus test): 129 bp reads, forward
+    /// `68S53M8S` @ 96 (aligned 96..148), reverse `28S48M53S` @ 49 (aligned 49..96). The
+    /// reverse read's aligned end coincides with the forward read's aligned start, and fgbio's
+    /// `SamBuilder` (via htsjdk `computeInsertSize`) gives the forward read TLEN +1 and the
+    /// reverse read TLEN -1. Returns `(forward, reverse)`.
+    fn fgbio_coincident_five_prime_dovetail() -> (Vec<u8>, Vec<u8>) {
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            95,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"dovetail",
+            &[encode_op(4, 68), encode_op(0, 53), encode_op(4, 8)],
+            129,
+            0,
+            48,
+            1,
+            &[],
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            48,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"dovetail",
+            &[encode_op(4, 28), encode_op(0, 48), encode_op(4, 53)],
+            129,
+            0,
+            95,
+            -1,
+            &[],
+        );
+        (fwd, rev)
+    }
+
+    /// Port of fgbio `CodecConsensusCallerTest` "classify a dovetail FR pair as FR regardless of
+    /// argument order" (~line 359): `isPrimaryFrPair(r1, r2)` and `(r2, r1)` are both true.
+    /// htsjdk 5.0.0 `SamPairUtil.getPairOrientation` (`SamPairUtil.java:136`, htsjdk#1771)
+    /// classifies FR when positive-strand 5' `<=` negative-strand 5', so a 5' tie (96 == 96
+    /// here) is FR.
+    #[test]
+    fn test_is_primary_fr_pair_raw_coincident_five_prime_dovetail() {
+        let (fwd, rev) = fgbio_coincident_five_prime_dovetail();
+        assert!(is_primary_fr_pair_raw(&fwd, &rev), "fgbio isPrimaryFrPair(r1, r2) is true");
+        assert!(is_primary_fr_pair_raw(&rev, &fwd), "fgbio isPrimaryFrPair(r2, r1) is true");
+    }
+
+    /// The per-record reverse-strand arm on the fgbio ~line 359 pair: mate (positive-strand) 5'
+    /// = 96 and this read's alignment end = 96. htsjdk 5.0.0 `getPairOrientation`
+    /// (`SamPairUtil.java:136`) returns FR on that tie (`<=`).
+    #[test]
+    fn test_is_fr_pair_raw_reverse_record_coincident_five_prime() {
+        let (fwd, rev) = fgbio_coincident_five_prime_dovetail();
+        assert!(is_fr_pair_raw(&rev), "reverse arm: 96 <= 96 is FR");
+        // Forward (TLEN) arm. Not a behavior change: `start + TLEN - 1` with `<=` classifies
+        // exactly as the former `start + TLEN` with `<` (96 < 97), since `a <= b - 1` iff
+        // `a < b`. It does fail if the `<=` alone reverts to `<` (96 < 96).
+        assert!(is_fr_pair_raw(&fwd), "forward arm: 96 <= getEnd(96, TLEN 1) = 96 is FR");
+    }
+
+    /// A strict RF pair one base past the tie stays RF: the reverse read `100M` @ 100 ends at
+    /// 199 and its forward mate starts at 200, so positive 5' (200) > negative 5' (199). Guards
+    /// the htsjdk 5.0.0 `<=` rule (`SamPairUtil.java:136`) against being widened past the tie.
+    #[test]
+    fn test_is_fr_pair_raw_strict_rf_stays_not_fr() {
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            99,
+            flags::PAIRED | flags::REVERSE,
+            b"rfpair",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            199,
+            2,
+            &[],
+        );
+        // htsjdk `computeInsertSize`: forward 5' 200, reverse 5' 199 -> TLEN -2 / +2.
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            199,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rfpair",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            99,
+            -2,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rev), "positive 5' 200 > negative 5' 199 is RF");
+        // Forward (TLEN) arm: RF under both the old and new arithmetic (they are equivalent),
+        // so this only documents the value; the TLEN arm's boundary is pinned by
+        // `test_is_fr_pair_raw_forward_tlen_arm_boundary`.
+        assert!(!is_fr_pair_raw(&fwd), "positive 5' 200 > getEnd(200, -2) = 197 is RF");
+        assert!(!is_primary_fr_pair_raw(&rev, &fwd));
+        assert!(!is_primary_fr_pair_raw(&fwd, &rev));
+    }
+
+    /// A 5'-tie FR pair as fgbio/htsjdk `setMateInfo` writes it: forward and reverse records
+    /// with each read's `MC` tag set to its mate's CIGAR and htsjdk `computeInsertSize` TLENs
+    /// (+1 on the forward read, -1 on the reverse, since the two 5' ends are equal). Positions
+    /// are 0-based. Returns `(forward, reverse)`.
+    fn five_prime_tie_pair_with_mc(
+        fwd_pos: i32,
+        fwd_cigar: &str,
+        rev_pos: i32,
+        rev_cigar: &str,
+        l_seq: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let ops = |cigar: &str| parse_mc_cigar_ops(cigar).expect("valid test CIGAR");
+        let mc = |cigar: &str| {
+            let mut aux = b"MCZ".to_vec();
+            aux.extend_from_slice(cigar.as_bytes());
+            aux.push(0);
+            aux
+        };
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            fwd_pos,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"tie",
+            &ops(fwd_cigar),
+            l_seq,
+            0,
+            rev_pos,
+            1,
+            &mc(rev_cigar),
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            rev_pos,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"tie",
+            &ops(rev_cigar),
+            l_seq,
+            0,
+            fwd_pos,
+            -1,
+            &mc(fwd_cigar),
+        );
+        (fwd, rev)
+    }
+
+    /// Pins the read-through clip the simplex/duplex callers apply (via the `MC`-tag path,
+    /// `num_bases_extending_past_mate_raw`) on 5'-tie FR pairs. The forward read reaches the
+    /// changed `is_fr_pair_with_mate_cigar_raw` arm (`this_start <= mate_end`); under a strict
+    /// `<` it is classified non-FR and clips 0.
+    ///
+    /// Expected values trace fgbio `SamRecordClipper.numBasesExtendingPastMate`
+    /// (SamRecordClipper.scala:333-346), gated on `isFrPair` = htsjdk 5.0.0
+    /// `getPairOrientation` (forward arm: `CoordMath.getEnd(mateStart, MC refLength)`; reverse
+    /// arm: `alignmentEnd`; FR iff `<=`), with the mate's soft-only unclipped bounds from `MC`:
+    ///
+    /// - `fgbio_hek293t` — forward `68S53M8S` @ 96 (aligned 96..148), reverse `28S48M53S` @ 49
+    ///   (aligned 49..96). `isFrPair`: `96 <= getEnd(49, 48) = 96` and `96 <= 96`, FR.
+    ///   Forward: mate unsoft-clipped end `96 + 53 = 149 > rec.end 148`, so
+    ///   `max(0, trailingSoft 8 - (149 - 148)) = 7`. Reverse: mate unsoft-clipped start
+    ///   `96 - 68 = 28 < rec.start 49`, so `max(0, leadingSoft 28 - (49 - 28)) = 7`.
+    /// - `htsjdk_dovetail_tie` — htsjdk `SamPairUtilTest` "dovetail 5' tie": forward `100M` @ 100
+    ///   (100..199), reverse `100M` @ 1 (1..100). `isFrPair`: `100 <= getEnd(1, 100) = 100`, FR.
+    ///   Forward: `rec.end 199 >= 100`, so `rec.length - readPosAtRefPos(100) = 100 - 1 = 99`.
+    ///   Reverse: `rec.start 1 <= 100`, so `readPosAtRefPos(100) - 1 = 99`.
+    ///
+    /// The mate-in-hand path (`num_bases_extending_past_mate_vs_mate_raw`, used by codec and
+    /// `fgumi clip`) must agree in both argument orders.
+    #[rstest]
+    #[case::fgbio_hek293t(95, "68S53M8S", 48, "28S48M53S", 129, 7, 7)]
+    #[case::htsjdk_dovetail_tie(99, "100M", 0, "100M", 100, 99, 99)]
+    fn test_num_bases_extending_past_mate_raw_five_prime_tie(
+        #[case] fwd_pos: i32,
+        #[case] fwd_cigar: &str,
+        #[case] rev_pos: i32,
+        #[case] rev_cigar: &str,
+        #[case] l_seq: usize,
+        #[case] expected_fwd: usize,
+        #[case] expected_rev: usize,
+    ) {
+        let (fwd, rev) = five_prime_tie_pair_with_mc(fwd_pos, fwd_cigar, rev_pos, rev_cigar, l_seq);
+
+        assert_eq!(num_bases_extending_past_mate_raw(&fwd), expected_fwd, "forward, MC path");
+        assert_eq!(num_bases_extending_past_mate_raw(&rev), expected_rev, "reverse, MC path");
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev), expected_fwd);
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&rev, &fwd), expected_rev);
+    }
+
+    /// The forward (TLEN) arm's FR/RF boundary: FR iff `start <= CoordMath.getEnd(start, TLEN)
+    /// = start + TLEN - 1`, i.e. iff `TLEN >= 1`. This boundary is the same as the former
+    /// `start < start + TLEN`; rewriting the arm as htsjdk's `getEnd` with `<=` does not move it.
+    /// `TLEN` 1 is htsjdk's `computeInsertSize` at a 5' tie (FR; fails if the `<=` reverts to
+    /// `<`); `TLEN` 0 is bwa's value at a 5' tie (RF here, where htsjdk 5.0.0 would use `MC`;
+    /// fails if the `- 1` is dropped while keeping `<=`).
+    #[rstest]
+    #[case::htsjdk_tie_tlen(1, true)]
+    #[case::bwa_tie_tlen(0, false)]
+    fn test_is_fr_pair_raw_forward_tlen_arm_boundary(#[case] tlen: i32, #[case] fr: bool) {
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            99,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            0,
+            tlen,
+            &[],
+        );
+        assert_eq!(is_fr_pair_raw(&rec), fr);
+    }
+
+    /// A mapped reverse read with no reference-consuming CIGAR ops (`100S`) at its forward
+    /// mate's start is RF, in every orientation copy here. htsjdk `getAlignmentEnd` is
+    /// `start + referenceLength - 1`, i.e. `start - 1` for a zero span, so the reverse arm
+    /// compares `100 <= 99`; the forward arm with `MC` uses `CoordMath.getEnd(100, 0) = 99`
+    /// likewise. Clamping the end to `start` made the inclusive `<=` call it FR (`100 <= 100`).
+    #[test]
+    fn test_zero_reference_span_reverse_read_at_mate_start_is_rf() {
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            99,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"zero",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            99,
+            0,
+            &[],
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            99,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"zero",
+            &[encode_op(4, 100)],
+            100,
+            0,
+            99,
+            0,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rev), "reverse arm: 100 <= 100 + 0 - 1 = 99 is RF");
+        assert!(!is_primary_fr_pair_raw(&fwd, &rev));
+        assert!(!is_primary_fr_pair_raw(&rev, &fwd));
+        assert!(!is_fr_pair_with_mate_cigar_raw(&fwd, 0), "MC arm: 100 <= getEnd(100, 0) = 99");
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&fwd, &rev), 0);
+        assert_eq!(num_bases_extending_past_mate_vs_mate_raw(&rev, &fwd), 0);
+    }
+
+    /// The forward TLEN arm is evaluated in `i64`, as in the sibling copies, so an extreme TLEN
+    /// cannot overflow `start + TLEN - 1` (a debug panic, a silent wrap in release).
+    #[rstest]
+    #[case::max_tlen(i32::MAX, true)]
+    #[case::min_tlen(i32::MIN, false)]
+    fn test_is_fr_pair_raw_extreme_tlen_does_not_overflow(#[case] tlen: i32, #[case] fr: bool) {
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            tlen,
+            &[],
+        );
+        assert_eq!(is_fr_pair_raw(&rec), fr);
     }
 
     // ========================================================================

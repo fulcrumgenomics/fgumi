@@ -28,14 +28,15 @@ pub enum PairOrientation {
     /// ```text
     /// 5' --F-->       <--R-- 5'
     /// ```
-    /// The positive strand 5' position is less than the negative strand 5' position.
+    /// The positive strand 5' position is less than or equal to the negative strand 5' position
+    /// (htsjdk 5.0.0 `SamPairUtil.getPairOrientation`).
     FR,
 
     /// Reverse-Forward orientation ("outie") - reads face away from each other:
     /// ```text
     /// <--R-- 5'       5' --F-->
     /// ```
-    /// The positive strand 5' position is greater than or equal to the negative strand 5' position.
+    /// The positive strand 5' position is greater than the negative strand 5' position.
     RF,
 
     /// Tandem orientation - both reads on the same strand:
@@ -131,7 +132,7 @@ pub fn read_pos_at_ref_pos(
 /// - Read is paired
 /// - Both read and mate are mapped
 /// - Both are on the same reference
-/// - The pair is in FR orientation (positive strand 5' < negative strand 5')
+/// - The pair is in FR orientation (positive strand 5' `<=` negative strand 5', per htsjdk 5.0.0)
 ///
 /// This matches fgbio's `isFrPair` algorithm using htsjdk's pair orientation logic.
 // RecordBuf kept: accesses flags/ref-id/mate fields via noodles typed API; raw equivalent is is_fr_pair_raw in fgumi-raw-bam.
@@ -479,7 +480,14 @@ pub fn reference_length(cigar: &impl CigarTrait) -> usize {
 }
 
 /// Get pair orientation using htsjdk's algorithm.
-/// This matches htsjdk's `SamPairUtil.getPairOrientation()` exactly.
+/// This matches htsjdk 5.0.0's `SamPairUtil.getPairOrientation()` when no `MC` tag is used: the
+/// forward-strand arm derives the mate's 5' end from TLEN, and the pair is FR iff the
+/// positive-strand 5' `<=` the negative-strand 5' (`SamPairUtil.java:136`, htsjdk#1771), so a
+/// 5' tie is FR. htsjdk 5.0.0 prefers the `MC` tag on the forward arm when present; this does
+/// not, so a pair whose forward `TLEN` disagrees with the mate's CIGAR (e.g. bwa's `TLEN` 0 at a
+/// 5' tie) can classify differently from its two ends. The reverse arm's alignment end is
+/// htsjdk's `getAlignmentEnd()`, `start + referenceLength - 1`, so a zero reference span ends at
+/// `start - 1`.
 // RecordBuf kept: reads flags/positions via noodles typed Flags and Position API; serves noodles-typed callers.
 #[must_use]
 pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
@@ -502,17 +510,21 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
         reason = "genomic positions are non-negative and fit in i64 on all supported platforms"
     )]
     let (positive_five_prime, negative_five_prime) = if is_reverse {
-        // This read is on reverse strand, mate is on positive strand
+        // This read is on reverse strand, mate is on positive strand. htsjdk's
+        // `getAlignmentEnd()` is `start + referenceLength - 1`, deliberately unclamped: a read
+        // with no reference-consuming ops ends at `start - 1`, so at its mate's start it is RF.
         let ref_len = reference_length(&record.cigar());
-        let end = alignment_start + ref_len.saturating_sub(1);
-        (mate_start as i64, end as i64)
+        (mate_start as i64, alignment_start as i64 + ref_len as i64 - 1)
     } else {
-        // This read is on positive strand, mate is on reverse strand
-        (alignment_start as i64, alignment_start as i64 + i64::from(insert_size))
+        // This read is on positive strand, mate is on reverse strand.
+        // htsjdk `CoordMath.getEnd(alignmentStart, insertSize)` = start + insertSize - 1. With
+        // `<=` below this classifies exactly as the former `start + insertSize` with `<` did
+        // (`a <= b - 1` iff `a < b`), so the TLEN arm's FR/RF boundary does not move.
+        (alignment_start as i64, alignment_start as i64 + i64::from(insert_size) - 1)
     };
 
-    // FR if positive strand 5' < negative strand 5'
-    if positive_five_prime < negative_five_prime {
+    // FR if positive strand 5' <= negative strand 5' (htsjdk 5.0.0): a 5' tie is FR.
+    if positive_five_prime <= negative_five_prime {
         PairOrientation::FR
     } else {
         PairOrientation::RF
@@ -522,7 +534,13 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
 /// Check if a read pair is in FR (forward-reverse) orientation.
 ///
 /// FR orientation means one read is on the forward strand and one on the reverse strand,
-/// with the positive strand 5' end before the negative strand 5' end.
+/// with the positive strand 5' end at or before the negative strand 5' end (a 5' tie is FR, per
+/// htsjdk 5.0.0 `SamPairUtil.getPairOrientation`).
+///
+/// Orientation is evaluated on `r1` via [`get_pair_orientation`]. When `r1` is the forward read,
+/// the mate's 5' end comes from `r1`'s `TLEN`, not `r2`'s CIGAR, so the answer can depend on
+/// argument order when `TLEN` disagrees with the mate's alignment — e.g. bwa writes `TLEN` 0 at a
+/// 5' tie, which reads as RF from the forward read and FR from the reverse read.
 ///
 /// This matches the behavior of fgbio's `isFrPair` check.
 // RecordBuf kept: reads flags/ref-ids via noodles typed Flags API; serves noodles-typed callers alongside raw is_fr_pair_raw in fgumi-raw-bam.
@@ -554,8 +572,8 @@ pub fn is_fr_pair(r1: &RecordBuf, r2: &RecordBuf) -> bool {
     }
 
     // Use htsjdk's pair orientation logic (matches fgbio)
-    // FR means one read is forward, one is reverse, with positive strand 5' < negative strand 5'
-    // This works regardless of which read is R1 vs R2
+    // FR means one read is forward, one is reverse, with positive strand 5' <= negative strand 5'.
+    // Evaluated on r1 only; see the doc comment for the TLEN-dependent forward arm.
     let orientation = get_pair_orientation(r1);
     orientation == PairOrientation::FR
 }
@@ -895,8 +913,8 @@ mod tests {
     #[test]
     fn test_is_fr_pair_true_for_fr_orientation() {
         // FR pair: positive strand read at pos 100, mate on negative strand
-        // Insert size positive (300), so negative 5' = 100 + 300 = 400
-        // positive 5' (100) < negative 5' (400) -> FR
+        // Insert size positive (300), so negative 5' = 100 + 300 - 1 = 399
+        // positive 5' (100) <= negative 5' (399) -> FR
         let read = create_fr_test_read(
             "fr_pair",
             FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
@@ -1019,8 +1037,8 @@ mod tests {
         // For negative strand read:
         //   positive 5' = mate_start
         //   negative 5' = alignment_end (this read's end)
-        // FR when positive 5' < negative 5'
-        // mate at 100, read ends at 300 -> 100 < 300 -> FR
+        // FR when positive 5' <= negative 5'
+        // mate at 100, read ends at 300 -> 100 <= 300 -> FR
         let read = create_fr_test_read(
             "fr_negative_strand",
             FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE, // negative strand, mate positive
@@ -1267,7 +1285,7 @@ mod tests {
     fn test_get_pair_orientation_fr_normal() {
         // FR (innie): positive strand at 100, negative strand 5' further right
         // Read on + strand at 100, mate on - strand, insert size 200
-        // positive 5' = 100, negative 5' = 100 + 200 = 300 -> 100 < 300 -> FR
+        // positive 5' = 100, negative 5' = 100 + 200 - 1 = 299 -> 100 <= 299 -> FR
         let read = create_fr_test_read(
             "fr_normal",
             FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
@@ -1297,9 +1315,9 @@ mod tests {
 
     #[test]
     fn test_get_pair_orientation_rf_outie() {
-        // RF (outie): positive strand 5' >= negative strand 5'
+        // RF (outie): positive strand 5' > negative strand 5'
         // Read on + strand at 200, mate on - strand at 100, negative insert size
-        // positive 5' = 200, negative 5' = 200 + (-100) = 100 -> 200 >= 100 -> RF
+        // positive 5' = 200, negative 5' = 200 + (-100) - 1 = 99 -> 200 > 99 -> RF
         let read = create_fr_test_read(
             "rf_outie",
             FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
@@ -1380,6 +1398,83 @@ mod tests {
         assert_eq!(get_pair_orientation(&read), PairOrientation::RF);
     }
 
+    /// A paired, mapped read on reference 0 with an explicit CIGAR, for the 5'-tie tests.
+    fn create_tie_test_read(
+        flags: u16,
+        pos: usize,
+        cigar: &str,
+        mate_pos: usize,
+        tlen: i32,
+    ) -> RecordBuf {
+        let query_len: usize = cigar
+            .split(|c: char| c.is_ascii_alphabetic())
+            .zip(cigar.chars().filter(char::is_ascii_alphabetic))
+            .filter(|(_, op)| matches!(op, 'M' | 'I' | 'S' | '=' | 'X'))
+            .map(|(len, _)| len.parse::<usize>().expect("CIGAR op length"))
+            .sum();
+        RecordBuilder::new()
+            .name("tie")
+            .sequence(&"A".repeat(query_len))
+            .qualities(&vec![30u8; query_len])
+            .cigar(cigar)
+            .reference_sequence_id(0)
+            .alignment_start(pos)
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(mate_pos)
+            .template_length(tlen)
+            .reverse_complement(flags & FLAG_REVERSE != 0)
+            .mate_reverse_complement(flags & FLAG_MATE_REVERSE != 0)
+            .first_segment(flags & FLAG_READ1 != 0)
+            .build()
+    }
+
+    /// htsjdk 5.0.0 `SamPairUtilTest` "dovetail 5' tie" (`testGetPairOrientationDataProvider`):
+    /// read 1 forward `100M` @ 100, read 2 reverse `100M` @ 1, so both 5' ends are at 100.
+    /// `SamPairUtil.setMateInfo` writes TLEN +1 on read 1 and -1 on read 2 (`computeInsertSize`'s
+    /// `+1` adjustment when the 5' ends are equal). htsjdk asserts FR from both ends.
+    ///
+    /// - forward arm: `100 <= CoordMath.getEnd(100, 1) = 100`, FR;
+    /// - reverse arm: `mateStart 100 <= alignmentEnd 100`, FR.
+    ///
+    /// Each arm fails under a strict `<`, so this pins the inclusive comparison in
+    /// `get_pair_orientation` and, through it, `is_fr_pair_from_tags` and `is_fr_pair` in both
+    /// argument orders.
+    #[test]
+    fn test_get_pair_orientation_htsjdk_dovetail_five_prime_tie_is_fr() {
+        let fwd =
+            create_tie_test_read(FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE, 100, "100M", 1, 1);
+        let rev = create_tie_test_read(FLAG_PAIRED | FLAG_REVERSE, 1, "100M", 100, -1);
+
+        assert_eq!(get_pair_orientation(&fwd), PairOrientation::FR, "forward arm");
+        assert_eq!(get_pair_orientation(&rev), PairOrientation::FR, "reverse arm");
+        assert!(is_fr_pair_from_tags(&fwd));
+        assert!(is_fr_pair_from_tags(&rev));
+        assert!(is_fr_pair(&fwd, &rev));
+        assert!(is_fr_pair(&rev, &fwd));
+    }
+
+    /// One base past the tie stays RF: reverse `100M` @ 1 ends at 100 and its forward mate
+    /// starts at 101 (htsjdk's "nojump outie"; TLEN -2 / +2 from `computeInsertSize`).
+    #[test]
+    fn test_get_pair_orientation_one_past_five_prime_tie_is_rf() {
+        let fwd = create_tie_test_read(FLAG_PAIRED | FLAG_MATE_REVERSE, 101, "100M", 1, -2);
+        let rev = create_tie_test_read(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE, 1, "100M", 101, 2);
+
+        assert_eq!(get_pair_orientation(&fwd), PairOrientation::RF, "forward arm");
+        assert_eq!(get_pair_orientation(&rev), PairOrientation::RF, "reverse arm");
+    }
+
+    /// A reverse read with no reference-consuming CIGAR ops (`100S`) at its forward mate's start
+    /// is RF. htsjdk `SAMRecord.getAlignmentEnd` is `start + referenceLength - 1`, i.e.
+    /// `start - 1` for a zero span, so the reverse arm compares `100 <= 99`. Clamping the end to
+    /// `start` would make the inclusive test `100 <= 100` pass and call it FR.
+    #[test]
+    fn test_get_pair_orientation_zero_reference_span_reverse_read_is_rf() {
+        let rev = create_tie_test_read(FLAG_PAIRED | FLAG_REVERSE, 100, "100S", 100, 0);
+        assert_eq!(get_pair_orientation(&rev), PairOrientation::RF);
+        assert!(!is_fr_pair_from_tags(&rev));
+    }
+
     // =====================================================================
     // Tests for is_fr_pair (two-record version)
     // =====================================================================
@@ -1421,7 +1516,7 @@ mod tests {
         // This creates an RF orientation where positive 5' > negative 5'
         let (r1, r2) = create_read_pair(200, false, 100, true, true);
         // With these positions, positive 5' = 200, and with negative tlen,
-        // negative 5' = 200 + (-50) = 150, so 200 > 150 -> RF
+        // negative 5' = 200 + (-50) - 1 = 149, so 200 > 149 -> RF
         let mut r1_rf = r1;
         *r1_rf.template_length_mut() = -50;
         assert!(!is_fr_pair(&r1_rf, &r2), "Should NOT detect FR pair for RF orientation");

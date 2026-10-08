@@ -651,8 +651,9 @@ impl CodecConsensusCaller {
 
         // Phase 1: Filter on raw bytes — keep paired, primary reads. FR classification is done
         // per *pair* in Phase 2 (see is_primary_fr_pair_raw), NOT per record: the per-record
-        // is_fr_pair_raw check is asymmetric on dovetails whose aligned ends coincide and would
-        // silently drop legitimate FR pairs (CODEC-01).
+        // is_fr_pair_raw check reads TLEN on its forward-strand arm, which can disagree with the
+        // mate's CIGAR on dovetails (e.g. a leftmost-to-rightmost TLEN), and would silently drop
+        // legitimate FR pairs (CODEC-01).
         let mut paired_indices: Vec<usize> = Vec::new();
         let mut frag_indices: Vec<usize> = Vec::new();
         for (i, raw) in records.iter().enumerate() {
@@ -2942,6 +2943,75 @@ mod tests {
             None,
             "a genuine (dovetail) FR pair must not be dropped/counted as NotPrimaryFrPair"
         );
+    }
+
+    /// Port of fgbio `CodecConsensusCallerTest` "not throw on an FR dovetail pair whose aligned
+    /// ends coincide" (~line 210 on fgbio main): the HEK293T geometry from fgumi #505, 129 bp
+    /// reads, forward `68S53M8S` @ 96 (aligned 96..148), reverse `28S48M53S` @ 49 (aligned
+    /// 49..96), `minReadsPerStrand=1`, `minDuplexLength=1`. The reverse read's aligned end
+    /// equals the forward read's aligned start, a 5' tie that htsjdk 5.0.0
+    /// `SamPairUtil.getPairOrientation` (`SamPairUtil.java:136`, `<=`) classifies FR, so fgbio's
+    /// `isPrimaryFrPair` keeps the pair. It must not be dropped as `NotPrimaryFrPair` in either
+    /// overlap-window mode. With the default (intersection) window it yields a consensus; under
+    /// `--legacy-overlap-window` — fgbio's current-release window, in which fgbio's own test runs
+    /// — the window `[49, 148]` reaches past both alignments, so the pair is rejected as a
+    /// `Dovetail` (fgbio buckets it under `IndelErrorBetweenStrands`), not as non-FR.
+    #[rstest]
+    #[case::intersection_window(false, 1)]
+    #[case::legacy_window(true, 0)]
+    fn test_coincident_five_prime_dovetail_is_not_rejected_as_non_fr(
+        #[case] legacy_overlap_window: bool,
+        #[case] expected_count: usize,
+    ) {
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            legacy_overlap_window,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        let reads = create_fr_pair(
+            "dt",
+            96,
+            49,
+            129,
+            35,
+            &[(Kind::SoftClip, 68), (Kind::Match, 53), (Kind::SoftClip, 8)],
+            &[(Kind::SoftClip, 28), (Kind::Match, 48), (Kind::SoftClip, 53)],
+            "hi",
+            Some("ACC-TGA"),
+            false, // R1 forward
+            true,  // R2 reverse
+        );
+
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
+
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::NotPrimaryFrPair),
+            None,
+            "a dovetail FR pair with coincident 5' ends must not be counted as NotPrimaryFrPair"
+        );
+        // fgbio's test asserts only that no exception is thrown; the reads overlap at reference
+        // position 96, which satisfies minDuplexLength=1, so the intersection window yields one
+        // consensus, while the legacy window rejects the pair because it dovetails.
+        assert_eq!(output.count, expected_count);
+        if legacy_overlap_window {
+            assert_eq!(
+                caller.stats.rejection_reasons.get(&CallerRejectionReason::Dovetail),
+                Some(&2),
+                "the legacy window rejects the pair as a dovetail: {:?}",
+                caller.stats.rejection_reasons
+            );
+        } else {
+            assert!(
+                caller.stats.rejection_reasons.is_empty(),
+                "the intersection window keeps the pair: {:?}",
+                caller.stats.rejection_reasons
+            );
+        }
     }
 
     /// Port of fgbio test: "not emit a consensus when there are insufficient reads"
