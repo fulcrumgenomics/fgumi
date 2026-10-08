@@ -1096,10 +1096,11 @@ mod tests {
     /// reading of the top strand, by the actual R1 strand — not the MI `/A`,`/B`
     /// suffix (which is not strand-reliable). The suffix still decides how the two
     /// UMI halves are paired up across strands (see
-    /// `test_duplex_umi_halves_paired_by_strand_family`); R1 strand only decides
-    /// which half the reported duplex UMI leads with. fgbio reports a read pair with UMI
-    /// `u1-u2` as `u1-u2` when R1 is on the positive strand, and as `u2-u1` when R1 is
-    /// on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
+    /// `test_duplex_umi_halves_paired_by_strand_family`); R1 strand decides which half
+    /// the reported duplex UMI leads with, except for FF/RR pairs, where the strand-family
+    /// order does (also `test_duplex_umi_halves_paired_by_strand_family`). fgbio reports a
+    /// read pair with UMI `u1-u2` as `u1-u2` when R1 is on the positive strand, and as
+    /// `u2-u1` when R1 is on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
     /// example `AAAA-GGGG`, R1 negative → `GGGG-AAAA`). Previously fgumi always led
     /// with the `/A` half, so a reverse-strand-first family was recorded in the wrong
     /// orientation.
@@ -1235,10 +1236,11 @@ mod tests {
             .collect();
         assert_eq!(observed, vec![("AAA", 2, 0, 1), ("CAG", 2, 0, 1)]);
 
-        // One duplex UMI, oriented to lead with the half a positive-strand R1 reads
-        // first. For FF/RR (`ff_*`/`rr_*`) neither strand family is F1R2-only, so
-        // fgbio's orientation depends on its MI hash order; the expected values pin
-        // fgumi's deterministic tie-break (`/A` leading half for FF, trailing for RR).
+        // One duplex UMI. Every expected value is fgbio's output on the same input with its
+        // single-strand families ordered by MI (fulcrumgenomics/fgbio#1186; released
+        // fgbio <= 4.1.1 orders them by hash, which flips `ff_*`/`rr_*` for MI `1`). For
+        // FF/RR neither strand family is F1R2-only, so the orientation follows that order:
+        // `1/A` first.
         let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
         let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
         let observed: Vec<(&str, usize, usize, usize)> = duplex_umis
@@ -1253,6 +1255,61 @@ mod tests {
             })
             .collect();
         assert_eq!(observed, vec![(expected_duplex_umi, 2, 0, 1)]);
+
+        Ok(())
+    }
+
+    /// When a UMI position splits 2-vs-2 between the strands, the consensus is decided by
+    /// floating-point summation order, so the two strands' observations must be added in
+    /// one fixed order: every read of the single-strand family whose MI sorts first (`/A`),
+    /// then the other; within a family, reads stay in file order. Feeding reads in file
+    /// order across strands instead resolved the same tie differently depending on how the
+    /// strands' reads interleave, or no-called it as `N`. The result must not depend on the
+    /// MI's hash either: `0/A` and `1/A` hash in opposite orders relative to their `/B`,
+    /// which decided released fgbio's order (<= 4.1.1, before it sorted by MI).
+    ///
+    /// Two `/A` templates carry `a_rx` and two `/B` templates `b_rx`, so the leading
+    /// position of the consensus sees two of one base from each strand. The `/A` R1 is at
+    /// 1000 on the strand given by `a_r1_plus` (FR/RF pairs). Expected values are the
+    /// output of fgbio `CollectDuplexSeqMetrics --duplex-umi-counts true`, with its
+    /// single-strand families ordered by MI (fulcrumgenomics/fgbio#1186), on the same
+    /// input, for every `mi_base` and `order`. The `TAA-GGG`/`GGG-AAA` content pins the
+    /// strand order: sorting the UMIs instead would call `TAA` for both.
+    #[rstest]
+    #[case::a_aaa_r1_plus("AAA-GGG", "GGG-TAA", true, "TAA", "TAA-GGG")]
+    #[case::a_aaa_r1_minus("AAA-GGG", "GGG-TAA", false, "TAA", "GGG-TAA")]
+    #[case::a_taa_r1_plus("TAA-GGG", "GGG-AAA", true, "AAA", "AAA-GGG")]
+    #[case::a_taa_r1_minus("TAA-GGG", "GGG-AAA", false, "AAA", "GGG-AAA")]
+    fn test_umi_consensus_tie_is_independent_of_strand_interleaving_and_mi(
+        #[case] a_rx: &str,
+        #[case] b_rx: &str,
+        #[case] a_r1_plus: bool,
+        #[case] expected_tied_umi: &str,
+        #[case] expected_duplex_umi: &str,
+        #[values("0", "1")] mi_base: &str,
+        #[values("AABB", "BBAA", "ABAB", "BABA")] order: &str,
+    ) -> Result<()> {
+        let mut records = Vec::new();
+        for (i, strand) in order.chars().enumerate() {
+            let name = format!("q{i}");
+            let (r1, r2) = if strand == 'A' {
+                let mi = format!("{mi_base}/A");
+                build_test_pair(&name, 0, 1000, 1300, a_rx, &mi, a_r1_plus, !a_r1_plus)
+            } else {
+                let mi = format!("{mi_base}/B");
+                build_test_pair(&name, 0, 1300, 1000, b_rx, &mi, !a_r1_plus, a_r1_plus)
+            };
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let (_, umis, duplex_umis) = run_duplex_metrics_with_umi_counts(records)?;
+
+        let mut expected =
+            vec![("GGG".to_string(), 4, 0, 1), (expected_tied_umi.to_string(), 4, 2, 1)];
+        expected.sort_unstable();
+        assert_eq!(umis, expected);
+        assert_eq!(duplex_umis, vec![(expected_duplex_umi.to_string(), 4, 2, 1)]);
 
         Ok(())
     }
@@ -1376,10 +1433,9 @@ mod tests {
         Ok((families, umis, duplex_umis))
     }
 
-    /// A duplex family observed only on its `/B` strand still reports its UMI halves
-    /// un-swapped back to the `/A` pairing, and orients its duplex UMI to lead with
-    /// the half a positive-strand R1 reads first: the `/B` RX as-is when its R1 is
-    /// positive, swapped when its R1 is negative.
+    /// A duplex family observed only on its `/B` strand is its own `ab` family: its RX is
+    /// read as-is, and its duplex UMI leads with the half a positive-strand R1 reads first
+    /// (the `/B` RX as-is when its R1 is positive, swapped when its R1 is negative).
     #[rstest]
     #[case::b_r1_positive(true, "CAG-AAA")]
     #[case::b_r1_negative(false, "AAA-CAG")]
