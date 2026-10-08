@@ -19,11 +19,11 @@ use crate::dna::reverse_complement;
 use crate::sam::SamTag;
 use crate::simulate::{
     FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias,
-    StrandBiasModel, create_rng,
+    StrandBiasModel, close_output, create_rng,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_bam_io::{ProgressTracker, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{OutputFile, ProgressTracker, create_raw_bam_reader, create_raw_bam_writer};
 use fgumi_raw_bam::{
     RawRecord, SamBuilder, aux_data_slice, find_string_tag, flags as raw_flags, update_string_tag,
 };
@@ -462,7 +462,8 @@ fn remap_truth_mi(input: &Path, output: &Path, old_to_new: &HashMap<u64, u64>) -
             .with_context(|| format!("Failed to read truth file {}", input.display()))?,
     );
     let mut writer = BufWriter::new(
-        File::create(output).with_context(|| format!("Failed to create {}", output.display()))?,
+        OutputFile::create(output)
+            .with_context(|| format!("Failed to create {}", output.display()))?,
     );
 
     for (row, line) in reader.lines().enumerate() {
@@ -495,7 +496,7 @@ fn remap_truth_mi(input: &Path, output: &Path, old_to_new: &HashMap<u64, u64>) -
 
         writeln!(writer, "{}", cols.join("\t"))?;
     }
-    writer.flush()?;
+    close_output(writer, output)?;
     Ok(())
 }
 
@@ -571,7 +572,7 @@ impl GroupedReads {
         // Create truth file. This is a staging path (see `execute`): it holds the
         // pre-renumber ids and is remapped and published only once the renumbered
         // BAM is also written.
-        let truth_file = File::create(truth_path)
+        let truth_file = OutputFile::create(truth_path)
             .with_context(|| format!("Failed to create {}", truth_path.display()))?;
         let mut truth_writer = BufWriter::new(truth_file);
         writeln!(
@@ -641,7 +642,7 @@ impl GroupedReads {
         }
 
         progress.log_final();
-        truth_writer.flush()?;
+        close_output(truth_writer, truth_path)?;
 
         Ok(total_pairs)
     }

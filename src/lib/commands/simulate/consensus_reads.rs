@@ -9,10 +9,11 @@ use crate::commands::simulate::common::{
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::sam::SamTag;
-use crate::simulate::{StrandBiasModel, create_rng};
+use crate::simulate::{StrandBiasModel, close_output, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_consensus::MethylationMode;
@@ -23,7 +24,6 @@ use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, LogNormal, Normal};
 use rayon::prelude::*;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -253,7 +253,7 @@ impl Command for ConsensusReads {
 
             // Create truth file if requested
             let mut truth_writer = if let Some(ref truth_path) = truth_path {
-                let truth_file = File::create(truth_path)
+                let truth_file = OutputFile::create(truth_path)
                     .with_context(|| format!("Failed to create {}", truth_path.display()))?;
                 let mut w = BufWriter::new(truth_file);
                 writeln!(w, "read_name\tchrom\tpos\tstrand\tcD\tcM\tcE\taD\tbD\taM\tbM\taE\tbE")?;
@@ -287,8 +287,8 @@ impl Command for ConsensusReads {
 
             progress.log_final();
 
-            if let Some(ref mut tw) = truth_writer {
-                tw.flush()?;
+            if let (Some(tw), Some(truth_path)) = (truth_writer, truth_path.as_ref()) {
+                close_output(tw, truth_path)?;
             }
 
             writer.finish()?;

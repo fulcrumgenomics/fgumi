@@ -6,10 +6,11 @@ use crate::commands::simulate::common::{
     ReferenceGenome, SimulationCommon, TemplateLocus, body_error_rng, convert_molecule_strand,
     generate_random_sequence, introduce_errors_inplace, join_writer_result,
 };
-use crate::simulate::{FastqWriter, create_rng};
+use crate::simulate::{FastqWriter, close_output, create_rng};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_dna::dna::complement_base;
 use log::{info, warn};
@@ -286,7 +287,7 @@ impl Command for FastqReads {
         let writer_handle = thread::spawn(move || -> Result<u64> {
             let mut r1_writer = FastqWriter::with_threads(&r1_path, compress_threads)?;
             let mut r2_writer = FastqWriter::with_threads(&r2_path, compress_threads)?;
-            let truth_file = File::create(&truth_path)
+            let truth_file = OutputFile::create(&truth_path)
                 .with_context(|| format!("Failed to create {}", truth_path.display()))?;
             let mut truth_writer = BufWriter::new(truth_file);
 
@@ -324,7 +325,7 @@ impl Command for FastqReads {
             progress.log_final();
             r1_writer.finish()?;
             r2_writer.finish()?;
-            truth_writer.flush()?;
+            close_output(truth_writer, &truth_path)?;
 
             Ok(read_count)
         });

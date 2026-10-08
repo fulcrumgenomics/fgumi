@@ -11,10 +11,10 @@
 //! `Serial + Affinity::Writer + sticky`, matching `WriteBgzfFile`: exactly one
 //! shared instance drains the (reorder-ordered) block stream to the sink.
 
-use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use fgumi_bam_io::{OutputSink, close_buffered, open_output_sink};
 use parking_lot::Mutex;
 
 use crate::types::{BgzfBlock, DecompressedBlock};
@@ -45,7 +45,7 @@ impl RawBytesBlock for BgzfBlock {
 /// stdout. Generic over the block type so it serves both the plain
 /// (`DecompressedBlock`) and BGZF-compressed (`BgzfBlock`) FASTQ tails.
 pub struct WriteRawFile<B> {
-    state: Mutex<Option<BufWriter<Box<dyn Write + Send>>>>,
+    state: Mutex<Option<BufWriter<Box<dyn OutputSink>>>>,
     /// Bytes appended once, after the last block, on a clean drain. Empty for
     /// plain output; the 28-byte BGZF EOF marker for BGZF output so the `.gz`
     /// stream is a complete, non-truncated BGZF file.
@@ -54,18 +54,22 @@ pub struct WriteRawFile<B> {
 }
 
 impl<B> WriteRawFile<B> {
-    /// Open `path` for writing (`-` selects stdout), appending `trailer` once
-    /// after the final block on clean completion. No header is written.
+    /// Open `path` for writing, appending `trailer` once after the final block
+    /// on clean completion. No header is written.
+    ///
+    /// Opens through [`open_output_sink`], as `WriteBgzfFile` does through
+    /// `open_output_writer`: `-` and `/dev/stdout` select a block-buffered
+    /// duplicate of stdout whose close is checked, and any other path an
+    /// output file that is synced and closed with its errors checked.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from opening the file.
+    /// Returns I/O errors from opening the file or duplicating stdout.
     pub fn new<P: AsRef<Path>>(path: P, trailer: &'static [u8]) -> io::Result<Self> {
-        let inner: Box<dyn Write + Send> = if path.as_ref().as_os_str() == "-" {
-            Box::new(io::stdout())
-        } else {
-            Box::new(File::create(path.as_ref())?)
-        };
+        let path = path.as_ref();
+        let inner = open_output_sink(path).map_err(|e| {
+            io::Error::new(e.kind(), format!("failed to open output {}: {e}", path.display()))
+        })?;
         Ok(Self {
             state: Mutex::new(Some(BufWriter::with_capacity(256 * 1024, inner))),
             trailer,
@@ -104,17 +108,21 @@ impl<B: RawBytesBlock> Step for WriteRawFile<B> {
         }
 
         if ctx.input.is_drained() {
-            // Clean end-of-stream: append the trailer (e.g. the BGZF EOF marker)
-            // exactly once, then flush and retire the sink.
-            if !self.trailer.is_empty() {
-                out.write_all(self.trailer)?;
-            }
-            out.flush()?;
-            let _ = guard.take();
+            let out = guard.take().expect("sink is open: checked above");
+            finish_stream(out, self.trailer)?;
             return Ok(StepOutcome::Finished);
         }
         Ok(StepOutcome::NoProgress)
     }
+}
+
+/// Clean end-of-stream: append `trailer` (e.g. the BGZF EOF marker) exactly
+/// once, then flush, sync and close the output (see [`OutputSink::close`]).
+fn finish_stream(mut out: BufWriter<Box<dyn OutputSink>>, trailer: &[u8]) -> io::Result<()> {
+    if !trailer.is_empty() {
+        out.write_all(trailer)?;
+    }
+    close_buffered(out)
 }
 
 impl<B> Drop for WriteRawFile<B> {
@@ -136,6 +144,51 @@ impl<B> Drop for WriteRawFile<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::test_support::{CLOSE_ERROR, CloseProbe};
+
+    #[test]
+    fn finish_stream_appends_trailer_once_and_closes_once() {
+        let probe = CloseProbe::default();
+        let mut out: BufWriter<Box<dyn OutputSink>> = BufWriter::new(Box::new(probe.clone()));
+        out.write_all(b"PAYLOAD").unwrap();
+        finish_stream(out, b"TRAILER").unwrap();
+
+        assert_eq!(probe.bytes(), b"PAYLOADTRAILER");
+        assert_eq!(probe.closes(), 1);
+    }
+
+    #[test]
+    fn finish_stream_propagates_close_error() {
+        let probe = CloseProbe::failing_close();
+        let out: BufWriter<Box<dyn OutputSink>> = BufWriter::new(Box::new(probe.clone()));
+        let err = finish_stream(out, b"").expect_err("close error must surface");
+        assert!(err.to_string().contains(CLOSE_ERROR), "{err}");
+    }
+
+    /// Both stdout spellings stream to stdout rather than creating a file
+    /// named `-` or reopening `/dev/stdout`, and finish cleanly.
+    #[test]
+    fn new_treats_both_stdout_spellings_as_stdout() {
+        let cwd_dash = std::path::Path::new("-");
+        let existed = cwd_dash.exists();
+        for path in ["-", "/dev/stdout"] {
+            let sink = WriteRawFile::<DecompressedBlock>::new(path, b"").unwrap();
+            let out = sink.state.lock().take().expect("sink is open");
+            finish_stream(out, b"").unwrap();
+        }
+        assert_eq!(cwd_dash.exists(), existed, "`-` must not create a file");
+    }
+
+    #[test]
+    fn new_writes_a_file_and_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.fq");
+        let sink = WriteRawFile::<DecompressedBlock>::new(&path, b"").unwrap();
+        let mut out = sink.state.lock().take().expect("sink is open");
+        out.write_all(b"@r\nACGT\n+\nIIII\n").unwrap();
+        finish_stream(out, b"").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"@r\nACGT\n+\nIIII\n");
+    }
 
     #[test]
     fn raw_bytes_block_exposes_payload() {

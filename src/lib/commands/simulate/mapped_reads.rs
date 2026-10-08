@@ -18,17 +18,18 @@ use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::sam::SamTag;
 use crate::simulate::{
-    FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias, create_rng,
+    FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias,
+    close_output, create_rng,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
+use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
 use fgumi_sort::{RawExternalSorter, SortOrder};
 use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
@@ -341,7 +342,7 @@ impl MappedReads {
         unmapped_rng: &mut impl Rng,
     ) -> Result<usize> {
         // Create truth file
-        let truth_file = File::create(&self.truth_output)
+        let truth_file = OutputFile::create(&self.truth_output)
             .with_context(|| format!("Failed to create {}", self.truth_output.display()))?;
         let mut truth_writer = BufWriter::new(truth_file);
         writeln!(truth_writer, "read_name\ttrue_umi\tmolecule_id\tchrom\tposition\tstrand")?;
@@ -421,7 +422,7 @@ impl MappedReads {
         }
 
         progress.log_final();
-        truth_writer.flush()?;
+        close_output(truth_writer, &self.truth_output)?;
 
         Ok(total_pairs)
     }

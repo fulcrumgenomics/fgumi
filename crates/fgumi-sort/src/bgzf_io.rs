@@ -21,8 +21,8 @@ const STAGING_PADDING: usize = 4096;
 /// Per-block position notification emitted by the I/O writer loop when index
 /// generation is enabled.
 ///
-/// `serial` is the block's serial number (assigned by [`StagingBuffer`] at
-/// flush time, and equal to its block number since one compress job produces
+/// `serial` is the block's serial number (issued by the writer's
+/// [`PermitPool`] at flush time, and equal to its block number since one compress job produces
 /// exactly one BGZF block). `compressed_start` is the cumulative number of
 /// compressed bytes written to the file *before* this block — i.e. its on-disk
 /// byte offset. The pooled indexing writer uses these to resolve BAI virtual
@@ -37,7 +37,6 @@ pub(crate) struct BlockOffset {
 pub(crate) struct StagingBuffer {
     pool: Arc<SortWorkerPool>,
     buf: Vec<u8>,
-    next_serial: u64,
     result_tx: Sender<CompressResult>,
     permit_pool: Arc<PermitPool>,
     codec: SpillCodec,
@@ -66,7 +65,6 @@ impl StagingBuffer {
         Self {
             pool,
             buf: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE + STAGING_PADDING),
-            next_serial: 0,
             result_tx,
             permit_pool,
             codec,
@@ -104,7 +102,7 @@ impl StagingBuffer {
     /// the block number the indexing writer pairs with [`BlockOffset`].
     #[inline]
     pub(crate) fn next_serial(&self) -> u64 {
-        self.next_serial
+        self.permit_pool.submitted()
     }
 
     /// Flush the staging buffer: swap it with a recycled buffer and submit for compression.
@@ -129,9 +127,9 @@ impl StagingBuffer {
             self.buf.reserve(BGZF_MAX_BLOCK_SIZE + STAGING_PADDING - self.buf.capacity());
         }
 
-        let serial = self.next_serial;
-        self.next_serial += 1;
-
+        // The serial comes from the permit pool, which counts it as submitted,
+        // so the I/O writer can tell a lost final block from a clean end.
+        let serial = self.permit_pool.issue_serial();
         self.pool.submit_compress(CompressJob {
             data,
             serial,
@@ -205,11 +203,14 @@ fn write_block_in_order<W: Write>(
 /// Releases one permit to `permit_pool` after each block is written out,
 /// unblocking the corresponding `StagingBuffer::flush()` call and bounding the
 /// number of in-flight compressed blocks to the pool capacity.
-/// Writes BGZF EOF marker and flushes when all blocks are received.
+/// Writes BGZF EOF marker and flushes when all blocks are received, then
+/// returns the writer so the caller decides how to close it: the sort's output
+/// is synced and its close checked (`fgumi_bam_io::close_buffered`), while a
+/// spill chunk, read back by this same process, is simply dropped.
 ///
 /// Generic over the sink rather than fixed to `File`: spill chunks are always
 /// files, but the sort's *output* may be stdout, which reaches here as the
-/// boxed writer `open_output_writer` hands back.
+/// boxed sink `open_output_writer` hands back.
 ///
 /// When `block_offset_tx` is `Some`, each written block's `(serial,
 /// compressed_start)` is emitted on it (in strict block order) for BAI virtual
@@ -217,8 +218,10 @@ fn write_block_in_order<W: Write>(
 ///
 /// # Errors
 ///
-/// Returns an error if any write fails or if a compressed block is missing
-/// (which would silently truncate the output).
+/// Returns an error if any write fails, if a compressed block is missing
+/// (which would silently truncate the output) — including the final one,
+/// detected by comparing the blocks written with [`PermitPool::submitted`] —
+/// or if a block arrives with a serial `permit_pool` did not issue.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn io_writer_loop<W: Write>(
     mut writer: BufWriter<W>,
@@ -227,7 +230,7 @@ pub(crate) fn io_writer_loop<W: Write>(
     permit_pool: Arc<PermitPool>,
     codec: SpillCodec,
     block_offset_tx: Option<Sender<BlockOffset>>,
-) -> Result<()> {
+) -> Result<BufWriter<W>> {
     let result = io_writer_loop_inner(
         &mut writer,
         &result_rx,
@@ -240,7 +243,7 @@ pub(crate) fn io_writer_loop<W: Write>(
         // Unblock any producers waiting on acquire() so they don't park forever.
         permit_pool.close();
     }
-    result
+    result.map(|()| writer)
 }
 
 fn io_writer_loop_inner<W: Write>(
@@ -258,6 +261,17 @@ fn io_writer_loop_inner<W: Write>(
 
     while let Ok(result) = result_rx.recv() {
         buffer_pool.checkin(result.recycled_buf);
+
+        // Serials are issued (and counted) by the permit pool before the job is
+        // queued, so one at or past the count was never counted, and the
+        // lost-final-block check below would be blind to it.
+        let issued = permit_pool.submitted();
+        if result.serial >= issued {
+            return Err(anyhow::anyhow!(
+                "compressed block {} was not issued by the permit pool ({issued} issued)",
+                result.serial
+            ));
+        }
 
         if result.serial == next_expected {
             write_block_in_order(
@@ -306,6 +320,18 @@ fn io_writer_loop_inner<W: Write>(
                  the output would be silently truncated"
             ));
         }
+    }
+
+    // A lost final block leaves no gap above: its job was abandoned (pool shut
+    // down while it was queued or compressing, or its worker panicked), its
+    // result sender dropped, and the input simply closed. Only the count of
+    // issued serials can tell that apart from a clean end of stream.
+    let submitted = permit_pool.submitted();
+    if next_expected < submitted {
+        return Err(anyhow::anyhow!(
+            "missing compressed block {next_expected} of {submitted} submitted; \
+             the output would be silently truncated"
+        ));
     }
 
     if matches!(codec, SpillCodec::Bgzf) {
@@ -391,6 +417,7 @@ mod tests {
             pool.stats.compress_jobs_submitted.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+        assert_eq!(staging.next_serial(), 0, "an empty flush issues no serial");
 
         if let Ok(p) = Arc::try_unwrap(pool) {
             p.shutdown();
@@ -450,6 +477,12 @@ mod tests {
         );
         staging.write_chunked(&large).unwrap();
         staging.flush().unwrap();
+        // Every submitted job was issued a serial, so the writer can detect a
+        // lost tail.
+        assert_eq!(
+            staging.next_serial(),
+            pool.stats.compress_jobs_submitted.load(std::sync::atomic::Ordering::Relaxed),
+        );
         drop(staging);
 
         io_handle.join().unwrap().unwrap();
@@ -489,10 +522,13 @@ mod tests {
 
         // Submit block 1 first, then block 0 (out of order).
         // Each needs a pre-acquired permit since they bypass StagingBuffer::flush().
+        // Serials are issued in order (0, 1); submit 1 before 0.
+        let serial0 = permit_pool.issue_serial();
+        let serial1 = permit_pool.issue_serial();
         permit_pool.acquire().unwrap();
         pool.submit_compress(CompressJob {
             data: data2,
-            serial: 1,
+            serial: serial1,
             result_tx: result_tx.clone(),
             codec,
             target: CompressTarget::Spill,
@@ -500,7 +536,7 @@ mod tests {
         permit_pool.acquire().unwrap();
         pool.submit_compress(CompressJob {
             data: data1,
-            serial: 0,
+            serial: serial0,
             result_tx,
             codec,
             target: CompressTarget::Spill,
@@ -563,6 +599,136 @@ mod tests {
             SpillCodec::Zstd => {
                 assert!(output.is_empty(), "empty zstd input → empty output (no EOF marker)");
             }
+        }
+    }
+
+    /// Delivers `serials` to an I/O writer loop over an in-memory buffer whose
+    /// permit pool issued `issued` serials, returning the loop's result and the
+    /// bytes it wrote.
+    fn run_writer_loop(
+        issued: u64,
+        serials: &[u64],
+        codec: SpillCodec,
+    ) -> (Result<()>, Vec<u8>, Arc<PermitPool>) {
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<CompressResult>(8);
+        let permit_pool = Arc::new(PermitPool::new(4));
+        for _ in 0..issued {
+            permit_pool.issue_serial();
+        }
+        for &serial in serials {
+            result_tx
+                .send(CompressResult {
+                    serial,
+                    compressed: format!("block {serial}").into_bytes(),
+                    recycled_buf: Vec::new(),
+                })
+                .unwrap();
+        }
+        drop(result_tx);
+
+        let mut writer = BufWriter::new(Vec::new());
+        let result = io_writer_loop_inner(
+            &mut writer,
+            &result_rx,
+            &BufferPool::new(4),
+            &permit_pool,
+            codec,
+            None,
+        );
+        (result, writer.into_inner().unwrap(), permit_pool)
+    }
+
+    /// A final block that was submitted but never delivered (its job abandoned
+    /// by a pool shutdown, or its worker panicking mid-compress) leaves no gap
+    /// in the serials the writer receives. The write must still fail rather
+    /// than stamp an EOF marker onto a truncated stream.
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_io_writer_loop_fails_when_final_block_never_arrives(#[case] codec: SpillCodec) {
+        let (result, bytes, _) = run_writer_loop(2, &[0], codec);
+        let err = result.expect_err("a lost final block must fail the write");
+        assert!(
+            err.to_string().contains("missing compressed block 1 of 2 submitted"),
+            "unexpected error: {err}"
+        );
+        assert!(!bytes.ends_with(&BGZF_EOF), "no EOF marker on a truncated stream");
+    }
+
+    /// The public loop closes the permit pool on that failure, so a producer
+    /// parked on a permit is released.
+    #[test]
+    fn test_io_writer_loop_closes_permit_pool_on_lost_final_block() {
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<CompressResult>(1);
+        let permit_pool = Arc::new(PermitPool::new(4));
+        permit_pool.issue_serial();
+        drop(result_tx);
+        let err = io_writer_loop(
+            BufWriter::new(Vec::new()),
+            result_rx,
+            BufferPool::new(4),
+            Arc::clone(&permit_pool),
+            SpillCodec::Bgzf,
+            None,
+        )
+        .map(drop)
+        .expect_err("a lost final block must fail the write");
+        assert!(err.to_string().contains("missing compressed block 0 of 1"), "{err}");
+        assert!(permit_pool.acquire().is_err(), "a failed writer must close the permit pool");
+    }
+
+    /// Every issued block delivered: the submitted-count check passes.
+    #[test]
+    fn test_io_writer_loop_accepts_all_submitted_blocks() {
+        let (result, bytes, _) = run_writer_loop(2, &[1, 0], SpillCodec::Bgzf);
+        result.expect("all submitted blocks arrived");
+        assert_eq!(bytes, [b"block 0".as_slice(), b"block 1", &BGZF_EOF].concat());
+    }
+
+    /// A block whose serial the permit pool never issued means a producer
+    /// submitted without counting it, which would blind the lost-final-block
+    /// check; the writer must refuse it rather than trust the count.
+    #[test]
+    fn test_io_writer_loop_rejects_serial_not_issued_by_permit_pool() {
+        let (result, _, _) = run_writer_loop(1, &[0, 1], SpillCodec::Bgzf);
+        let err = result.expect_err("an uncounted block must fail the write");
+        assert!(
+            err.to_string().contains("compressed block 1 was not issued by the permit pool"),
+            "unexpected error: {err}"
+        );
+        let (result, _, _) = run_writer_loop(0, &[0], SpillCodec::Bgzf);
+        result.expect_err("a producer that never counts must fail on its first block");
+    }
+
+    /// The staging buffer's serials come from its permit pool, so the pool's
+    /// count always matches the blocks submitted.
+    #[rstest]
+    #[case(SpillCodec::Bgzf)]
+    #[case(SpillCodec::Zstd)]
+    fn test_staging_buffer_serials_come_from_permit_pool(#[case] codec: SpillCodec) {
+        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
+        let (result_tx, result_rx) = pool.compress_result_channel();
+        let permit_pool = make_permit_pool(&pool);
+        let mut staging = StagingBuffer::new(
+            Arc::clone(&pool),
+            result_tx,
+            Arc::clone(&permit_pool),
+            codec,
+            CompressTarget::Spill,
+        );
+        for expected in 0..3 {
+            assert_eq!(staging.next_serial(), expected);
+            staging.buf().extend_from_slice(b"data");
+            staging.flush().unwrap();
+        }
+        assert_eq!(permit_pool.submitted(), 3);
+        drop(staging);
+        let mut serials: Vec<u64> = result_rx.iter().map(|r| r.serial).collect();
+        serials.sort_unstable();
+        assert_eq!(serials, [0, 1, 2]);
+
+        if let Ok(p) = Arc::try_unwrap(pool) {
+            p.shutdown();
         }
     }
 }

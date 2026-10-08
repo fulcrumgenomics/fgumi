@@ -5,11 +5,11 @@
 
 use super::parallel_gzip_writer::{ParallelGzipConfig, ParallelGzipWriter};
 use anyhow::{Context, Result};
+use fgumi_bam_io::{OutputFile, OutputSink, close_buffered};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A writer for gzip-compressed FASTQ files.
 ///
@@ -38,10 +38,12 @@ use std::path::Path;
 /// ```
 pub struct FastqWriter {
     inner: FastqWriterInner,
+    /// The output path, named in close errors.
+    path: PathBuf,
 }
 
 enum FastqWriterInner {
-    SingleThreaded(GzEncoder<BufWriter<File>>),
+    SingleThreaded(GzEncoder<BufWriter<Box<dyn OutputSink>>>),
     MultiThreaded(ParallelGzipWriter),
 }
 
@@ -58,12 +60,7 @@ impl FastqWriter {
     ///
     /// Returns an error if the file cannot be created.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        let file =
-            File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
-        let buf = BufWriter::new(file);
-        let gz = GzEncoder::new(buf, Compression::default());
-        Ok(Self { inner: FastqWriterInner::SingleThreaded(gz) })
+        Self::with_threads(path, 1)
     }
 
     /// Create a new FASTQ writer with specified thread count.
@@ -80,19 +77,23 @@ impl FastqWriter {
     /// Returns an error if the file cannot be created.
     pub fn with_threads<P: AsRef<Path>>(path: P, threads: usize) -> Result<Self> {
         let path = path.as_ref();
-        let file =
-            File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+        let file = OutputFile::create(path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        Self::from_sink(Box::new(file), path, threads)
+    }
 
-        if threads <= 1 {
-            let buf = BufWriter::new(file);
-            let gz = GzEncoder::new(buf, Compression::default());
-            Ok(Self { inner: FastqWriterInner::SingleThreaded(gz) })
+    /// Build the writer over an already-open sink; `path` names it in errors.
+    fn from_sink(sink: Box<dyn OutputSink>, path: &Path, threads: usize) -> Result<Self> {
+        let inner = if threads <= 1 {
+            let buf = BufWriter::new(sink);
+            FastqWriterInner::SingleThreaded(GzEncoder::new(buf, Compression::default()))
         } else {
             let config = ParallelGzipConfig::with_threads(threads);
-            let writer = ParallelGzipWriter::new(file, &config)
+            let writer = ParallelGzipWriter::new(sink, &config)
                 .with_context(|| "Failed to create parallel gzip writer")?;
-            Ok(Self { inner: FastqWriterInner::MultiThreaded(writer) })
-        }
+            FastqWriterInner::MultiThreaded(writer)
+        };
+        Ok(Self { inner, path: path.to_path_buf() })
     }
 
     /// Write a FASTQ record.
@@ -115,21 +116,27 @@ impl FastqWriter {
         }
     }
 
-    /// Finish writing and flush all data.
+    /// Finish writing, flush all data, and sync and close the file.
     ///
     /// This must be called to ensure all data is written and the gzip stream
     /// is properly terminated.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing fails.
+    /// Returns an error if flushing, syncing, or closing the file fails.
     pub fn finish(self) -> Result<()> {
+        let path = self.path.display();
         match self.inner {
             FastqWriterInner::SingleThreaded(writer) => {
-                writer.finish().context("Failed to finish gzip stream")?;
+                let buf = writer
+                    .finish()
+                    .with_context(|| format!("Failed to finish gzip stream {path}"))?;
+                close_buffered(buf).with_context(|| format!("Failed to sync/close {path}"))?;
             }
             FastqWriterInner::MultiThreaded(writer) => {
-                writer.finish().context("Failed to finish parallel gzip stream")?;
+                writer
+                    .finish()
+                    .with_context(|| format!("Failed to finish parallel gzip stream {path}"))?;
             }
         }
         Ok(())
@@ -161,6 +168,7 @@ fn write_record_to<W: Write>(writer: &mut W, name: &str, seq: &[u8], qual: &[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Read;
     use tempfile::NamedTempFile;
 
@@ -290,6 +298,32 @@ mod tests {
         assert!(content.contains("@read00000"));
         assert!(content.contains("@read09999"));
 
+        Ok(())
+    }
+
+    /// Both arms close the file once, and a close failure fails `finish`
+    /// naming the output; the bytes written are a complete gzip stream.
+    #[rstest::rstest]
+    #[case::single_threaded(1)]
+    #[case::multi_threaded(2)]
+    fn test_finish_closes_once_and_reports_close_error(#[case] threads: usize) -> Result<()> {
+        use crate::simulate::test_support::CloseProbe;
+
+        let path = Path::new("reads.fq.gz");
+        let probe = CloseProbe::default();
+        let mut writer = FastqWriter::from_sink(Box::new(probe.clone()), path, threads)?;
+        writer.write_record("r1", b"ACGT", &[30; 4])?;
+        writer.finish()?;
+        assert_eq!(probe.closes(), 1);
+        assert_eq!(probe.decoded(), b"@r1\nACGT\n+\n????\n");
+
+        let probe = CloseProbe::failing_close();
+        let mut writer = FastqWriter::from_sink(Box::new(probe.clone()), path, threads)?;
+        writer.write_record("r1", b"ACGT", &[30; 4])?;
+        let err = writer.finish().expect_err("a failed close must surface");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(crate::simulate::test_support::CLOSE_ERROR), "{msg}");
+        assert!(msg.contains("reads.fq.gz"), "the error must name the output: {msg}");
         Ok(())
     }
 }

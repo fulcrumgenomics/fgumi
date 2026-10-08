@@ -4,10 +4,11 @@ use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{generate_random_sequence, join_writer_result};
 use crate::sam::SamTag;
-use crate::simulate::create_rng;
+use crate::simulate::{close_output, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::create_raw_bam_writer;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
@@ -15,7 +16,6 @@ use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,13 +168,13 @@ impl Command for CorrectReads {
         umis.sort();
 
         // Write includelist
-        let includelist_file = File::create(&self.includelist)
+        let includelist_file = OutputFile::create(&self.includelist)
             .with_context(|| format!("Failed to create {}", self.includelist.display()))?;
         let mut includelist_writer = BufWriter::new(includelist_file);
         for umi in &umis {
             writeln!(includelist_writer, "{umi}")?;
         }
-        includelist_writer.flush()?;
+        close_output(includelist_writer, &self.includelist)?;
         info!("Wrote includelist with {} UMIs", umis.len());
 
         // Share UMI list across workers
@@ -222,7 +222,7 @@ impl Command for CorrectReads {
             )?;
 
             // Create truth file
-            let truth_file = File::create(&truth_path)
+            let truth_file = OutputFile::create(&truth_path)
                 .with_context(|| format!("Failed to create {}", truth_path.display()))?;
             let mut truth_writer = BufWriter::new(truth_file);
             writeln!(
@@ -266,7 +266,7 @@ impl Command for CorrectReads {
             }
 
             progress.log_final();
-            truth_writer.flush()?;
+            close_output(truth_writer, &truth_path)?;
             writer.finish()?;
 
             Ok((read_count, exact_count, edit1_count, edit2_count, multi_count))

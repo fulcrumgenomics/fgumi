@@ -386,7 +386,21 @@ impl MergeOutputTarget {
     /// Atomically moves the finished temp onto its resolved destination (a no-op
     /// for stdout), first stamping the resolved mode so the output is not left
     /// temp-private (`0600`). Consumes `self`, disarming the RAII auto-remove.
+    ///
+    /// The merge wrote the temp through its own descriptor, which its writer
+    /// already synced and closed with the result checked (`OutputFile`), so the
+    /// temp's handle here is closed, checked, without a second sync before the
+    /// rename.
     fn persist(self) -> Result<()> {
+        self.persist_with(|file| fgumi_bam_io::OutputFile::unsynced(file).close())
+    }
+
+    /// [`persist`](Self::persist) with the temp handle's close supplied, so
+    /// tests can make it fail.
+    fn persist_with<F>(self, close: F) -> Result<()>
+    where
+        F: FnOnce(std::fs::File) -> std::io::Result<()>,
+    {
         if let Self::Temp { temp, dest } = self {
             // Re-stamp the temp to the mode `File::create(dest)` would produce
             // before the rename: `NamedTempFile` is `0600`, and `persist` keeps
@@ -398,7 +412,7 @@ impl MergeOutputTarget {
             fgumi_bam_io::restamp_for_persist(temp.as_file(), &dest).with_context(|| {
                 format!("failed to set mode on merge temp for {}", dest.display())
             })?;
-            temp.persist(&dest).map_err(|e| e.error).with_context(|| {
+            fgumi_bam_io::persist_after_close(temp, &dest, close).with_context(|| {
                 format!("failed to finalize merged output at {}", dest.display())
             })?;
         }
@@ -6538,6 +6552,43 @@ mod tests {
             assert_ne!(mode, 0o600, "merged output must not inherit the temp's owner-only 0o600");
         }
         assert_eq!(mode, expected_mode, "persisted merge output must match File::create's mode");
+    }
+
+    /// The merge temp is closed before it is renamed, and a failed close fails
+    /// the merge: nothing is renamed onto `dest` (an existing output is left
+    /// as it was) and the temp is removed.
+    #[test]
+    fn merge_persist_close_error_leaves_dest_and_removes_temp() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let dest = dir.path().join("merged.bam");
+        std::fs::write(&dest, b"previous").expect("pre-create destination");
+
+        let target = MergeOutputTarget::create(&dest).expect("create merge target");
+        let temp_path = target.path().to_path_buf();
+        std::fs::write(&temp_path, b"merged").expect("write merge temp");
+        let err = target
+            .persist_with(|_| {
+                assert_eq!(std::fs::read(&dest).unwrap(), b"previous", "closed before rename");
+                Err(std::io::Error::other("input/output error at close"))
+            })
+            .expect_err("a failed close must fail the merge");
+
+        assert!(format!("{err:#}").contains("error at close"), "{err:#}");
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"previous");
+        assert!(!temp_path.exists(), "the merge temp must be removed");
+    }
+
+    /// A clean persist renames the merged bytes onto `dest` and leaves no temp.
+    #[test]
+    fn merge_persist_renames_temp_onto_dest() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let dest = dir.path().join("merged.bam");
+        let target = MergeOutputTarget::create(&dest).expect("create merge target");
+        let temp_path = target.path().to_path_buf();
+        std::fs::write(&temp_path, b"merged").expect("write merge temp");
+        target.persist().expect("persist merge output");
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"merged");
+        assert!(!temp_path.exists(), "the temp must be renamed away");
     }
 
     // ========================================================================

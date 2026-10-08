@@ -25,7 +25,7 @@ use crate::codec::SpillCodec;
 use crate::worker_pool::{CompressResult, CompressTarget, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, bounded, unbounded};
-use fgumi_bam_io::{BaiBuilder, is_stdout_path, open_output_writer};
+use fgumi_bam_io::{BaiBuilder, OutputSink, close_buffered, is_stdout_path, open_output_writer};
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
 use noodles::bam::bai;
 use noodles::sam::Header;
@@ -131,6 +131,18 @@ impl PooledBamWriter {
         // up here — the in-memory write, the k-way merge, and the indexing
         // variant below — so this is the only place that dispatch is needed.
         let sink = open_output_writer(path)?;
+        Self::from_sink(pool, sink, header, indexing)
+    }
+
+    /// Build the writer over an already-open output sink. The I/O thread
+    /// closes the sink once the stream is written (see [`OutputSink::close`]),
+    /// so a sync or close failure is returned by `finish`/`finish_index`.
+    fn from_sink(
+        pool: Arc<SortWorkerPool>,
+        sink: Box<dyn OutputSink>,
+        header: &Header,
+        indexing: bool,
+    ) -> Result<Self> {
         let writer = BufWriter::with_capacity(256 * 1024, sink);
 
         let reorder_capacity = pool.num_workers() * 4;
@@ -151,7 +163,16 @@ impl PooledBamWriter {
 
         let pp = Arc::clone(&permit_pool);
         let io_handle = thread::spawn(move || {
-            io_writer_loop(writer, result_rx, buffer_pool, pp, SpillCodec::Bgzf, block_offset_tx)
+            let writer = io_writer_loop(
+                writer,
+                result_rx,
+                buffer_pool,
+                pp,
+                SpillCodec::Bgzf,
+                block_offset_tx,
+            )?;
+            close_buffered(writer)?;
+            Ok(())
         });
 
         // `CompressTarget::Output`: every block this writer submits is the sort's
@@ -404,6 +425,88 @@ mod tests {
         rec.resize(rec.len() + seq_bytes, 0x11); // seq
         rec.resize(rec.len() + seq_len, 0xFF); // qual
         rec
+    }
+
+    /// An in-memory [`OutputSink`] that counts closes and can fail its close,
+    /// modelling write-back (or an NFS flush) failing only at close.
+    #[derive(Clone, Default)]
+    struct CloseProbe {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+        fail_close: bool,
+    }
+
+    impl std::io::Write for CloseProbe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl OutputSink for CloseProbe {
+        fn close(self: Box<Self>) -> std::io::Result<()> {
+            self.closes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_close {
+                return Err(std::io::Error::other("input/output error at close"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Writes test records through a writer over `sink`, finishing it the way
+    /// the sort does for the given variant.
+    fn write_test_records(
+        pool: &Arc<SortWorkerPool>,
+        sink: Box<dyn OutputSink>,
+        indexing: bool,
+    ) -> Result<()> {
+        let mut w = PooledBamWriter::from_sink(Arc::clone(pool), sink, &test_header(), indexing)?;
+        for i in 0..100 {
+            w.write_raw_record(&make_mapped_record(format!("r{i}").as_bytes(), 0, i * 10, 50))?;
+        }
+        if indexing { w.finish_index().map(drop) } else { w.finish() }
+    }
+
+    /// The output is closed exactly once, and closing does not change its
+    /// bytes: the stream matches the same records written to a file.
+    #[rstest]
+    #[case::plain(false)]
+    #[case::indexing(true)]
+    fn test_finish_closes_output_once(#[case] indexing: bool) {
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let probe = CloseProbe::default();
+        write_test_records(&pool, Box::new(probe.clone()), indexing).expect("finish");
+        assert_eq!(probe.closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("out.bam");
+        let file = fgumi_bam_io::open_output_writer(&path).expect("open");
+        write_test_records(&pool, file, indexing).expect("finish file");
+        let on_disk = std::fs::read(&path).expect("read");
+
+        let bytes = probe.written.lock().expect("lock").clone();
+        assert_eq!(bytes, on_disk);
+        assert!(bytes.ends_with(&fgumi_bgzf::BGZF_EOF));
+        let eofs = bytes
+            .windows(fgumi_bgzf::BGZF_EOF.len())
+            .filter(|w| *w == fgumi_bgzf::BGZF_EOF)
+            .count();
+        assert_eq!(eofs, 1);
+    }
+
+    #[rstest]
+    #[case::plain(false)]
+    #[case::indexing(true)]
+    fn test_finish_propagates_close_error(#[case] indexing: bool) {
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6, crate::codec::SpillCodec::Bgzf));
+        let probe = CloseProbe { fail_close: true, ..CloseProbe::default() };
+        let err = write_test_records(&pool, Box::new(probe), indexing)
+            .expect_err("close error must surface");
+        assert!(format!("{err:#}").contains("error at close"), "{err:#}");
     }
 
     /// The indexing writer must produce byte-identical BAM output to the plain
