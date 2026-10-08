@@ -64,6 +64,11 @@ overlap within a read pair are consensus called jointly before UMI consensus cal
 --consensus-call-overlapping-bases false to call each end of a pair independently, as fgbio does. Insertion or
 deletion errors in the reads are not considered in the consensus model.
 
+Bases at a read's 3' end that extend past its mate (read-through into adapter) are trimmed before consensus
+calling. The mate's alignment comes from the read's MC tag or, when MC is absent, from its mate in the same group;
+a read lacking MC whose mate is mapped to the same reference on the opposite strand but is not in the group is an
+error when the read is in an emitted consensus.
+
 The consensus reads produced are unaligned, due to the difficulty and error-prone nature of inferring the consensus
 alignment. Consensus reads should therefore be aligned after, which should not be too expensive as likely there
 are far fewer consensus reads than input raw reads.

@@ -5,6 +5,24 @@ use crate::cigar::{
 use crate::fields::{RawRecordView, aux_data_slice, flags, mate_pos, mate_ref_id, template_length};
 use crate::tags::RawTagsView;
 
+/// Whether a read and its mate, judged from the read's own fields, are both mapped to the same
+/// reference on opposite strands: the read is paired, neither it nor its mate is unmapped, its
+/// mate reference is its own, and its strand differs from its mate's.
+///
+/// These are the preconditions for the read to be one end of an FR or RF pair, before any
+/// orientation test. They are shared by every per-record FR test here and by the consensus
+/// callers' check for whether a read lacking `MC` needs its mate's CIGAR, so the guards cannot
+/// drift apart.
+#[must_use]
+pub fn is_mapped_opposite_strand_pair_raw(bam: &[u8]) -> bool {
+    let v = RawRecordView::new(bam);
+    let flg = v.flags();
+    flg & flags::PAIRED != 0
+        && flg & (flags::UNMAPPED | flags::MATE_UNMAPPED) == 0
+        && v.ref_id() == mate_ref_id(bam)
+        && (flg & flags::REVERSE == 0) != (flg & flags::MATE_REVERSE == 0)
+}
+
 /// Crate-internal per-record FR (forward-reverse) classification from raw BAM bytes.
 ///
 /// **Per-record, and not a gate for pair decisions.** The forward-strand arm derives the mate's
@@ -25,32 +43,12 @@ use crate::tags::RawTagsView;
 /// a dovetail whose reverse read's aligned end equals the forward read's aligned start — is FR.
 #[must_use]
 pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
+    // Paired, both mapped, same reference, opposite strands (FR or RF).
+    if !is_mapped_opposite_strand_pair_raw(bam) {
+        return false;
+    }
     let v = RawRecordView::new(bam);
-    let flg = v.flags();
-
-    // Must be paired
-    if flg & flags::PAIRED == 0 {
-        return false;
-    }
-
-    // Both read and mate must be mapped
-    if flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
-        return false;
-    }
-
-    // Must be on the same reference
-    let this_ref_id = v.ref_id();
-    let m_ref_id = mate_ref_id(bam);
-    if this_ref_id != m_ref_id {
-        return false;
-    }
-
-    // Must be on opposite strands for FR or RF
-    let is_reverse = flg & flags::REVERSE != 0;
-    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
-    if is_reverse == mate_is_reverse {
-        return false;
-    }
+    let is_reverse = v.flags() & flags::REVERSE != 0;
 
     // Determine if FR or RF using htsjdk 5.0.0's logic (TLEN fallback for the forward arm):
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
@@ -150,27 +148,14 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 /// pairs without needing the mate record in hand.
 #[must_use]
 fn is_fr_pair_with_mate_cigar_raw(bam: &[u8], mate_ref_len: i32) -> bool {
+    // Paired, both read and mate mapped, same reference, opposite strands — the same guards as
+    // `is_fr_pair_raw`.
+    if !is_mapped_opposite_strand_pair_raw(bam) {
+        return false;
+    }
     let v = RawRecordView::new(bam);
-    let flg = v.flags();
 
-    // Paired, both read and mate mapped, same reference, opposite strands — identical to the
-    // non-orientation guards in `is_fr_pair_raw`.
-    if flg & flags::PAIRED == 0 {
-        return false;
-    }
-    if flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
-        return false;
-    }
-    if v.ref_id() != mate_ref_id(bam) {
-        return false;
-    }
-    let is_reverse = flg & flags::REVERSE != 0;
-    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
-    if is_reverse == mate_is_reverse {
-        return false;
-    }
-
-    if is_reverse {
+    if v.flags() & flags::REVERSE != 0 {
         // This read is the reverse record; its own arm is CIGAR-derived and TLEN-independent.
         return is_fr_pair_raw(bam);
     }
@@ -200,36 +185,76 @@ fn is_fr_pair_with_mate_cigar_raw(bam: &[u8], mate_ref_len: i32) -> bool {
 /// [`crate::cigar::mate_unclipped_5prime`]), which follows samtools' soft+hard convention.
 ///
 /// Used by the simplex (vanilla) and duplex consensus callers, in the place of fgbio's base
-/// `UmiConsensusCaller.numBasesExtendingPastMate`. The codec caller instead uses
+/// `UmiConsensusCaller.numBasesExtendingPastMate`. For a read with no MC tag those callers take
+/// the mate CIGAR from the mate record in the group instead, through
+/// [`num_bases_extending_past_mate_cigar_raw`]. The codec caller instead uses
 /// [`num_bases_extending_past_mate_vs_mate_raw`], which reads the mate's alignment from the mate
 /// record in hand rather than its MC tag (see CODEC3-04).
 #[must_use]
 pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
-    // Need the MC tag for mate CIGAR information. Parsed before the FR gate because the gate
-    // now classifies orientation from the mate CIGAR (see below); with no usable MC there is
-    // nothing to compute the overhang from anyway, so absent/invalid MC fails closed to 0.
+    num_bases_extending_past_mate_from_mc_raw(bam).unwrap_or(0)
+}
+
+/// As [`num_bases_extending_past_mate_raw`], but distinguishes a read with no MC tag: returns
+/// `None` when the tag is absent, and otherwise the clip, which is `0` for non-FR pairs or an
+/// invalid MC tag.
+///
+/// Lets a caller that falls back to another source for the mate CIGAR (the simplex and duplex
+/// callers' backfill from the in-group mate) look the tag up once per read.
+#[must_use]
+pub fn num_bases_extending_past_mate_from_mc_raw(bam: &[u8]) -> Option<usize> {
+    // Parsed before the FR gate because the gate classifies orientation from the mate CIGAR (see
+    // `num_bases_extending_past_mate_cigar_raw`); with no usable MC there is nothing to compute
+    // the overhang from anyway, so an invalid MC fails closed to 0.
     let aux = aux_data_slice(bam);
-    let Some(mc_bytes) = RawTagsView::new(aux).find_string(SamTag::MC) else {
-        return 0;
-    };
+    let mc_bytes = RawTagsView::new(aux).find_string(SamTag::MC)?;
     let Ok(mc_cigar) = std::str::from_utf8(mc_bytes) else {
-        return 0;
+        return Some(0);
     };
 
-    // A malformed MC CIGAR fails closed to 0 (no clip), honoring the doc contract above
-    // ("Returns 0 ... when the MC tag is absent/invalid").
+    // A malformed MC CIGAR fails closed to 0 (no clip), honoring the doc contract of
+    // `num_bases_extending_past_mate_raw` ("Returns 0 ... when the MC tag is absent/invalid").
     let Some(mate_ops) = parse_mc_cigar_ops(mc_cigar) else {
-        return 0;
+        return Some(0);
     };
+    Some(clip_against_valid_mate_cigar(bam, &mate_ops))
+}
 
+/// Number of bases a read extends past its mate for FR pairs, given the mate's CIGAR ops
+/// (BAM-encoded, as from [`crate::cigar::get_cigar_ops`]) in place of the read's MC tag. Returns
+/// `0` for non-FR pairs, and for mate ops that are not a structurally valid CIGAR for a mapped
+/// record — the same validation [`num_bases_extending_past_mate_raw`] applies to an MC tag, so
+/// an empty (`*`), fully clipped or otherwise degenerate mate CIGAR is never clipped against.
+///
+/// This is the core of [`num_bases_extending_past_mate_raw`] once the MC tag has been parsed:
+/// the mate's position still comes from the read's own mate-position field, exactly as when the
+/// MC tag supplies the CIGAR. The simplex and duplex callers use it to backfill a missing MC tag
+/// from the mate record in the same group, as fgbio's `UmiConsensusCaller.updateMateCigars` does.
+///
+/// [`num_bases_extending_past_mate_vs_mate_raw`] also measures against an in-group mate, but it
+/// is not interchangeable: it takes the mate's position from the mate record rather than the
+/// read's mate-position field, and gates on both records' flags rather than the read's own. A
+/// read lacking MC must be clipped exactly as it would be with a correct MC tag, so this path
+/// keeps the MC path's geometry and gate and swaps in only the CIGAR.
+#[must_use]
+pub fn num_bases_extending_past_mate_cigar_raw(bam: &[u8], mate_ops: &[u32]) -> usize {
+    if !is_valid_mapped_cigar(mate_ops) {
+        return 0;
+    }
+    clip_against_valid_mate_cigar(bam, mate_ops)
+}
+
+/// Shared body of the MC-tag and mate-CIGAR entry points, for mate ops already validated by
+/// [`is_valid_mapped_cigar`].
+fn clip_against_valid_mate_cigar(bam: &[u8], mate_ops: &[u32]) -> usize {
     // Only applies to FR pairs. Classify per-pair from the read plus its mate CIGAR rather than
     // the per-record `is_fr_pair_raw`, whose forward-strand TLEN arm misclassifies dovetail FR
     // pairs (#839 / htsjdk/samtools#1771) and would zero the read-through clip for the forward
     // read, leaking adapter into the simplex/duplex consensus.
-    if !is_fr_pair_with_mate_cigar_raw(bam, saturating_reference_length(&mate_ops)) {
+    if !is_fr_pair_with_mate_cigar_raw(bam, saturating_reference_length(mate_ops)) {
         return 0;
     }
-    bases_extending_past_mate(bam, mate_pos(bam) + 1, &mate_ops)
+    bases_extending_past_mate(bam, mate_pos(bam) + 1, mate_ops)
 }
 
 /// Number of bases a read extends past its mate for FR pairs, taking the mate's alignment from
@@ -450,19 +475,20 @@ const MAX_CIGAR_OP_LEN: u32 = (1 << 28) - 1;
 /// mate-record paths share one set of CIGAR walkers.
 ///
 /// Returns `None` for any CIGAR that is not a structurally valid SAM CIGAR for a mapped record,
-/// so malformed MC-tag input fails closed rather than yielding a partial answer. Rejected:
+/// so malformed MC-tag input fails closed rather than yielding a partial answer. Lexically
+/// rejected here:
 /// - an unknown operator byte (e.g. the `f`/`o` in `10Mfoo5S`, or a non-ASCII byte);
 /// - an operator with no preceding run-length (a bare `MS`) or a zero run-length (`0M`, `10M0S`);
 /// - a run-length past [`MAX_CIGAR_OP_LEN`], which no BAM CIGAR operation can hold;
-/// - a trailing run-length with no operator (`10M5`), or an empty CIGAR;
-/// - a soft (`S`) or hard (`H`) clip that is not at the end of the CIGAR — `S` may only sit at the
-///   ends (inside any `H`), and `H` only as the first/last operation (e.g. `10M5S10M` is invalid);
-/// - a CIGAR with no reference-consuming operation (`10S`), which a mapped mate cannot have.
+/// - a trailing run-length with no operator (`10M5`), or an empty CIGAR.
+///
+/// The parsed ops are then held to [`is_valid_mapped_cigar`], the structural check shared with a
+/// mate CIGAR taken from the mate record (misplaced clips, or no reference-consuming operation).
 fn parse_mc_cigar_ops(cigar: &str) -> Option<Vec<u32>> {
-    // Phase 1: tokenize into (run_length, operator) pairs. Accumulate the run-length from digit
+    // Tokenize and pack into (run_length << 4) | op_code. Accumulate the run-length from digit
     // bytes directly rather than slicing the string by byte offset — slicing on a non-ASCII byte
-    // (a malformed CIGAR) would panic on a char boundary. Reject lexical errors here.
-    let mut tokens: Vec<(u32, u8)> = Vec::new();
+    // (a malformed CIGAR) would panic on a char boundary.
+    let mut ops: Vec<u32> = Vec::new();
     let mut num = 0u32;
     let mut have_digits = false;
     for &c in cigar.as_bytes() {
@@ -477,50 +503,59 @@ fn parse_mc_cigar_ops(cigar: &str) -> Option<Vec<u32>> {
             continue;
         }
         // Every operator needs a positive run-length, and must be a known CIGAR operator.
-        if !have_digits || num == 0 || cigar_op_code(c).is_none() {
+        if !have_digits || num == 0 {
             return None;
         }
-        tokens.push((num, c));
+        // `num <= MAX_CIGAR_OP_LEN` (28 bits), so the shift cannot drop bits.
+        ops.push((num << 4) | cigar_op_code(c)?);
         num = 0;
         have_digits = false;
     }
-    // A dangling run-length with no operator (`10M5`), or an empty CIGAR, is malformed.
-    if have_digits || tokens.is_empty() {
+    // A dangling run-length with no operator (`10M5`) is malformed; an empty CIGAR is rejected
+    // by the structural check.
+    if have_digits {
         return None;
     }
+    is_valid_mapped_cigar(&ops).then_some(ops)
+}
 
-    // Phase 2: validate structure and pack the ops in one pass. Soft clips must sit at the ends
-    // (inside any hard clip); hard clips only as the first/last operation.
-    let last = tokens.len() - 1;
-    let mut ops = Vec::with_capacity(tokens.len());
+/// Whether BAM-packed CIGAR ops (`(len << 4) | op_code`) are a structurally valid CIGAR for a
+/// mapped record. The single structural check for a mate CIGAR, whether it came from an MC tag
+/// ([`parse_mc_cigar_ops`]) or from the mate record itself
+/// ([`num_bases_extending_past_mate_cigar_raw`]), so the two paths cannot drift. Rejected:
+/// - no operations at all (an unmapped record's `*` CIGAR, or a truncated record);
+/// - a zero-length operation, or an operation code that is not a CIGAR operator;
+/// - a soft (`S`) or hard (`H`) clip that is not at the end of the CIGAR — `S` may only sit at the
+///   ends (inside any `H`), and `H` only as the first/last operation (e.g. `10M5S10M` is invalid);
+/// - no reference-consuming operation (`10S`), which a mapped record cannot have.
+fn is_valid_mapped_cigar(ops: &[u32]) -> bool {
+    let Some(last) = ops.len().checked_sub(1) else {
+        return false;
+    };
+    let is_hard = |op: &u32| op & 0xF == 5;
     let mut saw_ref_op = false;
-    for (i, &(len, op)) in tokens.iter().enumerate() {
-        // Phase 1 accepted every operator, so this lookup cannot fail.
-        let op_code = cigar_op_code(op)?;
-        match op {
-            b'M' | b'D' | b'N' | b'=' | b'X' => saw_ref_op = true,
-            b'I' | b'P' => {} // interior op: no placement constraint
-            b'S' => {
-                let leading = tokens[..i].iter().all(|&(_, o)| o == b'H');
-                let trailing = tokens[i + 1..].iter().all(|&(_, o)| o == b'H');
+    for (i, &op) in ops.iter().enumerate() {
+        if op >> 4 == 0 {
+            return false;
+        }
+        match op & 0xF {
+            0 | 2 | 3 | 7 | 8 => saw_ref_op = true, // M, D, N, =, X
+            1 | 6 => {}                             // I, P: interior op, no placement constraint
+            4 => {
+                // S: only inside the hard clips at either end.
+                let leading = ops[..i].iter().all(is_hard);
+                let trailing = ops[i + 1..].iter().all(is_hard);
                 if !leading && !trailing {
-                    return None; // internal soft clip: invalid placement
+                    return false;
                 }
             }
-            b'H' if i == 0 || i == last => {} // hard clip only permitted at the ends
-            // An internal hard clip is invalid placement; the tokenizer already rejected unknown
-            // operators, so every other operator byte here also fails closed.
-            _ => return None,
+            5 if i == 0 || i == last => {} // H: only as the first/last operation
+            // An internal hard clip, or a code past `X`, is invalid.
+            _ => return false,
         }
-        // `len <= MAX_CIGAR_OP_LEN` (28 bits), so the shift cannot drop bits.
-        ops.push((len << 4) | op_code);
     }
-    // A mapped mate's CIGAR must consume reference; a fully-clipped CIGAR (`10S`) cannot.
-    if !saw_ref_op {
-        return None;
-    }
-
-    Some(ops)
+    // A mapped record's CIGAR must consume reference; a fully-clipped CIGAR (`10S`) cannot.
+    saw_ref_op
 }
 
 /// BAM operation code for a CIGAR operator character, in `BAM_CIGAR_STR` (`MIDNSHP=X`) order, or
@@ -840,6 +875,97 @@ mod tests {
             &aux,
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    /// A forward `100M` read at 1-based 1001 whose reverse mate starts at 1-based 1051, carrying
+    /// `mc` as its MC tag when given.
+    fn forward_read_with_mate_at_1051(mc: Option<&str>) -> Vec<u8> {
+        let mut aux = Vec::new();
+        if let Some(mc) = mc {
+            aux.extend_from_slice(b"MCZ");
+            aux.extend_from_slice(mc.as_bytes());
+            aux.push(0);
+        }
+        make_bam_bytes_with_tlen(
+            0,
+            1000,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            1050,
+            90,
+            &aux,
+        )
+    }
+
+    /// A mate CIGAR taken from the mate record is held to the same structural check as an MC
+    /// tag: an empty CIGAR (an unmapped mate's `*`, or a truncated record), a CIGAR with no
+    /// reference-consuming operation, a misplaced clip, a zero-length operation or an unknown
+    /// operation code is never clipped against. Before that check an empty mate CIGAR gave the
+    /// mate a reference span of 0, which passed the FR gate and clipped the forward read at the
+    /// mate's start, removing 50 aligned bases.
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::soft_clip_only(&[encode_op(4, 100)])]
+    #[case::internal_soft_clip(&[encode_op(0, 10), encode_op(4, 5), encode_op(0, 10)])]
+    #[case::internal_hard_clip(&[encode_op(0, 10), encode_op(5, 5), encode_op(0, 10)])]
+    #[case::zero_length_op(&[encode_op(0, 0), encode_op(0, 40)])]
+    #[case::unknown_op_code(&[encode_op(0, 40), 9])]
+    fn mate_cigar_path_rejects_what_the_mc_path_rejects(#[case] mate_ops: &[u32]) {
+        let rec = forward_read_with_mate_at_1051(None);
+        assert_eq!(num_bases_extending_past_mate_cigar_raw(&rec, mate_ops), 0);
+    }
+
+    /// A valid mate CIGAR clips the same whether it comes from the MC tag or is passed in: the
+    /// `40M` mate ends at 1090, 10 bases before the read's end at 1100.
+    #[test]
+    fn mate_cigar_path_matches_the_mc_path_for_a_valid_cigar() {
+        let with_mc = forward_read_with_mate_at_1051(Some("40M"));
+        let without_mc = forward_read_with_mate_at_1051(None);
+        assert_eq!(num_bases_extending_past_mate_raw(&with_mc), 10);
+        assert_eq!(num_bases_extending_past_mate_cigar_raw(&without_mc, &[encode_op(0, 40)]), 10);
+    }
+
+    /// `num_bases_extending_past_mate_from_mc_raw` returns `None` only when the MC tag is
+    /// absent; an MC tag that is present but invalid fails closed to `Some(0)`.
+    #[rstest]
+    #[case::absent(None, None)]
+    #[case::valid(Some("40M"), Some(10))]
+    #[case::unmapped_mate_star(Some("*"), Some(0))]
+    #[case::soft_clip_only(Some("100S"), Some(0))]
+    fn from_mc_distinguishes_an_absent_tag(
+        #[case] mc: Option<&str>,
+        #[case] expected: Option<usize>,
+    ) {
+        let rec = forward_read_with_mate_at_1051(mc);
+        assert_eq!(num_bases_extending_past_mate_from_mc_raw(&rec), expected);
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), expected.unwrap_or(0));
+    }
+
+    // ========================================================================
+    // is_mapped_opposite_strand_pair_raw tests
+    // ========================================================================
+
+    /// Each case differs from `fr_candidate` in exactly one guard, so each guard is what rejects
+    /// it.
+    #[rstest]
+    #[case::fr_candidate(flags::PAIRED | flags::MATE_REVERSE, 0, true)]
+    #[case::reverse_read(flags::PAIRED | flags::REVERSE, 0, true)]
+    #[case::not_paired(flags::MATE_REVERSE, 0, false)]
+    #[case::read_unmapped(flags::PAIRED | flags::MATE_REVERSE | flags::UNMAPPED, 0, false)]
+    #[case::mate_unmapped(flags::PAIRED | flags::MATE_REVERSE | flags::MATE_UNMAPPED, 0, false)]
+    #[case::mate_on_other_reference(flags::PAIRED | flags::MATE_REVERSE, 1, false)]
+    #[case::both_forward(flags::PAIRED, 0, false)]
+    #[case::both_reverse(flags::PAIRED | flags::REVERSE | flags::MATE_REVERSE, 0, false)]
+    fn test_is_mapped_opposite_strand_pair_raw(
+        #[case] flag: u16,
+        #[case] mate_tid: i32,
+        #[case] expected: bool,
+    ) {
+        let rec = make_bam_bytes(0, 100, flag, b"rea", &[encode_op(0, 10)], 10, mate_tid, 200, &[]);
+        assert_eq!(is_mapped_opposite_strand_pair_raw(&rec), expected);
     }
 
     /// A mate record whose trailing soft clips sum past `i32::MAX` must clamp the mate

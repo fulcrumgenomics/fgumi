@@ -1789,6 +1789,8 @@ fn test_duplex_command_emits_unmapped_consensus_header(#[case] threads: Option<&
 /// [`create_duplex_read_pair_with_sequences`] so it lands in the same molecule.
 ///
 /// The R2 keeps its REVERSE flag so strand grouping is unaffected; only the mapping is removed.
+/// The R1 carries `MATE_UNMAPPED` to match: the pre-group filter drops the unmapped R2, and a
+/// mapped read with no `MC` that claims a mapped mate absent from its group is an error.
 fn create_half_mapped_a_strand_pair(
     name: &str,
     mi_tag: &str,
@@ -1811,7 +1813,9 @@ fn create_half_mapped_a_strand_pair(
         b.read_name(name.as_bytes())
             .sequence(r1_sequence.as_bytes())
             .qualities(&vec![quality; read_len])
-            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .flags(
+                flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE | flags::MATE_UNMAPPED,
+            )
             .ref_id(0)
             .pos(ref_start - 1)
             .mapq(60)
@@ -2485,5 +2489,167 @@ fn test_duplex_chain_ref_without_methylation_mode_rejected_same_as_oracle() {
     assert_eq!(
         single_msg, chain_msg,
         "--ref without --methylation-mode must be rejected with the same message on both paths",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mate-CIGAR (`MC`) backfill for read-through clipping.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 80 bp insert of the read-through duplex templates, at 1-based 1001-1080.
+const READ_THROUGH_INSERT: &str =
+    "ACCTCTCCATCTGACCCAAGATTGTGCTTGTTCAATTCTTCTTAACGTGATAACAGAATCAAACCTGCCAGGCGGTCGTC";
+/// 20 bp adapter each read sequences past the end of the insert.
+const READ_THROUGH_ADAPTER: &str = "AGATCGGAAGAGCACACGTC";
+
+/// One read-through duplex template `(R1, R2)`: a forward `80M20S` read and a reverse `20S80M`
+/// read, both starting at 1-based 1001, so each reads 20 bp of adapter past its mate. On the AB
+/// strand R1 is the forward read, on the BA strand R2 is. Each read carries its mate's CIGAR in
+/// `MC` when `with_mc` is set.
+fn read_through_duplex_template(
+    name: &str,
+    mi: &str,
+    is_b_strand: bool,
+    with_mc: bool,
+) -> (RawRecord, RawRecord) {
+    let forward_seq = format!("{READ_THROUGH_INSERT}{READ_THROUGH_ADAPTER}");
+    // BAM stores a reverse read's bases on the forward reference strand.
+    let reverse_seq = format!("{}{READ_THROUGH_INSERT}", reverse_complement(READ_THROUGH_ADAPTER));
+    let build = |segment: u16, reverse: bool| {
+        let (strand, seq, cigar, mate_cigar, tlen) = if reverse {
+            (flags::REVERSE, &reverse_seq, [(20u32 << 4) | 4, 80 << 4], "80M20S", -80)
+        } else {
+            (flags::MATE_REVERSE, &forward_seq, [80u32 << 4, (20 << 4) | 4], "20S80M", 80)
+        };
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq.as_bytes())
+            .qualities(&[40; 100])
+            .flags(flags::PAIRED | flags::PROPER_PAIR | segment | strand)
+            .ref_id(0)
+            .pos(1000)
+            .mapq(60)
+            .cigar_ops(&cigar)
+            .mate_ref_id(0)
+            .mate_pos(1000)
+            .template_length(tlen)
+            .add_string_tag(SamTag::MI, mi.as_bytes());
+        if with_mc {
+            b.add_string_tag(SamTag::MC, mate_cigar.as_bytes());
+        }
+        b.build()
+    };
+    (build(flags::FIRST_SEGMENT, is_b_strand), build(flags::LAST_SEGMENT, !is_b_strand))
+}
+
+/// One read-through duplex molecule (MI `1`) with three templates per strand.
+fn read_through_duplex_molecule(with_mc: bool) -> Vec<(RawRecord, RawRecord)> {
+    let mut molecule = Vec::new();
+    for (strand, is_b_strand) in [("A", false), ("B", true)] {
+        for i in 0..3 {
+            let name = format!("{}_{i}", strand.to_lowercase());
+            molecule.push(read_through_duplex_template(
+                &name,
+                &format!("1/{strand}"),
+                is_b_strand,
+                with_mc,
+            ));
+        }
+    }
+    molecule
+}
+
+/// The `duplex` arguments for the mate-CIGAR backfill tests, with `--threads` when given.
+fn duplex_backfill_args<'a>(
+    input: &'a Path,
+    output: &'a Path,
+    threads: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "duplex",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--min-reads",
+        "1",
+    ];
+    if let Some(threads) = threads {
+        args.extend(["--threads", threads]);
+    }
+    args
+}
+
+/// A read with no `MC` tag takes its mate CIGAR from its mate in the same molecule, as fgbio's
+/// `UmiConsensusCaller.updateMateCigars` (`UmiConsensusCaller.scala:328-343`, called at `:356`)
+/// does for `CallDuplexConsensusReads` too. The `/A` and `/B` reads are merged into one group, so
+/// each read's mate is found and the read-through molecule is trimmed exactly as when it carries
+/// `MC`: both duplex consensus reads keep the 80 bp insert. Checked on the single-worker and the
+/// multi-worker chain.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_backfills_a_missing_mate_cigar_from_the_mate(#[case] threads: Option<&str>) {
+    let temp_dir = TempDir::new().unwrap();
+    let with_mc = temp_dir.path().join("with_mc.bam");
+    let without_mc = temp_dir.path().join("without_mc.bam");
+    create_duplex_bam(&with_mc, vec![read_through_duplex_molecule(true)]);
+    create_duplex_bam(&without_mc, vec![read_through_duplex_molecule(false)]);
+
+    let with_mc_out = temp_dir.path().join("with_mc.out.bam");
+    let without_mc_out = temp_dir.path().join("without_mc.out.bam");
+    for (input, output) in [(&with_mc, &with_mc_out), (&without_mc, &without_mc_out)] {
+        Duplex::try_parse_from(duplex_backfill_args(input, output, threads))
+            .expect("failed to parse duplex args")
+            .execute("fgumi duplex")
+            .expect("duplex run failed");
+    }
+
+    let (_, expected) = crate::helpers::read_bam_output(&with_mc_out);
+    let (_, actual) = crate::helpers::read_bam_output(&without_mc_out);
+    let lengths: Vec<usize> = actual.iter().map(|r| r.sequence().len()).collect();
+    assert_eq!(lengths, vec![80, 80], "both ends trimmed to the insert");
+    assert_eq!(actual, expected, "output without MC must match output with MC");
+}
+
+/// A read with no `MC` tag whose mate is missing from its molecule cannot be trimmed at the
+/// mate's end, so `duplex` fails naming the molecule and the read rather than calling the
+/// read-through bases into the consensus (fgbio fails too, in
+/// `UmiConsensusCaller.updateMateCigars`, `UmiConsensusCaller.scala:328-343`). The error must
+/// surface, with the duplex step's `MI` context, from the multi-worker chain too.
+#[rstest]
+#[case::single_threaded(None)]
+#[case::threaded(Some("2"))]
+fn test_duplex_fails_naming_a_read_whose_missing_mate_cigar_cannot_be_backfilled(
+    #[case] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let header = create_minimal_header("chr1", 10000);
+    let mut writer = bam::io::Writer::new(fs::File::create(&input).expect("create input BAM"));
+    writer.write_header(&header).expect("write header");
+    // Drop the R2 of template `a_0`, leaving its R1 without MC or a mate.
+    for (i, (r1, r2)) in read_through_duplex_molecule(false).into_iter().enumerate() {
+        writer.write_alignment_record(&header, &to_record_buf(&r1)).expect("write R1");
+        if i != 0 {
+            writer.write_alignment_record(&header, &to_record_buf(&r2)).expect("write R2");
+        }
+    }
+    writer.try_finish().expect("finish input BAM");
+
+    let err = Duplex::try_parse_from(duplex_backfill_args(&input, &output, threads))
+        .expect("failed to parse duplex args")
+        .execute("fgumi duplex")
+        .expect_err("a read lacking MC whose mate is absent must fail the run");
+
+    // Both paths run the consensus as a pipeline step, which flattens the caller's error into
+    // one message prefixed with the step and the molecule.
+    assert_eq!(
+        err.root_cause().to_string(),
+        "Pipeline::run: step \"DuplexConsensus\" failed: Duplex consensus error for MI 1\t: Mate \
+         cigar (MC SAM tag) needed for read 'a_0': the read has no MC tag and its primary mate is \
+         not in the same group. Add MC tags (e.g. with fgumi zipper or samtools fixmate), or keep \
+         both reads of each template in the same group."
     );
 }
