@@ -436,13 +436,36 @@ mod tests {
             .expect("raw_record_to_record_buf failed in test")
     }
 
-    /// Builds a pair of reads with proper mate information
-    #[allow(clippy::too_many_arguments, clippy::cast_sign_loss)]
+    /// Builds a pair of reads with proper mate information, both mates on `ref_id`
+    #[allow(clippy::too_many_arguments)]
     fn build_test_pair(
         name: &str,
         ref_id: usize,
         pos1: i32,
         pos2: i32,
+        rx_umi: &str,
+        mi_tag: &str,
+        strand1_plus: bool,
+        strand2_plus: bool,
+    ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
+        build_test_pair_on_refs(
+            name,
+            (ref_id, pos1),
+            (ref_id, pos2),
+            rx_umi,
+            mi_tag,
+            strand1_plus,
+            strand2_plus,
+        )
+    }
+
+    /// Builds a pair of reads with proper mate information, R1 at `(ref_id1, pos1)`
+    /// and R2 at `(ref_id2, pos2)`, so the mates may lie on different references.
+    #[allow(clippy::too_many_arguments, clippy::cast_sign_loss)]
+    fn build_test_pair_on_refs(
+        name: &str,
+        (ref_id1, pos1): (usize, i32),
+        (ref_id2, pos2): (usize, i32),
         rx_umi: &str,
         mi_tag: &str,
         strand1_plus: bool,
@@ -464,13 +487,13 @@ mod tests {
         let mut b1 = RawSamBuilder::new();
         b1.read_name(name.as_bytes())
             .flags(r1_flags)
-            .ref_id(ref_id as i32)
+            .ref_id(ref_id1 as i32)
             .pos(pos1 - 1)
             .mapq(60)
             .cigar_ops(&[cigar])
             .sequence(&seq)
             .qualities(&quals)
-            .mate_ref_id(ref_id as i32)
+            .mate_ref_id(ref_id2 as i32)
             .mate_pos(pos2 - 1);
         b1.add_string_tag(SamTag::RX, rx_umi.as_bytes());
         b1.add_string_tag(SamTag::MI, mi_tag.as_bytes());
@@ -479,13 +502,13 @@ mod tests {
         let mut b2 = RawSamBuilder::new();
         b2.read_name(name.as_bytes())
             .flags(r2_flags)
-            .ref_id(ref_id as i32)
+            .ref_id(ref_id2 as i32)
             .pos(pos2 - 1)
             .mapq(60)
             .cigar_ops(&[cigar])
             .sequence(&seq)
             .qualities(&quals)
-            .mate_ref_id(ref_id as i32)
+            .mate_ref_id(ref_id1 as i32)
             .mate_pos(pos1 - 1);
         b2.add_string_tag(SamTag::RX, rx_umi.as_bytes());
         b2.add_string_tag(SamTag::MI, mi_tag.as_bytes());
@@ -1067,7 +1090,10 @@ mod tests {
 
     /// DXM-02: the `--duplex-umi-counts` duplex UMI must be oriented to the F1R2
     /// reading of the top strand, by the actual R1 strand — not the MI `/A`,`/B`
-    /// suffix (which is not strand-reliable). fgbio reports a read pair with UMI
+    /// suffix (which is not strand-reliable). The suffix still decides how the two
+    /// UMI halves are paired up across strands (see
+    /// `test_duplex_umi_halves_paired_by_strand_family`); R1 strand only decides
+    /// which half the reported duplex UMI leads with. fgbio reports a read pair with UMI
     /// `u1-u2` as `u1-u2` when R1 is on the positive strand, and as `u2-u1` when R1 is
     /// on the negative strand (`CollectDuplexSeqMetrics.scala:419-425`; docstring
     /// example `AAAA-GGGG`, R1 negative → `GGGG-AAAA`). Previously fgumi always led
@@ -1121,6 +1147,179 @@ mod tests {
             umis.contains("GAT-CCA"),
             "forward-strand-first family must stay GAT-CCA, got {umis:?}"
         );
+
+        Ok(())
+    }
+
+    /// The two halves of a duplex UMI must be paired up by single-strand family (the
+    /// MI `/A`,`/B` suffix), as fgbio does (`CollectDuplexSeqMetrics.scala:407-408`),
+    /// not by the R1 strand. A duplex whose mates map in the same orientation (FF/RR,
+    /// e.g. inversions and most inter-chromosomal chimeras) has R1 on the same strand
+    /// in both its `/A` and `/B` families, so orienting by R1 strand leaves the `/B`
+    /// reads unswapped and mixes the two halves into one consensus (e.g. `AAA` with
+    /// `CAG` → `NAN`), inflating `raw_observations_with_errors` in `umi_counts.txt`
+    /// and corrupting the `duplex_umi_counts.txt` key.
+    ///
+    /// The `/A` strand's R1 is placed at `chr1:100` and its R2 at `(a_r2_ref, 200)`
+    /// with the given strands; the `/B` strand of the same molecule has its R1 where
+    /// the `/A` R2 is (same orientation) and vice versa, so both co-group into one
+    /// duplex family. `a_r2_ref = 1` makes an inter-chromosomal chimera.
+    #[rstest]
+    #[case::fr_a_positive(0, true, false, "AAA-CAG")]
+    #[case::rf_a_negative(0, false, true, "CAG-AAA")]
+    #[case::ff_same_orientation(0, true, true, "AAA-CAG")]
+    #[case::rr_same_orientation(0, false, false, "CAG-AAA")]
+    #[case::ff_inter_chromosomal(1, true, true, "AAA-CAG")]
+    #[case::rr_inter_chromosomal(1, false, false, "CAG-AAA")]
+    fn test_duplex_umi_halves_paired_by_strand_family(
+        #[case] a_r2_ref: usize,
+        #[case] a_r1_plus: bool,
+        #[case] a_r2_plus: bool,
+        #[case] expected_duplex_umi: &str,
+    ) -> Result<()> {
+        let (a_r1_pos, a_r2_pos) = ((0, 100), (a_r2_ref, 200));
+        let mut records = Vec::new();
+        let (r1, r2) = build_test_pair_on_refs(
+            "a", a_r1_pos, a_r2_pos, "AAA-CAG", "1/A", a_r1_plus, a_r2_plus,
+        );
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair_on_refs(
+            "b", a_r2_pos, a_r1_pos, "CAG-AAA", "1/B", a_r2_plus, a_r1_plus,
+        );
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: true,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        // The /A and /B strands form one duplex family.
+        let family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let families: Vec<DuplexFamilySizeMetric> = DelimFile::default().read_tsv(&family_path)?;
+        assert_eq!(families.len(), 1, "expected one duplex family, got {families:?}");
+        assert_eq!((families[0].ab_size, families[0].ba_size, families[0].count), (1, 1, 1));
+
+        // Each UMI half is seen once per strand, with no errors.
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let mut umis: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        umis.sort_by(|a, b| a.umi.cmp(&b.umi));
+        let observed: Vec<(&str, usize, usize, usize)> = umis
+            .iter()
+            .map(|m| {
+                (
+                    m.umi.as_str(),
+                    m.raw_observations,
+                    m.raw_observations_with_errors,
+                    m.unique_observations,
+                )
+            })
+            .collect();
+        assert_eq!(observed, vec![("AAA", 2, 0, 1), ("CAG", 2, 0, 1)]);
+
+        // One duplex UMI, oriented to lead with the half a positive-strand R1 reads
+        // first. For FF/RR (`ff_*`/`rr_*`) neither strand family is F1R2-only, so
+        // fgbio's orientation depends on its MI hash order; the expected values pin
+        // fgumi's deterministic tie-break (`/A` leading half for FF, trailing for RR).
+        let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
+        let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
+        let observed: Vec<(&str, usize, usize, usize)> = duplex_umis
+            .iter()
+            .map(|m| {
+                (
+                    m.umi.as_str(),
+                    m.raw_observations,
+                    m.raw_observations_with_errors,
+                    m.unique_observations,
+                )
+            })
+            .collect();
+        assert_eq!(observed, vec![(expected_duplex_umi, 2, 0, 1)]);
+
+        Ok(())
+    }
+
+    /// A duplex family observed only on its `/B` strand still reports its UMI halves
+    /// un-swapped back to the `/A` pairing, and orients its duplex UMI to lead with
+    /// the half a positive-strand R1 reads first: the `/B` RX as-is when its R1 is
+    /// positive, swapped when its R1 is negative.
+    #[rstest]
+    #[case::b_r1_positive(true, "CAG-AAA")]
+    #[case::b_r1_negative(false, "AAA-CAG")]
+    fn test_duplex_umi_orientation_of_b_only_family(
+        #[case] b_r1_plus: bool,
+        #[case] expected_duplex_umi: &str,
+    ) -> Result<()> {
+        let mut records = Vec::new();
+        for name in ["b1", "b2"] {
+            let (r1, r2) =
+                build_test_pair(name, 0, 100, 200, "CAG-AAA", "1/B", b_r1_plus, !b_r1_plus);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: true,
+            intervals: None,
+            description: None,
+            threading: crate::commands::common::ThreadingOptions { threads: None },
+            scheduler_opts: crate::commands::common::SchedulerOptions::default(),
+            queue_memory: crate::commands::common::QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let umi_path = format!("{}.umi_counts.txt", output.display());
+        let mut umis: Vec<UmiMetric> = DelimFile::default().read_tsv(&umi_path)?;
+        umis.sort_by(|a, b| a.umi.cmp(&b.umi));
+        let observed: Vec<(&str, usize, usize, usize)> = umis
+            .iter()
+            .map(|m| {
+                (
+                    m.umi.as_str(),
+                    m.raw_observations,
+                    m.raw_observations_with_errors,
+                    m.unique_observations,
+                )
+            })
+            .collect();
+        assert_eq!(observed, vec![("AAA", 2, 0, 1), ("CAG", 2, 0, 1)]);
+
+        let duplex_umi_path = format!("{}.duplex_umi_counts.txt", output.display());
+        let duplex_umis: Vec<DuplexUmiMetric> = DelimFile::default().read_tsv(&duplex_umi_path)?;
+        let observed: Vec<(&str, usize, usize, usize)> = duplex_umis
+            .iter()
+            .map(|m| {
+                (
+                    m.umi.as_str(),
+                    m.raw_observations,
+                    m.raw_observations_with_errors,
+                    m.unique_observations,
+                )
+            })
+            .collect();
+        assert_eq!(observed, vec![(expected_duplex_umi, 2, 0, 1)]);
 
         Ok(())
     }
