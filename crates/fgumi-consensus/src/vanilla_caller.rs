@@ -23,7 +23,10 @@ use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 use std::collections::HashSet;
 
-/// Indexed source read for alignment filtering: (index, length, `simplified_cigar`)
+/// Indexed source read for alignment filtering: (index, length, `simplified_cigar`).
+///
+/// `length` is the read's base count, which is the sort key. It can be shorter than the query
+/// span of `simplified_cigar`, because a hard clip that survives into the cigar becomes `M`.
 pub(crate) type IndexedSourceRead = (usize, usize, SimplifiedCigar);
 
 /// CIGAR group with indices: (cigar, `read_indices`)
@@ -41,7 +44,9 @@ type ConsensusResult = (Vec<u8>, Vec<PhredScore>, Vec<u16>, Vec<u16>);
 ///
 /// # Arguments
 /// * `indexed` - Slice of (`original_index`, length, `simplified_cigar`) tuples,
-///   sorted by descending length for proper prefix matching.
+///   sorted by descending length for proper prefix matching. As in fgbio, the length is the
+///   read's base count, not the cigar's query span; the two differ when a hard clip survives
+///   into the cigar as `M` (an untrimmed `95M10H` read has 95 bases and a `105M` cigar).
 ///
 /// # Returns
 /// Vector of indices belonging to the most common alignment group.
@@ -134,7 +139,9 @@ pub(crate) struct SourceRead {
     pub(crate) bases: Vec<u8>,
     /// Transformed quality scores (reversed if originally negative strand, trimmed)
     pub(crate) quals: Vec<u8>,
-    /// Simplified CIGAR (reversed if originally negative strand, truncated to trimmed length)
+    /// Simplified CIGAR (reversed if originally negative strand, truncated to the trimmed length
+    /// if the read was trimmed, then simplified). Hard clips become `M`, so it can be longer
+    /// than `bases`.
     pub(crate) simplified_cigar: SimplifiedCigar,
     /// Raw BAM flags from the original record (used by duplex caller for R1/R2 splitting)
     pub(crate) flags: u16,
@@ -612,8 +619,6 @@ impl VanillaUmiConsensusCaller {
         read: &noodles::sam::alignment::record_buf::RecordBuf,
         original_idx: usize,
     ) -> Option<SourceRead> {
-        use fgumi_sam::clipper::cigar_utils;
-
         // The query-space past-mate count now lives solely in fgumi-raw-bam's raw-byte core
         // (record_utils::num_bases_extending_past_mate, the RecordBuf/reference-space copy,
         // was removed as stale — issue #760). This bridge only has a RecordBuf in hand, so
@@ -677,11 +682,8 @@ impl VanillaUmiConsensusCaller {
 
         let original_cigar: SimplifiedCigar =
             read.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect();
-        let mut simplified_cigar = cigar_utils::simplify_cigar(read.cigar());
-        if is_negative_strand {
-            simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
-        }
-        simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
+        let simplified_cigar =
+            Self::source_read_cigar(&original_cigar, is_negative_strand, final_len, read_len);
 
         let flg = u16::from(read.flags());
         #[allow(clippy::cast_possible_truncation)] // ref IDs are always within i32 range
@@ -1020,17 +1022,38 @@ impl VanillaUmiConsensusCaller {
         trim_point
     }
 
-    /// Reverses a simplified CIGAR (for negative strand reads).
-    /// In fgbio, when a read is on the negative strand, its CIGAR is reversed
-    /// along with the bases and qualities.
-    fn reverse_simplified_cigar(cigar: &[(Kind, usize)]) -> Vec<(Kind, usize)> {
-        cigar.iter().rev().copied().collect()
+    /// Builds a `SourceRead`'s alignment cigar from its full cigar, in fgbio's order: reverse it
+    /// for a negative-strand read, truncate it to `final_len` query bases only when trimming
+    /// shortened the read (`final_len < read_len`), and only then simplify it (S/=/X/H -> M).
+    ///
+    /// This matches fgbio's `UmiConsensusCaller.toSourceRead`, which truncates the record's own
+    /// cigar, and `filterToMostCommonAlignment`, which simplifies it afterwards. The order
+    /// matters for hard clips. Truncation counts only query-consuming operations, so a hard clip
+    /// ahead of the cut point is kept and one after it is dropped, and an untrimmed read keeps
+    /// all of its hard clips: a `95M10H` read groups as `105M`, not as a prefix of `100M`.
+    /// Simplifying first would make each hard clip a query-consuming `M`, so truncating to the
+    /// read's length would cut it away.
+    fn source_read_cigar(
+        cigar: &[(Kind, usize)],
+        is_negative_strand: bool,
+        final_len: usize,
+        read_len: usize,
+    ) -> SimplifiedCigar {
+        let mut cigar = cigar.to_vec();
+        if is_negative_strand {
+            cigar.reverse();
+        }
+        if final_len < read_len {
+            cigar = Self::truncate_cigar_to_query_length(&cigar, final_len);
+        }
+        fgumi_raw_bam::simplify_cigar_ops(&cigar)
     }
 
-    /// Truncates a simplified CIGAR to a given query length.
+    /// Truncates a CIGAR to a given query length.
     /// This matches fgbio's `Cigar.truncateToQueryLength` behavior.
-    /// Only query-consuming operations (M, I, S, =, X) contribute to length.
-    fn truncate_simplified_cigar(
+    /// Only query-consuming operations (M, I, S, =, X) contribute to length; non-consuming
+    /// operations (D, N, H, P) are kept while the cut point has not been reached.
+    fn truncate_cigar_to_query_length(
         cigar: &[(Kind, usize)],
         query_length: usize,
     ) -> Vec<(Kind, usize)> {
@@ -1057,8 +1080,8 @@ impl VanillaUmiConsensusCaller {
                 result.push((kind, take));
                 remaining -= take;
             } else {
-                // Deletions, skips, etc. don't consume query bases
-                // Include them fully (they represent gaps in the reference)
+                // D, N, H and P consume no query bases, so they are kept whole until the cut
+                // point; one that falls after the last kept query base is dropped by the break
                 result.push((kind, len));
             }
         }
@@ -1074,7 +1097,8 @@ impl VanillaUmiConsensusCaller {
     /// 3. Quality masking (low quality bases → N with qual 2, only up to trim point)
     /// 4. Mate overlap trimming (clip bases extending past mate)
     /// 5. Trailing N removal
-    /// 6. CIGAR transformation (reverse if negative strand, truncate to final length)
+    /// 6. CIGAR transformation (reverse if negative strand, truncate to the final length if the
+    ///    read was shortened, then simplify; see [`Self::source_read_cigar`])
     ///
     /// Returns `Ok(None)` if the final length is 0 (`ZeroPostAfterTrimming`), which is a legitimate
     /// filtering outcome. Returns `Err` if the read has absent base qualities (BAM `QUAL` of `*`,
@@ -1167,16 +1191,11 @@ impl VanillaUmiConsensusCaller {
         bases.truncate(final_len);
         quals.truncate(final_len);
 
-        // Get simplified CIGAR from raw ops
+        // Reorient and truncate the full cigar, then simplify it (see `source_read_cigar`)
         let cigar_ops = bam_fields::get_cigar_ops(raw);
         let original_cigar = bam_fields::cigar_from_raw(&cigar_ops);
-        let mut simplified_cigar = bam_fields::simplify_cigar_from_raw(&cigar_ops);
-
-        if is_negative_strand {
-            simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
-        }
-
-        simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
+        let simplified_cigar =
+            Self::source_read_cigar(&original_cigar, is_negative_strand, final_len, read_len);
 
         let rid = view.ref_id();
         let astart = i64::from(view.pos());
@@ -4850,6 +4869,86 @@ mod tests {
         }
     }
 
+    /// Hard clips must survive into the alignment-group cigar: `create_source_read` truncates the
+    /// raw cigar only when the read is shortened (`final_len < read_len`) and simplifies (H -> M)
+    /// afterwards, so a hard clip stays in the cigar unless the read is trimmed and the clip falls
+    /// after the cut point.
+    ///
+    /// fgbio has no unit test for this; the cases pin the behaviour of fgbio (e51a661)
+    /// `UmiConsensusCaller.scala:272-276` (`toSourceRead` reverses a negative-strand cigar) and
+    /// `:314-321` (a read whose final length equals its base count keeps its cigar as-is,
+    /// otherwise `cigar.truncateToQueryLength(n)`, `Alignment.scala:215`), together with
+    /// `filterToMostCommonAlignment` (`UmiConsensusCaller.scala:413`, `simplifyCigar` at
+    /// `:448-464`) simplifying the cigar afterwards. fgbio's `truncateToQueryLength`
+    /// (`Alignment.scala:249-266`) keeps non-query consuming elements such as `H` ahead of the
+    /// cut point, so a leading hard clip survives a truncation and a trailing one does not.
+    ///
+    /// The same rule applies to any non-query-consuming element after the last query base: an
+    /// untrimmed `50M2D` read (or a negative-strand `2D50M` read, reversed to `50M2D`) keeps its
+    /// trailing `D`, while a trimmed one drops it.
+    ///
+    /// Cases: `reverse` flips the strand, `n_tail` is the number of trailing `N` bases (in
+    /// alignment orientation) that are trimmed off, and `mate_clip` is the number of bases
+    /// clipped for extending past the mate.
+    #[rstest]
+    #[case::trailing_hard_clip_kept("95M10H", false, 95, 0, 0, "105M")]
+    #[case::leading_hard_clip_kept("10H95M", false, 95, 0, 0, "105M")]
+    #[case::hard_clip_after_deletion_kept("50M1D45M10H", false, 95, 0, 0, "50M1D55M")]
+    #[case::hard_clip_with_no_excess("95M5H", false, 95, 0, 0, "100M")]
+    #[case::negative_strand_hard_clip_kept("95M10H", true, 95, 0, 0, "105M")]
+    #[case::truncation_keeps_leading_hard_clip("10H90M", false, 90, 10, 0, "90M")]
+    #[case::truncation_drops_trailing_hard_clip("90M10H", false, 90, 10, 0, "80M")]
+    #[case::negative_strand_truncation_keeps_leading_hard_clip("90M10H", true, 90, 10, 0, "90M")]
+    #[case::negative_strand_truncation_drops_trailing_hard_clip("10H90M", true, 90, 10, 0, "80M")]
+    #[case::truncation_counts_soft_clip_as_query("10H5S85M", false, 90, 10, 0, "90M")]
+    #[case::mate_clip_keeps_leading_hard_clip("10H90M", false, 90, 0, 10, "90M")]
+    #[case::mate_clip_drops_trailing_hard_clip("90M10H", false, 90, 0, 10, "80M")]
+    #[case::untrimmed_trailing_deletion_kept("50M2D", false, 50, 0, 0, "50M2D")]
+    #[case::negative_strand_untrimmed_leading_deletion_kept("2D50M", true, 50, 0, 0, "50M2D")]
+    #[case::truncation_drops_trailing_deletion("50M2D", false, 50, 5, 0, "45M")]
+    fn test_to_source_read_truncates_raw_cigar_before_simplifying(
+        #[case] cigar: &str,
+        #[case] reverse: bool,
+        #[case] read_len: usize,
+        #[case] n_tail: usize,
+        #[case] mate_clip: usize,
+        #[case] expected_cigar: &str,
+    ) {
+        let caller = VanillaUmiConsensusCaller::new(
+            "consensus".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions { min_input_base_quality: 2, ..Default::default() },
+        );
+
+        // `n_tail` N bases end the read in alignment orientation; a negative-strand record stores
+        // them at the start of SEQ and they are moved to the end by the reverse complement.
+        let mut bases = vec![b'A'; read_len - n_tail];
+        bases.extend(vec![b'N'; n_tail]);
+        if reverse {
+            bases.reverse();
+        }
+
+        let record = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"hard")
+                .ref_id(0)
+                .pos(1000)
+                .flags(if reverse { flags::REVERSE } else { 0 })
+                .sequence(&bases)
+                .qualities(&vec![30; read_len])
+                .cigar_ops(&parse_cigar_str(cigar));
+            b.build()
+        };
+
+        let sr = caller
+            .create_source_read(record.as_ref(), 0, mate_clip)
+            .expect("valid qualities")
+            .expect("source read should be created");
+
+        assert_eq!(sr.bases.len(), read_len - n_tail - mate_clip);
+        assert_eq!(simplified_cigar_to_string(&sr.simplified_cigar), expected_cigar);
+    }
+
     // ============================================================================
     // Port of fgbio consensusCall tests for exact quality verification
     // ============================================================================
@@ -5508,6 +5607,246 @@ mod tests {
             .expect("consensus should succeed without MC tag");
 
         assert_eq!(output.count, 2, "Should produce 2 consensus reads even without MC tag");
+    }
+
+    /// Builds one FR read pair for [`test_hard_clip_alignment_group_matches_fgbio`]: a forward R1
+    /// at 1001 with `r1_cigar`/`r1_seq` and a reverse 100M R2 at 2001, far enough apart that no
+    /// bases extend past the mate. `MC` is set on both reads.
+    fn hard_clip_pair(name: &str, r1_cigar: &str, r1_seq: &[u8], r2_seq: &[u8]) -> Vec<RawRecord> {
+        let r1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(1000)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .mate_ref_id(0)
+                .mate_pos(2000)
+                .template_length(1100)
+                .sequence(r1_seq)
+                .qualities(&vec![40; r1_seq.len()])
+                .cigar_ops(&parse_cigar_str(r1_cigar))
+                .add_string_tag(SamTag::MI, b"1")
+                .add_string_tag(SamTag::MC, b"100M");
+            b.build()
+        };
+        let r2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(2000)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .mate_ref_id(0)
+                .mate_pos(1000)
+                .template_length(-1100)
+                .sequence(r2_seq)
+                .qualities(&vec![40; r2_seq.len()])
+                .cigar_ops(&parse_cigar_str("100M"))
+                .add_string_tag(SamTag::MI, b"1")
+                .add_string_tag(SamTag::MC, r1_cigar.as_bytes());
+            b.build()
+        };
+        vec![r1, r2]
+    }
+
+    /// Reads with hard clips are grouped by their unclipped (H -> M) cigar, so a `95M10H` read is
+    /// a `105M` read and is NOT a prefix of a plain `100M` read; the two form separate alignment
+    /// groups and only the larger group makes the consensus.
+    ///
+    /// fgbio has no unit test for this; the cases pin the behaviour of fgbio (e51a661)
+    /// `UmiConsensusCaller.scala:314-321` (`toSourceRead` does not truncate a read whose length is
+    /// unchanged) and `UmiConsensusCaller.scala:406-421` (`filterToMostCommonAlignment`, reads
+    /// sorted by descending base count, then a cigar is only grouped under a longer-or-equal group
+    /// by `Alignment.scala:276` `isPrefixOf`). The expected consensus lengths and `cD` values were
+    /// checked by running fgbio 4.1.0 `CallMolecularConsensusReads -M 1` on equivalent read pairs
+    /// (same cigars and read counts, R2 always `100M`). In every case except
+    /// `hard_clip_within_read_length` the hard-clipped reads form their own group: only the larger
+    /// group is called, so `cD` is that group's size, and when it is the hard-clipped group the
+    /// consensus is only 95bp. A `95M5H` read is a `100M` read and joins the plain group (`cD` 5).
+    #[rstest]
+    #[case::minority_hard_clip("100M", 3, "95M10H", 2, 0, 100, 3)]
+    #[case::majority_hard_clip("100M", 2, "95M10H", 3, 0, 95, 3)]
+    #[case::hard_clip_within_read_length("100M", 3, "95M5H", 2, 0, 100, 5)]
+    #[case::leading_hard_clip("100M", 3, "10H95M", 2, 10, 100, 3)]
+    #[case::hard_clip_with_deletion("50M1D50M", 3, "50M1D45M10H", 2, 0, 100, 3)]
+    fn test_hard_clip_alignment_group_matches_fgbio(
+        #[case] plain_cigar: &str,
+        #[case] n_plain: usize,
+        #[case] hard_cigar: &str,
+        #[case] n_hard: usize,
+        #[case] hard_start: usize,
+        #[case] expected_r1_len: usize,
+        #[case] expected_r1_depth: i32,
+    ) {
+        // Every hard-clipped R1 in the cases above has 95 query bases.
+        const HARD_READ_LEN: usize = 95;
+
+        // A deterministic pseudo-random genome so a read shifted by `hard_start` bases disagrees
+        // with the unshifted reads at most positions.
+        let mut state = 7u32;
+        let genome: Vec<u8> = (0..200)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b"ACGT"[(state >> 24) as usize % 4]
+            })
+            .collect();
+        let r2_seq = &genome[100..200];
+
+        let mut records = Vec::new();
+        for i in 0..n_plain {
+            records.extend(hard_clip_pair(&format!("p{i}"), plain_cigar, &genome[..100], r2_seq));
+        }
+        for i in 0..n_hard {
+            records.extend(hard_clip_pair(
+                &format!("h{i}"),
+                hard_cigar,
+                &genome[hard_start..hard_start + HARD_READ_LEN],
+                r2_seq,
+            ));
+        }
+
+        let mut caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions {
+                min_reads: 1,
+                min_input_base_quality: 2,
+                ..VanillaUmiConsensusOptions::default()
+            },
+        );
+        let output = consensus_reads_from_raw(&mut caller, records)
+            .expect("consensus should succeed for hard-clipped reads");
+        assert_eq!(output.count, 2, "one R1 and one R2 consensus");
+
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        let r1 = parsed
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("R1 consensus should be emitted");
+        let r2 = parsed
+            .iter()
+            .find(|r| r.flag & flags::LAST_SEGMENT != 0)
+            .expect("R2 consensus should be emitted");
+
+        assert_eq!(r1.bases, genome[..expected_r1_len], "R1 consensus bases");
+        assert_eq!(r1.get_int_tag(SamTag::CD), Some(expected_r1_depth), "R1 cD");
+        assert_eq!(r1.get_float_tag(SamTag::CE), Some(0.0), "R1 cE");
+        assert_eq!(r2.bases.len(), 100, "R2 consensus length");
+        assert_eq!(r2.get_int_tag(SamTag::CD), Some(5), "R2 cD");
+    }
+
+    /// An untrimmed `5H45M` read groups as `50M`, so it breaks a 2-vs-2 tie between `50M` and
+    /// `45M1I4M` reads in favour of `50M`. Truncating before simplifying made it `45M`, a prefix
+    /// of both groups, so it joined both and the tie went to `45M1I4M`.
+    ///
+    /// The `50M` reads carry `G` at offset 45 and the `45M1I4M` reads carry their inserted `C`
+    /// there. fgbio 4.1.0 `CallMolecularConsensusReads -M 1` calls `G` at offset 45 with `cD` 3
+    /// on these reads.
+    #[test]
+    fn test_untrimmed_leading_hard_clip_breaks_alignment_group_tie_like_fgbio() {
+        let fragment = |name: &str, cigar: &str, seq: &[u8]| {
+            SamBuilder::new()
+                .read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(1000)
+                .flags(0)
+                .sequence(seq)
+                .qualities(&vec![40; seq.len()])
+                .cigar_ops(&parse_cigar_str(cigar))
+                .add_string_tag(SamTag::MI, b"1")
+                .build()
+        };
+        let with_base_at_45 = |base: u8| {
+            let mut seq = vec![b'A'; 50];
+            seq[45] = base;
+            seq
+        };
+
+        let records = vec![
+            fragment("m0", "50M", &with_base_at_45(b'G')),
+            fragment("m1", "50M", &with_base_at_45(b'G')),
+            fragment("i0", "45M1I4M", &with_base_at_45(b'C')),
+            fragment("i1", "45M1I4M", &with_base_at_45(b'C')),
+            fragment("h0", "5H45M", &[b'A'; 45]),
+        ];
+
+        let mut caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions {
+                min_reads: 1,
+                min_input_base_quality: 2,
+                ..VanillaUmiConsensusOptions::default()
+            },
+        );
+        let output = consensus_reads_from_raw(&mut caller, records)
+            .expect("consensus should succeed for hard-clipped reads");
+        assert_eq!(output.count, 1, "one fragment consensus");
+
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &parsed[0];
+        assert_eq!(consensus.bases, with_base_at_45(b'G'), "consensus bases follow the 50M group");
+        assert_eq!(consensus.get_int_tag(SamTag::CD), Some(3), "cD");
+    }
+
+    /// An untrimmed read keeps a deletion that follows its last query base, so a `50M2D` read is
+    /// not a prefix of `50M` and forms its own alignment group; with three `50M` reads it is
+    /// rejected as a minority alignment. A negative-strand `2D50M` read reverses to `50M2D` and
+    /// behaves the same way. Truncating every read to its length used to drop the trailing `D`,
+    /// so these reads joined the `50M` group.
+    ///
+    /// This pins fgbio (21e65b6) `UmiConsensusCaller.scala:314-315` (`toSourceRead` keeps the
+    /// cigar untruncated when the read is not shortened) and `Alignment.scala:276-279`
+    /// (`isPrefixOf` is false when the candidate has more elements than the group's cigar).
+    #[rstest]
+    #[case::forward_trailing_deletion("50M2D", false)]
+    #[case::negative_strand_leading_deletion("2D50M", true)]
+    fn test_untrimmed_trailing_deletion_forms_own_alignment_group_like_fgbio(
+        #[case] deletion_cigar: &str,
+        #[case] reverse: bool,
+    ) {
+        let fragment = |name: &str, cigar: &str| {
+            SamBuilder::new()
+                .read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(1000)
+                .flags(if reverse { flags::REVERSE } else { 0 })
+                .sequence(&[b'A'; 50])
+                .qualities(&[40; 50])
+                .cigar_ops(&parse_cigar_str(cigar))
+                .add_string_tag(SamTag::MI, b"1")
+                .build()
+        };
+
+        let records = vec![
+            fragment("m0", "50M"),
+            fragment("m1", "50M"),
+            fragment("m2", "50M"),
+            fragment("d0", deletion_cigar),
+            fragment("d1", deletion_cigar),
+        ];
+
+        let mut caller = VanillaUmiConsensusCaller::new(
+            "c".to_string(),
+            "A".to_string(),
+            VanillaUmiConsensusOptions {
+                min_reads: 1,
+                min_input_base_quality: 2,
+                ..VanillaUmiConsensusOptions::default()
+            },
+        );
+        let output = consensus_reads_from_raw(&mut caller, records)
+            .expect("consensus should succeed for reads with a trailing deletion");
+        assert_eq!(output.count, 1, "one fragment consensus");
+
+        let parsed = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(parsed[0].get_int_tag(SamTag::CD), Some(3), "cD counts only the 50M reads");
+
+        let stats = caller.statistics();
+        assert_eq!(
+            stats.rejection_reasons.get(&RejectionReason::MinorityAlignment).copied(),
+            Some(2),
+            "both deletion reads are rejected as a minority alignment"
+        );
     }
 
     // =========================================================================

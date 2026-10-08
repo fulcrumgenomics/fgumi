@@ -13,9 +13,9 @@ pub fn cigar_from_raw(
 
 /// Simplify CIGAR operations from raw BAM u32 ops.
 ///
-/// Same logic as `cigar_utils::simplify_cigar` but operates on raw BAM CIGAR
-/// u32 words instead of noodles `Cigar`. Converts S, =, X, H operations to M
-/// and coalesces adjacent operations of the same type.
+/// Decodes raw BAM CIGAR u32 words with [`cigar_from_raw`] and simplifies them with
+/// [`simplify_cigar_ops`]: converts S, =, X, H operations to M and coalesces adjacent
+/// operations of the same type.
 ///
 /// Uses `noodles::sam::alignment::record::cigar::op::Kind` for the output
 /// representation to stay compatible with the existing `SimplifiedCigar` type.
@@ -23,11 +23,23 @@ pub fn cigar_from_raw(
 pub fn simplify_cigar_from_raw(
     cigar_ops: &[u32],
 ) -> Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> {
+    simplify_cigar_ops(&cigar_from_raw(cigar_ops))
+}
+
+/// Simplify `(Kind, length)` CIGAR operations: converts S, =, X, H operations to M and
+/// coalesces adjacent operations of the same type.
+///
+/// This is the single implementation of the rule: [`simplify_cigar_from_raw`] and
+/// `fgumi_sam::clipper::cigar_utils::simplify_cigar` both delegate to it.
+#[must_use]
+pub fn simplify_cigar_ops(
+    cigar: &[(noodles::sam::alignment::record::cigar::op::Kind, usize)],
+) -> Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> {
     use noodles::sam::alignment::record::cigar::op::Kind;
 
     let mut simplified: Vec<(Kind, usize)> = Vec::new();
 
-    for (kind, op_len) in cigar_from_raw(cigar_ops) {
+    for &(kind, op_len) in cigar {
         // Simplify: convert S, =, X, H to M
         let new_kind = match kind {
             Kind::SoftClip | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::HardClip => {
@@ -282,6 +294,8 @@ mod tests {
     use crate::SamTag;
     use crate::builder::*;
     use crate::testutil::*;
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    use rstest::rstest;
 
     // ========================================================================
     // simplify_cigar_from_raw tests
@@ -416,6 +430,29 @@ mod tests {
         let cigar = &[encode_op(4, 10)];
         let result = simplify_cigar_from_raw(cigar);
         assert_eq!(result, vec![(Kind::Match, 10)]);
+    }
+
+    /// `simplify_cigar_ops` takes an already-decoded cigar, which the consensus caller has
+    /// reoriented and possibly truncated before simplifying it.
+    #[rstest]
+    #[case::empty(&[], &[])]
+    #[case::clips_and_matches_coalesce(
+        &[(Kind::HardClip, 2), (Kind::SoftClip, 3), (Kind::SequenceMatch, 4), (Kind::SequenceMismatch, 1), (Kind::Match, 5)],
+        &[(Kind::Match, 15)],
+    )]
+    #[case::indels_skips_and_pads_kept(
+        &[(Kind::Match, 5), (Kind::Insertion, 2), (Kind::Deletion, 1), (Kind::Skip, 3), (Kind::Pad, 1), (Kind::HardClip, 4)],
+        &[(Kind::Match, 5), (Kind::Insertion, 2), (Kind::Deletion, 1), (Kind::Skip, 3), (Kind::Pad, 1), (Kind::Match, 4)],
+    )]
+    #[case::leading_hard_clip_and_trailing_deletion(
+        &[(Kind::HardClip, 10), (Kind::Match, 80), (Kind::Deletion, 2)],
+        &[(Kind::Match, 90), (Kind::Deletion, 2)],
+    )]
+    fn test_simplify_cigar_ops(
+        #[case] cigar: &[(Kind, usize)],
+        #[case] expected: &[(Kind, usize)],
+    ) {
+        assert_eq!(simplify_cigar_ops(cigar), expected);
     }
 
     // ========================================================================

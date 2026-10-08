@@ -1233,33 +1233,12 @@ pub mod cigar_utils {
     /// 2. Coalescing adjacent operations of the same type
     ///
     /// This is useful for comparing read alignments where only indel positions matter.
+    /// Delegates to [`fgumi_raw_bam::simplify_cigar_ops`], which owns the rule.
     #[must_use]
     pub fn simplify_cigar(cigar: &noodles::sam::alignment::record_buf::Cigar) -> SimplifiedCigar {
-        let mut simplified: SimplifiedCigar = Vec::new();
-
-        for op in cigar.as_ref() {
-            let (kind, len) = (op.kind(), op.len());
-
-            // Convert S, EQ, X, H to M; keep I, D, and M as-is
-            let new_kind = match kind {
-                Kind::SoftClip | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::HardClip => {
-                    Kind::Match
-                }
-                _ => kind,
-            };
-
-            // Coalesce adjacent operations of the same type
-            if let Some((last_kind, last_len)) = simplified.last_mut()
-                && *last_kind == new_kind
-            {
-                *last_len += len;
-                continue;
-            }
-
-            simplified.push((new_kind, len));
-        }
-
-        simplified
+        let ops: Vec<(Kind, usize)> =
+            cigar.as_ref().iter().map(|op| (op.kind(), op.len())).collect();
+        fgumi_raw_bam::simplify_cigar_ops(&ops)
     }
 
     /// Checks if `cigar_a` is a prefix of `cigar_b`.
@@ -2162,6 +2141,24 @@ mod tests {
 
         // 50M + 40M = 90 (insertion is not aligned)
         assert_eq!(aligned, 90);
+    }
+
+    #[test]
+    fn test_cigar_utils_simplify_cigar() {
+        let record = create_test_record("5H3S10=2X1I4M2D6S", "ACGTACGTACGT", 1000);
+        let simplified = cigar_utils::simplify_cigar(record.cigar());
+
+        // H, S, = and X become M and coalesce; I and D are kept.
+        assert_eq!(
+            simplified,
+            vec![
+                (Kind::Match, 20),
+                (Kind::Insertion, 1),
+                (Kind::Match, 4),
+                (Kind::Deletion, 2),
+                (Kind::Match, 6)
+            ]
+        );
     }
 
     #[test]
