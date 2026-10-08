@@ -24,13 +24,12 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ahash::AHashMap;
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 
 use crate::commands::filter::{CollectedFilterMetrics, Filter, FilterProcessCaptures};
-use crate::consensus_filter::retained_primary_masked_bases;
+use crate::consensus_filter::{is_primary_read, retained_primary_masked_bases};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
@@ -69,12 +68,14 @@ impl FinalizeHook for FilterFinalizeHook {
         let mut passed_reads = 0u64;
         let mut failed_reads = 0u64;
         let mut total_bases_masked = 0u64;
+        let mut evaluated_records = 0u64;
         for slot in accumulators.slots() {
             let m = slot.lock();
             total_reads += m.total_records;
             passed_reads += m.passed_records;
             failed_reads += m.failed_records;
             total_bases_masked += m.total_bases_masked;
+            evaluated_records += m.evaluated_records;
         }
 
         info!("Processed {total_reads} reads; kept {passed_reads} and rejected {failed_reads}");
@@ -82,7 +83,7 @@ impl FinalizeHook for FilterFinalizeHook {
             info!("Wrote {failed_reads} rejected records to rejects file");
         }
         info!("Total bases masked: {total_bases_masked}");
-        for warning in methylation_skip_warnings(total_reads, &methylation_skips) {
+        for warning in methylation_skip_warnings(evaluated_records, &methylation_skips) {
             warn!("{warning}");
         }
 
@@ -93,9 +94,11 @@ impl FinalizeHook for FilterFinalizeHook {
 }
 
 /// The end-of-run warnings for records the methylation filters could not evaluate, or whose
-/// modification tags they removed.
+/// modification tags they removed. `evaluated` is the number of records the filter evaluated
+/// ([`CollectedFilterMetrics::evaluated_records`]), which the every-record warnings are measured
+/// against.
 fn methylation_skip_warnings(
-    total_reads: u64,
+    evaluated: u64,
     skips: &crate::commands::filter::MethylationFilterSkips,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -105,16 +108,16 @@ fn methylation_skip_warnings(
     // The skip causes are exclusive per record: together they may cover every record without
     // any one of them doing so, and then the methylation filters also checked nothing.
     let skipped = unaligned + no_counts + length_mismatch;
-    let single_cause = [unaligned, no_counts, length_mismatch].contains(&total_reads);
-    if skipped > 0 && skipped == total_reads && !single_cause {
+    let single_cause = [unaligned, no_counts, length_mismatch].contains(&evaluated);
+    if skipped > 0 && skipped == evaluated && !single_cause {
         warnings.push(format!(
-            "none of the {total_reads} records were checked by the methylation filters (see the \
+            "none of the {evaluated} records were checked by the methylation filters (see the \
              reasons below)"
         ));
     }
     // A skip that hit every record means the methylation filters checked nothing at all.
     let mut skip_warning = |count: u64, every: &str, some: String| {
-        if count > 0 && count == total_reads {
+        if count > 0 && count == evaluated {
             warnings.push(format!(
                 "none of the {count} records were checked by the methylation filters: {every}"
             ));
@@ -266,12 +269,15 @@ pub(crate) fn process_record_raw_call(
 /// per-thread accumulator. Shared by all four `build_filter_step_*` factories so
 /// the metrics contract lives in exactly one place (four copies of it is the
 /// sibling-divergence pattern that has shipped bugs in this module).
+/// `evaluated_count` is the records the filter evaluated, which only the template
+/// steps can leave below `total_records`.
 fn record_batch_metrics(
     captures: &FilterProcessCaptures,
     accumulators: &PerThreadAccumulator<CollectedFilterMetrics>,
     total_records: u64,
     passed_count: u64,
     bases_masked_total: u64,
+    evaluated_count: u64,
 ) {
     let prev = captures.progress.fetch_add(total_records, Ordering::Relaxed);
     if (prev + total_records) / 1_000_000 > prev / 1_000_000 {
@@ -282,6 +288,7 @@ fn record_batch_metrics(
         m.passed_records += passed_count;
         m.failed_records += total_records - passed_count;
         m.total_bases_masked += bases_masked_total;
+        m.evaluated_records += evaluated_count;
     });
 }
 
@@ -315,6 +322,92 @@ fn filter_one_record(
         fgumi_raw_bam::write_framed_record(rejected, record.as_ref())?;
     }
     Ok((pass, masked_contribution))
+}
+
+/// The result of filtering one template: whether each record is kept, the template's share of
+/// fgbio's "Total bases masked" (the masked bases of its primary reads when it is kept, else 0),
+/// and how many of its records were evaluated.
+#[derive(Debug, PartialEq, Eq)]
+struct TemplateFilterOutcome {
+    keep: Vec<bool>,
+    masked_bases: u64,
+    evaluated: u64,
+}
+
+/// Apply the filter to one template the way fgbio does (`FilterConsensusReads.scala:189-219`,
+/// fgbio `origin/main` e51a661).
+///
+/// The primary reads ([`is_primary_read`]) are evaluated in template order (R1 before R2, as
+/// [`Template`](crate::template::Template) orders them) and evaluation stops at the first that
+/// fails; the secondary and supplementary records are evaluated only when every primary read
+/// passed, and each is then kept on its own result.
+///
+/// A record left unevaluated is rejected as it was read, so a rejected template never errors on
+/// a later record that lacks the consensus tags. It gets only
+/// [`Filter::orient_per_base_tags`], the change every record gets, as fgbio reverses every read
+/// of the template before filtering (`:195-200`). Skipping it also skips the rest of
+/// [`process_record_raw_call`]: an unevaluated record is not checked against the "--ref is
+/// required for mapped reads" guard, and is neither counted in the methylation-filter skip
+/// warnings nor in the records they are out of ([`TemplateFilterOutcome::evaluated`]).
+///
+/// # Errors
+///
+/// A template with no primary read (only secondary or supplementary records, for example after
+/// its primary reads were removed upstream) is an error naming the template, as in fgbio, which
+/// throws `"<name> had no R1."` (`:190`). So is any error evaluating a record.
+///
+/// Shared by both template step builders so the short-circuit cannot drift between them.
+fn filter_template_records(
+    records: &mut [RawRecord],
+    captures: &FilterProcessCaptures,
+) -> io::Result<TemplateFilterOutcome> {
+    if !records.iter().any(is_primary_read) {
+        let name = records
+            .first()
+            .map(|r| String::from_utf8_lossy(fgumi_raw_bam::RawRecordView::new(r).read_name()))
+            .unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "template {name} has no primary read (only secondary or supplementary records); \
+             filter needs each template's primary reads, as fgbio does"
+        )));
+    }
+
+    let mut keep = vec![false; records.len()];
+    let mut masked_bases: u64 = 0;
+    let mut evaluated: u64 = 0;
+    // The index of the primary read that failed, if one did; the primary reads up to and
+    // including it are the only records evaluated.
+    let mut failed_at: Option<usize> = None;
+
+    for (idx, record) in records.iter_mut().enumerate().filter(|(_, r)| is_primary_read(r)) {
+        evaluated += 1;
+        let (masked, pass) = process_record_raw_call(record, captures).map_err(io::Error::other)?;
+        if !pass {
+            failed_at = Some(idx);
+            break;
+        }
+        keep[idx] = true;
+        // Only primary reads reach this tally, so it is `retained_primary_masked_bases`'s rule.
+        masked_bases += masked;
+    }
+    if let Some(failed) = failed_at {
+        for (idx, record) in records.iter_mut().enumerate() {
+            let was_evaluated = is_primary_read(record) && idx <= failed;
+            if !was_evaluated {
+                Filter::orient_per_base_tags(record, captures.should_reverse_tags)
+                    .map_err(io::Error::other)?;
+            }
+        }
+        keep.fill(false);
+        return Ok(TemplateFilterOutcome { keep, masked_bases: 0, evaluated });
+    }
+
+    for (idx, record) in records.iter_mut().enumerate().filter(|(_, r)| !is_primary_read(r)) {
+        evaluated += 1;
+        let (_, pass) = process_record_raw_call(record, captures).map_err(io::Error::other)?;
+        keep[idx] = pass;
+    }
+    Ok(TemplateFilterOutcome { keep, masked_bases, evaluated })
 }
 
 /// Build the single-read, no-rejects filter step.
@@ -361,6 +454,7 @@ pub(crate) fn build_filter_step_single_no_rejects(
                 records_count,
                 passed_count,
                 bases_masked_total,
+                records_count, // every record is evaluated
             );
 
             Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
@@ -432,6 +526,7 @@ pub(crate) fn build_filter_step_single_with_rejects(
                 records_count,
                 passed_count,
                 bases_masked_total,
+                records_count, // every record is evaluated
             );
 
             Ok(Process2Output::both(
@@ -493,6 +588,7 @@ pub(crate) fn build_filter_step_single_no_rejects_raw(
                 records_count,
                 passed_count,
                 bases_masked_total,
+                records_count, // every record is evaluated
             );
 
             Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
@@ -565,6 +661,7 @@ pub(crate) fn build_filter_step_single_with_rejects_raw(
                 records_count,
                 passed_count,
                 bases_masked_total,
+                records_count, // every record is evaluated
             );
 
             Ok(Process2Output::both(
@@ -591,8 +688,6 @@ pub(crate) fn build_filter_step_template_no_rejects(
     DecompressedBlock,
     impl Fn(BamTemplateBatch) -> io::Result<DecompressedBlock> + Send + Sync + 'static,
 > {
-    use crate::consensus_filter::template_passes;
-
     process_ordered::<BamTemplateBatch, DecompressedBlock, _>(
         "FilterProcess",
         limit_bytes,
@@ -602,39 +697,16 @@ pub(crate) fn build_filter_step_template_no_rejects(
             let mut total_records: u64 = 0;
             let mut passed_count: u64 = 0;
             let mut bases_masked_total: u64 = 0;
+            let mut evaluated_count: u64 = 0;
 
             for template in templates {
                 let mut template_records: Vec<RawRecord> = template.into_records();
-                let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
-                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
+                total_records += template_records.len() as u64;
+                let outcome = filter_template_records(&mut template_records, &captures)?;
+                bases_masked_total += outcome.masked_bases;
+                evaluated_count += outcome.evaluated;
 
-                for (idx, record) in template_records.iter_mut().enumerate() {
-                    total_records += 1;
-                    let (masked, pass) =
-                        process_record_raw_call(record, &captures).map_err(io::Error::other)?;
-                    masked_by_record.push(masked);
-                    pass_map.insert(idx, pass);
-                }
-
-                let template_pass = template_passes(&template_records, &pass_map);
-                // Match fgbio's "Total bases masked" tally:
-                // count masked bases only in retained primary reads of a retained
-                // template (0 for a dropped template), not the raw per-record sum.
-                bases_masked_total += retained_primary_masked_bases(
-                    &template_records,
-                    &masked_by_record,
-                    template_pass,
-                );
-
-                for (idx, record) in template_records.into_iter().enumerate() {
-                    let flags = fgumi_raw_bam::RawRecordView::new(&record).flags();
-                    let is_primary = (flags & fgumi_raw_bam::flags::SECONDARY) == 0
-                        && (flags & fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
-                    let keep = if is_primary {
-                        template_pass
-                    } else {
-                        template_pass && pass_map.get(&idx).copied().unwrap_or(false)
-                    };
+                for (record, keep) in template_records.into_iter().zip(outcome.keep) {
                     if keep {
                         passed_count += 1;
                         fgumi_raw_bam::write_framed_record(&mut kept_bytes, record.as_ref())?;
@@ -648,6 +720,7 @@ pub(crate) fn build_filter_step_template_no_rejects(
                 total_records,
                 passed_count,
                 bases_masked_total,
+                evaluated_count,
             );
 
             Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
@@ -678,7 +751,6 @@ pub(crate) fn build_filter_step_template_with_rejects(
     + Sync
     + 'static,
 > {
-    use crate::consensus_filter::template_passes;
     use crate::pipeline::steps::process::Process2Output;
 
     process2_ordered::<BamTemplateBatch, DecompressedBlock, DecompressedBlock, _>(
@@ -693,40 +765,16 @@ pub(crate) fn build_filter_step_template_with_rejects(
             let mut total_records: u64 = 0;
             let mut passed_count: u64 = 0;
             let mut bases_masked_total: u64 = 0;
+            let mut evaluated_count: u64 = 0;
 
             for template in templates {
                 let mut template_records: Vec<RawRecord> = template.into_records();
-                let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
-                let mut masked_by_record: Vec<u64> = Vec::with_capacity(template_records.len());
+                total_records += template_records.len() as u64;
+                let outcome = filter_template_records(&mut template_records, &captures)?;
+                bases_masked_total += outcome.masked_bases;
+                evaluated_count += outcome.evaluated;
 
-                for (idx, record) in template_records.iter_mut().enumerate() {
-                    total_records += 1;
-                    let (masked, pass) = process_record_raw_call(record, &captures)
-                        .map_err(io::Error::other)?;
-                    masked_by_record.push(masked);
-                    pass_map.insert(idx, pass);
-                }
-
-                let template_pass = template_passes(&template_records, &pass_map);
-                // Match fgbio's "Total bases masked" tally:
-                // count masked bases only in retained primary reads of a retained
-                // template (0 for a dropped template), not the raw per-record sum.
-                bases_masked_total += retained_primary_masked_bases(
-                    &template_records,
-                    &masked_by_record,
-                    template_pass,
-                );
-
-                for (idx, record) in template_records.into_iter().enumerate() {
-                    let flags = fgumi_raw_bam::RawRecordView::new(&record).flags();
-                    let is_primary = (flags & fgumi_raw_bam::flags::SECONDARY) == 0
-                        && (flags & fgumi_raw_bam::flags::SUPPLEMENTARY) == 0;
-
-                    let keep = if is_primary {
-                        template_pass
-                    } else {
-                        template_pass && pass_map.get(&idx).copied().unwrap_or(false)
-                    };
+                for (record, keep) in template_records.into_iter().zip(outcome.keep) {
                     let target = if keep {
                         passed_count += 1;
                         &mut kept_bytes
@@ -743,6 +791,7 @@ pub(crate) fn build_filter_step_template_with_rejects(
                 total_records,
                 passed_count,
                 bases_masked_total,
+                evaluated_count,
             );
 
             Ok(Process2Output::both(
@@ -834,5 +883,80 @@ mod tests {
         for (warning, needle) in warnings.iter().zip(expected) {
             assert!(warning.contains(needle), "{warning:?} lacks {needle:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
+
+    use crate::commands::filter::{FilterProcessCaptures, MethylationFilterSkips};
+    use crate::consensus_filter::{FilterConfig, MethylationDepthThresholds};
+    use crate::sam::SamTag;
+
+    /// An unmapped paired read of template `t` with simplex consensus depth `depth` and no
+    /// `cu`/`ct` methylation counts.
+    fn unmapped_member(flag: u16, depth: i32) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"t").flags(flag | flags::UNMAPPED).sequence(b"AAAA").qualities(&[30; 4]);
+        b.add_int_tag(SamTag::CD, depth).add_float_tag(SamTag::CE, 0.0_f32);
+        b.build()
+    }
+
+    /// The methylation-filter warnings are measured against the records the filter evaluated,
+    /// not every record read: a template whose R1 fails leaves R2 unevaluated and unclassified,
+    /// so a run where no evaluated record carries `cu`/`ct` still says that none did.
+    #[test]
+    fn test_methylation_warnings_count_only_evaluated_records() {
+        let skips = Arc::new(MethylationFilterSkips::default());
+        let captures = FilterProcessCaptures {
+            config: Arc::new(FilterConfig::new(&[5], &[1.0], &[1.0], None, None, 1.0)),
+            reference: None,
+            min_base_quality: None,
+            should_reverse_tags: false,
+            min_mean_base_quality: None,
+            max_no_call_fraction: 1.0,
+            require_single_strand_agreement: false,
+            methylation_depth_thresholds: Some(MethylationDepthThresholds::from_values(&[1])),
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: fgumi_consensus::MethylationMode::EmSeq,
+            ref_names: Arc::new(Vec::new()),
+            progress: Arc::new(AtomicU64::new(0)),
+            header: noodles::sam::Header::default(),
+            methylation_skips: Arc::clone(&skips),
+        };
+        let mut records = vec![
+            unmapped_member(flags::PAIRED | flags::FIRST_SEGMENT, 2),
+            unmapped_member(flags::PAIRED | flags::LAST_SEGMENT, 10),
+        ];
+
+        let outcome =
+            super::filter_template_records(&mut records, &captures).expect("filter the template");
+
+        assert_eq!(
+            (outcome, skips.no_counts.load(Ordering::Relaxed)),
+            (
+                super::TemplateFilterOutcome {
+                    keep: vec![false, false],
+                    masked_bases: 0,
+                    evaluated: 1
+                },
+                1
+            ),
+            "only R1 is evaluated (and classified)"
+        );
+        let warnings = super::methylation_skip_warnings(1, &skips);
+        assert_eq!(
+            warnings,
+            vec![
+                "none of the 1 records were checked by the methylation filters: no record carries \
+                 cu/ct methylation counts; call consensus with --methylation-mode"
+                    .to_string()
+            ]
+        );
     }
 }

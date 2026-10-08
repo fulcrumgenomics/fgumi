@@ -15,17 +15,24 @@
 //!
 //! 2. **Output parity with the pre-removal serial path**
 //!    (`cutover_matches_baseline`). The current build's `filter` output — kept
-//!    records and (when written) the rejects BAM (both byte-identical modulo the
-//!    `@PG` line) and the `--stats` counts — must match the frozen owned-serial
-//!    baseline binary. `--stats` is compared by value, not byte-for-byte, because
-//!    its layout changed intentionally after 0.7.0 (headerless key/value rows to a
-//!    headered one-row TSV) and a pre-change baseline writes the old layout. The baseline path comes from `FGUMI_BASELINE_BIN`; when it
-//!    is unset (or names a missing file) the case degrades to a self-consistency
-//!    oracle (min-reads filtering, base masking, and NM regeneration asserted
-//!    directly) rather than skipping — the exact fallback discipline of
-//!    `test_sort_cutover_parity.rs`. Cases cover `--min-reads` filtering (records
-//!    kept vs rejected), `--ref`-based NM/UQ/MD regeneration, base masking, and
-//!    both `filter-by-template` modes, plus `--rejects` and `--stats`.
+//!    records (byte-identical modulo the `@PG` line), which records went to the
+//!    rejects BAM when written, and the `--stats` counts — must match the frozen
+//!    owned-serial baseline binary. `--stats` is compared by value, not
+//!    byte-for-byte, because its layout changed intentionally after 0.7.0
+//!    (headerless key/value rows to a headered one-row TSV) and a pre-change
+//!    baseline writes the old layout. The rejects BAM is compared by record
+//!    identity, and each rejected record byte for byte, except the reads the
+//!    read-level checks reject (`low_depth`, `pair` R2): their content changed
+//!    intentionally, since those checks now run before masking, as in fgbio, so
+//!    such a read is written as it was read rather than masked with `NM`/`UQ`/`MD`
+//!    regenerated (`assert_rejects_content` pins the new content). The baseline path comes
+//!    from `FGUMI_BASELINE_BIN`; when it is unset (or names a missing file) the
+//!    case degrades to a self-consistency oracle (min-reads filtering, base
+//!    masking, and NM regeneration asserted directly) rather than skipping — the
+//!    exact fallback discipline of `test_sort_cutover_parity.rs`. Cases cover
+//!    `--min-reads` filtering (records kept vs rejected), `--ref`-based NM/UQ/MD
+//!    regeneration, base masking, and both `filter-by-template` modes, plus
+//!    `--rejects` and `--stats`.
 //!
 //! **Not a RED/GREEN gate for the parity half.** Because the removed serial loop
 //! and the chain were already output-equivalent (see the in-tree
@@ -170,7 +177,8 @@ fn consensus_read(
 /// Four single-end reads (each its own template, so they behave identically in
 /// both `--filter-by-template` modes):
 /// - `pass`: depth 10, exact match, no masking — kept, `NM` 0.
-/// - `low_depth`: depth 1 (< `--min-reads 3`) — rejected by the read-level filter.
+/// - `low_depth`: depth 1 (< `--min-reads 3`) — rejected by the read-level filter,
+///   before masking, so it reaches `--rejects` as it was read.
 /// - `masked`: depth 10 but one per-base depth 1 (< 3) — that base masked to `N`,
 ///   read still kept (1 `N` of 8 = 0.125 < `--max-no-call-fraction 0.2`), `NM`
 ///   regenerated over the masked base.
@@ -341,11 +349,34 @@ fn cutover_matches_baseline(
             baseline.display(),
         );
         if with_rejects {
+            // Which records are rejected, in order, is unchanged, and so is the content of every
+            // one except the reads rejected before masking (see the module docs), which
+            // `assert_rejects_content` pins instead of the baseline.
+            let rejected_ids = name_flags(&read_bam_output(&current_rejects).1);
             assert_eq!(
-                decompressed_records_without_pg(&current_rejects),
-                decompressed_records_without_pg(&baseline_rejects),
-                "chain --rejects output diverges from the serial baseline binary"
+                rejected_ids,
+                name_flags(&read_bam_output(&baseline_rejects).1),
+                "chain --rejects records diverge from the serial baseline binary"
             );
+            let current_bytes = record_bytes(&current_rejects);
+            let baseline_bytes = record_bytes(&baseline_rejects);
+            let unchanged: Vec<&(String, u16)> = rejected_ids
+                .iter()
+                .filter(|(name, bits)| !rejected_before_masking().contains(&(name.as_str(), *bits)))
+                .collect();
+            // In template mode `pair` R1 is rejected with its mate after passing its own checks.
+            assert_eq!(unchanged.len(), usize::from(filter_by_template), "{unchanged:?}");
+            for ((id, current), baseline) in
+                rejected_ids.iter().zip(&current_bytes).zip(&baseline_bytes)
+            {
+                if unchanged.contains(&id) {
+                    assert_eq!(
+                        current, baseline,
+                        "--rejects record {id:?} diverges from the serial baseline binary"
+                    );
+                }
+            }
+            assert_rejects_content(filter_by_template, &input, &current_rejects);
         }
         if with_stats {
             // The `--stats` layout changed intentionally (headerless key/value rows ->
@@ -373,6 +404,7 @@ fn cutover_matches_baseline(
         );
         assert_self_consistent(
             filter_by_template,
+            &input,
             &current_out,
             cur_rej.as_deref(),
             cur_stats.as_deref(),
@@ -393,6 +425,7 @@ fn cutover_matches_baseline(
 ///   and `pair` R2 (2).
 fn assert_self_consistent(
     filter_by_template: bool,
+    input: &Path,
     output: &Path,
     rejects: Option<&Path>,
     stats: Option<&Path>,
@@ -401,7 +434,6 @@ fn assert_self_consistent(
         if filter_by_template { (6, 3, 3) } else { (6, 4, 2) };
 
     let paired_r1 = flags::PAIRED | flags::FIRST_SEGMENT;
-    let paired_r2 = flags::PAIRED | flags::LAST_SEGMENT;
 
     // Assert the *exact* kept set as a (read name, flag bits) multiset, not just
     // names and a count. This pins the identity of every kept record: in
@@ -441,21 +473,7 @@ fn assert_self_consistent(
     assert_eq!(nm_tag(masked), Some(1), "masked read NM must regenerate over the masked base");
 
     if let Some(rejects_path) = rejects {
-        // Assert the *exact* rejected set as a (read name, flag bits) multiset,
-        // so a duplicated or flag-substituted `low_depth` record cannot pass. In
-        // template mode the whole `pair` template is rejected (R1 too, with
-        // FIRST_SEGMENT); in single-read mode only `pair` R2 (LAST_SEGMENT) is.
-        let (_, rejected) = read_bam_output(rejects_path);
-        let expected_rejected: Vec<(&str, u16)> = if filter_by_template {
-            vec![("low_depth", 0), ("pair", paired_r1), ("pair", paired_r2)]
-        } else {
-            vec![("low_depth", 0), ("pair", paired_r2)]
-        };
-        assert_eq!(
-            sorted_name_flags(&rejected),
-            sorted_expected(&expected_rejected),
-            "filter_by_template={filter_by_template}: rejected (read name, flags) multiset mismatch"
-        );
+        assert_rejects_content(filter_by_template, input, rejects_path);
     }
 
     if let Some(stats_path) = stats {
@@ -474,6 +492,91 @@ fn assert_self_consistent(
             assert_eq!(actual, expected, "stats `{name}` value mismatch; got:\n{tsv}");
         }
     }
+}
+
+/// Asserts the exact rejected set and each rejected record's bases and `NM`, as a sorted
+/// `(read name, flag bits, bases, NM)` multiset, so a duplicated or flag-substituted record
+/// cannot pass. In template mode the whole `pair` template is rejected (R1 too, with
+/// `FIRST_SEGMENT`); in single-read mode only `pair` R2 (`LAST_SEGMENT`) is.
+///
+/// The reads that fail `--min-reads` (`low_depth`, `pair` R2) are rejected before masking, as in
+/// fgbio (`FilterConsensusReads.scala:245-248`, fgbio `origin/main` e51a661), so they are written
+/// as they were read: their depth-1 bases unmasked and no `NM` added. In template mode `pair` R1
+/// passed its own checks before R2 failed, so it went through masking (nothing to mask) and `NM`
+/// regeneration before the template was rejected. The two unmasked reads are also compared in
+/// full (qualities, `cd`/`ce` and every other field) against the same records in `input`.
+fn assert_rejects_content(filter_by_template: bool, input: &Path, rejects: &Path) {
+    let [low_depth, pair_r2] = rejected_before_masking();
+    let paired_r1 = flags::PAIRED | flags::FIRST_SEGMENT;
+    let (_, rejected) = read_bam_output(rejects);
+    let mut actual: Vec<(String, u16, Vec<u8>, Option<i64>)> = rejected
+        .iter()
+        .map(|r| (record_name(r), r.flags().bits(), r.sequence().as_ref().to_vec(), nm_tag(r)))
+        .collect();
+    actual.sort();
+    let mut expected: Vec<(String, u16, Vec<u8>, Option<i64>)> = vec![
+        (low_depth.0.to_string(), low_depth.1, b"ACGTACGT".to_vec(), None),
+        (pair_r2.0.to_string(), pair_r2.1, b"ACGTACGT".to_vec(), None),
+    ];
+    if filter_by_template {
+        expected.push(("pair".to_string(), paired_r1, b"ACGTACGT".to_vec(), Some(0)));
+    }
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "filter_by_template={filter_by_template}: rejected (name, flags, bases, NM) mismatch"
+    );
+
+    let (_, input_records) = read_bam_output(input);
+    let find = |records: &[noodles::sam::alignment::RecordBuf], name: &str, bits: u16| {
+        records
+            .iter()
+            .find(|r| record_name(r) == name && r.flags().bits() == bits)
+            .unwrap_or_else(|| panic!("no ({name}, {bits}) record"))
+            .clone()
+    };
+    for (name, bits) in rejected_before_masking() {
+        assert_eq!(
+            find(&rejected, name, bits),
+            find(&input_records, name, bits),
+            "filter_by_template={filter_by_template}: ({name}, {bits}) must be written to \
+             --rejects exactly as it was read"
+        );
+    }
+}
+
+/// The `(read name, flag bits)` of the reads the read-level checks reject (`--min-reads`), which
+/// are written to `--rejects` as they were read rather than masked: `low_depth` and `pair` R2.
+fn rejected_before_masking() -> [(&'static str, u16); 2] {
+    [("low_depth", 0), ("pair", flags::PAIRED | flags::LAST_SEGMENT)]
+}
+
+/// Each record's bytes (`block_size` and the record), in order, from a BAM's decompressed
+/// stream, so a record can be compared byte for byte without parsing it.
+fn record_bytes(path: &Path) -> Vec<Vec<u8>> {
+    let raw = decompressed_records_without_pg(path);
+    let u32_at = |at: usize| {
+        usize::try_from(u32::from_le_bytes(raw[at..at + 4].try_into().expect("4 bytes")))
+            .expect("fits usize")
+    };
+    let mut at = 8 + u32_at(4); // magic, l_text, text
+    let n_ref = u32_at(at);
+    at += 4;
+    for _ in 0..n_ref {
+        at += 4 + u32_at(at) + 4; // l_name, name, l_ref
+    }
+    let mut records = Vec::new();
+    while at < raw.len() {
+        let end = at + 4 + u32_at(at);
+        records.push(raw[at..end].to_vec());
+        at = end;
+    }
+    records
+}
+
+/// The `(read name, flag bits)` of each record, in order.
+fn name_flags(records: &[noodles::sam::alignment::RecordBuf]) -> Vec<(String, u16)> {
+    records.iter().map(|r| (record_name(r), r.flags().bits())).collect()
 }
 
 /// Parses a `filter --stats` file in either layout: the current headered one-row
@@ -523,8 +626,7 @@ fn record_name(record: &noodles::sam::alignment::RecordBuf) -> String {
 /// The sorted `(read name, flag bits)` multiset of a record set, so kept/rejected
 /// identities can be compared exactly and order-independently.
 fn sorted_name_flags(records: &[noodles::sam::alignment::RecordBuf]) -> Vec<(String, u16)> {
-    let mut pairs: Vec<(String, u16)> =
-        records.iter().map(|r| (record_name(r), r.flags().bits())).collect();
+    let mut pairs = name_flags(records);
     pairs.sort();
     pairs
 }

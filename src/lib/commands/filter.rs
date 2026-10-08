@@ -137,7 +137,11 @@ pub struct Filter {
     pub min_base_quality: Option<u8>,
 
     /// Minimum mean base quality across the read, computed over the full read length prior
-    /// to any masking (matching fgbio `FilterConsensusReads`)
+    /// to any masking (matching fgbio `FilterConsensusReads`). Must be a finite value >= 0.
+    ///
+    /// A read with no bases (SEQ `*`) has a mean base quality of 0, so any value above 0
+    /// rejects it. This differs from fgbio, whose mean for such a read is 0 / 0 = NaN, which
+    /// passes the check.
     #[arg(short = 'q', long = "min-mean-base-quality")]
     pub min_mean_base_quality: Option<f64>,
 
@@ -160,7 +164,18 @@ pub struct Filter {
     #[arg(long = "filter-by-template", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub filter_by_template: bool,
 
-    /// Optional output BAM file for rejected reads
+    /// Optional output BAM file for rejected reads.
+    ///
+    /// A read rejected by --min-reads, --max-read-error-rate or --min-mean-base-quality
+    /// (including a duplex read's per-strand limits) is written as it was read, without masking.
+    /// A read rejected by --max-no-call-fraction or --min-conversion-fraction is written after
+    /// masking, with NM/UQ/MD regenerated. With --filter-by-template, the other records of a
+    /// rejected template are written as they were read if they were never evaluated (the records
+    /// after the first primary read that fails, and every secondary and supplementary record),
+    /// and after masking if they were (a primary read that passed before its mate failed).
+    /// A record left unevaluated is also not checked for --ref, which a mapped record otherwise
+    /// requires. With --reverse-per-base-tags, a negative-strand read's per-base tags are
+    /// reversed in every case.
     #[arg(long = "rejects")]
     pub rejects: Option<PathBuf>,
 
@@ -279,7 +294,7 @@ pub struct FilterOptions {
     /// Filter whole templates rather than individual reads.
     #[arg(long = "filter-by-template", value_name = "true|false", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub filter_by_template: bool,
-    /// Optional path for rejected records.
+    /// Optional path for rejected records (see `fgumi filter --help` for how each is written).
     #[arg(long = "rejects")]
     pub rejects: Option<PathBuf>,
     /// Optional path for filter statistics.
@@ -372,6 +387,10 @@ pub(crate) struct CollectedFilterMetrics {
     pub(crate) failed_records: u64,
     /// Total bases masked.
     pub(crate) total_bases_masked: u64,
+    /// Records the filter evaluated: the count the end-of-run methylation-filter warnings are
+    /// out of. With `--filter-by-template` it can be fewer than `total_records`, as a failed
+    /// template leaves its later records unevaluated, and so unclassified.
+    pub(crate) evaluated_records: u64,
 }
 
 /// Shared state for a filter pipeline run, built by `setup_pipeline`.
@@ -586,11 +605,21 @@ impl FilterOptions {
             }
         }
 
-        // Validate max-no-call-fraction
-        // If >= 1.0, it should be an integer (count of bases)
-        // If < 1.0, it's a fraction
-        if self.max_no_call_fraction < 0.0 {
-            bail!("--max-no-call-fraction must be >= 0.0, got {}", self.max_no_call_fraction);
+        // Validate min-mean-base-quality. A non-finite or negative value is never meaningful, and
+        // NaN would silently reject every read (every comparison with NaN is false).
+        if let Some(min_qual) = self.min_mean_base_quality
+            && !(min_qual.is_finite() && min_qual >= 0.0)
+        {
+            bail!("--min-mean-base-quality must be a finite value >= 0, got {min_qual}");
+        }
+
+        // Validate max-no-call-fraction: a fraction of the read length below 1.0, an integer count
+        // of bases at or above it. As above, NaN would silently reject every read.
+        if !(self.max_no_call_fraction.is_finite() && self.max_no_call_fraction >= 0.0) {
+            bail!(
+                "--max-no-call-fraction must be a finite value >= 0, got {}",
+                self.max_no_call_fraction
+            );
         }
         if self.max_no_call_fraction >= 1.0 && self.max_no_call_fraction.fract() != 0.0 {
             bail!(
@@ -715,10 +744,13 @@ pub(crate) struct MethylationFilterSkips {
 }
 
 impl Filter {
-    /// Process a single raw BAM record: reverse tags, mask bases, regenerate alignment
-    /// tags, and check filters.
+    /// Process a single raw BAM record in fgbio's order: reverse tags, check the read-level
+    /// filters, then (only for a read that passes them) mask bases, regenerate alignment tags,
+    /// and check the no-call and conversion-fraction filters.
     ///
-    /// Returns `(bases_masked, pass)`.
+    /// Returns `(bases_masked, pass)`. A read that fails the read-level filters is returned as
+    /// `(0, false)` with no base masked and no tag rewritten (other than the per-base tag
+    /// reversal, when `reverse_tags`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_record_raw(
         record: &mut RawRecord,
@@ -753,31 +785,84 @@ impl Filter {
             }
         }
 
-        if reverse_tags {
-            reverse_per_base_tags_raw(record)?;
+        Self::orient_per_base_tags(record, reverse_tags)?;
+
+        // The read-level checks come first, on the read as it was read, as in fgbio
+        // (`FilterConsensusReads.scala:245-248`; the duplex tiers at `:302-317`). A read that
+        // fails them is rejected before any base is masked or any tag rewritten, so it reaches
+        // `--rejects` as it was read (with its per-base tags reversed, when asked). One walk of
+        // the scalar consensus tags serves both the duplex/simplex split and the checks; nothing
+        // below rewrites those tags.
+        let scalar_tags = ConsensusScalarTags::from_aux(fgumi_raw_bam::aux_data_slice(record));
+        let is_duplex = scalar_tags.is_duplex();
+        let passes_read_level =
+            Self::passes_read_level_checks(record, &scalar_tags, config, min_mean_base_quality)?;
+
+        // Parse methylation tags once for all EM-Seq filters
+        let needs_methylation_tags = methylation_depth_thresholds.is_some()
+            || (require_strand_methylation_agreement && is_duplex)
+            || min_conversion_fraction.is_some();
+        let methylation_tags =
+            if needs_methylation_tags { Some(MethylationTags::from_record(record)) } else { None };
+
+        // A single-strand record's informative positions and `CpG`s come from the reference
+        // (a converted `T` could be a variant), so resolve its reference bases once for all
+        // methylation filters; a duplex record's come from its own SEQ (the molecule's
+        // sequence), aligned or not. The resolver lives in the `consensus`-gated `methylation`
+        // module, so without `consensus` these filters are unavailable.
+        #[cfg(feature = "consensus")]
+        let ref_base_map = if needs_methylation_tags && !is_duplex {
+            reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "consensus"))]
+        let ref_base_map: Option<Vec<Option<crate::consensus_filter::RefBase>>> = {
+            if needs_methylation_tags {
+                bail!(
+                    "reference-dependent methylation filters require building fgumi with the `consensus` feature"
+                );
+            }
+            None
+        };
+
+        // Records the methylation filters cannot evaluate are left unfiltered by them and
+        // counted (an aligned BAM always carries some unmapped records). A record rejected by the
+        // read-level checks is counted too, so classify before returning it.
+        let count = |counter: &std::sync::atomic::AtomicU64| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let l_seq = RawRecordView::new(record).l_seq() as usize;
+        let methylation_tags = match methylation_tags {
+            Some(tags) if tags.cu.is_none() && tags.ct.is_none() => {
+                count(&methylation_skips.no_counts);
+                None
+            }
+            Some(tags) if !tags.fits(l_seq) => {
+                count(&methylation_skips.length_mismatch);
+                None
+            }
+            Some(_) if !is_duplex && ref_base_map.is_none() => {
+                count(&methylation_skips.unaligned);
+                None
+            }
+            tags => tags,
+        };
+        // Strand agreement compares the two strands of a duplex record; it cannot apply here.
+        if require_strand_methylation_agreement && !is_duplex {
+            count(&methylation_skips.simplex_agreement);
         }
 
-        // Capture the mean base quality over the full read BEFORE any masking — fgbio's
-        // read-level mean-quality filter is evaluated on the unmasked read (FILT-01).
-        // Only scan when the mean-quality filter is actually configured; masking mutates
-        // the read below, so it must be taken here (pre-mask) rather than recomputed later.
-        // When unset the value is never read downstream, so a placeholder 0.0 is fine.
-        let pre_mask_mean_qual = if min_mean_base_quality.is_some() {
-            mean_base_quality_full_length(record.as_ref())
-        } else {
-            0.0
-        };
+        if !passes_read_level {
+            return Ok((0, false));
+        }
 
-        // Classification needs the scalar consensus tags before masking picks a
-        // path. Masking only rewrites per-base *array* tags (aD_BASES etc.), not
-        // these scalar tags, but `regenerate_alignment_tags_raw_with_scoring` /
-        // `reverse_per_base_tags_raw` below can relayout aux — so the scalar
-        // tags used for the *filter decision* are re-extracted at that point;
-        // this extraction is used only for the pre-mask duplex/simplex split.
-        let is_duplex = {
-            let aux = fgumi_raw_bam::aux_data_slice(record);
-            ConsensusScalarTags::from_aux(aux).is_duplex()
-        };
+        // Only a record that passed the read-level checks reaches the methylation filters, so
+        // only one of those can have been evaluated at the wrong positions.
+        if methylation_tags.is_some() && !reverse_tags && RawRecordView::new(record).is_reverse() {
+            count(&methylation_skips.unreversed_reverse_strand);
+        }
+
         // A simplex methylation consensus keeps the converted bases in SEQ, so regenerated
         // NM/UQ hide the conversions as the bisulfite-aware aligner did; a duplex consensus's
         // SEQ is the molecule's sequence and is scored literally (as `clip` does).
@@ -812,63 +897,6 @@ impl Filter {
                 .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
             mask_bases(record, thresholds, min_base_quality)?
         };
-
-        // Parse methylation tags once for all EM-Seq filters
-        let needs_methylation_tags = methylation_depth_thresholds.is_some()
-            || (require_strand_methylation_agreement && is_duplex)
-            || min_conversion_fraction.is_some();
-        let methylation_tags =
-            if needs_methylation_tags { Some(MethylationTags::from_record(record)) } else { None };
-
-        // A single-strand record's informative positions and `CpG`s come from the reference
-        // (a converted `T` could be a variant), so resolve its reference bases once for all
-        // methylation filters; a duplex record's come from its own SEQ (the molecule's
-        // sequence), aligned or not. The resolver lives in the `consensus`-gated `methylation`
-        // module, so without `consensus` these filters are unavailable.
-        #[cfg(feature = "consensus")]
-        let ref_base_map = if needs_methylation_tags && !is_duplex {
-            reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
-        } else {
-            None
-        };
-        #[cfg(not(feature = "consensus"))]
-        let ref_base_map: Option<Vec<Option<crate::consensus_filter::RefBase>>> = {
-            if needs_methylation_tags {
-                bail!(
-                    "reference-dependent methylation filters require building fgumi with the `consensus` feature"
-                );
-            }
-            None
-        };
-
-        // Records the methylation filters cannot evaluate are left unfiltered by them and
-        // counted (an aligned BAM always carries some unmapped records).
-        let count = |counter: &std::sync::atomic::AtomicU64| {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        };
-        let l_seq = RawRecordView::new(record).l_seq() as usize;
-        let methylation_tags = match methylation_tags {
-            Some(tags) if tags.cu.is_none() && tags.ct.is_none() => {
-                count(&methylation_skips.no_counts);
-                None
-            }
-            Some(tags) if !tags.fits(l_seq) => {
-                count(&methylation_skips.length_mismatch);
-                None
-            }
-            Some(_) if !is_duplex && ref_base_map.is_none() => {
-                count(&methylation_skips.unaligned);
-                None
-            }
-            tags => tags,
-        };
-        // Strand agreement compares the two strands of a duplex record; it cannot apply here.
-        if require_strand_methylation_agreement && !is_duplex {
-            count(&methylation_skips.simplex_agreement);
-        }
-        if methylation_tags.is_some() && !reverse_tags && RawRecordView::new(record).is_reverse() {
-            count(&methylation_skips.unreversed_reverse_strand);
-        }
 
         // A duplex record's methylation sites come from its SEQ before masking; a single-strand
         // record's from the reference (resolved above; one without it was skipped).
@@ -925,43 +953,9 @@ impl Filter {
             )?;
         }
 
-        let mut pass = {
-            // Single aux walk for the read-level filter decision, taken after all
-            // record mutations above (masking / tag regeneration / per-base tag
-            // reversal). Replaces the ~9 per-tag `find_*` walks the previous
-            // `check_*_filters_raw(aux, ..)` did.
-            let scalar_tags = {
-                let aux = fgumi_raw_bam::aux_data_slice(record);
-                ConsensusScalarTags::from_aux(aux)
-            };
-            if is_duplex {
-                let (cc_thresh, ab_thresh, ba_thresh) = config
-                    .duplex_thresholds()
-                    .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-                Self::check_duplex_filters_raw(
-                    record,
-                    &scalar_tags,
-                    cc_thresh,
-                    ab_thresh,
-                    ba_thresh,
-                    pre_mask_mean_qual,
-                    min_mean_base_quality,
-                    max_no_call_fraction,
-                )?
-            } else {
-                let thresholds = config
-                    .effective_single_strand_thresholds()
-                    .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-                Self::check_filters_raw(
-                    record,
-                    &scalar_tags,
-                    thresholds,
-                    pre_mask_mean_qual,
-                    min_mean_base_quality,
-                    max_no_call_fraction,
-                )?
-            }
-        };
+        // The no-call check follows masking, as in fgbio (`FilterConsensusReads.scala:252`), so
+        // the bases masked above count against the read.
+        let mut pass = Self::passes_no_call_threshold(record, max_no_call_fraction);
 
         // Conversion fraction filter (EM-Seq/TAPs read-level)
         if pass
@@ -982,26 +976,55 @@ impl Filter {
         Ok((masked_count as u64, pass))
     }
 
-    /// Check mean quality and no-call fraction/count on a raw BAM record.
-    ///
-    /// `mean_qual` is the read's mean base quality computed over the full read length
-    /// **prior to masking** (see [`mean_base_quality_full_length`]); it is passed in rather
-    /// than recomputed here because masking mutates the record before this check runs, and
-    /// fgbio evaluates the mean-quality filter on the unmasked read. The no-call count, in
-    /// contrast, is taken from the (already-masked) record — fgbio counts Ns *after* masking.
-    ///
-    /// Returns `true` if the record passes the mean-quality and no-call thresholds.
-    fn check_no_call_and_quality(
-        bam: &[u8],
-        mean_qual: f64,
-        min_mean_qual: Option<f64>,
-        max_no_call_frac: f64,
-    ) -> bool {
-        if let Some(min_qual) = min_mean_qual
-            && mean_qual < min_qual
-        {
-            return false;
+    /// Reverses the record's per-base tags to read orientation when `reverse_tags`: the one change
+    /// made to every record of the run, whether or not it is evaluated. [`Self::process_record_raw`]
+    /// makes it first, and the template filter makes it for each record a failed template leaves
+    /// unevaluated, as fgbio reverses every read of a template before filtering it
+    /// (`FilterConsensusReads.scala:195-200`, fgbio `origin/main` e51a661). Anything else every
+    /// record must get before evaluation belongs here too, so the two cannot drift.
+    pub(crate) fn orient_per_base_tags(record: &mut RawRecord, reverse_tags: bool) -> Result<()> {
+        if reverse_tags {
+            reverse_per_base_tags_raw(record)?;
         }
+        Ok(())
+    }
+
+    /// The read-level checks fgbio makes before masking (`FilterConsensusReads.scala:240-248`,
+    /// and `:302-317` for the single-strand tiers of a duplex read): the depth and error rate of
+    /// each consensus tier, and the mean base quality over the whole unmasked read.
+    ///
+    /// Returns `true` if the record passes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record lacks the `cD`/`cE` consensus tags, or if no thresholds are
+    /// configured for its kind (simplex or duplex).
+    fn passes_read_level_checks(
+        bam: &[u8],
+        scalar_tags: &ConsensusScalarTags,
+        config: &FilterConfig,
+        min_mean_base_quality: Option<f64>,
+    ) -> Result<bool> {
+        let result = if scalar_tags.is_duplex() {
+            let (cc_thresh, ab_thresh, ba_thresh) = config
+                .duplex_thresholds()
+                .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
+            filter_duplex_read_tags(scalar_tags, cc_thresh, ab_thresh, ba_thresh)?
+        } else {
+            let thresholds = config
+                .effective_single_strand_thresholds()
+                .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
+            filter_read_tags(scalar_tags, thresholds)?
+        };
+        Ok(result == FilterResult::Pass
+            && min_mean_base_quality
+                .is_none_or(|min_qual| mean_base_quality_full_length(bam) >= min_qual))
+    }
+
+    /// Whether the record's no-calls are within `max_no_call_frac`: a fraction of the read
+    /// length when below 1.0, an absolute count of bases otherwise (fgbio's
+    /// `passesNoCallThreshold`).
+    fn passes_no_call_threshold(bam: &[u8], max_no_call_frac: f64) -> bool {
         let no_calls = count_no_calls(bam);
         let seq_len = fgumi_raw_bam::l_seq(bam) as usize;
         if max_no_call_frac >= 1.0 {
@@ -1012,48 +1035,6 @@ impl Filter {
             let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
             no_call_frac <= max_no_call_frac
         }
-    }
-
-    /// Checks read-level filters on a raw simplex consensus record.
-    ///
-    /// Returns `true` if the record passes all filters (depth, error rate, mean quality,
-    /// no-call fraction/count).
-    fn check_filters_raw(
-        bam: &[u8],
-        scalar_tags: &ConsensusScalarTags,
-        thresholds: &crate::consensus_filter::FilterThresholds,
-        mean_qual: f64,
-        min_mean_qual: Option<f64>,
-        max_no_call_frac: f64,
-    ) -> Result<bool> {
-        let filter_result = filter_read_tags(scalar_tags, thresholds)?;
-        if filter_result != FilterResult::Pass {
-            return Ok(false);
-        }
-        Ok(Self::check_no_call_and_quality(bam, mean_qual, min_mean_qual, max_no_call_frac))
-    }
-
-    /// Checks read-level filters on a raw duplex consensus record.
-    ///
-    /// Returns `true` if the record passes all filters (CC/AB/BA depth and error rate,
-    /// mean quality, no-call fraction/count).
-    #[allow(clippy::too_many_arguments)]
-    fn check_duplex_filters_raw(
-        bam: &[u8],
-        scalar_tags: &ConsensusScalarTags,
-        cc_thresholds: &crate::consensus_filter::FilterThresholds,
-        ab_thresholds: &crate::consensus_filter::FilterThresholds,
-        ba_thresholds: &crate::consensus_filter::FilterThresholds,
-        mean_qual: f64,
-        min_mean_qual: Option<f64>,
-        max_no_call_frac: f64,
-    ) -> Result<bool> {
-        let filter_result =
-            filter_duplex_read_tags(scalar_tags, cc_thresholds, ab_thresholds, ba_thresholds)?;
-        if filter_result != FilterResult::Pass {
-            return Ok(false);
-        }
-        Ok(Self::check_no_call_and_quality(bam, mean_qual, min_mean_qual, max_no_call_frac))
     }
 
     /// Validates that parameter vectors have 1-3 values and are in valid ranges.
@@ -1589,6 +1570,116 @@ mod tests {
         assert!(cmd.validate_parameters().is_err());
     }
 
+    /// `--min-mean-base-quality` must be finite and >= 0. A NaN threshold in particular would
+    /// otherwise reject every read without a word (every comparison with NaN is false), where
+    /// fgbio's `minMeanBaseQuality.exists(_ > mean)` would reject none.
+    #[rstest]
+    #[case::nan(f64::NAN, Some("got NaN"))]
+    #[case::infinite(f64::INFINITY, Some("got inf"))]
+    #[case::negative_infinite(f64::NEG_INFINITY, Some("got -inf"))]
+    #[case::negative(-1.0, Some("got -1"))]
+    #[case::zero(0.0, None)]
+    #[case::fractional(30.5, None)]
+    fn test_validate_min_mean_base_quality(
+        #[case] min_mean_base_quality: f64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.min_mean_base_quality = Some(min_mean_base_quality);
+        let error = cmd.validate_parameters().err().map(|e| e.to_string());
+        assert_eq!(
+            error,
+            expected_error
+                .map(|got| format!("--min-mean-base-quality must be a finite value >= 0, {got}"))
+        );
+    }
+
+    /// `--min-mean-base-quality NaN` parses (as `f64` does) and is then refused by validation.
+    #[test]
+    fn test_min_mean_base_quality_nan_is_refused() {
+        let cmd = Filter::try_parse_from([
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-M",
+            "1",
+            "--min-mean-base-quality",
+            "NaN",
+        ])
+        .expect("NaN parses as an f64");
+        assert_eq!(
+            cmd.validate_parameters().map_err(|e| e.to_string()),
+            Err("--min-mean-base-quality must be a finite value >= 0, got NaN".to_string())
+        );
+    }
+
+    /// `--max-no-call-fraction` must be finite and >= 0, and an integer when >= 1. A NaN
+    /// threshold in particular would otherwise reject every read without a word (every
+    /// comparison with NaN is false).
+    #[rstest]
+    #[case::nan(f64::NAN, Some("--max-no-call-fraction must be a finite value >= 0, got NaN"))]
+    #[case::infinite(
+        f64::INFINITY,
+        Some("--max-no-call-fraction must be a finite value >= 0, got inf")
+    )]
+    #[case::negative_infinite(
+        f64::NEG_INFINITY,
+        Some("--max-no-call-fraction must be a finite value >= 0, got -inf")
+    )]
+    #[case::negative(-1.0, Some("--max-no-call-fraction must be a finite value >= 0, got -1"))]
+    #[case::negative_fraction(
+        -0.5,
+        Some("--max-no-call-fraction must be a finite value >= 0, got -0.5")
+    )]
+    #[case::non_integer_count(
+        1.5,
+        Some("--max-no-call-fraction >= 1.0 must be an integer (count of bases), got 1.5")
+    )]
+    #[case::zero(0.0, None)]
+    #[case::fraction(0.2, None)]
+    #[case::count(5.0, None)]
+    fn test_validate_max_no_call_fraction(
+        #[case] max_no_call_fraction: f64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.max_no_call_fraction = max_no_call_fraction;
+        let error = cmd.validate_parameters().err().map(|e| e.to_string());
+        assert_eq!(error.as_deref(), expected_error);
+    }
+
+    /// `--max-no-call-fraction NaN` parses (as `f64` does) and is then refused by validation.
+    #[test]
+    fn test_max_no_call_fraction_nan_is_refused() {
+        let cmd = Filter::try_parse_from([
+            "filter",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "-M",
+            "1",
+            "--max-no-call-fraction",
+            "NaN",
+        ])
+        .expect("NaN parses as an f64");
+        assert!(cmd.max_no_call_fraction.is_nan());
+        assert_eq!(
+            cmd.validate_parameters().map_err(|e| e.to_string()),
+            Err("--max-no-call-fraction must be a finite value >= 0, got NaN".to_string())
+        );
+    }
+
     #[test]
     fn test_validate_conversion_fraction_requires_methylation_mode() {
         let mut cmd = create_filter_with_paths(
@@ -1891,6 +1982,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // `template_passes` is deprecated but still public.
     fn test_template_passes_all_pass() {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
@@ -1907,6 +1999,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // `template_passes` is deprecated but still public.
     fn test_template_passes_one_fails() {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
@@ -4197,6 +4290,331 @@ mod tests {
         Ok(())
     }
 
+    /// The flags of the records in the template short-circuit tests below.
+    const T_R1: u16 = flags::PAIRED | flags::FIRST_SEGMENT;
+    const T_R2: u16 = flags::PAIRED | flags::LAST_SEGMENT;
+    const T_SUPPLEMENTARY: u16 = flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY;
+    const T_SECONDARY: u16 = flags::PAIRED | flags::LAST_SEGMENT | flags::SECONDARY;
+
+    /// One record of template `t`: `AAAA` over 4M with Q30, carrying simplex consensus tags with
+    /// per-read depth `depth` (`--min-reads 5` below), or no consensus tags at all when `depth`
+    /// is `None`.
+    fn template_member(flag: u16, depth: Option<i32>) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"t")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flag)
+            .cigar_ops(&[4 << 4])
+            .sequence(b"AAAA")
+            .qualities(&[30; 4]);
+        if let Some(depth) = depth {
+            let per_base = i16::try_from(depth).expect("depth fits in i16");
+            b.add_int_tag(SamTag::CD, depth)
+                .add_int_tag(SamTag::CM, depth)
+                .add_float_tag(SamTag::CE, 0.0_f32)
+                .add_array_i16(SamTag::CD_BASES, &[per_base; 4])
+                .add_array_i16(SamTag::CE_BASES, &[0; 4]);
+        }
+        b.build()
+    }
+
+    /// The [`template_member`]s of one template, in order.
+    fn template_members(members: &[(u16, Option<i32>)]) -> Vec<RawRecord> {
+        members.iter().map(|&(flag, depth)| template_member(flag, depth)).collect()
+    }
+
+    /// Runs `--filter-by-template` (`--min-reads 5`) over `records` (one template, in order) and
+    /// returns the kept records and, when `with_rejects`, the rejected ones.
+    fn run_template_filter(
+        records: Vec<RawRecord>,
+        threading: ThreadingOptions,
+        with_rejects: bool,
+        reverse_per_base_tags: bool,
+    ) -> Result<(Vec<RecordBuf>, Option<Vec<RecordBuf>>)> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+        let rejects_path = dir.path().join("rejects.bam");
+        write_test_bam(&input_path, records)?;
+
+        let cmd = Filter {
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            reference: Some(ref_path),
+            min_reads: vec![5],
+            max_read_error_rate: vec![0.1],
+            max_base_error_rate: vec![0.3],
+            min_base_quality: Some(10),
+            min_mean_base_quality: None,
+            max_no_call_fraction: 0.5,
+            reverse_per_base_tags,
+
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            filter_by_template: true,
+            rejects: with_rejects.then(|| rejects_path.clone()),
+            stats: None,
+            require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: None,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let kept = read_bam_records(&output_path)?;
+        let rejected = if with_rejects { Some(read_bam_records(&rejects_path)?) } else { None };
+        Ok((kept, rejected))
+    }
+
+    /// `(flags, sequence)` of each record, in order.
+    fn flags_and_sequence(records: &[RecordBuf]) -> Vec<(u16, Vec<u8>)> {
+        records.iter().map(|r| (r.flags().bits(), r.sequence().as_ref().to_vec())).collect()
+    }
+
+    /// fgbio evaluates R2 only when R1 passed, and the secondary/supplementary records only when
+    /// the template was kept (`FilterConsensusReads.scala:205` and `:214`, fgbio `origin/main`
+    /// e51a661). A template that fails therefore never reaches a record that lacks `cD`/`cE`,
+    /// and is rejected quietly. Evaluating every record first instead exits with "read does not
+    /// appear to have consensus calling tags". The unevaluated records are written to
+    /// `--rejects` as they were read.
+    ///
+    /// fgbio's own tests all carry the consensus tags on every record, so this has no fgbio
+    /// test to port; the cases are the short-circuits `execute()` makes, for a supplementary and
+    /// a secondary record. `expected_rejected` is the flags of the rejected records in output
+    /// order, which is template order (R1, R2, then the others): `r1_fails_r2_first_untagged`
+    /// lists R2 first in the input and shows that R1 is still the read evaluated first.
+    ///
+    /// Every rejected record is compared in full against the record as it was read, except a
+    /// passing R1 (`cD` 10) of a template whose R2 then fails: R1 is always evaluated, so it went
+    /// through masking and `NM`/`UQ`/`MD` regeneration before the template was rejected.
+    #[rstest]
+    #[case::r1_fails_r2_untagged(&[(T_R1, Some(2)), (T_R2, None)], &[T_R1, T_R2])]
+    #[case::r1_fails_r2_first_untagged(&[(T_R2, None), (T_R1, Some(2))], &[T_R1, T_R2])]
+    #[case::r1_fails_supplementary_untagged(
+        &[(T_R1, Some(2)), (T_R2, Some(10)), (T_SUPPLEMENTARY, None)],
+        &[T_R1, T_R2, T_SUPPLEMENTARY]
+    )]
+    #[case::r2_fails_supplementary_untagged(
+        &[(T_R1, Some(10)), (T_R2, Some(2)), (T_SUPPLEMENTARY, None)],
+        &[T_R1, T_R2, T_SUPPLEMENTARY]
+    )]
+    #[case::r2_fails_secondary_untagged(
+        &[(T_R1, Some(10)), (T_R2, Some(2)), (T_SECONDARY, None)],
+        &[T_R1, T_R2, T_SECONDARY]
+    )]
+    fn test_filter_template_skips_records_after_a_failed_template(
+        #[case] members: &[(u16, Option<i32>)],
+        #[case] expected_rejected: &[u16],
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(4))] threading: ThreadingOptions,
+        #[values(false, true)] with_rejects: bool,
+    ) -> Result<()> {
+        let (kept, rejected) =
+            run_template_filter(template_members(members), threading, with_rejects, false)?;
+        assert_eq!(flags_and_sequence(&kept), vec![], "the template fails, so nothing is kept");
+        let expected_rejects: Option<Vec<(u16, Vec<u8>)>> = with_rejects
+            .then(|| expected_rejected.iter().map(|&flag| (flag, b"AAAA".to_vec())).collect());
+        assert_eq!(
+            rejected.as_deref().map(flags_and_sequence),
+            expected_rejects,
+            "every record is rejected, and written to --rejects when it is given"
+        );
+
+        if let Some(rejected) = rejected {
+            let dir = TempDir::new()?;
+            let input_path = dir.path().join("input.bam");
+            write_test_bam(&input_path, template_members(members))?;
+            let input = read_bam_records(&input_path)?;
+            for record in &rejected {
+                let flag = record.flags().bits();
+                let depth = members.iter().find(|&&(f, _)| f == flag).and_then(|&(_, d)| d);
+                if flag == T_R1 && depth.is_some_and(|d| d >= 5) {
+                    continue; // evaluated and passed before R2 failed
+                }
+                let as_read = input.iter().find(|r| r.flags().bits() == flag).expect("input");
+                assert_eq!(
+                    record, as_read,
+                    "{flag:#x} must be written to --rejects as it was read"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The short-circuit does not excuse a record that lacks `cD`/`cE` in a template that is
+    /// kept: fgbio evaluates the secondary/supplementary records of a kept template and fails on
+    /// one without the tags (`FilterConsensusReads.scala:214`, `:242`).
+    #[rstest]
+    fn test_filter_template_errors_on_untagged_supplementary_of_kept_template(
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(4))] threading: ThreadingOptions,
+        #[values(false, true)] with_rejects: bool,
+    ) {
+        let members = [(T_R1, Some(10)), (T_R2, Some(10)), (T_SUPPLEMENTARY, None)];
+        let error = run_template_filter(template_members(&members), threading, with_rejects, false)
+            .expect_err("an untagged supplementary of a kept template is an error");
+        assert!(
+            format!("{error:#}").contains("does not appear to have consensus calling tags"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// A template with no primary read (only secondary or supplementary records, for example
+    /// after its primary reads were removed upstream) is an error naming the template, as in
+    /// fgbio, which throws `"<name> had no R1."` (`FilterConsensusReads.scala:190`, fgbio
+    /// `origin/main` e51a661). No record is evaluated, so the error is the same whether or not
+    /// the records carry the consensus tags.
+    #[rstest]
+    #[case::supplementary_untagged(&[(T_SUPPLEMENTARY, None)])]
+    #[case::supplementary_tagged(&[(T_SUPPLEMENTARY, Some(10))])]
+    #[case::secondary_and_supplementary(&[(T_SECONDARY, Some(10)), (T_SUPPLEMENTARY, Some(10))])]
+    fn test_filter_template_errors_on_template_without_primary_read(
+        #[case] members: &[(u16, Option<i32>)],
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(4))] threading: ThreadingOptions,
+        #[values(false, true)] with_rejects: bool,
+    ) {
+        let error = run_template_filter(template_members(members), threading, with_rejects, false)
+            .expect_err("a template with no primary read is an error");
+        assert!(
+            format!("{error:#}").contains(
+                "template t has no primary read (only secondary or supplementary records)"
+            ),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// The per-base depths (`cd`) of a record read back from a BAM.
+    fn per_base_depths(record: &RecordBuf) -> Vec<i16> {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::{Value, value::Array};
+        match record.data().get(&Tag::from(SamTag::CD_BASES)) {
+            Some(Value::Array(Array::Int16(values))) => values.clone(),
+            other => panic!("expected an Int16 cd array, got {other:?}"),
+        }
+    }
+
+    /// A record a failed template leaves unevaluated still has its per-base tags reversed with
+    /// `--reverse-per-base-tags`, as fgbio reverses every read of a template before filtering
+    /// it (`FilterConsensusReads.scala:195-200`, fgbio `origin/main` e51a661) and as every
+    /// evaluated record is, so `--rejects` holds every record in one orientation. Every record
+    /// is reverse-strand, and each is rejected with `cd` reversed exactly once.
+    ///
+    /// - `r1_fails`: R1 is evaluated and fails `--min-reads` (`cD` 2); R2 and the supplementary
+    ///   are never evaluated. `cd` 1,2,3,4 would mask every base below `--min-reads 5`, so the
+    ///   unmasked bases show that none of them was masked.
+    /// - `r2_fails`: R1 (`cD` 10) is evaluated and passes, so it is reversed once while it is
+    ///   evaluated and must not be reversed again when R2 (`cD` 2) then fails; the supplementary
+    ///   is never evaluated. `cd` 5,6,7,8 masks nothing, so only the orientation is tested.
+    #[rstest]
+    #[case::r1_fails([2, 10], [1, 2, 3, 4])]
+    #[case::r2_fails([10, 2], [5, 6, 7, 8])]
+    fn test_filter_template_reverses_tags_of_unevaluated_records(
+        #[case] depths: [i32; 2],
+        #[case] cd_values: [i16; 4],
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(4))] threading: ThreadingOptions,
+    ) -> Result<()> {
+        let reverse_member = |flag: u16, depth: i32| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"t")
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(flag | flags::REVERSE)
+                .cigar_ops(&[4 << 4])
+                .sequence(b"AAAA")
+                .qualities(&[30; 4]);
+            b.add_int_tag(SamTag::CD, depth)
+                .add_int_tag(SamTag::CM, 1)
+                .add_float_tag(SamTag::CE, 0.0_f32)
+                .add_array_i16(SamTag::CD_BASES, &cd_values)
+                .add_array_i16(SamTag::CE_BASES, &[0; 4]);
+            b.build()
+        };
+        let [r1_depth, r2_depth] = depths;
+        let records = vec![
+            reverse_member(T_R1, r1_depth),
+            reverse_member(T_R2, r2_depth),
+            reverse_member(T_SUPPLEMENTARY, 10),
+        ];
+        let reversed: Vec<i16> = cd_values.iter().rev().copied().collect();
+
+        let (kept, rejected) = run_template_filter(records, threading, true, true)?;
+
+        assert_eq!(flags_and_sequence(&kept), vec![], "the template fails, so nothing is kept");
+        let rejected = rejected.expect("--rejects was given");
+        assert_eq!(
+            (flags_and_sequence(&rejected), rejected.iter().map(per_base_depths).collect()),
+            (
+                vec![
+                    (T_R1 | flags::REVERSE, b"AAAA".to_vec()),
+                    (T_R2 | flags::REVERSE, b"AAAA".to_vec()),
+                    (T_SUPPLEMENTARY | flags::REVERSE, b"AAAA".to_vec()),
+                ],
+                vec![reversed.clone(), reversed.clone(), reversed]
+            )
+        );
+        Ok(())
+    }
+
+    /// The end-of-run methylation-filter warnings are measured against the records the filter
+    /// evaluated, end to end through `execute` and its finalize hook. The template's R1 fails
+    /// `--min-reads` (`cD` 2), so R2 is never evaluated; neither record carries `cu`/`ct`. Of the
+    /// one record evaluated, one has no counts, so the warning says that no record carries them.
+    /// Measured against the two records read instead, it would report "1 records without cu/ct".
+    #[rstest]
+    fn test_filter_methylation_warnings_count_only_evaluated_records(
+        #[values(ThreadingOptions::none(), ThreadingOptions::new(4))] threading: ThreadingOptions,
+    ) -> Result<()> {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+        let member = |flag: u16, depth: i32| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"t").flags(flag | flags::UNMAPPED).sequence(b"AAAA").qualities(&[30; 4]);
+            b.add_int_tag(SamTag::CD, depth).add_float_tag(SamTag::CE, 0.0_f32);
+            b.build()
+        };
+        write_test_bam(&input_path, vec![member(T_R1, 2), member(T_R2, 10)])?;
+
+        let mut cmd =
+            create_filter_with_paths(input_path, output_path.clone(), dir.path().join("unused.fa"));
+        cmd.reference = None;
+        cmd.min_reads = vec![5];
+        cmd.threading = threading;
+        cmd.filter_by_template = true;
+        cmd.min_methylation_depth = vec![1];
+        cmd.methylation_mode = Some(crate::commands::common::MethylationModeArg::EmSeq);
+
+        let _session = capture_logs();
+        cmd.execute("test")?;
+        let warnings: Vec<String> =
+            captured().into_iter().filter(|line| line.contains("methylation filters")).collect();
+
+        assert_eq!(
+            (read_bam_records(&output_path)?.len(), warnings),
+            (
+                0,
+                vec![
+                    "none of the 1 records were checked by the methylation filters: no record \
+                     carries cu/ct methylation counts; call consensus with --methylation-mode"
+                        .to_string()
+                ]
+            )
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_filter_execute_parallel_with_supplementary() -> Result<()> {
         // Test supplementary records in parallel template mode
@@ -4594,180 +5012,66 @@ mod tests {
 
     // ========== Tests for max_no_call_fraction count mode ==========
 
-    #[test]
-    fn test_check_filters_raw_no_call_fraction_mode() -> Result<()> {
-        // Test fraction mode (threshold < 1.0) with max_no_call_fraction = 0.2
-        // Build a record with 10 bases, 2 Ns => 0.2 fraction => should pass
-        use crate::consensus_filter::FilterThresholds;
-
-        let raw_record = {
+    /// `--max-no-call-fraction` below 1.0 is a fraction of the read, and from 1.0 up a count of
+    /// bases; both bounds are inclusive.
+    ///
+    /// A read with no bases (`SEQ` `*`) passes in both modes. This differs from fgbio, whose
+    /// fraction mode divides 0 by 0 and rejects the read on the resulting `NaN`
+    /// (`FilterConsensusReads.scala:268`, fgbio `origin/main` e51a661); it predates the
+    /// check-before-mask reordering and is pinned here so a change to it is deliberate.
+    #[rstest]
+    #[case::fraction_at_limit(b"AANNTTGGCC", 0.2, true)]
+    #[case::fraction_over_limit(b"AANNTTGGCC", 0.19, false)]
+    #[case::count_under_limit(b"AANNNTTGGC", 5.0, true)]
+    #[case::count_at_limit(b"AANNNTTGGC", 3.0, true)]
+    #[case::count_over_limit(b"AANNNTTGGC", 2.0, false)]
+    #[case::no_bases_fraction(b"", 0.2, true)]
+    #[case::no_bases_count(b"", 5.0, true)]
+    fn test_passes_no_call_threshold(
+        #[case] bases: &[u8],
+        #[case] max_no_call_fraction: f64,
+        #[case] expected: bool,
+    ) {
+        let record = {
             let mut b = RawSamBuilder::new();
-            b.sequence(b"AANNTTGGCC") // 10 bases, 2 Ns
-                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
+            b.sequence(bases).qualities(&vec![30; bases.len()]);
             b.build()
         };
-        let raw = raw_record.into_inner();
-
-        let aux = fgumi_raw_bam::aux_data_slice(&raw);
-        let thresholds =
-            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
-
-        // Fraction mode: 2/10 = 0.2, threshold = 0.2 => should pass
-        let result = Filter::check_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            crate::consensus_filter::mean_base_quality_full_length(&raw),
-            None,
-            0.2,
-        )?;
-        assert!(result, "Should pass with 2/10 Ns and threshold 0.2");
-
-        // Fraction mode: 2/10 = 0.2, threshold = 0.19 => should fail
-        let result = Filter::check_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            crate::consensus_filter::mean_base_quality_full_length(&raw),
-            None,
-            0.19,
-        )?;
-        assert!(!result, "Should fail with 2/10 Ns and threshold 0.19");
-
-        Ok(())
+        assert_eq!(Filter::passes_no_call_threshold(&record, max_no_call_fraction), expected);
     }
 
-    #[test]
-    fn test_check_filters_raw_no_call_count_mode_pass() -> Result<()> {
-        // Test count mode (threshold >= 1.0) with max_no_call_fraction = 5.0
-        // Build a record with 10 bases, 3 Ns => 3 < 5 => should pass
-        use crate::consensus_filter::FilterThresholds;
-
-        let raw_record = {
+    /// A read with no bases (`SEQ` `*`) has a mean base quality of 0, so any
+    /// `--min-mean-base-quality` above 0 rejects it at the read-level checks. This differs from
+    /// fgbio, whose mean for such a read is 0 / 0 = `NaN`, and `minMeanBaseQuality.exists(_ >
+    /// NaN)` is false, so fgbio passes it (`FilterConsensusReads.scala:247`, fgbio `origin/main`
+    /// e51a661). Pinned, with the no-call side above, so a change to either is deliberate.
+    #[rstest]
+    #[case::no_threshold(None, true)]
+    #[case::zero_threshold(Some(0.0), true)]
+    #[case::positive_threshold(Some(0.5), false)]
+    fn test_passes_read_level_checks_empty_sequence(
+        #[case] min_mean_base_quality: Option<f64>,
+        #[case] expected: bool,
+    ) -> Result<()> {
+        let record = {
             let mut b = RawSamBuilder::new();
-            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
-                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
-            b.build()
-        };
-        let raw = raw_record.into_inner();
-
-        let aux = fgumi_raw_bam::aux_data_slice(&raw);
-        let thresholds =
-            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
-
-        // Count mode: 3 Ns <= 5.0 threshold => should pass
-        let result = Filter::check_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            crate::consensus_filter::mean_base_quality_full_length(&raw),
-            None,
-            5.0,
-        )?;
-        assert!(result, "Should pass with 3 Ns and count threshold 5.0");
-
-        // Count mode: 3 Ns <= 3.0 threshold => should pass (boundary)
-        let result = Filter::check_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            crate::consensus_filter::mean_base_quality_full_length(&raw),
-            None,
-            3.0,
-        )?;
-        assert!(result, "Should pass with 3 Ns and count threshold 3.0 (boundary)");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_check_filters_raw_no_call_count_mode_fail() -> Result<()> {
-        // Test count mode (threshold >= 1.0) with max_no_call_fraction = 2.0
-        // Build a record with 10 bases, 3 Ns => 3 > 2 => should fail
-        use crate::consensus_filter::FilterThresholds;
-
-        let raw_record = {
-            let mut b = RawSamBuilder::new();
-            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
-                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
-            b.build()
-        };
-        let raw = raw_record.into_inner();
-
-        let aux = fgumi_raw_bam::aux_data_slice(&raw);
-        let thresholds =
-            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
-
-        // Count mode: 3 Ns > 2.0 threshold => should fail
-        let result = Filter::check_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            crate::consensus_filter::mean_base_quality_full_length(&raw),
-            None,
-            2.0,
-        )?;
-        assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_check_duplex_filters_raw_no_call_count_mode() -> Result<()> {
-        // Test duplex filtering with count mode for no-call counting
-        use crate::consensus_filter::FilterThresholds;
-
-        let raw_record = {
-            let mut b = RawSamBuilder::new();
-            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
-                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            // Per-read consensus tags (cD/cE) plus duplex tags aD, bD, aE, bE, aM, bM.
+            b.read_name(b"empty").flags(flags::UNMAPPED).sequence(b"").qualities(&[]);
             b.add_int_tag(SamTag::CD, 10)
-                .add_float_tag(SamTag::CE, 0.01_f32)
-                .add_int_tag(SamTag::AD, 10)
-                .add_int_tag(SamTag::BD, 8)
-                .add_float_tag(SamTag::AE, 0.01_f32)
-                .add_float_tag(SamTag::BE, 0.01_f32)
-                .add_int_tag(SamTag::AM, 10)
-                .add_int_tag(SamTag::BM, 8);
+                .add_int_tag(SamTag::CM, 10)
+                .add_float_tag(SamTag::CE, 0.0);
             b.build()
         };
-        let raw = raw_record.into_inner();
-
-        let aux = fgumi_raw_bam::aux_data_slice(&raw);
-        let mean_qual = crate::consensus_filter::mean_base_quality_full_length(&raw);
-        let thresholds =
-            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
-
-        // Count mode: 3 Ns <= 5.0 threshold => should pass
-        let result = Filter::check_duplex_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            &thresholds,
-            &thresholds,
-            mean_qual,
-            None,
-            5.0,
-        )?;
-        assert!(result, "Should pass with 3 Ns and count threshold 5.0");
-
-        // Count mode: 3 Ns > 2.0 threshold => should fail
-        let result = Filter::check_duplex_filters_raw(
-            &raw,
-            &ConsensusScalarTags::from_aux(aux),
-            &thresholds,
-            &thresholds,
-            &thresholds,
-            mean_qual,
-            None,
-            2.0,
-        )?;
-        assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
-
+        let config = FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0);
+        let scalar_tags = ConsensusScalarTags::from_aux(aux_data_slice(&record));
+        assert_eq!(
+            Filter::passes_read_level_checks(
+                &record,
+                &scalar_tags,
+                &config,
+                min_mean_base_quality
+            )?,
+            expected
+        );
         Ok(())
     }
 
@@ -5072,16 +5376,19 @@ mod tests {
 
     /// The methylation filters read cu/ct by SEQ position in reference orientation: a
     /// reverse-mapped record they evaluate without --reverse-per-base-tags is counted (filter
-    /// warns at the end of the run), and nothing else is: a forward or unmapped record, or one
-    /// whose tags were reversed here.
+    /// warns at the end of the run), and nothing else is: a forward or unmapped record, one
+    /// whose tags were reversed here, or one rejected by the read-level checks before the
+    /// methylation filters run (`cD` 10 < `--min-reads` 11).
     #[rstest]
-    #[case::forward(0, false, 0)]
-    #[case::reverse_unreversed(flags::REVERSE, false, 1)]
-    #[case::reverse_reversed(flags::REVERSE, true, 0)]
-    #[case::unmapped(flags::UNMAPPED, false, 0)]
+    #[case::forward(0, false, 1, 0)]
+    #[case::reverse_unreversed(flags::REVERSE, false, 1, 1)]
+    #[case::reverse_reversed(flags::REVERSE, true, 1, 0)]
+    #[case::unmapped(flags::UNMAPPED, false, 1, 0)]
+    #[case::reverse_unreversed_rejected(flags::REVERSE, false, 11, 0)]
     fn test_process_record_raw_counts_unreversed_reverse_strand(
         #[case] extra_flags: u16,
         #[case] reverse_tags: bool,
+        #[case] min_reads: usize,
         #[case] expected: u64,
     ) -> Result<()> {
         let dir = TempDir::new()?;
@@ -5105,7 +5412,7 @@ mod tests {
         let skips = MethylationFilterSkips::default();
         Filter::process_record_raw(
             &mut raw,
-            &FilterConfig::new(&[1], &[1.0], &[1.0], None, None, 1.0),
+            &FilterConfig::new(&[min_reads], &[1.0], &[1.0], None, None, 1.0),
             Some(&reference),
             &test_bam_header(),
             reverse_tags,
@@ -5641,6 +5948,464 @@ mod tests {
         assert_eq!(
             fgumi_raw_bam::find_array_tag(aux, SamTag::ML).map(|a| a.data.to_vec()),
             Some(vec![255])
+        );
+        Ok(())
+    }
+
+    /// The record's bases as a string.
+    fn bases_string(record: &RawRecord) -> String {
+        String::from_utf8(RawRecordView::new(record).sequence_vec()).expect("ASCII bases")
+    }
+
+    /// fgbio's `r(len=10, q, minDepth, depth, readErr, depths, errors)` (`FilterConsensusReadsTest
+    /// .scala:72`): a mapped forward fragment at 1-based position 100, `A` x 10 over 10M, base
+    /// quality `q`, with the per-read `cD`/`cM`/`cE` and, when given, the per-base `cd`/`ce`.
+    fn fgbio_simplex_read(
+        q: u8,
+        min_depth: i32,
+        depth: i32,
+        read_err: f32,
+        depths: Option<Vec<i16>>,
+        errors: Option<Vec<i16>>,
+    ) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"frag")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(0)
+            .cigar_ops(&[10 << 4])
+            .sequence(b"AAAAAAAAAA")
+            .qualities(&[q; 10]);
+        b.add_int_tag(SamTag::CD, depth)
+            .add_int_tag(SamTag::CM, min_depth)
+            .add_float_tag(SamTag::CE, read_err);
+        if let Some(depths) = depths {
+            b.add_array_i16(SamTag::CD_BASES, &depths);
+        }
+        if let Some(errors) = errors {
+            b.add_array_i16(SamTag::CE_BASES, &errors);
+        }
+        b.build()
+    }
+
+    /// The `FilterConsensusReads` settings of fgbio's `fv(q, d, mq, readErr, baseErr, n)` and
+    /// the record `process_record_raw` is run on.
+    struct FgbioSimplexCase {
+        min_base_quality: u8,
+        min_reads: usize,
+        min_mean_base_quality: Option<f64>,
+        max_read_error_rate: f64,
+        max_base_error_rate: f64,
+        max_no_call_fraction: f64,
+        record: RawRecord,
+    }
+
+    /// Runs `process_record_raw` on `case.record` as `Filter::execute` does for a simplex
+    /// consensus read of a mapped BAM, with `--ref` and no per-base tag reversal, returning
+    /// `(masked, pass)`.
+    fn process_fgbio_simplex_case(case: &mut FgbioSimplexCase) -> Result<(u64, bool)> {
+        let dir = TempDir::new()?;
+        let reference = ReferenceReader::new(create_test_reference(&dir))?;
+        let config = FilterConfig::new(
+            &[case.min_reads],
+            &[case.max_read_error_rate],
+            &[case.max_base_error_rate],
+            Some(case.min_base_quality),
+            case.min_mean_base_quality,
+            case.max_no_call_fraction,
+        );
+        Filter::process_record_raw(
+            &mut case.record,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            Some(case.min_base_quality),
+            false, // no single-strand agreement
+            case.min_mean_base_quality,
+            case.max_no_call_fraction,
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::Disabled,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )
+    }
+
+    /// A read that fails a read-level check is written to `--rejects` as it was read: no base is
+    /// masked and no tag is rewritten (`NM`/`UQ`/`MD`, `MM`/`ML`, quality). fgbio decides on the
+    /// read first and returns before masking (`FilterConsensusReads.scala:245-248`); fgumi
+    /// masked first, so a read rejected for low depth came back as `NNNNNNNNNN`.
+    ///
+    /// Ported from `FilterConsensusReadsTest.scala:101` ("filter out a read with depth <
+    /// minDepth", fgbio `origin/main` e51a661), expected values verbatim: `keepRead` false,
+    /// `maskedBases` 0, bases `A` x 10. The other two cases are fgbio's `:110` ("too high an
+    /// error rate") and `:167` ("mean base quality is too low") with one setting changed so that
+    /// masking would otherwise fire: fgbio's own settings (`baseErr` 0.5, `minBaseQuality` 20)
+    /// leave every base unmasked there, whether or not the read is checked first. `:110` uses
+    /// `baseErr` 0.1 (each base has errors/depth 0.2) and `:167` uses `minBaseQuality` 35 (the
+    /// bases are Q30).
+    #[rstest]
+    #[case::depth_below_min_depth(FgbioSimplexCase {
+        min_base_quality: 10,
+        min_reads: 5,
+        min_mean_base_quality: None,
+        max_read_error_rate: 0.05,
+        max_base_error_rate: 0.1,
+        max_no_call_fraction: 0.2,
+        record: fgbio_simplex_read(40, 4, 4, 0.0, Some(vec![4; 10]), Some(vec![0; 10])),
+    })]
+    #[case::read_error_rate_too_high(FgbioSimplexCase {
+        min_base_quality: 10,
+        min_reads: 3,
+        min_mean_base_quality: None,
+        max_read_error_rate: 0.05,
+        max_base_error_rate: 0.1,
+        max_no_call_fraction: 0.2,
+        record: fgbio_simplex_read(40, 50, 50, 0.20, Some(vec![50; 10]), Some(vec![10; 10])),
+    })]
+    #[case::mean_base_quality_too_low(FgbioSimplexCase {
+        min_base_quality: 35,
+        min_reads: 5,
+        min_mean_base_quality: Some(31.0),
+        max_read_error_rate: 0.05,
+        max_base_error_rate: 0.1,
+        max_no_call_fraction: 0.2,
+        record: fgbio_simplex_read(30, 20, 20, 0.0, None, None),
+    })]
+    fn rejected_reads_are_written_without_masking(
+        #[case] mut case: FgbioSimplexCase,
+    ) -> Result<()> {
+        let original = case.record.clone();
+        let (masked, pass) = process_fgbio_simplex_case(&mut case)?;
+        assert_eq!(
+            (pass, masked, bases_string(&case.record)),
+            (false, 0, "AAAAAAAAAA".to_string()),
+            "keepRead / maskedBases / basesString"
+        );
+        assert_eq!(case.record, original, "a rejected read is written exactly as it was read");
+        Ok(())
+    }
+
+    /// The same for a duplex read that fails a read-level check, built as fgbio's
+    /// `DuplexBuilder.addSimple(abDp, baDp)` builds it (`cD` = AB depth + BA depth, every base at
+    /// its strand's depth) and filtered with `min-reads` `min_reads` (fgbio `origin/main`
+    /// e51a661). fgbio asserts only `keepRead` false in these tests; the masked count and bases
+    /// are the same rule as `:101` above. Each read's per-base depths would mask every base if it
+    /// were masked before the read-level check.
+    ///
+    /// - `total_depth_below_min`: the `bad` read of `FilterConsensusReadsTest.scala:466` ("filter
+    ///   appropriately by total read depth"), rejected by the consensus depth (`cD` 4 < 5).
+    /// - `ba_depth_below_shared_cutoff` / `ab_depth_below_shared_cutoff`: the `bad1` / `bad2`
+    ///   reads of `:482` ("filter appropriately by AB/BA read depth when they are set to the same
+    ///   cutoff value"), which pass `cD` (5 >= 3) and are rejected only by the single-strand
+    ///   tiers (`:302-317` in `FilterConsensusReads.scala`).
+    #[rstest]
+    #[case::total_depth_below_min([5, 1, 1], 2, 2)]
+    #[case::ba_depth_below_shared_cutoff([3, 3, 3], 3, 2)]
+    #[case::ab_depth_below_shared_cutoff([3, 3, 3], 2, 3)]
+    fn rejected_duplex_reads_are_written_without_masking(
+        #[case] min_reads: [usize; 3],
+        #[case] ab_depth: i16,
+        #[case] ba_depth: i16,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let reference = ReferenceReader::new(create_test_reference(&dir))?;
+        let mut record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"duplex_read")
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .cigar_ops(&[10 << 4])
+                .sequence(b"AAAAAAAAAA")
+                .qualities(&[90; 10]);
+            b.add_int_tag(SamTag::CD, i32::from(ab_depth + ba_depth))
+                .add_int_tag(SamTag::AD, i32::from(ab_depth))
+                .add_int_tag(SamTag::BD, i32::from(ba_depth))
+                .add_int_tag(SamTag::CM, 10)
+                .add_int_tag(SamTag::AM, 5)
+                .add_int_tag(SamTag::BM, 5)
+                .add_float_tag(SamTag::CE, 0.0_f32)
+                .add_float_tag(SamTag::AE, 0.0_f32)
+                .add_float_tag(SamTag::BE, 0.0_f32);
+            b.add_array_i16(SamTag::AD_BASES, &[ab_depth; 10])
+                .add_array_i16(SamTag::BD_BASES, &[ba_depth; 10])
+                .add_array_i16(SamTag::AE_BASES, &[0; 10])
+                .add_array_i16(SamTag::BE_BASES, &[0; 10]);
+            b.build()
+        };
+        let original = record.clone();
+        let config =
+            FilterConfig::new(&min_reads, &[1.0, 1.0, 1.0], &[1.0, 1.0, 1.0], Some(1), None, 1.0);
+
+        let (masked, pass) = Filter::process_record_raw(
+            &mut record,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            Some(1),
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            1.0,   // max no-call fraction
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::Disabled,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )?;
+
+        assert_eq!(
+            (pass, masked, bases_string(&record)),
+            (false, 0, "AAAAAAAAAA".to_string()),
+            "keepRead / maskedBases / basesString"
+        );
+        assert_eq!(record, original, "a rejected read is written exactly as it was read");
+        Ok(())
+    }
+
+    /// A methylation-tagged read that fails a read-level check keeps its `MM`/`ML` (and
+    /// `cu`/`ct`) as read: it is returned before the methylation masking and the `MM`/`ML`
+    /// cleanup run. Each read fails `--min-reads 20` (`cD` 10), and would otherwise lose
+    /// methylation calls: on the reference `ACGT` repeats, the C at 1 has no `cu`/`ct` depth, so
+    /// `--min-methylation-depth` would mask it on the single-strand read and drop its `CpG`'s
+    /// calls from `MM`/`ML` on the duplex read, and the per-base depths of 10 would mask every
+    /// base. With `--reverse-per-base-tags` a reverse-mapped read is still rejected with SEQ and
+    /// `MM`/`ML` as read (`ACGTACGT` is its own reverse complement); only its per-base tags are
+    /// reversed.
+    #[rstest]
+    #[case::simplex(false, false)]
+    #[case::duplex(true, false)]
+    #[case::simplex_reverse(false, true)]
+    #[case::duplex_reverse(true, true)]
+    fn rejected_methylation_reads_keep_mm_ml(
+        #[case] duplex: bool,
+        #[case] reverse: bool,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = dir.path().join("ref.fa");
+        std::fs::write(&ref_path, format!(">chr1\n{}\n", "ACGT".repeat(250)))?;
+        let reference = ReferenceReader::new(&ref_path)?;
+        let cu = [0, 0, 0, 0, 0, 3, 0, 0];
+        let ct = [0, 0, 3, 0, 0, 0, 3, 0];
+        let mut record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"r1")
+                .flags(
+                    flags::PAIRED | flags::FIRST_SEGMENT | if reverse { flags::REVERSE } else { 0 },
+                )
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8]);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.0_f32);
+            if duplex {
+                b.add_int_tag(SamTag::AD, 5)
+                    .add_int_tag(SamTag::BD, 5)
+                    .add_int_tag(SamTag::AM, 5)
+                    .add_int_tag(SamTag::BM, 5)
+                    .add_float_tag(SamTag::AE, 0.0_f32)
+                    .add_float_tag(SamTag::BE, 0.0_f32);
+                b.add_array_u16(SamTag::AD_BASES, &[5; 8])
+                    .add_array_u16(SamTag::BD_BASES, &[5; 8])
+                    .add_array_u16(SamTag::AE_BASES, &[0; 8])
+                    .add_array_u16(SamTag::BE_BASES, &[0; 8]);
+                b.add_array_i16(SamTag::CU, &cu).add_array_i16(SamTag::CT, &ct);
+                b.add_array_i16(SamTag::AU, &cu).add_array_i16(SamTag::AT, &[0; 8]);
+                b.add_array_i16(SamTag::BU, &[0; 8]).add_array_i16(SamTag::BT, &ct);
+                b.add_string_tag(SamTag::MM, b"C+m?,0,0;G-m?,0,0;")
+                    .add_array_u8(SamTag::ML, &[255, 255, 0, 0]);
+            } else {
+                b.add_array_u16(SamTag::CD_BASES, &[10; 8])
+                    .add_array_u16(SamTag::CE_BASES, &[0; 8]);
+                b.add_array_i16(SamTag::CU, &cu).add_array_i16(SamTag::CT, &ct);
+                b.add_string_tag(SamTag::MM, b"C+m?,0,0;").add_array_u8(SamTag::ML, &[0, 255]);
+            }
+            b.build()
+        };
+        let original = record.clone();
+        let config = FilterConfig::new(&[20, 20, 20], &[1.0], &[1.0], None, None, 1.0);
+
+        let (masked, pass) = Filter::process_record_raw(
+            &mut record,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            reverse, // reverse per-base tags
+            None,    // no min base quality
+            false,   // no single-strand agreement
+            None,    // no min mean base quality
+            1.0,     // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[1, 1, 1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )?;
+
+        assert_eq!(
+            (pass, masked, bases_string(&record), mm_ml(&record)),
+            (false, 0, "ACGTACGT".to_string(), mm_ml(&original)),
+            "keepRead / maskedBases / basesString / MM+ML"
+        );
+        if !reverse {
+            assert_eq!(record, original, "a rejected read is written exactly as it was read");
+        }
+        Ok(())
+    }
+
+    /// A rejected read keeps its original bases but not necessarily its per-base tags as read:
+    /// `--reverse-per-base-tags` runs before the read-level check, so a reverse-mapped read that
+    /// fails comes back with `cd` reversed to read orientation and SEQ unmasked (the per-base
+    /// depths 1..=10 would otherwise mask the bases below `--min-reads 5`).
+    #[test]
+    fn rejected_reads_keep_reversed_per_base_tags_and_original_bases() -> Result<()> {
+        let dir = TempDir::new()?;
+        let reference = ReferenceReader::new(create_test_reference(&dir))?;
+        let depths: Vec<i16> = (1..=10).collect();
+        let mut record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"frag")
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(flags::REVERSE)
+                .cigar_ops(&[10 << 4])
+                .sequence(b"AAAAAAAAAA")
+                .qualities(&[40; 10]);
+            b.add_int_tag(SamTag::CD, 4)
+                .add_int_tag(SamTag::CM, 4)
+                .add_float_tag(SamTag::CE, 0.0_f32);
+            b.add_array_i16(SamTag::CD_BASES, &depths).add_array_i16(SamTag::CE_BASES, &[0; 10]);
+            b.build()
+        };
+        let config = FilterConfig::new(&[5], &[0.05], &[0.1], Some(10), None, 0.2);
+
+        let (masked, pass) = Filter::process_record_raw(
+            &mut record,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            true, // reverse per-base tags
+            Some(10),
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            0.2,   // max no-call fraction
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::Disabled,
+            &["chr1".to_string()],
+            &MethylationFilterSkips::default(),
+        )?;
+
+        let expected_depths: Vec<i16> = (1..=10).rev().collect();
+        assert_eq!(
+            (pass, masked, bases_string(&record), counts(&record, SamTag::CD_BASES)),
+            (false, 0, "AAAAAAAAAA".to_string(), expected_depths)
+        );
+        Ok(())
+    }
+
+    /// The no-call check stays after masking, as in fgbio: a read that passes the read-level
+    /// checks and is then rejected for too many `N`s is written masked, and `N`s already in
+    /// the input are not counted as masked. Ported from `FilterConsensusReadsTest.scala:148`
+    /// ("filter out the read if too many bases are masked post-filtering", first assertion)
+    /// and `:138` ("too many bases are masked in the read in the first place"), fgbio
+    /// `origin/main` e51a661, expected values verbatim.
+    #[rstest]
+    #[case::masked_by_error_rate(
+        "AAAAAAAAAA",
+        Some(vec![3, 3, 3, 0, 0, 0, 0, 3, 3, 3]),
+        6,
+        "NNNAAAANNN"
+    )]
+    #[case::ns_in_input("AANNNNNAAA", None, 0, "AANNNNNAAA")]
+    fn reads_failing_the_no_call_check_are_written_after_masking(
+        #[case] bases: &str,
+        #[case] errors: Option<Vec<i16>>,
+        #[case] expected_masked: u64,
+        #[case] expected_bases: &str,
+    ) -> Result<()> {
+        let depths = errors.as_ref().map(|_| vec![20; 10]);
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"frag")
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[10 << 4])
+                .sequence(bases.as_bytes())
+                .qualities(&[40; 10]);
+            b.add_int_tag(SamTag::CD, 20)
+                .add_int_tag(SamTag::CM, 20)
+                .add_float_tag(SamTag::CE, 0.0_f32);
+            if let (Some(depths), Some(errors)) = (&depths, &errors) {
+                b.add_array_i16(SamTag::CD_BASES, depths).add_array_i16(SamTag::CE_BASES, errors);
+            }
+            b.build()
+        };
+        let mut case = FgbioSimplexCase {
+            min_base_quality: 20,
+            min_reads: 5,
+            min_mean_base_quality: None,
+            max_read_error_rate: 0.05,
+            max_base_error_rate: 0.1,
+            max_no_call_fraction: 0.2,
+            record,
+        };
+
+        let (masked, pass) = process_fgbio_simplex_case(&mut case)?;
+
+        assert_eq!(
+            (pass, masked, bases_string(&case.record)),
+            (false, expected_masked, expected_bases.to_string()),
+            "keepRead / maskedBases / basesString"
+        );
+        Ok(())
+    }
+
+    /// A rejected read is still classified for the methylation filters, so the end-of-run
+    /// warnings count it: here a read with no `cu`/`ct` that fails `--min-reads` is counted in
+    /// `no_counts` although it is rejected before any methylation filter runs.
+    #[test]
+    fn test_process_record_raw_counts_methylation_skips_of_rejected_reads() -> Result<()> {
+        let dir = TempDir::new()?;
+        let reference = ReferenceReader::new(create_test_reference(&dir))?;
+        let mut record = fgbio_simplex_read(40, 4, 4, 0.0, None, None);
+        let config = FilterConfig::new(&[5], &[0.05], &[0.1], Some(10), None, 0.2);
+        let skips = MethylationFilterSkips::default();
+
+        let (masked, pass) = Filter::process_record_raw(
+            &mut record,
+            &config,
+            Some(&reference),
+            &test_bam_header(),
+            false, // no tag reversal
+            Some(10),
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            0.2,   // max no-call fraction
+            Some(&MethylationDepthThresholds::from_values(&[1])),
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            fgumi_consensus::MethylationMode::EmSeq,
+            &["chr1".to_string()],
+            &skips,
+        )?;
+
+        assert_eq!(
+            (pass, masked, skips.no_counts.load(std::sync::atomic::Ordering::Relaxed)),
+            (false, 0, 1)
         );
         Ok(())
     }
