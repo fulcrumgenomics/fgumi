@@ -4101,11 +4101,7 @@ impl RawExternalSorter {
             let bam_bytes = record.as_ref();
             let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
             if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
+                return Err(dropped_lane_error(&violation_read_name(bam_bytes), violation));
             }
             buffer.push(bam_bytes, K::from_full(&full))?;
         }
@@ -4122,11 +4118,7 @@ impl RawExternalSorter {
             // narrowed key.
             let full = extract_template_key_inline(bam_bytes, lib_lookup, self.cell_tag, cb_hasher);
             if let Some(violation) = verify_dropped_lanes(&first, &full, variant) {
-                let name = String::from_utf8_lossy(
-                    fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name(),
-                )
-                .into_owned();
-                return Err(dropped_lane_error(&name, violation));
+                return Err(dropped_lane_error(&violation_read_name(bam_bytes), violation));
             }
             buffer.push(bam_bytes, K::from_full(&full))?;
 
@@ -5697,6 +5689,17 @@ impl TemplateKeyVariant {
     pub fn lanes(self) -> usize {
         3 + usize::from(self.cb) + usize::from(self.tertiary)
     }
+
+    /// Bytes one accumulated `TemplateRecordRef<K>` occupies for this variant:
+    /// the narrowed key (8 bytes per lane) plus the 16-byte
+    /// `offset`/`len`/`padding` tail. Derived from [`Self::lanes`], which owns the
+    /// lane count; pinned against `size_of` by `ref_width_matches_the_ref_size`.
+    /// A logical size: records × `ref_width` is what the refs hold, while a
+    /// growing `Vec` of them can have up to about twice that allocated.
+    #[must_use]
+    pub fn ref_width(self) -> usize {
+        8 * self.lanes() + 16
+    }
 }
 
 /// Parsed `--key-types` spec controlling which optional sort-key lanes are kept.
@@ -5822,7 +5825,27 @@ pub fn verify_dropped_lanes(
     None
 }
 
+/// The read name of a record that violated a dropped lane, for its error
+/// message: the bytes [`RawRecordView::read_name`](fgumi_raw_bam::RawRecordView::read_name)
+/// returns when `l_read_name` fits inside `body`, else `<malformed read name>`.
+/// The key extractor tolerates a name that overruns its body (it bounds-checks
+/// the name), so such a record can reach the violation branch, which must not
+/// slice past the body while formatting the error.
+pub(crate) fn violation_read_name(body: &[u8]) -> String {
+    let l = body.get(8).map_or(0, |&b| usize::from(b));
+    let name: &[u8] = if l > 1 {
+        match body.get(32..32 + l - 1) {
+            Some(name) => name,
+            None => return "<malformed read name>".to_owned(),
+        }
+    } else {
+        &[]
+    };
+    String::from_utf8_lossy(name).into_owned()
+}
+
 /// Build the actionable error message for a dropped-lane violation.
+#[must_use]
 pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
     let field = match v {
         DroppedLaneViolation::Cb => "CB",
@@ -10254,6 +10277,22 @@ mod tests {
         assert_eq!(bpr_lite, 8 + 250 + 40);
     }
 
+    /// `ref_width` is the bytes one accumulated template ref occupies for the
+    /// variant; memory accounting multiplies records by it, so it must
+    /// equal the real `size_of` for every lane, not a hand-kept table.
+    #[rstest]
+    #[case::k24(false, false, std::mem::size_of::<TemplateRecordRef<TemplateKey24>>())]
+    #[case::cb32(true, false, std::mem::size_of::<TemplateRecordRef<CbKey32>>())]
+    #[case::tert32(false, true, std::mem::size_of::<TemplateRecordRef<TertKey32>>())]
+    #[case::k40(true, true, std::mem::size_of::<TemplateRecordRef<TemplateKey>>())]
+    fn ref_width_matches_the_ref_size(
+        #[case] cb: bool,
+        #[case] tertiary: bool,
+        #[case] size: usize,
+    ) {
+        assert_eq!(TemplateKeyVariant { cb, tertiary }.ref_width(), size);
+    }
+
     // ========================================================================
     // T10: narrow-key byte-identity correctness proof
     // ========================================================================
@@ -11015,6 +11054,51 @@ mod tests {
                 "a completely-unmapped read in a single-library input must not trigger a \
                  false dropped-lane library violation",
             );
+    }
+
+    /// The owned template ingest reports a violating record whose `l_read_name`
+    /// overruns its body under a placeholder name, rather than panicking while
+    /// formatting the error. The reader frames records by `block_size` alone,
+    /// so such a record reaches the key extractor.
+    #[test]
+    fn owned_template_sort_reports_a_violation_whose_read_name_overruns_its_body() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(1_000_000).expect("nonzero"),
+                ),
+            )
+            .build();
+        let mut cb = b"CBZ".to_vec();
+        cb.extend_from_slice(b"AAAA\0");
+        let first =
+            fgumi_raw_bam::testutil::make_bam_bytes(0, 100, 0x3, b"r0a", &[], 20, 0, 150, &cb);
+        let mut bad =
+            fgumi_raw_bam::testutil::make_bam_bytes(0, 101, 0x3, b"r1a", &[], 20, 0, 151, &[]);
+        bad[8] = 200;
+        let input = dir.path().join("in.bam");
+        {
+            let mut w = noodles_bgzf::io::Writer::new(std::fs::File::create(&input).unwrap());
+            fgumi_bam_io::write_bam_header(&mut w, &header).unwrap();
+            for r in [&first, &bad] {
+                w.write_all(&u32::try_from(r.len()).unwrap().to_le_bytes()).unwrap();
+                w.write_all(r).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let err = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .cell_tag(SamTag::CB)
+            .key_types(KeyTypesSpec::None)
+            .sort(&input, &dir.path().join("out.bam"))
+            .expect_err("the missing CB violates the dropped lane");
+        assert!(
+            format!("{err:#}").contains("record <malformed read name> carries a CB"),
+            "{err:#}"
+        );
     }
 }
 
