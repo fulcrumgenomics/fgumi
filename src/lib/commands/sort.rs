@@ -475,8 +475,14 @@ pub struct Sort {
     /// Whenever the k-way merge runs -- any sort that spills, or that keeps
     /// more than one in-memory chunk -- prints the `SortMerge` merge-loop
     /// diagnostic ("Sort merge diag: ..."): stalls (merge-loop passes that were
-    /// input-starved waiting on decompress), contention (dispatches that
-    /// produced nothing), and output-backpressure counts. Only when the sort
+    /// input-starved waiting on decompress and found nothing when they
+    /// registered to be woken), contention (dispatches that produced nothing),
+    /// and output-backpressure counts. When the merge reads spill files it is
+    /// followed by the merge-demand lines ("Merge demand:", "Awaited slot at
+    /// stall:", "Merge output:"): stall episodes and their time, wakes the spill
+    /// supply delivered to the parked merge, the awaited spill file's state at
+    /// each stall, and partial batches flushed on a stall (see the performance
+    /// tuning guide). Only when the sort
     /// spills nothing *and* fits in a single in-memory chunk is there no merge
     /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
     /// diag: ...") saying the single-chunk in-memory fast path was taken.

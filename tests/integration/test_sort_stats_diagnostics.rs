@@ -236,27 +236,44 @@ fn write_shuffled_bam_fixture(path: &Path, families: usize, seed: u64) {
     write_bam(path, &header, &records);
 }
 
-/// Runs `fgumi sort --order coordinate` on the shuffled fixture at info
-/// verbosity with `FGUMI_PIPELINE_STATS=1`; returns stderr.
-fn sort_shuffled(families: usize, max_memory: &str, extra_args: &[&str]) -> String {
+/// Runs `fgumi sort --order <order>` on the shuffled fixture at info verbosity
+/// (and `FGUMI_PIPELINE_STATS=1` when `with_stats`); returns stderr.
+fn sort_shuffled(
+    order: &str,
+    families: usize,
+    max_memory: &str,
+    extra_args: &[&str],
+    with_stats: bool,
+) -> String {
     let tmp = TempDir::new().expect("tempdir");
     let input: PathBuf = tmp.path().join("unsorted.bam");
     write_shuffled_bam_fixture(&input, families, 0x5EED);
     let output = tmp.path().join("sorted.bam");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
-    cmd.env("RUST_LOG", "info").env("FGUMI_PIPELINE_STATS", "1");
+    cmd.env("RUST_LOG", "info");
+    if with_stats {
+        cmd.env("FGUMI_PIPELINE_STATS", "1");
+    }
     let result = cmd
         .args(["sort", "-i"])
         .arg(&input)
         .arg("-o")
         .arg(&output)
-        .args(["--order", "coordinate", "-m", max_memory])
+        .args(["--order", order, "-m", max_memory])
         .args(extra_args)
         .output()
         .expect("run fgumi sort");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
     stderr
+}
+
+/// `fgumi sort --order <order>` on the shuffled multi-source fixture (unsorted
+/// in every order, with equal-key ties) under a small `--max-memory`, at info
+/// verbosity, with `extra` args; returns stderr. Callers guard on
+/// `Merge sources: N` with `N >= 2`.
+fn sort_spilling_with(order: &str, extra: &[&str]) -> String {
+    sort_shuffled(order, 20_000, "1M", extra, false)
 }
 
 /// `N` from the standalone-sort summary line `Merge sources: N`.
@@ -291,7 +308,7 @@ fn detached_parks(stderr: &str, step: &str) -> Option<(u64, u64, u64)> {
 /// loaded host), so the check is on the group, not on one step.
 #[test]
 fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
-    let stderr = sort_shuffled(20_000, "512K", &["--threads", "4"]);
+    let stderr = sort_shuffled("coordinate", 20_000, "512K", &["--threads", "4"], true);
     let sources =
         merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(sources > 1, "the fixture must merge more than one source (got {sources}):\n{stderr}");
@@ -343,7 +360,7 @@ fn wake_column(stderr: &str, step: &str, column: &str) -> Option<u64> {
 /// — are logged on every run; there is no stats-off CLI path to contrast with.)
 #[test]
 fn sort_stats_render_the_wake_table_under_pipeline_stats() {
-    let stderr = sort_shuffled(20_000, "512K", &["--threads", "4"]);
+    let stderr = sort_shuffled("coordinate", 20_000, "512K", &["--threads", "4"], true);
     let sources =
         merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(sources > 1, "the fixture must merge more than one source (got {sources}):\n{stderr}");
@@ -371,13 +388,16 @@ fn sort_stats_render_the_wake_table_under_pipeline_stats() {
 }
 
 /// `--sort-stats` gates the `SortMerge` k-way-merge diagnostic line on a
-/// spilling sort: absent by default, present when passed.
+/// sort that merges at least two sources: absent by default, present when
+/// passed.
 #[rstest]
 #[case::without_flag(&[], false)]
 #[case::with_flag(&["--sort-stats"], true)]
 fn sort_stats_gates_merge_diagnostics(#[case] extra_args: &[&str], #[case] expect_present: bool) {
-    let stderr = sort_spilling(extra_args);
+    let stderr = sort_spilling_with("coordinate", extra_args);
     assert_really_spilled(&stderr);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "the fixture must merge at least 2 sources (got {n}):\n{stderr}");
 
     let present = stderr.contains(MERGE_DIAG_SUBSTRING);
     assert_eq!(
@@ -389,6 +409,22 @@ fn sort_stats_gates_merge_diagnostics(#[case] extra_args: &[&str], #[case] expec
         !stderr.contains("is ignored by the sort chain"),
         "stale --sort-stats warning still present:\n{stderr}"
     );
+}
+
+/// The merge-demand lines are gated on `--sort-stats`, on a sort that merges
+/// at least two sources, in every order.
+#[rstest]
+fn sort_stats_gates_merge_demand_lines(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    for needle in ["Merge demand:", "Awaited slot at stall:", "Merge output:"] {
+        assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
+    }
 }
 
 /// On a sort that fits entirely in memory (the single-chunk fast path, no

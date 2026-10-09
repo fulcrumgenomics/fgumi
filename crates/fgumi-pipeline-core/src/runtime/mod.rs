@@ -33,7 +33,7 @@ pub(crate) use pool::{assign_exclusive_owners, assign_sticky_owners};
 pub use scheduler::{
     ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, Scheduler, WalkDirection,
 };
-pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot};
+pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot, elapsed_ns};
 pub(crate) use storage::build_worker_storage;
 pub(crate) use worker_core::WorkerCore;
 #[cfg(any(test, feature = "test-utils"))]

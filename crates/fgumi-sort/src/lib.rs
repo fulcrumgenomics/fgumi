@@ -54,6 +54,9 @@ pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;
 pub(crate) mod memory_probe;
+// The merge's demand facts (awaited file, consumer wake, demand counters),
+// shared by the spill supply and the merge. Surfaced via the re-export below.
+pub(crate) mod merge_demand;
 pub(crate) mod merge_phases;
 pub(crate) mod merge_slots;
 pub(crate) mod merge_stalls;
@@ -264,6 +267,7 @@ pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
+pub use merge_demand::{AwaitedSlotState, MergeDemand, MergeDemandSnapshot, MergeDemandStats};
 pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use reader::{

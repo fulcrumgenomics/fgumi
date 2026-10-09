@@ -310,3 +310,262 @@ fn zero_block_batch_is_clamped_to_one() {
     let passthrough = SortSpillDecompress::new(4 * 1024 * 1024, tuning);
     assert_eq!(passthrough.tuning.block_batch, 8, "a nonzero block_batch is honoured");
 }
+
+// ── Merge-demand notification ────────────────────────────────────────────────
+//
+// Every wake below is observed by a real thread parked for 10 s under a 5 s
+// watchdog, so only an unpark from the step under test can end the park in time.
+
+/// Write a BGZF spill file holding `blocks` blocks of `per_block` u64-keyed
+/// records (prologue, independently compressed blocks, trailer — the layout
+/// `SpillWrite` produces) and open it as slot `file_id` with the production
+/// opener, `fgumi_sort::open_spill_slot`.
+fn spill_slot(
+    dir: &std::path::Path,
+    file_id: u32,
+    blocks: usize,
+    per_block: usize,
+) -> Arc<SortMergeSlot> {
+    use std::io::Write;
+    let path = dir.join(format!("run{file_id}.spill"));
+    let mut file = std::fs::File::create(&path).expect("create spill file");
+    file.write_all(fgumi_sort::spill_magic(SpillCodec::Bgzf)).unwrap();
+    let mut compressor = fgumi_sort::SpillBlockCompressor::new(SpillCodec::Bgzf, 1).unwrap();
+    for block in 0..blocks {
+        let mut raw = Vec::new();
+        for i in 0..per_block {
+            let key = fgumi_sort::RawCoordinateKey { sort_key: (block * per_block + i) as u64 };
+            fgumi_sort::frame_keyed_record_into(&mut raw, &key, &[0u8; 8]).unwrap();
+        }
+        file.write_all(&compressor.compress_block(&raw).unwrap()).unwrap();
+    }
+    file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
+    drop(file);
+    fgumi_sort::open_spill_slot(&path, file_id).expect("open spill slot")
+}
+
+/// A thread registered as `demand`'s consumer and awaiting `file_id`, then
+/// parked for up to 10 s. `assert_woken` fails the test if it has not woken
+/// within 5 s — with a 10 s park, only an unpark can end it that early. It
+/// registers the way the merge does, through `await_slot`, on an empty open
+/// stand-in slot carrying `file_id`.
+struct ParkedConsumer {
+    done: std::sync::mpsc::Receiver<()>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl ParkedConsumer {
+    fn start(demand: &Arc<fgumi_sort::MergeDemand>, file_id: u32) -> Self {
+        let d = Arc::clone(demand);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let stand_in = SortMergeSlot::new(
+                file_id,
+                std::io::BufReader::new(tempfile::tempfile().unwrap()),
+                SpillCodec::Bgzf,
+            );
+            assert!(!d.await_slot(&stand_in), "an empty, open slot never satisfies the re-check");
+            ready_tx.send(()).unwrap();
+            std::thread::park_timeout(std::time::Duration::from_secs(10));
+            let _ = done_tx.send(());
+        });
+        ready_rx.recv().unwrap();
+        Self { done, handle }
+    }
+
+    fn assert_woken(self, what: &str) {
+        self.done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{what}: the awaiting consumer was not woken"));
+        self.handle.join().unwrap();
+    }
+
+    /// Fails if the consumer wakes within 500 ms. A wrong unpark ends the park
+    /// at once, so the window only bounds how quickly a woken thread gets to
+    /// run; a correct step can never fail this.
+    fn assert_still_parked(&self, what: &str) {
+        assert!(
+            self.done.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "{what}: the consumer woke without a matching delivery"
+        );
+    }
+}
+
+/// Register `slots` with the step, as its `SpillReady` arm does.
+fn register_slots(step: &mut SortSpillDecompress, slots: &[Arc<SortMergeSlot>]) {
+    let mut registry = step.registry.lock();
+    for slot in slots {
+        registry.push(RegisteredSpill { slot: Arc::clone(slot) });
+    }
+}
+
+/// The inline (file-granularity) path never raises a slot's `in_flight`, so
+/// the merge cannot classify its stalls: wiring the demand there marks the
+/// `--sort-stats` awaited-slot line as unclassified; the block-parallel path
+/// leaves it classified.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn inline_decompress_marks_stalls_unclassified(#[case] file_granularity: bool) {
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let _step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 1 },
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    assert_eq!(demand.snapshot().inline_decompress, file_granularity);
+    assert_eq!(
+        demand.snapshot().log_lines()[1].contains("not classified"),
+        file_granularity,
+        "{:?}",
+        demand.snapshot().log_lines()
+    );
+}
+
+/// A delivery to the awaited slot wakes the parked merge; a delivery to another
+/// slot does not. Both fill paths. Only slot 1 is registered with the step, so
+/// emptiest-first scheduling cannot pick another slot.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn delivery_to_the_awaited_slot_wakes_the_merge(#[case] file_granularity: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = spill_slot(tmp.path(), 1, 4, 8);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+
+    // A delivery to slot 1 while the consumer awaits file 9: no wake. This
+    // consumer is never joined; it times out on its own.
+    let other = ParkedConsumer::start(&demand, 9);
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 1 },
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    register_slots(&mut step, std::slice::from_ref(&slot));
+    assert!(step.try_fill_some_slot().unwrap());
+    assert!(slot.fifo_len() > 0, "precondition: the fill delivered a block");
+    other.assert_still_parked("delivery to a non-awaited file");
+    assert_eq!(demand.awaited(), Some(9));
+    demand.clear_awaited();
+
+    // Await slot 1 itself, after draining what was delivered: the next delivery wakes.
+    slot.decompressed.lock().unwrap().clear();
+    let consumer = ParkedConsumer::start(&demand, 1);
+    while slot.fifo_len() == 0 {
+        assert!(step.try_fill_some_slot().unwrap());
+    }
+    consumer.assert_woken("delivery to the awaited slot");
+    assert_eq!(demand.awaited(), None);
+}
+
+/// The run ends exactly at a block boundary. The slot holds exactly
+/// `block_batch` blocks, so the first fill reads them all without seeing EOF;
+/// the merge drains them and awaits the slot; the second fill takes the
+/// EOF-with-no-block path (inline: `got == 0`; block-parallel:
+/// `bp_commit_read(0, true)` → an empty `bp_insert_drain_finalize`) — which must
+/// wake the merge.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn eof_finalize_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = spill_slot(tmp.path(), 0, 4, 8);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 4 },
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    register_slots(&mut step, std::slice::from_ref(&slot));
+    // First fill: all four blocks, no EOF yet.
+    while slot.fifo_len() < 4 {
+        assert!(step.try_fill_some_slot().unwrap());
+    }
+    assert!(!slot.queue_eof.load(Ordering::Acquire), "a full first read must not see EOF");
+    slot.decompressed.lock().unwrap().clear(); // the merge consumed them
+    let consumer = ParkedConsumer::start(&demand, 0);
+    while !slot.queue_eof.load(Ordering::Acquire) {
+        step.try_fill_some_slot().unwrap();
+    }
+    consumer.assert_woken("EOF finalize");
+    assert_eq!(slot.fifo_len(), 0, "EOF with no block");
+}
+
+/// A slot failure (poisoned reader) wakes the awaiting merge, so it surfaces
+/// the error instead of sleeping until its timer.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn failed_slot_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        BufReader::new(tempfile::tempfile().unwrap()),
+        SpillCodec::Bgzf,
+    ));
+    let holder = Arc::clone(&slot);
+    let _ = std::thread::spawn(move || {
+        let _g = holder.reader.lock().unwrap();
+        panic!("simulated fill-worker panic under the reader lock");
+    })
+    .join();
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let consumer = ParkedConsumer::start(&demand, 0);
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 1 },
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    let r = if file_granularity {
+        step.try_fill_inline_slot(&slot)
+    } else {
+        step.try_fill_block_parallel_slot(&slot)
+    };
+    assert!(r.is_err());
+    assert!(slot.has_error());
+    consumer.assert_woken("slot failure");
+}
+
+/// Worker copies share the one demand (`Arc::ptr_eq`).
+#[test]
+fn worker_copies_share_the_merge_demand() {
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let step = SortSpillDecompress::new(1 << 20, SortDecompressTuning::default())
+        .with_merge_demand(Arc::clone(&demand));
+    let copy = step.new_worker_copy();
+    assert!(Arc::ptr_eq(copy.merge_demand_for_test().unwrap(), &demand));
+}
+
+/// The block-parallel drain-only pass (Phase B) delivers a block that waited in
+/// the reorder buffer behind a full FIFO; that delivery must wake the merge too.
+/// The test holds the reader lock so the fill cannot take Phase A.
+#[test]
+fn phase_b_drain_wakes_the_awaiting_merge() {
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        BufReader::new(tempfile::tempfile().unwrap()),
+        SpillCodec::Bgzf,
+    ));
+    // A full FIFO, and one in-order block parked in the reorder buffer.
+    {
+        let mut dec = slot.decompressed.lock().unwrap();
+        for _ in 0..fgumi_sort::PHASE2_DECOMP_CAP {
+            dec.push_back(vec![0]);
+        }
+    }
+    slot.bp_commit_read(1, false);
+    assert!(!slot.bp_insert_drain_finalize(0, vec![vec![7]], 1), "precondition: no FIFO room");
+    slot.decompressed.lock().unwrap().clear(); // the merge consumed the FIFO
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let consumer = ParkedConsumer::start(&demand, 0);
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity: false, block_batch: 1 },
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    let reader = slot.reader.lock().unwrap();
+    assert!(step.try_fill_block_parallel_slot(&slot).unwrap(), "Phase B drained the block");
+    drop(reader);
+    consumer.assert_woken("Phase-B drain");
+    assert_eq!(slot.fifo_len(), 1);
+}

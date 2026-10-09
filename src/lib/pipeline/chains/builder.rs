@@ -3590,11 +3590,16 @@ impl<'a> ChainBuilder<'a> {
                 file_granularity: sort.file_granularity,
                 block_batch: sort.block_batch,
             };
+            // One merge-wide demand per sort, shared by the supply
+            // (`notify_delivered` after each delivery) and the merge
+            // (`await_slot` on a stall; the thread the delivery unparks).
+            let merge_demand = Arc::new(fgumi_sort::MergeDemand::new());
             // Phase-2 cap (`--merge-threads`): bounds concurrent spill
             // decompression together with the terminal output compressor.
             let decompress =
                 SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
-                    .with_phase_cap(phase2_cap.clone());
+                    .with_phase_cap(phase2_cap.clone())
+                    .with_merge_demand(Arc::clone(&merge_demand));
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -3829,6 +3834,7 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
+                merge = merge.with_merge_demand(Arc::clone(&merge_demand));
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -3882,7 +3888,9 @@ impl<'a> ChainBuilder<'a> {
                 // rather than serially on the detached thread. Bounded to the
                 // effective phase-2 count (`--merge-threads` within `--threads`).
                 .with_fast_path_threads(phases.phase2);
-                merge = merge.with_fast_path_cap(phase2_cap.clone());
+                merge = merge
+                    .with_fast_path_cap(phase2_cap.clone())
+                    .with_merge_demand(Arc::clone(&merge_demand));
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
