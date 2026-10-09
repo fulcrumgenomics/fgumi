@@ -305,7 +305,15 @@ Each pool worker row also reports `waits notified% timed_out%`: how many times i
 fgumi sort --sort-stats --input reads.bam --output sorted.bam
 ```
 
-`fgumi sort` runs through the same shared `ChainBuilder` pipeline as every other command, but it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats` for its own merge-loop diagnostic. Whenever the k-way merge runs -- any sort that spills, or a no-spill sort that still holds more than one in-memory chunk -- it prints a single `Sort merge diag: stalls=... contention=... output_full=... progress_dispatches=...` line reporting merge-loop stalls (waiting on decompress), contention (dispatches that produced nothing), and output backpressure. Only when the sort spills nothing *and* fits in a single in-memory chunk does no k-way merge run; there it instead prints one `Sort fast-path diag: ...` line noting the single-chunk in-memory fast path was taken. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
+`fgumi sort` runs through the same shared `ChainBuilder` pipeline as every other command, but it carries a dedicated `--sort-stats` flag instead of `--pipeline-stats` for its own merge-loop diagnostic. Whenever the k-way merge runs -- any sort that spills, or a no-spill sort that still holds more than one in-memory chunk -- it prints a `Sort merge diag: stalls=... contention=... output_full=... progress_dispatches=...` line reporting merge-loop stalls (waiting on decompress), contention (dispatches that produced nothing), and output backpressure. `stalls=` counts only stalls the merge could not resolve at once: when the merge finds the block it is waiting on has landed by the time it registers to be woken for it, it keeps merging and the stall is not counted, so compare `stalls=` only between runs of the same release.
+
+When the merge reads spill files, the diag line is followed by the merge-demand lines, in this order:
+
+- `Merge demand:` stall episodes (one per wait for a block, however many times the merge re-checks within it) and their exact total time; then `wakes delivered W of P parking registrations (R registrations)`: of the `R` times the merge registered to be woken for the spill file it waits on, `P` were followed by a park, and `W` parks were ended by the delivery of that file's block (the rest ended on the merge's idle timer).
+- `Awaited slot at stall:` the share of stall episodes whose awaited spill file had no block being decompressed (`starved`) or had blocks being decompressed (`decompressing`). Under `--file-granularity` decompression runs inline and is never tracked per block, so every stall reports `starved` and the line says the stalls are not classified.
+- `Merge output:` how many output batches the merge flushed early, short of their target size, because it stalled with records already merged.
+
+Only when the sort spills nothing *and* fits in a single in-memory chunk does no k-way merge run; there it instead prints one `Sort fast-path diag: ...` line noting the single-chunk in-memory fast path was taken. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
 
 ### Scheduler Strategy (legacy, inert)
 

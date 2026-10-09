@@ -231,6 +231,14 @@ impl StepStats {
 /// `PipelineStats::new` call site.
 const MAX_TRACKED_WORKERS: usize = 512;
 
+/// Nanoseconds since `start`, saturating into a `u64` (a `u64` of ns is ~584
+/// years, so the cap only avoids a `u128`-to-`u64` panic path on an absurd
+/// clock). For steps and stages that time their own work.
+#[must_use]
+pub fn elapsed_ns(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Per-step counter container. Sized to match the pipeline's chain length;
 /// callers obtain one via `Pipeline::stats()`.
 #[derive(Debug)]
@@ -457,7 +465,7 @@ impl PipelineStats {
     /// per-step first/last progress timestamps.
     #[must_use]
     pub fn elapsed_ns(&self) -> u64 {
-        u64::try_from(self.pipeline_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        elapsed_ns(self.pipeline_start)
     }
 
     #[must_use]

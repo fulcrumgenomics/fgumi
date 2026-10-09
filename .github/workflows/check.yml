@@ -282,9 +282,9 @@ jobs:
           cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked --lib \
             -E 'test(bwa_mem3_engine_smoke_pair_emit)'
 
-  # `merge_slots.rs` (fgumi-sort) and `admission.rs` (fgumi-pipeline-core) swap
-  # their sync primitives for loom's under `--cfg loom`, and
-  # `tests/loom_merge_slots.rs`, `tests/loom_admission.rs` and
+  # `merge_slots.rs` and `merge_demand.rs` (fgumi-sort) and `admission.rs`
+  # (fgumi-pipeline-core) swap their sync primitives for loom's under
+  # `--cfg loom`, and `tests/loom_merge_slots.rs`, `tests/loom_admission.rs` and
   # `tests/loom_wake.rs` are `#![cfg(loom)]`. None is built by any other job, so
   # without this one a broken model — or a `cfg(loom)` build that stopped
   # compiling — is invisible: the test target compiles to an empty binary under

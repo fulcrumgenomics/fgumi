@@ -741,8 +741,9 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// after consolidation) runs this merge read.
     spill_stats: Option<Arc<crate::sort::SpillRunStats>>,
     /// Whether to log the `--sort-stats` merge-loop performance diagnostic
-    /// (`Sort merge diag: ...`: stalls/contention/backpressure counters). Off
-    /// by default -- it is instrumentation for performance investigations, not
+    /// (`Sort merge diag: ...`: stalls/contention/backpressure counters, then
+    /// the merge demand's `MergeDemandSnapshot::log_lines` when a demand is
+    /// attached). Off by default -- it is instrumentation for performance investigations, not
     /// something a normal run should show. See [`Self::with_sort_stats`].
     sort_stats: bool,
     /// Total records ingested, captured at the merge transition (the summary's
@@ -791,21 +792,41 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// uncapped). The gather runs beside the output compressor that shares
     /// this cap, so it holds every permit while it runs.
     fast_path_cap: Option<Arc<PhaseCap>>,
+    /// The sort's merge-wide demand, shared with `SortSpillDecompress`: on a
+    /// stall the merge declares the slot it waits on, and the delivery to that
+    /// slot unparks this step's driver thread. `None` when the merge runs
+    /// without a spill supply that notifies (unit tests that drive it alone).
+    demand: Option<Arc<fgumi_sort::MergeDemand>>,
+    /// When the current stall episode began (`None` while the merge is not
+    /// stalled). One episode spans every `Stalled` until the next `Produced` or
+    /// `Done`.
+    stall_started: Option<std::time::Instant>,
+    /// This dispatch's stall registered on the merge demand (its `await_slot`
+    /// found nothing). `try_run` settles it once the dispatch's outcome is
+    /// known: a park (`Contention`) is recorded as one, and any other outcome
+    /// withdraws the registration, because the merge runs again before it
+    /// parks and re-registers then.
+    awaiting: bool,
 }
 
 /// Lever-2 diagnostic counters: is the serial merge starved on decompress
 /// (`input-empty`/`stalls`) or blocked on the downstream writer
-/// (`output_full`), and how much does its worker spin (`contention`)?
+/// (`output_full`), and how often does a dispatch deliver nothing (`contention`)?
 #[derive(Default, Clone, Copy)]
 struct MergeDiag {
     /// Merge-loop passes that ended `Stalled` — the winning source's next block
-    /// was not yet decompressed (INPUT-STARVED: the lever-2 hypothesis).
+    /// was not yet decompressed (INPUT-STARVED: the lever-2 hypothesis) — and
+    /// that `MergeDemand::await_slot`'s re-check did not resolve. A stall whose
+    /// re-check finds the block or EOF already landed keeps merging and is not
+    /// counted; before the merge demand every stall was, so this count is not
+    /// comparable with a pre-`MergeDemand` run's `stalls=`.
     stalls: u64,
     /// `ctx.outputs.push` returned `Err` — downstream (compress/write) full
     /// (OUTPUT-BACKPRESSURE).
     output_full: u64,
-    /// `try_run` returned `Contention` — the merge worker had nothing to do this
-    /// dispatch and spun/yielded (pure under-utilization).
+    /// `try_run` returned `Contention` — the merge had nothing to deliver this
+    /// dispatch, so its driver parked until the awaited slot's delivery woke it
+    /// (or its idle timer expired).
     contention: u64,
     /// `try_run` calls that delivered ≥1 batch (PROGRESS dispatches).
     progress_dispatches: u64,
@@ -849,7 +870,19 @@ impl<O: MergeOutput> SortMerge<O> {
             fast_path_pool: None,
             fast_pending: std::collections::VecDeque::new(),
             fast_path_cap: None,
+            demand: None,
+            stall_started: None,
+            awaiting: false,
         }
+    }
+
+    /// Share the sort's [`fgumi_sort::MergeDemand`] with the spill supply, so a
+    /// stalled merge parks until the block it awaits lands instead of until its
+    /// driver's idle timer.
+    #[must_use]
+    pub fn with_merge_demand(mut self, demand: Arc<fgumi_sort::MergeDemand>) -> Self {
+        self.demand = Some(demand);
+        self
     }
 
     /// Make the parallel fast-path gather take its threads from the phase-2
@@ -912,11 +945,32 @@ impl<O: MergeOutput> SortMerge<O> {
     }
 
     /// Enable or disable the `--sort-stats` merge-loop performance diagnostic
-    /// (`Sort merge diag: ...`). Off by default.
+    /// (`Sort merge diag: ...` and the merge-demand lines). Off by default.
     #[must_use]
     pub fn with_sort_stats(mut self, enabled: bool) -> Self {
         self.sort_stats = enabled;
         self
+    }
+
+    /// Settle this dispatch's merge-demand registration (`awaiting`) once its
+    /// outcome is known. A `Contention` parks the driver until the awaited
+    /// slot's delivery (or its idle timer), so it is a parking registration.
+    /// Any other outcome runs the merge again before it parks — after a stall
+    /// that flushed a partial batch, or with that batch held on a full output
+    /// edge — so the registration is withdrawn: a delivery must not unpark a
+    /// merge that is not waiting on it, and the next stall re-registers (and
+    /// re-checks) before any park.
+    fn settle_await(&mut self, outcome: &io::Result<StepOutcome>) {
+        if !std::mem::take(&mut self.awaiting) {
+            return;
+        }
+        if let Some(d) = &self.demand {
+            if matches!(outcome, Ok(StepOutcome::Contention)) {
+                d.stats().record_park();
+            } else {
+                d.clear_awaited();
+            }
+        }
     }
 
     fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
@@ -997,6 +1051,9 @@ impl<O: MergeOutput> SortMerge<O> {
         let target = self.target_batch_count;
         let byte_limit = self.output_byte_limit;
         let bytes_cap = usize::try_from(byte_limit).unwrap_or(usize::MAX);
+        let demand = self.demand.as_deref();
+        let stall_started = &mut self.stall_started;
+        let awaiting = &mut self.awaiting;
         let SortMergeState::Merging { driver, builder, next_ordinal } = &mut self.state else {
             unreachable!("next_batch called outside Merging state");
         };
@@ -1025,6 +1082,11 @@ impl<O: MergeOutput> SortMerge<O> {
                 MergeStep::Produced(bytes) => {
                     builder.push_record_bytes(bytes)?;
                     *records_out += 1;
+                    if let Some(t0) = stall_started.take()
+                        && let Some(d) = demand
+                    {
+                        d.stats().record_stall_ns(fgumi_pipeline_core::runtime::elapsed_ns(t0));
+                    }
                     let count_full = builder.len() >= target;
                     let bytes_full = (builder.total_bytes() as u64) >= byte_limit;
                     if count_full || bytes_full {
@@ -1032,9 +1094,35 @@ impl<O: MergeOutput> SortMerge<O> {
                     }
                 }
                 MergeStep::Stalled => {
-                    return Ok(NextBatch::Stalled(flush_partial(builder, next_ordinal)));
+                    if let (Some(d), Some(slot)) = (demand, driver.stalled_slot()) {
+                        // Declare the slot awaited, then re-check it (the wake
+                        // protocol in `fgumi_sort::MergeDemand`): a block or EOF
+                        // that already landed means keep merging; otherwise the
+                        // delivery to this slot unparks the driver.
+                        if d.await_slot(slot) {
+                            continue;
+                        }
+                        *awaiting = true;
+                        if stall_started.is_none() {
+                            *stall_started = Some(std::time::Instant::now());
+                            d.stats().record_stall(slot.awaited_state());
+                        }
+                    }
+                    let partial = flush_partial(builder, next_ordinal);
+                    if partial.is_some()
+                        && let Some(d) = demand
+                    {
+                        d.stats().record_partial_flush();
+                    }
+                    return Ok(NextBatch::Stalled(partial));
                 }
                 MergeStep::Done => {
+                    // The last episode (typically a run-end EOF stall) ends here.
+                    if let Some(t0) = stall_started.take()
+                        && let Some(d) = demand
+                    {
+                        d.stats().record_stall_ns(fgumi_pipeline_core::runtime::elapsed_ns(t0));
+                    }
                     return Ok(NextBatch::Done(
                         flush_partial(builder, next_ordinal),
                         driver.records_merged(),
@@ -1086,26 +1174,28 @@ impl<O: MergeOutput> SortMerge<O> {
                         self.dbg.progress_dispatches += 1;
                         StepOutcome::Progress
                     } else {
-                        // Pure under-utilization: this dispatch did nothing.
+                        // Nothing delivered this dispatch: the driver parks
+                        // until the awaited slot's delivery unparks it (the
+                        // merge demand), with its idle timer only as the bound.
                         self.dbg.contention += 1;
                         StepOutcome::Contention
                     });
                 }
                 NextBatch::Done(partial, merged) => {
-                    if let Some(batch) = partial {
-                        if let Err(unpushed) = ctx.outputs.push(batch) {
-                            self.dbg.output_full += 1;
-                            self.held.put(unpushed);
-                            return Ok(StepOutcome::Progress);
-                        }
-                        delivered += 1;
+                    if let Some(batch) = partial
+                        && let Err(unpushed) = ctx.outputs.push(batch)
+                    {
+                        self.dbg.output_full += 1;
+                        self.held.put(unpushed);
+                        return Ok(StepOutcome::Progress);
                     }
                     log::info!("Sort merge complete: {merged} records merged");
                     // INSTRUMENTATION (lever-2): is the serial merge starved on
                     // decompress (stalls/contention high) or blocked on the
                     // writer (output_full high)? `stalls` counts merge-loop
-                    // passes that ended input-starved; `contention` counts
-                    // dispatches that produced nothing (pure idle spin);
+                    // passes that ended input-starved with no block landed by
+                    // the await re-check (see `MergeDiag::stalls`); `contention` counts
+                    // dispatches that produced nothing (the driver then parks);
                     // `output_full` counts downstream-backpressure events.
                     //
                     // Gated on `--sort-stats` (`self.sort_stats`): this is
@@ -1123,6 +1213,11 @@ impl<O: MergeOutput> SortMerge<O> {
                             merged,
                             self.chunk_count,
                         );
+                        if let Some(d) = &self.demand {
+                            for line in d.snapshot().log_lines() {
+                                log::info!("{line}");
+                            }
+                        }
                     }
                     if let Some(slot) = &self.stats_slot {
                         *slot.lock() = Some(fgumi_sort::SortStats {
@@ -1134,11 +1229,12 @@ impl<O: MergeOutput> SortMerge<O> {
                         });
                     }
                     self.state = SortMergeState::Done;
-                    return Ok(if delivered > 0 {
-                        StepOutcome::Progress
-                    } else {
-                        StepOutcome::NoProgress
-                    });
+                    // Reaching `Done` is progress even when this dispatch
+                    // delivered nothing (the run-end stall: the last source's
+                    // EOF woke the merge, which then had nothing left to emit).
+                    // `NoProgress` would park the driver on its idle timer
+                    // before the next dispatch reports `Finished`.
+                    return Ok(StepOutcome::Progress);
                 }
             }
         }
@@ -1677,14 +1773,16 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             }
         };
         ctx.counters.add(RECORDS, records_this_call);
-        match outcome {
+        let outcome = match outcome {
             Ok(StepOutcome::NoProgress | StepOutcome::Contention | StepOutcome::Capped)
                 if took_input =>
             {
                 Ok(StepOutcome::Progress)
             }
             other => other,
-        }
+        };
+        self.settle_await(&outcome);
+        outcome
     }
 }
 
