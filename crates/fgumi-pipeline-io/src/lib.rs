@@ -15,6 +15,7 @@
 //!     between steps.
 
 pub mod boundaries;
+pub mod pread;
 pub mod sink;
 pub mod sort;
 pub mod source;

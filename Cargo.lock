@@ -813,6 +813,7 @@ dependencies = [
  "noodles",
  "noodles-bgzf",
  "noodles-csi",
+ "parking_lot",
  "proptest",
  "rstest",
  "tempfile",
@@ -826,6 +827,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "libdeflater",
+ "proptest",
  "rstest",
 ]
 

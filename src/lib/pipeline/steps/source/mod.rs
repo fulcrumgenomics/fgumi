@@ -184,15 +184,7 @@ impl InputSource {
         if is_stdin {
             // The path is just `-`, so there is no suffix to consult and the
             // content decides. `PipelineReaderOpts` is not threaded through here:
-            // there is no path to reopen, so there is no async-reader wiring and
-            // no positional (scatter) reads. Warn if `--read-streams` explicitly
-            // asked for concurrency stdin can't provide (the `Auto` default falls
-            // back silently) so this path gives the same feedback as the others.
-            fgumi_bam_io::pread::warn_read_streams_unavailable(
-                opts.read_streams,
-                "stdin",
-                "is not a seekable regular file",
-            );
+            // there is no path to reopen, so there is no async-reader wiring.
             open_stream_by_content(Box::new(io::stdin()))
         } else if suffix_is_bam {
             // BAM file: parse header via the existing helper, which
@@ -217,14 +209,8 @@ impl InputSource {
             // async-reader wiring, whereas a wrong "regular" answer corrupts input.
             if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
                 // Non-regular: classify in-stream. Same trade-off the stdin branch
-                // makes — no async-reader wiring and no positional reads, because
-                // there is no reopenable path. Warn on an explicit `--read-streams`
-                // the input can't honor (the `Auto` default stays silent).
-                fgumi_bam_io::pread::warn_read_streams_unavailable(
-                    opts.read_streams,
-                    &path.display().to_string(),
-                    "is not a seekable regular file",
-                );
+                // makes — no async-reader wiring, because there is no reopenable
+                // path.
                 return open_stream_by_content(Box::new(file));
             }
 
