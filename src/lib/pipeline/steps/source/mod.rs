@@ -188,7 +188,7 @@ impl InputSource {
             // no positional (scatter) reads. Warn if `--read-streams` explicitly
             // asked for concurrency stdin can't provide (the `Auto` default falls
             // back silently) so this path gives the same feedback as the others.
-            fgumi_bam_io::scatter_reader::warn_read_streams_unavailable(
+            fgumi_bam_io::pread::warn_read_streams_unavailable(
                 opts.read_streams,
                 "stdin",
                 "is not a seekable regular file",
@@ -220,7 +220,7 @@ impl InputSource {
                 // makes — no async-reader wiring and no positional reads, because
                 // there is no reopenable path. Warn on an explicit `--read-streams`
                 // the input can't honor (the `Auto` default stays silent).
-                fgumi_bam_io::scatter_reader::warn_read_streams_unavailable(
+                fgumi_bam_io::pread::warn_read_streams_unavailable(
                     opts.read_streams,
                     &path.display().to_string(),
                     "is not a seekable regular file",
