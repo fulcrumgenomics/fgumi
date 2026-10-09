@@ -456,17 +456,18 @@ pub struct Sort {
     /// streams, while on a direct-attached instance-store SSD one stream is
     /// already faster than four are on gp3 and adding more costs 1.8%.
     ///
-    /// `auto` therefore measures instead of guessing. It reads the first several
-    /// fills at a single stream -- exactly the pre-existing behaviour -- then
-    /// commits once to a count of `ceil(target-throughput / measured)`, capped at
-    /// 8. It lands on four for gp3 and stays at one for `NVMe` without being told
-    /// which is which, and does not revisit the choice afterwards.
+    /// `auto` therefore measures instead of guessing. It starts at one stream
+    /// and doubles the count (up to 8) whenever the device starved the input
+    /// framer for more than 25% of a window of eight 4 MiB fills; it never
+    /// decreases. It
+    /// climbs to four or more on gp3 and stays at one on `NVMe` without being
+    /// told which is which.
     ///
-    /// Each active stream is served by a scoped OS thread spawned per fill window,
-    /// bounded by the chosen count (at most 8) -- this is independent of
-    /// `--threads`. Applies to the input BAM only, not the merge's spill files.
-    /// Ignored for stdin and other non-seekable inputs, where positional reads do
-    /// not exist.
+    /// Streams are not extra threads: each read is a task on the pipeline's
+    /// worker pool, so concurrency is bounded by the pool (and by
+    /// `--sort-threads`). The merge's spill reads adopt the input's stream
+    /// count. SAM, plain-gzip, stdin and other non-seekable inputs are read
+    /// sequentially.
     #[arg(long = "read-streams", default_value_t = fgumi_sort::ReadStreams::Auto)]
     pub read_streams: fgumi_sort::ReadStreams,
 
@@ -2834,6 +2835,20 @@ mod tests {
         use clap::CommandFactory;
         let help = long_help_of(&Sort::command(), long);
         assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
+    }
+
+    /// `--read-streams` describes the starvation ratchet on the worker pool,
+    /// not the retired one-shot probe on per-fill threads.
+    #[test]
+    fn read_streams_help_describes_the_ratchet() {
+        use clap::CommandFactory;
+        let help = long_help_of(&Sort::command(), "read-streams");
+        for gone in ["scoped OS thread", "independent of `--threads`", "commits once"] {
+            assert!(!help.contains(gone), "stale {gone:?} in --read-streams help:\n{help}");
+        }
+        for needle in ["doubles", "pool", "spill", "sequentially"] {
+            assert!(help.contains(needle), "--read-streams help lacks {needle:?}:\n{help}");
+        }
     }
 
     /// The runall-side `--sort::` flags carry the same contract (generated from

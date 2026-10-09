@@ -217,7 +217,7 @@ pub fn read_bam<P: AsRef<Path>>(
         .map_err(|e| io::Error::other(format!("create_raw_bam_reader_with_opts: {e}")))?;
 
     let file = File::open(path)?;
-    let reader = build_source_reader(file, path, &opts)?;
+    let reader = sequential_or_async_reader(file, path, opts.async_reader);
     Ok(read_bam_from_reader(reader, header, blocks_per_batch, output_byte_limit))
 }
 
@@ -237,26 +237,6 @@ fn sequential_or_async_reader(
     }
 }
 
-/// Pick the reader for a regular-file source: the concurrent
-/// [`fgumi_bam_io::pread::ScatterReader`] when `--read-streams` asks
-/// for more than one stream and the file is seekable, otherwise the sequential
-/// / async reader. The scatter-vs-fallback decision (and its warning) is shared
-/// with the sort chain's reader via [`fgumi_bam_io::pread::decide_reader`]
-/// so the two copies cannot drift; only the fallback reader differs (a 2 MiB
-/// `BufReader` here vs a bare `File` there).
-fn build_source_reader(
-    file: File,
-    path: &Path,
-    opts: &PipelineReaderOpts,
-) -> io::Result<Box<dyn io::Read + Send>> {
-    match fgumi_bam_io::pread::decide_reader(file, opts.read_streams, path, "reader")? {
-        fgumi_bam_io::pread::ScatterDecision::Scatter(scatter) => Ok(scatter),
-        fgumi_bam_io::pread::ScatterDecision::Fallback(file) => {
-            Ok(sequential_or_async_reader(file, path, opts.async_reader))
-        }
-    }
-}
-
 /// Stdin counterpart to [`read_bam`].
 ///
 /// # Errors
@@ -267,14 +247,6 @@ pub fn read_bam_stdin(
     blocks_per_batch: usize,
     output_byte_limit: u64,
 ) -> io::Result<(ReadBgzfBlocks, Header)> {
-    // stdin is not seekable, so concurrent positional reads cannot apply. Don't
-    // fail the run over a perf knob — warn (only on an explicit `Fixed(n>1)`;
-    // the `Auto` default falls back silently) and read sequentially.
-    fgumi_bam_io::pread::warn_read_streams_unavailable(
-        opts.read_streams,
-        "stdin",
-        "is not a seekable regular file",
-    );
     let (reader, header) =
         fgumi_bam_io::create_bam_reader_for_pipeline_with_opts(Path::new("-"), opts).map_err(
             |e| io::Error::other(format!("create_bam_reader_for_pipeline_with_opts: {e}")),
@@ -441,26 +413,6 @@ mod tests {
         // which is what `FindBamBoundaries` downstream expects to receive.
         let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
         assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
-    }
-
-    #[rstest]
-    #[case::sequential(fgumi_bam_io::ReadStreams::Fixed(1))]
-    #[case::four_streams(fgumi_bam_io::ReadStreams::Fixed(4))]
-    #[case::auto(fgumi_bam_io::ReadStreams::Auto)]
-    fn read_streams_emit_identical_blocks(#[case] read_streams: fgumi_bam_io::ReadStreams) {
-        // Routing a seekable file through the scatter reader (Fixed(4)/Auto)
-        // must yield byte-identical blocks to the plain sequential reader
-        // (Fixed(1)). 2000 records keep the file comfortably larger than the
-        // 64-record fixture while staying fast to build.
-        let (path, _) = temp_bam(2000);
-        let baseline = drive(&path, 4, 1);
-        let opts = PipelineReaderOpts { read_streams, ..PipelineReaderOpts::default() };
-        let actual = drive_with_opts(&path, 4, 1, opts);
-        assert_eq!(actual.len(), baseline.len(), "block count must not depend on read-streams");
-        for (a, b) in actual.iter().zip(baseline.iter()) {
-            assert_eq!(a.batch_serial, b.batch_serial);
-            assert_eq!(a.bytes, b.bytes, "block bytes must be identical across read-streams");
-        }
     }
 
     #[test]

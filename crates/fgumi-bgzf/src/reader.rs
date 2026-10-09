@@ -269,6 +269,145 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
 }
 
 // ============================================================================
+// Slice framing (chain-native positional reads)
+// ============================================================================
+
+/// One block cut by [`BgzfSliceFramer::push`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SliceFrame {
+    /// The block lies wholly inside the pushed slice, at this byte range: a
+    /// caller can borrow it without copying.
+    Within(std::ops::Range<usize>),
+    /// The block straddled the previous slice(s) and this one; it was
+    /// reassembled from the carry into an owned buffer.
+    Carried(Vec<u8>),
+}
+
+/// Incremental BGZF framer over arbitrary byte slices, for readers that fetch
+/// a stream as positional slices rather than through [`Read`].
+///
+/// It applies the same header predicates as [`read_raw_blocks`]
+/// ([`crate::header::validate`] and [`crate::header::block_size_checked`], with
+/// the same error text), so a block this accepts is one `read_raw_blocks`
+/// accepts, and it skips EOF-marker blocks as `read_raw_blocks` does. A block
+/// that crosses a slice boundary is carried (at most one block) and emitted
+/// as [`SliceFrame::Carried`] once complete; every other block is a
+/// [`SliceFrame::Within`] range, so the framer never copies a block that a
+/// caller could borrow.
+#[derive(Debug, Default)]
+pub struct BgzfSliceFramer {
+    carry: Vec<u8>,
+}
+
+impl BgzfSliceFramer {
+    /// A framer at the start of a stream.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes of an incomplete block held from earlier slices.
+    #[must_use]
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+
+    /// Cut every complete non-EOF-marker block from `carry ++ slice`: a
+    /// [`SliceFrame::Carried`] for the block completing the carry, a
+    /// [`SliceFrame::Within`] for each block wholly in `slice`; the partial
+    /// tail moves into the carry. Returns the number of frames pushed.
+    ///
+    /// # Errors
+    /// `InvalidData` for a header [`read_raw_blocks`] would reject, with the
+    /// same message.
+    pub fn push(&mut self, slice: &[u8], out: &mut Vec<SliceFrame>) -> io::Result<usize> {
+        let before = out.len();
+        let mut pos = 0usize;
+        if !self.carry.is_empty() {
+            let Some(total) = self.carried_block_size(slice)? else {
+                self.carry.extend_from_slice(slice);
+                return Ok(0);
+            };
+            let take = total - self.carry.len();
+            // Allocate the block once at its known size: it moves out as the
+            // emitted frame, so the carry cannot be reused across blocks.
+            self.carry.reserve_exact(take);
+            if slice.len() < take {
+                self.carry.extend_from_slice(slice);
+                return Ok(0);
+            }
+            self.carry.extend_from_slice(&slice[..take]);
+            pos = take;
+            let block = std::mem::take(&mut self.carry);
+            if block != BGZF_EOF {
+                out.push(SliceFrame::Carried(block));
+            }
+        }
+        while slice.len() - pos >= BGZF_HEADER_SIZE {
+            let size = Self::checked_size(&slice[pos..pos + BGZF_HEADER_SIZE])?;
+            if slice.len() - pos < size {
+                self.carry.reserve_exact(size);
+                break;
+            }
+            let range = pos..pos + size;
+            if slice[range.clone()] != BGZF_EOF {
+                out.push(SliceFrame::Within(range));
+            }
+            pos += size;
+        }
+        self.carry.extend_from_slice(&slice[pos..]);
+        Ok(out.len() - before)
+    }
+
+    /// End of stream.
+    ///
+    /// # Errors
+    /// `UnexpectedEof` when a partial block is still carried.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.carry.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated BGZF block: {} trailing bytes", self.carry.len()),
+            ))
+        }
+    }
+
+    /// Total size of the carried block once its header is known (completing
+    /// the header from `slice` on the stack if the carry holds only part of
+    /// it); `None` while the header is still incomplete.
+    fn carried_block_size(&self, slice: &[u8]) -> io::Result<Option<usize>> {
+        if self.carry.len() >= BGZF_HEADER_SIZE {
+            return Self::checked_size(&self.carry[..BGZF_HEADER_SIZE]).map(Some);
+        }
+        let need = BGZF_HEADER_SIZE - self.carry.len();
+        if slice.len() < need {
+            return Ok(None);
+        }
+        let mut header = [0u8; BGZF_HEADER_SIZE];
+        header[..self.carry.len()].copy_from_slice(&self.carry);
+        header[self.carry.len()..].copy_from_slice(&slice[..need]);
+        Self::checked_size(&header).map(Some)
+    }
+
+    /// Validate an 18-byte header and return its block size, with
+    /// `read_raw_block`'s errors.
+    fn checked_size(header: &[u8]) -> io::Result<usize> {
+        crate::header::validate(header)
+            .map_err(|rejection| io::Error::new(io::ErrorKind::InvalidData, rejection))?;
+        crate::header::block_size_checked(header).ok_or_else(|| {
+            let stored = crate::header::block_size(header)
+                .expect("a validated header is long enough to carry BSIZE");
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("BGZF block too small: {stored} bytes"),
+            )
+        })
+    }
+}
+
+// ============================================================================
 // Decompression Helpers
 // ============================================================================
 
@@ -2155,5 +2294,167 @@ mod tests {
         let err = decompress_into_slice(&block, &mut Decompressor::new(), &mut out)
             .expect_err("the plain entry point must still verify CRC32");
         assert!(err.to_string().contains("CRC32"), "got: {err}");
+    }
+
+    // ---- BgzfSliceFramer ----
+
+    /// `n` real blocks of pseudo-random (incompressible, so near-64 KiB) or
+    /// short payloads, then an EOF marker: a stream whose block sizes vary.
+    fn bgzf_stream_of(n: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
+        let mut stream = Vec::new();
+        for i in 0..n {
+            let len = if i % 3 == 2 { 17 + i } else { 30_000 + 997 * i };
+            let payload: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[3]
+                })
+                .collect();
+            let mut compressor = crate::writer::InlineBgzfCompressor::new(1);
+            compressor.write_all(&payload).expect("buffer payload");
+            compressor.flush().expect("flush to a block");
+            compressor.write_blocks_to(&mut stream).expect("emit block bytes");
+        }
+        stream.extend_from_slice(&BGZF_EOF);
+        stream
+    }
+
+    proptest::proptest! {
+        /// Identical blocks to `read_raw_blocks` for any slicing, including
+        /// 1-byte slices and cuts inside the 18-byte header.
+        #[test]
+        fn framer_matches_read_raw_blocks_over_random_cuts(
+            n_blocks in 1usize..12,
+            cuts in proptest::collection::vec(1usize..(256 * 1024), 1..64),
+            tiny in proptest::bool::ANY,
+        ) {
+            let stream = bgzf_stream_of(n_blocks);
+            // `read_raw_blocks` pre-allocates `max_blocks`, so the oracle bounds it
+            // by the stream length (every block is at least 26 bytes).
+            let oracle: Vec<Vec<u8>> = read_raw_blocks(&mut &stream[..], stream.len())
+                .unwrap()
+                .into_iter()
+                .map(|b| b.data)
+                .collect();
+            let mut framer = BgzfSliceFramer::new();
+            let mut got = Vec::new();
+            let mut pos = 0;
+            let mut ci = 0;
+            while pos < stream.len() {
+                // `tiny` shrinks every cut to 1..=19 bytes so slices end inside
+                // headers and single bytes are pushed.
+                let cut = if tiny { 1 + cuts[ci % cuts.len()] % 19 } else { cuts[ci % cuts.len()] };
+                let len = cut.min(stream.len() - pos);
+                ci += 1;
+                let slice = &stream[pos..pos + len];
+                let mut out = Vec::new();
+                framer.push(slice, &mut out).unwrap();
+                for f in out {
+                    got.push(match f {
+                        SliceFrame::Within(r) => slice[r].to_vec(),
+                        SliceFrame::Carried(v) => v,
+                    });
+                }
+                proptest::prop_assert!(framer.carry_len() < 65_536 + 18, "carry never exceeds one block");
+                pos += len;
+            }
+            framer.finish().unwrap();
+            proptest::prop_assert_eq!(got, oracle);
+        }
+    }
+
+    #[test]
+    fn framer_finish_on_partial_block_is_unexpected_eof() {
+        let stream = bgzf_stream_of(2);
+        let mut f = BgzfSliceFramer::new();
+        f.push(&stream[..stream.len() - 40], &mut Vec::new()).unwrap();
+        assert_eq!(f.finish().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn framer_rejects_a_bad_header_like_read_raw_block() {
+        let mut stream = bgzf_stream_of(1);
+        stream[12] ^= 0xff; // corrupt the BC subfield identifier
+        let mut f = BgzfSliceFramer::new();
+        let err = f.push(&stream, &mut Vec::new()).unwrap_err();
+        let oracle = read_raw_blocks(&mut &stream[..], 1).unwrap_err();
+        assert_eq!(err.kind(), oracle.kind());
+        assert_eq!(err.to_string(), oracle.to_string());
+    }
+
+    /// The same rejection when the bad header is split across two slices
+    /// (assembled from the carry and the next slice).
+    #[test]
+    fn framer_rejects_a_bad_header_split_across_slices() {
+        let mut stream = bgzf_stream_of(1);
+        stream[12] ^= 0xff;
+        let oracle = read_raw_blocks(&mut &stream[..], 1).unwrap_err();
+        let mut f = BgzfSliceFramer::new();
+        assert_eq!(f.push(&stream[..5], &mut Vec::new()).unwrap(), 0);
+        let err = f.push(&stream[5..], &mut Vec::new()).unwrap_err();
+        assert_eq!(err.to_string(), oracle.to_string());
+    }
+
+    #[test]
+    fn eof_markers_are_skipped_anywhere() {
+        let mut stream = bgzf_stream_of(1);
+        stream.extend_from_slice(&BGZF_EOF);
+        stream.extend_from_slice(&bgzf_stream_of(1));
+        let mut f = BgzfSliceFramer::new();
+        let mut out = Vec::new();
+        f.push(&stream, &mut out).unwrap();
+        assert_eq!(out.len(), 2, "two real blocks, three markers skipped");
+        f.finish().unwrap();
+    }
+
+    /// An EOF marker that straddles a slice boundary is skipped too.
+    #[test]
+    fn a_carried_eof_marker_is_skipped() {
+        let mut f = BgzfSliceFramer::new();
+        let mut out = Vec::new();
+        assert_eq!(f.push(&BGZF_EOF[..10], &mut out).unwrap(), 0);
+        assert_eq!(f.push(&BGZF_EOF[10..], &mut out).unwrap(), 0);
+        assert!(out.is_empty());
+        assert_eq!(f.carry_len(), 0);
+        f.finish().unwrap();
+    }
+
+    /// A carried block is allocated once at its exact size, whether the first
+    /// cut falls after the header (size known at the cut) or inside it (size
+    /// known once a later slice completes the header).
+    #[rstest::rstest]
+    #[case::after_the_header(&[0.6])]
+    #[case::inside_the_header(&[0.001, 0.6])]
+    fn a_carried_block_is_allocated_at_its_exact_size(#[case] cuts: &[f64]) {
+        let mut x = 0x9E37_79B9_u32;
+        let payload: Vec<u8> = (0..4000)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                x.to_le_bytes()[3]
+            })
+            .collect();
+        let block = single_block_bytes(&payload);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "test cut points"
+        )]
+        let mut at: Vec<usize> =
+            cuts.iter().map(|c| ((block.len() as f64 * c) as usize).max(5)).collect();
+        at.push(block.len());
+        let mut f = BgzfSliceFramer::new();
+        let mut out = Vec::new();
+        let mut from = 0;
+        for to in at {
+            f.push(&block[from..to], &mut out).unwrap();
+            from = to;
+        }
+        assert_eq!(out.len(), 1);
+        let SliceFrame::Carried(v) = &out[0] else { panic!("expected a carried block") };
+        assert_eq!((v.len(), v.capacity()), (block.len(), block.len()));
     }
 }

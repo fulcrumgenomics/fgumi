@@ -872,7 +872,6 @@ impl<'a> ChainBuilder<'a> {
                     path,
                     fgumi_bam_io::PipelineReaderOpts {
                         async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
                         ..Default::default()
                     },
                 )
@@ -898,7 +897,6 @@ impl<'a> ChainBuilder<'a> {
                     unmapped,
                     fgumi_bam_io::PipelineReaderOpts {
                         async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
                         ..Default::default()
                     },
                 )
@@ -916,7 +914,6 @@ impl<'a> ChainBuilder<'a> {
                     mapped,
                     fgumi_bam_io::PipelineReaderOpts {
                         async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
                         ..Default::default()
                     },
                 )
