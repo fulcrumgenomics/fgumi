@@ -36,8 +36,10 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
+use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
+use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
-    ArenaPool, InMemoryChunk, PooledSegmentedBuf, RawSortKey, RecordRef,
+    ArenaPool, BoundedSortPool, InMemoryChunk, PooledSegmentedBuf, RawSortKey, RecordRef,
     coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_arena_refs,
 };
 
@@ -78,13 +80,6 @@ pub const FRONT_REGION: usize = 8 * 1024 * 1024;
 /// than relying on the `< run_cap` cumulative check being off by one.
 const MAX_BGZF_BLOCK: usize = 1 << 16;
 
-/// Bytes ahead of the current scan cursor to software-prefetch in the
-/// `FindBoundariesAndSort` boundary+key scan.  Chosen from a microbench over a
-/// cold ~2.6 GiB arena (matching the ~220 B/record production density): 2 KiB
-/// gave the best speedup (~15%); ≤1 KiB was negligible (too little lead time),
-/// 4 KiB matched 2 KiB.  At ~220 B/record this is ~9 records of lead.
-const SCAN_PREFETCH_DISTANCE: usize = 2048;
-
 /// Max blocks `ReadBlocks` admits per `try_run` dispatch.
 ///
 /// `ReadBlocks` runs on the coordination driver (`StepKind::Detached`), whose
@@ -106,43 +101,6 @@ const READ_BLOCKS_BYTES_READ: usize = 1;
 
 /// `FindBoundariesAndSort` counter slot index: record boundaries found this call.
 const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
-
-/// Software-prefetch (read, into L1, temporal) the cache line containing `byte`.
-/// The `FindBoundariesAndSort` scan walks the run's arena cold (it was written by
-/// the parallel `InflateToArena` workers long before this serial scan runs), so it
-/// is latency-bound on cache misses; prefetching [`SCAN_PREFETCH_DISTANCE`] ahead
-/// hides them.  `cfg`-gated to the supported architectures; a no-op elsewhere.
-///
-/// SAFETY note: this is the only place `fgumi-pipeline-io` uses an architecture
-/// intrinsic.  Both `prfm` (`aarch64`) and `_mm_prefetch` (`x86_64`) are
-/// *non-faulting hints* — they never read or write observable memory and never
-/// trap, even on an unmapped address.  `byte` is a live `&u8` (the caller
-/// bounds-checks the index), so the pointer is valid to name.  See CLAUDE.md
-/// §"Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)".
-#[inline]
-fn prefetch_read_l1(byte: &u8) {
-    let ptr: *const u8 = byte;
-    #[cfg(target_arch = "aarch64")]
-    #[allow(unsafe_code)]
-    // SAFETY: `prfm pldl1keep` is a non-faulting prefetch hint over a valid pointer.
-    unsafe {
-        core::arch::asm!(
-            "prfm pldl1keep, [{p}]",
-            p = in(reg) ptr,
-            options(nostack, readonly, preserves_flags),
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    #[allow(unsafe_code)]
-    // SAFETY: `_mm_prefetch` is a non-faulting prefetch hint over a valid pointer.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = ptr; // no portable stable prefetch; hint is a no-op on other arches
-    }
-}
 
 // ============================================================================
 // ReadBlocks: serial arena-admit step
@@ -1139,9 +1097,9 @@ pub struct QuerynameStrategy<K: RawSortKey> {
     refs: Vec<(K, u64, u32)>,
     /// Bounded rayon pool (sized to `sort_threads`) the per-run comparator sort
     /// installs into, so the parallel sort does not oversubscribe the pipeline's
-    /// worker pool on a spill. Built once on the first seal, reused; `None` on a
-    /// fresh copy. Mirrors [`TemplateArenaAccumulator`](fgumi_sort::TemplateArenaAccumulator)'s pool.
-    sort_pool: Option<rayon::ThreadPool>,
+    /// worker pool on a spill. Built on the first seal, reused; unbuilt on a
+    /// fresh copy.
+    sort_pool: BoundedSortPool,
     /// Erases the sorted `InMemoryChunk<K>` into the correct `MemoryChunkErased`
     /// arm (`QuerynameLex` for the lex key, `QuerynameNatural` for the natural
     /// key). A `fn` pointer so [`fresh`](ArenaSortStrategy::fresh) can copy it.
@@ -1152,7 +1110,7 @@ impl<K: RawSortKey> QuerynameStrategy<K> {
     /// Build a queryname strategy that erases its sealed chunk via `wrap`.
     #[must_use]
     pub fn new(wrap: fn(InMemoryChunk<K>) -> MemoryChunkErased) -> Self {
-        Self { refs: Vec::new(), sort_pool: None, wrap }
+        Self { refs: Vec::new(), sort_pool: BoundedSortPool::new("qname-sort"), wrap }
     }
 
     /// Test-only observation of the bounded sort pool's thread count, so a test
@@ -1161,7 +1119,7 @@ impl<K: RawSortKey> QuerynameStrategy<K> {
     /// first [`seal`](ArenaSortStrategy::seal) builds the pool.
     #[cfg(test)]
     pub(crate) fn sort_pool_threads(&self) -> Option<usize> {
-        self.sort_pool.as_ref().map(rayon::ThreadPool::current_num_threads)
+        self.sort_pool.built_threads()
     }
 }
 
@@ -1181,13 +1139,7 @@ impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
         let refs = std::mem::take(&mut self.refs);
-        let pool = self.sort_pool.get_or_insert_with(|| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(sort_threads.max(1))
-                .thread_name(|i| format!("qname-sort-{i}"))
-                .build()
-                .expect("build bounded queryname-sort rayon pool")
-        });
+        let pool = self.sort_pool.bounded(sort_threads);
         let wrap = self.wrap;
         pool.install(move || wrap(queryname_chunk_from_arena_refs(arena, refs)))
     }
@@ -1467,7 +1419,8 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` on a `block_size` value that overflows `u32`.
+    /// Returns an `InvalidData` `io::Error` on a `block_size` value that
+    /// overflows `u32` or is shorter than a BAM record's 32 fixed bytes.
     fn scan_available(&mut self, arena: &PooledSegmentedBuf) -> io::Result<u64> {
         let scan_start = self.scan_start;
         let scan_start_usize = usize::try_from(scan_start).expect("scan_start must fit in usize");
@@ -1510,9 +1463,20 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
                 // Record body not fully inflated yet — wait for the next block.
                 break;
             }
+            // A frame shorter than the 32 fixed BAM bytes cannot be a record, and
+            // every strategy's key extractor indexes those fields.
+            if bs < MIN_BAM_RECORD_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FindBoundariesAndSort: block_size {bs} is shorter than a BAM record \
+                         ({MIN_BAM_RECORD_LEN} bytes)"
+                    ),
+                ));
+            }
             // Software-prefetch a few records ahead to hide the cold-arena miss
             // latency of this forward scan.
-            let pf = cur + SCAN_PREFETCH_DISTANCE;
+            let pf = cur + KEY_PREFETCH_DISTANCE;
             if pf < span.len() {
                 prefetch_read_l1(&span[pf]);
             }
@@ -2374,6 +2338,47 @@ mod tests {
             chunk_bytes, oracle_bytes,
             "arena-scan single-run sort must be byte-identical to the copy-based sorter"
         );
+    }
+
+    /// A frame whose `block_size` is below the 32 fixed BAM bytes cannot be a
+    /// record: the scan rejects it with `InvalidData` before any strategy's key
+    /// extractor indexes its fixed fields.
+    #[allow(unsafe_code)]
+    #[test]
+    fn scan_rejects_a_frame_shorter_than_a_bam_record() {
+        let header = minimal_bam_header(1);
+        let recs = [coord_body(0, 50, b'a'), vec![0u8; 12]];
+        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
+        arena.reserve_full_capacity();
+        // SAFETY: every slot fully written before any read.
+        let h_off = unsafe { arena.grow_uninit(header.len()) };
+        unsafe { arena.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
+        #[allow(clippy::cast_possible_truncation)]
+        let run_start = h_off as u64;
+        for r in &recs {
+            let bs = u32::try_from(r.len()).unwrap();
+            let po = unsafe { arena.grow_uninit(4) };
+            unsafe { arena.slice_mut(po, 4) }.copy_from_slice(&bs.to_le_bytes());
+            let bo = unsafe { arena.grow_uninit(r.len()) };
+            unsafe { arena.slice_mut(bo, r.len()) }.copy_from_slice(r);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let run_len = arena.len() as u64 - run_start;
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
+        let mut step = FindBoundariesAndSort::new(CoordinateStrategy::new(1), 1, 64 * 1024 * 1024);
+        let err = step
+            .ingest_block(&InflatedBlock {
+                arena: Arc::clone(&arena),
+                ordinal: 0,
+                offset: run_start,
+                len: u32::try_from(run_len).unwrap(),
+                is_last_of_run: true,
+                run_seq: 0,
+                seals_to_spill: false,
+            })
+            .expect_err("a 12-byte frame must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("block_size 12 is shorter than a BAM record"), "{err}");
     }
 
     /// Two-run straddler test: a record that spans the boundary between run 0 and
