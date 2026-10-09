@@ -1112,7 +1112,7 @@ fn cutover_sort_stats_and_read_streams_are_active() {
 /// spill through the external-merge path (it does not resize the reader's fill
 /// window, which is fixed at 4 MiB), so this exercises `--read-streams` end to
 /// end through spill+merge. The scatter reader's own multi-fill / multi-slice
-/// behaviour is covered directly by the unit proptests in `scatter_reader`.
+/// behaviour is covered directly by the unit proptests in `pread`.
 #[rstest]
 #[case::coordinate("coordinate")]
 #[case::queryname_natural("queryname-natural")]

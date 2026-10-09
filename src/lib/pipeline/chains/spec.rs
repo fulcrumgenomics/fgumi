@@ -36,7 +36,7 @@ pub struct ChainSpec {
     /// (the default every command but `sort` uses) is the plain
     /// sequential/async reader; `sort` sets this from its `--read-streams` flag
     /// to raise the device read queue depth (see
-    /// [`fgumi_bam_io::scatter_reader`]).
+    /// [`fgumi_bam_io::pread`]).
     pub read_streams: ReadStreams,
     /// Whether the BAM source's BGZF decode verifies each block's CRC32. Set
     /// from the command's `--check-crc`/`--no-check-crc` policy (via

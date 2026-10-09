@@ -238,10 +238,10 @@ fn sequential_or_async_reader(
 }
 
 /// Pick the reader for a regular-file source: the concurrent
-/// [`fgumi_bam_io::scatter_reader::ScatterReader`] when `--read-streams` asks
+/// [`fgumi_bam_io::pread::ScatterReader`] when `--read-streams` asks
 /// for more than one stream and the file is seekable, otherwise the sequential
 /// / async reader. The scatter-vs-fallback decision (and its warning) is shared
-/// with the sort chain's reader via [`fgumi_bam_io::scatter_reader::decide_reader`]
+/// with the sort chain's reader via [`fgumi_bam_io::pread::decide_reader`]
 /// so the two copies cannot drift; only the fallback reader differs (a 2 MiB
 /// `BufReader` here vs a bare `File` there).
 fn build_source_reader(
@@ -249,9 +249,9 @@ fn build_source_reader(
     path: &Path,
     opts: &PipelineReaderOpts,
 ) -> io::Result<Box<dyn io::Read + Send>> {
-    match fgumi_bam_io::scatter_reader::decide_reader(file, opts.read_streams, path, "reader")? {
-        fgumi_bam_io::scatter_reader::ScatterDecision::Scatter(scatter) => Ok(scatter),
-        fgumi_bam_io::scatter_reader::ScatterDecision::Fallback(file) => {
+    match fgumi_bam_io::pread::decide_reader(file, opts.read_streams, path, "reader")? {
+        fgumi_bam_io::pread::ScatterDecision::Scatter(scatter) => Ok(scatter),
+        fgumi_bam_io::pread::ScatterDecision::Fallback(file) => {
             Ok(sequential_or_async_reader(file, path, opts.async_reader))
         }
     }
@@ -270,7 +270,7 @@ pub fn read_bam_stdin(
     // stdin is not seekable, so concurrent positional reads cannot apply. Don't
     // fail the run over a perf knob — warn (only on an explicit `Fixed(n>1)`;
     // the `Auto` default falls back silently) and read sequentially.
-    fgumi_bam_io::scatter_reader::warn_read_streams_unavailable(
+    fgumi_bam_io::pread::warn_read_streams_unavailable(
         opts.read_streams,
         "stdin",
         "is not a seekable regular file",

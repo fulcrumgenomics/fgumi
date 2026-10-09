@@ -241,7 +241,7 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 ///
 /// Ports the semantics of fgumi v0.7.0's `fgumi sort --read-streams` flag. The
 /// mechanism (concurrent positional reads that raise the device's read queue
-/// depth) lives in [`crate::scatter_reader`]; on a slow, deep-queue device
+/// depth) lives in [`crate::pread`]; on a slow, deep-queue device
 /// (e.g. EBS gp3) issuing several reads at once is markedly faster than the
 /// single outstanding read a plain reader issues.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -305,7 +305,7 @@ pub struct PipelineReaderOpts {
     /// `Fixed(1)` (the default) is the plain sequential / async-prefetch reader
     /// that every command except `fgumi sort` uses — only `sort` sets this from
     /// its own `--read-streams` flag. A higher count (or `Auto`) selects the
-    /// [`crate::scatter_reader::ScatterReader`] for seekable files; non-seekable
+    /// [`crate::pread::ScatterReader`] for seekable files; non-seekable
     /// inputs (stdin, pipes) fall back to the sequential/async reader regardless.
     pub read_streams: ReadStreams,
 }
@@ -474,22 +474,22 @@ fn open_normalized_with_opts(
 }
 
 /// Choose the reader for an open regular file: the concurrent
-/// [`crate::scatter_reader::ScatterReader`] when `--read-streams` asks for more
+/// [`crate::pread::ScatterReader`] when `--read-streams` asks for more
 /// than one stream and the file is seekable (Unix only), otherwise the plain
 /// sequential / async-prefetch reader. The scatter-vs-fallback decision (and its
 /// "requested but unavailable" warning) is shared with `read_bam`'s entry point
-/// via [`crate::scatter_reader::decide_reader`] so the two cannot drift.
+/// via [`crate::pread::decide_reader`] so the two cannot drift.
 fn build_file_reader(
     file: File,
     path: &Path,
     opts: &PipelineReaderOpts,
     label: &str,
 ) -> Result<Box<dyn Read + Send>> {
-    let file = match crate::scatter_reader::decide_reader(file, opts.read_streams, path, label)
+    let file = match crate::pread::decide_reader(file, opts.read_streams, path, label)
         .with_context(|| format!("open scatter reader for {}", path.display()))?
     {
-        crate::scatter_reader::ScatterDecision::Scatter(scatter) => return Ok(scatter),
-        crate::scatter_reader::ScatterDecision::Fallback(file) => file,
+        crate::pread::ScatterDecision::Scatter(scatter) => return Ok(scatter),
+        crate::pread::ScatterDecision::Fallback(file) => file,
     };
 
     Ok(if opts.async_reader {
