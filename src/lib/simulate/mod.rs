@@ -32,7 +32,7 @@ pub use strand_bias::StrandBiasModel;
 ///
 /// # Errors
 ///
-/// Returns an error if flushing, syncing, or closing the output fails.
+/// Returns an error if flushing or closing the output fails.
 pub(crate) fn close_output<W: fgumi_bam_io::OutputSink>(
     writer: std::io::BufWriter<W>,
     path: &std::path::Path,
@@ -40,7 +40,7 @@ pub(crate) fn close_output<W: fgumi_bam_io::OutputSink>(
     use anyhow::Context;
 
     fgumi_bam_io::close_buffered(writer)
-        .with_context(|| format!("Failed to sync/close {}", path.display()))
+        .with_context(|| format!("Failed to close {}", path.display()))
 }
 
 /// Test doubles shared by the simulation tests.
@@ -56,8 +56,8 @@ pub(crate) mod test_support {
     pub(crate) const CLOSE_ERROR: &str = "input/output error at close";
 
     /// An in-memory [`OutputSink`] that records its bytes, counts closes, and
-    /// can fail its close, modelling write-back (or an NFS flush) failing only
-    /// when the file is closed. Clones share state.
+    /// can fail its close, modelling an error reported at close (such as an
+    /// NFS flush failing). Clones share state.
     #[derive(Clone, Default)]
     pub(crate) struct CloseProbe {
         written: Arc<Mutex<Vec<u8>>>,

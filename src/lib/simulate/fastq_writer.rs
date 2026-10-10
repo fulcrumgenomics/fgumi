@@ -116,14 +116,14 @@ impl FastqWriter {
         }
     }
 
-    /// Finish writing, flush all data, and sync and close the file.
+    /// Finish writing, flush all data, and close the file.
     ///
     /// This must be called to ensure all data is written and the gzip stream
     /// is properly terminated.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing, syncing, or closing the file fails.
+    /// Returns an error if flushing or closing the file fails.
     pub fn finish(self) -> Result<()> {
         let path = self.path.display();
         match self.inner {
@@ -131,7 +131,7 @@ impl FastqWriter {
                 let buf = writer
                     .finish()
                     .with_context(|| format!("Failed to finish gzip stream {path}"))?;
-                close_buffered(buf).with_context(|| format!("Failed to sync/close {path}"))?;
+                close_buffered(buf).with_context(|| format!("Failed to close {path}"))?;
             }
             FastqWriterInner::MultiThreaded(writer) => {
                 writer
