@@ -46,7 +46,7 @@ log = { workspace = true }
 # in the workspace, and the root manifest reserves `[workspace.dependencies]` for
 # crates shared by two or more members.
 smallvec = { version = "1.15", features = ["const_generics"] }
-zstd = "0.13"
+zstd = "0.14"
 voracious_radix_sort = { version = "1", features = ["voracious_multithread"] }
 
 [target.'cfg(unix)'.dependencies]

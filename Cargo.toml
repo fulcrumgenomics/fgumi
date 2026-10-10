@@ -55,13 +55,13 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 csv = "1.1"
-fgoxide = "0.6.0"
+fgoxide = "0.7.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-itertools = "0.14.0"
+itertools = "0.15.0"
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
-mach2 = "0.6"
+mach2 = "0.7"
 memchr = "2"
 # Built on every Unix target: `fgumi-bam-io` needs `unistd::close`, the only safe
 # checked close (std's `File` drop discards the error), to surface errors the OS
@@ -74,9 +74,9 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 # thread pool, so `--threads` would silently stop bounding BGZF decompression/compression
 # parallelism — and fgumi already runs work inside its own scoped rayon pools. Upgrading needs a
 # dedicated, benchmarked migration PR.
-noodles = "0.115.0"
-noodles-bgzf = { version = "0.51.0", features = ["libdeflate"] }
-noodles-csi = "0.60.0"
+noodles = "0.117.0"
+noodles-bgzf = { version = "0.52.0", features = ["libdeflate"] }
+noodles-csi = "0.62.0"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.10"
@@ -94,15 +94,15 @@ rand = "0.10"
 # feature-unification trap documented on `flate2` above.
 rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
-rstest = "0.26"
+rstest = "0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 syn = { version = "3", features = ["full"] }
-statrs = "0.18"
+statrs = "0.19"
 # Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
 # silently raise the effective MSRV.
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = "3.4.0"
 thiserror = "2"
 trybuild = "1.0"
