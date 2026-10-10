@@ -1929,6 +1929,23 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(150), "no token was left on this thread");
     }
 
+    /// The request `SortMerge` makes when it stalls (`PoolHandle::request_worker`)
+    /// reaches a worker parked on its timer (a pinned worker or a holder, armed
+    /// direct-parked) when no worker waits on the event-count: the timer-parked
+    /// worker is unparked at once rather than left to its timer.
+    #[test]
+    fn a_merge_request_reaches_a_timer_parked_worker() {
+        let (plan, _g) = tests_support::directed_plan_with_workers(2);
+        plan.register_worker(1, std::thread::current());
+        assert!(plan.arm_direct(1));
+        let h = PoolHandle::new(&plan, None, StepIdx(0));
+        assert_eq!(h.request_worker(), PoolRequest::Woken);
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(5), "worker 1 (this thread) was unparked");
+        assert_eq!(h.request_worker(), PoolRequest::AllAwake, "its bit was claimed");
+    }
+
     /// With no event-count waiter and no direct-parked worker, a request wakes a
     /// worker parked only because a phase cap refused it.
     #[test]

@@ -36,9 +36,13 @@ impl<S: Step> StepProbe<S> {
     #[must_use]
     pub fn new(step: &S) -> Self {
         let profile = step.profile();
+        // As the builder does: a single-producer step's declared ordering
+        // collapses to none (no reorder stage on its outputs).
+        let ordering =
+            crate::erased::effective_branch_orderings(profile.kind, &profile.branch_ordering);
         let (output_queues, view) = <S::Outputs as StepOutputs>::build_queues(
             &profile.output_queues,
-            &profile.branch_ordering,
+            &ordering,
             InstrumentationLevel::Off,
         );
         let input_queue = Arc::new(UnboundedQueue::new());

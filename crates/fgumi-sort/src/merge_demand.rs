@@ -51,6 +51,30 @@ impl AwaitedSlotState {
     const COUNT: usize = 2;
 }
 
+/// Outcome of the merge's pool-worker request, mirrored from pipeline-core's
+/// `PoolRequest`: fgumi-sort does not depend on pipeline-core, and these
+/// counters must exist whenever `--sort-stats` does. The same outcomes are
+/// also counted per step by pipeline-core (the `req_*` wake-table columns),
+/// deliberately: that table needs pipeline stats on and has no
+/// `Unavailable` column, and neither can relate a request to the stall it was
+/// made in, which the sleeper share here does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergePoolRequest {
+    /// A parked worker was woken.
+    Woken,
+    /// Every worker was awake.
+    AllAwake,
+    /// An unacknowledged request was outstanding.
+    Pending,
+    /// No pool to ask.
+    Unavailable,
+}
+
+impl MergePoolRequest {
+    /// The number of outcomes (the stats' bucket count).
+    const COUNT: usize = 4;
+}
+
 /// The merge's demand counters (relaxed; read once at the end). Plain std
 /// atomics even under loom: they are not part of the wake protocol. Written by
 /// the consumer, except `wakes_delivered`, which a producer bumps only when it
@@ -64,6 +88,10 @@ pub struct MergeDemandStats {
     wakes_delivered: StdAtomicU64,
     /// Indexed by `AwaitedSlotState as usize`.
     awaited: [StdAtomicU64; AwaitedSlotState::COUNT],
+    /// Indexed by `MergePoolRequest as usize`.
+    pool: [StdAtomicU64; MergePoolRequest::COUNT],
+    requests_with_sleeper: StdAtomicU64,
+    stall_ns_with_sleeper: StdAtomicU64,
     partial_flushes: StdAtomicU64,
     /// The supply decompresses inline (`--sort::file-granularity`), so stalls
     /// are not classified: see [`Self::mark_inline_decompress`].
@@ -87,6 +115,26 @@ impl MergeDemandStats {
     /// parks until the awaited slot's delivery or its idle timer).
     pub fn record_park(&self) {
         self.parking_registrations.fetch_add(1, Relaxed);
+    }
+
+    /// The merge asked the pool for a worker and got `r`, with
+    /// `parked_workers` workers parked on the pool's event-count when it
+    /// asked. Returns whether the request found a sleeping worker: one parked
+    /// on the event-count, or — `r == Woken` with none there — one woken from
+    /// a timer park (a pinned or holding worker, a cap-parked one, or worker 0
+    /// at one thread), which the event-count census does not see.
+    pub fn record_pool_request(&self, r: MergePoolRequest, parked_workers: usize) -> bool {
+        let sleeper = parked_workers > 0 || r == MergePoolRequest::Woken;
+        self.pool[r as usize].fetch_add(1, Relaxed);
+        if sleeper {
+            self.requests_with_sleeper.fetch_add(1, Relaxed);
+        }
+        sleeper
+    }
+
+    /// A stall episode whose pool request found a sleeping worker lasted `ns`.
+    pub fn record_stall_with_sleeper_ns(&self, ns: u64) {
+        self.stall_ns_with_sleeper.fetch_add(ns, Relaxed);
     }
 
     /// The merge flushed a partial output batch because it stalled.
@@ -126,6 +174,19 @@ pub struct MergeDemandSnapshot {
     pub awaited_starved: u64,
     /// Stall episodes whose awaited slot had blocks being decompressed.
     pub awaited_decompressing: u64,
+    /// Pool requests that woke a parked worker.
+    pub pool_woken: u64,
+    /// Pool requests that found every worker awake.
+    pub pool_all_awake: u64,
+    /// Pool requests refused because one was already pending.
+    pub pool_pending: u64,
+    /// Pool requests with no pool to ask.
+    pub pool_unavailable: u64,
+    /// Pool requests that found a sleeping worker: parked on the pool's
+    /// event-count when the merge asked, or woken from a timer park.
+    pub requests_with_sleeper: u64,
+    /// Stall time of episodes whose request found a sleeping worker, in ns.
+    pub stall_ns_with_sleeper: u64,
     /// Partial output batches flushed on a stall.
     pub partial_flushes: u64,
     /// The supply decompresses inline, so the awaited-slot buckets are not
@@ -138,6 +199,12 @@ fn pct_int(num: u64, den: u64) -> u64 {
     if den == 0 { 0 } else { (num * 100 + den / 2) / den }
 }
 
+/// `num / den` as a percentage; `0.0` when `den == 0`.
+#[allow(clippy::cast_precision_loss)]
+fn pct(num: u64, den: u64) -> f64 {
+    if den == 0 { 0.0 } else { num as f64 * 100.0 / den as f64 }
+}
+
 /// Nanoseconds as seconds.
 #[allow(clippy::cast_precision_loss)]
 fn secs(ns: u64) -> f64 {
@@ -146,9 +213,12 @@ fn secs(ns: u64) -> f64 {
 
 impl MergeDemandSnapshot {
     /// The `--sort-stats` lines, in their fixed order: demand, awaited slot
-    /// state, partial flushes. Line 2's percentages are of `stall_episodes`.
+    /// state, pool requests at stalls, partial flushes. Line 2's percentages
+    /// are of `stall_episodes`; line 3's sleeper share is of pool requests.
     #[must_use]
     pub fn log_lines(&self) -> Vec<String> {
+        let requests =
+            self.pool_woken + self.pool_all_awake + self.pool_pending + self.pool_unavailable;
         let n = self.stall_episodes;
         vec![
             format!(
@@ -170,6 +240,16 @@ impl MergeDemandSnapshot {
                     ""
                 }
             ),
+            format!(
+                "Pool at stall: requests woken {} / all-awake {} / pending {} / unavailable {}; \
+                 a worker was asleep at {:.1}% of requests ({:.1} s)",
+                self.pool_woken,
+                self.pool_all_awake,
+                self.pool_pending,
+                self.pool_unavailable,
+                pct(self.requests_with_sleeper, requests),
+                secs(self.stall_ns_with_sleeper)
+            ),
             format!("Merge output: {} partial flushes on stall", self.partial_flushes),
         ]
     }
@@ -183,6 +263,11 @@ pub struct MergeDemand {
     awaited: CachePadded<AtomicU64>,
     /// The thread to unpark when the awaited file's block lands.
     consumer: Mutex<Option<Thread>>,
+    /// Raised while the merge is parked on an empty awaited slot; the pool
+    /// scheduler reads it (the sort's refill hint) to run the spill supply
+    /// before other pool work. A plain std atomic even under loom: it steers
+    /// scheduling only and is not part of the wake protocol.
+    starved: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stats: MergeDemandStats,
 }
 
@@ -202,7 +287,23 @@ impl MergeDemand {
         Self {
             awaited: CachePadded::new(AtomicU64::new(NONE)),
             consumer: Mutex::new(None),
+            starved: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats: MergeDemandStats::default(),
+        }
+    }
+
+    /// The shared `starved` flag, for the pool scheduler's refill hint.
+    #[must_use]
+    pub fn starved_signal(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.starved)
+    }
+
+    /// Raise or lower `starved`. Stores only on a change, so a merge that
+    /// re-stalls within one episode does not rewrite a line every pool worker
+    /// reads on every pass.
+    pub fn set_starved(&self, on: bool) {
+        if self.starved.load(Relaxed) != on {
+            self.starved.store(on, Relaxed);
         }
     }
 
@@ -326,6 +427,12 @@ impl MergeDemand {
             wakes_delivered: ld(&s.wakes_delivered),
             awaited_starved: ld(&s.awaited[AwaitedSlotState::Starved as usize]),
             awaited_decompressing: ld(&s.awaited[AwaitedSlotState::Decompressing as usize]),
+            pool_woken: ld(&s.pool[MergePoolRequest::Woken as usize]),
+            pool_all_awake: ld(&s.pool[MergePoolRequest::AllAwake as usize]),
+            pool_pending: ld(&s.pool[MergePoolRequest::Pending as usize]),
+            pool_unavailable: ld(&s.pool[MergePoolRequest::Unavailable as usize]),
+            requests_with_sleeper: ld(&s.requests_with_sleeper),
+            stall_ns_with_sleeper: ld(&s.stall_ns_with_sleeper),
             partial_flushes: ld(&s.partial_flushes),
             inline_decompress: s.inline_decompress.load(Relaxed),
         }
@@ -462,6 +569,18 @@ mod tests {
     }
 
     #[test]
+    fn starved_signal_is_shared_and_toggles() {
+        let d = MergeDemand::new();
+        let sig = d.starved_signal();
+        assert!(!sig.load(std::sync::atomic::Ordering::Relaxed));
+        d.set_starved(true);
+        assert!(sig.load(std::sync::atomic::Ordering::Relaxed));
+        d.set_starved(false);
+        assert!(!sig.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&sig, &d.starved_signal()));
+    }
+
+    #[test]
     fn stall_buckets_and_log_lines() {
         let d = MergeDemand::new();
         d.stats().record_stall(AwaitedSlotState::Starved);
@@ -470,13 +589,29 @@ mod tests {
         d.stats().record_stall(AwaitedSlotState::Starved);
         d.stats().record_stall_ns(2_000_000_000);
         d.stats().record_partial_flush();
+        assert!(d.stats().record_pool_request(MergePoolRequest::Woken, 3));
+        assert!(!d.stats().record_pool_request(MergePoolRequest::AllAwake, 0));
+        // Woken with nobody on the event-count: a timer-parked worker (or
+        // worker 0 at one thread) was asleep, so it counts as a sleeper.
+        assert!(d.stats().record_pool_request(MergePoolRequest::Woken, 0));
+        assert!(!d.stats().record_pool_request(MergePoolRequest::Unavailable, 0));
+        d.stats().record_stall_with_sleeper_ns(500_000_000);
         let s = d.snapshot();
         assert_eq!((s.stall_episodes, s.awaited_starved, s.awaited_decompressing), (4, 2, 2));
+        assert_eq!(
+            (s.pool_woken, s.pool_all_awake, s.pool_pending, s.pool_unavailable),
+            (2, 1, 0, 1)
+        );
         let lines = s.log_lines();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].starts_with("Merge demand: 4 stall episodes (2.0 s exact)"), "{lines:?}");
         assert_eq!(lines[1], "Awaited slot at stall: starved 50% / decompressing 50%");
-        assert_eq!(lines[2], "Merge output: 1 partial flushes on stall");
+        assert_eq!(
+            lines[2],
+            "Pool at stall: requests woken 2 / all-awake 1 / pending 0 / unavailable 1; a \
+             worker was asleep at 50.0% of requests (0.5 s)"
+        );
+        assert_eq!(lines[3], "Merge output: 1 partial flushes on stall");
         d.stats().mark_inline_decompress();
         let lines = d.snapshot().log_lines();
         assert_eq!(

@@ -31,7 +31,8 @@ pub use event_count::{NotifyOutcome, PoolEventCount, WaitKey, WaitOutcome};
 pub(crate) use fused::{run_fused_single_thread, should_fuse_single_thread};
 pub(crate) use pool::{assign_exclusive_owners, assign_sticky_owners};
 pub use scheduler::{
-    ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, Scheduler, WalkDirection,
+    ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, RefillSource, Scheduler,
+    WalkDirection,
 };
 pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot, elapsed_ns};
 pub(crate) use storage::build_worker_storage;

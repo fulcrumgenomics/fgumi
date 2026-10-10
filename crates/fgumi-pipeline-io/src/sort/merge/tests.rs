@@ -127,3 +127,88 @@ fn a_dispatch_that_absorbed_setup_input_is_progress() {
     assert!(probe.input_is_empty(), "both announcements were absorbed");
     assert_eq!(outcome, StepOutcome::Progress, "a dispatch that took input is not idle");
 }
+
+/// A one-record spill block at `pos` on reference 0 (the coordinate key is
+/// embedded in the record, so the frame is `[u32 len][record]`).
+fn one_record_block(pos: usize) -> Vec<u8> {
+    let pos = i32::try_from(pos).expect("small test positions");
+    let record = fgumi_raw_bam::testutil::make_bam_bytes(
+        0,
+        pos,
+        0,
+        format!("r{pos:04}").as_bytes(),
+        &[],
+        4,
+        -1,
+        -1,
+        &[],
+    );
+    let mut block = Vec::new();
+    fgumi_sort::frame_keyed_record_into(&mut block, &RawCoordinateKey::default(), &record)
+        .expect("frame record");
+    block
+}
+
+/// A stall whose partial batch is refused by a full output edge leaves the
+/// merge blocked on its output, not on the spill supply: it lowers `starved`
+/// (so the pool's refill walk stops putting the supply ahead of the steps that
+/// drain that edge), withdraws its registration, and the dispatch that then
+/// parks on the held batch is not a parking registration.
+#[test]
+fn a_partial_batch_held_on_a_full_output_lowers_starved() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    // A 256-byte edge: a few one-record batches (their buffers are sized up to
+    // the 256-byte cap) fill it, and one record never fills a batch, so each
+    // stall flushes a partial batch.
+    let mut step =
+        SortMerge::<RecordBatchOutput>::with_target_batch_count(SortOrder::Coordinate, 256, 1024)
+            .with_merge_demand(Arc::clone(&demand));
+    let probe = StepProbe::new(&step);
+    let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
+        .map(|file_id| {
+            let slot = Arc::new(SortMergeSlot::new(
+                file_id,
+                std::io::BufReader::new(tempfile::tempfile().unwrap()),
+                fgumi_sort::SpillCodec::Bgzf,
+            ));
+            slot.decompressed.lock().unwrap().push_back(one_record_block(file_id as usize));
+            slot
+        })
+        .collect();
+    for slot in &slots {
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::from("spill"),
+            records_ingested_so_far: 1000,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 1000,
+    });
+    let starved = demand.starved_signal();
+    // Each dispatch merges one record and runs dry on that record's slot,
+    // flushing it as a partial batch; feeding the slot's next record first
+    // keeps every dispatch a stall with one record merged. Nothing drains the
+    // edge, so a partial batch is eventually refused and held.
+    let mut next = 2;
+    loop {
+        assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Progress);
+        if step.held.is_held() {
+            break;
+        }
+        assert!(next < 1000, "the output edge never filled");
+        slots[next % 2].decompressed.lock().unwrap().push_back(one_record_block(next));
+        next += 1;
+    }
+    assert!(
+        !starved.load(std::sync::atomic::Ordering::Relaxed),
+        "a merge blocked on its output must not keep the refill walk raised"
+    );
+    assert_eq!(demand.awaited(), None, "the stall's registration was withdrawn");
+    // The edge is still full: this dispatch parks on the held batch.
+    assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Contention);
+    assert_eq!(demand.snapshot().parking_registrations, 0, "it parks on output, not a slot");
+}

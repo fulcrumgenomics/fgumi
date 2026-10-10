@@ -267,7 +267,9 @@ pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
-pub use merge_demand::{AwaitedSlotState, MergeDemand, MergeDemandSnapshot, MergeDemandStats};
+pub use merge_demand::{
+    AwaitedSlotState, MergeDemand, MergeDemandSnapshot, MergeDemandStats, MergePoolRequest,
+};
 pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use reader::{

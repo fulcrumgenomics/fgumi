@@ -2135,10 +2135,13 @@ mod tests {
         // Never bound, so the read-ahead cap is absent and the refill walk
         // applies for the whole run.
         let scheduler = crate::runtime::scheduler::RefillDrainScheduler::new(
-            Arc::new(AtomicBool::new(true)),
-            refill_through,
-            BranchIdx(0),
-            u64::MAX,
+            WalkDirection::Reverse,
+            vec![crate::runtime::scheduler::RefillSource {
+                signal: Arc::new(AtomicBool::new(true)),
+                refill_through,
+                refill_branch: BranchIdx(0),
+                cap_bytes: u64::MAX,
+            }],
         );
         assert_eq!(
             crate::runtime::scheduler::Scheduler::walk(&scheduler),
