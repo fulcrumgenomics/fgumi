@@ -22,6 +22,7 @@ pub mod arena_split;
 pub mod merge;
 pub mod protocol;
 pub(crate) mod read_ahead_budget;
+pub mod run_ledger;
 pub(crate) mod run_stack;
 pub mod sort_buffer;
 pub mod spill_block_compress;
@@ -43,6 +44,7 @@ pub use arena_split::{
     SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
 };
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
+pub use run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, RunPrior, run_cap_for};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
 pub use spill_block_compress::{SpillBlockCompress, SpillBufPool};
 pub use spill_decompress::SortSpillDecompress;

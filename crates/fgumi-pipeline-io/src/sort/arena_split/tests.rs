@@ -489,6 +489,10 @@ impl ArenaKeyExtractor for ProbeKeys {
         unreachable!("tests build the context")
     }
 
+    fn known_ref_width((): &()) -> Option<usize> {
+        Some(0)
+    }
+
     fn ref_width(_ctx: &Self::Ctx) -> usize {
         8
     }

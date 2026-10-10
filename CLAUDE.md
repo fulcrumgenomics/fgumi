@@ -661,6 +661,25 @@ Queryname (`FindQuerynameBoundaries` → `ExtractQuerynameKeys` →
 own `QnRefBuilder` and classifies (and, on a learned prefix, re-windows) the
 batch before it leaves the extractor, so the run sort only sorts.
 
+**What `--max-memory` bounds.** The record budget (`--max-memory` × the phase-1
+thread count) covers each run's records **and** their sort refs (24 B
+coordinate, 40 B queryname, 40–56 B template). `ReadBlocks` seals a run at
+`run_cap_for(memory_limit, ledger.snapshot())` = `memory_limit × m / (m + w)`:
+`w` the ref width, `m` the previous run's exact mean record size from the
+sort's `RunLedger` (run 0: `RUN0_MEAN_RECORD_BYTES` = 258, and the widest
+56-byte template ref under `--key-types auto` until the first record chooses
+the lanes). The run sort publishes each run's totals before its chunk can free
+the arena, so boundaries are a function of the input alone. The charge is an
+estimate: a run of much shorter records than the previous one holds more refs
+than `w × cap / m`. The published `run_bytes` span complete records only (no
+BAM header, no carried tail), so `m` is exact. Every seal moves the run's refs
+into its chunk (in place for coordinate and serial template sorts; the parallel
+template merge copies once and frees the refs), so a
+run's refs are resident once, never beside a retained buffer while the chunk
+spills or through the merge. `SortBuffer` charges each record its strategy's
+exact ref width. Queue memory and the merge's spill read-ahead are separate
+budgets.
+
 Coordinate (`FindCoordinateBoundaries` → `ExtractCoordinateKeys` →
 `SortCoordinateRun`) extracts 24-byte `RecordRef`s and radix-sorts each run;
 the radix spawns its own `sort_threads` threads, so the bounded pool the trait

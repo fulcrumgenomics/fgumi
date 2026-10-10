@@ -421,7 +421,11 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - Uses an internal LoserTree (tournament tree) for k-way merging, which performs significantly
   better than a simple heap merge when the number of sorted runs is large
 - `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
-  reduce the number of intermediate merge passes
+  reduce the number of intermediate merge passes. The budget covers each run's records **and** their sort refs (24 to 56 bytes per record, by
+  order and key lanes), so a run holds somewhat fewer bytes of records than the budget — the
+  queue budget and the final merge's spill read-ahead are separate. The refs are charged at the
+  previous run's mean record size, so a run of much shorter records than the one before it can
+  exceed the budget.
 - A standalone sort leaves mimalloc's purge delay at its 1 s default, as v0.7.0 did: on a
   whole-genome sort, keeping freed memory mapped for 60 s raised peak RSS by 3–5 GiB and made
   the sort no faster. `MIMALLOC_PURGE_DELAY` still applies if you set it.

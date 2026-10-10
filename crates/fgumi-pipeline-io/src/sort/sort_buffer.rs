@@ -54,13 +54,6 @@ use fgumi_pipeline_core::{
 /// Max staged events flushed to the output per `try_run` invocation.
 const MAX_EVENTS_PER_LOCK: usize = 8;
 
-/// Per-record memory overhead added to the arena byte count so the seal
-/// threshold accounts for the strategy's `(key, offset, len)` ref alongside the
-/// record body. Conservative; the exact value only shifts spill boundaries, not
-/// the merged output (every order's sort is stable: equal keys keep input
-/// order).
-const PER_RECORD_REF_OVERHEAD: usize = 64;
-
 /// Record-input arena accumulator: copies each pushed record into a growing
 /// [`SegmentedBuf`] and drives an [`ArenaSortStrategy`] over the arena refs, so
 /// the record-input (SAM / fused) path seals the same arena-backed chunks as the
@@ -104,7 +97,15 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
         // `(key, offset, len)`; it does not retain `body`, so the arena may grow
         // (and this slice's borrow end) freely afterwards.
         self.strategy.push_record(body, offset, len).map_err(|e| anyhow!("{e:#}"))?;
-        self.memory_used += bam_bytes.len() + PER_RECORD_REF_OVERHEAD;
+        // Each record is charged its bytes plus its sort ref, so a run's records
+        // and refs together fit the budget; template order charges the widest
+        // ref until its first record chooses the lanes. Boundaries only, never
+        // output: every order's sort is stable.
+        let ref_width = self
+            .strategy
+            .ref_width()
+            .unwrap_or_else(|| fgumi_sort::TemplateKeyVariant::WIDEST.ref_width());
+        self.memory_used += bam_bytes.len() + ref_width;
         self.total_records += 1;
         Ok(self.memory_used >= self.memory_limit)
     }
@@ -653,6 +654,28 @@ mod tests {
         #[case] expected_len: usize,
     ) {
         assert_eq!(residual_chunks_for(chunk, had_spills).len(), expected_len);
+    }
+
+    /// A coordinate run is charged each record's bytes plus its 24-byte ref:
+    /// with fixed-size records it seals after `memory_limit / (len + 24)`
+    /// records, ± 1.
+    #[test]
+    fn sort_buffer_charges_the_strategy_ref_width() {
+        let body =
+            fgumi_raw_bam::testutil::make_bam_bytes(0, 100, 0, b"rd_1", &[], 20, -1, -1, &[]);
+        let memory_limit = 1000 * (body.len() + 24);
+        let mut acc = ArenaAccum::new(crate::sort::CoordinateStrategy::new(1), memory_limit, 1);
+        let mut pushed = 0usize;
+        while !acc.push(&body).unwrap() {
+            pushed += 1;
+            assert!(pushed < 10_000, "the run never sealed");
+        }
+        let want = memory_limit / (body.len() + 24);
+        assert!(
+            (pushed + 1).abs_diff(want) <= 1,
+            "sealed after {} records, want {want}",
+            pushed + 1
+        );
     }
 
     // ── Ingest failure handling ─────────────────────────────────────────────

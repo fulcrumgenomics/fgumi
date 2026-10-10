@@ -52,13 +52,14 @@ use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
     BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf, QnBatchLcp,
     QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, RecordRef,
-    TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateMemChunk,
+    TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateKeyVariant, TemplateMemChunk,
     coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
     radix_sorts_in_parallel, seal_template_refs,
 };
 use log::{debug, info};
 
 use super::arena_ingest::{FRONT_REGION, InflatedBlock, reserve_for_run_sort};
+use super::run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, run_cap_for};
 use crate::boundaries::bam_header_len;
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
 
@@ -83,6 +84,9 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
     type Scratch: Default + Clone + Send + 'static;
     /// The sort's context, from its first record's body.
     fn provision(seed: &Self::Seed, first_body: &[u8]) -> Self::Ctx;
+    /// Bytes of one record's ref, when known before the first record (every
+    /// order but template order under `--key-types auto`).
+    fn known_ref_width(seed: &Self::Seed) -> Option<usize>;
     /// Bytes of one record's ref.
     fn ref_width(ctx: &Self::Ctx) -> usize;
     /// Re-walk `[byte_start, byte_end)` of `arena` as exactly `n`
@@ -269,6 +273,8 @@ pub struct FindRecordBoundaries<X: ArenaKeyExtractor> {
     /// The next run's sequence number.
     next_seq: u32,
     finalized: bool,
+    /// Receives the ref width when the sort's first record provisions it.
+    ledger: Option<Arc<RunLedger>>,
     /// Test probe: may hold the scan after batch 0 until it is extracted.
     #[cfg(test)]
     probe: Option<Arc<SplitProbe>>,
@@ -300,9 +306,18 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
             next_ordinal: 0,
             next_seq: 0,
             finalized: false,
+            ledger: None,
             #[cfg(test)]
             probe: None,
         }
+    }
+
+    /// Publish the provisioned ref width to the sort's run ledger, which sizes
+    /// the next run's arena cap.
+    #[must_use]
+    pub fn with_run_ledger(mut self, ledger: Arc<RunLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     /// Cut batches of `n` records instead of [`KEY_BATCH_RECORDS`] (tests).
@@ -466,7 +481,11 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
                 prefetch_read_l1(ahead);
             }
             if self.ctx.is_none() {
-                self.ctx = Some(X::provision(&self.seed, &span[cur + 4..cur + 4 + bs]));
+                let ctx = X::provision(&self.seed, &span[cur + 4..cur + 4 + bs]);
+                if let Some(ledger) = &self.ledger {
+                    ledger.publish_width(X::ref_width(&ctx));
+                }
+                self.ctx = Some(ctx);
             }
             cur += 4 + bs;
             found += 1;
@@ -885,6 +904,9 @@ pub struct SortRun<X: ArenaKeyExtractor> {
     census: KeyOverlapCensus,
     run_batches: Vec<(u64, Instant)>,
     census_logged: bool,
+    /// The sort's run ledger and in-memory budget: each run's totals are
+    /// published to it, and each run's refs are reserved from it.
+    budget: Option<(Arc<RunLedger>, usize)>,
     #[cfg(test)]
     probe: Option<Arc<SplitProbe>>,
 }
@@ -915,9 +937,20 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
             census: KeyOverlapCensus::default(),
             run_batches: Vec::new(),
             census_logged: false,
+            budget: None,
             #[cfg(test)]
             probe: None,
         }
+    }
+
+    /// Publish each run's exact totals to the sort's run ledger (before the
+    /// run's chunk is emitted, so before its arena can return to `ReadBlocks`),
+    /// and reserve each run's refs for the arena cap the ledger implies under
+    /// `memory_limit`.
+    #[must_use]
+    pub fn with_run_ledger(mut self, ledger: Arc<RunLedger>, memory_limit: usize) -> Self {
+        self.budget = Some((ledger, memory_limit));
+        self
     }
 
     /// Publish the final census to `probe` (tests).
@@ -970,9 +1003,15 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         }
         if self.run_arena.is_none() {
             self.run_arena = Some(Arc::clone(&batch.arena));
-            if let Some(ctx) = &self.ctx {
+            if let (Some(ctx), Some((ledger, memory_limit))) = (&self.ctx, &self.budget) {
+                // The records this run's arena cap holds at the previous run's mean
+                // size. Every order's seal moved the last run's refs into its chunk,
+                // so this sizes the run's fresh buffer.
+                let prior = ledger.snapshot();
+                let mean = prior.mean_record_bytes.unwrap_or(RUN0_MEAN_RECORD_BYTES).max(1);
+                let records = run_cap_for(*memory_limit, prior) as u64 / mean;
                 let acc = self.acc.get_or_insert_with(|| X::accum_for(ctx));
-                X::reserve(acc, (batch.arena.len() / 192).max(1024));
+                X::reserve(acc, usize::try_from(records).unwrap_or(usize::MAX));
             }
         }
         if let Some(refs) = batch.refs {
@@ -995,6 +1034,10 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         // run sort, which the census must not count as extraction lag.
         let last_batch_at = Instant::now();
         let arena = self.run_arena.take().expect("a run with a last batch has an arena");
+        if let Some((ledger, _)) = &self.budget {
+            let records: u64 = self.run_batches.iter().map(|(n, _)| n).sum();
+            ledger.publish_seal(end.run_bytes, records);
+        }
         let chunk = match self.ctx.as_ref() {
             Some(ctx) => {
                 let acc = self.acc.get_or_insert_with(|| X::accum_for(ctx));
@@ -1153,6 +1196,10 @@ impl ArenaKeyExtractor for TemplateKeys {
 
     fn provision(seed: &Self::Seed, first_body: &[u8]) -> Self::Ctx {
         seed.provision(first_body)
+    }
+
+    fn known_ref_width(seed: &Self::Seed) -> Option<usize> {
+        seed.known_variant().map(TemplateKeyVariant::ref_width)
     }
 
     fn ref_width(ctx: &Self::Ctx) -> usize {
@@ -1325,6 +1372,10 @@ impl ArenaKeyExtractor for CoordinateKeys {
         CoordinateCtx { n_ref: *seed }
     }
 
+    fn known_ref_width(_seed: &Self::Seed) -> Option<usize> {
+        Some(size_of::<RecordRef>())
+    }
+
     fn ref_width(_ctx: &Self::Ctx) -> usize {
         size_of::<RecordRef>()
     }
@@ -1442,6 +1493,10 @@ impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
 
     fn provision(seed: &Self::Seed, _first_body: &[u8]) -> Self::Ctx {
         seed.clone()
+    }
+
+    fn known_ref_width(_seed: &Self::Seed) -> Option<usize> {
+        Some(size_of::<QnRef>())
     }
 
     fn ref_width(_ctx: &Self::Ctx) -> usize {

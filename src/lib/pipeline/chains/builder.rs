@@ -3787,10 +3787,11 @@ impl<'a> ChainBuilder<'a> {
             // in-memory capacity (768 MiB/thread) for standalone `--max-memory
             // auto`, relying on the old `RawExternalSorter`'s lazy buffer growth.
             // That knob does not carry over to the arena front used below
-            // (`ReadBlocks`): it sizes its arena segment to the FULL budget
-            // (`run_cap = memory_limit`) so a run that fits `--max-memory` sorts
-            // in memory with zero spills (see `ReadBlocks::new`). Capping the
-            // segment would cap `run_cap` and force premature spills — the exact
+            // (`ReadBlocks`): it sizes its arena segment to the FULL budget, and
+            // each run's cap leaves room in that budget for the run's sort refs
+            // (`run_cap_for`), so a run whose records and refs fit `--max-memory`
+            // sorts in memory with zero spills (see `ReadBlocks::new`). Capping the
+            // segment would cap the run and force premature spills — the exact
             // wall-clock regression that doc warns against — so there is no
             // separate initial-capacity clamp here.
 
@@ -3958,7 +3959,10 @@ impl<'a> ChainBuilder<'a> {
                     // BAM sort through the parallel-inflate arena front
                     // (ReadBlocks → InflateToArena → …). Every order runs on the
                     // split front (boundaries → key extraction → run sort).
-                    use fgumi_pipeline_io::sort::{InflateToArena, ReadBlocks};
+                    use fgumi_pipeline_io::sort::{
+                        ArenaKeyExtractor, CoordinateKeys, InflateToArena, QuerynameKeys,
+                        ReadBlocks, RunLedger, TemplateKeys,
+                    };
                     use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
@@ -3966,8 +3970,31 @@ impl<'a> ChainBuilder<'a> {
                     // the effective sort-phase thread count). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
+                    //
+                    // That budget holds a run's records AND its sort refs: one
+                    // ledger per sort sizes each run's arena cap from the previous
+                    // run's exact totals (`run_cap_for`). The ref width is known up
+                    // front except for template order under `--key-types auto`,
+                    // whose boundary step publishes it once the first record
+                    // chooses the lanes.
+                    let template_seed = fgumi_sort::TemplateKeySeed::from_header(
+                        &self.header,
+                        cell_tag,
+                        sort.key_types.unwrap_or_default(),
+                    );
+                    let known_width = match sort_order {
+                        SortOrder::Coordinate => CoordinateKeys::known_ref_width(&n_ref),
+                        SortOrder::Queryname(_) => {
+                            QuerynameKeys::<fgumi_sort::QnLex>::known_ref_width(&qn_keys)
+                        }
+                        SortOrder::TemplateCoordinate => {
+                            TemplateKeys::known_ref_width(&template_seed)
+                        }
+                    };
+                    let ledger = RunLedger::new(known_width);
                     let read_blocks =
-                        ReadBlocks::new(total_memory, byte_limit).with_sort_stats(sort.sort_stats);
+                        ReadBlocks::new(total_memory, byte_limit, Arc::clone(&ledger))
+                            .with_sort_stats(sort.sort_stats);
                     // The arena front is the only decode path standalone sort
                     // takes, so the chain's CRC policy has to reach it here --
                     // `BgzfDecompress` (which also honors `spec.verify_crc`) is
@@ -3989,6 +4016,8 @@ impl<'a> ChainBuilder<'a> {
                         sort_stats: sort.sort_stats,
                         cap: phase1_cap.clone(),
                         placement: extract_placement,
+                        ledger: Arc::clone(&ledger),
+                        memory_limit: total_memory,
                     };
                     let t = self.pipeline.append_step(read_blocks, tail);
                     let t = self.pipeline.append_step(inflate, t);
@@ -3997,16 +4026,10 @@ impl<'a> ChainBuilder<'a> {
                             // Template-coordinate: the split front. The seed carries
                             // the library / cell-barcode / `--key-types` machinery;
                             // the sort's first record chooses the key lanes.
-                            let key_types = sort.key_types.unwrap_or_default();
-                            let seed = fgumi_sort::TemplateKeySeed::from_header(
-                                &self.header,
-                                cell_tag,
-                                key_types,
-                            );
-                            append_split::<fgumi_pipeline_io::sort::TemplateKeys>(
+                            append_split::<TemplateKeys>(
                                 &self.pipeline,
                                 t,
-                                seed,
+                                template_seed,
                                 split_front(),
                             )
                         }
@@ -7091,6 +7114,11 @@ struct SplitFront {
     cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
     /// Where key extraction runs.
     placement: fgumi_pipeline_core::PoolPlacement,
+    /// The sort's run ledger, shared with `ReadBlocks`: the boundary step
+    /// publishes the ref width, the run sort each run's totals.
+    ledger: Arc<fgumi_pipeline_io::sort::RunLedger>,
+    /// The in-memory budget a run's records and refs share.
+    memory_limit: usize,
 }
 
 /// Append the split arena front for the order `X` after `InflateToArena`:
@@ -7103,14 +7131,21 @@ fn append_split<X: fgumi_pipeline_io::sort::ArenaKeyExtractor>(
     front: SplitFront,
 ) -> (StepIdx, BranchIdx) {
     use fgumi_pipeline_io::sort::{ExtractKeys, FindRecordBoundaries, SortRun};
-    let SplitFront { sort_threads, byte_limit, sort_stats, cap, placement } = front;
-    let t = pipeline.append_step(FindRecordBoundaries::<X>::new(seed, byte_limit), tail);
+    let SplitFront { sort_threads, byte_limit, sort_stats, cap, placement, ledger, memory_limit } =
+        front;
+    let t = pipeline.append_step(
+        FindRecordBoundaries::<X>::new(seed, byte_limit).with_run_ledger(Arc::clone(&ledger)),
+        tail,
+    );
     let t = pipeline.append_step(
         ExtractKeys::<X>::new(byte_limit).with_phase_cap(cap.clone()).with_placement(placement),
         t,
     );
     pipeline.append_step(
-        SortRun::<X>::new(sort_threads, byte_limit).with_phase_cap(cap).with_sort_stats(sort_stats),
+        SortRun::<X>::new(sort_threads, byte_limit)
+            .with_phase_cap(cap)
+            .with_sort_stats(sort_stats)
+            .with_run_ledger(ledger, memory_limit),
         t,
     )
 }

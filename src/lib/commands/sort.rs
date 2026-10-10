@@ -280,6 +280,13 @@ pub struct Sort {
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
     ///
+    /// The record buffer's budget covers the records and their sort refs (24 to
+    /// 56 bytes per record, by sort order and key lanes): a run holds records
+    /// until the records plus their refs reach it, the refs estimated from the
+    /// previous run's mean record size (a run of much shorter records than the
+    /// one before it can exceed the budget). The queue budget is separate from
+    /// it, as is the final merge's spill read-ahead.
+    ///
     /// This bounds two budgets: the in-memory record buffer (the dominant
     /// consumer, reported on the "Max memory" log line) and the bytes held in the
     /// queues between pipeline stages (applied, but not separately logged). It is
@@ -581,6 +588,13 @@ pub struct SortOptions {
     /// enabled (default).
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
+    ///
+    /// The record buffer's budget covers the records and their sort refs (24 to
+    /// 56 bytes per record, by sort order and key lanes): a run holds records
+    /// until the records plus their refs reach it, the refs estimated from the
+    /// previous run's mean record size (a run of much shorter records than the
+    /// one before it can exceed the budget). The queue budget is separate from
+    /// it, as is the final merge's spill read-ahead.
     ///
     /// The two budgets scale by different thread counts: the record buffer by
     /// the effective sort-phase thread count (the sort phase fills it) —
@@ -2714,6 +2728,23 @@ mod tests {
         use clap::CommandFactory;
         let help = long_help_of(&Sort::command(), long);
         assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
+    }
+
+    /// `--max-memory` says the record buffer's budget is charged for the sort
+    /// refs as well as the records, and that the queue budget is separate —
+    /// for standalone `sort` and for runall's `--sort::max-memory`.
+    #[rstest]
+    #[case::refs("records and their sort refs")]
+    #[case::estimate("previous run's mean record size")]
+    #[case::queues("queue budget is separate")]
+    fn max_memory_help_says_refs_are_charged(#[case] needle: &str) {
+        use clap::CommandFactory;
+        for (command, long) in
+            [(Sort::command(), "max-memory"), (PrefixedSort::command(), "sort::max-memory")]
+        {
+            let help = long_help_of(&command, long);
+            assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
+        }
     }
 
     /// `--read-streams` describes the starvation ratchet on the worker pool,

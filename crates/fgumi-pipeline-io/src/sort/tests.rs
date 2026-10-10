@@ -891,18 +891,35 @@ fn production_arena_front(_order: SortOrder) -> ArenaFront {
     ArenaFront::Split
 }
 
+/// The sort's run ledger, with the ref width `config`'s order knows up front.
+fn run_ledger_for(config: SortBufferConfig, header: &Header) -> Arc<RunLedger> {
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+    RunLedger::new(match config.sort_order {
+        SortOrder::Coordinate => CoordinateKeys::known_ref_width(&n_ref),
+        SortOrder::Queryname(_) => QuerynameKeys::<fgumi_sort::QnLex>::known_ref_width(
+            &fgumi_sort::QnSortState::new(false),
+        ),
+        SortOrder::TemplateCoordinate => TemplateKeys::known_ref_width(
+            &fgumi_sort::TemplateKeySeed::from_header(header, config.cell_tag, config.key_types),
+        ),
+    })
+}
+
 /// The split front's three steps for extractor `X`, with `caps`' test knobs.
 fn split_steps<'b, X: ArenaKeyExtractor>(
     head: Chain<'b, OrderedBytesSingle<InflatedBlock>>,
     seed: X::Seed,
     sort_threads: usize,
     output_byte_limit: u64,
+    (ledger, memory_limit): (&Arc<RunLedger>, usize),
     caps: &ChainCaps,
 ) -> Chain<'b, Single<SortChunkEvent>> {
-    let mut boundaries = FindRecordBoundaries::<X>::new(seed, output_byte_limit);
+    let mut boundaries =
+        FindRecordBoundaries::<X>::new(seed, output_byte_limit).with_run_ledger(Arc::clone(ledger));
     let mut extract = ExtractKeys::<X>::new(output_byte_limit).with_phase_cap(caps.phase1.clone());
-    let mut run =
-        SortRun::<X>::new(sort_threads, output_byte_limit).with_phase_cap(caps.phase1.clone());
+    let mut run = SortRun::<X>::new(sort_threads, output_byte_limit)
+        .with_phase_cap(caps.phase1.clone())
+        .with_run_ledger(Arc::clone(ledger), memory_limit);
     if let Some(n) = caps.batch_records {
         boundaries = boundaries.with_batch_records(n);
     }
@@ -923,15 +940,18 @@ fn arena_front<'b>(
     header: &Header,
     output_byte_limit: u64,
     caps: &ChainCaps,
+    ledger: &Arc<RunLedger>,
 ) -> Chain<'b, Single<SortChunkEvent>> {
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
-    let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, .. } = config;
+    let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, memory_limit } = config;
+    let budget = (ledger, memory_limit);
     match (front, sort_order) {
         (ArenaFront::Split, SortOrder::TemplateCoordinate) => split_steps::<TemplateKeys>(
             head,
             fgumi_sort::TemplateKeySeed::from_header(header, cell_tag, key_types),
             sort_threads,
             output_byte_limit,
+            budget,
             caps,
         ),
         (ArenaFront::Split, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => {
@@ -940,6 +960,7 @@ fn arena_front<'b>(
                 fgumi_sort::QnSortState::new(false),
                 sort_threads,
                 output_byte_limit,
+                budget,
                 caps,
             )
         }
@@ -949,12 +970,18 @@ fn arena_front<'b>(
                 fgumi_sort::QnSortState::new(false),
                 sort_threads,
                 output_byte_limit,
+                budget,
                 caps,
             )
         }
-        (ArenaFront::Split, SortOrder::Coordinate) => {
-            split_steps::<CoordinateKeys>(head, n_ref, sort_threads, output_byte_limit, caps)
-        }
+        (ArenaFront::Split, SortOrder::Coordinate) => split_steps::<CoordinateKeys>(
+            head,
+            n_ref,
+            sort_threads,
+            output_byte_limit,
+            budget,
+            caps,
+        ),
     }
 }
 
@@ -973,13 +1000,14 @@ fn drive_arena_chain(
     sink: MergeSink,
     caps: &ChainCaps,
 ) -> Result<ChainRun> {
+    let ledger = run_ledger_for(config, header);
     let builder = Pipeline::builder();
     let head = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit).reader(caps.reader_source))
-        .chain(ReadBlocks::new(config.memory_limit, output_byte_limit))
+        .chain(ReadBlocks::new(config.memory_limit, output_byte_limit, Arc::clone(&ledger)))
         .chain(InflateToArena::new(output_byte_limit).with_phase_cap(caps.phase1.clone()));
     let taps = attach_spill_and_merge(
-        arena_front(head, front, config, header, output_byte_limit, caps),
+        arena_front(head, front, config, header, output_byte_limit, caps, &ledger),
         config.sort_order,
         output_byte_limit,
         threads,
@@ -1005,12 +1033,13 @@ fn drive_arena_chunks(
 ) -> Result<ArenaFrontOutput> {
     const OUTPUT_BYTE_LIMIT: u64 = 4 * 1024 * 1024;
     let received: Arc<Mutex<ArenaFrontOutput>> = Arc::new(Mutex::new(ArenaFrontOutput::default()));
+    let ledger = run_ledger_for(config, header);
     let builder = Pipeline::builder();
     let head = builder
         .chain(BgzfBlockSource::new(blocks, OUTPUT_BYTE_LIMIT).reader(caps.reader_source))
-        .chain(ReadBlocks::new(config.memory_limit, OUTPUT_BYTE_LIMIT))
+        .chain(ReadBlocks::new(config.memory_limit, OUTPUT_BYTE_LIMIT, Arc::clone(&ledger)))
         .chain(InflateToArena::new(OUTPUT_BYTE_LIMIT).with_phase_cap(caps.phase1.clone()));
-    arena_front(head, front, config, header, OUTPUT_BYTE_LIMIT, caps)
+    arena_front(head, front, config, header, OUTPUT_BYTE_LIMIT, caps, &ledger)
         .chain(ChunkEventSink { received: Arc::clone(&received) })
         .into_sink_marker();
     builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
@@ -3653,6 +3682,8 @@ struct ArenaFrontOutput {
     chunks: Vec<RecordBytes>,
     /// Each chunk's key kind, parallel to `chunks`.
     key_kinds: Vec<fgumi_sort::SpillKeyKind>,
+    /// Each `Spill`'s `records_ingested_so_far`, in order: the spill boundaries.
+    spill_ingested: Vec<u64>,
     slot_count: u32,
     total_records: u64,
 }
@@ -3683,6 +3714,9 @@ impl Step for ChunkEventSink {
         match ctx.input.pop() {
             Some(event) => {
                 let mut out = self.received.lock();
+                if let SortChunkEvent::Spill { records_ingested_so_far, .. } = &event {
+                    out.spill_ingested.push(*records_ingested_so_far);
+                }
                 match event {
                     SortChunkEvent::Spill { chunk, .. }
                     | SortChunkEvent::Residual { chunk, .. } => {
@@ -3789,15 +3823,22 @@ fn drive_arena_front(
     threads: usize,
 ) -> Result<ArenaFrontOutput> {
     let received: Arc<Mutex<ArenaFrontOutput>> = Arc::new(Mutex::new(ArenaFrontOutput::default()));
+    let ledger = RunLedger::new(CoordinateKeys::known_ref_width(&n_ref));
 
     let builder = Pipeline::builder();
     builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
-        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit, Arc::clone(&ledger)))
         .chain(InflateToArena::new(output_byte_limit))
-        .chain(FindCoordinateBoundaries::new(n_ref, output_byte_limit))
+        .chain(
+            FindCoordinateBoundaries::new(n_ref, output_byte_limit)
+                .with_run_ledger(Arc::clone(&ledger)),
+        )
         .chain(ExtractCoordinateKeys::new(output_byte_limit))
-        .chain(SortCoordinateRun::new(1, output_byte_limit))
+        .chain(
+            SortCoordinateRun::new(1, output_byte_limit)
+                .with_run_ledger(Arc::clone(&ledger), memory_limit),
+        )
         .chain(ChunkEventSink { received: Arc::clone(&received) })
         .into_sink_marker();
     let pipeline = builder.build()?;
@@ -4104,6 +4145,7 @@ impl Step for ThrottledVecSink {
 /// forces several sealed runs (several spill files), giving every one of these
 /// steps repeated, spread-out `try_run` calls rather than a single batch.
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end chain and its four counter checks
 fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() {
     use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
     use fgumi_pipeline_core::runtime::telemetry::TelemetryConfig;
@@ -4143,14 +4185,21 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
 
     let (planner, pread, decompress, demand) =
         spill_supply(output_byte_limit, 1, SupplyTuning::default());
+    let ledger = RunLedger::new(CoordinateKeys::known_ref_width(&n_ref));
     let builder = Pipeline::builder();
     let fan = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
-        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit, Arc::clone(&ledger)))
         .chain(InflateToArena::new(output_byte_limit))
-        .chain(FindCoordinateBoundaries::new(n_ref, output_byte_limit))
+        .chain(
+            FindCoordinateBoundaries::new(n_ref, output_byte_limit)
+                .with_run_ledger(Arc::clone(&ledger)),
+        )
         .chain(ExtractCoordinateKeys::new(output_byte_limit))
-        .chain(SortCoordinateRun::new(1, output_byte_limit))
+        .chain(
+            SortCoordinateRun::new(1, output_byte_limit)
+                .with_run_ledger(Arc::clone(&ledger), memory_limit),
+        )
         .chain(SpillGather::new(output_byte_limit))
         .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
@@ -5497,4 +5546,110 @@ fn key_kind_is_of(order: SortOrder, kind: fgumi_sort::SpillKeyKind) -> bool {
             matches!(kind, K::TemplateK24 | K::TemplateCb32 | K::TemplateTert32 | K::TemplateK40)
         }
     }
+}
+
+/// One BGZF block per `per_block` whole records, after a block holding only the
+/// BAM header: no record straddles a block, so each block's uncompressed size
+/// and record count are known. Returns the blocks and `(isize, records)` per
+/// block.
+fn whole_record_blocks(
+    records: &[RawRecord],
+    n_ref: u32,
+    per_block: usize,
+) -> (Vec<crate::types::BgzfBlock>, Vec<(u64, u64)>) {
+    let mut payloads = vec![(minimal_binary_bam_header(n_ref), 0u64)];
+    for group in records.chunks(per_block) {
+        let mut payload = Vec::new();
+        for record in group {
+            let bytes = record.as_ref();
+            payload.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+            payload.extend_from_slice(bytes);
+        }
+        payloads.push((payload, group.len() as u64));
+    }
+    let shape = payloads.iter().map(|(p, n)| (p.len() as u64, *n)).collect();
+    let blocks = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, (payload, _))| {
+            let mut compressor = fgumi_bgzf::writer::InlineBgzfCompressor::new(1);
+            compressor.write_all(payload).unwrap();
+            compressor.flush().unwrap();
+            let mut out = compressor.take_blocks();
+            assert_eq!(out.len(), 1, "a group of records fits one BGZF block");
+            crate::types::BgzfBlock {
+                batch_serial: i as u64,
+                bytes: out.remove(0).data.into(),
+                uncompressed_size: u32::try_from(payload.len()).unwrap(),
+                index: None,
+            }
+        })
+        .collect();
+    (blocks, shape)
+}
+
+/// The `Spill.records_ingested_so_far` sequence the charged caps imply, worked
+/// by hand: run 0's cap is `M·258/(258+w0)`; run k > 0's is `M·m/(m+w)` with
+/// `m = ⌊bytes_{k−1} / records_{k−1}⌋`. Mirroring `ReadBlocks`, a run's seal is
+/// armed by the first block whose append makes the run's bytes reach the cap
+/// (`run_cumulative >= run_cap`, tested after appending), and fires — as a
+/// spill — only when a following block arrives.
+fn expected_boundaries(blocks: &[(u64, u64)], memory_limit: u64, w0: u64, w: u64) -> Vec<u64> {
+    let mut cap = memory_limit * 258 / (258 + w0);
+    let (mut bytes, mut records, mut ingested) = (0u64, 0u64, 0u64);
+    let mut boundaries = Vec::new();
+    for (i, &(isize, n)) in blocks.iter().enumerate() {
+        bytes += isize;
+        records += n;
+        ingested += n;
+        if bytes >= cap && i + 1 < blocks.len() {
+            boundaries.push(ingested);
+            let m = bytes / records;
+            cap = memory_limit * m / (m + w);
+            (bytes, records) = (0, 0);
+        }
+    }
+    boundaries
+}
+
+/// Spill boundaries follow the charged caps exactly, at one and four threads:
+/// template order under `--key-types auto` (run 0 charged at the widest 56-byte
+/// ref, later runs at the provisioned 40), queryname (40) and coordinate (24),
+/// each over at least four runs. Two runs at four threads split identically.
+#[rstest]
+#[case::template_auto(SortOrder::TemplateCoordinate, 56, 40)]
+#[case::queryname(SortOrder::Queryname(QuerynameComparator::Lexicographic), 40, 40)]
+#[case::coordinate(SortOrder::Coordinate, 24, 24)]
+fn spill_boundaries_match_the_hand_computed_caps(
+    #[case] order: SortOrder,
+    #[case] w0: u64,
+    #[case] w: u64,
+) {
+    let (header, records) = match order {
+        SortOrder::Queryname(_) => instrument_switching_records(3_000, 0xB0B),
+        _ => template_records(3_000, 0xB0B, false, false),
+    };
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let (_, shape) = whole_record_blocks(&records, n_ref, 16);
+    let memory_limit = 64 * 1024;
+    let expected = expected_boundaries(&shape, memory_limit as u64, w0, w);
+    assert!(expected.len() >= 4, "{order:?}: at least four runs spill ({expected:?})");
+    let config = buffer_config(order, memory_limit, 2);
+    let run = |threads| {
+        let (blocks, _) = whole_record_blocks(&records, n_ref, 16);
+        drive_arena_chunks(
+            ArenaFront::Split,
+            config,
+            &header,
+            blocks,
+            threads,
+            &ChainCaps::default(),
+        )
+        .unwrap()
+        .spill_ingested
+    };
+    assert_eq!(run(1), expected, "{order:?} t1");
+    let t4 = run(4);
+    assert_eq!(t4, expected, "{order:?} t4");
+    assert_eq!(run(4), t4, "{order:?}: two t4 runs split identically");
 }

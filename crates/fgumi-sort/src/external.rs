@@ -5730,6 +5730,10 @@ pub struct TemplateKeyVariant {
 }
 
 impl TemplateKeyVariant {
+    /// The widest variant (every optional lane): what a template ref is charged
+    /// at before the sort's first record chooses its lanes.
+    pub const WIDEST: Self = Self { cb: true, tertiary: true };
+
     /// Number of u64 lanes: 3 + cb + tertiary.
     #[must_use]
     pub fn lanes(self) -> usize {

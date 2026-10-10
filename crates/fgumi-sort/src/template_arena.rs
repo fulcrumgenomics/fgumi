@@ -376,6 +376,13 @@ impl TemplateArenaAccumulator {
         self.state.as_ref().map_or(0, |(_, refs)| refs.len())
     }
 
+    /// Bytes one ref occupies for the provisioned lanes; `None` until the
+    /// first record chooses them.
+    #[must_use]
+    pub fn ref_width(&self) -> Option<usize> {
+        self.state.as_ref().map(|(ctx, _)| ctx.variant.ref_width())
+    }
+
     /// Extract the template key from `body` (the record's BAM body, `block_size`
     /// prefix excluded, at arena offset `body_off`, length `len`), provision the
     /// narrowed-lane variant on the first record, verify the dropped lanes on

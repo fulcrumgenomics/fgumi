@@ -5,7 +5,9 @@
 //! (capacity 1) to acquire/reuse arenas, reserves a fixed front region
 //! `[0, FRONT_REGION)` per run for the straddler carry (Task 2), reserves an
 //! uninit slot per block via `grow_uninit` at offsets `>= FRONT_REGION`, and
-//! seals a run when its cumulative uncompressed bytes reach `run_cap = memory_limit`.
+//! seals a run when its cumulative uncompressed bytes reach the run's charged cap
+//! ([`run_cap_for`]: `--max-memory` less room for the
+//! run's sort refs).
 //! Sealed mid-stream runs emit [`ArenaBlock`]s with `seals_to_spill = true`;
 //! the final residual run emits with `seals_to_spill = false`.
 //! This is the second `unsafe` site in `fgumi-pipeline-io`; see CLAUDE.md
@@ -54,6 +56,7 @@ use fgumi_pipeline_core::{PhaseCap, WholeCap, admit_input};
 
 use crate::sort::arena_split::QnChunkOrder;
 use crate::sort::protocol::MemoryChunkErased;
+use crate::sort::run_ledger::{RunLedger, run_cap_for};
 
 // ============================================================================
 // Constants
@@ -104,8 +107,10 @@ const READ_BLOCKS_BYTES_READ: usize = 1;
 /// once at acquire (so block slots can be sliced by inflate workers without
 /// further `&mut` growth), reserves a front region `[0, FRONT_REGION)` per run,
 /// assigns each block a slot at an arithmetic offset (`FRONT_REGION` + prefix-sum
-/// of ISIZE), seals a run when cumulative uncompressed bytes reach `memory_limit`,
-/// and emits one [`ArenaBlock`] per block.
+/// of ISIZE), seals a run when cumulative uncompressed bytes reach the run's
+/// charged cap — `memory_limit` less room for the run's sort refs, sized from
+/// the previous run's exact totals in the sort's [`RunLedger`] — and emits one
+/// [`ArenaBlock`] per block.
 ///
 /// **Eager (streaming) emission.** Blocks are emitted *as they are read*, not
 /// buffered until the run seals: the `Arc<PooledSegmentedBuf>` is created at
@@ -133,8 +138,9 @@ const READ_BLOCKS_BYTES_READ: usize = 1;
 pub struct ReadBlocks {
     /// Bounded pool (capacity 1) that owns arena storage and reuses it across runs.
     pool: Arc<ArenaPool>,
-    /// Size of each arena segment (`FRONT_REGION + run_cap + MAX_BGZF_BLOCK`); the
-    /// whole segment is grown live once at acquire.
+    /// Size of each arena segment (`FRONT_REGION + memory_limit + MAX_BGZF_BLOCK`);
+    /// the whole segment is grown live once at acquire. It is reserved capacity:
+    /// pages past a run's cap are never touched.
     segment_size: usize,
     /// `Arc`-shared arena for the current run, grown to full capacity at acquire so
     /// blocks (and their inflate slots) can be handed out eagerly without further
@@ -164,8 +170,13 @@ pub struct ReadBlocks {
     run_seq: u32,
     /// Cumulative uncompressed bytes in the current run (resets on each seal).
     run_cumulative: usize,
-    /// Budget per run: seal when `run_cumulative >= run_cap`.
+    /// Budget per run: seal when `run_cumulative >= run_cap`. Recomputed when
+    /// each run's arena is acquired, from `memory_limit` and the ledger.
     run_cap: usize,
+    /// The sort's in-memory budget: a run's records plus its refs.
+    memory_limit: usize,
+    /// Per-run facts the run sort publishes; sizes each run's cap.
+    ledger: Arc<RunLedger>,
     /// Armed when the current run reached `run_cap`, but the seal is DEFERRED
     /// until the next block arrives.  Deferring by one block guarantees that a
     /// spill seal is only ever fired when at least one more block follows (so
@@ -202,14 +213,16 @@ pub struct ReadBlocks {
 impl ReadBlocks {
     /// Create a new `ReadBlocks` step.
     ///
-    /// - `memory_limit`: bytes of record data a run holds before sealing — the
-    ///   FULL in-memory budget (`--max-memory × threads`, via
-    ///   `resolve_memory_budget`).  This is the SAME spill trigger legacy uses:
-    ///   the front spills to disk ONLY when the data exceeds this budget.  For
-    ///   data that fits the budget the result is exactly ONE in-memory run, ZERO
-    ///   disk spills, and one radix sort over the full budget — legacy's
-    ///   in-memory algorithm and footprint, but with the no-copy arena ingest.
+    /// - `memory_limit`: the FULL in-memory budget (`--max-memory × threads`, via
+    ///   `resolve_memory_budget`) for a run's records **and** its sort refs. Each
+    ///   run seals when its record bytes reach
+    ///   [`run_cap_for`]`(memory_limit,
+    ///   ledger.snapshot())` = `memory_limit × m / (m + w)` — `m` the previous
+    ///   run's mean record bytes, `w` the ref width — so records plus refs fit
+    ///   the budget, as v0.7.0's in-memory buffer did. Data that fits leaves one
+    ///   in-memory run and no spills.
     /// - `output_byte_limit`: byte-bounds the output queue.
+    /// - `ledger`: the sort's [`RunLedger`], which its run sort publishes to.
     ///
     /// The arena segment is sized so one full run always fits within ONE segment
     /// (`FRONT_REGION` + the run budget + one deferred-seal tipping block), which
@@ -219,17 +232,15 @@ impl ReadBlocks {
     /// even when the data fit `--max-memory` — a wall-clock regression vs legacy.
     /// Sizing the segment to the budget instead removes that forced spill.)
     #[must_use]
-    pub fn new(memory_limit: usize, output_byte_limit: u64) -> Self {
-        // Seal a run only when its record data reaches the full budget (legacy's
-        // trigger); never cap below it.
-        let run_cap = memory_limit;
-        // One run = front region + up to `run_cap` of data + the single block that
+    pub fn new(memory_limit: usize, output_byte_limit: u64, ledger: Arc<RunLedger>) -> Self {
+        let run_cap = run_cap_for(memory_limit, ledger.snapshot());
+        // One run = front region + up to `memory_limit` of data + the single block that
         // tips `run_cumulative` over `run_cap` (the deferred seal holds the NEXT
         // block for the following run, so the current run overshoots by at most one
         // block).  Sizing the segment to that upper bound guarantees a run is
         // gap-free within one segment, so the scan's single `arena.slice(..)` over
         // `[scan_start, run_end)` never spans a segment boundary.
-        let segment_size = FRONT_REGION + run_cap + MAX_BGZF_BLOCK;
+        let segment_size = FRONT_REGION + memory_limit + MAX_BGZF_BLOCK;
         let pool = ArenaPool::new(1, segment_size);
         Self {
             pool,
@@ -244,6 +255,8 @@ impl ReadBlocks {
             run_seq: 0,
             run_cumulative: 0,
             run_cap,
+            memory_limit,
+            ledger,
             seal_pending: false,
             finished: false,
             output_byte_limit,
@@ -365,6 +378,10 @@ impl ReadBlocks {
         // is wrapped by construction here and only needs sharing.
         self.arena = Some(Arc::new(arena));
         self.run_offset = FRONT_REGION as u64;
+        // The previous run sealed (and published its totals) before its chunk
+        // released the arena this run just acquired, so the cap is a function of
+        // the input alone.
+        self.run_cap = run_cap_for(self.memory_limit, self.ledger.snapshot());
         true
     }
 
@@ -1057,6 +1074,10 @@ pub trait ArenaSortStrategy: Send + 'static {
     /// thread at `sort_threads` — what decides whether the seal must take the
     /// whole phase cap (see `seal_under_cap`).
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool;
+
+    /// Bytes one accumulated ref occupies. Constant per strategy except
+    /// template order, whose lanes the first record chooses: `None` until then.
+    fn ref_width(&self) -> Option<usize>;
 }
 
 /// Reserve the whole phase-1 cap for an off-pool run sort: the one reservation
@@ -1152,6 +1173,10 @@ impl ArenaSortStrategy for CoordinateStrategy {
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
         fgumi_sort::radix_sorts_in_parallel(self.refs.len(), sort_threads)
     }
+
+    fn ref_width(&self) -> Option<usize> {
+        Some(size_of::<RecordRef>())
+    }
 }
 
 /// Template-coordinate strategy: wraps a [`fgumi_sort::TemplateArenaAccumulator`],
@@ -1189,6 +1214,10 @@ impl ArenaSortStrategy for TemplateStrategy {
 
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
         fgumi_sort::radix_sorts_in_parallel(self.acc.pending_len(), sort_threads)
+    }
+
+    fn ref_width(&self) -> Option<usize> {
+        self.acc.ref_width()
     }
 }
 
@@ -1320,6 +1349,10 @@ impl<C: QnChunkOrder> ArenaSortStrategy for QuerynameStrategy<C> {
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
         sort_threads > 1
     }
+
+    fn ref_width(&self) -> Option<usize> {
+        Some(size_of::<QnRef>())
+    }
 }
 
 // ============================================================================
@@ -1418,7 +1451,7 @@ mod tests {
 
     #[test]
     fn read_blocks_runs_off_pool_on_the_coordination_driver() {
-        let step = ReadBlocks::new(1 << 20, 4096);
+        let step = ReadBlocks::new(1 << 20, 4096, RunLedger::new(Some(0)));
         let profile = step.profile();
         assert_eq!(profile.name, "ReadBlocks");
         // Detached keeps the serial arena-admit off a pool worker so it cannot
@@ -1504,7 +1537,7 @@ mod tests {
         let payload = b"deferred-block-payload";
         let bytes = make_test_bgzf_block(payload);
         let isz = u32::try_from(uncompressed_size_of(&bytes)).unwrap();
-        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024, RunLedger::new(Some(0)));
         let probe = StepProbe::new(&step);
         let stolen = step.pool.try_acquire().expect("the pool's one arena");
         probe.push_input(BgzfBlock {
@@ -1538,7 +1571,7 @@ mod tests {
         let isz1 = uncompressed_size_of(&blk1);
 
         // memory_limit larger than both blocks combined → single run
-        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024, RunLedger::new(Some(0)));
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 0,
@@ -1582,6 +1615,37 @@ mod tests {
         assert!(Arc::ptr_eq(&emitted[0].arena, &emitted[1].arena));
     }
 
+    /// Each run's arena cap leaves room for its refs: run 0 is charged at the
+    /// run-0 prior (258 B/record) and the configured width, run 1 at run 0's
+    /// exact mean record size. The expected caps are computed here from the
+    /// fixture, not by `run_cap_for`.
+    #[test]
+    fn read_blocks_seals_at_the_charged_cap() {
+        let memory_limit = 100_000usize;
+        let width = 40usize;
+        let ledger = crate::sort::RunLedger::new(Some(width));
+        let mut step = ReadBlocks::new(memory_limit, 64 * 1024 * 1024, Arc::clone(&ledger));
+        // Four 250-byte "records" per 1000-byte block.
+        let payload = vec![7u8; 1000];
+        let block = |serial| BgzfBlock {
+            batch_serial: serial,
+            bytes: make_test_bgzf_block(&payload).into(),
+            uncompressed_size: 1000,
+            index: None,
+        };
+        assert!(step.admit_block(block(0)).is_ok());
+        assert_eq!(step.run_cap, memory_limit * 258 / (258 + width), "run 0: the prior");
+        assert!(step.admit_block(block(1)).is_ok());
+        step.seal_run(true);
+        drop(step.emit.drain(..).collect::<Vec<_>>());
+        // The run sort publishes run 0's exact totals before its chunk frees the arena.
+        let (run0_bytes, run0_records) = (2000u64, 8u64);
+        ledger.publish_seal(run0_bytes, run0_records);
+        assert!(step.admit_block(block(2)).is_ok());
+        let m = usize::try_from(run0_bytes / run0_records).unwrap();
+        assert_eq!(step.run_cap, memory_limit * m / (m + width), "run 1: run 0's mean");
+    }
+
     /// Feed enough blocks to force TWO runs.
     ///
     /// Asserts:
@@ -1618,7 +1682,7 @@ mod tests {
         // budget (FRONT_REGION + run_cap + one block), so all tiny test blocks
         // still fit in one segment per run.
         let run_cap = isz0 + isz1;
-        let mut step = ReadBlocks::new(run_cap, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(run_cap, 64 * 1024 * 1024, RunLedger::new(Some(0)));
 
         // Admit run 0 blocks.
         assert!(
@@ -1809,7 +1873,7 @@ mod tests {
     /// its arena without ever waiting.
     #[test]
     fn register_then_retry_catches_a_release_in_between() {
-        let mut step = ReadBlocks::new(1 << 16, 1 << 20);
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20, RunLedger::new(Some(0)));
         assert!(step.ensure_arena_for_test(), "the pool's one arena");
         let held = step.take_arena_for_test().expect("arena");
         step.before_register_for_test(Box::new(move || drop(held)));
@@ -1826,7 +1890,7 @@ mod tests {
     #[test]
     fn read_blocks_separates_arena_wait_from_wake_latency() {
         use std::time::Duration;
-        let mut step = ReadBlocks::new(1 << 16, 1 << 20);
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20, RunLedger::new(Some(0)));
         assert!(step.ensure_arena_for_test());
         let held = step.take_arena_for_test().expect("arena");
         assert!(!step.ensure_arena_for_test(), "refused while the arena is held");
@@ -1839,6 +1903,33 @@ mod tests {
         assert!(wait_ns >= 130_000_000, "wait {wait_ns} ns");
         assert!(wake_ns >= 30_000_000, "wake {wake_ns} ns");
         assert!(wake_ns <= wait_ns - 100_000_000, "wake {wake_ns} ns within wait {wait_ns} ns");
+    }
+
+    /// Each strategy reports the bytes one of its refs occupies: coordinate 24,
+    /// queryname 40, and template order the provisioned lanes' width — none
+    /// until its first record chooses them.
+    #[rstest]
+    #[case::k24(&[], 40)]
+    #[case::cb32(b"CBZAAAC\0", 48)]
+    #[case::tert32(b"MIZ7\0", 48)]
+    #[case::k40(b"CBZAAAC\0MIZ7\0", 56)]
+    fn strategies_report_their_ref_width(#[case] aux: &[u8], #[case] width: usize) {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        assert_eq!(CoordinateStrategy::new(1).ref_width(), Some(24));
+        let qn = QuerynameStrategy::<fgumi_sort::QnLex>::new(QnSortState::new(false));
+        assert_eq!(qn.ref_width(), Some(40));
+        let header = noodles::sam::Header::default();
+        let mut template =
+            TemplateStrategy::new(fgumi_sort::TemplateArenaAccumulator::from_header(
+                &header,
+                Some(fgumi_raw_bam::SamTag::CB),
+                fgumi_sort::KeyTypesSpec::Auto,
+            ));
+        assert_eq!(template.ref_width(), None, "lanes unknown before the first record");
+        let body = make_bam_bytes(0, 100, 0x63, b"rd_1", &[], 20, 0, 300, aux);
+        let len = u32::try_from(body.len()).unwrap();
+        template.push_record(&body, 0, len).unwrap();
+        assert_eq!(template.ref_width(), Some(width));
     }
 
     /// The record-input front cannot re-window a batch when it closes (it has
@@ -2024,6 +2115,9 @@ mod tests {
         }
         fn sorts_in_parallel(&self, _sort_threads: usize) -> bool {
             self.parallel
+        }
+        fn ref_width(&self) -> Option<usize> {
+            Some(0)
         }
     }
 
