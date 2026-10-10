@@ -445,14 +445,7 @@ pub(crate) type ProgramIdRenames = HashMap<BString, BString>;
 
 /// Returns `pg` with its `PP` rewritten through `renames`, if `PP` names a renamed ID.
 fn rewrite_previous_program(pg: &ProgramMap, renames: &ProgramIdRenames) -> ProgramMap {
-    let mut pg = pg.clone();
-    let fields = pg.other_fields_mut();
-    if let Some(new_pp) =
-        fields.get(&program_tag::PREVIOUS_PROGRAM_ID).and_then(|pp| renames.get(pp)).cloned()
-    {
-        fields.insert(program_tag::PREVIOUS_PROGRAM_ID, new_pp);
-    }
-    pg
+    fgumi_bam_io::header::with_renamed_reference(pg, program_tag::PREVIOUS_PROGRAM_ID, renames)
 }
 
 /// Merges the @PG records of the unmapped and mapped headers, unmapped records first.
@@ -511,16 +504,8 @@ pub(crate) fn program_id_renames(unmapped: &Header, mapped: &Header) -> ProgramI
             }
             let Some(mapped_pg) = mapped_programs.get(id) else { continue };
             if rewrite_previous_program(pg, &renames) != *mapped_pg {
-                // Same `{id}.{n}` scheme as `make_unique_program_id`; `used` is finite, so
-                // this terminates.
-                let mut suffix = 1_usize;
-                let fresh = loop {
-                    let candidate = BString::from(format!("{id}.{suffix}"));
-                    if !used.contains(&candidate) {
-                        break candidate;
-                    }
-                    suffix += 1;
-                };
+                let fresh =
+                    fgumi_bam_io::header::suffixed_id(id, |candidate| used.contains(candidate));
                 used.insert(fresh.clone());
                 renames.insert(id.clone(), fresh);
                 changed = true;

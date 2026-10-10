@@ -616,3 +616,195 @@ fn test_merge_output_is_template_coordinate_sorted() {
     // The whole point of merge is the output claim: verify it holds.
     assert_bam_sorted(&merged, "template-coordinate", Some("mi"));
 }
+
+// -----------------------------------------------------------------------------
+// Inputs that reuse an @RG/@PG ID: identical records are combined, and a record
+// whose ID is already used for different content gets a fresh ID, which that
+// input's read tags follow.
+// -----------------------------------------------------------------------------
+
+/// A `chr1` header with no `@HD` sort order (so inputs are verified record by
+/// record during the merge) plus the tab-separated @RG/@PG `lines`.
+fn header_with_lines(lines: &[&str]) -> Header {
+    let mut text = String::from("@SQ\tSN:chr1\tLN:10000\n");
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.parse().expect("valid SAM header text")
+}
+
+/// A mapped 20M record on chr1 at the 1-based `pos`, with the given `RG`/`PG` tags.
+fn tagged_record(name: &[u8], pos: i32, rg: Option<&str>, pg: Option<&str>) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .ref_id(0)
+        .pos(pos - 1)
+        .mapq(60)
+        .cigar_ops(&[20 << 4])
+        .sequence(b"ACGTACGTACGTACGTACGT")
+        .qualities(&[30; 20]);
+    if let Some(rg) = rg {
+        b.add_string_tag(SamTag::RG, rg.as_bytes());
+    }
+    if let Some(pg) = pg {
+        b.add_string_tag(SamTag::PG, pg.as_bytes());
+    }
+    b.build()
+}
+
+/// `(read name, RG, PG)` for every record of `path`, in file order.
+fn read_name_rg_pg(path: &Path) -> Vec<(String, Option<String>, Option<String>)> {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    let string_tag = |rec: &noodles::sam::alignment::RecordBuf, tag: SamTag| match rec
+        .data()
+        .get(&Tag::from(tag))
+    {
+        Some(Value::String(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    reader
+        .record_bufs(&header)
+        .map(|r| {
+            let rec = r.unwrap();
+            let name = String::from_utf8(rec.name().unwrap().to_vec()).unwrap();
+            (name, string_tag(&rec, SamTag::RG), string_tag(&rec, SamTag::PG))
+        })
+        .collect()
+}
+
+/// The @RG and @PG lines of the header of `path`, in header order, as SAM text.
+fn read_group_and_program_lines(path: &Path) -> Vec<String> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    let mut writer = noodles::sam::io::Writer::new(Vec::new());
+    writer.write_header(&header).unwrap();
+    String::from_utf8(writer.get_ref().clone())
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("@RG") || line.starts_with("@PG"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Two inputs reuse `RG:A` and `PG:bwa` for different read groups and programs: the
+/// second input's are renamed `A.1` and `bwa.1`, and its reads' tags follow, in every
+/// merge order. A tag naming an ID its input's header does not declare is kept.
+#[rstest::rstest]
+#[case::coordinate(SortOrderArg::Coordinate)]
+#[case::queryname(SortOrderArg::Queryname)]
+#[case::queryname_natural(SortOrderArg::QuerynameNatural)]
+#[case::template_coordinate(SortOrderArg::TemplateCoordinate)]
+fn test_merge_rewrites_read_tags_of_conflicting_ids(#[case] order: SortOrderArg) {
+    let dir = TempDir::new().unwrap();
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(
+        &in1,
+        &header_with_lines(&["@RG\tID:A\tLB:libX", "@PG\tID:bwa\tCL:bwa ref1.fa"]),
+        &[tagged_record(b"r1", 100, Some("A"), Some("bwa"))],
+    );
+    write_bam(
+        &in2,
+        &header_with_lines(&["@RG\tID:A\tLB:libY", "@PG\tID:bwa\tCL:bwa ref2.fa"]),
+        &[
+            tagged_record(b"r2", 200, Some("A"), Some("bwa")),
+            tagged_record(b"r3", 300, Some("undeclared"), None),
+        ],
+    );
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], order).expect("merge should succeed");
+
+    assert_eq!(
+        read_group_and_program_lines(&merged),
+        [
+            "@RG\tID:A\tLB:libX",
+            "@RG\tID:A.1\tLB:libY",
+            "@PG\tID:bwa\tCL:bwa ref1.fa",
+            "@PG\tID:bwa.1\tCL:bwa ref2.fa",
+        ]
+    );
+    let mut tags = read_name_rg_pg(&merged);
+    tags.sort();
+    let owned = |name: &str, rg: Option<&str>, pg: Option<&str>| {
+        (name.to_string(), rg.map(str::to_string), pg.map(str::to_string))
+    };
+    assert_eq!(
+        tags,
+        [
+            owned("r1", Some("A"), Some("bwa")),
+            owned("r2", Some("A.1"), Some("bwa.1")),
+            owned("r3", Some("undeclared"), None),
+        ]
+    );
+}
+
+/// Shards of one sample share identical @RG/@PG records: each is written once and the
+/// reads' tags are unchanged (`samtools merge` would rename them without `-c`/`-p`).
+#[test]
+fn test_merge_combines_identical_shard_headers() {
+    let dir = TempDir::new().unwrap();
+    let lines = ["@RG\tID:A\tLB:libX", "@PG\tID:bwa\tCL:bwa ref.fa"];
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(
+        &in1,
+        &header_with_lines(&lines),
+        &[tagged_record(b"r1", 100, Some("A"), Some("bwa"))],
+    );
+    write_bam(
+        &in2,
+        &header_with_lines(&lines),
+        &[tagged_record(b"r2", 200, Some("A"), Some("bwa"))],
+    );
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], SortOrderArg::Coordinate).expect("merge should succeed");
+
+    assert_eq!(read_group_and_program_lines(&merged), lines);
+    let tags = read_name_rg_pg(&merged);
+    let expected: Vec<_> = ["r1", "r2"]
+        .iter()
+        .map(|name| (name.to_string(), Some("A".to_string()), Some("bwa".to_string())))
+        .collect();
+    assert_eq!(tags, expected);
+}
+
+/// The template-coordinate key orders templates at the same position by library. Both
+/// inputs call their read group `A`, with libraries `libA` and `libZ`; once the second
+/// input's reads are retagged `A.1` (`libZ`), its read `b` sorts after `a` (`libA`) at
+/// position 300. Were `b` keyed by the first input's `A` (`libA`), the two would tie on
+/// library and the name hash, which puts `b` first, would decide. The `refill` case puts
+/// another record before each tie, so `a` and `b` are each read after their input's
+/// first record rather than as it.
+#[rstest::rstest]
+#[case::first_record(&[], &[], &["a", "b"])]
+#[case::refill(&[("c", 100)], &[("d", 50)], &["d", "c", "a", "b"])]
+fn test_merge_template_coordinate_orders_by_renamed_read_group_library(
+    #[case] in1_before: &[(&str, i32)],
+    #[case] in2_before: &[(&str, i32)],
+    #[case] expected: &[&str],
+) {
+    let dir = TempDir::new().unwrap();
+    let records = |before: &[(&str, i32)], tied: &str| -> Vec<RawRecord> {
+        before
+            .iter()
+            .map(|(name, pos)| tagged_record(name.as_bytes(), *pos, Some("A"), None))
+            .chain(std::iter::once(tagged_record(tied.as_bytes(), 300, Some("A"), None)))
+            .collect()
+    };
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(&in1, &header_with_lines(&["@RG\tID:A\tLB:libA"]), &records(in1_before, "a"));
+    write_bam(&in2, &header_with_lines(&["@RG\tID:A\tLB:libZ"]), &records(in2_before, "b"));
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], SortOrderArg::TemplateCoordinate).expect("merge should succeed");
+
+    let names: Vec<String> = read_name_rg_pg(&merged).into_iter().map(|(name, ..)| name).collect();
+    assert_eq!(names, expected);
+}

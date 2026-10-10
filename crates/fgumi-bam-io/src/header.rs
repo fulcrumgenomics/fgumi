@@ -9,7 +9,7 @@ use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::Program;
 use noodles::sam::header::record::value::map::program::tag;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Get the ID of the last program in the @PG chain (for PP chaining).
 ///
@@ -59,23 +59,56 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
 /// A program ID not already in the header, either the base ID or with a numeric suffix.
 #[must_use]
 pub fn make_unique_program_id(header: &Header, base_id: &str) -> String {
-    let programs = header.programs();
-    let program_map = programs.as_ref();
+    let program_map = header.programs();
+    let program_map = program_map.as_ref();
 
     // Check if base ID is available
     if !program_map.contains_key(base_id.as_bytes()) {
         return base_id.to_string();
     }
 
-    // Append numeric suffix until unique; the header is finite, so this terminates
+    suffixed_id(base_id.as_bytes(), |candidate| program_map.contains_key(candidate)).to_string()
+}
+
+/// Returns the first `{id}.{n}` (n = 1, 2, ...) for which `is_taken` returns false.
+///
+/// This is the scheme fgumi uses whenever a header record needs a fresh ID: its own
+/// @PG ([`make_unique_program_id`]) and conflicting @RG/@PG records renamed by `zipper`
+/// and `merge`. `{id}.{n}` splits back uniquely at its last dot, so distinct `id`s never
+/// yield the same candidate. `is_taken` must return false for some `n`, as it does for
+/// any finite set of taken IDs.
+#[must_use]
+pub fn suffixed_id(id: &[u8], is_taken: impl Fn(&[u8]) -> bool) -> BString {
     let mut suffix = 1_usize;
     loop {
-        let candidate = format!("{base_id}.{suffix}");
-        if !program_map.contains_key(candidate.as_bytes()) {
+        let mut candidate = BString::from(id);
+        candidate.extend_from_slice(format!(".{suffix}").as_bytes());
+        if !is_taken(&candidate) {
             return candidate;
         }
         suffix += 1;
     }
+}
+
+/// Returns `record` with the ID in its `tag` field (e.g. a @PG `PP` or an @RG `PG`)
+/// rewritten through `renames`, if that field names a renamed ID.
+#[must_use]
+pub fn with_renamed_reference<T, S>(
+    record: &Map<T>,
+    tag: noodles::sam::header::record::value::map::tag::Other<T::StandardTag>,
+    renames: &HashMap<BString, BString, S>,
+) -> Map<T>
+where
+    T: noodles::sam::header::record::value::map::Inner,
+    Map<T>: Clone,
+    S: std::hash::BuildHasher,
+{
+    let mut record = record.clone();
+    let fields = record.other_fields_mut();
+    if let Some(renamed) = fields.get(&tag).and_then(|id| renames.get(id)).cloned() {
+        fields.insert(tag, renamed);
+    }
+    record
 }
 
 /// Build a @PG record with all standard fields.
@@ -271,6 +304,35 @@ mod tests {
     #[test]
     fn test_get_last_program_id_cycle_picks_last_program() {
         assert_eq!(get_last_program_id(&header_with_pp_cycle()), Some("b".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::first_suffix_free("A", &[], "A.1")]
+    #[case::skips_taken_suffixes("A", &["A.1", "A.2"], "A.3")]
+    #[case::ignores_unrelated_ids("A", &["B.1", "A.1.1"], "A.1")]
+    #[case::dotted_id("A.1", &["A.1.1"], "A.1.2")]
+    fn test_suffixed_id(#[case] id: &str, #[case] taken: &[&str], #[case] expected: &str) {
+        let taken: HashSet<&[u8]> = taken.iter().map(|t| t.as_bytes()).collect();
+        assert_eq!(suffixed_id(id.as_bytes(), |candidate| taken.contains(candidate)), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::renamed(Some("bwa"), Some("bwa.1"))]
+    #[case::not_renamed(Some("samtools"), Some("samtools"))]
+    #[case::no_reference(None, None)]
+    fn test_with_renamed_reference(#[case] previous: Option<&str>, #[case] expected: Option<&str>) {
+        let mut builder = Map::<Program>::builder().insert(tag::NAME, "fgumi");
+        if let Some(pp) = previous {
+            builder = builder.insert(tag::PREVIOUS_PROGRAM_ID, pp);
+        }
+        let pg = builder.build().expect("valid @PG");
+        let renames = HashMap::from([(BString::from("bwa"), BString::from("bwa.1"))]);
+
+        let renamed = with_renamed_reference(&pg, tag::PREVIOUS_PROGRAM_ID, &renames);
+
+        let pp = renamed.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(ToString::to_string);
+        assert_eq!(pp.as_deref(), expected);
+        assert_eq!(renamed.other_fields().get(&tag::NAME), pg.other_fields().get(&tag::NAME));
     }
 
     #[test]
