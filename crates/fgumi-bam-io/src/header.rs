@@ -9,7 +9,7 @@ use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::Program;
 use noodles::sam::header::record::value::map::program::tag;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Get the ID of the last program in the @PG chain (for PP chaining).
 ///
@@ -59,23 +59,56 @@ pub fn get_last_program_id(header: &Header) -> Option<String> {
 /// A program ID not already in the header, either the base ID or with a numeric suffix.
 #[must_use]
 pub fn make_unique_program_id(header: &Header, base_id: &str) -> String {
-    let programs = header.programs();
-    let program_map = programs.as_ref();
+    let program_map = header.programs();
+    let program_map = program_map.as_ref();
 
     // Check if base ID is available
     if !program_map.contains_key(base_id.as_bytes()) {
         return base_id.to_string();
     }
 
-    // Append numeric suffix until unique; the header is finite, so this terminates
+    suffixed_id(base_id.as_bytes(), |candidate| program_map.contains_key(candidate)).to_string()
+}
+
+/// Returns the first `{id}.{n}` (n = 1, 2, ...) for which `is_taken` returns false.
+///
+/// This is the scheme fgumi uses whenever a header record needs a fresh ID: its own
+/// @PG ([`make_unique_program_id`]) and conflicting @RG/@PG records renamed by `zipper`
+/// and `merge`. `{id}.{n}` splits back uniquely at its last dot, so distinct `id`s never
+/// yield the same candidate. `is_taken` must return false for some `n`, as it does for
+/// any finite set of taken IDs.
+#[must_use]
+pub fn suffixed_id(id: &[u8], is_taken: impl Fn(&[u8]) -> bool) -> BString {
     let mut suffix = 1_usize;
     loop {
-        let candidate = format!("{base_id}.{suffix}");
-        if !program_map.contains_key(candidate.as_bytes()) {
+        let mut candidate = BString::from(id);
+        candidate.extend_from_slice(format!(".{suffix}").as_bytes());
+        if !is_taken(&candidate) {
             return candidate;
         }
         suffix += 1;
     }
+}
+
+/// Returns `record` with the ID in its `tag` field (e.g. a @PG `PP` or an @RG `PG`)
+/// rewritten through `renames`, if that field names a renamed ID.
+#[must_use]
+pub fn with_renamed_reference<T, S>(
+    record: &Map<T>,
+    tag: noodles::sam::header::record::value::map::tag::Other<T::StandardTag>,
+    renames: &HashMap<BString, BString, S>,
+) -> Map<T>
+where
+    T: noodles::sam::header::record::value::map::Inner,
+    Map<T>: Clone,
+    S: std::hash::BuildHasher,
+{
+    let mut record = record.clone();
+    let fields = record.other_fields_mut();
+    if let Some(renamed) = fields.get(&tag).and_then(|id| renames.get(id)).cloned() {
+        fields.insert(tag, renamed);
+    }
+    record
 }
 
 /// Build a @PG record with all standard fields.
@@ -100,13 +133,34 @@ pub fn build_program_record(
     let mut builder = Map::<Program>::builder()
         .insert(tag::NAME, "fgumi")
         .insert(tag::VERSION, version)
-        .insert(tag::COMMAND_LINE, command_line);
+        .insert(tag::COMMAND_LINE, header_safe_value(command_line));
 
     if let Some(pp) = previous_program {
         builder = builder.insert(tag::PREVIOUS_PROGRAM_ID, pp);
     }
 
     Ok(builder.build()?)
+}
+
+/// Returns `value` with every character a SAM header field cannot hold replaced, so a
+/// record built from it can always be written.
+///
+/// The SAM spec (§1.3) limits header field values to printable ASCII (`[ -~]+`), and
+/// noodles refuses to write anything else, so one tab or non-ASCII byte in a command line
+/// would otherwise fail the whole output. Tabs, newlines and carriage returns become a
+/// space, as `samtools` does for tabs; any other character becomes its `\u{..}` escape,
+/// which keeps a non-ASCII path legible.
+#[must_use]
+pub fn header_safe_value(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            ' '..='~' => safe.push(c),
+            '\t' | '\n' | '\r' => safe.push(' '),
+            _ => safe.extend(c.escape_unicode()),
+        }
+    }
+    safe
 }
 
 /// Add a @PG record to an existing header with automatic PP chaining.
@@ -271,6 +325,59 @@ mod tests {
     #[test]
     fn test_get_last_program_id_cycle_picks_last_program() {
         assert_eq!(get_last_program_id(&header_with_pp_cycle()), Some("b".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::printable_ascii_unchanged(
+        "fgumi merge -o out.bam a.bam",
+        "fgumi merge -o out.bam a.bam"
+    )]
+    #[case::whitespace_controls_become_spaces("a\tb\nc\rd", "a b c d")]
+    #[case::other_controls_escaped("a\u{1}b\u{7f}", "a\\u{1}b\\u{7f}")]
+    #[case::non_ascii_escaped("caf\u{e9}.bam", "caf\\u{e9}.bam")]
+    fn test_header_safe_value(#[case] value: &str, #[case] expected: &str) {
+        assert_eq!(header_safe_value(value), expected);
+    }
+
+    /// A command line with characters a header cannot hold still yields a writable @PG.
+    #[test]
+    fn test_build_program_record_with_unprintable_command_line_is_writable() {
+        let pg = build_program_record("1.0", "fgumi merge -o caf\u{e9}.bam\ta.bam", None)
+            .expect("program record");
+        let header = Header::builder().add_program("fgumi", pg).build();
+        let mut writer = noodles::sam::io::Writer::new(Vec::new());
+        writer.write_header(&header).expect("header with a sanitized CL must be writable");
+        let text = String::from_utf8(writer.get_ref().clone()).expect("UTF-8 header");
+        assert!(text.contains("CL:fgumi merge -o caf\\u{e9}.bam a.bam"), "{text}");
+    }
+
+    #[rstest::rstest]
+    #[case::first_suffix_free("A", &[], "A.1")]
+    #[case::skips_taken_suffixes("A", &["A.1", "A.2"], "A.3")]
+    #[case::ignores_unrelated_ids("A", &["B.1", "A.1.1"], "A.1")]
+    #[case::dotted_id("A.1", &["A.1.1"], "A.1.2")]
+    fn test_suffixed_id(#[case] id: &str, #[case] taken: &[&str], #[case] expected: &str) {
+        let taken: HashSet<&[u8]> = taken.iter().map(|t| t.as_bytes()).collect();
+        assert_eq!(suffixed_id(id.as_bytes(), |candidate| taken.contains(candidate)), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::renamed(Some("bwa"), Some("bwa.1"))]
+    #[case::not_renamed(Some("samtools"), Some("samtools"))]
+    #[case::no_reference(None, None)]
+    fn test_with_renamed_reference(#[case] previous: Option<&str>, #[case] expected: Option<&str>) {
+        let mut builder = Map::<Program>::builder().insert(tag::NAME, "fgumi");
+        if let Some(pp) = previous {
+            builder = builder.insert(tag::PREVIOUS_PROGRAM_ID, pp);
+        }
+        let pg = builder.build().expect("valid @PG");
+        let renames = HashMap::from([(BString::from("bwa"), BString::from("bwa.1"))]);
+
+        let renamed = with_renamed_reference(&pg, tag::PREVIOUS_PROGRAM_ID, &renames);
+
+        let pp = renamed.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(ToString::to_string);
+        assert_eq!(pp.as_deref(), expected);
+        assert_eq!(renamed.other_fields().get(&tag::NAME), pg.other_fields().get(&tag::NAME));
     }
 
     #[test]

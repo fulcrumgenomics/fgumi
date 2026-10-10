@@ -3047,6 +3047,27 @@ impl RawExternalSorter {
     ///
     /// Returns an error if any input cannot be opened, or writing fails.
     pub fn merge_bams(&self, inputs: &[PathBuf], header: &Header, output: &Path) -> Result<u64> {
+        self.merge_bams_rewriting(inputs, header, output, |_, _| {})
+    }
+
+    /// Like [`Self::merge_bams`], but passes every record to `rewrite_record`, with the
+    /// index of its input in `inputs`, before its sort key is extracted.
+    ///
+    /// `rewrite_record` may edit the raw record bytes in place, for example to translate
+    /// an `RG` tag to the ID its read group is written under in `header`. Because the
+    /// sort key is extracted from the rewritten record, keys that depend on such tags
+    /// (the template-coordinate library) follow the rewrite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any input cannot be opened, or writing fails.
+    pub fn merge_bams_rewriting(
+        &self,
+        inputs: &[PathBuf],
+        header: &Header,
+        output: &Path,
+        mut rewrite_record: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<u64> {
         use crate::inline::extract_coordinate_key_inline;
         use crate::keys::{
             QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
@@ -3066,28 +3087,48 @@ impl RawExternalSorter {
                 let lib_lookup = LibraryLookup::from_header(header);
                 let cell_tag = self.cell_tag;
                 let hasher = cb_hasher();
-                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
-                    extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher)
-                })
+                self.run_merge_loop(
+                    &mut readers,
+                    inputs,
+                    &output_header,
+                    output,
+                    &mut rewrite_record,
+                    |bam| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),
+                )
             }
             SortOrder::Coordinate => {
                 #[allow(clippy::cast_possible_truncation)]
                 let nref = header.reference_sequences().len() as u32;
-                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
-                    RawCoordinateKey { sort_key: extract_coordinate_key_inline(bam, nref) }
-                })
+                self.run_merge_loop(
+                    &mut readers,
+                    inputs,
+                    &output_header,
+                    output,
+                    &mut rewrite_record,
+                    |bam| RawCoordinateKey { sort_key: extract_coordinate_key_inline(bam, nref) },
+                )
             }
             SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                 let ctx = SortContext::from_header(header);
-                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
-                    RawQuerynameLexKey::extract(bam, &ctx)
-                })
+                self.run_merge_loop(
+                    &mut readers,
+                    inputs,
+                    &output_header,
+                    output,
+                    &mut rewrite_record,
+                    |bam| RawQuerynameLexKey::extract(bam, &ctx),
+                )
             }
             SortOrder::Queryname(QuerynameComparator::Natural) => {
                 let ctx = SortContext::from_header(header);
-                self.run_merge_loop(&mut readers, inputs, &output_header, output, |bam| {
-                    RawQuerynameKey::extract(bam, &ctx)
-                })
+                self.run_merge_loop(
+                    &mut readers,
+                    inputs,
+                    &output_header,
+                    output,
+                    &mut rewrite_record,
+                    |bam| RawQuerynameKey::extract(bam, &ctx),
+                )
             }
         }
     }
@@ -3116,13 +3157,15 @@ impl RawExternalSorter {
     /// K-way merge loop: extract keys on the merge thread, write to output.
     ///
     /// Uses reusable per-source record buffers to avoid per-record heap
-    /// allocations during the merge.
+    /// allocations during the merge. Each record is passed to `rewrite_record`,
+    /// with the index of its source in `inputs`, before its key is extracted.
     fn run_merge_loop<K: Ord>(
         &self,
         readers: &mut [RawReadAheadReader],
         inputs: &[PathBuf],
         output_header: &Header,
         output: &Path,
+        rewrite_record: &mut impl FnMut(usize, &mut Vec<u8>),
         extract_key: impl Fn(&[u8]) -> K,
     ) -> Result<u64> {
         use crate::loser_tree::LoserTree;
@@ -3137,6 +3180,7 @@ impl RawExternalSorter {
             if let Some(raw_record) = reader.next() {
                 let mut buf = Vec::with_capacity(raw_record.as_ref().len());
                 buf.extend_from_slice(raw_record.as_ref());
+                rewrite_record(idx, &mut buf);
                 initial_keys.push(extract_key(&buf));
                 records.push(buf);
                 source_map.push(idx);
@@ -3194,6 +3238,7 @@ impl RawExternalSorter {
                 let buf = &mut records[winner];
                 buf.clear();
                 buf.extend_from_slice(raw_record.as_ref());
+                rewrite_record(reader_idx, buf);
                 let new_key = extract_key(buf);
                 // MERGE3-01 streaming verify: the merge assumes each input is
                 // already sorted in the merge order. `tree.winner_key()` still

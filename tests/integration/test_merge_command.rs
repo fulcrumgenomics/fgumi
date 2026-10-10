@@ -97,6 +97,16 @@ fn merge(
     inputs: Vec<std::path::PathBuf>,
     order: SortOrderArg,
 ) -> anyhow::Result<()> {
+    merge_with_command_line(output, inputs, order, "fgumi merge")
+}
+
+/// [`merge`], recording `command_line` as the merge's command line.
+fn merge_with_command_line(
+    output: &Path,
+    inputs: Vec<std::path::PathBuf>,
+    order: SortOrderArg,
+    command_line: &str,
+) -> anyhow::Result<()> {
     Merge {
         output: output.to_path_buf(),
         inputs,
@@ -105,7 +115,7 @@ fn merge(
         threads: 1,
         compression_level: 1,
     }
-    .execute("fgumi merge")
+    .execute(command_line)
 }
 
 /// MERGE3-01 header check: a coordinate-sorted input fed to the default
@@ -615,4 +625,322 @@ fn test_merge_output_is_template_coordinate_sorted() {
 
     // The whole point of merge is the output claim: verify it holds.
     assert_bam_sorted(&merged, "template-coordinate", Some("mi"));
+}
+
+// -----------------------------------------------------------------------------
+// Inputs that reuse an @RG/@PG ID: identical records are combined, and a record
+// whose ID is already used for different content gets a fresh ID, which that
+// input's read tags follow.
+// -----------------------------------------------------------------------------
+
+/// A `chr1` header with no `@HD` sort order (so inputs are verified record by
+/// record during the merge) plus the tab-separated @RG/@PG `lines`.
+fn header_with_lines(lines: &[&str]) -> Header {
+    let mut text = String::from("@SQ\tSN:chr1\tLN:10000\n");
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.parse().expect("valid SAM header text")
+}
+
+/// A mapped 20M record on chr1 at the 1-based `pos`, with the given `RG`/`PG` tags.
+fn tagged_record(name: &[u8], pos: i32, rg: Option<&str>, pg: Option<&str>) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name)
+        .ref_id(0)
+        .pos(pos - 1)
+        .mapq(60)
+        .cigar_ops(&[20 << 4])
+        .sequence(b"ACGTACGTACGTACGTACGT")
+        .qualities(&[30; 20]);
+    if let Some(rg) = rg {
+        b.add_string_tag(SamTag::RG, rg.as_bytes());
+    }
+    if let Some(pg) = pg {
+        b.add_string_tag(SamTag::PG, pg.as_bytes());
+    }
+    b.build()
+}
+
+/// `(read name, RG, PG)` for every record of `path`, in file order.
+fn read_name_rg_pg(path: &Path) -> Vec<(String, Option<String>, Option<String>)> {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    let string_tag = |rec: &noodles::sam::alignment::RecordBuf, tag: SamTag| match rec
+        .data()
+        .get(&Tag::from(tag))
+    {
+        Some(Value::String(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    reader
+        .record_bufs(&header)
+        .map(|r| {
+            let rec = r.unwrap();
+            let name = String::from_utf8(rec.name().unwrap().to_vec()).unwrap();
+            (name, string_tag(&rec, SamTag::RG), string_tag(&rec, SamTag::PG))
+        })
+        .collect()
+}
+
+/// The @PG line `fgumi merge` (run by [`merge`]) adds, with ID `id`, chained to `previous`.
+fn merge_pg_line(id: &str, previous: Option<&str>) -> String {
+    merge_pg_line_with_command_line(id, "fgumi merge", previous)
+}
+
+/// [`merge_pg_line`] with `command_line` as the recorded `CL`.
+fn merge_pg_line_with_command_line(id: &str, command_line: &str, previous: Option<&str>) -> String {
+    let line = format!(
+        "@PG\tID:{id}\tPN:fgumi\tVN:{}\tCL:{command_line}",
+        fgumi_lib::version::VERSION.as_str()
+    );
+    match previous {
+        Some(pp) => format!("{line}\tPP:{pp}"),
+        None => line,
+    }
+}
+
+/// The @RG and @PG lines of the header of `path`, in header order, as SAM text.
+fn read_group_and_program_lines(path: &Path) -> Vec<String> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    let mut writer = noodles::sam::io::Writer::new(Vec::new());
+    writer.write_header(&header).unwrap();
+    String::from_utf8(writer.get_ref().clone())
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("@RG") || line.starts_with("@PG"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Two inputs reuse `RG:A` and `PG:bwa` for different read groups and programs: the
+/// second input's are renamed `A.1` and `bwa.1`, and its reads' tags follow, in every
+/// merge order. A tag naming an ID its input's header does not declare is kept.
+#[rstest::rstest]
+#[case::coordinate(SortOrderArg::Coordinate)]
+#[case::queryname(SortOrderArg::Queryname)]
+#[case::queryname_natural(SortOrderArg::QuerynameNatural)]
+#[case::template_coordinate(SortOrderArg::TemplateCoordinate)]
+fn test_merge_rewrites_read_tags_of_conflicting_ids(#[case] order: SortOrderArg) {
+    let dir = TempDir::new().unwrap();
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(
+        &in1,
+        &header_with_lines(&["@RG\tID:A\tLB:libX", "@PG\tID:bwa\tCL:bwa ref1.fa"]),
+        &[tagged_record(b"r1", 100, Some("A"), Some("bwa"))],
+    );
+    write_bam(
+        &in2,
+        &header_with_lines(&["@RG\tID:A\tLB:libY", "@PG\tID:bwa\tCL:bwa ref2.fa"]),
+        &[
+            tagged_record(b"r2", 200, Some("A"), Some("bwa")),
+            tagged_record(b"r3", 300, Some("undeclared"), None),
+        ],
+    );
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], order).expect("merge should succeed");
+
+    assert_eq!(
+        read_group_and_program_lines(&merged),
+        [
+            "@RG\tID:A\tLB:libX".to_string(),
+            "@RG\tID:A.1\tLB:libY".to_string(),
+            "@PG\tID:bwa\tCL:bwa ref1.fa".to_string(),
+            "@PG\tID:bwa.1\tCL:bwa ref2.fa".to_string(),
+            merge_pg_line("fgumi", Some("bwa.1")),
+        ]
+    );
+    let mut tags = read_name_rg_pg(&merged);
+    tags.sort();
+    let owned = |name: &str, rg: Option<&str>, pg: Option<&str>| {
+        (name.to_string(), rg.map(str::to_string), pg.map(str::to_string))
+    };
+    assert_eq!(
+        tags,
+        [
+            owned("r1", Some("A"), Some("bwa")),
+            owned("r2", Some("A.1"), Some("bwa.1")),
+            owned("r3", Some("undeclared"), None),
+        ]
+    );
+}
+
+/// Shards of one sample share identical @RG/@PG records: each is written once and the
+/// reads' tags are unchanged (`samtools merge` would rename them without `-c`/`-p`).
+#[test]
+fn test_merge_combines_identical_shard_headers() {
+    let dir = TempDir::new().unwrap();
+    let lines = ["@RG\tID:A\tLB:libX", "@PG\tID:bwa\tCL:bwa ref.fa"];
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(
+        &in1,
+        &header_with_lines(&lines),
+        &[tagged_record(b"r1", 100, Some("A"), Some("bwa"))],
+    );
+    write_bam(
+        &in2,
+        &header_with_lines(&lines),
+        &[tagged_record(b"r2", 200, Some("A"), Some("bwa"))],
+    );
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], SortOrderArg::Coordinate).expect("merge should succeed");
+
+    let mut expected_lines: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
+    expected_lines.push(merge_pg_line("fgumi", Some("bwa")));
+    assert_eq!(read_group_and_program_lines(&merged), expected_lines);
+    let tags = read_name_rg_pg(&merged);
+    let expected: Vec<_> = ["r1", "r2"]
+        .iter()
+        .map(|name| (name.to_string(), Some("A".to_string()), Some("bwa".to_string())))
+        .collect();
+    assert_eq!(tags, expected);
+}
+
+/// The template-coordinate key orders templates at the same position by library. Both
+/// inputs call their read group `A`, with libraries `libA` and `libZ`; once the second
+/// input's reads are retagged `A.1` (`libZ`), its read `b` sorts after `a` (`libA`) at
+/// position 300. Were `b` keyed by the first input's `A` (`libA`), the two would tie on
+/// library and the name hash, which puts `b` first, would decide. The `refill` case puts
+/// another record before each tie, so `a` and `b` are each read after their input's
+/// first record rather than as it.
+#[rstest::rstest]
+#[case::first_record(&[], &[], &["a", "b"])]
+#[case::refill(&[("c", 100)], &[("d", 50)], &["d", "c", "a", "b"])]
+fn test_merge_template_coordinate_orders_by_renamed_read_group_library(
+    #[case] in1_before: &[(&str, i32)],
+    #[case] in2_before: &[(&str, i32)],
+    #[case] expected: &[&str],
+) {
+    let dir = TempDir::new().unwrap();
+    let records = |before: &[(&str, i32)], tied: &str| -> Vec<RawRecord> {
+        before
+            .iter()
+            .map(|(name, pos)| tagged_record(name.as_bytes(), *pos, Some("A"), None))
+            .chain(std::iter::once(tagged_record(tied.as_bytes(), 300, Some("A"), None)))
+            .collect()
+    };
+    let in1 = dir.path().join("in1.bam");
+    let in2 = dir.path().join("in2.bam");
+    write_bam(&in1, &header_with_lines(&["@RG\tID:A\tLB:libA"]), &records(in1_before, "a"));
+    write_bam(&in2, &header_with_lines(&["@RG\tID:A\tLB:libZ"]), &records(in2_before, "b"));
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, vec![in1, in2], SortOrderArg::TemplateCoordinate).expect("merge should succeed");
+
+    let names: Vec<String> = read_name_rg_pg(&merged).into_iter().map(|(name, ..)| name).collect();
+    assert_eq!(names, expected);
+}
+
+/// `fgumi merge` adds one @PG of its own, with its command line, chained to the newest
+/// program in the merged header (the last chain end in header order), as every other
+/// fgumi command does, and under a fresh ID when an input already has `ID:fgumi`. A
+/// single input is recorded too.
+#[rstest::rstest]
+#[case::no_input_programs(vec![vec![], vec![]], vec![merge_pg_line("fgumi", None)])]
+#[case::single_input(
+    vec![vec!["@PG\tID:bwa\tCL:bwa ref.fa"]],
+    vec!["@PG\tID:bwa\tCL:bwa ref.fa".to_string(), merge_pg_line("fgumi", Some("bwa"))],
+)]
+#[case::chains_to_newest_program(
+    vec![
+        vec!["@PG\tID:bwa\tCL:bwa ref.fa", "@PG\tID:samtools\tPP:bwa\tCL:samtools sort"],
+        vec!["@PG\tID:bwa\tCL:bwa ref.fa", "@PG\tID:samtools\tPP:bwa\tCL:samtools sort"],
+    ],
+    vec![
+        "@PG\tID:bwa\tCL:bwa ref.fa".to_string(),
+        "@PG\tID:samtools\tPP:bwa\tCL:samtools sort".to_string(),
+        merge_pg_line("fgumi", Some("samtools")),
+    ],
+)]
+#[case::fresh_id_after_fgumi_programs(
+    vec![
+        vec!["@PG\tID:bwa\tCL:bwa ref.fa", "@PG\tID:fgumi\tPP:bwa\tCL:fgumi zipper"],
+        vec!["@PG\tID:bwa\tCL:bwa ref.fa", "@PG\tID:fgumi\tPP:bwa\tCL:fgumi zipper"],
+    ],
+    vec![
+        "@PG\tID:bwa\tCL:bwa ref.fa".to_string(),
+        "@PG\tID:fgumi\tPP:bwa\tCL:fgumi zipper".to_string(),
+        merge_pg_line("fgumi.1", Some("fgumi")),
+    ],
+)]
+// Sharded fgumi runs: the inputs' fgumi @PGs differ, so the second is renamed `fgumi.1`
+// and the merge's own @PG takes the next free ID and chains to it.
+#[case::fresh_id_after_conflicting_fgumi_programs(
+    vec![vec!["@PG\tID:fgumi\tCL:fgumi zipper a"], vec!["@PG\tID:fgumi\tCL:fgumi zipper b"]],
+    vec![
+        "@PG\tID:fgumi\tCL:fgumi zipper a".to_string(),
+        "@PG\tID:fgumi.1\tCL:fgumi zipper b".to_string(),
+        merge_pg_line("fgumi.2", Some("fgumi.1")),
+    ],
+)]
+fn test_merge_adds_its_own_program_record(
+    #[case] inputs: Vec<Vec<&str>>,
+    #[case] expected_programs: Vec<String>,
+) {
+    let dir = TempDir::new().unwrap();
+    let paths: Vec<PathBuf> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, lines)| {
+            let path = dir.path().join(format!("in{i}.bam"));
+            let pos = 100 * (i32::try_from(i).unwrap() + 1);
+            let name = format!("r{i}");
+            write_bam(
+                &path,
+                &header_with_lines(lines),
+                &[tagged_record(name.as_bytes(), pos, None, None)],
+            );
+            path
+        })
+        .collect();
+
+    let merged = dir.path().join("merged.bam");
+    merge(&merged, paths, SortOrderArg::Coordinate).expect("merge should succeed");
+
+    assert_eq!(read_group_and_program_lines(&merged), expected_programs);
+}
+
+/// The merge's @PG records the command line it was run with, not a fixed string, with
+/// the tab a SAM header cannot hold turned into a space rather than failing the output.
+#[test]
+fn test_merge_program_record_records_command_line() {
+    let dir = TempDir::new().unwrap();
+    let paths: Vec<PathBuf> = (0..2)
+        .map(|i| {
+            let path = dir.path().join(format!("in{i}.bam"));
+            let name = format!("r{i}");
+            write_bam(
+                &path,
+                &header_with_lines(&[]),
+                &[tagged_record(name.as_bytes(), 100 * (i + 1), None, None)],
+            );
+            path
+        })
+        .collect();
+
+    let merged = dir.path().join("merged.bam");
+    merge_with_command_line(
+        &merged,
+        paths,
+        SortOrderArg::Coordinate,
+        "fgumi merge --order coordinate\t-o merged.bam in0.bam in1.bam",
+    )
+    .expect("merge should succeed");
+
+    assert_eq!(
+        read_group_and_program_lines(&merged),
+        [merge_pg_line_with_command_line(
+            "fgumi",
+            "fgumi merge --order coordinate -o merged.bam in0.bam in1.bam",
+            None,
+        )]
+    );
 }

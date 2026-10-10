@@ -72,6 +72,15 @@ fgumi merge --order template-coordinate --output merged.bam \
   lane1.bam lane2.bam lane3.bam
 ```
 
+`@RG` and `@PG` records shared by several inputs are handled differently from `samtools merge`.
+samtools renames every record whose `ID` is already taken, even an identical one, unless you pass
+`-c`/`-p`, which instead keep the first record and drop the rest. fgumi compares content: an
+identical record (e.g. the same read group in every lane BAM of one sample) is written once,
+and a record that reuses an `ID` for different content is written under a fresh `ID` (`A.1`,
+`A.2`, ...), with the `RG`/`PG` tags of that input's reads rewritten to match. Records count as
+identical only if the `@PG` their `PP` (or an `@RG`'s `PG`) names is identical too. The fresh
+IDs are deterministic, where samtools appends a random suffix.
+
 If you produce a queryname-sorted output from `fgumi merge` (or from any
 other source — `fgumi extract`, `samtools sort -n`, etc.), insert a
 `fgumi sort --order template-coordinate` step before `fgumi group`,
