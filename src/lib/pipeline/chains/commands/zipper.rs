@@ -57,7 +57,7 @@ impl FinalizeHook for ZipperFinalizeHook {
 /// Captures for [`build_zipper_merge_config`] construction.
 pub(crate) struct ZipperMergeCaptures {
     pub(crate) zipper_opts: ZipperOptions,
-    pub(crate) output_header: Arc<noodles::sam::Header>,
+    pub(crate) pg_renames: Arc<crate::commands::zipper::ProgramIdRenames>,
     pub(crate) tuning: BamPipelineTuning,
     pub(crate) missing_count: Arc<AtomicU64>,
     pub(crate) records_emitted: Arc<AtomicU64>,
@@ -73,7 +73,7 @@ pub(crate) struct ZipperMergeCaptures {
 pub(crate) fn build_zipper_merge_config(
     caps: ZipperMergeCaptures,
 ) -> Result<merge_step::ZipperMergeConfig> {
-    let ZipperMergeCaptures { zipper_opts, output_header, tuning, missing_count, records_emitted } =
+    let ZipperMergeCaptures { zipper_opts, pg_renames, tuning, missing_count, records_emitted } =
         caps;
 
     let ZipperMergeRules { tag_info, skip_tc_tags } = zipper_opts.merge_rules()?;
@@ -82,7 +82,7 @@ pub(crate) fn build_zipper_merge_config(
         tag_info,
         skip_tc_tags,
         exclude_missing_reads: zipper_opts.exclude_missing_reads,
-        output_header,
+        pg_renames,
         missing_count,
         records_emitted,
         target_batch_count: tuning.template_batch_size,

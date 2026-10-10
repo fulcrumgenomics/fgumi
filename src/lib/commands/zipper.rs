@@ -54,6 +54,7 @@ use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::{validate_file_exists, validate_input_exists};
 use anyhow::{Context, Result, bail, ensure};
+use bstr::BString;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
@@ -64,7 +65,10 @@ use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView, TagBitset};
 use log::{debug, info};
 use noodles::sam::Header;
-use std::collections::HashSet;
+use noodles::sam::header::record::value::Map;
+use noodles::sam::header::record::value::map::Program;
+use noodles::sam::header::record::value::map::program::tag as program_tag;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -374,8 +378,9 @@ impl Zipper {
 /// - Reference sequences from the reference dictionary
 /// - Comments from both input files
 /// - Read groups from both inputs (mapped takes precedence)
-/// - Program records from both inputs (mapped takes precedence), unmapped first so the
-///   aligner's program is the newest chain leaf for the @PG that zipper adds
+/// - Program records from both inputs, unmapped first so the aligner's program is the
+///   newest chain leaf for the @PG that zipper adds; a record identical in both is written
+///   once, in its mapped position (see `merge_program_records`)
 /// - Header lines from unmapped BAM
 ///
 /// # Arguments
@@ -421,14 +426,8 @@ pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path)
         }
     }
 
-    let mapped_programs = mapped.programs();
-    for (id, pg) in unmapped.programs().as_ref() {
-        if !mapped_programs.as_ref().contains_key(id) {
-            header = header.add_program(id.clone(), pg.clone());
-        }
-    }
-    for (id, pg) in mapped_programs.as_ref() {
-        header = header.add_program(id.clone(), pg.clone());
+    for (id, pg) in merge_program_records(unmapped, mapped) {
+        header = header.add_program(id, pg);
     }
 
     if let Some(hdr) = unmapped.header() {
@@ -436,6 +435,102 @@ pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path)
     }
 
     Ok(header.build())
+}
+
+/// An @PG record as held in a header.
+type ProgramMap = Map<Program>;
+
+/// Unmapped-header @PG IDs that zipper writes under a fresh ID, keyed by the original ID.
+pub(crate) type ProgramIdRenames = HashMap<BString, BString>;
+
+/// Returns `pg` with its `PP` rewritten through `renames`, if `PP` names a renamed ID.
+fn rewrite_previous_program(pg: &ProgramMap, renames: &ProgramIdRenames) -> ProgramMap {
+    let mut pg = pg.clone();
+    let fields = pg.other_fields_mut();
+    if let Some(new_pp) =
+        fields.get(&program_tag::PREVIOUS_PROGRAM_ID).and_then(|pp| renames.get(pp)).cloned()
+    {
+        fields.insert(program_tag::PREVIOUS_PROGRAM_ID, new_pp);
+    }
+    pg
+}
+
+/// Merges the @PG records of the unmapped and mapped headers, unmapped records first.
+///
+/// A record present in both headers with identical content is written once, in the mapped
+/// header's position. When both headers hold a record with the same ID but different
+/// content, both are kept: the unmapped copy is written under the fresh ID given by
+/// [`program_id_renames`], and every `PP` in the unmapped records that named it is
+/// rewritten to follow it, so the unmapped program chain keeps its provenance. An
+/// unmapped read's `PG` tag is rewritten the same way, both when [`merge_raw_with`] copies
+/// it onto a merged read and when [`encode_unmapped_template_records`] writes an
+/// unmapped-only read.
+///
+/// This deliberately differs from fgbio `ZipperBams`, which keeps the unmapped record only
+/// when no record with that ID exists in the mapped header, so htsjdk's
+/// `SAMFileHeader.addProgramRecord` fails on a same-ID, different-content pair. Dropping
+/// the unmapped copy instead would silently re-point the unmapped chain's `PP` at an
+/// unrelated mapped program (e.g. `samtools import` vs `samtools view`).
+fn merge_program_records(unmapped: &Header, mapped: &Header) -> Vec<(BString, ProgramMap)> {
+    let unmapped_programs = unmapped.programs();
+    let unmapped_programs = unmapped_programs.as_ref();
+    let mapped_programs = mapped.programs();
+    let mapped_programs = mapped_programs.as_ref();
+    let renames = program_id_renames(unmapped, mapped);
+
+    let unmapped_kept = unmapped_programs.iter().filter_map(|(id, pg)| match renames.get(id) {
+        Some(fresh) => Some((fresh.clone(), rewrite_previous_program(pg, &renames))),
+        None if mapped_programs.contains_key(id) => None,
+        None => Some((id.clone(), rewrite_previous_program(pg, &renames))),
+    });
+    let mapped_kept = mapped_programs.iter().map(|(id, pg)| (id.clone(), pg.clone()));
+    unmapped_kept.chain(mapped_kept).collect()
+}
+
+/// Returns the unmapped @PG IDs that [`build_output_header`] writes under a fresh ID.
+///
+/// An unmapped record is renamed when the mapped header holds a record with the same ID
+/// but different content. The fresh ID is `{id}.{n}` (the same scheme as
+/// `make_unique_program_id`) and is not used in either header. A rename can make a record
+/// that pointed at the renamed ID differ from its mapped namesake, so conflicts are
+/// recomputed until none remain. Empty when the headers share no conflicting ID.
+pub(crate) fn program_id_renames(unmapped: &Header, mapped: &Header) -> ProgramIdRenames {
+    let unmapped_programs = unmapped.programs();
+    let unmapped_programs = unmapped_programs.as_ref();
+    let mapped_programs = mapped.programs();
+    let mapped_programs = mapped_programs.as_ref();
+
+    let mut used: HashSet<BString> =
+        unmapped_programs.keys().chain(mapped_programs.keys()).cloned().collect();
+    let mut renames = ProgramIdRenames::new();
+    loop {
+        let mut changed = false;
+        for (id, pg) in unmapped_programs {
+            if renames.contains_key(id) {
+                continue;
+            }
+            let Some(mapped_pg) = mapped_programs.get(id) else { continue };
+            if rewrite_previous_program(pg, &renames) != *mapped_pg {
+                // Same `{id}.{n}` scheme as `make_unique_program_id`; `used` is finite, so
+                // this terminates.
+                let mut suffix = 1_usize;
+                let fresh = loop {
+                    let candidate = BString::from(format!("{id}.{suffix}"));
+                    if !used.contains(&candidate) {
+                        break candidate;
+                    }
+                    suffix += 1;
+                };
+                used.insert(fresh.clone());
+                renames.insert(id.clone(), fresh);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    renames
 }
 
 /// Adds `tc` tags to secondary/supplementary reads.
@@ -567,6 +662,12 @@ pub(crate) struct ZipperTags {
     has_remove: bool,
     /// Whether any reverse/revcomp transform is configured.
     has_transforms: bool,
+    /// `PG` values to rewrite on an unmapped read's tag (copied onto a merged read, or
+    /// on an unmapped-only read), from the unmapped @PG IDs the output header renames
+    /// (see [`program_id_renames`]). Keys and values are the NUL-terminated `Z` value
+    /// bytes, so a copied tag is looked up without allocating. Empty, and never
+    /// consulted, when no @PG ID was renamed.
+    pg_renames: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl ZipperTags {
@@ -578,7 +679,22 @@ impl ZipperTags {
             reverse: TagBitset::from_names(&tag_info.reverse),
             revcomp: TagBitset::from_names(&tag_info.revcomp),
             has_transforms: tag_info.has_revs_or_revcomps(),
+            pg_renames: HashMap::new(),
         }
+    }
+
+    /// Rewrites an unmapped read's `PG` tag, whether copied onto a merged read or written
+    /// on an unmapped-only read, to the ID its @PG record is written under in the output
+    /// header, so the read keeps naming the same program.
+    pub(crate) fn with_pg_renames(mut self, renames: &ProgramIdRenames) -> Self {
+        let nul_terminated = |id: &BString| {
+            let mut bytes = id.to_vec();
+            bytes.push(0);
+            bytes
+        };
+        self.pg_renames =
+            renames.iter().map(|(old, new)| (nul_terminated(old), nul_terminated(new))).collect();
+        self
     }
 }
 
@@ -688,9 +804,23 @@ pub(crate) fn merge_raw_with(
         // Pre-filter the copy set by the strand-independent conditions (skip the
         // configured remove-set). `PG` is additionally skipped per record when the
         // destination already carries a `PG`, so `adds_no_pg` is the copy set for a
-        // destination that already has `PG`.
-        let adds_all: Vec<fgumi_raw_bam::TagEntry<'_>> =
-            u_tags.iter().copied().filter(|e| !tags.remove.contains(e.tag)).collect();
+        // destination that already has `PG`. A copied `PG` naming an unmapped @PG that the
+        // output header renamed is rewritten to the new ID.
+        let adds_all: Vec<fgumi_raw_bam::TagEntry<'_>> = u_tags
+            .iter()
+            .copied()
+            .filter(|e| !tags.remove.contains(e.tag))
+            .map(|e| {
+                if e.tag == *SamTag::PG
+                    && e.type_byte == b'Z'
+                    && let Some(renamed) = tags.pg_renames.get(e.value_bytes)
+                {
+                    fgumi_raw_bam::TagEntry { value_bytes: renamed, ..e }
+                } else {
+                    e
+                }
+            })
+            .collect();
         let adds_no_pg: Vec<fgumi_raw_bam::TagEntry<'_>> =
             adds_all.iter().copied().filter(|e| e.tag != *SamTag::PG).collect();
 
@@ -966,12 +1096,31 @@ fn revcomp_tag_in_place_raw_by_type(
     }
 }
 
-/// Returns all raw BAM records for an unmapped template by cloning them.
+/// Returns all raw BAM records for an unmapped template (one with no mapped match) by
+/// cloning them. A `PG` tag naming an unmapped @PG that the output header renamed is
+/// rewritten to the new ID, as [`merge_raw_with`] does for tags it copies, so the read
+/// keeps naming the program that produced it.
 fn encode_unmapped_template_records(
     template: &Template,
-    _header: &Header,
+    tags: &ZipperTags,
 ) -> Result<Vec<RawRecord>> {
-    Ok(template.records().to_vec())
+    let mut records = template.records().to_vec();
+    if tags.pg_renames.is_empty() {
+        return Ok(records);
+    }
+    for record in &mut records {
+        let aux = fgumi_raw_bam::aux_data_slice(record);
+        let renamed = fgumi_raw_bam::find_string_tag(aux, SamTag::PG).and_then(|pg| {
+            let mut key = pg.to_vec();
+            key.push(0);
+            // Map values are NUL-terminated; `update_string_tag` adds its own NUL.
+            tags.pg_renames.get(&key).map(|new| new[..new.len() - 1].to_vec())
+        });
+        if let Some(renamed) = renamed {
+            fgumi_raw_bam::update_string_tag(record.as_mut_vec(), SamTag::PG, &renamed);
+        }
+    }
+    Ok(records)
 }
 
 impl Zipper {
@@ -1167,8 +1316,7 @@ impl Zipper {
                     if self.exclude_missing_reads {
                         templates_not_in_mapped_bam += 1;
                     } else {
-                        let raw =
-                            encode_unmapped_template_records(&unmapped_template, output_header)?;
+                        let raw = encode_unmapped_template_records(&unmapped_template, tags)?;
                         for rec in &raw {
                             writer.write_raw_record(rec)?;
                             progress.log_if_needed(1);
@@ -1184,7 +1332,7 @@ impl Zipper {
                 if self.exclude_missing_reads {
                     templates_not_in_mapped_bam += 1;
                 } else {
-                    let raw = encode_unmapped_template_records(&unmapped_template, output_header)?;
+                    let raw = encode_unmapped_template_records(&unmapped_template, tags)?;
                     for rec in &raw {
                         writer.write_raw_record(rec)?;
                         progress.log_if_needed(1);
@@ -1367,7 +1515,8 @@ impl Command for Zipper {
 
         // Build the tag lookups once for the whole run; `process_raw` reuses them
         // for every template on either scheduling path.
-        let tags = ZipperTags::from_tag_info(&rules.tag_info);
+        let tags = ZipperTags::from_tag_info(&rules.tag_info)
+            .with_pg_renames(&program_id_renames(&unmapped_header, &mapped_header));
 
         // zipper is a lightweight streaming step (`aligner | fgumi zipper |
         // fgumi sort`), so it must honour `--threads` and not oversubscribe
@@ -1427,8 +1576,6 @@ pub(crate) mod merge_step {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use noodles::sam::Header;
-
     use crate::pipeline::core::Unpushed;
     use crate::pipeline::core::held::HeldSlot;
     use crate::pipeline::core::item::{HeapSize, Ordered};
@@ -1460,7 +1607,9 @@ pub(crate) mod merge_step {
         pub tag_info: Arc<TagInfo>,
         pub skip_tc_tags: bool,
         pub exclude_missing_reads: bool,
-        pub output_header: Arc<Header>,
+        /// Unmapped @PG IDs renamed in the output header, so read `PG` tags follow them
+        /// (see [`super::program_id_renames`]).
+        pub pg_renames: Arc<super::ProgramIdRenames>,
         /// Counter for unmapped templates that had no mapped match.
         /// Exposed back to the command after `Pipeline::run` so the
         /// summary log (`"Excluded N templates..."`) reflects the
@@ -1556,7 +1705,8 @@ pub(crate) mod merge_step {
             // read see the floored value.
             cfg.target_batch_count = cfg.target_batch_count.max(1);
             let target = cfg.target_batch_count;
-            let tags = super::ZipperTags::from_tag_info(&cfg.tag_info);
+            let tags =
+                super::ZipperTags::from_tag_info(&cfg.tag_info).with_pg_renames(&cfg.pg_renames);
             Self {
                 cfg,
                 tags,
@@ -1627,11 +1777,10 @@ pub(crate) mod merge_step {
                 self.cfg.missing_count.fetch_add(1, Ordering::Relaxed);
                 Ok(None)
             } else {
-                let records =
-                    super::encode_unmapped_template_records(&unmapped, &self.cfg.output_header)
-                        .map_err(|e| {
-                            io::Error::other(format!("encode_unmapped_template_records: {e}"))
-                        })?;
+                let records = super::encode_unmapped_template_records(&unmapped, &self.tags)
+                    .map_err(|e| {
+                        io::Error::other(format!("encode_unmapped_template_records: {e}"))
+                    })?;
                 let template = Template::from_records(records).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2179,7 +2328,9 @@ pub(crate) mod merge_step {
     impl ZipperMerge {
         #[must_use]
         pub fn new(cfg: ZipperMergeConfig) -> Self {
-            let tags = Arc::new(super::ZipperTags::from_tag_info(&cfg.tag_info));
+            let tags = Arc::new(
+                super::ZipperTags::from_tag_info(&cfg.tag_info).with_pg_renames(&cfg.pg_renames),
+            );
             Self { cfg, tags, aux_scratch: Vec::new(), held: HeldSlot::new() }
         }
     }
@@ -2252,13 +2403,13 @@ pub(crate) mod merge_step {
                         mapped
                     }
                     ZipItem::UnmappedOnly { unmapped } => {
-                        let records = super::encode_unmapped_template_records(
-                            &unmapped,
-                            &self.cfg.output_header,
-                        )
-                        .map_err(|e| {
-                            io::Error::other(format!("encode_unmapped_template_records: {e}"))
-                        })?;
+                        let records =
+                            super::encode_unmapped_template_records(&unmapped, &self.tags)
+                                .map_err(|e| {
+                                    io::Error::other(format!(
+                                        "encode_unmapped_template_records: {e}"
+                                    ))
+                                })?;
                         Template::from_records(records).map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -2290,7 +2441,6 @@ pub(crate) mod merge_step {
         use crate::pipeline::core::reorder::BranchOrdering;
         use crate::sam::SamTag;
         use crate::umi::TagInfo;
-        use noodles::sam::Header;
         use std::sync::Arc;
 
         fn make_cfg(exclude: bool) -> ZipperMergeConfig {
@@ -2298,7 +2448,7 @@ pub(crate) mod merge_step {
                 tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
                 skip_tc_tags: true,
                 exclude_missing_reads: exclude,
-                output_header: Arc::new(Header::default()),
+                pg_renames: Arc::default(),
                 missing_count: Arc::new(AtomicU64::new(0)),
                 records_emitted: Arc::new(AtomicU64::new(0)),
                 target_batch_count: 4,
@@ -3778,34 +3928,94 @@ mod tests {
         Ok(())
     }
 
-    /// The unmapped BAM's programs are listed before the mapped BAM's, so the @PG that
-    /// zipper adds chains to the aligner instead of orphaning it.
-    #[rstest]
-    fn test_output_header_chains_zipper_pg_to_aligner(
-        #[values(1, 4)] threads: usize,
-    ) -> Result<()> {
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::Program;
+    /// An @PG record as held in a header.
+    type PgMap =
+        noodles::sam::header::record::value::Map<noodles::sam::header::record::value::map::Program>;
+
+    /// An output @PG record with its ID.
+    type OutputProgram = (String, PgMap);
+
+    /// Builds an input @PG record with the given `PN` and `CL`, and an optional `PP`.
+    fn pg_program(name: &str, command_line: &str, previous: Option<&str>) -> PgMap {
         use noodles::sam::header::record::value::map::program::tag;
 
-        let program = |command_line: &str| {
-            Map::<Program>::builder()
-                .insert(tag::COMMAND_LINE, command_line)
-                .build()
-                .expect("building program map should succeed")
-        };
+        let mut builder =
+            PgMap::builder().insert(tag::NAME, name).insert(tag::COMMAND_LINE, command_line);
+        if let Some(pp) = previous {
+            builder = builder.insert(tag::PREVIOUS_PROGRAM_ID, pp);
+        }
+        builder.build().expect("building program map should succeed")
+    }
 
+    /// The @PG record zipper is expected to add, written out field by field rather than
+    /// through `build_program_record`, so the test does not use the code under test as
+    /// its own oracle.
+    fn expected_zipper_pg(previous: &str) -> PgMap {
+        use noodles::sam::header::record::value::map::program::tag;
+
+        PgMap::builder()
+            .insert(tag::NAME, "fgumi")
+            .insert(tag::VERSION, crate::version::VERSION.as_str())
+            .insert(tag::COMMAND_LINE, "fgumi zipper")
+            .insert(tag::PREVIOUS_PROGRAM_ID, previous)
+            .build()
+            .expect("building program map should succeed")
+    }
+
+    /// Runs zipper on a one-pair input whose unmapped and mapped headers carry exactly the
+    /// given @PG records, and returns the output header's @PG records in header order.
+    fn zipper_output_programs(
+        unmapped_programs: &[(&str, PgMap)],
+        mapped_programs: &[(&str, PgMap)],
+        threads: usize,
+    ) -> Result<Vec<(String, PgMap)>> {
+        let (programs, _) =
+            run_zipper_with_programs(unmapped_programs, mapped_programs, None, None, threads)?;
+        Ok(programs)
+    }
+
+    /// Runs zipper on an input whose unmapped and mapped headers carry exactly the given
+    /// @PG records. Pair `q1` is in both inputs; pair `q2` is unmapped-only, so it is
+    /// written without a merge. Unmapped reads carry `unmapped_read_pg` and mapped reads
+    /// `mapped_read_pg` as their `PG` tag (none when `None`). Returns the output header's
+    /// @PG records in header order and the output records (`q1`'s pair, then `q2`'s).
+    fn run_zipper_with_programs(
+        unmapped_programs: &[(&str, PgMap)],
+        mapped_programs: &[(&str, PgMap)],
+        unmapped_read_pg: Option<&str>,
+        mapped_read_pg: Option<&str>,
+        threads: usize,
+    ) -> Result<(Vec<OutputProgram>, Vec<RecordBuf>)> {
+        let read_attrs = |pg: Option<&str>| {
+            let mut attrs = HashMap::new();
+            if let Some(pg) = pg {
+                attrs.insert("PG", BufValue::from(pg.to_string()));
+            }
+            attrs
+        };
         let mut unmapped = FgSamBuilder::new_unmapped();
         let mut mapped = FgSamBuilder::new_mapped();
-        unmapped.add_pair_with_attrs("q1", None, None, true, true, &HashMap::new());
-        mapped.add_pair_with_attrs("q1", Some(100), Some(200), true, true, &HashMap::new());
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &read_attrs(unmapped_read_pg));
+        unmapped.add_pair_with_attrs("q2", None, None, true, true, &read_attrs(unmapped_read_pg));
+        mapped.add_pair_with_attrs(
+            "q1",
+            Some(100),
+            Some(200),
+            true,
+            true,
+            &read_attrs(mapped_read_pg),
+        );
 
-        let unmapped_programs = unmapped.header.programs_mut().as_mut();
-        unmapped_programs.clear();
-        unmapped_programs.insert("samtools".into(), program("samtools import"));
-        let mapped_programs = mapped.header.programs_mut().as_mut();
-        mapped_programs.clear();
-        mapped_programs.insert("bwa-mem3".into(), program("bwa-mem3 mem"));
+        let programs = unmapped.header.programs_mut().as_mut();
+        programs.clear();
+        for (id, pg) in unmapped_programs {
+            programs.insert((*id).into(), pg.clone());
+        }
+        let programs = mapped.header.programs_mut().as_mut();
+        programs.clear();
+        for (id, pg) in mapped_programs {
+            programs.insert((*id).into(), pg.clone());
+        }
 
         let dir = TempDir::new()?;
         let unmapped_path = dir.path().join("unmapped.bam");
@@ -3834,15 +4044,321 @@ mod tests {
         zipper.execute("fgumi zipper")?;
 
         let header = read_bam_header(&output_path)?;
-        let programs = header.programs();
-        let ids: Vec<String> = programs.as_ref().keys().map(ToString::to_string).collect();
-        assert_eq!(ids, ["samtools", "bwa-mem3", "fgumi"]);
-        let previous_program = programs
+        let programs = header
+            .programs()
             .as_ref()
-            .get(b"fgumi".as_slice())
-            .and_then(|pg| pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID))
-            .map(ToString::to_string);
-        assert_eq!(previous_program.as_deref(), Some("bwa-mem3"));
+            .iter()
+            .map(|(id, pg)| (id.to_string(), pg.clone()))
+            .collect();
+        Ok((programs, read_bam_records(&output_path)?))
+    }
+
+    /// The `PG` tag of every output record, in output order.
+    fn read_pg_tags(records: &[RecordBuf]) -> Vec<Option<String>> {
+        records
+            .iter()
+            .map(|r| match r.data().get(&Tag::from(SamTag::PG)) {
+                Some(BufValue::String(pg)) => Some(pg.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asserts the output @PG records' ordered (ID, PN, PP) triples, which name the record
+    /// that differs when the full-record comparison fails, then every field of every record.
+    fn assert_programs(actual: &[(String, PgMap)], expected: &[(&str, PgMap)]) {
+        use noodles::sam::header::record::value::map::program::tag;
+
+        let field = |pg: &PgMap, key| pg.other_fields().get(&key).map(ToString::to_string);
+        let triples = |id: &str, pg: &PgMap| {
+            (id.to_string(), field(pg, tag::NAME), field(pg, tag::PREVIOUS_PROGRAM_ID))
+        };
+        let actual_triples: Vec<_> = actual.iter().map(|(id, pg)| triples(id, pg)).collect();
+        let expected_triples: Vec<_> = expected.iter().map(|(id, pg)| triples(id, pg)).collect();
+        assert_eq!(actual_triples, expected_triples, "(ID, PN, PP) of the output @PG records");
+
+        let expected: Vec<(String, &PgMap)> =
+            expected.iter().map(|(id, pg)| ((*id).to_string(), pg)).collect();
+        let actual: Vec<(String, &PgMap)> =
+            actual.iter().map(|(id, pg)| (id.clone(), pg)).collect();
+        assert_eq!(actual, expected, "output @PG records");
+    }
+
+    /// The unmapped BAM's programs are listed before the mapped BAM's, so the @PG that
+    /// zipper adds chains to the aligner instead of orphaning it.
+    ///
+    /// Both inputs hold a two-record PP chain, and the mapped chain's leaf (`SortSam`) is
+    /// not the last @PG in header order, so zipper's PP must come from the PP links rather
+    /// than from header order. The input programs pass through verbatim, as fgbio asserts
+    /// in `ZipperBamsTest.scala:137` (`programGroups should contain theSameElementsAs
+    /// Seq(unmappedPg, mappedPg)`); fgbio adds no @PG of its own, so the single fgumi @PG
+    /// is fgumi behavior.
+    #[rstest]
+    fn test_output_header_chains_zipper_pg_to_aligner(
+        #[values(1, 4)] threads: usize,
+    ) -> Result<()> {
+        let samtools = pg_program("samtools", "samtools import", None);
+        let fgbio = pg_program("fgbio", "fgbio FastqToBam", Some("samtools"));
+        let sort = pg_program("SortSam", "SortSam SORT_ORDER=queryname", Some("bwa-mem3"));
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", None);
+
+        let actual = zipper_output_programs(
+            &[("samtools", samtools.clone()), ("fgbio", fgbio.clone())],
+            &[("SortSam", sort.clone()), ("bwa-mem3", bwa.clone())],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[
+                ("samtools", samtools),
+                ("fgbio", fgbio),
+                ("SortSam", sort),
+                ("bwa-mem3", bwa),
+                ("fgumi", expected_zipper_pg("SortSam")),
+            ],
+        );
+        Ok(())
+    }
+
+    /// In the usual `fgumi extract` -> align -> `fgumi zipper` flow the unmapped header
+    /// already holds `ID:fgumi`, so zipper adds `fgumi.1`, chained to the aligner.
+    #[rstest]
+    fn test_output_header_after_fgumi_extract(#[values(1, 4)] threads: usize) -> Result<()> {
+        let extract = pg_program("fgumi", "fgumi extract", None);
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", None);
+
+        let actual = zipper_output_programs(
+            &[("fgumi", extract.clone())],
+            &[("bwa-mem3", bwa.clone())],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[("fgumi", extract), ("bwa-mem3", bwa), ("fgumi.1", expected_zipper_pg("bwa-mem3"))],
+        );
+        Ok(())
+    }
+
+    /// When both inputs carry an @PG with the same ID but different content, both records
+    /// are kept: the unmapped copy gets a fresh ID and the unmapped programs whose PP named
+    /// it follow it, so their provenance is unchanged, and zipper's @PG still chains to
+    /// the aligner side (`samtools view`) rather than to the unmapped `fgumi correct`.
+    /// fgbio fails on this input (htsjdk rejects the duplicate ID).
+    #[rstest]
+    fn test_output_header_renames_conflicting_unmapped_pg(
+        #[values(1, 4)] threads: usize,
+    ) -> Result<()> {
+        let import = pg_program("samtools", "samtools import", None);
+        let correct = pg_program("fgumi", "fgumi correct", Some("samtools"));
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", None);
+        let view = pg_program("samtools", "samtools view", Some("bwa-mem3"));
+
+        let actual = zipper_output_programs(
+            &[("samtools", import.clone()), ("fgumi", correct)],
+            &[("bwa-mem3", bwa.clone()), ("samtools", view.clone())],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[
+                ("samtools.1", import),
+                ("fgumi", pg_program("fgumi", "fgumi correct", Some("samtools.1"))),
+                ("bwa-mem3", bwa),
+                ("samtools", view),
+                ("fgumi.1", expected_zipper_pg("samtools")),
+            ],
+        );
+        Ok(())
+    }
+
+    /// An @PG record present, identical, in both inputs is written once, in the mapped
+    /// BAM's position, and unmapped programs that name it keep pointing at it.
+    #[rstest]
+    fn test_output_header_dedups_identical_shared_pg(#[values(1, 4)] threads: usize) -> Result<()> {
+        let import = pg_program("samtools", "samtools import", None);
+        let extract = pg_program("fgumi", "fgumi extract", Some("samtools"));
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", Some("samtools"));
+
+        let actual = zipper_output_programs(
+            &[("samtools", import.clone()), ("fgumi", extract.clone())],
+            &[("samtools", import.clone()), ("bwa-mem3", bwa.clone())],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[
+                ("fgumi", extract),
+                ("samtools", import),
+                ("bwa-mem3", bwa),
+                ("fgumi.1", expected_zipper_pg("bwa-mem3")),
+            ],
+        );
+        Ok(())
+    }
+
+    /// The fresh ID given to a conflicting unmapped @PG skips every ID already used in
+    /// either input: `samtools.1` is taken by the mapped header and `samtools.2` by the
+    /// unmapped one, so the unmapped `samtools` becomes `samtools.3`.
+    #[rstest]
+    fn test_output_header_rename_skips_existing_ids(#[values(1, 4)] threads: usize) -> Result<()> {
+        let import = pg_program("samtools", "samtools import", None);
+        let unmapped_view = pg_program("samtools", "samtools view -b", Some("samtools"));
+        let extract = pg_program("fgumi", "fgumi extract", Some("samtools.2"));
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", None);
+        let mapped_view = pg_program("samtools", "samtools view", Some("bwa-mem3"));
+        let sort = pg_program("samtools", "samtools sort -n", Some("samtools"));
+
+        let actual = zipper_output_programs(
+            &[
+                ("samtools", import.clone()),
+                ("samtools.2", unmapped_view),
+                ("fgumi", extract.clone()),
+            ],
+            &[
+                ("bwa-mem3", bwa.clone()),
+                ("samtools", mapped_view.clone()),
+                ("samtools.1", sort.clone()),
+            ],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[
+                ("samtools.3", import),
+                ("samtools.2", pg_program("samtools", "samtools view -b", Some("samtools.3"))),
+                ("fgumi", extract),
+                ("bwa-mem3", bwa),
+                ("samtools", mapped_view),
+                ("samtools.1", sort),
+                ("fgumi.1", expected_zipper_pg("samtools.1")),
+            ],
+        );
+        Ok(())
+    }
+
+    /// A rename can make a record that matched its mapped namesake differ from it: the
+    /// unmapped `fgumi` names `PP:samtools` exactly like the mapped one, but once the
+    /// conflicting unmapped `samtools` is renamed its PP becomes `samtools.1`, so it too
+    /// needs a fresh ID. `fgumi` is listed before `samtools` so that a single pass in header
+    /// order would miss it.
+    #[rstest]
+    fn test_output_header_rename_cascades_through_pp(#[values(1, 4)] threads: usize) -> Result<()> {
+        let extract = pg_program("fgumi", "fgumi extract", Some("samtools"));
+        let unmapped_import = pg_program("samtools", "samtools import", None);
+        let mapped_import = pg_program("samtools", "samtools import -O bam", None);
+        let bwa = pg_program("bwa-mem3", "bwa-mem3 mem", Some("fgumi"));
+
+        let actual = zipper_output_programs(
+            &[("fgumi", extract.clone()), ("samtools", unmapped_import.clone())],
+            &[
+                ("samtools", mapped_import.clone()),
+                ("fgumi", extract.clone()),
+                ("bwa-mem3", bwa.clone()),
+            ],
+            threads,
+        )?;
+
+        assert_programs(
+            &actual,
+            &[
+                ("fgumi.1", pg_program("fgumi", "fgumi extract", Some("samtools.1"))),
+                ("samtools.1", unmapped_import),
+                ("samtools", mapped_import),
+                ("fgumi", extract),
+                ("bwa-mem3", bwa),
+                ("fgumi.2", expected_zipper_pg("bwa-mem3")),
+            ],
+        );
+        Ok(())
+    }
+
+    /// A `PG` tag copied from an unmapped read follows its @PG record when the output
+    /// header renames it, so the read still names the program that produced it. Inputs
+    /// are the `renames_conflicting_unmapped_pg` headers: the unmapped `samtools`
+    /// (`samtools import`) becomes `samtools.1`, and the mapped `samtools` (`samtools
+    /// view`) keeps its ID. A mapped read's own `PG` is kept, and the unmapped `PG` is
+    /// copied only when the mapped read has none (fgbio `ZipperBams.copyTags`). An
+    /// unmapped-only read is written without a merge, and its own `PG` follows the rename
+    /// the same way.
+    #[rstest]
+    #[case::renamed_id_follows_rename(
+        Some("samtools"),
+        None,
+        Some("samtools.1"),
+        Some("samtools.1")
+    )]
+    #[case::unrenamed_id_kept(Some("fgumi"), None, Some("fgumi"), Some("fgumi"))]
+    #[case::unknown_id_kept(Some("unknown"), None, Some("unknown"), Some("unknown"))]
+    #[case::mapped_pg_wins(
+        Some("samtools"),
+        Some("bwa-mem3"),
+        Some("bwa-mem3"),
+        Some("samtools.1")
+    )]
+    #[case::mapped_pg_naming_shared_id_kept(None, Some("samtools"), Some("samtools"), None)]
+    #[case::no_pg(None, None, None, None)]
+    fn test_read_pg_tag_follows_renamed_unmapped_pg(
+        #[case] unmapped_read_pg: Option<&str>,
+        #[case] mapped_read_pg: Option<&str>,
+        #[case] expected_merged_pg: Option<&str>,
+        #[case] expected_unmapped_only_pg: Option<&str>,
+        #[values(1, 4)] threads: usize,
+    ) -> Result<()> {
+        let (programs, records) = run_zipper_with_programs(
+            &[
+                ("samtools", pg_program("samtools", "samtools import", None)),
+                ("fgumi", pg_program("fgumi", "fgumi correct", Some("samtools"))),
+            ],
+            &[
+                ("bwa-mem3", pg_program("bwa-mem3", "bwa-mem3 mem", None)),
+                ("samtools", pg_program("samtools", "samtools view", Some("bwa-mem3"))),
+            ],
+            unmapped_read_pg,
+            mapped_read_pg,
+            threads,
+        )?;
+
+        let ids: Vec<&str> = programs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["samtools.1", "fgumi", "bwa-mem3", "samtools", "fgumi.1"]);
+        let merged = expected_merged_pg.map(str::to_string);
+        let unmapped_only = expected_unmapped_only_pg.map(str::to_string);
+        assert_eq!(
+            read_pg_tags(&records),
+            [merged.clone(), merged, unmapped_only.clone(), unmapped_only]
+        );
+        Ok(())
+    }
+
+    /// A read `PG` naming an unmapped @PG renamed only on a later pass (the
+    /// `rename_cascades_through_pp` headers, where `fgumi` becomes `fgumi.1` because its
+    /// PP `samtools` was renamed) is rewritten too, on merged and unmapped-only reads.
+    #[rstest]
+    fn test_read_pg_tag_follows_cascaded_rename(#[values(1, 4)] threads: usize) -> Result<()> {
+        let extract = pg_program("fgumi", "fgumi extract", Some("samtools"));
+        let (programs, records) = run_zipper_with_programs(
+            &[
+                ("fgumi", extract.clone()),
+                ("samtools", pg_program("samtools", "samtools import", None)),
+            ],
+            &[
+                ("samtools", pg_program("samtools", "samtools import -O bam", None)),
+                ("fgumi", extract),
+                ("bwa-mem3", pg_program("bwa-mem3", "bwa-mem3 mem", Some("fgumi"))),
+            ],
+            Some("fgumi"),
+            None,
+            threads,
+        )?;
+
+        let ids: Vec<&str> = programs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["fgumi.1", "samtools.1", "samtools", "fgumi", "bwa-mem3", "fgumi.2"]);
+        let expected = Some("fgumi.1".to_string());
+        assert_eq!(read_pg_tags(&records), vec![expected; 4]);
         Ok(())
     }
 
