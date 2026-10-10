@@ -136,7 +136,7 @@ impl PooledBamWriter {
 
     /// Build the writer over an already-open output sink. The I/O thread
     /// closes the sink once the stream is written (see [`OutputSink::close`]),
-    /// so a sync or close failure is returned by `finish`/`finish_index`.
+    /// so a close failure is returned by `finish`/`finish_index`.
     fn from_sink(
         pool: Arc<SortWorkerPool>,
         sink: Box<dyn OutputSink>,
@@ -428,7 +428,7 @@ mod tests {
     }
 
     /// An in-memory [`OutputSink`] that counts closes and can fail its close,
-    /// modelling write-back (or an NFS flush) failing only at close.
+    /// modelling an error reported at close (such as an NFS flush failing).
     #[derive(Clone, Default)]
     struct CloseProbe {
         written: Arc<std::sync::Mutex<Vec<u8>>>,

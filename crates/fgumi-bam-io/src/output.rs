@@ -1,16 +1,24 @@
 //! Output sinks whose close is checked.
 //!
 //! Dropping a [`File`] closes its descriptor and discards the result, and
-//! `File::flush` is a no-op on Unix. So an error the OS reports only after the
-//! last `write` (deferred write-back failing with `EIO`, or `ENOSPC`/`EDQUOT` on
-//! an NFS mount, which flushes dirty pages at `close`) is lost, and the command
-//! exits zero with a short or corrupt output.
+//! `File::flush` is a no-op on Unix. So an error the OS reports only at `close`
+//! (`ENOSPC`/`EDQUOT` or `EIO` on an NFS mount, which flushes dirty pages
+//! there) is lost, and the command exits zero with a short or corrupt output.
 //!
-//! [`OutputFile`] owns an output file and finishes it with [`OutputFile::close`]:
-//! `sync_data` (regular files only), then a checked `close(2)`. This follows
-//! htslib's `bgzf_close`, which syncs through `hflush` and then checks `close`;
-//! like htslib, a sync the file or filesystem does not support is skipped
-//! rather than failed (see [`OutputFile::close`]).
+//! [`OutputFile`] owns an output file and finishes it with [`OutputFile::close`],
+//! a checked `close(2)`. It deliberately does not sync the file's data to
+//! storage first, as fgumi 0.7.0 did not. This differs from htslib (and so
+//! samtools), whose `bgzf_close` reaches `fdatasync` through `hflush`. Syncing
+//! made the final close wait out the whole write-back: closing a 49 GB
+//! coordinate-sorted output took 61.5 s with the sync against 20-28 s without
+//! it (c7g.4xlarge, gp3). Durability against a host crash is the caller's job
+//! (e.g. `sync` after the command). The cost is that a write-back error the OS
+//! reports only after the close is not seen; one reported at the close itself
+//! still fails the command.
+//!
+//! Two outputs outside this module do sync, each for its own reason: the
+//! metrics writer's temp-and-rename (`fgumi-metrics`, small files) and
+//! `review`'s staged grouped BAM.
 //! [`OutputSink`] is the type-erased form, so a writer that may target either a
 //! file or stdout can be finished the same way; [`open_output_sink`] opens one
 //! for a path, honouring `-` and `/dev/stdout`.
@@ -30,12 +38,11 @@ use crate::paths::is_stdout_path;
 /// without closing it releases it but discards any error, so drop only on an
 /// abort path where the output is already known to be bad.
 pub trait OutputSink: Write + Send {
-    /// Flush, make the data durable where applicable, and release the sink,
-    /// returning the first error encountered.
+    /// Flush and release the sink, returning the first error encountered.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing, syncing, or closing fails.
+    /// Returns an error if flushing or closing fails.
     fn close(self: Box<Self>) -> io::Result<()>;
 }
 
@@ -45,7 +52,7 @@ impl<S: OutputSink + ?Sized> OutputSink for Box<S> {
     }
 }
 
-/// Stdout cannot be closed or synced, so closing it only flushes. Used only
+/// Stdout cannot be closed, so closing it only flushes. Used only
 /// where stdout cannot be duplicated (targets without file descriptors); on
 /// Unix [`open_output_sink`] returns a checked duplicate instead.
 impl OutputSink for Stdout {
@@ -54,8 +61,8 @@ impl OutputSink for Stdout {
     }
 }
 
-/// An output file that is closed with its errors checked, and synced first
-/// unless created with [`OutputFile::unsynced`].
+/// An output file that is closed with its errors checked. Its data is not
+/// synced to storage.
 ///
 /// Created with [`OutputFile::create`] or wrapped around an open [`File`] with
 /// [`From`]. Writes go straight to the file (wrap it in a [`BufWriter`] for
@@ -64,7 +71,6 @@ impl OutputSink for Stdout {
 #[derive(Debug)]
 pub struct OutputFile {
     file: File,
-    sync: bool,
 }
 
 impl OutputFile {
@@ -77,42 +83,25 @@ impl OutputFile {
         File::create(path).map(Self::from)
     }
 
-    /// Wrap `file` so that [`close`](Self::close) checks the close but does
-    /// not sync: for a descriptor whose data is synced elsewhere, or that this
-    /// process does not own (a duplicate of stdout, whose redirect target is
-    /// the shell's file).
-    #[must_use]
-    pub fn unsynced(file: File) -> Self {
-        Self { file, sync: false }
-    }
-
-    /// Sync the file's data to storage if it is a regular file, then close it,
-    /// returning any error either step reports.
+    /// Close the file, returning any error `close(2)` reports.
     ///
-    /// Syncing is skipped for pipes, character devices (e.g. `/dev/null`), and
-    /// other non-regular files, and for a file created with
-    /// [`unsynced`](Self::unsynced). A sync that fails with `EINVAL`,
-    /// `ENOTSUP`, `EOPNOTSUPP` or `ENOTTY` (the file or filesystem does not
-    /// support it, e.g. `F_FULLFSYNC` on some network mounts on macOS) is
-    /// logged and skipped, as htslib does; any other sync error is returned. On Unix an
-    /// `EINTR` from `close` is treated as success: the descriptor is released
-    /// regardless, and retrying could close a descriptor another thread has
-    /// since opened.
-    ///
-    /// The file is closed even when the sync fails; the sync's error is then
-    /// the one returned.
+    /// The data is not synced to storage first, so an error the OS defers past
+    /// the close (write-back failing after it) is not seen; one reported at the
+    /// close itself (e.g. `ENOSPC`/`EDQUOT` on NFS) is. On Unix an `EINTR` from
+    /// `close` is treated as success: the descriptor is released regardless,
+    /// and retrying could close a descriptor another thread has since opened.
     ///
     /// # Errors
     ///
-    /// Returns an error if the sync or the close fails.
+    /// Returns an error if the close fails.
     pub fn close(self) -> io::Result<()> {
-        if self.sync { sync_then_close(self.file, sync_if_regular) } else { close_file(self.file) }
+        close_file(self.file)
     }
 }
 
 impl From<File> for OutputFile {
     fn from(file: File) -> Self {
-        Self { file, sync: true }
+        Self { file }
     }
 }
 
@@ -154,9 +143,8 @@ pub fn close_buffered<W: OutputSink>(writer: BufWriter<W>) -> io::Result<()> {
 /// `\n`; binary output such as BGZF carries `0x0a` at arbitrary offsets, so a
 /// large flush would be torn into many small writes. Its close is checked (on
 /// NFS every `close(2)` flushes the file's dirty pages, so a `> out.bam`
-/// redirect onto a full or failing mount reports the error there) but it is
-/// not synced: stdout is usually a pipe, and a redirect target is the shell's
-/// file, not ours. The duplicate is closed, never fd 1 itself.
+/// redirect onto a full or failing mount reports the error there). The
+/// duplicate is closed, never fd 1 itself.
 ///
 /// # Errors
 ///
@@ -178,7 +166,7 @@ fn block_buffered_stdout() -> io::Result<Box<dyn OutputSink>> {
     use std::os::fd::AsFd;
 
     let dup = io::stdout().as_fd().try_clone_to_owned()?;
-    Ok(Box::new(OutputFile::unsynced(File::from(dup))))
+    Ok(Box::new(OutputFile::from(File::from(dup))))
 }
 
 /// Stdout itself: targets without file descriptors cannot duplicate it, so the
@@ -189,14 +177,20 @@ fn block_buffered_stdout() -> io::Result<Box<dyn OutputSink>> {
     Ok(Box::new(io::stdout()))
 }
 
-/// Finish a temp file and atomically rename it onto `dest`: `close` releases
-/// the temp's own handle (e.g. `|f| OutputFile::from(f).close()` to sync and
-/// close it), and only once that succeeds is the temp renamed.
+/// Finish a temp file and rename it onto `dest`: `close` releases the temp's
+/// own handle, and only once that succeeds is the temp renamed.
 ///
-/// So a write-back or close error fails the write instead of leaving a renamed
-/// but incomplete file at `dest`. On any error the temp is removed and `dest`
-/// is left untouched. Re-stamp the temp's mode (`restamp_for_persist`) before
-/// calling this.
+/// Production callers pass `|f| OutputFile::from(f).close()`; `close` is a
+/// parameter so tests (here and in `fgumi-sort`) can inject a close failure,
+/// which a real file cannot be made to produce portably.
+///
+/// So a close error fails the write instead of leaving a renamed but
+/// incomplete file at `dest`. On any error the temp is removed and `dest` is
+/// left untouched. The rename is atomic with respect to a failure of this
+/// process only: the data is not synced before it, so after a host crash or
+/// power loss the rename can be durable ahead of the data, leaving an
+/// incomplete file at `dest`. Re-stamp the temp's mode (`restamp_for_persist`)
+/// before calling this.
 ///
 /// # Errors
 ///
@@ -208,74 +202,12 @@ where
     let (file, temp_path) = tmp.into_parts();
     // On error `temp_path` is dropped, removing the temp.
     close(file).with_context(|| {
-        format!("Failed to sync/close temp file before renaming onto: {}", dest.display())
+        format!("Failed to close temp file before renaming onto: {}", dest.display())
     })?;
     temp_path
         .persist(dest)
         .map_err(|e| e.error)
         .with_context(|| format!("Failed to rename temp file onto: {}", dest.display()))
-}
-
-/// Run `sync` on `file`, then close it even if the sync failed, returning the
-/// sync's error first.
-fn sync_then_close<F>(file: File, sync: F) -> io::Result<()>
-where
-    F: FnOnce(&File) -> io::Result<bool>,
-{
-    let synced = sync(&file);
-    let closed = close_file(file);
-    synced.and(closed)
-}
-
-/// Sync `file`'s data to storage if it is a regular file. Returns whether a
-/// sync was performed.
-fn sync_if_regular(file: &File) -> io::Result<bool> {
-    sync_regular_with(file, File::sync_data)
-}
-
-/// [`sync_if_regular`] with the sync call supplied, so tests can make it fail.
-fn sync_regular_with<F>(file: &File, sync: F) -> io::Result<bool>
-where
-    F: FnOnce(&File) -> io::Result<()>,
-{
-    if !file.metadata()?.file_type().is_file() {
-        return Ok(false);
-    }
-    match sync(file) {
-        Ok(()) => Ok(true),
-        Err(e) if sync_unsupported(&e) => {
-            log::debug!("output file does not support sync; skipping it: {e}");
-            Ok(false)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Whether a sync error means the file or filesystem cannot be synced, rather
-/// than that the data failed to reach storage.
-///
-/// Matches htslib's `fd_flush` (`hfile.c`), which `bgzf_close` reaches through
-/// `hflush`: it ignores `EINVAL` (e.g. a pipe) and `ENOTSUP` ("operation-not-
-/// supported errors (Mac OS X)") from `fdatasync`/`fsync` and fails on any
-/// other error. `EOPNOTSUPP` is included because it is a distinct value from
-/// `ENOTSUP` on macOS and the BSDs (Linux defines them equal). On macOS std's
-/// `sync_data` is `fcntl(F_FULLFSYNC)`, which filesystems without it reject
-/// with `ENOTSUP` (e.g. SMB mounts) or, where the filesystem has no handler
-/// for the request at all, `ENOTTY`; htslib does not see `ENOTTY` because it
-/// calls plain `fsync`, so it is added here.
-#[cfg(unix)]
-fn sync_unsupported(e: &io::Error) -> bool {
-    use nix::errno::Errno;
-
-    let unsupported = [Errno::EINVAL, Errno::ENOTSUP, Errno::EOPNOTSUPP, Errno::ENOTTY];
-    e.raw_os_error().is_some_and(|code| unsupported.iter().any(|&errno| errno as i32 == code))
-}
-
-/// Whether a sync error means the file cannot be synced. Targets without
-/// errno values report it only as [`io::ErrorKind::Unsupported`].
-#[cfg(not(unix))]
-fn sync_unsupported(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::Unsupported
 }
 
 /// Close `file`, returning the error `close(2)` reports.
@@ -317,8 +249,8 @@ pub(crate) mod test_support {
     pub(crate) const CLOSE_ERROR: &str = "input/output error at close";
 
     /// An in-memory [`OutputSink`] that records its bytes, counts closes, and
-    /// can fail its writes or its close (modelling write-back, or an NFS
-    /// flush, failing only when the file is closed). Clones share state.
+    /// can fail its writes or its close (modelling an error reported at close,
+    /// such as an NFS flush failing). Clones share state.
     #[derive(Clone, Default)]
     pub(crate) struct CloseProbe {
         pub(crate) written: Arc<Mutex<Vec<u8>>>,
@@ -383,69 +315,8 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
     }
 
-    #[test]
-    fn test_sync_if_regular_syncs_only_regular_files() {
-        let tmp = tempfile::tempfile().unwrap();
-        assert!(sync_if_regular(&tmp).unwrap(), "a regular file must be synced");
-
-        #[cfg(unix)]
-        {
-            let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
-            assert!(!sync_if_regular(&dev_null).unwrap(), "/dev/null must not be synced");
-
-            let (_reader, writer) = std::io::pipe().unwrap();
-            let pipe = File::from(std::os::fd::OwnedFd::from(writer));
-            assert!(!sync_if_regular(&pipe).unwrap(), "a pipe must not be synced");
-        }
-    }
-
-    /// The sync errors htslib treats as "sync not supported" skip the sync;
-    /// every other sync error (EIO, ENOSPC, EDQUOT, ...) is fatal.
-    #[cfg(unix)]
-    #[test]
-    fn test_sync_unsupported_classifies_errnos() {
-        use nix::errno::Errno;
-
-        for errno in [Errno::EINVAL, Errno::ENOTSUP, Errno::EOPNOTSUPP, Errno::ENOTTY] {
-            let err = io::Error::from_raw_os_error(errno as i32);
-            assert!(sync_unsupported(&err), "{errno} means sync is unsupported");
-        }
-        for errno in [Errno::EIO, Errno::ENOSPC, Errno::EDQUOT, Errno::EBADF] {
-            let err = io::Error::from_raw_os_error(errno as i32);
-            assert!(!sync_unsupported(&err), "{errno} must stay fatal");
-        }
-        assert!(!sync_unsupported(&io::Error::other("no errno")));
-    }
-
-    /// A regular file whose sync is unsupported is reported as not synced, and
-    /// closing it still succeeds with its bytes on disk; a real sync failure on
-    /// a regular file still fails the close.
-    #[cfg(unix)]
-    #[test]
-    fn test_unsupported_sync_is_skipped_and_close_still_checked() {
-        use nix::errno::Errno;
-
-        let dir = tempfile::tempdir().unwrap();
-        for errno in [Errno::EINVAL, Errno::ENOTSUP, Errno::EOPNOTSUPP, Errno::ENOTTY] {
-            let path = dir.path().join(format!("{errno}.txt"));
-            let mut file = File::create(&path).unwrap();
-            file.write_all(b"data").unwrap();
-            let fail = |_: &File| Err(io::Error::from_raw_os_error(errno as i32));
-            assert!(!sync_regular_with(&file, fail).unwrap(), "{errno}: not synced");
-            sync_then_close(file, |f| sync_regular_with(f, fail))
-                .unwrap_or_else(|e| panic!("{errno}: an unsupported sync must not fail: {e}"));
-            assert_eq!(std::fs::read(&path).unwrap(), b"data");
-        }
-
-        let file = tempfile::tempfile().unwrap();
-        let eio = |_: &File| Err(io::Error::from_raw_os_error(Errno::EIO as i32));
-        let err = sync_then_close(file, |f| sync_regular_with(f, eio))
-            .expect_err("EIO from sync must surface");
-        assert_eq!(err.raw_os_error(), Some(Errno::EIO as i32));
-    }
-
-    /// Closing an output that is not a regular file must still succeed: syncing
-    /// a pipe or `/dev/null` fails (`EINVAL`, or `ENOTSUP`/`ENOTTY` on macOS).
+    /// Closing an output that is not a regular file (a pipe, `/dev/null`) must
+    /// succeed.
     #[cfg(unix)]
     #[test]
     fn test_output_file_close_succeeds_on_non_regular_files() {
@@ -496,8 +367,8 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::EBADF as i32), "{err}");
     }
 
-    /// The same failure through the public API, synced or not: an
-    /// `OutputFile` whose descriptor is no longer valid must not close cleanly.
+    /// The same failure through the public API: an `OutputFile` whose
+    /// descriptor is no longer valid must not close cleanly.
     #[cfg(unix)]
     #[test]
     fn test_output_file_close_surfaces_error() {
@@ -507,42 +378,23 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        for (name, wrap) in [
-            ("synced", OutputFile::from as fn(File) -> OutputFile),
-            ("unsynced", OutputFile::unsynced),
-        ] {
-            let file = File::create(dir.path().join(name)).unwrap();
-            let fd = file.as_raw_fd();
-            let out = wrap(file);
-            nix::unistd::close(fd).unwrap();
-            let err = out.close().expect_err("closing a closed descriptor must fail");
-            assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::EBADF as i32), "{name}: {err}");
-        }
+        let file = File::create(dir.path().join("out.txt")).unwrap();
+        let fd = file.as_raw_fd();
+        let out = OutputFile::from(file);
+        nix::unistd::close(fd).unwrap();
+        let err = out.close().expect_err("closing a closed descriptor must fail");
+        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::EBADF as i32), "{err}");
     }
 
-    /// A failed sync is reported even though the close that follows succeeds,
-    /// and the file is still closed (its bytes are on disk).
-    #[test]
-    fn test_sync_error_surfaces_when_close_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.txt");
-        let mut file = File::create(&path).unwrap();
-        file.write_all(b"data").unwrap();
-        let err = sync_then_close(file, |_| Err(io::Error::from_raw_os_error(5)))
-            .expect_err("a sync error must surface");
-        assert_eq!(err.raw_os_error(), Some(5));
-        assert_eq!(std::fs::read(&path).unwrap(), b"data");
-    }
-
-    /// An unsynced file (the stdout duplicate) is flushed and its descriptor
-    /// released on close; a pipe stands in for stdout so the bytes can be read
-    /// back.
+    /// A boxed output file (the stdout duplicate) is flushed and its
+    /// descriptor released on close; a pipe stands in for stdout so the bytes
+    /// can be read back.
     #[cfg(unix)]
     #[test]
-    fn test_unsynced_close_flushes_and_closes() {
+    fn test_boxed_output_file_close_flushes_and_closes() {
         let (mut reader, writer) = std::io::pipe().unwrap();
         let mut sink: Box<dyn OutputSink> =
-            Box::new(OutputFile::unsynced(File::from(std::os::fd::OwnedFd::from(writer))));
+            Box::new(OutputFile::from(File::from(std::os::fd::OwnedFd::from(writer))));
         sink.write_all(b"to stdout").unwrap();
         sink.close().expect("closing the stdout duplicate must succeed");
         // EOF is seen only once the duplicate (the pipe's last writer) is closed.
@@ -551,13 +403,79 @@ mod tests {
         assert_eq!(received, b"to stdout");
     }
 
-    /// An unsynced file is closed without syncing it.
+    /// fgumi's outputs must not sync their data to storage on close: on a large
+    /// output that waits out the whole write-back (61.5 s against 20-28 s to
+    /// close a 49 GB coordinate-sorted output).
+    ///
+    /// A sync leaves no trace a test can observe without a seam built only for
+    /// it, so this scans the source of every crate in the workspace (`src/` and
+    /// `crates/`, production and test code alike) for a sync call. The only
+    /// syncs allowed are the [`ALLOWED_SYNCS`] exceptions, and each must still
+    /// be present, so the list cannot go stale. Outside the workspace (e.g. a
+    /// packaged crate) there is no source tree to scan and the test is skipped.
     #[test]
-    fn test_unsynced_output_file_skips_sync() {
-        let out = OutputFile::unsynced(tempfile::tempfile().unwrap());
-        assert!(!out.sync);
-        out.close().unwrap();
-        assert!(OutputFile::from(tempfile::tempfile().unwrap()).sync);
+    fn test_workspace_issues_no_unlisted_sync() {
+        // Spelled in pieces so this test does not match itself.
+        let calls = [
+            concat!("sync", "_data"),
+            concat!("sync", "_all"),
+            concat!("fdata", "sync"),
+            concat!("f", "sync"),
+            concat!("F_FULL", "FSYNC"),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !root.join("crates/fgumi-bam-io/src/output.rs").is_file() {
+            eprintln!("skipped: not built inside the fgumi workspace");
+            return;
+        }
+        let mut files = Vec::new();
+        collect_rust_files(&root.join("src"), &mut files);
+        collect_rust_files(&root.join("crates"), &mut files);
+        assert!(
+            files.len() > 50,
+            "found only {} source files under {}",
+            files.len(),
+            root.display()
+        );
+
+        let mut found: Vec<(String, String)> = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).unwrap();
+            let rel = file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+            for line in source.lines().filter(|line| !line.trim_start().starts_with("//")) {
+                for call in calls.iter().filter(|call| line.contains(**call)) {
+                    found.push((rel.clone(), (*call).to_string()));
+                }
+            }
+        }
+        found.sort();
+        let mut allowed: Vec<(String, String)> =
+            ALLOWED_SYNCS.iter().map(|(f, c)| ((*f).to_string(), (*c).to_string())).collect();
+        allowed.sort();
+        assert_eq!(found, allowed, "sync calls in the workspace differ from ALLOWED_SYNCS");
+    }
+
+    /// The syncs fgumi does issue: `(path from the workspace root, call)`.
+    const ALLOWED_SYNCS: &[(&str, &str)] = &[
+        // Metrics temp-and-rename: small files, synced so a host crash cannot
+        // persist the rename ahead of the data.
+        ("crates/fgumi-metrics/src/writer.rs", concat!("sync", "_all")),
+        // `review`'s staged grouped BAM.
+        ("src/lib/commands/review.rs", concat!("sync", "_all")),
+    ];
+
+    /// Append every `.rs` file under `dir` to `files`, skipping build output.
+    fn collect_rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "target") {
+                    collect_rust_files(&path, files);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
     }
 
     /// Both spellings of stdout open a sink that closes cleanly.
@@ -658,7 +576,7 @@ mod tests {
         let err = persist_after_close(tmp, &dest, |_| Err(io::Error::other(CLOSE_ERROR)))
             .expect_err("a close error must fail the write");
         assert!(format!("{err:#}").contains(CLOSE_ERROR), "{err:#}");
-        assert!(format!("{err:#}").contains("sync/close"), "{err:#}");
+        assert!(format!("{err:#}").contains("Failed to close temp file"), "{err:#}");
         assert_eq!(std::fs::read(&dest).unwrap(), b"previous");
         assert!(!temp_path.exists(), "the temp must be removed");
     }

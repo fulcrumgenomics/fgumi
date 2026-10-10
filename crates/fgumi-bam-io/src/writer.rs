@@ -162,15 +162,15 @@ impl Write for BgzfWriterEnum {
 
 impl BgzfWriterEnum {
     /// Finish the stream: flush buffered data, write the BGZF EOF block, then
-    /// flush and close the underlying sink (see [`OutputSink::close`]; a file is
-    /// synced to storage and its close checked).
+    /// flush and close the underlying sink (see [`OutputSink::close`]; a file's
+    /// close is checked).
     ///
     /// Always call this rather than dropping the writer: a drop also writes the
     /// EOF block, but discards any error doing so, and does not check the close.
     ///
     /// # Errors
-    /// Returns an error if flushing, writing the EOF block, or flushing,
-    /// syncing, or closing the underlying sink fails.
+    /// Returns an error if flushing, writing the EOF block, or flushing or
+    /// closing the underlying sink fails.
     pub fn finish(self) -> io::Result<()> {
         let mut inner = match self.inner {
             // On error, noodles' `Drop` retries the EOF write (ignoring its
@@ -985,8 +985,8 @@ impl IndexingBamWriter {
         self.bai.resolve()
     }
 
-    /// Finish writing, flush the BGZF stream, close the output file (synced to
-    /// storage, close checked), and return the index.
+    /// Finish writing, flush the BGZF stream, close the output file (close
+    /// checked), and return the index.
     ///
     /// # Errors
     /// Returns an error if flushing, finalizing, closing the output, or
@@ -1147,16 +1147,19 @@ pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
 /// # Errors
 /// Returns an error if the file cannot be created or writing the index fails.
 ///
-/// The write is atomic: the serialized index is written to a temporary file in
-/// the destination directory, synced and closed, and then renamed onto `path`,
-/// so a failure partway through never leaves a truncated or partial `.bai` at
-/// the final path (a half-written index parses as valid but silently
-/// mis-answers queries).
+/// The serialized index is written to a temporary file in the destination
+/// directory, closed, and then renamed onto `path`, so a failure of this
+/// process partway through never leaves a truncated or partial `.bai` at the
+/// final path (a half-written index parses as valid but silently mis-answers
+/// queries). The data is not synced before the rename, so this does not hold
+/// across a host crash or power loss (see [`persist_after_close`](crate::persist_after_close)).
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     write_bai_index_with(path.as_ref(), index, |file| OutputFile::from(file).close())
 }
 
-/// [`write_bai_index`] with the temp's close supplied, so tests can make it fail.
+/// [`write_bai_index`] with the temp's close supplied. Production always passes
+/// a checked [`OutputFile`] close; the parameter exists so tests can make the
+/// close fail.
 fn write_bai_index_with<F>(path_ref: &Path, index: &bai::Index, close: F) -> Result<()>
 where
     F: FnOnce(File) -> io::Result<()>,
@@ -1188,7 +1191,7 @@ where
     // sidecar would otherwise be `0600` while the BAM it indexes is `0644`.
     crate::fs_mode::restamp_for_persist(tmp.as_file(), path_ref)
         .with_context(|| format!("Failed to set mode on index temp for: {}", path_ref.display()))?;
-    // Sync and close the temp before the rename, so a write-back or close error
+    // Close the temp before the rename, so a close error
     // fails the write rather than leaving a renamed but incomplete index.
     crate::output::persist_after_close(tmp, path_ref, close)
         .with_context(|| format!("Failed to persist index to: {}", path_ref.display()))
@@ -1295,9 +1298,9 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 /// [`File`] — rather than [`std::io::Stdout`], whose `LineWriter` would tear
 /// every BGZF flush at each `0x0a`.
 ///
-/// Finish the returned sink with [`OutputSink::close`]: a file is synced to
-/// storage and its close checked (see [`OutputFile`]); for stdout the
-/// duplicated descriptor is flushed and its close checked, but not synced.
+/// Finish the returned sink with [`OutputSink::close`]: a file's close is
+/// checked (see [`OutputFile`]); for stdout the duplicated descriptor is
+/// flushed and its close checked.
 /// Dropping it instead discards any error the close would report.
 ///
 /// # Errors
