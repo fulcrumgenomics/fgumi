@@ -293,14 +293,15 @@ of records) and a safe rewrite measurably regresses sort throughput.
 
 ### Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)
 
-The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`)
-inflates BGZF blocks in parallel straight into one shared arena segment and scans
-the records in place. It calls the two approved `SegmentedBuf` methods above
-(`grow_uninit`, `slice_mut`) at three production `#[allow(unsafe_code)]` sites,
-under their documented contracts. Approved for the same reason as those methods:
-the ingest runs once per BGZF block over millions of blocks, and the safe
-alternatives (zero-filling the segment, or inflating into an owned buffer and
-copying it into the arena) add a full extra pass over every inflated byte.
+The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`
+and `sort/arena_split.rs`) inflates BGZF blocks in parallel straight into one
+shared arena segment and scans the records in place. It calls the two approved
+`SegmentedBuf` methods above (`grow_uninit`, `slice_mut`) at four production
+`#[allow(unsafe_code)]` sites, under their documented contracts. Approved for
+the same reason as those methods: the ingest runs once per BGZF block over
+millions of blocks, and the safe alternatives (zero-filling the segment, or
+inflating into an owned buffer and copying it into the arena) add a full extra
+pass over every inflated byte.
 
 - `ReadBlocks::ensure_arena` — one `grow_uninit(segment_size)` that grows the
   whole segment once, on the serial admit path, before the arena is wrapped in an
@@ -313,14 +314,24 @@ copying it into the arena) add a full extra pass over every inflated byte.
   slot. SAFETY: the slot was grown before the block was enqueued; the ISIZE
   prefix sum partitions the arena into disjoint slots, so no two workers' `&mut`
   overlap; `decompress_into_slice_with_crc` fills every byte before any read.
-- `FindBoundariesAndSort::ingest_block` — one `slice_mut` writing the previous
-  run's straddler carry right-aligned into `[FRONT_REGION - l, FRONT_REGION)`.
-  SAFETY: that range lies strictly below `FRONT_REGION`, where no inflate slot
-  ever lies, so it aliases no slot a worker is writing; the segment was frozen by
+- `FindBoundariesAndSort::ingest_block` and `FindRecordBoundaries::ingest_block`
+  (`arena_split.rs`) — one `slice_mut` each, writing the previous run's straddler
+  carry right-aligned into `[FRONT_REGION - l, FRONT_REGION)`. SAFETY: that
+  range lies strictly below `FRONT_REGION`, where no inflate slot ever lies, so
+  it aliases no slot a worker is writing; the segment was frozen by
   `reserve_full_capacity` before sharing, so no grow can move it.
 
 The prefetch hint this front also uses is `fgumi-sort`'s `prefetch_read_l1`
 (listed above); `fgumi-pipeline-io` has no intrinsic of its own.
+
+Concurrent reads (safe code, but the invariant the sites above must keep): on
+the split front, `ExtractKeys` workers read a key batch's
+`[byte_start, byte_end)` while inflate workers write later slots of the same
+run. Every byte of a batch lies below the boundary scan's cursor, which only
+advances over slots whose `InflatedBlock` token arrived (the inflate write
+happens-before the token's push, the scan's pop, the batch's push and the
+extractor's pop); the carry is written before any batch of its run is cut; and
+nothing below the cursor is written again during the run.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 
@@ -626,6 +637,21 @@ between prefix and window. `--sort-stats` logs a `Queryname keys:` line with the
 classes, re-windowed batches and the compare shares (`arena fallbacks` is the
 share that read the arena). The spill format is unchanged: queryname keys are
 embedded in the record, and the merge rebuilds them from the body.
+
+### Split arena front (template-coordinate)
+
+Template-coordinate phase 1 runs as three steps generic over an
+`ArenaKeyExtractor` (`crates/fgumi-pipeline-io/src/sort/arena_split.rs`):
+`FindTemplateBoundaries` (serial, `sort-coord`) cuts 4096-record key batches
+and run ends, `ExtractTemplateKeys` (parallel, excluded from the reader's
+worker) extracts refs under the phase-1 cap, and `SortTemplateRun` (serial,
+`sort-coord`) sorts each run behind the ordinal reorder, reserving the whole
+phase-1 cap for a parallel sort. Every run's chunk is identical to the one the
+single-step front produced. `--sort-stats` logs a `Deferred key extraction:`
+census (records keyed before the scan reached their run's end, and the tail
+wait). `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` lets extraction run on the reader's
+worker too — a diagnostic knob for measuring the reader exclusion, not a tuning
+option.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

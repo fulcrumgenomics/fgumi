@@ -237,7 +237,11 @@ impl SortPhase {
             // FrameBgzfBlocks`) are the read half of this phase.
             "PlanInputReads" | "PreadInputSlices" | "FrameBgzfBlocks" | "ReadBlocks"
             | "InflateToArena" => Some(SortPhase::ReadDecompress),
-            "FindBoundariesAndSort" | "SortBuffer" => Some(SortPhase::InMemorySort),
+            "FindBoundariesAndSort"
+            | "SortBuffer"
+            | "FindTemplateBoundaries"
+            | "ExtractTemplateKeys"
+            | "SortTemplateRun" => Some(SortPhase::InMemorySort),
             "SpillGather" | "SpillBlockCompress" | "SpillWrite" => Some(SortPhase::SpillWrite),
             // The merge supply (`SpillReadPlanner → PreadSpillSlices →
             // SortSpillDecompress`) is Phase-2 read-ahead of the final merge's
@@ -638,6 +642,9 @@ mod tests {
     #[case::inflate("InflateToArena", SortPhase::ReadDecompress)]
     #[case::find_and_sort("FindBoundariesAndSort", SortPhase::InMemorySort)]
     #[case::sort_buffer("SortBuffer", SortPhase::InMemorySort)]
+    #[case::find_template_boundaries("FindTemplateBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_template_keys("ExtractTemplateKeys", SortPhase::InMemorySort)]
+    #[case::sort_template_run("SortTemplateRun", SortPhase::InMemorySort)]
     #[case::spill_gather("SpillGather", SortPhase::SpillWrite)]
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]

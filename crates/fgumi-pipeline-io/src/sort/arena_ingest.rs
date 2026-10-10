@@ -19,6 +19,10 @@
 //! unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)" for the
 //! full justification and SAFETY invariant.
 //!
+//! Template-coordinate order on the arena front runs on the split front in
+//! [`arena_split`](super::arena_split) (`FindTemplateBoundaries` →
+//! `ExtractTemplateKeys` → `SortTemplateRun`), not on `FindBoundariesAndSort`.
+//!
 //! `FindBoundariesAndSort`: serial step that scans a run's contiguous arena span
 //! directly (no copy), skips the BAM header via [`crate::boundaries::bam_header_len`],
 //! builds `(body_offset, block_size)` refs, sorts via
@@ -57,7 +61,7 @@ use fgumi_pipeline_core::step::{
     CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
 };
 use fgumi_pipeline_core::{HeldRetry, Unpushed};
-use fgumi_pipeline_core::{PhaseCap, admit_input};
+use fgumi_pipeline_core::{PhaseCap, WholeCap, admit_input};
 
 use crate::boundaries::bam_header_len;
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
@@ -1079,16 +1083,43 @@ pub trait ArenaSortStrategy: Send + 'static {
         Self: Sized;
 }
 
+/// Reserve the whole phase-1 cap for an off-pool run sort: the one reservation
+/// path of every run seal ([`seal_under_cap`] and the split front's `SortRun`).
+///
+/// Returns `Ok(None)` when there is no cap (an unset `--sort-threads`) or the
+/// sort runs on one thread — a serial sort is the coordination thread's own
+/// work, which the cap does not count. Otherwise registers a pending
+/// reservation (new pool admissions are refused while it waits), parks until
+/// every permit is held, and returns the guard; the sort runs while it is held.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::Interrupted`] when the run is cancelled (or failed)
+/// while waiting; the caller must not sort.
+pub(crate) fn reserve_for_run_sort(
+    cap: Option<&PhaseCap>,
+    sorts_in_parallel: bool,
+) -> io::Result<Option<WholeCap<'_>>> {
+    match cap {
+        Some(cap) if sorts_in_parallel => cap.acquire_whole().map(Some).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "sort cancelled while waiting for its phase cap",
+            )
+        }),
+        _ => Ok(None),
+    }
+}
+
 /// Seal one run under the phase-1 cap.
 ///
 /// Uncapped: the sort runs at its full `sort_threads` width. Capped (an
 /// explicit `--sort-threads`): when the run sorts in parallel, the per-run
 /// sort is phase-1 work on its own rayon threads beside the pool steps that
-/// share the cap, so it takes the whole cap ([`PhaseCap::acquire_whole`]) and
+/// share the cap, so it takes the whole cap ([`reserve_for_run_sort`]) and
 /// sorts on exactly the cap's width — pool admission pauses until it is done,
 /// and sort threads + inflate + spill-compression workers never exceed the cap
-/// together. A run that sorts on one thread takes no permit: it is the serial
-/// coordination thread's own work, which the cap does not count.
+/// together. A run that sorts on one thread takes no permit.
 ///
 /// # Errors
 ///
@@ -1101,18 +1132,9 @@ pub(crate) fn seal_under_cap<S: ArenaSortStrategy>(
     sort_threads: usize,
 ) -> io::Result<MemoryChunkErased> {
     let sort_threads = sort_threads.max(1);
-    match cap {
-        Some(cap) if strategy.sorts_in_parallel(sort_threads) => {
-            let whole = cap.acquire_whole().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "sort cancelled while waiting for its phase cap",
-                )
-            })?;
-            Ok(strategy.seal(arena, whole.width()))
-        }
-        _ => Ok(strategy.seal(arena, sort_threads)),
-    }
+    let whole = reserve_for_run_sort(cap, strategy.sorts_in_parallel(sort_threads))?;
+    let width = whole.as_ref().map_or(sort_threads, WholeCap::width);
+    Ok(strategy.seal(arena, width))
 }
 
 /// Coordinate-order strategy: extracts the fixed `u64` coordinate key inline and
@@ -1167,6 +1189,9 @@ impl ArenaSortStrategy for CoordinateStrategy {
 /// machinery the template key needs; accumulates arena-pointing refs and seals to
 /// [`MemoryChunkErased::TemplateCoordinate`] (an arena-backed
 /// `InMemoryChunk<TemplateKey>`), byte-identical to the owned `TemplateChunkSorter`.
+///
+/// Its production user is `SortBuffer`, the record-input front; the block-input
+/// arena front sorts template order through [`super::arena_split`].
 pub struct TemplateStrategy {
     acc: fgumi_sort::TemplateArenaAccumulator,
 }

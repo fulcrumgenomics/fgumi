@@ -505,6 +505,21 @@ fn sort_stats_gates_spill_supply_lines(
     }
 }
 
+/// The template split front's key-overlap census is logged at info only
+/// under `--sort-stats`, on a sort that spills.
+#[rstest]
+fn sort_stats_gates_key_overlap_census(#[values(false, true)] with_flag: bool) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with("template-coordinate", extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
+    for prefix in ["Deferred key extraction: ", "  tail wait (exact): "] {
+        let present = bodies.iter().any(|b| b.starts_with(prefix));
+        assert_eq!(present, with_flag, "`{prefix}` presence:\n{stderr}");
+    }
+}
+
 /// On a multi-source merge, `--sort-stats` reports how often the merge served
 /// itself from a stalled slot's stash. Whether a stall finds stashed blocks is
 /// scheduling (the unit test `stalled_merge_self_serves_from_the_stash` forces

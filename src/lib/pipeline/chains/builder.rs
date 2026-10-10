@@ -3956,7 +3956,7 @@ impl<'a> ChainBuilder<'a> {
                     use fgumi_pipeline_io::sort::protocol::MemoryChunkErased;
                     use fgumi_pipeline_io::sort::{
                         CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
-                        QuerynameStrategy, ReadBlocks, TemplateStrategy,
+                        QuerynameStrategy, ReadBlocks,
                     };
                     use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
@@ -3977,29 +3977,35 @@ impl<'a> ChainBuilder<'a> {
                     // pools (`bounded_sort_pool`, `qname-sort`,
                     // `sort_coordinate_refs`).
                     let sort_threads = phases.phase1;
+                    // Diagnostic knob for the reader-exclusion measurement: let key
+                    // extraction run on the reader worker too. Read once, here.
+                    let extract_placement = extract_placement_from_env(
+                        std::env::var("FGUMI_SORT_EXTRACT_ALL_WORKERS").ok().as_deref(),
+                    );
                     let t = self.pipeline.append_step(read_blocks, tail);
                     let t = self.pipeline.append_step(inflate, t);
                     let out = match sort_order {
                         SortOrder::TemplateCoordinate => {
-                            // Template-coordinate: the accumulator carries the
-                            // library / cell-barcode / MI and `--key-types`
-                            // narrowed-lane machinery the template key needs, built
-                            // from the header exactly as the legacy
-                            // TemplateChunkSorter.
+                            // Template-coordinate: the split front. The seed carries
+                            // the library / cell-barcode / `--key-types` machinery;
+                            // the sort's first record chooses the key lanes.
                             let key_types = sort.key_types.unwrap_or_default();
-                            let acc = fgumi_sort::TemplateArenaAccumulator::from_header(
+                            let seed = fgumi_sort::TemplateKeySeed::from_header(
                                 &self.header,
                                 cell_tag,
                                 key_types,
                             );
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    TemplateStrategy::new(acc),
+                            append_split::<fgumi_pipeline_io::sort::TemplateKeys>(
+                                &self.pipeline,
+                                t,
+                                seed,
+                                SplitFront {
                                     sort_threads,
                                     byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
-                                t,
+                                    sort_stats: sort.sort_stats,
+                                    cap: phase1_cap.clone(),
+                                    placement: extract_placement,
+                                },
                             )
                         }
                         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
@@ -4043,9 +4049,9 @@ impl<'a> ChainBuilder<'a> {
                             t,
                         ),
                     };
-                    // Opt this chain into downstream-first dispatch: the serial
-                    // FindBoundariesAndSort scan then overlaps the 8-way parallel
-                    // InflateToArena instead of starving behind it on the pool.
+                    // The serial `sort-coord` driver (boundary scan, run sort, range
+                    // planning) is the phase-1 bottleneck; dispatch downstream-first
+                    // so its outputs drain.
                     self.use_drain_first_scheduler = true;
                     out
                 } else {
@@ -7075,6 +7081,55 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
     )
 }
 
+/// Where the split front's key extraction runs, from the diagnostic
+/// `FGUMI_SORT_EXTRACT_ALL_WORKERS` value: `"1"` lets it run on the reader
+/// worker too (logged); anything else keeps it off the reader worker.
+fn extract_placement_from_env(value: Option<&str>) -> fgumi_pipeline_core::PoolPlacement {
+    if value == Some("1") {
+        log::info!("FGUMI_SORT_EXTRACT_ALL_WORKERS=1: key extraction may run on the reader worker");
+        fgumi_pipeline_core::PoolPlacement::AllWorkers
+    } else {
+        fgumi_pipeline_core::PoolPlacement::ExcludeReader
+    }
+}
+
+/// The configuration of a split arena front (see [`append_split`]).
+struct SplitFront {
+    /// The resolved phase-1 width (`PhaseThreads::phase1`): sizes the run sort.
+    sort_threads: usize,
+    /// Byte bound of each step's output queue.
+    byte_limit: u64,
+    /// `--sort-stats`: the overlap census at `info`.
+    sort_stats: bool,
+    /// The phase-1 cap — present only for an explicit `--sort-threads`. Key
+    /// extraction is admitted by it; the run sort reserves all of it.
+    cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    /// Where key extraction runs.
+    placement: fgumi_pipeline_core::PoolPlacement,
+}
+
+/// Append the split arena front for the order `X` after `InflateToArena`:
+/// `FindRecordBoundaries<X>` → `ExtractKeys<X>` → `SortRun<X>`. Returns the run
+/// sort's output tail.
+fn append_split<X: fgumi_pipeline_io::sort::ArenaKeyExtractor>(
+    pipeline: &PipelineBuilder,
+    tail: (StepIdx, BranchIdx),
+    seed: X::Seed,
+    front: SplitFront,
+) -> (StepIdx, BranchIdx) {
+    use fgumi_pipeline_io::sort::{ExtractKeys, FindRecordBoundaries, SortRun};
+    let SplitFront { sort_threads, byte_limit, sort_stats, cap, placement } = front;
+    let t = pipeline.append_step(FindRecordBoundaries::<X>::new(seed, byte_limit), tail);
+    let t = pipeline.append_step(
+        ExtractKeys::<X>::new(byte_limit).with_phase_cap(cap.clone()).with_placement(placement),
+        t,
+    );
+    pipeline.append_step(
+        SortRun::<X>::new(sort_threads, byte_limit).with_phase_cap(cap).with_sort_stats(sort_stats),
+        t,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7795,13 +7850,15 @@ mod tests {
     #[test]
     fn sort_chain_gating_matches_the_table() {
         // (name, kind, output branches, gated branches)
-        const TABLE: [(&str, &str, usize, usize); 15] = [
+        const TABLE: [(&str, &str, usize, usize); 17] = [
             ("PlanInputReads", "Serial", 1, 1),
             ("PreadInputSlices", "Parallel", 1, 1),
             ("FrameBgzfBlocks", "Serial", 1, 1),
             ("ReadBlocks", "Detached", 1, 1),
             ("InflateToArena", "Parallel", 1, 1),
-            ("FindBoundariesAndSort", "Detached", 1, 1),
+            ("FindTemplateBoundaries", "Detached", 1, 1),
+            ("ExtractTemplateKeys", "Parallel", 1, 1),
+            ("SortTemplateRun", "Detached", 1, 1),
             ("SpillGather", "Detached", 1, 1),
             ("SpillBlockCompress", "Parallel", 1, 1),
             ("SpillWrite", "Detached", 1, 1),
@@ -7962,6 +8019,128 @@ mod tests {
             .map(|&(_, c)| c)
             .expect("the spill reads");
         assert_eq!(eligible, clones.min(merge_threads.unwrap_or(clones)), "{planned:?}");
+    }
+
+    /// A BAM template-coordinate sort runs on the split arena front at every
+    /// thread count: the three split steps, and no `FindBoundariesAndSort`.
+    #[rstest::rstest]
+    fn template_sort_dag_has_the_split_front(#[values(1usize, 16)] threads: usize) {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], threads, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(threads);
+        for name in ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"] {
+            assert!(dag.contains(name), "t{threads}: {name} missing:\n{dag}");
+        }
+        assert!(!dag.contains("FindBoundariesAndSort"), "t{threads}:\n{dag}");
+    }
+
+    /// The extraction step carries the phase-1 cap only for an explicit
+    /// `--sort-threads` (clamped to `--threads`), and no `cap=` token otherwise.
+    #[rstest::rstest]
+    #[case::explicit(Some(4), Some("cap=sort-phase1(4)"))]
+    #[case::clamped(Some(32), Some("cap=sort-phase1(16)"))]
+    #[case::unset(None, None)]
+    fn extract_keys_carries_the_explicit_phase1_cap(
+        #[case] sort_threads: Option<usize>,
+        #[case] token: Option<&str>,
+    ) {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, sort_threads, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag();
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        match token {
+            Some(t) => assert!(line.contains(t), "{line}"),
+            None => assert!(!line.contains("cap="), "{line}"),
+        }
+    }
+
+    /// At one thread the reader worker is the only pool worker, so the
+    /// extraction clone is hosted on its producer's driver, `sort-coord`.
+    #[test]
+    fn t1_extraction_is_hosted_on_the_coord_driver() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 1, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(1);
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        assert!(line.ends_with(" placement=ExcludeReader host=driver(sort-coord)"), "{line}");
+    }
+
+    /// With `--sort-threads 4`, inflate, key extraction, spill compression and
+    /// the run sort all hold the one phase-1 cap.
+    #[test]
+    fn the_split_front_shares_the_phase1_cap() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, Some(4), fgumi_bam_io::ReadStreams::Auto);
+        let caps = built.pipeline.phase_caps();
+        let cap_of = |name: &str| caps.iter().find(|(n, _)| *n == name).expect(name).1;
+        let inflate = cap_of("InflateToArena");
+        for name in ["ExtractTemplateKeys", "SpillBlockCompress", "SortTemplateRun"] {
+            assert!(std::ptr::eq(cap_of(name), inflate), "{name} shares the phase-1 cap");
+        }
+    }
+
+    /// Unset `--sort-threads`: no phase cap on any step, so the run sort
+    /// reserves nothing.
+    #[test]
+    fn unset_sort_threads_means_no_cap_and_no_reservation() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 8, None, fgumi_bam_io::ReadStreams::Auto);
+        assert!(built.pipeline.phase_caps().is_empty(), "no caps without an explicit flag");
+        assert!(!built.pipeline.dag().contains("cap="), "no cap tokens");
+    }
+
+    /// A BAM sort chain keeps downstream-first dispatch with the sort's refill
+    /// hint: the refill-drain scheduler under the automatic choice.
+    #[test]
+    fn bam_sort_chain_uses_the_refill_drain_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let spec = sort_chain_spec(tmp.path(), input, vec![Stage::Sort]);
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        assert!(chain.use_drain_first_scheduler, "the arena front opts into drain-first");
+        assert!(
+            matches!(
+                choose_pool_scheduler(
+                    crate::commands::common::PoolScheduler::Auto,
+                    chain.use_drain_first_scheduler,
+                    &chain.refill_hints,
+                ),
+                PoolSchedulerChoice::RefillDrain { .. }
+            ),
+            "the refill-drain scheduler"
+        );
+    }
+
+    /// A runall chain whose first stage sorts a BAM uses the split front too.
+    #[test]
+    fn runall_sort_first_bam_uses_the_split_front() {
+        let (_, built, _tmp) = build_native_sort(
+            vec![Stage::Sort, Stage::Group],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Fixed(1),
+        );
+        let dag = built.pipeline.dag();
+        assert!(dag.contains("FindTemplateBoundaries"), "{dag}");
+        assert!(!dag.contains("FindBoundariesAndSort"), "{dag}");
+    }
+
+    /// `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` puts key extraction on every worker,
+    /// the reader's included; any other value, or none, keeps it off the reader
+    /// worker — which is what the default chain shows.
+    #[test]
+    fn extract_placement_override_is_honoured() {
+        use fgumi_pipeline_core::PoolPlacement;
+        assert_eq!(extract_placement_from_env(Some("1")), PoolPlacement::AllWorkers);
+        assert_eq!(extract_placement_from_env(Some("0")), PoolPlacement::ExcludeReader);
+        assert_eq!(extract_placement_from_env(None), PoolPlacement::ExcludeReader);
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 4, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(4);
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        assert!(line.contains("placement=ExcludeReader"), "{line}");
     }
 
     /// The native input path is taken exactly when `--read-streams` asks for

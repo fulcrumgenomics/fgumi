@@ -303,6 +303,13 @@ fn spill_supply(
 struct ChainCaps {
     phase1: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
     phase2: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    /// Records per key batch on the split front (`None`: the production size).
+    batch_records: Option<usize>,
+    /// Probe on the split front's steps.
+    probe: Option<Arc<crate::sort::arena_split::SplitProbe>>,
+    /// Make the block source a `Serial` reader-affinity step (worker 0), as
+    /// production's input reader is.
+    reader_source: bool,
 }
 
 /// What a test chain's taps and sinks collect while it runs; read back by
@@ -874,6 +881,9 @@ enum Front {
 enum ArenaFront {
     /// `FindBoundariesAndSort` over the order's `ArenaSortStrategy`.
     Fbs,
+    /// The split front for template-coordinate order
+    /// (`FindTemplateBoundaries` → `ExtractTemplateKeys` → `SortTemplateRun`).
+    SplitTemplate,
 }
 
 /// The arena front each order ships with at this commit. When an order moves
@@ -881,9 +891,85 @@ enum ArenaFront {
 /// arena-front test gates the front that ships.
 fn production_arena_front(order: SortOrder) -> ArenaFront {
     match order {
-        SortOrder::Coordinate | SortOrder::TemplateCoordinate | SortOrder::Queryname(_) => {
-            ArenaFront::Fbs
+        SortOrder::TemplateCoordinate => ArenaFront::SplitTemplate,
+        SortOrder::Coordinate | SortOrder::Queryname(_) => ArenaFront::Fbs,
+    }
+}
+
+/// Append `front`'s steps for `config.sort_order` to an arena chain head
+/// (`… → InflateToArena`), returning the front's chunk-event tail.
+fn arena_front<'b>(
+    head: Chain<'b, OrderedBytesSingle<InflatedBlock>>,
+    front: ArenaFront,
+    config: SortBufferConfig,
+    header: &Header,
+    output_byte_limit: u64,
+    caps: &ChainCaps,
+) -> Chain<'b, Single<SortChunkEvent>> {
+    use crate::sort::protocol::MemoryChunkErased;
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+    let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, .. } = config;
+    match (front, sort_order) {
+        (ArenaFront::SplitTemplate, SortOrder::TemplateCoordinate) => {
+            let seed = fgumi_sort::TemplateKeySeed::from_header(header, cell_tag, key_types);
+            let mut boundaries = FindTemplateBoundaries::new(seed, output_byte_limit);
+            let mut extract =
+                ExtractTemplateKeys::new(output_byte_limit).with_phase_cap(caps.phase1.clone());
+            let mut run = SortTemplateRun::new(sort_threads, output_byte_limit)
+                .with_phase_cap(caps.phase1.clone());
+            if let Some(n) = caps.batch_records {
+                boundaries = boundaries.with_batch_records(n);
+            }
+            if let Some(probe) = &caps.probe {
+                boundaries = boundaries.with_probe(Arc::clone(probe));
+                extract = extract.with_probe(Arc::clone(probe));
+                run = run.with_probe(Arc::clone(probe));
+            }
+            head.chain(boundaries).chain(extract).chain(run)
         }
+        (ArenaFront::SplitTemplate, order) => unreachable!("no split front for {order:?} yet"),
+        (ArenaFront::Fbs, SortOrder::Coordinate) => head.chain(
+            FindBoundariesAndSort::new(
+                CoordinateStrategy::new(n_ref),
+                sort_threads,
+                output_byte_limit,
+            )
+            .with_phase_cap(caps.phase1.clone()),
+        ),
+        (ArenaFront::Fbs, SortOrder::TemplateCoordinate) => {
+            let acc =
+                fgumi_sort::TemplateArenaAccumulator::from_header(header, cell_tag, key_types);
+            head.chain(
+                FindBoundariesAndSort::new(
+                    TemplateStrategy::new(acc),
+                    sort_threads,
+                    output_byte_limit,
+                )
+                .with_phase_cap(caps.phase1.clone()),
+            )
+        }
+        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => head.chain(
+            FindBoundariesAndSort::new(
+                QuerynameStrategy::<fgumi_sort::QnLex>::new(
+                    MemoryChunkErased::QuerynameLex,
+                    fgumi_sort::QnSortState::new(false),
+                ),
+                sort_threads,
+                output_byte_limit,
+            )
+            .with_phase_cap(caps.phase1.clone()),
+        ),
+        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Natural)) => head.chain(
+            FindBoundariesAndSort::new(
+                QuerynameStrategy::<fgumi_sort::QnNatural>::new(
+                    MemoryChunkErased::QuerynameNatural,
+                    fgumi_sort::QnSortState::new(false),
+                ),
+                sort_threads,
+                output_byte_limit,
+            )
+            .with_phase_cap(caps.phase1.clone()),
+        ),
     }
 }
 
@@ -902,80 +988,48 @@ fn drive_arena_chain(
     sink: MergeSink,
     caps: &ChainCaps,
 ) -> Result<ChainRun> {
-    use crate::sort::protocol::MemoryChunkErased;
-    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
-    let SortBufferConfig { sort_order, memory_limit, sort_threads, cell_tag, key_types } = config;
     let builder = Pipeline::builder();
     let head = builder
-        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
-        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(BgzfBlockSource::new(blocks, output_byte_limit).reader(caps.reader_source))
+        .chain(ReadBlocks::new(config.memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit).with_phase_cap(caps.phase1.clone()));
-    let attach = |front| {
-        attach_spill_and_merge(
-            front,
-            sort_order,
-            output_byte_limit,
-            threads,
-            sink,
-            SupplyTuning::default(),
-            ZSTD_1,
-            caps,
-        )
-    };
-    let taps = match (front, sort_order) {
-        (ArenaFront::Fbs, SortOrder::Coordinate) => attach(
-            head.chain(
-                FindBoundariesAndSort::new(
-                    CoordinateStrategy::new(n_ref),
-                    sort_threads,
-                    output_byte_limit,
-                )
-                .with_phase_cap(caps.phase1.clone()),
-            ),
-        ),
-        (ArenaFront::Fbs, SortOrder::TemplateCoordinate) => {
-            let acc =
-                fgumi_sort::TemplateArenaAccumulator::from_header(header, cell_tag, key_types);
-            attach(
-                head.chain(
-                    FindBoundariesAndSort::new(
-                        TemplateStrategy::new(acc),
-                        sort_threads,
-                        output_byte_limit,
-                    )
-                    .with_phase_cap(caps.phase1.clone()),
-                ),
-            )
-        }
-        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => attach(
-            head.chain(
-                FindBoundariesAndSort::new(
-                    QuerynameStrategy::<fgumi_sort::QnLex>::new(
-                        MemoryChunkErased::QuerynameLex,
-                        fgumi_sort::QnSortState::new(false),
-                    ),
-                    sort_threads,
-                    output_byte_limit,
-                )
-                .with_phase_cap(caps.phase1.clone()),
-            ),
-        ),
-        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Natural)) => attach(
-            head.chain(
-                FindBoundariesAndSort::new(
-                    QuerynameStrategy::<fgumi_sort::QnNatural>::new(
-                        MemoryChunkErased::QuerynameNatural,
-                        fgumi_sort::QnSortState::new(false),
-                    ),
-                    sort_threads,
-                    output_byte_limit,
-                )
-                .with_phase_cap(caps.phase1.clone()),
-            ),
-        ),
-    }?;
+    let taps = attach_spill_and_merge(
+        arena_front(head, front, config, header, output_byte_limit, caps),
+        config.sort_order,
+        output_byte_limit,
+        threads,
+        sink,
+        SupplyTuning::default(),
+        ZSTD_1,
+        caps,
+    )?;
     builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
     Ok(taps.collect())
+}
+
+/// Drive the block-input front alone (`BgzfBlockSource` → `ReadBlocks` →
+/// `InflateToArena` → `front`'s steps) into a [`ChunkEventSink`], returning
+/// every emitted chunk's records, its key kind, and the `AllAnnounced` counts.
+fn drive_arena_chunks(
+    front: ArenaFront,
+    config: SortBufferConfig,
+    header: &Header,
+    blocks: Vec<crate::types::BgzfBlock>,
+    threads: usize,
+    caps: &ChainCaps,
+) -> Result<ArenaFrontOutput> {
+    const OUTPUT_BYTE_LIMIT: u64 = 4 * 1024 * 1024;
+    let received: Arc<Mutex<ArenaFrontOutput>> = Arc::new(Mutex::new(ArenaFrontOutput::default()));
+    let builder = Pipeline::builder();
+    let head = builder
+        .chain(BgzfBlockSource::new(blocks, OUTPUT_BYTE_LIMIT).reader(caps.reader_source))
+        .chain(ReadBlocks::new(config.memory_limit, OUTPUT_BYTE_LIMIT))
+        .chain(InflateToArena::new(OUTPUT_BYTE_LIMIT).with_phase_cap(caps.phase1.clone()));
+    arena_front(head, front, config, header, OUTPUT_BYTE_LIMIT, caps)
+        .chain(ChunkEventSink { received: Arc::clone(&received) })
+        .into_sink_marker();
+    builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
+    Ok(std::mem::take(&mut *received.lock()))
 }
 
 /// Drives the PRODUCTION front of `front`'s kind for `config.sort_order`:
@@ -3544,12 +3598,21 @@ struct BgzfBlockSource {
     blocks: Vec<crate::types::BgzfBlock>,
     held: HeldSlot<Unpushed<crate::types::BgzfBlock>>,
     output_byte_limit: u64,
+    /// `Serial` with reader affinity (worker 0) instead of `Exclusive`.
+    reader: bool,
 }
 
 impl BgzfBlockSource {
     fn new(mut blocks: Vec<crate::types::BgzfBlock>, output_byte_limit: u64) -> Self {
         blocks.reverse();
-        Self { blocks, held: HeldSlot::new(), output_byte_limit }
+        Self { blocks, held: HeldSlot::new(), output_byte_limit, reader: false }
+    }
+
+    /// Run as the chain's reader: a `Serial` step pinned to worker 0, which a
+    /// split front's extraction then excludes.
+    fn reader(mut self, on: bool) -> Self {
+        self.reader = on;
+        self
     }
 }
 
@@ -3560,10 +3623,18 @@ impl Step for BgzfBlockSource {
     fn profile(&self) -> StepProfile {
         StepProfile {
             name: "BgzfBlockSource",
-            kind: StepKind::Exclusive,
+            kind: if self.reader { StepKind::Serial } else { StepKind::Exclusive },
             sticky: true,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
             branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+        }
+    }
+
+    fn affinity(&self) -> fgumi_pipeline_core::step::Affinity {
+        if self.reader {
+            fgumi_pipeline_core::step::Affinity::Reader
+        } else {
+            fgumi_pipeline_core::step::Affinity::None
         }
     }
 
@@ -3595,6 +3666,8 @@ impl Step for BgzfBlockSource {
 #[derive(Default)]
 struct ArenaFrontOutput {
     chunks: Vec<RecordBytes>,
+    /// Each chunk's key kind, parallel to `chunks`.
+    key_kinds: Vec<fgumi_sort::SpillKeyKind>,
     slot_count: u32,
     total_records: u64,
 }
@@ -3631,6 +3704,7 @@ impl Step for ChunkEventSink {
                         out.chunks.push(
                             (0..chunk.len()).map(|i| chunk.record_bytes(i).to_vec()).collect(),
                         );
+                        out.key_kinds.push(chunk.key_kind());
                     }
                     SortChunkEvent::AllAnnounced { slot_count, total_records, .. } => {
                         out.slot_count = slot_count;
@@ -3676,6 +3750,29 @@ fn bgzf_blocks_for(
         stream.extend_from_slice(&block_size.to_le_bytes());
         stream.extend_from_slice(bytes);
     }
+    blocks_from_stream(&stream, payload_bytes)
+}
+
+/// `bgzf_blocks_for` with the stream's last `cut` bytes dropped, so the final
+/// record is incomplete.
+fn bgzf_blocks_truncated(
+    records: &[RawRecord],
+    n_ref: u32,
+    payload_bytes: usize,
+    cut: usize,
+) -> Vec<crate::types::BgzfBlock> {
+    let mut stream = minimal_binary_bam_header(n_ref);
+    for record in records {
+        let bytes = record.as_ref();
+        stream.extend_from_slice(&u32::try_from(bytes.len()).expect("fits").to_le_bytes());
+        stream.extend_from_slice(bytes);
+    }
+    stream.truncate(stream.len() - cut);
+    blocks_from_stream(&stream, payload_bytes)
+}
+
+/// One single-block BGZF payload per `payload_bytes` of `stream`.
+fn blocks_from_stream(stream: &[u8], payload_bytes: usize) -> Vec<crate::types::BgzfBlock> {
     stream
         .chunks(payload_bytes)
         .enumerate()
@@ -3859,7 +3956,11 @@ fn shared_phase_caps_bound_pool_concurrency_without_changing_output(
         64 * 1024,
         4 * 1024 * 1024,
         4,
-        &ChainCaps { phase1: Some(Arc::clone(&phase1)), phase2: Some(Arc::clone(&phase2)) },
+        &ChainCaps {
+            phase1: Some(Arc::clone(&phase1)),
+            phase2: Some(Arc::clone(&phase2)),
+            ..ChainCaps::default()
+        },
     )
     .expect("capped pipeline must run to completion");
 
@@ -4818,4 +4919,418 @@ fn full_batches_under_backpressure_are_delivered_once() {
     let merge_stats =
         &snapshot.steps.iter().find(|(name, _)| *name == "SortMerge").expect("SortMerge").1;
     assert!(merge_stats.holds > 0, "the output edge never refused a push: {merge_stats:?}");
+}
+
+// ── The split arena front (template-coordinate) ─────────────────────────────
+
+/// A template-record fixture's lane content.
+#[derive(Clone, Copy, Debug)]
+enum LaneCase {
+    AutoPlain,
+    AutoCb,
+    AutoMi,
+    AutoBoth,
+    Full,
+    NonePlain,
+    ExplicitCb,
+    ExplicitTertiary,
+}
+
+impl LaneCase {
+    /// `(key types, cell tag, records carry CB, records carry MI, expected lane)`.
+    fn params(
+        self,
+    ) -> (KeyTypesSpec, Option<fgumi_raw_bam::SamTag>, bool, bool, fgumi_sort::SpillKeyKind) {
+        use fgumi_raw_bam::SamTag;
+        use fgumi_sort::SpillKeyKind::{TemplateCb32, TemplateK24, TemplateK40, TemplateTert32};
+        match self {
+            Self::AutoPlain => (KeyTypesSpec::Auto, None, false, false, TemplateK24),
+            Self::AutoCb => (KeyTypesSpec::Auto, Some(SamTag::CB), true, false, TemplateCb32),
+            Self::AutoMi => (KeyTypesSpec::Auto, None, false, true, TemplateTert32),
+            Self::AutoBoth => (KeyTypesSpec::Auto, Some(SamTag::CB), true, true, TemplateK40),
+            Self::Full => (KeyTypesSpec::Full, Some(SamTag::CB), true, true, TemplateK40),
+            Self::NonePlain => (KeyTypesSpec::None, None, false, false, TemplateK24),
+            Self::ExplicitCb => (
+                KeyTypesSpec::Explicit { cb: true, tertiary: false },
+                Some(SamTag::CB),
+                true,
+                false,
+                TemplateCb32,
+            ),
+            Self::ExplicitTertiary => (
+                KeyTypesSpec::Explicit { cb: false, tertiary: true },
+                None,
+                false,
+                true,
+                TemplateTert32,
+            ),
+        }
+    }
+}
+
+/// `n` shuffled paired template records, optionally carrying `CB:Z` and
+/// `MI:Z` values that vary across records.
+fn template_records(n: usize, seed: u64, cb: bool, mi: bool) -> (Header, Vec<RawRecord>) {
+    let mut rng = SplitMix(seed);
+    let records = (0..n)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let (tid, pos) = (rng.below(N_TEST_REFS as u64) as i32, rng.below(500_000) as i32);
+            let mut aux = Vec::new();
+            if cb {
+                aux.extend_from_slice(b"CBZ");
+                aux.extend_from_slice(["AAAC", "CCAG", "GGTA"][i % 3].as_bytes());
+                aux.push(0);
+            }
+            if mi {
+                aux.extend_from_slice(b"MIZ");
+                aux.extend_from_slice(format!("{}", rng.below(40)).as_bytes());
+                aux.push(0);
+            }
+            let flags = if i % 2 == 0 { 0x63 } else { 0x93 };
+            let name = format!("tpl{}", rng.below(1 << 20));
+            RawRecord::from(make_bam_bytes(
+                tid,
+                pos,
+                flags,
+                name.as_bytes(),
+                &[],
+                30,
+                tid,
+                pos + 200,
+                &aux,
+            ))
+        })
+        .collect();
+    (synthetic_header(), records)
+}
+
+/// The split front at every lane width and thread count: each run's chunk is
+/// the chunk `FindBoundariesAndSort<TemplateStrategy>` seals for the same
+/// run, record for record and lane for lane, and the merged output is the
+/// reference sort. Small batches (64 records) over several runs, with records
+/// straddling block and run boundaries.
+#[rstest]
+fn template_split_matches_fbs_and_reference_across_runs(
+    #[values(
+        LaneCase::AutoPlain,
+        LaneCase::AutoCb,
+        LaneCase::AutoMi,
+        LaneCase::AutoBoth,
+        LaneCase::Full,
+        LaneCase::NonePlain,
+        LaneCase::ExplicitCb,
+        LaneCase::ExplicitTertiary
+    )]
+    case: LaneCase,
+    #[values(1usize, 2, 4)] threads: usize,
+) {
+    let (key_types, cell_tag, cb, mi, lane) = case.params();
+    let (header, records) = template_records(3_000, 0x7E4A + threads as u64, cb, mi);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = SortBufferConfig {
+        sort_order: SortOrder::TemplateCoordinate,
+        memory_limit: 96 * 1024,
+        sort_threads: threads,
+        cell_tag,
+        key_types,
+    };
+    let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+    let split =
+        drive_arena_chunks(ArenaFront::SplitTemplate, config, &header, blocks(), threads, &caps)
+            .unwrap();
+    let fbs =
+        drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), threads, &caps).unwrap();
+    assert!(split.chunks.len() >= 3, "{case:?}: several runs (got {})", split.chunks.len());
+    let (_, spilled) = split.chunks.split_last().expect("chunks");
+    assert!(
+        spilled.iter().all(|c| c.len() > 64),
+        "{case:?}: every spilled run spans several batches"
+    );
+    assert!(split.key_kinds.iter().all(|&k| k == lane), "{case:?}: {:?}", split.key_kinds);
+    assert_eq!(split.key_kinds, fbs.key_kinds, "{case:?}");
+    assert!(split.chunks == fbs.chunks, "{case:?} t{threads}: chunks differ from FBS");
+    assert_eq!((split.slot_count, split.total_records), (fbs.slot_count, fbs.total_records));
+    let merged = drive_arena_chain(
+        ArenaFront::SplitTemplate,
+        config,
+        &header,
+        blocks(),
+        4 * 1024 * 1024,
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    assert_record_parity(
+        &format!("{case:?} t{threads}"),
+        &merged.records,
+        &reference_sort(SortOrder::TemplateCoordinate, &header, &records, cell_tag),
+    );
+}
+
+/// A dropped-lane violation under `--key-types none` is reported with the same
+/// text by every template path — the record-input front, the old arena front
+/// and the split front at one and four threads — and names the first
+/// offending record (7), though another (300) sits in a later batch.
+#[test]
+fn violation_report_is_identical_across_template_paths() {
+    let records: Vec<RawRecord> = (0..600i32)
+        .map(|i| {
+            let mi = match i {
+                7 => 2,
+                300 => 3,
+                _ => 1,
+            };
+            RawRecord::from(record_with_mi(1000 + i, format!("rd_{i}").as_bytes(), mi))
+        })
+        .collect();
+    let header = synthetic_header();
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = SortBufferConfig {
+        key_types: KeyTypesSpec::None,
+        ..buffer_config(SortOrder::TemplateCoordinate, 64 * 1024, 2)
+    };
+    let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
+    let arena_err = |front, threads| {
+        let err = drive_arena_chain(
+            front,
+            config,
+            &header,
+            bgzf_blocks_for(&records, n_ref, 4096),
+            4 * 1024 * 1024,
+            threads,
+            MergeSink::Batches(StepKind::Serial),
+            &caps,
+        )
+        .expect_err("a violation fails the sort");
+        format!("{err:#}")
+    };
+    // The innermost violation: the record-input front wraps it in its own
+    // push context, which is not part of the report.
+    let violation = |msg: &str| {
+        msg.rsplit_once("record rd_").map(|(_, rest)| format!("record rd_{rest}")).expect(msg)
+    };
+    let fbs = violation(&arena_err(ArenaFront::Fbs, 2));
+    assert!(fbs.starts_with("record rd_7 "), "{fbs}");
+    for threads in [1, 4] {
+        assert_eq!(violation(&arena_err(ArenaFront::SplitTemplate, threads)), fbs, "t{threads}");
+    }
+    let buffer = drive_buffer_chain(
+        config,
+        &header,
+        pack_batches(&records, 256),
+        4 * 1024 * 1024,
+        2,
+        MergeSink::Batches(StepKind::Serial),
+        SupplyTuning::default(),
+        ZSTD_1,
+    )
+    .expect_err("the record-input front fails too");
+    assert_eq!(violation(&format!("{buffer:#}")), fbs);
+}
+
+/// Edge inputs behave on the split front exactly as on `FindBoundariesAndSort`:
+/// a header-only BAM, a single in-memory run, and a final record cut short.
+#[rstest]
+#[case::header_only(0, usize::MAX, false)]
+#[case::residual_only(500, 64 << 20, false)]
+#[case::truncated(500, 64 * 1024, true)]
+fn split_front_edge_cases_match_fbs(
+    #[case] n: usize,
+    #[case] memory_limit: usize,
+    #[case] truncate: bool,
+) {
+    let (header, records) = template_records(n, 0xED6E, false, false);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(SortOrder::TemplateCoordinate, memory_limit.min(64 << 20), 2);
+    let blocks = || {
+        if truncate {
+            bgzf_blocks_truncated(&records, n_ref, 4096, 5)
+        } else {
+            bgzf_blocks_for(&records, n_ref, 4096)
+        }
+    };
+    let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
+    let split = drive_arena_chunks(ArenaFront::SplitTemplate, config, &header, blocks(), 2, &caps);
+    let fbs = drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), 2, &caps);
+    match (split, fbs) {
+        (Ok(s), Ok(f)) => {
+            assert!(!truncate);
+            assert!(s.chunks == f.chunks && s.key_kinds == f.key_kinds);
+            assert_eq!((s.slot_count, s.total_records), (f.slot_count, f.total_records));
+        }
+        (Err(s), Err(f)) => {
+            assert!(truncate);
+            let (s, f) = (format!("{s:#}"), format!("{f:#}"));
+            assert!(s.contains("truncated BAM: final record incomplete"), "{s}");
+            assert!(f.contains("truncated BAM: final record incomplete"), "{f}");
+        }
+        (s, f) => panic!("split {:?} vs fbs {:?}", s.map(|_| ()), f.map(|_| ())),
+    }
+}
+
+/// Under a phase-1 cap of one with four workers — inflate, extraction and
+/// spill compression share one permit and the run sort reserves it — the
+/// split front still completes, with the reference output.
+#[test]
+fn a_one_permit_phase1_cap_completes_on_the_split_front() {
+    let (header, records) = tie_heavy_records(4_000, 21);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let cap = fgumi_pipeline_core::PhaseCap::new("sort-phase1", 1);
+    let caps = ChainCaps { phase1: Some(Arc::clone(&cap)), ..ChainCaps::default() };
+    let run = drive_arena_chain(
+        ArenaFront::SplitTemplate,
+        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, 4),
+        &header,
+        bgzf_blocks_for(&records, n_ref, 4096),
+        4 * 1024 * 1024,
+        4,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    assert!(run.merge_sources >= 2, "the fixture spills");
+    assert_record_parity(
+        "cap 1",
+        &run.records,
+        &reference_sort(SortOrder::TemplateCoordinate, &header, &records, None),
+    );
+    assert_eq!(cap.peak(), 1);
+}
+
+/// Extraction overlaps the scan: the boundary step holds after cutting the
+/// sort's first batch until that batch is extracted, without blocking its
+/// driver. Were extraction serialised behind the scan, the batch would never
+/// be extracted and the 30 s watchdog would fire. The census reports
+/// overlapped records.
+#[rstest]
+fn split_extracts_while_the_scan_continues(#[values(2usize, 4)] threads: usize) {
+    let (header, records) = tie_heavy_records(3_000, 31);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let probe = Arc::new(crate::sort::arena_split::SplitProbe::holding_scan());
+    let caps = ChainCaps {
+        batch_records: Some(64),
+        probe: Some(Arc::clone(&probe)),
+        ..ChainCaps::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let out = drive_arena_chain(
+            ArenaFront::SplitTemplate,
+            buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, threads),
+            &header,
+            bgzf_blocks_for(&records, n_ref, 4096),
+            4 * 1024 * 1024,
+            threads,
+            MergeSink::Batches(StepKind::Serial),
+            &caps,
+        )
+        .map(|r| r.records.len());
+        let _ = tx.send(out);
+    });
+    let n = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("watchdog: extraction never ran while the scan was held")
+        .unwrap();
+    worker.join().unwrap();
+    assert!(n > 0);
+    let census = probe.census.lock().expect("the run sort published its census");
+    assert!(census.overlapped_records > 0, "{census:?}");
+}
+
+/// At one thread the reader holds the only pool worker, so extraction runs on
+/// the `sort-coord` driver — the thread that did the work before the split.
+#[test]
+fn t1_split_runs_extract_on_the_coord_driver() {
+    let (header, records) = tie_heavy_records(2_000, 41);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let probe = Arc::new(crate::sort::arena_split::SplitProbe::default());
+    let caps =
+        ChainCaps { probe: Some(Arc::clone(&probe)), reader_source: true, ..ChainCaps::default() };
+    let run = drive_arena_chain(
+        ArenaFront::SplitTemplate,
+        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, 1),
+        &header,
+        bgzf_blocks_for(&records, n_ref, 4096),
+        4 * 1024 * 1024,
+        1,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    assert_eq!(run.records.len(), records.len());
+    let threads = probe.extract_threads.lock().clone();
+    assert_eq!(
+        threads.into_iter().collect::<Vec<_>>(),
+        vec![format!("fgumi-driver-{}", crate::sort::SORT_COORD_GROUP)]
+    );
+}
+
+/// The split front completes with the reference output at one and two
+/// threads, uncapped and under an explicit `--sort-threads 1` (whose run sort
+/// reserves the whole one-permit cap on the same driver that may host the
+/// extraction).
+#[rstest]
+fn split_front_at_one_and_two_threads(
+    #[values(1usize, 2)] threads: usize,
+    #[values(false, true)] capped: bool,
+) {
+    let (header, records) = tie_heavy_records(3_000, 51);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let caps = ChainCaps {
+        phase1: capped.then(|| fgumi_pipeline_core::PhaseCap::new("sort-phase1", 1)),
+        reader_source: true,
+        ..ChainCaps::default()
+    };
+    let run = drive_arena_chain(
+        ArenaFront::SplitTemplate,
+        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, if capped { 1 } else { threads }),
+        &header,
+        bgzf_blocks_for(&records, n_ref, 4096),
+        4 * 1024 * 1024,
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    assert!(run.merge_sources >= 2, "the fixture spills");
+    assert_record_parity(
+        &format!("t{threads} capped={capped}"),
+        &run.records,
+        &reference_sort(SortOrder::TemplateCoordinate, &header, &records, None),
+    );
+}
+
+/// A large spilling template sort through the split front completes under a
+/// watchdog at one, two and four pipeline threads (soak).
+#[cfg(feature = "stress-tests")]
+#[rstest]
+fn three_step_chain_large_spill_completes_on_the_arena_split(
+    #[values(1usize, 2, 4)] pipeline_threads: usize,
+) {
+    let (header, records) = template_records(60_000, 0x50A4, true, true);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let expected = reference_sort(SortOrder::TemplateCoordinate, &header, &records, None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = drive_arena_chain(
+            ArenaFront::SplitTemplate,
+            buffer_config(SortOrder::TemplateCoordinate, 1 << 20, pipeline_threads),
+            &header,
+            bgzf_blocks_for(&records, n_ref, 16 * 1024),
+            4 * 1024 * 1024,
+            pipeline_threads,
+            MergeSink::Batches(StepKind::Serial),
+            &ChainCaps { reader_source: true, ..ChainCaps::default() },
+        );
+        let _ = tx.send(out.map(|r| (r.merge_sources, r.records)));
+    });
+    let (merge_sources, out) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("watchdog: the split front did not finish")
+        .unwrap();
+    assert!(merge_sources >= 4, "the soak spills several runs (got {merge_sources})");
+    assert_record_parity(&format!("t{pipeline_threads}"), &out, &expected);
 }

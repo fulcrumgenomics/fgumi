@@ -3283,13 +3283,15 @@ mod tests {
     }
 
     /// Step names of [`native_input_sort_topology`], in `StepIdx` order.
-    const NATIVE_INPUT_SORT_NAMES: [&str; 15] = [
+    const NATIVE_INPUT_SORT_NAMES: [&str; 17] = [
         "PlanInputReads",
         "PreadInputSlices",
         "FrameBgzfBlocks",
         "ReadBlocks",
         "InflateToArena",
-        "FindBoundariesAndSort",
+        "FindTemplateBoundaries",
+        "ExtractTemplateKeys",
+        "SortTemplateRun",
         "SpillGather",
         "SpillBlockCompress",
         "SpillWrite",
@@ -3302,7 +3304,7 @@ mod tests {
     ];
 
     /// A hand-written model of `fgumi sort`'s template-coordinate chain with
-    /// native input, at t16: 15 steps, two driver groups (coord, io), the
+    /// native input, at t16: 17 steps, two driver groups (coord, io), the
     /// planner and framer pinned to the reader worker, every edge
     /// byte-bounded. Its step names, kinds, branch counts and per-branch
     /// gating mirror the table fgumi's `sort_chain_gating_matches_the_table`
@@ -3311,60 +3313,32 @@ mod tests {
     /// checked by nothing but the tests below.
     pub(super) fn native_input_sort_topology() -> Topology {
         use StepKind::{Detached as D, Parallel as P, Serial as S};
-        let kinds = vec![S, P, S, D, P, D, D, P, D, S, P, P, D, P, D];
-        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        let kinds = vec![S, P, S, D, P, D, P, D, D, P, D, S, P, P, D, P, D];
+        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
         let mut g = ChainGraph::new();
         let idx: Vec<StepIdx> = NATIVE_INPUT_SORT_NAMES
             .iter()
             .zip(branches)
             .map(|(n, b)| g.register_step(n, b))
             .collect();
-        for i in 0..9 {
+        for i in 0..11 {
             g.wire(idx[i], BranchIdx(0), idx[i + 1]);
         }
-        g.wire(idx[9], BranchIdx(0), idx[10]);
-        g.wire(idx[10], BranchIdx(0), idx[11]);
-        g.wire(idx[9], BranchIdx(1), idx[12]);
+        g.wire(idx[11], BranchIdx(0), idx[12]);
         g.wire(idx[12], BranchIdx(0), idx[13]);
-        g.wire(idx[13], BranchIdx(0), idx[14]);
+        g.wire(idx[11], BranchIdx(1), idx[14]);
+        g.wire(idx[14], BranchIdx(0), idx[15]);
+        g.wire(idx[15], BranchIdx(0), idx[16]);
         let (coord, io) = (Some(DriverIdx(0)), Some(DriverIdx(1)));
         let driver_of = vec![
-            None, None, None, coord, None, coord, coord, None, io, None, None, None, coord, None,
-            io,
+            None, None, None, coord, None, coord, None, coord, coord, None, io, None, None, None,
+            coord, None, io,
         ];
-        let pinned = vec![
-            Some(0),
-            None,
-            Some(0),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ];
-        let queues = vec![
-            q(0, 0),
-            q(1, 0),
-            q(2, 0),
-            q(3, 0),
-            q(4, 0),
-            q(5, 0),
-            q(6, 0),
-            q(7, 0),
-            q(8, 0),
-            q(9, 0),
-            q(9, 1),
-            q(10, 0),
-            q(12, 0),
-            q(13, 0),
-        ];
+        let mut pinned = vec![None; 17];
+        pinned[0] = Some(0);
+        pinned[2] = Some(0);
+        let mut queues: Vec<_> = (0..=11).map(|s| q(s, 0)).collect();
+        queues.extend([q(11, 1), q(12, 0), q(14, 0), q(15, 0)]);
         (g, kinds, pinned, driver_of, queues)
     }
 
@@ -3386,7 +3360,7 @@ mod tests {
         assert_eq!(plan.mode(), WakeMode::Directed);
         // Every branch of a step with outputs is gated; `SortSpillDecompress`
         // (a zero-output Parallel step) and the `WriteBgzfFile` sink have none.
-        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
         for (i, want) in want.iter().enumerate() {
             assert_eq!(
                 plan.gated_branches(StepIdx(i)),
@@ -3397,7 +3371,7 @@ mod tests {
             );
         }
         assert_eq!(
-            plan.forward_branch_count_for_test(StepIdx(11)),
+            plan.forward_branch_count_for_test(StepIdx(13)),
             1,
             "SortSpillDecompress: implicit cascade"
         );

@@ -387,6 +387,32 @@ fn test_sort_template_coordinate_many_spills_t4() {
     assert_eq!(count_records(&input), count_records(&output), "record count mismatch");
 }
 
+/// At `--threads 1` the template split front hosts key extraction on the
+/// `sort-coord` driver; a spilling sort there must emit every record, sorted,
+/// in exactly the order the four-thread sort emits.
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_template_coordinate_single_thread_with_spills() {
+    if !samtools_available() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = create_test_bam(dir.path(), 3000);
+    let t1 = dir.path().join("sorted.t1.bam");
+    let t4 = dir.path().join("sorted.t4.bam");
+
+    sort_bam(&input, &t1, "template-coordinate", 1, "30K");
+    sort_bam(&input, &t4, "template-coordinate", 4, "30K");
+    assert!(verify_sorted(&t1, "template-coordinate"), "template-coordinate t1 failed");
+    assert_eq!(record_identities(&input), record_identities(&t1), "t1 record multiset differs");
+    let view = |path: &Path| {
+        let out = Command::new("samtools").args(["view"]).arg(path).output().expect("samtools");
+        assert!(out.status.success());
+        out.stdout
+    };
+    assert!(view(&t1) == view(&t4), "t1 and t4 template-coordinate outputs differ");
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Consistency across thread counts
 // ---------------------------------------------------------------------------

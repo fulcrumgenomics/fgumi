@@ -1,9 +1,11 @@
 //! Sort typed-steps for the declarative chain.
 
 /// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
-/// the serial phase-1 coordination steps (`ReadBlocks` admit, `FindBoundariesAndSort`
-/// sort/seal, `SpillGather` range planning — the pool frames and compresses the
-/// ranges) plus the phase-2 `SortMerge`. One dedicated
+/// the serial phase-1 coordination steps (`ReadBlocks` admit, the split front's
+/// boundary scan and run sort — `FindTemplateBoundaries` / `SortTemplateRun`, with
+/// key extraction on the pool between them — `FindBoundariesAndSort` for the
+/// orders not yet split, `SpillGather` range planning — the pool frames and
+/// compresses the ranges) plus the phase-2 `SortMerge`. One dedicated
 /// thread runs all of them off the pool — the true N+2 model (mirrors main's
 /// single main thread). Phase 1 and phase 2 are temporally disjoint, so the
 /// coordination steps finish and leave the driver's live set before the merge
@@ -17,6 +19,7 @@ pub const SORT_COORD_GROUP: &str = "sort-coord";
 pub const SORT_IO_GROUP: &str = "sort-io";
 
 pub mod arena_ingest;
+pub mod arena_split;
 pub mod merge;
 pub mod protocol;
 pub(crate) mod read_ahead_budget;
@@ -32,6 +35,11 @@ pub mod supply_ledger;
 pub use arena_ingest::{
     ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
     InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
+};
+pub use arena_split::{
+    ArenaKeyExtractor, ExtractKeys, ExtractTemplateKeys, FindRecordBoundaries,
+    FindTemplateBoundaries, KEY_BATCH_RECORDS, KeyBatch, KeyOverlapCensus, RefBatch, RunEnd,
+    SortRun, SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
 };
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
