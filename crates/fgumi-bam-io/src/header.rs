@@ -133,13 +133,34 @@ pub fn build_program_record(
     let mut builder = Map::<Program>::builder()
         .insert(tag::NAME, "fgumi")
         .insert(tag::VERSION, version)
-        .insert(tag::COMMAND_LINE, command_line);
+        .insert(tag::COMMAND_LINE, header_safe_value(command_line));
 
     if let Some(pp) = previous_program {
         builder = builder.insert(tag::PREVIOUS_PROGRAM_ID, pp);
     }
 
     Ok(builder.build()?)
+}
+
+/// Returns `value` with every character a SAM header field cannot hold replaced, so a
+/// record built from it can always be written.
+///
+/// The SAM spec (§1.3) limits header field values to printable ASCII (`[ -~]+`), and
+/// noodles refuses to write anything else, so one tab or non-ASCII byte in a command line
+/// would otherwise fail the whole output. Tabs, newlines and carriage returns become a
+/// space, as `samtools` does for tabs; any other character becomes its `\u{..}` escape,
+/// which keeps a non-ASCII path legible.
+#[must_use]
+pub fn header_safe_value(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            ' '..='~' => safe.push(c),
+            '\t' | '\n' | '\r' => safe.push(' '),
+            _ => safe.extend(c.escape_unicode()),
+        }
+    }
+    safe
 }
 
 /// Add a @PG record to an existing header with automatic PP chaining.
@@ -304,6 +325,30 @@ mod tests {
     #[test]
     fn test_get_last_program_id_cycle_picks_last_program() {
         assert_eq!(get_last_program_id(&header_with_pp_cycle()), Some("b".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::printable_ascii_unchanged(
+        "fgumi merge -o out.bam a.bam",
+        "fgumi merge -o out.bam a.bam"
+    )]
+    #[case::whitespace_controls_become_spaces("a\tb\nc\rd", "a b c d")]
+    #[case::other_controls_escaped("a\u{1}b\u{7f}", "a\\u{1}b\\u{7f}")]
+    #[case::non_ascii_escaped("caf\u{e9}.bam", "caf\\u{e9}.bam")]
+    fn test_header_safe_value(#[case] value: &str, #[case] expected: &str) {
+        assert_eq!(header_safe_value(value), expected);
+    }
+
+    /// A command line with characters a header cannot hold still yields a writable @PG.
+    #[test]
+    fn test_build_program_record_with_unprintable_command_line_is_writable() {
+        let pg = build_program_record("1.0", "fgumi merge -o caf\u{e9}.bam\ta.bam", None)
+            .expect("program record");
+        let header = Header::builder().add_program("fgumi", pg).build();
+        let mut writer = noodles::sam::io::Writer::new(Vec::new());
+        writer.write_header(&header).expect("header with a sanitized CL must be writable");
+        let text = String::from_utf8(writer.get_ref().clone()).expect("UTF-8 header");
+        assert!(text.contains("CL:fgumi merge -o caf\\u{e9}.bam a.bam"), "{text}");
     }
 
     #[rstest::rstest]

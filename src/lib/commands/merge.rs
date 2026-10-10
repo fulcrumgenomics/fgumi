@@ -58,7 +58,8 @@ libraries), each distinct later record is written under a fresh ID (`A.1`,
 records and the `PG` of its @RG records are rewritten to match, so every read
 keeps its own read group and program. Each rename is logged. Unlike `samtools
 merge`, identical records are combined without `-c`/`-p`, and fresh IDs are
-deterministic.
+deterministic. The output gets one @PG for this merge, chained to the last
+input's program chain; `samtools merge` adds one per input chain.
 
 EXAMPLES:
 
@@ -111,7 +112,7 @@ pub struct Merge {
 }
 
 impl Command for Merge {
-    fn execute(&self, _command_line: &str) -> Result<()> {
+    fn execute(&self, command_line: &str) -> Result<()> {
         let mut input_paths: Vec<PathBuf> = self.inputs.clone();
 
         if let Some(ref list_path) = self.input_list {
@@ -169,6 +170,11 @@ impl Command for Merge {
         // declared sort order against --order; MERGE3-01 fast check).
         let MergedHeader { header, input_renames } = merge_headers(&input_paths, self.order)?;
         log_renames(&input_paths, &input_renames);
+        // Record this merge with one @PG, as every fgumi command does, chained to the last
+        // program chain end in merged-header order, which is the last input's when inputs
+        // carry separate chains. `samtools merge` instead adds one @PG per chain end; fgumi
+        // adds one per command (see `fgumi_bam_io::header::add_pg_record`).
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
         let mut rewriter = ReadTagRewriter::new(&input_paths, input_renames);
 
         let mut sorter = RawExternalSorter::new(self.order.into())
@@ -545,7 +551,8 @@ fn log_renames(input_paths: &[PathBuf], input_renames: &[InputIdRenames]) {
 /// groups and programs are written under in the merged header.
 ///
 /// When no input has a renamed ID, every read passes through untouched, at no
-/// per-record cost. Otherwise every read's tags are checked: a tag naming a renamed ID
+/// per-record cost, so an undeclared `PG` tag that happens to equal the ID of the
+/// merge's own @PG (`fgumi`, ...) goes unreported and resolves to it. Otherwise every read's tags are checked: a tag naming a renamed ID
 /// is rewritten, and a tag naming an ID its input's header does not declare is left
 /// unchanged and reported (once per input and tag, then as a count). When that ID is a
 /// fresh ID minted for a renamed record, the read now joins that record, so the
