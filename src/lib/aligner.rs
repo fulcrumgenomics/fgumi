@@ -84,6 +84,50 @@ pub(crate) fn user_set_mimalloc_purge() -> bool {
     names_set_mimalloc_purge(std::env::vars_os().map(|(name, _)| name))
 }
 
+/// Delay mimalloc returning freed pages to the OS (by
+/// [`fgumi_sort::RETAINED_PURGE_DELAY_MS`]), unless the user set the purge
+/// delay. The align stage frees and reallocates large per-batch buffers on
+/// every pool thread, and mimalloc's default purge (decommit after 1 s) turns
+/// that reuse into millions of page faults.
+///
+/// The setting is process-wide and is never restored, so it covers every stage
+/// of the `runall` process, not just align. The delay is bounded rather than
+/// never-purge on purpose: with `-1`, memory a fused sort frees at each spill
+/// is never returned, and peak RSS grows by roughly the sort's memory budget
+/// (+5.5 GB in-process on 30M pairs, enough to exceed a 30 GB limit). Measured
+/// on 3M pairs at 32 threads (extract through simplex consensus, subprocess and
+/// in-process aligners, with and without a spilling sort), the 60 s delay
+/// matches never-purging on wall time, CPU and page faults (~30k vs ~750k at
+/// mimalloc's default, which is ~3% slower); on 30M pairs it gives back most of
+/// never-purging's extra memory (fgumi 13.4 GB vs 17.6 GB, 11.6 GB at the
+/// default). Set `MIMALLOC_PURGE_DELAY` to choose otherwise.
+///
+/// Both align backends call it at wiring; `stage` labels the debug line that
+/// reports the resulting delay. A sort does not: v0.7.0 never set the delay,
+/// and on a production-sized sort the 60 s delay cost 3–5 GiB of peak RSS with
+/// no speed benefit.
+pub(crate) fn retain_freed_memory_unless_user_set(stage: &str) {
+    retain_unless_user_set(
+        std::env::vars_os().map(|(name, _)| name),
+        fgumi_sort::retain_freed_memory,
+    );
+    log::debug!("{stage}: mimalloc purge delay {} ms", fgumi_sort::mi_purge_delay_ms());
+}
+
+/// Call `retain` unless `names` (environment variable names) set the purge
+/// delay; returns whether it was called.
+fn retain_unless_user_set<I, S>(names: I, retain: impl FnOnce()) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let retained = !names_set_mimalloc_purge(names);
+    if retained {
+        retain();
+    }
+    retained
+}
+
 /// Whether `names` (environment variable names) include either
 /// [`MIMALLOC_PURGE_ENV`] name. The comparison ignores ASCII case because
 /// mimalloc's own lookup does, so `mimalloc_purge_delay=250` is the user's
@@ -1387,6 +1431,22 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// A user-set purge delay (either name, any case) wins: the delay is not
+    /// set.
+    #[rstest]
+    #[case::unset(&["PATH", "MIMALLOC_VERBOSE"], true)]
+    #[case::purge_delay(&["MIMALLOC_PURGE_DELAY"], false)]
+    #[case::legacy_name(&["MIMALLOC_RESET_DELAY"], false)]
+    #[case::any_case(&["mimalloc_purge_delay"], false)]
+    fn the_purge_delay_is_retained_unless_the_user_set_it(
+        #[case] names: &[&str],
+        #[case] expected: bool,
+    ) {
+        let mut called = false;
+        assert_eq!(retain_unless_user_set(names, || called = true), expected);
+        assert_eq!(called, expected);
+    }
 
     #[rstest]
     #[case::current_name(&["MIMALLOC_PURGE_DELAY"], true)]

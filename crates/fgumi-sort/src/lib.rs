@@ -262,8 +262,9 @@ pub use fd_limit::{
 };
 pub use inline::{
     CbKey32, ChunkRef, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef,
-    SORT_SEGMENT_SIZE, TemplateKey, TemplateKey24, TertKey32, extract_coordinate_key_inline,
-    radix_sort_record_refs, radix_sort_record_refs_with_max,
+    SORT_SEGMENT_SIZE, TemplateKey, TemplateKey24, TemplateLaneKey, TemplateRecordRef, TertKey32,
+    extract_coordinate_key_inline, radix_sort_record_refs, radix_sort_record_refs_with_max,
+    radix_sort_template_refs, sort_template_refs_into_records,
 };
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,

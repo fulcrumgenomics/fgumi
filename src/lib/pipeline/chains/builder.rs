@@ -3937,6 +3937,11 @@ impl<'a> ChainBuilder<'a> {
             // A queryname sort shares one class table and one set of key
             // counters across its front and its summary.
             let qn_keys = fgumi_sort::QnSortState::new(sort.sort_stats);
+            // A sort leaves mimalloc's purge delay alone, as v0.7.0 did: on a
+            // production-sized sort, align's retained 60 s delay cost 3–5 GiB of
+            // peak RSS for no speed gain. Report it, since an align stage in the same
+            // process may have raised it.
+            log::debug!("sort: mimalloc purge delay {} ms", fgumi_sort::mi_purge_delay_ms());
             let phase1_tail = {
                 let (temp_dirs, alloc) = fgumi_sort::create_sort_temp_dirs(&sort.tmp_dirs)
                     .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;

@@ -256,6 +256,41 @@ fn sort_spilling_with(order: &str, extra: &[&str]) -> String {
     sort_shuffled(order, 20_000, "1M", extra, false)
 }
 
+/// A sort does not set mimalloc's purge delay, as v0.7.0 did not: the delay
+/// stays at the bundled mimalloc's 1000 ms default, or at what the user set.
+#[rstest]
+#[case::default(None, "sort: mimalloc purge delay 1000 ms")]
+#[case::user_set(Some("250"), "sort: mimalloc purge delay 250 ms")]
+fn sort_does_not_set_the_mimalloc_purge_delay(
+    #[case] purge_delay: Option<&str>,
+    #[case] expected: &str,
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let input: PathBuf = tmp.path().join("unsorted.bam");
+    write_shuffled_bam_fixture(&input, 200, 0x5EED);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.env("RUST_LOG", "debug")
+        .env_remove("MIMALLOC_PURGE_DELAY")
+        .env_remove("MIMALLOC_RESET_DELAY");
+    if let Some(ms) = purge_delay {
+        cmd.env("MIMALLOC_PURGE_DELAY", ms);
+    }
+    let result = cmd
+        .args(["sort", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(tmp.path().join("sorted.bam"))
+        .args(["--order", "coordinate"])
+        .output()
+        .expect("run fgumi sort");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
+    assert!(
+        stderr.lines().map(log_body).any(|l| l == expected),
+        "expected `{expected}`:\n{stderr}"
+    );
+}
+
 /// `N` from the standalone-sort summary line `Merge sources: N`.
 fn merge_sources(stderr: &str) -> Option<u64> {
     stderr

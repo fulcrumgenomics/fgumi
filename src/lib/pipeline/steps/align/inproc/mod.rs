@@ -156,7 +156,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // No poison-on-error guard is needed for the header handle: if `wire`
         // returns `Err`, `ChainBuilder::add_align` propagates it before stashing
         // the handle for the sink, so no consumer can be blocked on it.
-        super::retain_freed_memory_unless_user_set();
+        crate::aligner::retain_freed_memory_unless_user_set("align");
 
         // Load the index once, synchronously, on the shared thread budget. Log
         // wall time and whether a staged shm segment was attached. A staged

@@ -422,6 +422,9 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
   better than a simple heap merge when the number of sorted runs is large
 - `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
   reduce the number of intermediate merge passes
+- A standalone sort leaves mimalloc's purge delay at its 1 s default, as v0.7.0 did: on a
+  whole-genome sort, keeping freed memory mapped for 60 s raised peak RSS by 3–5 GiB and made
+  the sort no faster. `MIMALLOC_PURGE_DELAY` still applies if you set it.
 - `--max-temp-files` sets how many spilled runs may be live at once; when the limit is reached,
   adjacent runs are merged — the smallest first — until the count is back under it. The final k-way merge opens every remaining run at once, so
   this limit is what bounds the sort's open file descriptors — and consolidation rewrites data

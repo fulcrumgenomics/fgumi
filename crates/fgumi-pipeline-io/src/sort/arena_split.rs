@@ -1376,6 +1376,8 @@ impl ArenaKeyExtractor for CoordinateKeys {
         sort_threads: usize,
         _pool: &BoundedSortPool,
     ) -> MemoryChunkErased {
+        // The refs move into the chunk (converted in place), leaving `acc`
+        // empty with no capacity.
         MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(
             arena,
             std::mem::take(acc),

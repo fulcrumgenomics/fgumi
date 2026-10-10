@@ -1469,7 +1469,7 @@ impl AlignBackend for SubprocessBackend {
         // fgumi's side of the subprocess route churns the same per-batch
         // buffers (FASTQ out, BAM in, merge); the aligner child gets the same
         // setting through its environment (see `AlignerProcess::spawn`).
-        super::retain_freed_memory_unless_user_set();
+        crate::aligner::retain_freed_memory_unless_user_set("align");
         let step = SubprocessAlignStep::new(
             SubprocessConfig {
                 partial_output_header: Arc::clone(&ctx.partial_output_header),

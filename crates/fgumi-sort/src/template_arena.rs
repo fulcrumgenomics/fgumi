@@ -38,7 +38,7 @@ use crate::external::{KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, viol
 use crate::frame_keyed_record_into;
 use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
-    TemplateRecordRef, TertKey32, parallel_radix_sort_template_refs, radix_sort_template_refs,
+    TemplateRecordRef, TertKey32, sort_template_refs_into_records,
 };
 use crate::run_bound::RunBound;
 use crate::sort_pool::BoundedSortPool;
@@ -195,16 +195,10 @@ impl TemplateMemChunk {
 #[must_use]
 pub fn template_chunk_from_arena_refs<K: TemplateLaneKey>(
     arena: Arc<PooledSegmentedBuf>,
-    mut refs: Vec<TemplateRecordRef<K>>,
+    refs: Vec<TemplateRecordRef<K>>,
     sort_threads: usize,
 ) -> InMemoryChunk<K> {
-    if crate::ref_sort::radix_sorts_in_parallel(refs.len(), sort_threads) {
-        parallel_radix_sort_template_refs(&mut refs);
-    } else {
-        radix_sort_template_refs(&mut refs);
-    }
-    let records: Vec<(K, u64, u32)> = refs.into_iter().map(|r| (r.key, r.offset, r.len)).collect();
-    InMemoryChunk::from_parts(arena, records)
+    InMemoryChunk::from_parts(arena, sort_template_refs_into_records(refs, sort_threads))
 }
 
 /// Narrow-lane ref accumulator, one arm per `--key-types` variant. Each arm holds
@@ -259,6 +253,17 @@ impl TemplateArenaRefs {
         self.len() == 0
     }
 
+    /// Refs the container holds without reallocating.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        match self {
+            Self::K24(v) => v.capacity(),
+            Self::Cb32(v) => v.capacity(),
+            Self::Tert32(v) => v.capacity(),
+            Self::K40(v) => v.capacity(),
+        }
+    }
+
     /// Append one extracted batch, in order. Append only a batch that
     /// reported no violation: one that did fails the run instead (see
     /// [`TemplateKeyContext::extract_batch`](crate::template_key::TemplateKeyContext::extract_batch)).
@@ -311,9 +316,10 @@ fn arm_name(v: TemplateKeyVariant) -> &'static str {
 /// `pool.install`. `sort_threads` is the phase-1 width; `pool` is the shared
 /// bounded pool built at that width. When `--sort-threads` caps phase 1, the
 /// caller holds the whole cap for the duration of this call, so pool steps and
-/// this sort never run together beyond the cap. `refs` is drained, leaving an
-/// empty container of the SAME arm for the next run (the variant is chosen once
-/// per sort).
+/// this sort never run together beyond the cap. The refs move out of `refs`
+/// into the chunk ([`template_chunk_from_arena_refs`]), leaving it empty with
+/// its arm (the variant is chosen once per sort) and no capacity: the run's
+/// one ref buffer is the chunk's, freed when the chunk drops.
 #[must_use]
 pub fn seal_template_refs(
     refs: &mut TemplateArenaRefs,
@@ -321,20 +327,18 @@ pub fn seal_template_refs(
     sort_threads: usize,
     pool: &rayon::ThreadPool,
 ) -> TemplateMemChunk {
-    let drained = std::mem::replace(refs, TemplateArenaRefs::for_variant(refs.variant()));
-    pool.install(move || match drained {
-        TemplateArenaRefs::K24(r) => {
-            TemplateMemChunk::K24(template_chunk_from_arena_refs(arena, r, sort_threads))
-        }
-        TemplateArenaRefs::Cb32(r) => {
-            TemplateMemChunk::Cb32(template_chunk_from_arena_refs(arena, r, sort_threads))
-        }
-        TemplateArenaRefs::Tert32(r) => {
-            TemplateMemChunk::Tert32(template_chunk_from_arena_refs(arena, r, sort_threads))
-        }
-        TemplateArenaRefs::K40(r) => {
-            TemplateMemChunk::K40(template_chunk_from_arena_refs(arena, r, sort_threads))
-        }
+    fn seal<K: TemplateLaneKey>(
+        arena: Arc<PooledSegmentedBuf>,
+        refs: &mut Vec<TemplateRecordRef<K>>,
+        sort_threads: usize,
+    ) -> InMemoryChunk<K> {
+        template_chunk_from_arena_refs(arena, std::mem::take(refs), sort_threads)
+    }
+    pool.install(move || match refs {
+        TemplateArenaRefs::K24(r) => TemplateMemChunk::K24(seal(arena, r, sort_threads)),
+        TemplateArenaRefs::Cb32(r) => TemplateMemChunk::Cb32(seal(arena, r, sort_threads)),
+        TemplateArenaRefs::Tert32(r) => TemplateMemChunk::Tert32(seal(arena, r, sort_threads)),
+        TemplateArenaRefs::K40(r) => TemplateMemChunk::K40(seal(arena, r, sort_threads)),
     })
 }
 
@@ -703,6 +707,7 @@ mod tests {
         let pool = BoundedSortPool::new("tmpl-sort");
         let b = seal_template_refs(&mut refs, Arc::clone(&arena), 2, pool.bounded(2));
         assert!(refs.is_empty(), "seal drains the container");
+        assert_eq!(refs.capacity(), 0, "the refs moved into the chunk; no buffer is kept");
         assert_eq!(refs.variant(), ctx.variant, "and leaves the same arm");
 
         assert_eq!(owned_chunk.len(), records.len());

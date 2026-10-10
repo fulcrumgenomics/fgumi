@@ -164,9 +164,12 @@ The following external FFI calls are approved because they back core infrastruct
   mimalloc synchronizes these calls internally, so they are safe to invoke
   concurrently. `retain_freed_memory` sets mimalloc's purge delay to
   `RETAINED_PURGE_DELAY_MS` (60 s); both align backends call it at wiring (via
-  `retain_freed_memory_unless_user_set`) unless `MIMALLOC_PURGE_DELAY` is set,
-  because their per-batch buffer churn otherwise costs millions of page faults at
-  mimalloc's 1 s default. The setting is process-wide and never restored. It is
+  `crate::aligner::retain_freed_memory_unless_user_set`) unless
+  `MIMALLOC_PURGE_DELAY` is set, because their per-batch buffer churn otherwise
+  costs millions of page faults at mimalloc's 1 s default. Sort chains do not
+  call it: v0.7.0 never set the delay, and on a production-sized sort (EC2,
+  HG00096) the 60 s delay cost 3–5 GiB of peak RSS with no speed benefit, so a
+  standalone sort keeps mimalloc's default. The setting is process-wide and never restored. It is
   deliberately bounded, not -1 (never purge): under -1 every page a later stage
   frees stays resident (mimalloc does not even mark it purgeable, so
   `force_mi_collect()` cannot release it), and a fused sort's freed spill memory

@@ -1010,3 +1010,194 @@ fn coordinate_sorts_in_parallel_exactly_when_the_radix_does() {
     }
     assert!(saw_parallel, "some run is large enough to sort in parallel");
 }
+
+/// A run accumulator whose capacity a test can read.
+trait AccCapacity {
+    fn cap(&self) -> usize;
+}
+
+impl AccCapacity for Vec<fgumi_sort::RecordRef> {
+    fn cap(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl AccCapacity for fgumi_sort::TemplateArenaRefs {
+    fn cap(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl AccCapacity for Vec<fgumi_sort::QnRef> {
+    fn cap(&self) -> usize {
+        self.capacity()
+    }
+}
+
+/// One run's single ref batch over `bodies`, extracted through `X`.
+fn run_batch<X: ArenaKeyExtractor>(
+    ctx: &X::Ctx,
+    bodies: &[Vec<u8>],
+    ordinal: u64,
+    run_seq: u32,
+    seals_to_spill: bool,
+) -> RefBatch<X> {
+    let data = frames(bodies);
+    let (arena, at) = arena_with(16, &data);
+    let n = u32::try_from(bodies.len()).unwrap();
+    let (refs, violation) =
+        X::extract_batch(ctx, &mut X::Scratch::default(), &arena, at, at + data.len() as u64, n, 0)
+            .unwrap();
+    let now = Instant::now();
+    RefBatch {
+        arena,
+        ctx: Some(ctx.clone()),
+        ordinal,
+        run_seq,
+        first_record_index: 0,
+        refs: Some(refs),
+        violation,
+        keyed_at: now,
+        run_end: Some(RunEnd {
+            seals_to_spill,
+            records_ingested_so_far: u64::from(n),
+            run_bytes: data.len() as u64,
+            scan_end: now,
+        }),
+    }
+}
+
+/// Feed `batches` to `sort` one at a time, returning each sealed chunk's
+/// record bodies and the accumulator's capacity right after each seal.
+fn seal_runs<X: ArenaKeyExtractor>(
+    sort: &mut SortRun<X>,
+    batches: Vec<RefBatch<X>>,
+) -> Vec<(Vec<Vec<u8>>, usize)>
+where
+    X::Accum: AccCapacity,
+{
+    let mut sp = StepProbe::new(&*sort);
+    let out = sp.take_output::<SortChunkEvent>(0);
+    let mut sealed = Vec::new();
+    for batch in batches {
+        sp.push_input(batch);
+        sp.try_run(sort).unwrap();
+        let cap = sort.acc.as_ref().map_or(0, AccCapacity::cap);
+        while let Some(ev) = out.pop() {
+            if let SortChunkEvent::Spill { chunk, .. } | SortChunkEvent::Residual { chunk, .. } = ev
+            {
+                sealed.push((
+                    (0..chunk.len()).map(|i| chunk.record_bytes(i).to_vec()).collect(),
+                    cap,
+                ));
+            }
+        }
+    }
+    sealed
+}
+
+/// Every order's seal moves the run's refs into its chunk, so the run sort
+/// keeps no ref buffer beside a chunk that is spilling (or, after the final
+/// run, through the merge): right after each seal — the spilled run 1 and the
+/// residual run 2 — the accumulator holds no capacity, and run 2's chunk is
+/// exactly the chunk a fresh run sort seals for the same records.
+#[rstest::rstest]
+fn seals_keep_no_ref_buffer(#[values("template", "coordinate", "queryname")] order: &str) {
+    fn check<X: ArenaKeyExtractor>(ctx: &X::Ctx, run1: &[Vec<u8>], run2: &[Vec<u8>])
+    where
+        X::Accum: AccCapacity,
+    {
+        let mut sort = SortRun::<X>::new(1, 1 << 20);
+        let sealed = seal_runs(
+            &mut sort,
+            vec![run_batch::<X>(ctx, run1, 0, 0, true), run_batch::<X>(ctx, run2, 1, 1, false)],
+        );
+        assert_eq!(sealed.len(), 2);
+        assert_eq!(sealed[0].1, 0, "the spilled run's refs moved into its chunk");
+        assert_eq!(sealed[1].1, 0, "the final run's refs moved into its chunk");
+        let mut fresh = SortRun::<X>::new(1, 1 << 20);
+        let alone = seal_runs(&mut fresh, vec![run_batch::<X>(ctx, run2, 0, 0, false)]);
+        assert!(sealed[1].0 == alone[0].0, "run 2 seals as on a fresh run sort");
+    }
+    let run1: Vec<Vec<u8>> = (0..1500).map(body).collect();
+    let run2: Vec<Vec<u8>> = (1500..2300).map(body).collect();
+    match order {
+        "template" => check::<TemplateKeys>(&seed().provision(&run1[0]), &run1, &run2),
+        "queryname" => {
+            let ctx = QuerynameKeys::<fgumi_sort::QnLex>::provision(
+                &fgumi_sort::QnSortState::new(false),
+                &run1[0],
+            );
+            check::<QuerynameKeys<fgumi_sort::QnLex>>(&ctx, &run1, &run2);
+        }
+        _ => {
+            let run1: Vec<Vec<u8>> =
+                (0..1500).map(|i| coord_body(i, 1, i32::try_from(i * 37 % 900).unwrap())).collect();
+            let run2: Vec<Vec<u8>> =
+                (0..800).map(|i| coord_body(i, 0, i32::try_from(i * 11 % 300).unwrap())).collect();
+            check::<CoordinateKeys>(&CoordinateKeys::provision(&2, &run1[0]), &run1, &run2);
+        }
+    }
+}
+
+/// A coordinate or template seal converts the refs into the chunk's tuples in
+/// place: the chunk's records live where the accumulator's refs did.
+#[rstest::rstest]
+fn coordinate_and_template_seals_move_the_refs(#[values(true, false)] template: bool) {
+    fn check<X: ArenaKeyExtractor>(ctx: &X::Ctx, bodies: &[Vec<u8>], at: fn(&X::Accum) -> *const u8)
+    where
+        X::Accum: AccCapacity,
+    {
+        let batch = run_batch::<X>(ctx, bodies, 0, 0, false);
+        let mut acc = X::accum_for(ctx);
+        X::append(&mut acc, batch.refs.unwrap());
+        let ptr = at(&acc);
+        let chunk = X::seal(&mut acc, ctx, batch.arena, 1, &BoundedSortPool::new("test-sort"));
+        let records = match &chunk {
+            MemoryChunkErased::Coordinate(c) => c.records_ptr().cast::<u8>(),
+            MemoryChunkErased::TemplateCoordinate(fgumi_sort::TemplateMemChunk::K24(c)) => {
+                c.records_ptr().cast::<u8>()
+            }
+            _ => panic!("an unexpected chunk"),
+        };
+        assert_eq!(chunk.len(), bodies.len());
+        assert!(std::ptr::eq(records, ptr), "the chunk's tuples are the refs' allocation");
+        assert_eq!(acc.cap(), 0, "the accumulator gave its buffer to the chunk");
+    }
+    if template {
+        let bodies: Vec<Vec<u8>> = (0..500).map(body).collect();
+        check::<TemplateKeys>(&seed().provision(&bodies[0]), &bodies, |acc| match acc {
+            fgumi_sort::TemplateArenaRefs::K24(v) => v.as_ptr().cast(),
+            _ => panic!("the fixture provisions the 24-byte lane"),
+        });
+    } else {
+        let bodies: Vec<Vec<u8>> =
+            (0..500).map(|i| coord_body(i, 1, i32::try_from(i * 37 % 900).unwrap())).collect();
+        check::<CoordinateKeys>(&CoordinateKeys::provision(&2, &bodies[0]), &bodies, |acc| {
+            acc.as_ptr().cast()
+        });
+    }
+}
+
+/// A queryname seal moves the run's refs into the chunk: the chunk's record
+/// tuples live where the accumulator's refs did. (Its accumulator therefore
+/// starts every run empty.)
+#[test]
+fn queryname_seal_moves_the_refs_without_copying() {
+    use fgumi_sort::{QnLex, QnSortState};
+    let bodies: Vec<Vec<u8>> = (0..500).map(body).collect();
+    let ctx = QuerynameKeys::<QnLex>::provision(&QnSortState::new(false), &bodies[0]);
+    let batch = run_batch::<QuerynameKeys<QnLex>>(&ctx, &bodies, 0, 0, false);
+    let mut acc = QuerynameKeys::<QnLex>::accum_for(&ctx);
+    QuerynameKeys::<QnLex>::append(&mut acc, batch.refs.unwrap());
+    let at = acc.as_ptr();
+    let pool = BoundedSortPool::new("qname-sort");
+    let MemoryChunkErased::QuerynameLex(chunk) =
+        QuerynameKeys::<QnLex>::seal(&mut acc, &ctx, batch.arena, 2, &pool)
+    else {
+        panic!("a lexicographic queryname chunk");
+    };
+    assert_eq!(chunk.len(), 500);
+    assert!(std::ptr::eq(chunk.records_ptr().cast::<u8>(), at.cast::<u8>()), "refs moved");
+    assert_eq!(acc.capacity(), 0, "the accumulator gave its buffer to the chunk");
+}

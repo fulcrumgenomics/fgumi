@@ -1142,8 +1142,11 @@ impl ArenaSortStrategy for CoordinateStrategy {
     }
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
-        let refs = std::mem::take(&mut self.refs);
-        MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(arena, refs, sort_threads))
+        MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(
+            arena,
+            std::mem::take(&mut self.refs),
+            sort_threads,
+        ))
     }
 
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {

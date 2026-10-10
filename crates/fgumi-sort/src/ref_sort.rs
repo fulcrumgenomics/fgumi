@@ -153,8 +153,13 @@ pub fn coordinate_chunk_from_arena_refs(
 
 /// Build a sorted coordinate chunk from already-extracted `RecordRef`s (each
 /// carries its coordinate `sort_key` and the `(offset, len)` of its body in
-/// `arena`).  Radix-sorts the refs and wraps `arena` into the returned chunk —
-/// NO walk of the arena and NO record-byte copies.
+/// `arena`).  Radix-sorts the refs in place and wraps `arena` into the returned
+/// chunk — NO walk of the arena and NO record-byte copies.
+///
+/// The refs' allocation becomes the chunk's record tuples: a `RecordRef` and a
+/// `(RawCoordinateKey, u64, u32)` have the same size and alignment, so the
+/// conversion runs in place. A run therefore holds one run-sized ref buffer,
+/// never a second one beside the chunk while the chunk spills.
 ///
 /// This is the fused entry point: the split front extracts the key in
 /// `ExtractCoordinateKeys` (and the record-input front as it pushes each record)
@@ -166,9 +171,15 @@ pub fn coordinate_chunk_from_refs(
     mut refs: Vec<RecordRef>,
     sort_threads: usize,
 ) -> InMemoryChunk<RawCoordinateKey> {
+    const {
+        assert!(size_of::<RecordRef>() == size_of::<(RawCoordinateKey, u64, u32)>());
+        assert!(align_of::<RecordRef>() == align_of::<(RawCoordinateKey, u64, u32)>());
+    }
     sort_coordinate_refs(&mut refs, sort_threads);
-    let records: Vec<(RawCoordinateKey, u64, u32)> =
-        refs.iter().map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len)).collect();
+    let records: Vec<(RawCoordinateKey, u64, u32)> = refs
+        .into_iter()
+        .map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len))
+        .collect();
     InMemoryChunk::from_parts(arena, records)
 }
 
@@ -289,6 +300,23 @@ mod tests {
             ref_bytes, oracle_bytes,
             "ref-sort output must be byte-identical to the copy-based sorter"
         );
+    }
+
+    /// A coordinate seal converts the refs into the chunk's tuples in place
+    /// (serial and parallel radix alike): the chunk's tuples live in the refs'
+    /// allocation, so a sealed run holds one run-sized ref buffer.
+    #[rstest::rstest]
+    fn seal_reuses_the_refs_allocation(#[values(1, 4)] sort_threads: usize) {
+        let n = PARALLEL_SORT_THRESHOLD + 3;
+        let refs: Vec<RecordRef> = (0..n as u64)
+            .map(|i| RecordRef::new(i.wrapping_mul(2_654_435_761) % 997, i, 1))
+            .collect();
+        let at = refs.as_ptr().cast::<u8>();
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default()));
+        let chunk = coordinate_chunk_from_refs(arena, refs, sort_threads);
+        assert_eq!(chunk.len(), n);
+        assert!(std::ptr::eq(chunk.records_ptr().cast::<u8>(), at), "the tuples reuse the refs");
+        assert!((1..n).all(|i| chunk.key_at(i - 1).sort_key <= chunk.key_at(i).sort_key), "sorted");
     }
 
     use proptest::prelude::*;
