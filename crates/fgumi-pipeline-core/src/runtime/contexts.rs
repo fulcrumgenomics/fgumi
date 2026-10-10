@@ -30,7 +30,7 @@ use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 ///
 /// There is exactly ONE `StepCounters` per `step_idx` (stored in
 /// `ChainContexts::step_counters`); the driver hands every dispatch of that
-/// step — including all `Parallel` per-worker clones — the SAME
+/// step — including every clone of a `Parallel` step — the SAME
 /// `&StepCounters`, so their bumps aggregate into one shared atomic with no
 /// per-clone slots and no summing pass. The backing `Arc<[AtomicU64]>` lets a
 /// step's internal helper thread clone the handle and bump it too.

@@ -1,10 +1,12 @@
 //! `WorkerStepEntry`: per-worker per-step storage shape. Determined by
-//! `StepKind` at run start; immutable thereafter.
+//! `StepKind` (and, for `Parallel`, the step's `ParallelHosts`) at run start;
+//! immutable thereafter.
 
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 
 use crate::erased::ErasedStep;
+use crate::runtime::placement::ParallelHosts;
 use crate::step::{Affinity, StepKind};
 
 /// Shared "this step has finished" latch for a `Serial` step.
@@ -37,11 +39,13 @@ impl DrainGate {
 
 /// One per (worker, step) cell.
 pub enum WorkerStepEntry {
-    /// `Parallel` step: this worker owns its private clone via `clone_boxed`.
-    /// Direct `&mut` access; no locking on `try_run` dispatch. Completion is
-    /// coordinated by the per-step `StepDrainCounter` (init N) in the driver:
-    /// every clone returns `Finished` when the input drains, but only the last
-    /// to finish closes the shared output.
+    /// `Parallel` step: this worker (one of the step's host workers, or the
+    /// driver hosting its single clone) owns its private clone via
+    /// `clone_boxed`. Direct `&mut` access; no locking on `try_run` dispatch.
+    /// Completion is coordinated by the per-step `StepDrainCounter` (init =
+    /// `ParallelHosts::clone_count()`) in the driver: every clone returns
+    /// `Finished` when the input drains, but only the last to finish closes the
+    /// shared output.
     Owned { step: Box<dyn ErasedStep> },
     /// `Serial` step: shared instance, mutex-protected. Any worker can acquire.
     /// The shared `DrainGate` finished-latch lets a worker that finishes the
@@ -50,8 +54,10 @@ pub enum WorkerStepEntry {
     /// `Exclusive` step: only this worker (the owner) ever runs it.
     /// Stored locally on the owner; other workers have `Skip`.
     Exclusive { step: Box<dyn ErasedStep> },
-    /// This worker doesn't run this step (it's an `Exclusive` step owned by
-    /// another worker). The worker loop skips it in dispatch.
+    /// This worker does not run the step: an `Exclusive` step owned by another
+    /// worker, a `Serial` step its affinity gates out, a `Detached` step, or a
+    /// `Parallel` step whose placement puts no clone here (excluded, or hosted
+    /// on a driver). The worker loop skips it in dispatch.
     Skip,
 }
 
@@ -68,24 +74,32 @@ impl WorkerStepEntry {
 /// `steps`: the chain in order (consumed).
 /// `exclusive_owners[step_idx] == Some(worker_id)` for each Exclusive step.
 /// `n_workers`: number of worker threads.
+/// `hosts[step_idx]`: where a `Parallel` step's clones live
+/// (`plan_parallel_hosts`); ignored for every other kind.
 ///
 /// Returns `entries[worker_id][step_idx] = WorkerStepEntry`.
 ///
 /// # Panics
 ///
-/// Panics if `exclusive_owners.len() != steps.len()` or if an Exclusive
-/// step has no owner assignment (`assign_exclusive_owners` must run first).
+/// Panics if `exclusive_owners.len() != steps.len()`, if
+/// `hosts.len() != steps.len()`, if an Exclusive step has no owner
+/// assignment (`assign_exclusive_owners` must run first), or if a `Parallel`
+/// step has no clone anywhere — neither a host worker nor a hosting driver
+/// (`plan_parallel_hosts` always gives one; without it nothing would ever pop
+/// the step's input and the run would wedge).
 #[must_use]
 pub fn build_worker_storage(
     steps: Vec<Box<dyn ErasedStep>>,
     exclusive_owners: &[Option<usize>],
     n_workers: usize,
+    hosts: &[ParallelHosts],
 ) -> Vec<Vec<WorkerStepEntry>> {
     assert_eq!(
         steps.len(),
         exclusive_owners.len(),
         "exclusive_owners length must match step count"
     );
+    assert_eq!(steps.len(), hosts.len(), "hosts length must match step count");
     assert!(n_workers > 0, "build_worker_storage requires at least one worker");
 
     let mut entries: Vec<Vec<WorkerStepEntry>> =
@@ -95,11 +109,33 @@ pub fn build_worker_storage(
         let kind = step.kind();
         match kind {
             StepKind::Parallel => {
-                // Each worker gets its own clone; the original goes to worker N-1.
-                for entries_for_worker in entries.iter_mut().take(n_workers - 1) {
-                    entries_for_worker.push(WorkerStepEntry::Owned { step: step.clone_boxed() });
+                // Clones go to exactly `hosts[step_idx].workers` (the original to
+                // the last host); every other worker `Skip`s. A hosted step (no
+                // worker hosts) was moved to its driver before this ran; its
+                // placeholder lands here and every worker Skips it.
+                assert!(
+                    hosts[step_idx].clone_count() > 0,
+                    "Parallel step `{}` has no host worker and no hosting driver; \
+                     plan_parallel_hosts gives every Parallel step at least one clone",
+                    step.name()
+                );
+                let host_workers = &hosts[step_idx].workers;
+                let last = host_workers.last().copied();
+                let mut original = Some(step);
+                for (w, row) in entries.iter_mut().enumerate() {
+                    if host_workers.contains(&w) {
+                        let entry = if Some(w) == last {
+                            original.take().expect("original placed once")
+                        } else {
+                            original.as_ref().expect("original alive until last").clone_boxed()
+                        };
+                        row.push(WorkerStepEntry::Owned { step: entry });
+                    } else {
+                        row.push(WorkerStepEntry::Skip);
+                    }
                 }
-                entries[n_workers - 1].push(WorkerStepEntry::Owned { step });
+                // Hosted placeholder (no worker hosts): dropped here.
+                drop(original);
             }
             StepKind::Serial => {
                 // Snapshot the affinity hint before moving `step` into
@@ -159,7 +195,7 @@ pub fn build_worker_storage(
                 // A Detached step never runs on the pool. Every real Detached
                 // instance is extracted by `extract_detached_steps` BEFORE this
                 // function runs (it drives the step on its own dedicated
-                // thread) and is replaced in `steps` by a `DetachedPlaceholder`
+                // thread) and is replaced in `steps` by an `ExtractedPlaceholder`
                 // whose `kind()` still reports `StepKind::Detached`. So on every
                 // real sort run this arm IS reached — once per placeholder — and
                 // its job is exactly this: give every pool worker a `Skip` entry
@@ -268,6 +304,61 @@ mod tests {
         }
     }
 
+    /// `build_worker_storage` with every `Parallel` step on every worker (the
+    /// `PoolPlacement::AllWorkers` placement), for the tests that are about the
+    /// other kinds.
+    fn storage_all_workers(
+        steps: Vec<Box<dyn ErasedStep>>,
+        owners: &[Option<usize>],
+        n: usize,
+    ) -> Vec<Vec<WorkerStepEntry>> {
+        let hosts: Vec<ParallelHosts> = steps
+            .iter()
+            .map(|s| match s.kind() {
+                StepKind::Parallel => ParallelHosts { workers: (0..n).collect(), driver: None },
+                _ => ParallelHosts::default(),
+            })
+            .collect();
+        build_worker_storage(steps, owners, n, &hosts)
+    }
+
+    /// A Parallel step's clones go to exactly its host workers: an excluded
+    /// worker gets `Skip`, and a step hosted on a driver is `Skip` on every
+    /// worker (its real instance runs in the driver's row).
+    #[rstest]
+    #[case::exclude_worker_zero(vec![1, 2], None, [false, true, true])]
+    #[case::hosted_on_a_driver(
+        vec![],
+        Some(crate::runtime::wake::DriverIdx(0)),
+        [false, false, false]
+    )]
+    fn parallel_clones_follow_hosts(
+        #[case] workers: Vec<usize>,
+        #[case] driver: Option<crate::runtime::wake::DriverIdx>,
+        #[case] owned: [bool; 3],
+    ) {
+        let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(ParallelStep))];
+        let hosts = [ParallelHosts { workers, driver }];
+        let entries = build_worker_storage(steps, &[None], 3, &hosts);
+        for (w, want_owned) in owned.iter().enumerate() {
+            if *want_owned {
+                assert!(matches!(entries[w][0], WorkerStepEntry::Owned { .. }), "worker {w}");
+            } else {
+                assert!(matches!(entries[w][0], WorkerStepEntry::Skip), "worker {w}");
+            }
+        }
+    }
+
+    /// A `Parallel` step with neither a host worker nor a hosting driver would
+    /// have no instance anywhere; storage rejects it rather than `Skip` it on
+    /// every worker and wedge the run.
+    #[test]
+    #[should_panic(expected = "has no host worker and no hosting driver")]
+    fn parallel_step_without_any_clone_panics() {
+        let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(ParallelStep))];
+        let _ = build_worker_storage(steps, &[None], 3, &[ParallelHosts::default()]);
+    }
+
     #[test]
     fn skip_is_not_dispatchable() {
         assert!(!WorkerStepEntry::Skip.is_dispatchable());
@@ -280,7 +371,7 @@ mod tests {
     fn detached_step_is_skipped_on_all_workers() {
         let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(DetachedStep))];
         let owners = vec![None];
-        let entries = build_worker_storage(steps, &owners, 4);
+        let entries = storage_all_workers(steps, &owners, 4);
         assert_eq!(entries.len(), 4);
         for w in &entries {
             assert_eq!(w.len(), 1);
@@ -295,7 +386,7 @@ mod tests {
     fn parallel_step_yields_owned_per_worker() {
         let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(ParallelStep))];
         let owners = vec![None];
-        let entries = build_worker_storage(steps, &owners, 4);
+        let entries = storage_all_workers(steps, &owners, 4);
         assert_eq!(entries.len(), 4);
         for w in &entries {
             assert_eq!(w.len(), 1);
@@ -307,7 +398,7 @@ mod tests {
     fn serial_step_yields_shared_arc_for_all_workers() {
         let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(SerialStep))];
         let owners = vec![None];
-        let entries = build_worker_storage(steps, &owners, 3);
+        let entries = storage_all_workers(steps, &owners, 3);
         for w in &entries {
             assert!(matches!(w[0], WorkerStepEntry::Shared { .. }));
         }
@@ -328,7 +419,7 @@ mod tests {
     fn exclusive_step_owner_gets_exclusive_others_skip() {
         let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(ExclusiveStep))];
         let owners = vec![Some(2)];
-        let entries = build_worker_storage(steps, &owners, 4);
+        let entries = storage_all_workers(steps, &owners, 4);
         assert!(matches!(entries[0][0], WorkerStepEntry::Skip));
         assert!(matches!(entries[1][0], WorkerStepEntry::Skip));
         assert!(matches!(entries[2][0], WorkerStepEntry::Exclusive { .. }));
@@ -363,7 +454,7 @@ mod tests {
         let steps: Vec<Box<dyn ErasedStep>> =
             vec![Box::new(TypedStep::new(AffinitySerialStep(affinity)))];
         let owners = vec![None];
-        let entries = build_worker_storage(steps, &owners, 3);
+        let entries = storage_all_workers(steps, &owners, 3);
         for (worker, entry) in entries.iter().enumerate() {
             if worker == eligible {
                 assert!(
@@ -386,7 +477,7 @@ mod tests {
             vec![Box::new(TypedStep::new(AffinitySerialStep(Affinity::Worker(99))))];
         let owners = vec![None];
         // build_worker_storage checks affinity in range via assert!; should panic.
-        let _ = build_worker_storage(steps, &owners, 3);
+        let _ = storage_all_workers(steps, &owners, 3);
     }
 
     /// The Exclusive arm's owner-range check is an always-on `assert!` (not a
@@ -400,7 +491,7 @@ mod tests {
     fn exclusive_out_of_range_owner_panics_in_storage() {
         let steps: Vec<Box<dyn ErasedStep>> = vec![Box::new(TypedStep::new(ExclusiveStep))];
         let owners = vec![Some(99)];
-        let _ = build_worker_storage(steps, &owners, 3);
+        let _ = storage_all_workers(steps, &owners, 3);
     }
 
     #[test]
@@ -412,7 +503,7 @@ mod tests {
             Box::new(TypedStep::new(ExclusiveStep)),
         ];
         let owners = vec![Some(0), None, None, Some(1)];
-        let entries = build_worker_storage(steps, &owners, 4);
+        let entries = storage_all_workers(steps, &owners, 4);
 
         assert!(matches!(entries[0][0], WorkerStepEntry::Exclusive { .. }));
         assert!(matches!(entries[1][0], WorkerStepEntry::Skip));
