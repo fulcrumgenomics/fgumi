@@ -30,15 +30,10 @@ use fgumi_pipeline_core::{
     step::{Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
-/// `Parallel + ByItemOrdinal` block compressor for the spill-write split.
-///
-/// Not to be confused with the similarly-named
-/// [`CompressSpill`](super::CompressSpill): this `SpillBlockCompress` is the
-/// **pure block-compression** middle step of the finer
-/// `SpillGather → SpillBlockCompress → SpillWrite` split (the disk write is the
-/// separate `SpillWrite` step), whereas `CompressSpill` is the **composite
-/// compress-and-write-to-disk** step of the coarser
-/// `SortBuffer → CompressSpill → SortSpillDecompress → SortMerge` chain.
+/// `Parallel + ByItemOrdinal` block compressor for the spill-write split: the
+/// middle step of `SpillGather → SpillBlockCompress → SpillWrite`. It compresses
+/// each block on a pool worker; the disk write is the separate `SpillWrite`
+/// step.
 pub struct SpillBlockCompress {
     codec: SpillCodec,
     compression: u32,

@@ -28,7 +28,6 @@
 //! [`TemplateKeyContext::extract_batch_erased`]: crate::template_key::TemplateKeyContext::extract_batch_erased
 
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -36,6 +35,7 @@ use noodles::sam::Header;
 
 use crate::arena_pool::PooledSegmentedBuf;
 use crate::external::{KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, violation_read_name};
+use crate::frame_keyed_record_into;
 use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
     TemplateRecordRef, TertKey32, parallel_radix_sort_template_refs, radix_sort_template_refs,
@@ -45,7 +45,6 @@ use crate::sort_pool::BoundedSortPool;
 use crate::template_key::{
     ExtractedRefs, TemplateKeyContext, TemplateKeySeed, lane_variant, with_lane_refs,
 };
-use crate::{SpillCodec, frame_keyed_record_into, write_sorted_chunk_inmem};
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
 
 /// Variant-carrying erased template residual chunk: one arm per `--key-types`
@@ -170,19 +169,6 @@ impl TemplateMemChunk {
     /// Returns an error if writing to `out` fails.
     pub fn frame_record_into(&self, i: usize, out: &mut Vec<u8>) -> io::Result<()> {
         with_template_chunk!(self, c => frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i)))
-    }
-
-    /// Write the whole chunk to a spill file at `path` via
-    /// [`write_sorted_chunk_inmem`], keyed by this chunk's narrow lane.
-    ///
-    /// Encapsulates the per-variant key dispatch so the pipeline-io compress
-    /// step stays variant-agnostic.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the spill write fails.
-    pub fn write_spill(&self, path: &Path, codec: SpillCodec, compression: u32) -> Result<()> {
-        with_template_chunk!(self, c => write_sorted_chunk_inmem(path, codec, compression, c))
     }
 }
 

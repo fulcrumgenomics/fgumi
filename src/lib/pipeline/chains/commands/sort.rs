@@ -55,6 +55,12 @@ pub(crate) struct SortSummaryFinalizeHook {
     /// reported as the `Byte fetch (input):` line; `Some` only under
     /// `--sort-stats` on that path.
     pub(crate) input_fetch: Option<InputFetchReport>,
+    /// A queryname sort's shared key state, reported as the `Queryname keys:`
+    /// line; `None` for the other orders.
+    pub(crate) queryname_keys: Option<fgumi_sort::QnSortState>,
+    /// Whether `--sort-stats` was given: the `Queryname keys:` line is logged
+    /// at `info` with it and at `debug` without it.
+    pub(crate) sort_stats: bool,
 }
 
 /// What the `Byte fetch (input):` line reports.
@@ -87,6 +93,8 @@ impl FinalizeHook for SortSummaryFinalizeHook {
             timer,
             phase_caps,
             input_fetch,
+            queryname_keys,
+            sort_stats,
         } = *self;
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
@@ -109,6 +117,14 @@ impl FinalizeHook for SortSummaryFinalizeHook {
         }
         if let Some(fetch) = &input_fetch {
             info!("{}", fetch.line());
+        }
+        if let Some(keys) = &queryname_keys {
+            let line = keys.stats.summary_line(&keys.table);
+            if sort_stats {
+                info!("{line}");
+            } else {
+                log::debug!("{line}");
+            }
         }
         if !phase_caps.is_empty() {
             // `peak` = most workers inside the phase at once, against its
@@ -222,13 +238,7 @@ impl SortPhase {
             "PlanInputReads" | "PreadInputSlices" | "FrameBgzfBlocks" | "ReadBlocks"
             | "InflateToArena" => Some(SortPhase::ReadDecompress),
             "FindBoundariesAndSort" | "SortBuffer" => Some(SortPhase::InMemorySort),
-            // `CompressSpill` is the fused compress-and-write spill variant
-            // (`SortBuffer → CompressSpill → …`); `add_sort` currently wires the
-            // `SpillGather`/`SpillBlockCompress`/`SpillWrite` split instead, but
-            // classify it so the roll-up stays correct if that wiring changes.
-            "SpillGather" | "SpillBlockCompress" | "SpillWrite" | "CompressSpill" => {
-                Some(SortPhase::SpillWrite)
-            }
+            "SpillGather" | "SpillBlockCompress" | "SpillWrite" => Some(SortPhase::SpillWrite),
             // The merge supply (`SpillReadPlanner → PreadSpillSlices →
             // SortSpillDecompress`) is Phase-2 read-ahead of the final merge's
             // sources, not consolidation; consolidation runs inside `SpillWrite`
@@ -410,6 +420,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -448,6 +460,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -477,6 +491,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: vec![phase1, phase2],
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
         let logs = captured();
@@ -625,7 +641,6 @@ mod tests {
     #[case::spill_gather("SpillGather", SortPhase::SpillWrite)]
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]
-    #[case::compress_spill("CompressSpill", SortPhase::SpillWrite)]
     #[case::spill_read_planner("SpillReadPlanner", SortPhase::KWayMerge)]
     #[case::pread_spill_slices("PreadSpillSlices", SortPhase::KWayMerge)]
     #[case::spill_decompress("SortSpillDecompress", SortPhase::KWayMerge)]

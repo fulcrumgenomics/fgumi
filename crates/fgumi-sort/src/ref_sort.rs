@@ -12,7 +12,7 @@ use crate::arena_pool::PooledSegmentedBuf;
 use crate::inline::{
     InMemoryChunk, RecordRef, extract_coordinate_key_inline, radix_sort_record_refs,
 };
-use crate::keys::{RawCoordinateKey, RawSortKey};
+use crate::keys::RawCoordinateKey;
 
 /// Arrays smaller than this sort faster single-threaded (the parallel radix's
 /// partition + thread-coordination overhead exceeds its benefit on small inputs;
@@ -169,37 +169,6 @@ pub fn coordinate_chunk_from_refs(
     sort_coordinate_refs(&mut refs, sort_threads);
     let records: Vec<(RawCoordinateKey, u64, u32)> =
         refs.iter().map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len)).collect();
-    InMemoryChunk::from_parts(arena, records)
-}
-
-/// Build a sorted queryname chunk from already-extracted `(key, offset, len)`
-/// refs pointing into `arena`. Unlike the coordinate/template builders, the
-/// queryname key is a variable-length read name (not radix-able), so this sorts
-/// by the key comparator with `par_sort_unstable_by` — matching the legacy
-/// queryname path's unstable comparator sort. No record bytes are copied: the
-/// returned chunk references its bodies in `arena`.
-///
-/// **Threading contract (differs from the coordinate/template radix builders on
-/// purpose).** Those take an explicit `sort_threads` and gate the parallel radix
-/// on both `sort_threads > 1` and `PARALLEL_SORT_THRESHOLD`. This builder takes
-/// no `sort_threads`: the caller (`QuerynameStrategy::seal`, in `fgumi-pipeline-io`)
-/// runs it inside a rayon pool already sized to `sort_threads`, so parallelism is
-/// bounded there,
-/// and `rayon::par_sort_unstable_by` has its own internal sequential cutoff for
-/// small slices — so a tiny run does not pay a partition/coordination cost even
-/// without an explicit size threshold here.
-#[must_use]
-pub fn queryname_chunk_from_arena_refs<K: RawSortKey>(
-    arena: Arc<PooledSegmentedBuf>,
-    mut records: Vec<(K, u64, u32)>,
-) -> InMemoryChunk<K> {
-    use rayon::prelude::*;
-    // `par_sort_unstable_by` gives no order guarantee for records whose keys
-    // compare equal (exact name+flag-class ties). samtools resolves those
-    // remaining ties by input order; the arena assigns offsets in ingest order,
-    // so break exact ties by ascending offset to preserve that (and keep output
-    // byte-identical run to run).
-    records.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     InMemoryChunk::from_parts(arena, records)
 }
 
@@ -371,54 +340,6 @@ mod tests {
                 (0..ref_chunk.len()).map(|i| ref_chunk.record_bytes(i).to_vec()).collect();
 
             prop_assert_eq!(ref_bytes, oracle_bytes);
-        }
-    }
-
-    /// Exact queryname ties (identical name + flag class) must emerge in ingest
-    /// order — samtools' final tie-break — which the arena encodes as ascending
-    /// offset. `par_sort_unstable_by` on the key alone gives no such guarantee,
-    /// so feed equal-key refs in scrambled order and assert the sort restores
-    /// ascending-offset (== ingest) order.
-    #[test]
-    #[allow(unsafe_code)]
-    fn queryname_arena_sort_breaks_exact_ties_by_offset() {
-        use crate::keys::RawQuerynameKey;
-
-        let n = 2_000usize;
-        let key = RawQuerynameKey::new(b"dup/name".to_vec(), 0); // one shared key → all ties
-
-        // Each body encodes its ingest index; offsets ascend with the index, so a
-        // correct sort must decode 0,1,2,… in order.
-        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-        arena.reserve_full_capacity();
-        let mut by_index: Vec<(u64, u32)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let body = (i as u64).to_le_bytes();
-            // SAFETY: each slot is fully written (copy_from_slice) before any read.
-            let off = unsafe { arena.grow_uninit(body.len()) };
-            unsafe { arena.slice_mut(off, body.len()) }.copy_from_slice(&body);
-            by_index.push((off as u64, u32::try_from(body.len()).unwrap()));
-        }
-
-        // Feed refs in a scrambled order (odds then evens) so an unstable sort with
-        // no offset tie-break would not reliably yield ascending offsets.
-        let mut refs: Vec<(RawQuerynameKey, u64, u32)> = Vec::with_capacity(n);
-        for i in (0..n).filter(|i| i % 2 == 1).chain((0..n).filter(|i| i % 2 == 0)) {
-            let (off, len) = by_index[i];
-            refs.push((key.clone(), off, len));
-        }
-
-        let arena_arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
-        let chunk = queryname_chunk_from_arena_refs(arena_arc, refs);
-        assert_eq!(chunk.len(), n);
-
-        let mut prev: Option<u64> = None;
-        for i in 0..chunk.len() {
-            let v = u64::from_le_bytes(chunk.record_bytes(i).try_into().unwrap());
-            if let Some(p) = prev {
-                assert!(v > p, "exact-tie records not in ascending ingest order: {p} then {v}");
-            }
-            prev = Some(v);
         }
     }
 }

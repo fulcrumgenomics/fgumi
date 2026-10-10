@@ -1,5 +1,5 @@
-//! `SortBuffer` — first step of the P6 Phase-1 split (`SortBuffer` →
-//! `CompressSpill` → `SortSpillDecompress` → `SortMerge`).
+//! `SortBuffer` — the record-input phase-1 front (`SortBuffer` → `SpillGather`
+//! → `SpillBlockCompress` → `SpillWrite` → merge supply → `SortMerge`).
 //!
 //! `SortBuffer` (`Serial`) ingests `RecordBatch`es into an in-memory arena via
 //! the order-erased `ChunkSorter` (each variant drives the same per-order
@@ -7,9 +7,7 @@
 //! sorts each filled arena, and emits the sorted records as a [`SortChunkEvent`]
 //! — **without touching disk**. Mid-stream spill
 //! chunks (`Spill { seq, .. }`) and the final residual (`Residual`) flow to the
-//! `Parallel` `CompressSpill` step, which compresses + writes spills and passes
-//! the residual through. This replaces the monolithic `SortAndSpill`, which
-//! drove a private `SortWorkerPool` to compress inline.
+//! spill steps, which compress + write spills and pass the residual through.
 //!
 //! Spill chunks are emitted **as the buffer fills** (not accumulated to the
 //! end), and `try_run` drains the staged-events queue before popping the next
@@ -36,7 +34,7 @@ use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::SamTag;
 use fgumi_sort::{
-    KeyTypesSpec, PooledSegmentedBuf, QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey,
+    KeyTypesSpec, PooledSegmentedBuf, QnLex, QnNatural, QnSortState, QuerynameComparator,
     SegmentedBuf, SortOrder, TemplateArenaAccumulator,
 };
 use noodles::sam::Header;
@@ -158,8 +156,8 @@ pub struct SortBufferConfig {
 enum ChunkSorter {
     Coordinate(ArenaAccum<CoordinateStrategy>),
     Template(ArenaAccum<TemplateStrategy>),
-    QuerynameLex(ArenaAccum<QuerynameStrategy<RawQuerynameLexKey>>),
-    QuerynameNatural(ArenaAccum<QuerynameStrategy<RawQuerynameKey>>),
+    QuerynameLex(ArenaAccum<QuerynameStrategy<QnLex>>),
+    QuerynameNatural(ArenaAccum<QuerynameStrategy<QnNatural>>),
 }
 
 impl ChunkSorter {
@@ -188,19 +186,34 @@ impl ChunkSorter {
             }
             SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                 Self::QuerynameLex(ArenaAccum::new(
-                    QuerynameStrategy::new(MemoryChunkErased::QuerynameLex),
+                    QuerynameStrategy::new(
+                        MemoryChunkErased::QuerynameLex,
+                        QnSortState::new(false),
+                    ),
                     memory_limit,
                     sort_threads,
                 ))
             }
             SortOrder::Queryname(QuerynameComparator::Natural) => {
                 Self::QuerynameNatural(ArenaAccum::new(
-                    QuerynameStrategy::new(MemoryChunkErased::QuerynameNatural),
+                    QuerynameStrategy::new(
+                        MemoryChunkErased::QuerynameNatural,
+                        QnSortState::new(false),
+                    ),
                     memory_limit,
                     sort_threads,
                 ))
             }
         })
+    }
+
+    /// Share the sort's queryname key state (a no-op for the other orders).
+    fn set_queryname_keys(&mut self, keys: QnSortState) {
+        match self {
+            Self::QuerynameLex(s) => s.strategy.set_keys(keys),
+            Self::QuerynameNatural(s) => s.strategy.set_keys(keys),
+            Self::Coordinate(_) | Self::Template(_) => {}
+        }
     }
 
     /// Make every run that sorts in parallel take the whole of `cap` (see
@@ -340,7 +353,7 @@ fn ingest_batch_records(
     (batch_records, None)
 }
 
-/// `Serial` step that buffers, sorts, and emits sorted chunks for `CompressSpill`.
+/// `Serial` step that buffers, sorts, and emits sorted chunks for the spill steps.
 pub struct SortBuffer {
     /// In-memory buffering sorter. `Some` while ingesting; `None` after the
     /// residual has been taken (finalized).
@@ -350,7 +363,7 @@ pub struct SortBuffer {
     pending: VecDeque<SortChunkEvent>,
     /// Monotonic spill index. Each `Spill` event's `seq` (= the eventual slot
     /// `file_id`) makes the merge tie-break order independent of which
-    /// `CompressSpill` worker writes the file. Also the final `slot_count`.
+    /// worker compresses which block. Also the final `slot_count`.
     next_seq: u32,
     /// First ingest failure, if any. Once set the step is poisoned and every
     /// later `try_run` re-raises instead of ingesting or finalizing — a step
@@ -403,6 +416,17 @@ impl SortBuffer {
             sorter.set_phase_cap(cap.clone());
         }
         self.cap = cap;
+        self
+    }
+
+    /// Share the sort's queryname key state — its class table and counters —
+    /// with this front, so the merge and the stats line see the same table. A
+    /// no-op for the other orders. Call before the step runs.
+    #[must_use]
+    pub fn with_queryname_keys(mut self, keys: QnSortState) -> Self {
+        if let Some(sorter) = self.sorter.as_mut() {
+            sorter.set_queryname_keys(keys);
+        }
         self
     }
 

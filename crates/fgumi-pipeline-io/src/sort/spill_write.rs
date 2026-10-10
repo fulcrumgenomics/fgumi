@@ -36,8 +36,8 @@
 //! the live-run count is being brought back under the limit.
 //!
 //! This step owns the `TmpDirAllocator` (Serial ⇒ the pick is uncontended) and
-//! the RAII temp-dir handles, matching the retired `CompressSpill`'s lifetime
-//! contract.
+//! the RAII temp-dir handles, which live as long as the step so the spill files
+//! outlive their reads.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -201,7 +201,7 @@ pub struct SpillWrite {
     /// so the spill-write rate over wall time is visible alongside ingest.
     spill_progress: ProgressTracker,
     /// RAII temp-dir handles, held for the step's lifetime so spill files survive
-    /// while being read by `SortMerge`. Matches `CompressSpill`'s lifetime.
+    /// while being read by `SortMerge`.
     #[allow(dead_code)]
     temp_dirs: Arc<Vec<TempDir>>,
     /// When `true`, advertise `StepKind::Detached` so the framework drives this

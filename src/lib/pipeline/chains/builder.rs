@@ -3933,6 +3933,10 @@ impl<'a> ChainBuilder<'a> {
             // keeping `SortBuffer` Serial (no N² rayon oversubscription). The head
             // emits `SortPhase1Event`, so `SortSpillDecompress`/`SortMerge` are
             // identical downstream regardless of order.
+            //
+            // A queryname sort shares one class table and one set of key
+            // counters across its front and its summary.
+            let qn_keys = fgumi_sort::QnSortState::new(sort.sort_stats);
             let phase1_tail = {
                 let (temp_dirs, alloc) = fgumi_sort::create_sort_temp_dirs(&sort.tmp_dirs)
                     .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;
@@ -3954,7 +3958,7 @@ impl<'a> ChainBuilder<'a> {
                         CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
                         QuerynameStrategy, ReadBlocks, TemplateStrategy,
                     };
-                    use fgumi_sort::{QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey};
+                    use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
                     // `total_memory` is the full in-memory budget (--max-memory ×
@@ -3999,12 +4003,13 @@ impl<'a> ChainBuilder<'a> {
                         }
                         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                             // Queryname (lexicographic): the read name IS the key,
-                            // embedded in the record; the strategy comparator-sorts
-                            // arena refs into an InMemoryChunk<RawQuerynameLexKey>.
+                            // embedded in the record; the strategy sorts 40-byte
+                            // arena refs into an InMemoryChunk<QnKey>.
                             self.pipeline.append_step(
                                 FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<RawQuerynameLexKey>::new(
+                                    QuerynameStrategy::<fgumi_sort::QnLex>::new(
                                         MemoryChunkErased::QuerynameLex,
+                                        qn_keys.clone(),
                                     ),
                                     sort_threads,
                                     byte_limit,
@@ -4016,8 +4021,9 @@ impl<'a> ChainBuilder<'a> {
                         SortOrder::Queryname(QuerynameComparator::Natural) => {
                             self.pipeline.append_step(
                                 FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<RawQuerynameKey>::new(
+                                    QuerynameStrategy::<fgumi_sort::QnNatural>::new(
                                         MemoryChunkErased::QuerynameNatural,
+                                        qn_keys.clone(),
                                     ),
                                     sort_threads,
                                     byte_limit,
@@ -4044,7 +4050,8 @@ impl<'a> ChainBuilder<'a> {
                 } else {
                     let mut sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
-                        .with_affinity(affinity);
+                        .with_affinity(affinity)
+                        .with_queryname_keys(qn_keys.clone());
                     sort_buffer = sort_buffer.with_phase_cap(phase1_cap.clone());
                     self.pipeline.append_step(sort_buffer, tail)
                 };
@@ -4164,6 +4171,9 @@ impl<'a> ChainBuilder<'a> {
                                         policy,
                                     }
                                 }),
+                            queryname_keys: matches!(sort_order, SortOrder::Queryname(_))
+                                .then(|| qn_keys.clone()),
+                            sort_stats: sort.sort_stats,
                         },
                     ));
                 }

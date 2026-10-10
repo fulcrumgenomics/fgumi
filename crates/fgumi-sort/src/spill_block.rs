@@ -1,7 +1,7 @@
 //! Block-granular spill compression kernel shared by the Phase-1 spill steps
 //! (`SpillGather` → `SpillCompress` → `SpillWrite`).
 //!
-//! The legacy [`SyncSpillWriter`](crate::sync_spill_writer) streams a whole
+//! The legacy streaming `SyncSpillWriter` (now the tests' reference) streams a whole
 //! sorted chunk through one stateful compressor on a single worker. To compress
 //! a spill across the framework pool instead, the chunk is cut into raw blocks by
 //! the (Serial) serialize step, each block is compressed **independently** by a
@@ -23,7 +23,7 @@
 //! the readers stream across boundaries, **any** blocking of the same raw
 //! `[key?][len][record]…` byte stream reads back to the identical records (see
 //! the round-trip + re-blocking-independence tests below and the format notes in
-//! [`sync_spill_writer`](crate::sync_spill_writer)). Block boundaries are
+//! the test-only `sync_spill_writer` module). Block boundaries are
 //! therefore the serialize step's free choice, and compression is a pure function
 //! of each block — so the result is byte-for-byte independent of how many workers
 //! compress concurrently. The one bound on that freedom is
@@ -72,12 +72,7 @@ pub fn frame_keyed_record_into<K: RawSortKey>(
 ) -> io::Result<()> {
     // Validate the length BEFORE writing the key, so an oversized record fails
     // loud without leaving partial (key) bytes in the block.
-    let record_len = u32::try_from(record.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("BAM record too large ({} bytes) for a u32 length prefix", record.len()),
-        )
-    })?;
+    let record_len = spill_record_len(record)?;
     if !K::EMBEDDED_IN_RECORD {
         // `Vec<u8>: Write`, so the key serializes straight into the block buffer.
         key.write_to(block)?;
@@ -85,6 +80,31 @@ pub fn frame_keyed_record_into<K: RawSortKey>(
     block.extend_from_slice(&record_len.to_le_bytes());
     block.extend_from_slice(record);
     Ok(())
+}
+
+/// Append one record whose key is embedded in its body (queryname orders) to
+/// `block`: `[u32 LE record-len][record body]` — the framing
+/// [`frame_keyed_record_into`] writes for a key with `EMBEDDED_IN_RECORD`,
+/// without needing the key.
+///
+/// # Errors
+///
+/// Returns an error if the record is longer than `u32::MAX`.
+pub fn frame_embedded_record_into(block: &mut Vec<u8>, record: &[u8]) -> io::Result<()> {
+    let record_len = spill_record_len(record)?;
+    block.extend_from_slice(&record_len.to_le_bytes());
+    block.extend_from_slice(record);
+    Ok(())
+}
+
+/// The `u32` length prefix of a spilled record.
+fn spill_record_len(record: &[u8]) -> io::Result<u32> {
+    u32::try_from(record.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("BAM record too large ({} bytes) for a u32 length prefix", record.len()),
+        )
+    })
 }
 
 /// Per-worker, codec-fixed block compressor. Constructed once per compress
@@ -215,6 +235,24 @@ mod tests {
     use std::io::{BufWriter, Write as _};
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// The embedded framing equals the keyed framing of an embedded-key order,
+    /// for both queryname keys.
+    #[test]
+    fn frame_embedded_record_into_equals_frame_keyed_record_into() {
+        let body =
+            fgumi_raw_bam::testutil::make_bam_bytes(0, 5, 0x41, b"A0:1:2", &[], 8, -1, -1, &[]);
+        let mut embedded = Vec::new();
+        frame_embedded_record_into(&mut embedded, &body).unwrap();
+        let mut lex = Vec::new();
+        let key = crate::RawQuerynameLexKey::extract_from_record(&body);
+        frame_keyed_record_into(&mut lex, &key, &body).unwrap();
+        let mut natural = Vec::new();
+        let key = crate::RawQuerynameKey::extract_from_record(&body);
+        frame_keyed_record_into(&mut natural, &key, &body).unwrap();
+        assert_eq!(embedded, lex);
+        assert_eq!(embedded, natural);
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_key(i: u64) -> TemplateKey {
@@ -410,7 +448,8 @@ mod tests {
             let kernel_path = dir.path().join(format!("kernel_{codec:?}.keyed"));
             let oracle_path = dir.path().join(format!("oracle_{codec:?}.keyed"));
             write_via_kernel(&kernel_path, codec, level, &records, 11);
-            crate::write_sorted_chunk(&oracle_path, codec, level, &keyed).unwrap();
+            crate::sync_spill_writer::write_sorted_chunk(&oracle_path, codec, level, &keyed)
+                .unwrap();
             assert_eq!(
                 read_back(&kernel_path),
                 read_back(&oracle_path),

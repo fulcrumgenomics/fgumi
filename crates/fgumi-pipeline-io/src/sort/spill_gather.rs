@@ -1,6 +1,5 @@
 //! `SpillGather` — first step of the block-parallel spill-write split
-//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`), replacing the monolithic
-//! single-worker `CompressSpill`.
+//! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`).
 //!
 //! `SpillGather` (`Serial`) consumes the [`SortChunkEvent`]s `SortBuffer`
 //! emits and fans each `Spill` chunk into record-aligned **raw** (uncompressed)
@@ -62,7 +61,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{RunBound, SpillKeyKind, frame_keyed_record_into};
+use fgumi_sort::{RunBound, SpillKeyKind, frame_embedded_record_into, frame_keyed_record_into};
 use log::info;
 
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent, SpillBlockEvent};
@@ -87,11 +86,9 @@ fn frame_record_at(chunk: &MemoryChunkErased, i: usize, out: &mut Vec<u8>) -> io
         MemoryChunkErased::Coordinate(c) => {
             frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
         }
-        MemoryChunkErased::QuerynameLex(c) => {
-            frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
-        }
-        MemoryChunkErased::QuerynameNatural(c) => {
-            frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
+        // Queryname keys are embedded in the record: no key bytes are framed.
+        MemoryChunkErased::QuerynameLex(c) | MemoryChunkErased::QuerynameNatural(c) => {
+            frame_embedded_record_into(out, c.record_bytes(i))
         }
         MemoryChunkErased::TemplateCoordinate(c) => c.frame_record_into(i, out),
     }

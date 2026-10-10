@@ -1,11 +1,10 @@
 //! Synchronous keyed-chunk spill writer (inline compression, no worker pool).
 //!
-//! The P6 Phase-1 decomposition runs the spill **compress** as a `Parallel`
-//! `CompressSpill` step on the framework work-stealing pool, replacing the async
-//! [`PooledChunkWriter`] → `SortWorkerPool` path so the sort no longer needs a
-//! second, private thread pool. Each `CompressSpill` `try_run` already executes
-//! on a framework worker, so the per-chunk write compresses **inline** on that
-//! thread.
+//! [`write_sorted_chunk`] streams a sorted chunk into one spill file on the
+//! calling thread. It is the reference writer the `spill_block` tests check the
+//! block-parallel [`SpillBlockCompressor`](crate::SpillBlockCompressor) against:
+//! a spill assembled from independently compressed blocks must read back the
+//! same records as one written by this streaming writer.
 //!
 //! The on-disk format is byte-compatible with [`PooledChunkWriter`], so
 //! `SortSpillDecompress` (the Phase-2 streaming reader) and
@@ -77,9 +76,8 @@ fn persist_spill(writer: BufWriter<NamedTempFile>, final_path: &Path) -> Result<
 /// Compress and write a fully-sorted in-memory chunk to `path` as a keyed spill
 /// file, inline on the calling thread (no `SortWorkerPool`).
 ///
-/// This is the single-chunk entry point the P6 `CompressSpill` step calls per
-/// sorted chunk: it creates a `SyncSpillWriter` for `codec`/`compression`,
-/// writes every `(key, record)` pair in `records` order, and closes the file.
+/// It creates a `SyncSpillWriter` for `codec`/`compression`, writes every
+/// `(key, record)` pair in `records` order, and closes the file.
 /// The on-disk format is byte-compatible with `PooledChunkWriter`, so
 /// [`open_spill_slot`](crate::open_spill_slot) → `SortSpillDecompress` / the
 /// merge reader consume it unchanged.
@@ -97,29 +95,6 @@ pub fn write_sorted_chunk<K: RawSortKey>(
     let mut writer = SyncSpillWriter::<K>::create(path, codec, compression)?;
     for (key, record) in records {
         writer.write_record(key, record.as_ref())?;
-    }
-    writer.finish()
-}
-
-/// Write an already-sorted [`InMemoryChunk`](crate::InMemoryChunk) to a spill
-/// file — the zero-copy analogue of [`write_sorted_chunk`]. The chunk's records
-/// share an `Arc<SegmentedBuf>` backing store, so this iterates by index and
-/// writes each record's bytes directly (no owned `RawRecord`s), avoiding the
-/// per-record copy the buffer chain previously paid to materialise
-/// `Vec<(K, RawRecord)>`.
-///
-/// # Errors
-///
-/// Propagates I/O / compression errors from the underlying writer.
-pub fn write_sorted_chunk_inmem<K: RawSortKey>(
-    path: &Path,
-    codec: SpillCodec,
-    compression: u32,
-    chunk: &crate::InMemoryChunk<K>,
-) -> Result<()> {
-    let mut writer = SyncSpillWriter::<K>::create(path, codec, compression)?;
-    for i in 0..chunk.len() {
-        writer.write_record(chunk.key_at(i), chunk.record_bytes(i))?;
     }
     writer.finish()
 }
@@ -653,41 +628,7 @@ mod tests {
         );
     }
 
-    /// `write_sorted_chunk_inmem` must produce a byte-identical spill file to
-    /// `write_sorted_chunk` for the same records.
-    ///
-    /// It is a separate public entry point that walks the chunk by index
-    /// (`key_at(i)` / `record_bytes(i)`) instead of iterating owned pairs, and
-    /// nothing covered it. An off-by-one or a key/record mismatch in that
-    /// indexing still yields a spill file that parses cleanly, so the merge
-    /// would emit wrong records rather than fail — the parity assertion is what
-    /// makes that visible.
-    #[test]
-    fn write_sorted_chunk_inmem_matches_write_sorted_chunk() {
-        let dir = TempDir::new().unwrap();
-        let records = sample_records(400);
-
-        let keyed: Vec<(TemplateKey, RawRecord)> =
-            records.iter().map(|(k, r)| (*k, RawRecord::from(r.clone()))).collect();
-        let owned: Vec<(TemplateKey, Vec<u8>)> =
-            records.iter().map(|(k, r)| (*k, r.clone())).collect();
-        let chunk = crate::InMemoryChunk::from_owned_records(owned);
-
-        let from_pairs = dir.path().join("pairs.keyed");
-        let from_chunk = dir.path().join("chunk.keyed");
-        crate::write_sorted_chunk(&from_pairs, SpillCodec::Zstd, 3, &keyed).unwrap();
-        crate::write_sorted_chunk_inmem(&from_chunk, SpillCodec::Zstd, 3, &chunk).unwrap();
-
-        assert_eq!(read_back(&from_chunk), records, "in-mem writer round-trip mismatch");
-        assert_eq!(
-            std::fs::read(&from_chunk).unwrap(),
-            std::fs::read(&from_pairs).unwrap(),
-            "the two writers must produce byte-identical spill files",
-        );
-    }
-
-    /// `write_sorted_chunk` (the per-chunk entry the `CompressSpill` step calls)
-    /// round-trips every record through the merge reader, and `open_spill_slot`
+    /// `write_sorted_chunk` round-trips every record through the merge reader, and `open_spill_slot`
     /// opens the result with the requested `file_id` and the detected codec.
     #[test]
     fn write_sorted_chunk_round_trips_and_open_spill_slot_sets_file_id() {
@@ -700,7 +641,7 @@ mod tests {
         let keyed: Vec<(TemplateKey, RawRecord)> =
             records.iter().map(|(k, r)| (*k, RawRecord::from(r.clone()))).collect();
 
-        crate::write_sorted_chunk(&path, SpillCodec::Zstd, 3, &keyed).unwrap();
+        super::write_sorted_chunk(&path, SpillCodec::Zstd, 3, &keyed).unwrap();
         assert_eq!(read_back(&path), records, "write_sorted_chunk round-trip mismatch");
 
         let slot = crate::open_spill_slot(&path, 7).expect("open spill slot");
@@ -709,7 +650,7 @@ mod tests {
 
         // The bgzf arm: codec detection must fall back to Bgzf (no ZSPILL magic).
         let bgzf_path = dir.path().join("chunk_0008.keyed");
-        crate::write_sorted_chunk(&bgzf_path, SpillCodec::Bgzf, 1, &keyed).unwrap();
+        super::write_sorted_chunk(&bgzf_path, SpillCodec::Bgzf, 1, &keyed).unwrap();
         let bgzf_slot = crate::open_spill_slot(&bgzf_path, 8).expect("open bgzf spill slot");
         assert_eq!(bgzf_slot.file_id, 8);
         assert_eq!(bgzf_slot.codec, SpillCodec::Bgzf);

@@ -337,10 +337,11 @@ regresses `samtools sort -n`–style throughput.
   - `natural_compare` — `get_unchecked` over `&[u8]` in the digit-run
     hot loop. SAFETY: indices are bounded by the loop invariants `pa < alen` /
     `pb < blen`, asserted in `debug_assert!` for the `at` helper.
-  - `natural_compare_nul` — raw `*const u8` walk that mirrors
-    samtools' `strnum_cmp`. SAFETY: caller guarantees both pointers are
-    null-terminated; `RawQuerynameKey::new` enforces this for every production
-    call site.
+  - `natural_compare_nul` — raw `*const u8` reads feeding `strnum_walk`, the
+    samtools `strnum_cmp` state machine it shares with the safe
+    `natural_cmp_bounded`. SAFETY: caller guarantees both pointers are
+    null-terminated, and the walk never reads past a side's terminator;
+    `RawQuerynameKey::new` enforces termination for every production call site.
   - `compare_nul` test helper and the `proptest` agreement test — push an
     explicit NUL into a `Vec<u8>` then take `as_ptr()`.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
@@ -595,6 +596,24 @@ and macOS only):
   above the buffer is at most `k x (cold + one carried frame) + P + decoded`.
   `--sort-stats` logs that bound (`Spill supply:`), the spill byte fetch, disk
   reads, and stash/claim counts.
+
+### Queryname sort refs
+
+A queryname run sorts 40-byte refs, not owned name keys
+(`crates/fgumi-sort/src/queryname_ref.rs`). A `QnKey` holds a 24-byte window of
+the read name after an elided common prefix — the `instrument:run:flowcell:lane:`
+part every read of a lane shares — plus the flag class, the tail length and the
+prefix's class id in a per-sort `QnClassTable` (at most 256 classes, lock-free
+reads). Prefixes are learned per 4096-record batch (`QnRefBuilder`). The
+comparator (`cmp_qn_refs`) decides from the windows, concatenates two classes'
+prefixes on the stack, and reads the names from the arena only when a truncated
+window was read to its end; then flags, then arena offset. That is exactly the
+owned keys' order, so the output is unchanged. A prefix holds no NUL and does
+not end on a digit (`trim_to_class_rule`), so a natural digit run is never split
+between prefix and window. `--sort-stats` logs a `Queryname keys:` line with the
+classes, re-windowed batches and the compare shares (`arena fallbacks` is the
+share that read the arena). The spill format is unchanged: queryname keys are
+embedded in the record, and the merge rebuilds them from the body.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

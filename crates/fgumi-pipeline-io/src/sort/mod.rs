@@ -16,7 +16,6 @@ pub const SORT_COORD_GROUP: &str = "sort-coord";
 pub const SORT_IO_GROUP: &str = "sort-io";
 
 pub mod arena_ingest;
-pub mod compress_spill;
 pub mod merge;
 pub mod protocol;
 pub(crate) mod read_ahead_budget;
@@ -33,7 +32,6 @@ pub use arena_ingest::{
     ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
     InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
 };
-pub use compress_spill::CompressSpill;
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
 pub use spill_block_compress::SpillBlockCompress;

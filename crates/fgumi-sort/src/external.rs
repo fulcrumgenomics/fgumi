@@ -24,9 +24,9 @@
 //! 4. Write raw record bytes to output
 
 use crate::inline::{
-    CbKey32, InMemoryChunk, ProbeableBuffer, RecordBuffer, TEMPLATE_HEADER_SIZE, TemplateKey,
-    TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordBuffer, TemplateRecordRef,
-    TertKey32,
+    CbKey32, ChunkRef, InMemoryChunk, ProbeableBuffer, RecordBuffer, TEMPLATE_HEADER_SIZE,
+    TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordBuffer,
+    TemplateRecordRef, TertKey32,
 };
 use crate::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::memory_probe::{
@@ -1016,22 +1016,25 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 /// individual `RawRecord`s and produces `Owned` chunks — the
 /// per-record allocation is sunk cost, so we preserve the original
 /// zero-copy `mem::swap` merge bridge.
-pub enum MemorySources<K: RawSortKey + Default + 'static> {
-    /// Inline-buffer (coordinate / template) residual chunks sharing an
-    /// `Arc<SegmentedBuf>` — zero per-record allocation.
-    Shared(Vec<InMemoryChunk<K>>),
+pub enum MemorySources<K: RawSortKey + Default + 'static, R = K> {
+    /// Arena-backed residual chunks sharing an `Arc<SegmentedBuf>` — zero
+    /// per-record allocation. Each record's stored ref `R` yields its merge key
+    /// ([`ChunkRef`]).
+    Shared(Vec<InMemoryChunk<R>>),
     /// Queryname-style residual chunks (each record an owned `RawRecord`).
     Owned(Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>),
 }
 
-impl<K: RawSortKey + Default + 'static> MemorySources<K> {
+impl<K: RawSortKey + Default + 'static, R> MemorySources<K, R> {
     fn num_non_empty(&self) -> usize {
         match self {
             Self::Shared(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
             Self::Owned(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
         }
     }
+}
 
+impl<K: RawSortKey + Default + 'static> MemorySources<K> {
     fn push_into(self, sources: &mut Vec<ChunkSource<K>>) {
         match self {
             Self::Shared(chunks) => {
@@ -2279,7 +2282,7 @@ impl RawExternalSorter {
     /// Same buffer sizing / rayon pool as the retired `into_coordinate_stream`,
     /// but with **no** `SortWorkerPool`, temp dirs, or spill files — the
     /// `SortBuffer` step only ingests + par-sorts + materializes chunks; the
-    /// `CompressSpill` step owns compression and disk I/O.
+    /// spill steps own compression and disk I/O.
     ///
     /// # Errors
     ///
@@ -5337,12 +5340,12 @@ impl RawExternalSorter {
         super::create_output_header(self.sort_order, header)
     }
 
-    /// Create the spill temp dirs + allocator for the P6 `CompressSpill` step.
+    /// Create the spill temp dirs + allocator for the spill writer.
     ///
     /// Public wrapper over `Self::create_temp_dirs`: honors `--temp-dir` /
     /// `FGUMI_TMP_DIRS` (the configured `temp_dirs`) exactly as the legacy
     /// streaming path does. The caller hands the [`Vec<TempDir>`] RAII handles to
-    /// `CompressSpill` (held for the step's lifetime) and the [`TmpDirAllocator`]
+    /// the spill writer (held for the step's lifetime) and the [`TmpDirAllocator`]
     /// behind a shared mutex for per-file base-dir allocation.
     ///
     /// # Errors
@@ -5912,9 +5915,9 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
 ///
 /// `file_id` is the slot's stable merge-order identifier — `SortMerge` orders
 /// sources by it so the `LoserTree` tie-break for equal sort keys matches the
-/// legacy chunk-files order. The P6 `CompressSpill` step passes a chunk's
-/// **logical spill index** here so the tie-break is independent of which worker
-/// happened to write the file.
+/// legacy chunk-files order. The spill writer passes a run's **logical spill
+/// index** here so the tie-break is independent of which worker happened to
+/// compress which block.
 ///
 /// # Errors
 ///
@@ -6304,7 +6307,7 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
 
 /// Merge source for the slot-backed `MergeDriver`: either a decompressing slot
 /// (read non-blocking) or an already-sorted in-memory residual chunk.
-enum SlotMergeSource<K: RawSortKey + Default + 'static> {
+enum SlotMergeSource<K: RawSortKey + Default + 'static, R: ChunkRef<K> = K> {
     /// Pipeline-integrated source — `SortSpillDecompress` fills
     /// `slot.decompressed` with decompressed blocks; this driver reads them
     /// in-order via the per-source [`SlotParserState`].
@@ -6316,10 +6319,10 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static> {
     /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. A
     /// read names the record's index; the driver emits its bytes straight from
     /// the shared buffer.
-    MemoryShared { chunk: InMemoryChunk<K>, idx: usize },
+    MemoryShared { chunk: InMemoryChunk<R>, idx: usize },
 }
 
-impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
+impl<K: RawSortKey + Default + 'static, R: ChunkRef<K>> SlotMergeSource<K, R> {
     /// Non-blocking read of the next record, returning its sort key and where
     /// its bytes live ([`RecLoc`]). Only a record that spans blocks, or an
     /// owned residual record, is placed in `scratch`. `Slot` sources may return
@@ -6346,7 +6349,7 @@ impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
                 if *idx < chunk.len() {
                     // The bytes stay in the shared `Arc<SegmentedBuf>`; the
                     // driver emits them from there by index.
-                    let key = chunk.take_key(*idx);
+                    let key = chunk.key_at(*idx).merge_key(chunk.record_bytes(*idx));
                     let loc = RecLoc::Chunk { idx: *idx };
                     *idx += 1;
                     Ok(TryRead::Ready(Some((key, loc))))
@@ -6431,8 +6434,8 @@ enum MergePhase<K> {
 /// Pausable state machine for a non-blocking k-way merge over slot + in-memory
 /// sources. Constructed via [`MergeDriver::from_slots`]; driven by the pipeline
 /// `SortMerge` step via [`MergeDriverDyn::try_step`].
-pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
-    sources: Vec<SlotMergeSource<K>>,
+pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> = K> {
+    sources: Vec<SlotMergeSource<K, R>>,
     /// Per-active-source scratch buffer, indexed by loser-tree leaf (parallel
     /// to `source_map`): holds the leaf's current record only when `locs` says
     /// [`RecLoc::Scratch`]. Grows during `Priming`. While a deferred refill is
@@ -6468,7 +6471,7 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
     last_predicted: Option<u32>,
 }
 
-impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
+impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
     /// Construct a driver from `SortMergeSlot`s and already-sorted in-memory
     /// chunks. Used by the cooperative pipeline `SortMerge` step.
     ///
@@ -6482,7 +6485,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
     #[must_use]
     pub fn from_slots(
         slots: Vec<Arc<crate::merge_slots::SortMergeSlot>>,
-        memory: MemorySources<K>,
+        memory: MemorySources<K, R>,
         total_records: u64,
     ) -> Self {
         let num_slots = slots.len();
@@ -6495,7 +6498,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
             );
         }
 
-        let mut sources: Vec<SlotMergeSource<K>> = Vec::with_capacity(num_sources);
+        let mut sources: Vec<SlotMergeSource<K, R>> = Vec::with_capacity(num_sources);
         // Order by `file_id`, do not trust the caller's `Vec` order. `file_id`
         // is documented on `SortMergeSlot` as the stable merge-order identity,
         // and the `LoserTree` breaks ties between equal sort keys by leaf index
@@ -6635,7 +6638,9 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
     }
 }
 
-impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K> {
+impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
+    for MergeDriver<K, R>
+{
     fn try_step(&mut self) -> Result<MergeStep<'_>> {
         // Move the phase out so the body works with owned `tree`/`keys`/`rec`
         // and can borrow `self.{sources,records,source_map}` freely without
@@ -6755,7 +6760,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
 }
 
 #[cfg(test)]
-impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
+impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
     /// Whether `ptr` lies inside loser-tree `leaf`'s slot source's current block.
     fn block_contains_for_test(&self, leaf: usize, ptr: *const u8) -> bool {
         match &self.sources[self.source_map[leaf]] {
@@ -6772,7 +6777,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
     }
 }
 
-impl<K: RawSortKey + Default + Send + 'static> Drop for MergeDriver<K> {
+impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> Drop for MergeDriver<K, R> {
     fn drop(&mut self) {
         self.progress.log_final();
     }
@@ -11435,8 +11440,8 @@ mod from_slots_merge_tests {
     /// the parser before the record is exposed, so we have no direct access to
     /// them at this layer. These slots are pre-populated and EOF-marked before
     /// the merge, so `try_step` never returns `Stalled` here.
-    fn drain_merge_driver_bytes<K: RawSortKey + Default + Send + 'static>(
-        mut driver: MergeDriver<K>,
+    fn drain_merge_driver_bytes<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>>(
+        mut driver: MergeDriver<K, R>,
     ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         loop {
@@ -12185,7 +12190,7 @@ mod from_slots_merge_tests {
     /// key prefix (`TestKey`, `[key(8)][len(4)][body]`) or a key embedded in
     /// the body (`TestEmbeddedKey`, `[len(4)][body]`, the layout of every
     /// production key), whose fast path parses the key from the borrowed body.
-    trait Layout: RawSortKey + Default + Send + 'static {
+    trait Layout: RawSortKey + Default + Copy + Send + Sync + 'static {
         /// The key `k`.
         fn key(k: u64) -> Self;
         /// The record body for key `k` with `tail`.
@@ -12460,6 +12465,111 @@ mod from_slots_merge_tests {
         let feeder =
             Feeder { slot, blocks: std::cell::RefCell::new(blocks), seq: std::cell::Cell::new(0) };
         (feeder, spanning)
+    }
+
+    /// A queryname residual record's merge key (rebuilt from its body through
+    /// `QnKey`'s `ChunkRef`) equals the key the merge parses for the same body
+    /// read from a slot, for both orders.
+    #[test]
+    fn memory_residual_key_equals_slot_key() {
+        use crate::keys::{RawQuerynameKey, RawQuerynameLexKey};
+        use crate::queryname_ref::{QnBatchLcp, QnClassTable, QnRefBuilder};
+        let table = QnClassTable::new();
+        let class = table.class_for(b"A00132:53:HFHJ:1:");
+        for name in [b"A00132:53:HFHJ:1:1101:23:45".as_slice(), b"r7x", b""] {
+            let body =
+                fgumi_raw_bam::testutil::make_bam_bytes(0, 1, 0x81, name, &[], 6, -1, -1, &[]);
+            let (key, ..) = QnRefBuilder::with_guess(class).build(
+                &table,
+                &mut QnBatchLcp::default(),
+                &body,
+                0,
+                0,
+            );
+            let lex: RawQuerynameLexKey = key.merge_key(&body);
+            let natural: RawQuerynameKey = key.merge_key(&body);
+            assert_eq!(
+                lex.cmp(&slot_parse_key::<RawQuerynameLexKey>(&[], &body).unwrap()),
+                std::cmp::Ordering::Equal
+            );
+            assert_eq!(
+                natural.cmp(&slot_parse_key::<RawQuerynameKey>(&[], &body).unwrap()),
+                std::cmp::Ordering::Equal
+            );
+        }
+    }
+
+    /// A queryname residual held as `InMemoryChunk<QnKey>` merges with a slot
+    /// into the owned-key order, and every record is borrowed: the residual's
+    /// from its arena, the slot's from its single block.
+    #[test]
+    fn memory_shared_queryname_residual_is_borrowed() {
+        use crate::keys::RawQuerynameLexKey;
+        use crate::queryname_ref::{
+            QnBatchLcp, QnClassTable, QnKey, QnLex, QnRefBuilder, queryname_chunk_from_qn_refs,
+        };
+        let body = |name: String| {
+            fgumi_raw_bam::testutil::make_bam_bytes(
+                0,
+                1,
+                0x41,
+                name.as_bytes(),
+                &[],
+                6,
+                -1,
+                -1,
+                &[],
+            )
+        };
+        let residual: Vec<Vec<u8>> = (0..40).map(|i| body(format!("F:1:{}", i * 2))).collect();
+        let spilled: Vec<Vec<u8>> = (0..30).map(|i| body(format!("F:1:{}", i * 2 + 1))).collect();
+        // The slot: one block of `[len][body]` records, sorted.
+        let mut sorted_spill = spilled.clone();
+        sorted_spill.sort_by(|a, b| {
+            RawQuerynameLexKey::extract_from_record(a)
+                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+        });
+        let mut block = Vec::new();
+        for b in &sorted_spill {
+            crate::spill_block::frame_embedded_record_into(&mut block, b).unwrap();
+        }
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
+        slot.decompressed.lock().unwrap().push_back(block);
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        // The residual: QnKey refs over an arena, sorted by the window comparator.
+        let mut arena = crate::segmented_buf::SegmentedBuf::new();
+        let spans: Vec<(u64, u32)> = residual
+            .iter()
+            .map(|b| (arena.extend_from_slice(b) as u64, u32::try_from(b.len()).unwrap()))
+            .collect();
+        let arena = StdArc::new(crate::arena_pool::PooledSegmentedBuf::unpooled(arena));
+        let table = QnClassTable::new();
+        let builder = QnRefBuilder::default();
+        let refs = residual
+            .iter()
+            .zip(&spans)
+            .map(|(b, &(o, l))| builder.build(&table, &mut QnBatchLcp::default(), b, o, l))
+            .collect();
+        let chunk: InMemoryChunk<QnKey> =
+            queryname_chunk_from_qn_refs::<QnLex>(&table, StdArc::clone(&arena), refs, None);
+        let n = (residual.len() + spilled.len()) as u64;
+        let driver = MergeDriver::<RawQuerynameLexKey, QnKey>::from_slots(
+            vec![slot],
+            MemorySources::Shared(vec![chunk]),
+            n,
+        );
+        let mut expected: Vec<Vec<u8>> = residual.iter().chain(&spilled).cloned().collect();
+        expected.sort_by(|a, b| {
+            RawQuerynameLexKey::extract_from_record(a)
+                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+        });
+        let mut d = driver;
+        let mut out = Vec::new();
+        while let MergeStep::Produced(b) = d.try_step().unwrap() {
+            out.push(b.to_vec());
+        }
+        assert_eq!(out, expected);
+        assert_eq!(d.record_counts(), (n, 0), "every record borrowed, none assembled");
     }
 }
 

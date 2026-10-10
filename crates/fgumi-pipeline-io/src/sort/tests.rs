@@ -903,8 +903,6 @@ fn drive_arena_chain(
     caps: &ChainCaps,
 ) -> Result<ChainRun> {
     use crate::sort::protocol::MemoryChunkErased;
-    use fgumi_sort::{RawQuerynameKey, RawQuerynameLexKey};
-
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
     let SortBufferConfig { sort_order, memory_limit, sort_threads, cell_tag, key_types } = config;
     let builder = Pipeline::builder();
@@ -952,7 +950,10 @@ fn drive_arena_chain(
         (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => attach(
             head.chain(
                 FindBoundariesAndSort::new(
-                    QuerynameStrategy::<RawQuerynameLexKey>::new(MemoryChunkErased::QuerynameLex),
+                    QuerynameStrategy::<fgumi_sort::QnLex>::new(
+                        MemoryChunkErased::QuerynameLex,
+                        fgumi_sort::QnSortState::new(false),
+                    ),
                     sort_threads,
                     output_byte_limit,
                 )
@@ -962,7 +963,10 @@ fn drive_arena_chain(
         (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Natural)) => attach(
             head.chain(
                 FindBoundariesAndSort::new(
-                    QuerynameStrategy::<RawQuerynameKey>::new(MemoryChunkErased::QuerynameNatural),
+                    QuerynameStrategy::<fgumi_sort::QnNatural>::new(
+                        MemoryChunkErased::QuerynameNatural,
+                        fgumi_sort::QnSortState::new(false),
+                    ),
                     sort_threads,
                     output_byte_limit,
                 )
@@ -1319,7 +1323,7 @@ fn detached_sink_chain_matches_reference_coordinate() {
 /// knobs — fills small enough that frames straddle slices, four slices per
 /// fill, and in-flight caps forced to bind — with a multi-spill workload that
 /// forces real spill files. Guards against any spill-format / slot-ordering
-/// drift between `CompressSpill` and the supply.
+/// drift between the spill split and the supply.
 #[rstest]
 #[case::default(SupplyTuning::default())]
 #[case::fills_64k(SupplyTuning { fills: Some((64 << 10, 64 << 10)), ..SupplyTuning::default() })]

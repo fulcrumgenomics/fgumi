@@ -8,7 +8,7 @@
 //! (`InMemoryChunk<RawCoordinateKey>`, zero body copies — the arena is moved,
 //! not copied). It never writes to disk, owns no
 //! `SortWorkerPool`, no temp dirs, and no spill files — compressing and writing
-//! a chunk is the `CompressSpill` step's job (P6 Phase-1 split).
+//! a chunk is the spill steps' job.
 //!
 //! The driver (`SortBuffer`) calls [`push`](CoordinateChunkSorter::push) per
 //! record; when it returns `true` (buffer at the memory limit), the driver takes
@@ -25,7 +25,7 @@
 //! globally-sorted chunk instead is record-order identical (the sub-runs are
 //! merged back by key with a lower-source-index tie-break, which for a stable
 //! global sort is the same original-insertion order), and it keeps the residual
-//! a single merge source so a `Parallel` `CompressSpill` reordering chunks can
+//! a single merge source so a parallel spill writer reordering chunks can
 //! never perturb the tie-break.
 
 use std::sync::Arc;
@@ -394,7 +394,7 @@ struct Provisioned {
 /// `select_template_variant`. The narrower key is a **speed** optimization
 /// (fewer radix passes). The emitted chunk re-widens to the full [`TemplateKey`]
 /// in [`take_sorted_chunk`](Self::take_sorted_chunk) so the buffer-chain protocol
-/// (`CompressSpill`/`SortMerge`) stays on the full key.
+/// (the spill steps and `SortMerge`) stays on the full key.
 ///
 /// Narrowing is order-preserving and validated: `--key-types` may only drop a
 /// lane the dropped-lane validation (`verify_dropped_lanes`) proves constant, so

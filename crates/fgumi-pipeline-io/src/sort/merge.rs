@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep,
+    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep, QnKey,
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, SortMergeSlot,
     SortOrder, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
@@ -364,8 +364,8 @@ impl TemplateChunks {
 #[derive(Default)]
 struct MemoryChunksByKind {
     coordinate: Vec<InMemoryChunk<RawCoordinateKey>>,
-    queryname_lex: Vec<InMemoryChunk<RawQuerynameLexKey>>,
-    queryname_natural: Vec<InMemoryChunk<RawQuerynameKey>>,
+    queryname_lex: Vec<InMemoryChunk<QnKey>>,
+    queryname_natural: Vec<InMemoryChunk<QnKey>>,
     template_coordinate: TemplateChunks,
 }
 
@@ -462,7 +462,7 @@ fn build_driver(
             demand,
         )),
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
-            MergeDriver::<RawQuerynameLexKey>::from_slots(
+            MergeDriver::<RawQuerynameLexKey, QnKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_lex),
                 total_records,
@@ -470,7 +470,7 @@ fn build_driver(
             demand,
         )),
         SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
-            MergeDriver::<RawQuerynameKey>::from_slots(
+            MergeDriver::<RawQuerynameKey, QnKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_natural),
                 total_records,
@@ -540,10 +540,10 @@ fn build_driver(
 
 /// Hand the sort's merge demand to `driver`, which publishes its predictions
 /// and frontier through it.
-fn attach<K: fgumi_sort::RawSortKey + Default + Send + 'static>(
-    driver: MergeDriver<K>,
+fn attach<K: fgumi_sort::RawSortKey + Default + Send + 'static, R: fgumi_sort::ChunkRef<K>>(
+    driver: MergeDriver<K, R>,
     demand: Option<&Arc<fgumi_sort::MergeDemand>>,
-) -> MergeDriver<K> {
+) -> MergeDriver<K, R> {
     match demand {
         Some(d) => driver.with_demand(Arc::clone(d)),
         None => driver,
@@ -723,7 +723,7 @@ fn absorb_phase2_event(
         }
         SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far } => {
             // The MemoryChunk `Arc` is created uniquely in the Phase-1 producer
-            // (`CompressSpill` / `SpillWrite`) and only ever *moved* (never cloned)
+            // (`SpillWrite`) and only ever *moved* (never cloned)
             // through `SortSpillDecompress` to here, so
             // it must be uniquely owned at this single consumer. Fail closed on a
             // shared `Arc` rather than silently deep-cloning a potentially large
@@ -743,7 +743,7 @@ fn absorb_phase2_event(
             total_records: ar_total,
         } => {
             // The Phase-2 protocol emits exactly one `AllAnnounced` (the last event
-            // from the Phase-1 producer, `CompressSpill` / `SpillWrite`). A second
+            // from the Phase-1 producer, `SpillWrite`). A second
             // one is a protocol violation; fail
             // closed rather than overwrite the prior expectations and risk masking
             // the bug behind a silently-different completion target.

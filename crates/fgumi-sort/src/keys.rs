@@ -524,11 +524,15 @@ pub fn normalize_natural_key(name: &[u8], out: &mut Vec<u8>) {
 // Shared queryname key helpers
 // ============================================================================
 
-/// Extract raw queryname bytes and flag-order value from BAM record bytes.
+/// The read name and flag-order value of a BAM record body: the one name-slice
+/// rule every queryname key shares. The name excludes its NUL terminator; it is
+/// empty when `l_read_name` is 0 or 1, or when the declared name runs past the
+/// body. The flag order is `queryname_flag_order` of the raw flags.
 ///
 /// BAM format offsets: 8 = `l_read_name` (u8), 14-15 = flags (u16), 32+ = name.
 #[inline]
-fn extract_raw_name_and_flags(bam: &[u8]) -> (&[u8], u16) {
+#[must_use]
+pub(crate) fn qn_name_and_flags(bam: &[u8]) -> (&[u8], u16) {
     let name_len = (bam[8] as usize).saturating_sub(1);
     let name =
         if name_len > 0 && 32 + name_len <= bam.len() { &bam[32..32 + name_len] } else { &[] };
@@ -663,7 +667,7 @@ impl RawQuerynameKey {
             // Truncated or non-terminated record: fall back to the stripped-name
             // path (`new` re-adds the terminator and sets `pos: 0`), preserving
             // the prior bytes exactly.
-            None => Self::new(extract_raw_name_and_flags(bam).0.to_vec(), flags),
+            None => Self::new(qn_name_and_flags(bam).0.to_vec(), flags),
         }
     }
 }
@@ -771,7 +775,7 @@ impl RawQuerynameLexKey {
     #[inline]
     #[must_use]
     fn extract_queryname_key(bam: &[u8]) -> Self {
-        let (raw_name, flags) = extract_raw_name_and_flags(bam);
+        let (raw_name, flags) = qn_name_and_flags(bam);
         Self { name: SmallVec::from_slice(raw_name), flags, pos: 0 }
     }
 }
@@ -1923,7 +1927,7 @@ mod tests {
     /// reads the stored NUL directly instead, so it must agree with this byte
     /// for byte on every input — well-formed or not.
     fn oracle_queryname_key(bam: &[u8]) -> (Vec<u8>, u16) {
-        let (raw_name, flags) = extract_raw_name_and_flags(bam);
+        let (raw_name, flags) = qn_name_and_flags(bam);
         let mut name = Vec::with_capacity(raw_name.len() + 1);
         name.extend_from_slice(raw_name);
         name.push(0);

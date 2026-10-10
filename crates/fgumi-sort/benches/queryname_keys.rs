@@ -18,13 +18,24 @@
 //!        is the ceiling on what a cheaper comparator (C, or radix on a packed
 //!        key) can recover on the sort side.
 //!
+//!   3. **The arena-borrowed ref** — `qnkey_extract` builds the 40-byte
+//!      `QnRef`s production sorts (a window behind a learned prefix, no
+//!      allocation), and `qnkey_window_cmp` / `qnkey_window_cmp_lex` sort them
+//!      through `cmp_qn_refs`, against the owned-key extracts and comparators.
+//!
 //!     cargo bench -p fgumi-sort --bench queryname_keys
 
 use std::cmp::Ordering;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fgumi_raw_bam::testutil::make_bam_bytes;
-use fgumi_sort::{RawQuerynameKey, RawQuerynameLexKey, RawSortKey};
+use std::sync::Arc;
+
+use fgumi_sort::{
+    PooledSegmentedBuf, QN_CLASS_BATCH_RECORDS, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
+    QnLex, QnNatural, QnRef, QnRefBuilder, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
+    SegmentedBuf, cmp_qn_refs,
+};
 
 /// Number of records per bench iteration.
 const N: usize = 1_000_000;
@@ -60,6 +71,50 @@ fn prefix8(name: &[u8]) -> u64 {
 /// a real record body exactly as production does.
 fn bam_records(names: &[Vec<u8>]) -> Vec<Vec<u8>> {
     names.iter().map(|name| make_bam_bytes(0, 0, 0, name, &[], 100, -1, -1, &[])).collect()
+}
+
+/// The records laid out in one arena, as a run is, with each body's
+/// `(offset, len)`.
+fn arena_of(records: &[Vec<u8>]) -> (Arc<PooledSegmentedBuf>, Vec<(u64, u32)>) {
+    let mut buf = SegmentedBuf::new();
+    let spans = records
+        .iter()
+        .map(|r| (buf.extend_from_slice(r) as u64, u32::try_from(r.len()).expect("fits")))
+        .collect();
+    (Arc::new(PooledSegmentedBuf::unpooled(buf)), spans)
+}
+
+/// Build every record's `QnRef` in classification batches, as the extractor
+/// does: one ref per body, then the batch's reclassification.
+fn build_qn_refs(
+    table: &QnClassTable,
+    arena: &PooledSegmentedBuf,
+    records: &[Vec<u8>],
+    spans: &[(u64, u32)],
+) -> Vec<QnRef> {
+    let mut builder = QnRefBuilder::default();
+    let mut refs = Vec::with_capacity(records.len());
+    for (bodies, spans) in
+        records.chunks(QN_CLASS_BATCH_RECORDS).zip(spans.chunks(QN_CLASS_BATCH_RECORDS))
+    {
+        let start = refs.len();
+        let mut lcp = QnBatchLcp::default();
+        refs.extend(
+            bodies.iter().zip(spans).map(|(b, &(o, l))| builder.build(table, &mut lcp, b, o, l)),
+        );
+        builder.reclassify(table, arena, &mut refs[start..], &lcp);
+    }
+    refs
+}
+
+/// Sort `refs` through the window comparator of `C`.
+fn sort_qn_refs<C: QnComparator>(
+    table: &QnClassTable,
+    arena: &PooledSegmentedBuf,
+    refs: &mut [QnRef],
+) {
+    let stats = QnCmpStats::new();
+    refs.sort_unstable_by(|a, b| cmp_qn_refs::<C, false>(table, arena, &stats, a, b));
 }
 
 fn bench_ingest(c: &mut Criterion) {
@@ -106,6 +161,15 @@ fn bench_ingest(c: &mut Criterion) {
                 })
                 .collect();
             std::hint::black_box(keys)
+        });
+    });
+
+    // The arena-borrowed ref: a window behind the learned prefix, no allocation.
+    let (arena, spans) = arena_of(&records);
+    group.bench_function("qnkey_extract", |b| {
+        b.iter(|| {
+            let table = QnClassTable::new();
+            std::hint::black_box(build_qn_refs(&table, &arena, &records, &spans))
         });
     });
 
@@ -172,6 +236,31 @@ fn bench_sort(c: &mut Criterion) {
                     other => other,
                 });
                 std::hint::black_box(keys)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // The arena-borrowed ref through the window comparator, both orders.
+    let (arena, spans) = arena_of(&records);
+    let table = QnClassTable::new();
+    let qn_refs = build_qn_refs(&table, &arena, &records, &spans);
+    group.bench_function("qnkey_window_cmp", |b| {
+        b.iter_batched(
+            || qn_refs.clone(),
+            |mut refs| {
+                sort_qn_refs::<QnNatural>(&table, &arena, &mut refs);
+                std::hint::black_box(refs)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.bench_function("qnkey_window_cmp_lex", |b| {
+        b.iter_batched(
+            || qn_refs.clone(),
+            |mut refs| {
+                sort_qn_refs::<QnLex>(&table, &arena, &mut refs);
+                std::hint::black_box(refs)
             },
             BatchSize::PerIteration,
         );

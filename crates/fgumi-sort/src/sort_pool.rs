@@ -26,6 +26,14 @@ impl BoundedSortPool {
         Self { pool: Arc::new(OnceLock::new()), name }
     }
 
+    /// The built pool's thread count, `None` before the first
+    /// [`Self::bounded`] call (tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn built_threads(&self) -> Option<usize> {
+        self.pool.get().map(rayon::ThreadPool::current_num_threads)
+    }
+
     /// The pool, built on first use at `sort_threads.max(1)` threads.
     ///
     /// # Panics
@@ -41,13 +49,6 @@ impl BoundedSortPool {
                 .build()
                 .expect("build bounded sort rayon pool")
         })
-    }
-
-    /// The built pool's thread count, or `None` before the first
-    /// [`bounded`](Self::bounded) call builds it. Never builds the pool.
-    #[must_use]
-    pub fn built_threads(&self) -> Option<usize> {
-        self.pool.get().map(rayon::ThreadPool::current_num_threads)
     }
 }
 

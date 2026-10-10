@@ -165,14 +165,33 @@ impl<K> InMemoryChunk<K> {
         &self.records[i].0
     }
 
-    /// Move out the `i`th record's key (replaces it with
-    /// `K::default()`). Used by the merge loop after the
-    /// loser-tree consumes the key.
+    /// Moves the key out of slot `i` (replacing it with `K::default()`). Sole
+    /// user: the in-process merge's `ChunkSource::Memory` (`external.rs`), which
+    /// keeps owned-key chunks; the slot-backed merge reads a chunk's keys
+    /// through [`ChunkRef`] instead.
     pub(crate) fn take_key(&mut self, i: usize) -> K
     where
         K: Default,
     {
         std::mem::take(&mut self.records[i].0)
+    }
+}
+
+/// How a sorted chunk's stored per-record ref yields the merge key of that
+/// record. Keys that are their own ref (coordinate and the template lanes)
+/// return themselves; a queryname chunk's [`QnKey`](crate::queryname_ref::QnKey)
+/// rebuilds the owned key from the record body, exactly as a spilled record's
+/// key is rebuilt.
+pub trait ChunkRef<K>: Copy + Send + Sync + 'static {
+    /// The merge key of the record whose stored ref is `self` and whose body is
+    /// `body`.
+    fn merge_key(&self, body: &[u8]) -> K;
+}
+
+impl<K: RawSortKey + Copy + Send + Sync + 'static> ChunkRef<K> for K {
+    #[inline]
+    fn merge_key(&self, _body: &[u8]) -> K {
+        *self
     }
 }
 

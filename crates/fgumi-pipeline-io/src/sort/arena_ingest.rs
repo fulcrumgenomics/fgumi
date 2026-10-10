@@ -40,8 +40,9 @@ use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
 use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
 use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
-    ArenaPool, BoundedSortPool, InMemoryChunk, PooledSegmentedBuf, RawSortKey, RecordRef,
-    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_arena_refs,
+    ArenaPool, BoundedSortPool, InMemoryChunk, PooledSegmentedBuf, QN_CLASS_BATCH_RECORDS,
+    QnBatchLcp, QnComparator, QnKey, QnRef, QnRefBuilder, QnSortState, RecordRef,
+    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
 };
 
 use crate::types::BgzfBlock;
@@ -135,8 +136,8 @@ const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
 /// `is_last_of_run = false, seals_to_spill = false`.
 ///
 /// With pool capacity 1, the next run's arena cannot be acquired until the
-/// prior run's [`Arc<PooledSegmentedBuf>`] drops (i.e. after `CompressSpill`
-/// consumes and releases it).  If acquisition fails, `try_run` returns
+/// prior run's [`Arc<PooledSegmentedBuf>`] drops (i.e. after the spill steps
+/// and the merge release its chunk).  If acquisition fails, `try_run` returns
 /// `NoProgress` (backpressure) and retries on the next call.
 pub struct ReadBlocks {
     /// Bounded pool (capacity 1) that owns arena storage and reuses it across runs.
@@ -1086,35 +1087,66 @@ impl ArenaSortStrategy for TemplateStrategy {
     }
 }
 
-/// Queryname-order strategy (lexicographic or natural, selected by the key type
-/// `K` + `wrap`): extracts the embedded read-name key from each record and
-/// accumulates `(key, offset, len)` refs pointing into the shared arena; at seal
-/// it comparator-sorts the refs (variable-length names are not radix-able) into
-/// an arena-backed [`InMemoryChunk<K>`], wrapped into the matching erased variant.
+/// Queryname-order strategy: builds one 40-byte [`QnRef`] per record — a
+/// window of the read name behind a learned common prefix, the flag class and
+/// the record's arena position — and at seal sorts the refs with
+/// [`queryname_chunk_from_qn_refs`] into an arena-backed `InMemoryChunk<QnKey>`,
+/// wrapped into the matching erased variant. Nothing is copied or allocated
+/// per record.
 ///
-/// The record bodies stay in the arena (zero-copy); only the small name bytes are
-/// owned by each key, exactly as the legacy queryname sort. Equal keys keep
-/// input order (ties break by arena offset), so one globally-sorted chunk per
-/// run is the stable sort of the run.
-pub struct QuerynameStrategy<K: RawSortKey> {
-    /// `(key, body_offset, len)` refs accumulated across the current run's blocks.
-    refs: Vec<(K, u64, u32)>,
-    /// Bounded rayon pool (sized to `sort_threads`) the per-run comparator sort
-    /// installs into, so the parallel sort does not oversubscribe the pipeline's
-    /// worker pool on a spill. Built on the first seal, reused; unbuilt on a
-    /// fresh copy.
+/// The prefix is learned per batch of [`QN_CLASS_BATCH_RECORDS`] records. This
+/// front pushes records one at a time with no arena to read back until the
+/// seal, so a batch whose guessed prefix failed is recorded at the batch's
+/// close and re-windowed at seal, before the sort.
+///
+/// Equal keys keep input order (ties break by arena offset), so one sorted
+/// chunk per run is the stable sort of the run.
+pub struct QuerynameStrategy<C: QnComparator> {
+    /// Refs accumulated across the current run.
+    refs: Vec<QnRef>,
+    /// The sort's shared class table and counters.
+    keys: QnSortState,
+    /// Carries the class guess across batches.
+    builder: QnRefBuilder,
+    /// The common prefix of the open batch's names.
+    lcp: QnBatchLcp,
+    /// Index in `refs` where the open batch starts.
+    batch_start: usize,
+    /// Closed batches to re-window at seal: `(refs range, class)`.
+    pending: Vec<(std::ops::Range<usize>, u8)>,
+    /// Bounded rayon pool (sized to `sort_threads` on the first seal) the run's
+    /// comparator sort runs on, so it does not oversubscribe the pipeline's
+    /// workers.
     sort_pool: BoundedSortPool,
-    /// Erases the sorted `InMemoryChunk<K>` into the correct `MemoryChunkErased`
-    /// arm (`QuerynameLex` for the lex key, `QuerynameNatural` for the natural
-    /// key). A `fn` pointer so [`fresh`](ArenaSortStrategy::fresh) can copy it.
-    wrap: fn(InMemoryChunk<K>) -> MemoryChunkErased,
+    /// Erases the sorted chunk into `QuerynameLex` or `QuerynameNatural`. A `fn`
+    /// pointer so [`fresh`](ArenaSortStrategy::fresh) can copy it.
+    wrap: fn(InMemoryChunk<QnKey>) -> MemoryChunkErased,
+    _order: std::marker::PhantomData<C>,
 }
 
-impl<K: RawSortKey> QuerynameStrategy<K> {
-    /// Build a queryname strategy that erases its sealed chunk via `wrap`.
+impl<C: QnComparator> QuerynameStrategy<C> {
+    /// A queryname strategy over the sort's shared key state `keys`, erasing its
+    /// sealed chunk via `wrap`.
     #[must_use]
-    pub fn new(wrap: fn(InMemoryChunk<K>) -> MemoryChunkErased) -> Self {
-        Self { refs: Vec::new(), sort_pool: BoundedSortPool::new("qname-sort"), wrap }
+    pub fn new(wrap: fn(InMemoryChunk<QnKey>) -> MemoryChunkErased, keys: QnSortState) -> Self {
+        Self {
+            refs: Vec::new(),
+            keys,
+            builder: QnRefBuilder::default(),
+            lcp: QnBatchLcp::default(),
+            batch_start: 0,
+            pending: Vec::new(),
+            sort_pool: BoundedSortPool::new("qname-sort"),
+            wrap,
+            _order: std::marker::PhantomData,
+        }
+    }
+
+    /// Replace the key state (before any record is pushed): the chain builder
+    /// shares one state across a sort's front and merge.
+    pub fn set_keys(&mut self, keys: QnSortState) {
+        debug_assert!(self.refs.is_empty(), "the key state is set before ingest");
+        self.keys = keys;
     }
 
     /// Test-only observation of the bounded sort pool's thread count, so a test
@@ -1125,9 +1157,27 @@ impl<K: RawSortKey> QuerynameStrategy<K> {
     pub(crate) fn sort_pool_threads(&self) -> Option<usize> {
         self.sort_pool.built_threads()
     }
+
+    /// Close the open batch: adopt a learned class if its guess failed (recorded
+    /// for re-windowing at seal) and count it.
+    fn close_batch(&mut self) {
+        let batch = &self.refs[self.batch_start..];
+        if batch.is_empty() {
+            return;
+        }
+        let adopted = self.builder.adopt_batch_class(&self.keys.table, batch, &self.lcp);
+        let class0 =
+            if adopted.is_some() { 0 } else { batch.iter().filter(|r| r.0.class == 0).count() };
+        self.keys.stats.note_batch(batch.len(), class0, adopted.is_some());
+        if let Some(class) = adopted {
+            self.pending.push((self.batch_start..self.refs.len(), class));
+        }
+        self.batch_start = self.refs.len();
+        self.lcp = QnBatchLcp::default();
+    }
 }
 
-impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
+impl<C: QnComparator> ArenaSortStrategy for QuerynameStrategy<C> {
     #[inline]
     fn reserve_for_run(&mut self, est_records: usize) {
         self.refs.reserve(est_records);
@@ -1135,17 +1185,26 @@ impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
 
     #[inline]
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()> {
-        // Queryname keys are EMBEDDED_IN_RECORD: the name lives in `body`, so the
-        // key is reconstructed straight from it (no SortContext needed).
-        self.refs.push((K::extract_from_record(body), body_off, len));
+        let r = self.builder.build(&self.keys.table, &mut self.lcp, body, body_off, len);
+        self.refs.push(r);
+        if self.refs.len() - self.batch_start == QN_CLASS_BATCH_RECORDS {
+            self.close_batch();
+        }
         Ok(())
     }
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
+        self.close_batch();
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, &arena, &mut self.refs[range], class);
+        }
         let refs = std::mem::take(&mut self.refs);
-        let pool = self.sort_pool.bounded(sort_threads);
+        self.batch_start = 0;
+        let keys = &self.keys;
         let wrap = self.wrap;
-        pool.install(move || wrap(queryname_chunk_from_arena_refs(arena, refs)))
+        self.sort_pool.bounded(sort_threads).install(move || {
+            wrap(queryname_chunk_from_qn_refs::<C>(&keys.table, arena, refs, keys.compare_stats()))
+        })
     }
 
     /// The comparator sort always runs inside the per-sort rayon pool, so it is
@@ -1155,7 +1214,11 @@ impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
     }
 
     fn fresh(&self) -> Self {
-        Self::new(self.wrap)
+        Self {
+            builder: self.builder.clone(),
+            sort_pool: self.sort_pool.clone(),
+            ..Self::new(self.wrap, self.keys.clone())
+        }
     }
 }
 
@@ -2838,6 +2901,52 @@ mod tests {
         );
     }
 
+    /// The record-input front cannot re-window a batch when it closes (it has
+    /// no arena yet): a failed guess is recorded and applied at seal. The first
+    /// batch is built in class 0, learns `A00132:53:HFHJ:1:`, and comes out of
+    /// the seal in that class; the next batch is built in it directly.
+    #[test]
+    fn queryname_strategy_rewindows_pending_batches_at_seal() {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        use fgumi_sort::{QN_CLASS_BATCH_RECORDS, QnLex, RawQuerynameLexKey, RawSortKey};
+
+        let n = QN_CLASS_BATCH_RECORDS + 100;
+        let bodies: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                let name = format!("A00132:53:HFHJ:1:{}:{}", 1101 + (i * 7919) % 1000, i);
+                make_bam_bytes(0, 0, 0x41, name.as_bytes(), &[], 4, -1, -1, &[])
+            })
+            .collect();
+        let mut arena = SegmentedBuf::new();
+        let keys = QnSortState::new(false);
+        let mut strategy =
+            QuerynameStrategy::<QnLex>::new(MemoryChunkErased::QuerynameLex, keys.clone());
+        for b in &bodies {
+            let off = arena.extend_from_slice(b) as u64;
+            strategy.push_record(b, off, u32::try_from(b.len()).unwrap()).unwrap();
+        }
+        let MemoryChunkErased::QuerynameLex(chunk) =
+            strategy.seal(Arc::new(PooledSegmentedBuf::unpooled(arena)), 2)
+        else {
+            panic!("a lex strategy seals a QuerynameLex chunk");
+        };
+        assert_eq!(keys.table.len(), 2, "the first batch learned one class");
+        assert_eq!(keys.table.ecp(1), b"A00132:53:HFHJ:1:");
+        assert!(
+            (0..chunk.len()).all(|i| chunk.key_at(i).class == 1),
+            "every ref, the first batch's included, is in the learned class"
+        );
+        let s = keys.stats.snapshot();
+        assert_eq!((s.batches, s.reclassified, s.class0_refs), (2, 1, 0));
+        let mut want = bodies.clone();
+        want.sort_by(|a, b| {
+            RawQuerynameLexKey::extract_from_record(a)
+                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+        });
+        let got: Vec<Vec<u8>> = (0..chunk.len()).map(|i| chunk.record_bytes(i).to_vec()).collect();
+        assert!(got == want, "the sealed chunk is in owned-key order");
+    }
+
     /// Runtime proof that `--sort-threads` (Phase 1) controls the actual sort
     /// worker count, not just that it parses.
     ///
@@ -2857,8 +2966,6 @@ mod tests {
     #[allow(unsafe_code)]
     #[test]
     fn phase1_sort_threads_sizes_the_queryname_worker_pool() {
-        use fgumi_sort::RawQuerynameLexKey;
-
         for sort_threads in [1usize, 3] {
             let n_ref = 2u32;
             let recs = [coord_body(0, 10, b'a'), coord_body(1, 20, b'b')];
@@ -2882,7 +2989,10 @@ mod tests {
             let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
 
             let mut step = FindBoundariesAndSort::new(
-                QuerynameStrategy::<RawQuerynameLexKey>::new(MemoryChunkErased::QuerynameLex),
+                QuerynameStrategy::<fgumi_sort::QnLex>::new(
+                    MemoryChunkErased::QuerynameLex,
+                    QnSortState::new(false),
+                ),
                 sort_threads,
                 64 * 1024 * 1024,
             );

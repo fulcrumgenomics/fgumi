@@ -823,3 +823,30 @@ fn fused_sort_then_group_chain_exercises_intermediate_add_sort_branch() {
         "expected each molecule group to have all 3 of its family's reads, got {counts:?}"
     );
 }
+
+/// A queryname sort reports its key classes and compares in one `Queryname
+/// keys:` line under `--sort-stats` (and never without it), on a sort that
+/// merges at least two sources, for both comparators. With the flag the line
+/// carries the compare shares; at least one class beyond the empty one is
+/// learned from the fixture's shared `fam_` name prefix.
+#[rstest]
+fn sort_stats_gates_the_queryname_keys_line(
+    #[values("queryname", "queryname::natural")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let line = stderr.lines().map(log_body).find(|l| l.starts_with("Queryname keys: "));
+    assert_eq!(line.is_some(), with_flag, "{order}: `Queryname keys:` presence:\n{stderr}");
+    if let Some(line) = line {
+        let classes: usize = line
+            .strip_prefix("Queryname keys: ")
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("{order}: unparseable classes: {line}"));
+        assert!(classes >= 2, "{order}: the `fam_` prefix is learned: {line}");
+        assert!(line.contains("arena fallbacks"), "{order}: compares are counted: {line}");
+    }
+}
