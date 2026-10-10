@@ -422,7 +422,7 @@ fn sort_stats_gates_merge_demand_lines(
     let stderr = sort_spilling_with(order, extra);
     let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
-    for needle in ["Merge demand:", "Awaited slot at stall:", "Merge output:"] {
+    for needle in ["Merge demand:", "Awaited slot at stall:", "Pool at stall:", "Merge output:"] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
     }
 }

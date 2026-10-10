@@ -511,6 +511,19 @@ enum NextBatch<I> {
     Done(Option<I>, u64),
 }
 
+/// Ask the pool for one parked worker, mirroring the outcome for the merge
+/// demand's counters (fgumi-sort does not depend on pipeline-core).
+fn merge_pool_request(pool: &fgumi_pipeline_core::PoolHandle<'_>) -> fgumi_sort::MergePoolRequest {
+    use fgumi_pipeline_core::PoolRequest;
+    use fgumi_sort::MergePoolRequest as M;
+    match pool.request_worker() {
+        PoolRequest::Woken => M::Woken,
+        PoolRequest::AllAwake => M::AllAwake,
+        PoolRequest::Pending => M::Pending,
+        PoolRequest::Unavailable => M::Unavailable,
+    }
+}
+
 /// Plan the output-block boundaries for a parallel fast-path gather of `chunk`,
 /// reproducing the serial [`SortMerge::next_fast_batch`] count/byte-cap split
 /// byte-for-byte — but from the per-record lengths alone, without constructing a
@@ -797,16 +810,58 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// slot unparks this step's driver thread. `None` when the merge runs
     /// without a spill supply that notifies (unit tests that drive it alone).
     demand: Option<Arc<fgumi_sort::MergeDemand>>,
-    /// When the current stall episode began (`None` while the merge is not
-    /// stalled). One episode spans every `Stalled` until the next `Produced` or
-    /// `Done`.
-    stall_started: Option<std::time::Instant>,
     /// This dispatch's stall registered on the merge demand (its `await_slot`
     /// found nothing). `try_run` settles it once the dispatch's outcome is
     /// known: a park (`Contention`) is recorded as one, and any other outcome
     /// withdraws the registration, because the merge runs again before it
     /// parks and re-registers then.
     awaiting: bool,
+    /// The current stall episode (one episode spans every `Stalled` until the
+    /// next `Produced` or `Done`).
+    episode: StallEpisode,
+}
+
+/// Bookkeeping for one stall episode of the merge: when it began, and whether
+/// its single pool-worker request has been made.
+#[derive(Default)]
+struct StallEpisode {
+    /// When the episode began; `None` while the merge is not stalled.
+    started: Option<std::time::Instant>,
+    /// The episode's pool-worker request was made (at most one per episode).
+    requested: bool,
+    /// That request found a sleeping worker: one parked on the event-count
+    /// when it asked, or one it woke from a timer park
+    /// (`MergeDemandStats::record_pool_request`).
+    had_sleeper: bool,
+}
+
+impl StallEpisode {
+    /// Open an episode on the first stall that will park, classifying the
+    /// awaited slot. A re-stall within the episode only refreshes `awaited`.
+    fn begin(&mut self, demand: &fgumi_sort::MergeDemand, slot: &SortMergeSlot) {
+        if self.started.is_none() {
+            self.started = Some(std::time::Instant::now());
+            demand.stats().record_stall(slot.awaited_state());
+        }
+        demand.set_starved(true);
+    }
+
+    /// Close the episode, if one is open: book its duration (and, when its
+    /// request found a sleeping worker, the sleeper time), lower `starved`,
+    /// and re-arm the once-per-episode request.
+    fn end(&mut self, demand: Option<&fgumi_sort::MergeDemand>) {
+        let Some(t0) = self.started.take() else { return };
+        if let Some(d) = demand {
+            let ns = fgumi_pipeline_core::runtime::elapsed_ns(t0);
+            d.stats().record_stall_ns(ns);
+            if self.requested && self.had_sleeper {
+                d.stats().record_stall_with_sleeper_ns(ns);
+            }
+            d.set_starved(false);
+        }
+        self.requested = false;
+        self.had_sleeper = false;
+    }
 }
 
 /// Lever-2 diagnostic counters: is the serial merge starved on decompress
@@ -871,8 +926,8 @@ impl<O: MergeOutput> SortMerge<O> {
             fast_pending: std::collections::VecDeque::new(),
             fast_path_cap: None,
             demand: None,
-            stall_started: None,
             awaiting: false,
+            episode: StallEpisode::default(),
         }
     }
 
@@ -1052,8 +1107,8 @@ impl<O: MergeOutput> SortMerge<O> {
         let byte_limit = self.output_byte_limit;
         let bytes_cap = usize::try_from(byte_limit).unwrap_or(usize::MAX);
         let demand = self.demand.as_deref();
-        let stall_started = &mut self.stall_started;
         let awaiting = &mut self.awaiting;
+        let episode = &mut self.episode;
         let SortMergeState::Merging { driver, builder, next_ordinal } = &mut self.state else {
             unreachable!("next_batch called outside Merging state");
         };
@@ -1082,11 +1137,7 @@ impl<O: MergeOutput> SortMerge<O> {
                 MergeStep::Produced(bytes) => {
                     builder.push_record_bytes(bytes)?;
                     *records_out += 1;
-                    if let Some(t0) = stall_started.take()
-                        && let Some(d) = demand
-                    {
-                        d.stats().record_stall_ns(fgumi_pipeline_core::runtime::elapsed_ns(t0));
-                    }
+                    episode.end(demand);
                     let count_full = builder.len() >= target;
                     let bytes_full = (builder.total_bytes() as u64) >= byte_limit;
                     if count_full || bytes_full {
@@ -1103,10 +1154,7 @@ impl<O: MergeOutput> SortMerge<O> {
                             continue;
                         }
                         *awaiting = true;
-                        if stall_started.is_none() {
-                            *stall_started = Some(std::time::Instant::now());
-                            d.stats().record_stall(slot.awaited_state());
-                        }
+                        episode.begin(d, slot);
                     }
                     let partial = flush_partial(builder, next_ordinal);
                     if partial.is_some()
@@ -1118,11 +1166,7 @@ impl<O: MergeOutput> SortMerge<O> {
                 }
                 MergeStep::Done => {
                     // The last episode (typically a run-end EOF stall) ends here.
-                    if let Some(t0) = stall_started.take()
-                        && let Some(d) = demand
-                    {
-                        d.stats().record_stall_ns(fgumi_pipeline_core::runtime::elapsed_ns(t0));
-                    }
+                    episode.end(demand);
                     return Ok(NextBatch::Done(
                         flush_partial(builder, next_ordinal),
                         driver.records_merged(),
@@ -1166,6 +1210,14 @@ impl<O: MergeOutput> SortMerge<O> {
                         if let Err(unpushed) = ctx.outputs.push(batch) {
                             self.dbg.output_full += 1;
                             self.held.put(unpushed);
+                            // Blocked on the output edge now, not on the
+                            // supply: until the held batch goes out, refilling
+                            // the spill supply first would only starve the
+                            // steps that drain this edge. The episode stays
+                            // open; the next stall raises `starved` again.
+                            if let Some(d) = &self.demand {
+                                d.set_starved(false);
+                            }
                             return Ok(StepOutcome::Progress);
                         }
                         delivered += 1;
@@ -1177,6 +1229,20 @@ impl<O: MergeOutput> SortMerge<O> {
                         // Nothing delivered this dispatch: the driver parks
                         // until the awaited slot's delivery unparks it (the
                         // merge demand), with its idle timer only as the bound.
+                        // The awaited block comes from pool work that reaches
+                        // the merge off any queue edge, so nothing else wakes a
+                        // parked pool worker for it: ask for one, once per stall
+                        // episode (the pool keeps at most one request pending).
+                        if let Some(d) = &self.demand
+                            && self.episode.started.is_some()
+                            && !self.episode.requested
+                        {
+                            self.episode.requested = true;
+                            let parked = ctx.pool.parked_workers();
+                            let outcome = merge_pool_request(&ctx.pool);
+                            self.episode.had_sleeper =
+                                d.stats().record_pool_request(outcome, parked);
+                        }
                         self.dbg.contention += 1;
                         StepOutcome::Contention
                     });

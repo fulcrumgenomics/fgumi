@@ -26,4 +26,5 @@
 pub use fgumi_pipeline_core as core;
 pub mod backpressure;
 pub mod chains;
+pub(crate) mod refill;
 pub mod steps;
