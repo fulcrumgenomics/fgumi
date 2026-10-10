@@ -63,7 +63,7 @@ use fgumi_pipeline_core::{
     WakeEdges, WakePlan, current_thread, delivery_fence,
 };
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use loom::thread;
 
 const ITEM: u64 = 8;
@@ -468,4 +468,60 @@ fn a_self_registered_thread_sees_the_work_or_is_unparked() {
 #[should_panic(expected = "deadlock")]
 fn spawner_side_registration_loses_the_wake() {
     registration_model(false);
+}
+
+/// The push gate under a racing consumer. Two clones of one producer: A pushes
+/// (`item = true`, `pushed += 1`) and B does not. Each snapshots `pushed`
+/// before its dispatch and, after it, notifies only if `pushed` moved — behind
+/// `notify_one`'s fence (`producer_fence`) and its read of the waiter count.
+/// The consumer arms (`waiters += 1`), fences (`prepare_wait`), re-polls `item`.
+/// In every interleaving the consumer saw the item or a notify set `token`; a
+/// clone whose stale snapshot equals the counter can only skip a wake that the
+/// pushing clone delivers itself.
+fn push_gate_model(producer_fence: bool) {
+    loom::model(move || {
+        let pushed = Arc::new(AtomicU64::new(0));
+        let item = Arc::new(AtomicBool::new(false));
+        let waiters = Arc::new(AtomicU64::new(0));
+        let token = Arc::new(AtomicBool::new(false));
+        let producer = |push: bool| {
+            let (pushed, item, waiters, token) =
+                (pushed.clone(), item.clone(), waiters.clone(), token.clone());
+            thread::spawn(move || {
+                let snap = pushed.load(Ordering::Relaxed);
+                if push {
+                    item.store(true, Ordering::Relaxed);
+                    pushed.fetch_add(1, Ordering::Relaxed);
+                }
+                if producer_fence {
+                    fence(Ordering::SeqCst); // notify_one's fence
+                }
+                if pushed.load(Ordering::Relaxed) != snap && waiters.load(Ordering::Relaxed) > 0 {
+                    token.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+        let a = producer(true);
+        let b = producer(false);
+        waiters.fetch_add(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let saw = item.load(Ordering::Relaxed);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(saw || token.load(Ordering::Relaxed), "lost wake");
+    });
+}
+
+#[test]
+fn loom_two_producers_one_consumer_gate() {
+    push_gate_model(true);
+}
+
+/// Negative control: without the producer's fence the gate can read a waiter
+/// count that predates the consumer's arm while the consumer's re-poll misses
+/// the item, so the model is known to be able to fail.
+#[test]
+#[should_panic(expected = "lost wake")]
+fn the_unfenced_push_gate_loses_the_wake() {
+    push_gate_model(false);
 }

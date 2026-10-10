@@ -102,8 +102,12 @@ pub trait ItemQueue<T: Send + 'static>: Send + Sync {
     fn on_final_reject(&self, _: Sealed);
 
     /// A push refused by [`Self::try_push_unlatched`] was accepted by the layer
-    /// above instead (the reorder stash): if the calling producer was holding
-    /// an item on this edge, its hold ends now, as on a successful push.
+    /// above instead (the reorder stash), so the item is reachable by its
+    /// consumer without passing through this transport. Treated as a
+    /// successful push: if the calling producer was holding an item on this
+    /// edge, its hold ends now, and a transport with a push counter
+    /// ([`BoundedQueueHandle::pushed_total`]) advances it, so a push-gated
+    /// producer still wakes its consumer. A transport with neither does nothing.
     #[doc(hidden)]
     fn note_stash_accepted(&self, _: Sealed);
 
@@ -421,11 +425,12 @@ pub struct ByteBoundedQueue<T: Send + HeapSize + 'static> {
     /// Hold timing and holder set installed by `Pipeline::run` on the edges
     /// it tracks; empty otherwise.
     tracking: OnceLock<EdgeTracking>,
-    /// Successful pushes on an edge with a holder set, bumped `Relaxed` on the
-    /// success path. Read by `WakePlan` as the push gate: a Detached producer's
-    /// `Progress` wakes its consumer only if this advanced during the dispatch.
-    /// Same struct as `current_bytes`, which that path already RMWs. Not
-    /// counted on untracked edges.
+    /// Successful pushes (plus reorder-stash inserts, `note_stash_accepted`) on an edge
+    /// with a holder set, bumped `Relaxed`. Read by `WakePlan` as the push gate:
+    /// in a `Directed` chain a producer's `Progress` wakes this edge's consumer
+    /// only if this advanced during the dispatch. Same struct as
+    /// `current_bytes`, which the push path already RMWs. Not counted on
+    /// untracked edges.
     pushed_total: AtomicU64,
 }
 
@@ -582,6 +587,13 @@ impl<T: Send + HeapSize + 'static> ByteBoundedQueue<T> {
         }
     }
 
+    /// Take (and clear) this edge's recorded holders; returns how many (test
+    /// support).
+    #[cfg(test)]
+    pub(crate) fn take_holders_for_test(&self) -> usize {
+        BoundedQueueHandle::take_holders(self, &mut |_| {}, SEALED)
+    }
+
     /// Best-effort, stale-tolerant `Relaxed` read of the running byte
     /// counter. Used by the rebalancer as a budget heuristic, not as a
     /// correctness gate — it may lag a concurrent `try_push`/`try_pop`.
@@ -693,8 +705,9 @@ pub trait BoundedQueueHandle: Send + Sync {
     /// Install this edge's tracking (once; a second call is ignored).
     #[doc(hidden)]
     fn enable_tracking(&self, t: EdgeTracking, _: Sealed);
-    /// Successful pushes so far (`Relaxed`). Advances only on edges with a
-    /// holder set.
+    /// Items made reachable by the consumer so far (`Relaxed`): successful
+    /// pushes plus items a reorder stage stashed on the edge's behalf
+    /// ([`ItemQueue::note_stash_accepted`]). Advances only on edges with a holder set.
     #[doc(hidden)]
     fn pushed_total(&self, _: Sealed) -> u64;
     /// Take (and clear) the threads this edge refused, calling `f(slot)` per
@@ -800,10 +813,13 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
     }
 
     fn note_stash_accepted(&self, _: Sealed) {
-        if let Some(t) = self.tracking.get()
-            && let Some(c) = &t.clock
-        {
-            c.on_push();
+        if let Some(t) = self.tracking.get() {
+            if t.holders.is_some() {
+                self.pushed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(c) = &t.clock {
+                c.on_push();
+            }
         }
     }
 

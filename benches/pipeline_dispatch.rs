@@ -25,7 +25,7 @@ use fgumi_pipeline_core::Unpushed;
 use fgumi_pipeline_core::builder::{Pipeline, PipelineConfig};
 use fgumi_pipeline_core::held::HeldSlot;
 use fgumi_pipeline_core::item::{HeapSize, Ordered};
-use fgumi_pipeline_core::outputs::OrderedBytesSingle;
+use fgumi_pipeline_core::outputs::{OrderedBytesSingle, Single};
 use fgumi_pipeline_core::queues::QueueSpec;
 use fgumi_pipeline_core::reorder::BranchOrdering;
 use fgumi_pipeline_core::runtime::stats::{PipelineStats, StepStatsSnapshot};
@@ -174,6 +174,70 @@ impl Step for PassThrough {
     }
 }
 
+/// An unordered pass-through (`Single<Item>`, `BranchOrdering::None`) with a
+/// byte-bounded output of `limit_bytes`. Unlike [`PassThrough`] its edge has no
+/// reorder stage, whose stash would accept every push: a full edge refuses,
+/// and the step holds the item until a retry goes through.
+struct UnorderedPass {
+    held: Option<Item>,
+    kind: StepKind,
+    work_us: u64,
+    limit_bytes: u64,
+}
+
+impl UnorderedPass {
+    fn new(kind: StepKind, work_us: u64, limit_bytes: u64) -> Self {
+        Self { held: None, kind, work_us, limit_bytes }
+    }
+}
+
+impl Step for UnorderedPass {
+    type Input = Item;
+    type Outputs = Single<Item>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "BenchUnorderedPass",
+            kind: self.kind,
+            sticky: false,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.limit_bytes }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(item) = self.held.take() {
+            return match ctx.outputs.push(item) {
+                Ok(()) => Ok(StepOutcome::Progress),
+                Err(again) => {
+                    self.held = Some(again.into_item());
+                    Ok(StepOutcome::Contention)
+                }
+            };
+        }
+        let Some(item) = ctx.input.pop() else {
+            if ctx.input.is_drained() {
+                return Ok(StepOutcome::Finished);
+            }
+            return Ok(StepOutcome::NoProgress);
+        };
+        if self.work_us > 0 {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_micros(self.work_us) {
+                std::hint::spin_loop();
+            }
+        }
+        if let Err(unpushed) = ctx.outputs.push(black_box(item)) {
+            self.held = Some(unpushed.into_item());
+        }
+        Ok(StepOutcome::Progress)
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        Self::new(self.kind, self.work_us, self.limit_bytes)
+    }
+}
+
 /// Terminal sink; counts arrivals into a shared atomic so the run is verifiable.
 /// `Exclusive` in the plain chain (as the no-op baseline always was); `Serial`
 /// in the detached-mid chain, whose source already takes the one exclusive
@@ -219,7 +283,16 @@ enum Shape {
     /// shape, where the middle step runs on its own driver thread and every
     /// push into / out of it is a directed wake.
     DetachedMid,
+    /// Source → Holder (Parallel, unordered) → one-item edge → Slow (Serial,
+    /// 20 µs, unordered) → Detached sink: the holder clones keep an item held
+    /// most of the time, so this measures the held-item path — gated
+    /// `Progress` that only held, and the reverse wake that releases a holder
+    /// on every slow pop.
+    HeldMid,
 }
+
+/// Per-item work of `Shape::HeldMid`'s slow Serial consumer.
+const HELD_MID_SLOW_US: u64 = 20;
 
 /// Build the chain; the returned counter is the sink's.
 fn build_chain(shape: Shape, work_us: u64, n_items: u64) -> (Pipeline, Arc<AtomicU64>) {
@@ -237,6 +310,12 @@ fn build_chain(shape: Shape, work_us: u64, n_items: u64) -> (Pipeline, Arc<Atomi
             .chain(PassThrough::new(StepKind::Detached, 0))
             .chain(PassThrough::new(StepKind::Parallel, work_us))
             .chain(CountingSink { seen: Arc::clone(&seen), kind: StepKind::Serial })
+            .into_sink_marker(),
+        Shape::HeldMid => builder
+            .chain(CountingSource::new(n_items))
+            .chain(UnorderedPass::new(StepKind::Parallel, work_us, 64))
+            .chain(UnorderedPass::new(StepKind::Serial, HELD_MID_SLOW_US, EDGE_LIMIT_BYTES))
+            .chain(CountingSink { seen: Arc::clone(&seen), kind: StepKind::Detached })
             .into_sink_marker(),
     }
     (builder.build().expect("bench chain builds"), seen)
@@ -294,6 +373,31 @@ fn print_counters() {
             }
         }
     }
+    for threads in [4usize, 8] {
+        let n = N_ITEMS_WORK;
+        let (pipeline, seen) = build_chain(Shape::HeldMid, 0, n);
+        let stats = pipeline.stats();
+        let start = Instant::now();
+        run_built(pipeline, &seen, n, threads, Some(Arc::clone(&stats)));
+        let wall = start.elapsed();
+        let snap = stats.snapshot();
+        let sum =
+            |f: fn(&StepStatsSnapshot) -> u64| snap.steps.iter().map(|(_, s)| f(s)).sum::<u64>();
+        let timed_out: u64 = snap.worker_waits.iter().map(|w| w.3).sum();
+        // `notifies_issued` already counts every outcome (woken + no waiter).
+        let notifies = sum(|s| s.notifies_issued);
+        #[allow(clippy::cast_precision_loss)] // counts far below 2^52
+        let per_item = notifies as f64 / n as f64;
+        eprintln!(
+            "counters held_mid threads={threads}: wall_ms={:.1} notifies_issued={notifies} \
+             notifies_per_item={per_item:.3} gated_off={} reverse_wakes={} \
+             direct_fallbacks={} ec_waits_timed_out={timed_out}",
+            wall.as_secs_f64() * 1e3,
+            sum(|s| s.gated_off),
+            sum(|s| s.reverse_wakes),
+            sum(|s| s.direct_fallbacks),
+        );
+    }
 }
 
 fn bench_dispatch(c: &mut Criterion) {
@@ -322,6 +426,18 @@ fn bench_dispatch(c: &mut Criterion) {
                 });
             });
         }
+    }
+    group.finish();
+    let mut group = c.benchmark_group("pipeline_dispatch_held");
+    group.sample_size(10);
+    group.throughput(criterion::Throughput::Elements(N_ITEMS_WORK));
+    for threads in [4usize, 8] {
+        group.bench_function(format!("held_mid/threads_{threads}"), |b| {
+            b.iter(|| {
+                let (p, seen) = build_chain(Shape::HeldMid, 0, N_ITEMS_WORK);
+                run_built(p, &seen, N_ITEMS_WORK, threads, None);
+            });
+        });
     }
     group.finish();
 }

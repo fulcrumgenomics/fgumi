@@ -9,22 +9,16 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use fgumi_lib::commands::common::{
-    CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, QueueMemoryOptions,
-    SchedulerOptions, ThreadingOptions,
-};
-use fgumi_lib::commands::group::GroupOptions;
-use fgumi_lib::commands::sort::{SortOptions, SortOrderArg};
+use fgumi_lib::commands::sort::SortOrderArg;
 use fgumi_lib::commands::zipper::ZipperOptions;
-use fgumi_lib::pipeline::chains::{
-    ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
-};
+use fgumi_lib::pipeline::chains::{SourceSpec, Stage, StageOptionsBag, build_for};
 use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, write_bam};
+use crate::helpers::chain_spec::{sort_options, spec, spec_with};
 use crate::helpers::cutover::decompressed_records_without_pg;
 
 /// `n` records (whole FR pairs) in reverse order of every sort key: template
@@ -63,58 +57,6 @@ fn unsorted_records(n: usize) -> Vec<RawRecord> {
         }
     }
     records
-}
-
-fn sort_options(sort_threads: Option<usize>, merge_threads: Option<usize>) -> SortOptions {
-    SortOptions {
-        order: SortOrderArg::Coordinate,
-        key_types: None,
-        max_memory: MemoryLimit::Fixed(64 * 1024 * 1024),
-        memory_reserve: MemoryReserve::Auto,
-        memory_per_thread: true,
-        tmp_dirs: Vec::new(),
-        sort_threads,
-        merge_threads,
-        temp_compression: 1,
-        temp_codec: fgumi_sort::SpillCodec::default(),
-        max_temp_files: MaxTempFiles::Auto,
-        sort_stats: false,
-    }
-}
-
-fn spec_with(
-    stages: Vec<Stage>,
-    source: SourceSpec,
-    output: &Path,
-    threads: Option<usize>,
-    stage_opts: StageOptionsBag,
-) -> ChainSpec {
-    ChainSpec {
-        stages,
-        source,
-        sink: SinkSpec::Bam(output.to_path_buf()),
-        stage_opts,
-        threading: ThreadingOptions { threads },
-        compression: CompressionOptions::default(),
-        scheduler: SchedulerOptions::default(),
-        queue_memory: QueueMemoryOptions::default(),
-        async_reader: false,
-        read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
-        verify_crc: true,
-        command_line: "fgumi sort <phase-cap test>".to_string(),
-    }
-}
-
-fn spec(
-    stages: Vec<Stage>,
-    input: &Path,
-    output: &Path,
-    threads: usize,
-    sort: SortOptions,
-) -> ChainSpec {
-    let group = stages.contains(&Stage::Group).then(GroupOptions::default);
-    let bag = StageOptionsBag { sort: Some(sort), group, ..Default::default() };
-    spec_with(stages, SourceSpec::Bam(input.to_path_buf()), output, Some(threads), bag)
 }
 
 /// The `cap=` token on the DAG line of `step`, if any.

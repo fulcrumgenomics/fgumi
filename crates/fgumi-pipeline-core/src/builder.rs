@@ -219,6 +219,13 @@ pub struct PipelineConfig {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub test_backoff: Vec<crate::runtime::worker_core::TestBackoff>,
+    /// Test support (`test-utils`, hidden): the reorder-stash byte cap applied
+    /// to every ordered byte-bounded edge after the queue budget is set (an
+    /// ordered count-bounded or unbounded edge has no stash cap to set). Lets a
+    /// test drive a chain into the stash cap, which no step can set.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub test_reorder_overflow_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for PipelineConfig {
@@ -278,6 +285,8 @@ impl Default for PipelineConfig {
             rss_probe: None,
             #[cfg(any(test, feature = "test-utils"))]
             test_backoff: Vec::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_reorder_overflow_bytes: None,
         }
     }
 }
@@ -1167,15 +1176,19 @@ impl Pipeline {
         self.dag_at(PipelineConfig::default().threads)
     }
 
-    /// Like [`Self::dag`] for an explicit thread count — wake targets depend on
-    /// it (`Affinity::Writer` is worker `n−1`; `Pool` resolves to `Worker(0)`
-    /// at one thread). `[gated]` is rendered only for byte-bounded edges, and
-    /// `reverse:` for tracked edges; both need the edge registries, which exist
-    /// once contexts are built, so `dag_at` shows forward targets only.
-    #[must_use]
-    pub fn dag_at(&self, n_threads: usize) -> String {
-        use std::fmt::Write as _;
-
+    /// The wake plan `Pipeline::run` builds for this chain at `n_threads`, over
+    /// the edge registries `edges` (`WakeEdges::NONE`: forward targets only),
+    /// the Parallel-clone placement it was built with, and each step's
+    /// Detached driver.
+    fn wake_plan_at(
+        &self,
+        n_threads: usize,
+        edges: super::runtime::wake::WakeEdges<'_>,
+    ) -> (
+        Arc<super::runtime::wake::WakePlan>,
+        Vec<super::runtime::ParallelHosts>,
+        Vec<Option<super::runtime::wake::DriverIdx>>,
+    ) {
         let owners = super::runtime::assign_exclusive_owners(&self.steps, n_threads)
             .unwrap_or_else(|_| vec![None; self.steps.len()]);
         let (kinds, pinned) = wake_inputs(&self.steps, &owners, n_threads);
@@ -1193,11 +1206,48 @@ impl Pipeline {
             &pinned,
             &super::runtime::placement::wake_driver_of(&detached, &hosts),
             &[],
-            super::runtime::wake::WakeEdges::NONE,
+            edges,
             None,
             n_threads,
             &hosts,
         );
+        (plan, hosts, detached)
+    }
+
+    /// The wake table `Pipeline::run` builds at `n_threads`, one `(step name,
+    /// wake line)` per step in `StepIdx` order. Unlike [`Self::dag_at`] it builds
+    /// the chain's edges, so `[gated]` and `reverse:` are rendered. Test support:
+    /// lets a chain-level test check the gating of a real chain.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wake_lines_at(&self, n_threads: usize) -> Vec<(&'static str, String)> {
+        let contexts = super::runtime::build_chain_contexts(
+            &self.steps,
+            &self.graph,
+            InstrumentationLevel::Off,
+            false,
+        );
+        let (plan, _, _) = self.wake_plan_at(n_threads, contexts.wake_edges());
+        plan.dag_lines(&self.graph)
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| (self.graph.step_name(super::topology::StepIdx(i)), line))
+            .collect()
+    }
+
+    /// Like [`Self::dag`] for an explicit thread count — wake targets depend on
+    /// it (`Affinity::Writer` is worker `n−1`; `Pool` resolves to `Worker(0)`
+    /// at one thread). `[gated]` is rendered only for byte-bounded edges, and
+    /// `reverse:` for tracked edges; both need the edge registries, which exist
+    /// once contexts are built, so `dag_at` shows forward targets only
+    /// (`wake_lines_at`, test support, renders them).
+    #[must_use]
+    pub fn dag_at(&self, n_threads: usize) -> String {
+        use std::fmt::Write as _;
+
+        let (plan, hosts, detached) =
+            self.wake_plan_at(n_threads, super::runtime::wake::WakeEdges::NONE);
         let wake_lines = plan.dag_lines(&self.graph);
 
         let mut s = String::new();
@@ -1464,6 +1514,12 @@ impl Pipeline {
         if let Some(total) = config.queue_memory_total {
             apply_initial_queue_budget(&contexts.bounded_queues, total);
         }
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(bytes) = config.test_reorder_overflow_bytes {
+            for reorder in contexts.bounded_queues.iter().filter_map(|rq| rq.reorder_cap.as_ref()) {
+                reorder.set_max_overflow_bytes(bytes);
+            }
+        }
 
         // 3. Extract `Detached` steps' real instances for their dedicated
         // threads, leaving same-position placeholders so `build_worker_storage`
@@ -1587,6 +1643,10 @@ impl Pipeline {
         // strand its holder on its timer. Checked right after the install, so a
         // registry or install bug fails every Directed run at once.
         debug_assert!(wake.reverse_edges_are_tracked(), "a reverse edge's queue is untracked");
+        // A gated branch on a queue with no holder set never advances its push
+        // counter, so the gate would hold every forward wake off and strand the
+        // consumer on its timer. Same check, for the gates.
+        debug_assert!(wake.gated_edges_are_tracked(), "a gated branch's queue is untracked");
         if n_threads == 1 {
             // The one-worker path runs worker 0 on this thread; register it now
             // so a driver that pushes before the loop starts can already unpark it.
@@ -3473,6 +3533,65 @@ mod tests {
         assert!(!plan.reverse_edges_are_tracked(), "nothing installed yet");
         install_edge_tracking(&plan, &contexts, &[], None, plan.n_slots());
         assert!(plan.reverse_edges_are_tracked());
+    }
+
+    /// `gated_edges_are_tracked` is what `Pipeline::run`'s post-install gate
+    /// assertion reads: false while a gated branch's queue has no holder set,
+    /// including when the queue's tracking was already installed elsewhere
+    /// with no holder set (the `OnceLock` keeps that first install), which
+    /// would freeze its push counter and gate every forward wake off.
+    #[test]
+    fn gated_edge_on_an_untracked_queue_is_detected() {
+        use crate::runtime::wake::{DriverIdx, WakePlan};
+        use StepKind::{Detached as D, Exclusive as E, Parallel as P};
+        const BB: QueueSpec = QueueSpec::ByteBounded { limit_bytes: 1 << 20 };
+        let none = BranchOrdering::None;
+        let fixture = || {
+            let steps: Vec<Box<dyn ErasedStep>> = vec![
+                Box::new(TypedStep::new(cfg::<(), Single<u32>>("Src", D, Some((BB, none))))),
+                Box::new(TypedStep::new(cfg::<u32, Single<u32>>("Par", P, Some((BB, none))))),
+                Box::new(TypedStep::new(cfg::<u32, ()>("Sink", E, None))),
+            ];
+            let mut graph = ChainGraph::new();
+            let ids: Vec<StepIdx> = ["Src", "Par", "Sink"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| graph.register_step(n, usize::from(i != 2)))
+                .collect();
+            for w in ids.windows(2) {
+                graph.wire(w[0], BranchIdx(0), w[1]);
+            }
+            let contexts = crate::runtime::build_chain_contexts(
+                &steps,
+                &graph,
+                InstrumentationLevel::Off,
+                false,
+            );
+            let kinds: Vec<StepKind> = steps.iter().map(|s| s.kind()).collect();
+            let plan = WakePlan::build(
+                &graph,
+                &kinds,
+                &[None; 3],
+                &[Some(DriverIdx(0)), None, None],
+                &[],
+                contexts.wake_edges(),
+                Some(Arc::new(crate::runtime::event_count::PoolEventCount::new(2))),
+                2,
+            );
+            (contexts, plan, kinds)
+        };
+        let (contexts, plan, kinds) = fixture();
+        assert!(plan.is_gated(StepIdx(0)), "fixture: Src's byte-bounded branch is gated");
+        assert!(!plan.gated_edges_are_tracked(), "nothing installed yet");
+        install_edge_tracking(&plan, &contexts, &kinds, None, plan.n_slots());
+        assert!(plan.gated_edges_are_tracked());
+
+        // A first install with a hold clock but no holder set wins the OnceLock.
+        let (contexts, plan, kinds) = fixture();
+        let stats = Arc::new(PipelineStats::new(vec!["Src", "Par", "Sink"]));
+        install_edge_tracking(&WakePlan::legacy(None), &contexts, &kinds, Some(&stats), 4);
+        install_edge_tracking(&plan, &contexts, &kinds, None, plan.n_slots());
+        assert!(!plan.gated_edges_are_tracked(), "a holder-less first install is caught");
     }
 
     #[derive(Clone)]

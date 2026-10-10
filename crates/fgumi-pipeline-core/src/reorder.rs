@@ -461,7 +461,8 @@ impl<T: Send + HeapSize + 'static> ReorderStage<T> {
                     // stash insert is an accepted push: a hold this producer
                     // had open on the transport ends here (the usual release of
                     // a fast-path hold, whose in-order pop frees no transport
-                    // room).
+                    // room), and it counts as a push on the transport, so a
+                    // push-gated producer still wakes the consumer.
                     self.transport.note_stash_accepted(SEALED);
                     // `usize → u64` is a lossless widen on every supported
                     // (≤64-bit) target, so this cast never truncates.
@@ -1417,5 +1418,53 @@ mod tests {
             "the stash insert of the held retry ends its hold"
         );
         let _ = crate::runtime::wake_slot::take_rejected();
+    }
+
+    /// A one-item tracked transport (holder set and hold clock) behind an
+    /// unbounded-stash reorder stage, and the stats the clock books into.
+    fn stash_fixture() -> (
+        Arc<crate::queues::ByteBoundedQueue<Sequenced<Sized8>>>,
+        ReorderStage<Sized8>,
+        Arc<crate::runtime::stats::PipelineStats>,
+    ) {
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, EdgeTracking};
+        use crate::runtime::stats::PipelineStats;
+        use crate::runtime::wake_slot::{HoldClock, HolderSet};
+        use crate::topology::StepIdx;
+
+        let stats = Arc::new(PipelineStats::new(vec!["Par"]));
+        let transport = Arc::new(ByteBoundedQueue::<Sequenced<Sized8>>::new(8));
+        transport.enable_tracking(
+            EdgeTracking {
+                clock: Some(HoldClock::per_thread(StepIdx(0), Arc::clone(&stats), 2)),
+                holders: Some(HolderSet::new(2)),
+            },
+            SEALED,
+        );
+        let stage = ReorderStage::new(Arc::clone(&transport) as _);
+        (transport, stage, stats)
+    }
+
+    /// A must-accept push stashed because the transport is full counts as a
+    /// push on the transport and leaves no hold behind on the producer: no
+    /// rejected flag, no holder bit, and no hold booked by a later push.
+    #[test]
+    fn stashed_must_accept_push_counts_as_a_push_and_records_no_hold() {
+        use crate::queues::BoundedQueueHandle;
+        use crate::runtime::wake_slot::{SlotGuard, take_rejected};
+
+        let _slot = SlotGuard::enter(1);
+        let (transport, stage, stats) = stash_fixture();
+        stage.try_push(1, Sized8).unwrap(); // out of order: fills the transport
+        let _ = take_rejected(); // clear any prior flag
+        let before = transport.pushed_total(SEALED);
+        stage.try_push(0, Sized8).unwrap(); // next_serial; transport full → stashed
+        assert_eq!(transport.pushed_total(SEALED), before + 1, "the stash insert is a push");
+        assert!(!take_rejected(), "the producer does not hold anything");
+        assert_eq!(transport.take_holders_for_test(), 0, "no holder bit recorded");
+        // A later real push by this thread closes no hold.
+        let _ = transport.try_pop();
+        stage.try_push(2, Sized8).unwrap();
+        assert_eq!(stats.snapshot().steps[0].1.holds, 0, "no phantom hold booked");
     }
 }

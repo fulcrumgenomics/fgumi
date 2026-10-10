@@ -12,12 +12,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use fgumi_lib::sam::SamTag;
-use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
+use fgumi_raw_bam::RawRecord;
 use rstest::rstest;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, transcode_bam_to_sam, write_bam};
+use crate::helpers::chain_spec::{logged_count, records, uniquely_named_records};
 use crate::helpers::cutover::decompressed_records_without_pg;
 
 /// A limit far above any run count these fixtures produce, so it never binds.
@@ -31,31 +31,6 @@ const UNBOUNDED: &str = "100000";
 /// unmapped sentinel key and only run order separates them.
 fn tie_heavy_records(n: usize) -> Vec<RawRecord> {
     records(n, |i| format!("q{}", (i * 31) % (n / 4)))
-}
-
-/// Like [`tie_heavy_records`] but with a unique name per record, for commands
-/// (such as `group`) that reject two primary reads sharing a name.
-fn uniquely_named_records(n: usize) -> Vec<RawRecord> {
-    records(n, |i| format!("q{i}"))
-}
-
-fn records<F: Fn(usize) -> String>(n: usize, name_of: F) -> Vec<RawRecord> {
-    (0..n)
-        .map(|i| {
-            let name = name_of(i);
-            let mut b = SamBuilder::new();
-            b.read_name(name.as_bytes()).sequence(b"ACGTACGTAC").qualities(&[30u8; 10]);
-            if i % 17 == 0 {
-                b.ref_id(-1).pos(-1).mapq(0).flags(flags::UNMAPPED);
-            } else {
-                let pos = i32::try_from(1 + (i * 7919 % 500) * 10).expect("pos fits i32");
-                let strand = if i % 2 == 0 { 0 } else { flags::REVERSE };
-                b.ref_id(0).pos(pos).mapq(60).flags(strand).cigar_ops(&[10u32 << 4]); // 10M
-            }
-            b.add_string_tag(SamTag::RX, format!("u{i}").as_bytes());
-            b.build()
-        })
-        .collect()
 }
 
 fn write_fixture(dir: &Path, n: usize) -> PathBuf {
@@ -91,13 +66,6 @@ fn sort(
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
     (output, stderr)
-}
-
-/// The integer after `label` on the first stderr line containing it.
-fn logged_count(stderr: &str, label: &str) -> Option<u64> {
-    let line = stderr.lines().find(|l| l.contains(label))?;
-    let rest = &line[line.find(label)? + label.len()..];
-    rest.split_whitespace().next()?.parse().ok()
 }
 
 #[rstest]
