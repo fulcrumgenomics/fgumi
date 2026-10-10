@@ -38,6 +38,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
+#[cfg(feature = "simulate")]
 use crate::helpers::cutover::decompressed_records_without_pg;
 use crate::helpers::fastq::{FastqFlavor, write_bgzf_fastq_with_corrupt_last_crc};
 use crate::helpers::read_bam_output;
