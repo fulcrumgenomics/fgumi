@@ -2460,12 +2460,8 @@ impl RawExternalSorter {
         self
     }
 
-    /// Effective Phase-1 worker count: `sort_threads` if set (uncapped by
-    /// `threads`), else `threads`, at least 1.
-    ///
-    /// Public so the streaming arena front (`SortBuffer::from_sorter`) sizes its
-    /// per-chunk sort with the resolved `--sort-threads` override rather than the
-    /// raw base `--threads` (`num_threads`), which silently ignores the override.
+    /// Effective Phase-1 worker count — the resolved phase-1 width: `sort_threads`
+    /// if set (uncapped by `threads`), else `threads`, at least 1.
     #[must_use]
     pub fn phase1_threads(&self) -> usize {
         self.sort_threads.unwrap_or(self.threads).max(1)

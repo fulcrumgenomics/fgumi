@@ -36,8 +36,8 @@ use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::SamTag;
 use fgumi_sort::{
-    KeyTypesSpec, PooledSegmentedBuf, QuerynameComparator, RawExternalSorter, RawQuerynameKey,
-    RawQuerynameLexKey, SegmentedBuf, SortOrder, TemplateArenaAccumulator,
+    KeyTypesSpec, PooledSegmentedBuf, QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey,
+    SegmentedBuf, SortOrder, TemplateArenaAccumulator,
 };
 use noodles::sam::Header;
 
@@ -59,8 +59,8 @@ const MAX_EVENTS_PER_LOCK: usize = 8;
 /// Per-record memory overhead added to the arena byte count so the seal
 /// threshold accounts for the strategy's `(key, offset, len)` ref alongside the
 /// record body. Conservative; the exact value only shifts spill boundaries, not
-/// the merged output (coordinate/template are globally stable; queryname's tie
-/// order is unspecified).
+/// the merged output (every order's sort is stable: equal keys keep input
+/// order).
 const PER_RECORD_REF_OVERHEAD: usize = 64;
 
 /// Record-input arena accumulator: copies each pushed record into a growing
@@ -137,8 +137,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
 }
 
 /// Everything a [`SortBuffer`] reads to provision its arena sorter — and
-/// nothing else, so a caller cannot set a knob here that the buffer ignores
-/// (the failure mode of configuring it through a whole [`RawExternalSorter`]).
+/// nothing else, so a caller cannot set a knob here that the buffer ignores.
 #[derive(Debug, Clone, Copy)]
 pub struct SortBufferConfig {
     /// The order to sort into.
@@ -151,30 +150,6 @@ pub struct SortBufferConfig {
     pub cell_tag: Option<SamTag>,
     /// Template-coordinate key-lane spec.
     pub key_types: KeyTypesSpec,
-}
-
-impl SortBufferConfig {
-    /// The subset of `sorter`'s configuration a [`SortBuffer`] reads.
-    ///
-    /// Takes the engine's own phase-1 count, which honours a `sort_threads`
-    /// override as-is (not capped by `threads`; see
-    /// [`RawExternalSorter::phase1_threads`]). No fgumi CLI path builds a
-    /// `SortBuffer` this way — the chain builder fills [`SortBufferConfig`]
-    /// directly from its `PhaseThreads` resolution (`min(--sort-threads,
-    /// pool)`) — so this engine-parity constructor is unaffected by that
-    /// contract and is used only by tests.
-    #[must_use]
-    pub fn from_sorter(sorter: &RawExternalSorter) -> Self {
-        Self {
-            sort_order: sorter.sort_order(),
-            memory_limit: sorter.memory_limit_bytes(),
-            // Phase-1 count honors the `--sort-threads` override (falls back to
-            // `--threads`); `num_threads()` would drop the override silently.
-            sort_threads: sorter.phase1_threads(),
-            cell_tag: sorter.cell_tag_value(),
-            key_types: sorter.key_types_spec(),
-        }
-    }
 }
 
 /// Order-erased record-input arena sorter. Each variant pairs an [`ArenaAccum`]
@@ -264,9 +239,8 @@ impl ChunkSorter {
     }
 
     /// Take the final residual as zero-or-one erased chunk. Every order seals one
-    /// globally-sorted chunk per run (coordinate/template are stable; queryname's
-    /// tie order is unspecified), so the residual is at most one chunk — the
-    /// legacy multi-chunk `par_chunks_mut` split is no longer needed.
+    /// globally-sorted chunk per run, stable by input order, so the residual is
+    /// at most one chunk.
     ///
     /// An empty residual is normally dropped. The one EXCEPTION is
     /// template-coordinate when there were prior spills: the empty chunk still
@@ -397,34 +371,14 @@ pub struct SortBuffer {
 }
 
 impl SortBuffer {
-    /// Build a `SortBuffer` from a configured `RawExternalSorter` (any of the
-    /// four sort orders) and the output `Header`.
-    ///
-    /// `output_byte_limit` byte-bounds the output event queue (its chunk-bearing
-    /// variants retain sorted records, so the queue budgets on bytes, not count).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the header's reference-sequence count does not fit in
-    /// a `u32` (the coordinate key's reference field). That conversion is the
-    /// only fallible step: the template path's `TemplateArenaAccumulator::from_header`
-    /// is infallible here.
-    #[allow(clippy::needless_pass_by_value)] // by-value keeps the caller's move-in; only read here
-    pub fn from_sorter(
-        sorter: RawExternalSorter,
-        header: &Header,
-        output_byte_limit: u64,
-    ) -> Result<Self> {
-        Self::new(SortBufferConfig::from_sorter(&sorter), header, output_byte_limit)
-    }
-
     /// Build a `SortBuffer` from exactly the configuration it reads (see
     /// [`SortBufferConfig`]), writing sorted chunks bounded by
     /// `output_byte_limit` bytes.
     ///
     /// # Errors
     ///
-    /// As [`Self::from_sorter`].
+    /// Returns an error if the header's reference-sequence count does not fit in
+    /// a `u32` (the coordinate key's reference field).
     pub fn new(config: SortBufferConfig, header: &Header, output_byte_limit: u64) -> Result<Self> {
         let chunk_sorter = ChunkSorter::new(config, header)?;
         Ok(Self {
@@ -699,12 +653,14 @@ mod tests {
     /// any later record whose MI differs is rejected — the one reachable
     /// `ChunkSorter::push` failure.
     fn template_sorter_dropping_mi(memory_limit: usize) -> ChunkSorter {
-        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(memory_limit)
-            .threads(1)
-            .key_types(KeyTypesSpec::None);
-        ChunkSorter::new(SortBufferConfig::from_sorter(&sorter), &Header::default())
-            .expect("build template chunk sorter")
+        let config = SortBufferConfig {
+            sort_order: SortOrder::TemplateCoordinate,
+            memory_limit,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::None,
+        };
+        ChunkSorter::new(config, &Header::default()).expect("build template chunk sorter")
     }
 
     /// A push failure must stop ingest at the offending record and leave the
@@ -770,12 +726,15 @@ mod tests {
         #[case] failed: Option<&str>,
         #[case] expected_message: Option<&str>,
     ) {
-        let mut step = SortBuffer::from_sorter(
-            RawExternalSorter::new(SortOrder::Coordinate).memory_limit(1 << 20).threads(1),
-            &Header::default(),
-            1 << 20,
-        )
-        .expect("build SortBuffer");
+        let config = SortBufferConfig {
+            sort_order: SortOrder::Coordinate,
+            memory_limit: 1 << 20,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let mut step =
+            SortBuffer::new(config, &Header::default(), 1 << 20).expect("build SortBuffer");
         step.failed = failed.map(str::to_string);
 
         match expected_message {

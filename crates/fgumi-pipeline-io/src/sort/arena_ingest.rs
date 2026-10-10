@@ -1093,9 +1093,9 @@ impl ArenaSortStrategy for TemplateStrategy {
 /// an arena-backed [`InMemoryChunk<K>`], wrapped into the matching erased variant.
 ///
 /// The record bodies stay in the arena (zero-copy); only the small name bytes are
-/// owned by each key, exactly as the legacy queryname sort. Queryname's
-/// tie order is unspecified (the integration parity gate is name-order, not
-/// byte-identity), so one globally-sorted chunk per run is correct.
+/// owned by each key, exactly as the legacy queryname sort. Equal keys keep
+/// input order (ties break by arena offset), so one globally-sorted chunk per
+/// run is the stable sort of the run.
 pub struct QuerynameStrategy<K: RawSortKey> {
     /// `(key, body_offset, len)` refs accumulated across the current run's blocks.
     refs: Vec<(K, u64, u32)>,

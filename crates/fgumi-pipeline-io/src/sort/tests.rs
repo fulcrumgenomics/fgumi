@@ -1,21 +1,26 @@
-//! Tests for the runall-sort chains.
+//! Tests for the sort chains.
 //!
-//! The record-input chain is `SortBuffer` → `CompressSpill` →
-//! `SortSpillDecompress` → `SortMerge`; the legacy `SortAndSpill` Phase-1 head
-//! it replaced was retired in P7. The block-input arena front (`ReadBlocks` →
-//! `InflateToArena` → `FindBoundariesAndSort`) is covered at the end of this
-//! module.
+//! Two phase-1 fronts feed the same spill and merge steps: the record-input
+//! front (`SortBuffer`) and the block-input arena front (`ReadBlocks` →
+//! `InflateToArena` → the order's arena steps, see [`production_arena_front`]).
+//! Both spill through `SpillGather` → `SpillBlockCompress` → `SpillWrite` and
+//! merge through `SpillReadPlanner` → `PreadSpillSlices` →
+//! `SortSpillDecompress` → `SortMerge`.
 //!
-//! `RawExternalSorter::sort` (driven here via [`sort_via_legacy`]) is retained
-//! as the parity oracle both chains are validated against.
+//! The output contract every parity test checks is [`reference_sort`]: the
+//! in-memory stable sort of the input records by the order's key. Equal keys
+//! keep input order — at every thread count, across spill boundaries and on
+//! both fronts — so every order, queryname included, is checked for byte
+//! identity.
 
+use std::cmp::Ordering;
 use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 use fgumi_raw_bam::testutil::make_bam_bytes;
-use fgumi_sort::{QuerynameComparator, RawExternalSorter, SortOrder, SpillCodec};
+use fgumi_sort::{KeyTypesSpec, QuerynameComparator, RawSortKey, SortOrder, SpillCodec};
 use noodles::sam::Header;
 use parking_lot::Mutex;
 use rstest::rstest;
@@ -24,10 +29,10 @@ use super::*;
 use crate::sort::protocol::SortChunkEvent;
 use crate::types::RecordBatch;
 use fgumi_pipeline_core::{
-    Unpushed,
-    builder::{Pipeline, PipelineConfig},
+    HeldRetry, Unpushed,
+    builder::{Chain, Pipeline, PipelineConfig},
     held::HeldSlot,
-    outputs::OrderedBytesSingle,
+    outputs::{OrderedBytesSingle, Single},
     queues::QueueSpec,
     reorder::BranchOrdering,
     step::{Step, StepCtx, StepKind, StepOutcome, StepProfile},
@@ -124,9 +129,75 @@ impl Step for VecSink {
     }
 }
 
+/// Pass-through between a phase-1 front and `SpillGather` that records every
+/// `Spill`'s `records_ingested_so_far`: the run boundaries, as input record
+/// counts, in run order.
+struct SpillBoundaryTap {
+    boundaries: Arc<Mutex<Vec<u64>>>,
+    held: HeldSlot<Unpushed<SortChunkEvent>>,
+    output_byte_limit: u64,
+}
+
+impl Step for SpillBoundaryTap {
+    type Input = SortChunkEvent;
+    type Outputs = Single<SortChunkEvent>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "SpillBoundaryTap",
+            kind: StepKind::Serial,
+            sticky: false,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if matches!(ctx.outputs.retry_held(&mut self.held), HeldRetry::StillHeld) {
+            return Ok(StepOutcome::Contention);
+        }
+        let Some(event) = ctx.input.pop() else {
+            return Ok(if ctx.input.is_drained() {
+                StepOutcome::Finished
+            } else {
+                StepOutcome::NoProgress
+            });
+        };
+        if let SortChunkEvent::Spill { records_ingested_so_far, .. } = &event {
+            self.boundaries.lock().push(*records_ingested_so_far);
+        }
+        if let Err(unpushed) = ctx.outputs.push(event) {
+            self.held.put(unpushed);
+        }
+        Ok(StepOutcome::Progress)
+    }
+}
+
 /// One sort's output as a flat list of raw BAM record-byte payloads, in output
-/// order. Both the streaming pipeline and the legacy oracle produce this shape.
+/// order. Both the streaming pipeline and the reference sort produce this shape.
 type RecordBytes = Vec<Vec<u8>>;
+
+/// Spill codec and compression level a test chain writes its spill files
+/// with. They shape only the temporary files, never the merged records.
+type SpillFormat = (SpillCodec, u32);
+
+/// The spill format the parity tests use unless they vary it.
+const ZSTD_1: SpillFormat = (SpillCodec::Zstd, 1);
+
+/// A [`SortBufferConfig`] with no cell tag and auto-detected key types.
+fn buffer_config(
+    sort_order: SortOrder,
+    memory_limit: usize,
+    sort_threads: usize,
+) -> SortBufferConfig {
+    SortBufferConfig {
+        sort_order,
+        memory_limit,
+        sort_threads,
+        cell_tag: None,
+        key_types: KeyTypesSpec::Auto,
+    }
+}
 
 // ── Synthetic-record helpers ────────────────────────────────────────────────
 
@@ -150,24 +221,28 @@ fn pack_batches(records: &[RawRecord], batch_size: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
-fn drive_sort_pipeline(
-    sorter: RawExternalSorter,
-    header: &Header,
-    batches: Vec<RecordBatch>,
-    output_byte_limit: u64,
-    threads: usize,
-    sink_kind: StepKind,
-) -> Result<Vec<Vec<u8>>> {
-    drive_sort_pipeline_tuned(
-        sorter,
-        header,
-        batches,
-        output_byte_limit,
-        threads,
-        sink_kind,
-        SupplyTuning::default(),
-        SpillCodec::Zstd,
-    )
+// ── Chain harness ───────────────────────────────────────────────────────────
+
+/// What one sort chain produced.
+#[derive(Debug, Default)]
+struct ChainRun {
+    /// The merged record bytes, in output order.
+    records: RecordBytes,
+    /// Spill files the merge saw (`SortStats::runs_written`): the runs the
+    /// `SpillGather` run-former formed.
+    runs: usize,
+    /// Spill runs handed to the final merge (`SpillRunStats::merge_sources`).
+    merge_sources: u64,
+    /// `records_ingested_so_far` of every `Spill` the front emitted, in order.
+    spill_boundaries: Vec<u64>,
+}
+
+/// The merge's output end: `SortMerge<RecordBatchOutput>` into a [`VecSink`],
+/// or the terminal `SortMerge<BlockOutput>` into a [`BlockSink`].
+#[derive(Clone, Copy, Debug)]
+enum MergeSink {
+    Batches(StepKind),
+    Blocks(StepKind),
 }
 
 /// The merge-supply knobs the parity tests vary; production resolves them
@@ -221,95 +296,210 @@ fn spill_supply(
     (planner, pread, decompress, demand)
 }
 
-/// Drive the production sort chain (`VecSource` → `SortBuffer` →
-/// `CompressSpill` → `SortSpillDecompress` → `SortMerge` → `VecSink`). The
-/// legacy `SortAndSpill` Phase-1 head was retired in P7, so the Phase-2 tests
-/// (decompress-granularity, out-of-order, soak) run through the same production
-/// chain `fgumi sort` / `runall` build.
+/// Optional phase caps for the pool steps of a test chain: phase 1 on
+/// `InflateToArena`, the front's capped steps and `SpillBlockCompress`;
+/// phase 2 on `PreadSpillSlices` and `SortSpillDecompress`.
+#[derive(Clone, Default)]
+struct ChainCaps {
+    phase1: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    phase2: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+}
+
+/// What a test chain's taps and sinks collect while it runs; read back by
+/// [`ChainTaps::collect`] once the pipeline has finished.
+struct ChainTaps {
+    boundaries: Arc<Mutex<Vec<u64>>>,
+    spill_stats: Arc<SpillRunStats>,
+    merge_stats: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
+    batches: Arc<Mutex<Vec<RecordBatch>>>,
+    blocks: Arc<Mutex<Vec<crate::types::DecompressedBlock>>>,
+}
+
+impl ChainTaps {
+    fn collect(self) -> ChainRun {
+        let mut records = Vec::new();
+        for batch in std::mem::take(&mut *self.batches.lock()) {
+            records.extend(batch.iter_record_bytes().map(<[u8]>::to_vec));
+        }
+        let mut blocks = std::mem::take(&mut *self.blocks.lock());
+        // `Detached` collapses ordering to None, so blocks arrive in merge-emit
+        // order on the single sink; sort by serial defensively in case a future
+        // change makes the sink parallel.
+        blocks.sort_by_key(|b| b.batch_serial);
+        for block in &blocks {
+            records.extend(unframe_block_records(&block.bytes));
+        }
+        let runs = self.merge_stats.lock().take().map_or(0, |s| s.runs_written);
+        let spill_boundaries = std::mem::take(&mut *self.boundaries.lock());
+        ChainRun {
+            records,
+            runs,
+            merge_sources: self.spill_stats.merge_sources(),
+            spill_boundaries,
+        }
+    }
+}
+
+/// Everything below a phase-1 front, shared by both fronts: the boundary tap,
+/// the spill split (`SpillGather` → `SpillBlockCompress` → `SpillWrite`), the
+/// merge supply and the merge into `sink`.
 #[allow(clippy::too_many_arguments)]
-fn drive_sort_pipeline_tuned(
-    sorter: RawExternalSorter,
+fn attach_spill_and_merge(
+    front: Chain<'_, Single<SortChunkEvent>>,
+    sort_order: SortOrder,
+    output_byte_limit: u64,
+    threads: usize,
+    sink: MergeSink,
+    supply: SupplyTuning,
+    (codec, compression): SpillFormat,
+    caps: &ChainCaps,
+) -> Result<ChainTaps> {
+    use fgumi_sort::TmpDirAllocator;
+
+    let dir = tempfile::TempDir::new()?;
+    let alloc =
+        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
+    let temp_dirs = Arc::new(vec![dir]);
+    let boundaries = Arc::new(Mutex::new(Vec::new()));
+    let spill_stats = Arc::new(SpillRunStats::default());
+    let merge_stats: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
+    let batches: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let blocks: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let tap = SpillBoundaryTap {
+        boundaries: Arc::clone(&boundaries),
+        held: HeldSlot::new(),
+        output_byte_limit,
+    };
+    let (planner, pread, decompress, demand) = spill_supply(output_byte_limit, threads, supply);
+    let fan = front
+        .chain(tap)
+        .chain(SpillGather::new(output_byte_limit))
+        .chain(
+            SpillBlockCompress::new(codec, compression, output_byte_limit)
+                .with_phase_cap(caps.phase1.clone()),
+        )
+        .chain(
+            SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs)
+                .with_stats(Arc::clone(&spill_stats)),
+        )
+        .chain(planner)
+        .into_multi();
+    fan.b0
+        .chain(pread.with_phase_cap(caps.phase2.clone()))
+        .chain(decompress.with_phase_cap(caps.phase2.clone()))
+        .into_sink_marker();
+    match sink {
+        MergeSink::Batches(kind) => fan
+            .b1
+            .chain(
+                SortMerge::<RecordBatchOutput>::with_target_batch_count(
+                    sort_order,
+                    output_byte_limit,
+                    256,
+                )
+                .with_stats_slot(Arc::clone(&merge_stats))
+                .with_merge_demand(demand),
+            )
+            .chain(VecSink { received: Arc::clone(&batches), kind, progress: None })
+            .into_sink_marker(),
+        MergeSink::Blocks(kind) => fan
+            .b1
+            .chain(
+                SortMerge::<BlockOutput>::with_target_batch_count(
+                    sort_order,
+                    output_byte_limit,
+                    256,
+                )
+                .with_stats_slot(Arc::clone(&merge_stats))
+                .with_merge_demand(demand),
+            )
+            .chain(BlockSink { received: Arc::clone(&blocks), kind })
+            .into_sink_marker(),
+    }
+    Ok(ChainTaps { boundaries, spill_stats, merge_stats, batches, blocks })
+}
+
+/// Drive the record-input front: `VecSource` → `SortBuffer` → the spill and
+/// merge steps of [`attach_spill_and_merge`].
+#[allow(clippy::too_many_arguments)]
+fn drive_buffer_chain(
+    config: SortBufferConfig,
+    header: &Header,
+    batches: Vec<RecordBatch>,
+    output_byte_limit: u64,
+    threads: usize,
+    sink: MergeSink,
+    supply: SupplyTuning,
+    spill: SpillFormat,
+) -> Result<ChainRun> {
+    let builder = Pipeline::builder();
+    let front = builder.chain(VecSource::new(batches, output_byte_limit)).chain(SortBuffer::new(
+        config,
+        header,
+        output_byte_limit,
+    )?);
+    let taps = attach_spill_and_merge(
+        front,
+        config.sort_order,
+        output_byte_limit,
+        threads,
+        sink,
+        supply,
+        spill,
+        &ChainCaps::default(),
+    )?;
+    builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
+    Ok(taps.collect())
+}
+
+/// Drive the production sort chain (`VecSource` → `SortBuffer` →
+/// `SpillGather` → `SpillBlockCompress` → `SpillWrite` → merge supply →
+/// `SortMerge` → `VecSink`) and collect the merged record bytes.
+fn drive_sort_pipeline(
+    config: SortBufferConfig,
     header: &Header,
     batches: Vec<RecordBatch>,
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
-    supply: SupplyTuning,
-    spill_codec: SpillCodec,
 ) -> Result<Vec<Vec<u8>>> {
-    drive_sort_buffer_pipeline(
-        sorter,
+    drive_sort_pipeline_tuned(
+        config,
         header,
         batches,
         output_byte_limit,
         threads,
         sink_kind,
-        supply,
-        spill_codec,
+        SupplyTuning::default(),
+        ZSTD_1,
     )
 }
 
-/// Drive the P6 four-step buffer chain
-/// (`VecSource` → `SortBuffer` → `CompressSpill` → `SortSpillDecompress` →
-/// `SortMerge` → `VecSink`) and collect the merged record bytes. Exercises
-/// every sort order `SortBuffer` supports (see
-/// `sort_buffer_chain_matches_legacy_all_orders`).
+/// [`drive_sort_pipeline`] with the merge-supply knobs and the spill format
+/// chosen by the caller.
 #[allow(clippy::too_many_arguments)]
-fn drive_sort_buffer_pipeline(
-    sorter: RawExternalSorter,
+fn drive_sort_pipeline_tuned(
+    config: SortBufferConfig,
     header: &Header,
     batches: Vec<RecordBatch>,
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
     supply: SupplyTuning,
-    spill_codec: SpillCodec,
+    spill: SpillFormat,
 ) -> Result<Vec<Vec<u8>>> {
-    use fgumi_sort::TmpDirAllocator;
-
-    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    let sort_order = sorter.sort_order();
-
-    // Temp dir + allocator for CompressSpill, held alive by the step. The
-    // deterministic always-ample probe avoids any dependency on host free space.
-    let dir = tempfile::TempDir::new()?;
-    let alloc =
-        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
-    let temp_dirs = Arc::new(vec![dir]);
-
-    let source = VecSource::new(batches, output_byte_limit);
-    let sort_buffer = SortBuffer::from_sorter(sorter, header, output_byte_limit)?;
-    // Codec/compression affect only intermediate spill bytes, not the final
-    // sorted records, so any codec yields output parity. The caller passes the
-    // codec so codec-specific tests (e.g. the BGZF block-parallel parity test)
-    // actually exercise their codec end-to-end.
-    let compress = CompressSpill::new(
-        Arc::new(Mutex::new(alloc)),
-        spill_codec,
-        3,
+    Ok(drive_buffer_chain(
+        config,
+        header,
+        batches,
         output_byte_limit,
-        temp_dirs,
-    );
-    let (planner, pread, decompress, demand) = spill_supply(output_byte_limit, threads, supply);
-    let merge =
-        SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256);
-    let sink = VecSink { received: Arc::clone(&received), kind: sink_kind, progress: None };
-
-    let builder = Pipeline::builder();
-    let fan = builder.chain(source).chain(sort_buffer).chain(compress).chain(planner).into_multi();
-    fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
-    let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
-
-    let collected = std::mem::take(&mut *received.lock());
-    let mut out = Vec::new();
-    for batch in collected {
-        for bytes in batch.iter_record_bytes() {
-            out.push(bytes.to_vec());
-        }
-    }
-    Ok(out)
+        threads,
+        MergeSink::Batches(sink_kind),
+        supply,
+        spill,
+    )?
+    .records)
 }
 
 /// Terminal-path sink: collects the [`DecompressedBlock`]s emitted by
@@ -366,121 +556,529 @@ fn unframe_block_records(bytes: &[u8]) -> Vec<Vec<u8>> {
 /// (`SortMerge<BlockOutput>` → `BlockSink`) and recover the merged record
 /// bodies by un-framing each `DecompressedBlock`. Used to prove the framed
 /// terminal output carries byte-identical records to the `RecordBatchOutput`
-/// path / legacy oracle (lever 1 parity gate).
-#[allow(clippy::too_many_arguments)]
+/// path and the reference sort (lever 1 parity gate).
 fn drive_sort_block_pipeline(
-    sorter: RawExternalSorter,
+    config: SortBufferConfig,
     header: &Header,
     batches: Vec<RecordBatch>,
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
-    supply: SupplyTuning,
-    spill_codec: SpillCodec,
 ) -> Result<Vec<Vec<u8>>> {
-    use fgumi_sort::TmpDirAllocator;
-
-    let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let sort_order = sorter.sort_order();
-
-    let dir = tempfile::TempDir::new()?;
-    let alloc =
-        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
-    let temp_dirs = Arc::new(vec![dir]);
-
-    let source = VecSource::new(batches, output_byte_limit);
-    let sort_buffer = SortBuffer::from_sorter(sorter, header, output_byte_limit)?;
-    let compress = CompressSpill::new(
-        Arc::new(Mutex::new(alloc)),
-        spill_codec,
-        3,
+    Ok(drive_buffer_chain(
+        config,
+        header,
+        batches,
         output_byte_limit,
-        temp_dirs,
-    );
-    let (planner, pread, decompress, demand) = spill_supply(output_byte_limit, threads, supply);
-    let merge =
-        SortMerge::<BlockOutput>::with_target_batch_count(sort_order, output_byte_limit, 256);
-    let sink = BlockSink { received: Arc::clone(&received), kind: sink_kind };
-
-    let builder = Pipeline::builder();
-    let fan = builder.chain(source).chain(sort_buffer).chain(compress).chain(planner).into_multi();
-    fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
-    let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
-
-    let mut collected = std::mem::take(&mut *received.lock());
-    // `Detached` collapses ordering to None, so blocks arrive in merge-emit
-    // order on the single sink; sort by serial defensively in case a future
-    // change makes the sink parallel.
-    collected.sort_by_key(|b| b.batch_serial);
-    let mut out = Vec::new();
-    for block in &collected {
-        out.extend(unframe_block_records(&block.bytes));
-    }
-    Ok(out)
+        threads,
+        MergeSink::Blocks(sink_kind),
+        SupplyTuning::default(),
+        ZSTD_1,
+    )?
+    .records)
 }
 
-// ── Reference: RawExternalSorter::sort to bytes ─────────────────────────────
+// ── Reference: the stable in-memory sort ────────────────────────────────────
 
-fn sort_via_legacy(
-    sort_order: SortOrder,
+/// One record's key in a sort order — the definition of that order.
+enum OrderKey {
+    Coordinate(fgumi_sort::RawCoordinateKey),
+    QuerynameLex(fgumi_sort::RawQuerynameLexKey),
+    QuerynameNatural(fgumi_sort::RawQuerynameKey),
+    Template(fgumi_sort::TemplateKey),
+}
+
+impl OrderKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Coordinate(a), Self::Coordinate(b)) => a.cmp(b),
+            (Self::QuerynameLex(a), Self::QuerynameLex(b)) => a.cmp(b),
+            (Self::QuerynameNatural(a), Self::QuerynameNatural(b)) => a.cmp(b),
+            (Self::Template(a), Self::Template(b)) => a.cmp(b),
+            _ => unreachable!("keys of one order"),
+        }
+    }
+}
+
+/// Every record's key in `order`, in record order. Template-coordinate uses
+/// the full key: a narrowed lane set orders exactly like the full key.
+fn order_keys<R: AsRef<[u8]>>(
+    order: SortOrder,
+    header: &Header,
+    records: &[R],
+    cell_tag: Option<fgumi_raw_bam::SamTag>,
+) -> Vec<OrderKey> {
+    let ctx = fgumi_sort::SortContext::from_header(header);
+    let lib = fgumi_sort::LibraryLookup::from_header(header);
+    let hasher = fgumi_sort::cb_hasher();
+    records
+        .iter()
+        .map(|r| {
+            let r = r.as_ref();
+            match order {
+                SortOrder::Coordinate => {
+                    OrderKey::Coordinate(fgumi_sort::RawCoordinateKey::extract(r, &ctx))
+                }
+                SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+                    OrderKey::QuerynameLex(fgumi_sort::RawQuerynameLexKey::extract(r, &ctx))
+                }
+                SortOrder::Queryname(QuerynameComparator::Natural) => {
+                    OrderKey::QuerynameNatural(fgumi_sort::RawQuerynameKey::extract(r, &ctx))
+                }
+                SortOrder::TemplateCoordinate => OrderKey::Template(
+                    fgumi_sort::extract_template_key_inline(r, &lib, cell_tag, &hasher),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// In-memory STABLE sort of `records` by the order's key — the definition of
+/// the output contract: equal keys keep input order.
+fn reference_sort(
+    order: SortOrder,
     header: &Header,
     records: &[RawRecord],
-    memory_limit: usize,
-    threads: usize,
-) -> Result<Vec<Vec<u8>>> {
-    let tmp_in = tempfile::NamedTempFile::new()?;
-    {
-        let mut writer = fgumi_bam_io::create_raw_bam_writer(tmp_in.path(), header, 1, 1)?;
-        for r in records {
-            writer.write_raw_record(r.as_ref())?;
-        }
-        writer.finish()?;
-    }
-
-    let tmp_out = tempfile::NamedTempFile::new()?;
-    let sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(memory_limit)
-        .threads(threads)
-        .output_compression(1)
-        .temp_compression(1);
-    sorter.sort(tmp_in.path(), tmp_out.path())?;
-
-    let (mut reader, _hdr) = fgumi_bam_io::create_raw_bam_reader_with_opts(
-        tmp_out.path(),
-        1,
-        fgumi_bam_io::PipelineReaderOpts::default(),
-    )?;
-    let mut record = RawRecord::default();
-    let mut out = Vec::new();
-    loop {
-        match reader.read_record(&mut record)? {
-            0 => break,
-            _ => out.push(record.as_ref().to_vec()),
-        }
-    }
-    Ok(out)
+    cell_tag: Option<fgumi_raw_bam::SamTag>,
+) -> RecordBytes {
+    let keys = order_keys(order, header, records, cell_tag);
+    let mut idx: Vec<usize> = (0..records.len()).collect();
+    // `sort_by` is stable.
+    idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+    idx.into_iter().map(|i| records[i].as_ref().to_vec()).collect()
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-//
-// (The former `three_step_chain_{in_memory,multi_spill}_path_matches_legacy`
-// tests, which drove the retired `SortAndSpill` head, are subsumed by
-// `sort_buffer_chain_matches_legacy_all_orders` below — same orders, same
-// regimes, against the same `sort_via_legacy` oracle, but through the
-// production `SortBuffer` → `CompressSpill` chain.)
+// ── Tie-heavy fixture ───────────────────────────────────────────────────────
 
-// ── P6 buffer-chain parity (SortBuffer → CompressSpill → decompress → merge) ─
+/// The input index a [`tie_heavy_records`] record carries in its last aux
+/// field, `XI:i:<index>`.
+fn xi_of(record: &[u8]) -> u32 {
+    let n = record.len();
+    assert!(n >= 7 && &record[n - 7..n - 4] == b"XIi", "record must end with an XI:i tag");
+    u32::from_le_bytes(record[n - 4..].try_into().expect("4 bytes"))
+}
 
-/// The P6 four-step chain must produce byte-identical output to the legacy
-/// oracle for EVERY sort order, across the in-memory and multi-spill regimes at
-/// 2 and 4 threads. This is the inc-4/5 parity gate: it exercises `SortBuffer`'s
-/// streaming-spill emission, `CompressSpill`'s inline writes + slot opens
-/// (`file_id == seq`), and the single-residual fast path all the way through the
-/// real `SortSpillDecompress` + `SortMerge` — for coordinate, template, and both
-/// queryname comparators.
+/// Adjacent runs of `out` whose records share one key in `order`, as index
+/// ranges into `out`.
+fn equal_key_groups(
+    order: SortOrder,
+    header: &Header,
+    out: &[Vec<u8>],
+) -> Vec<std::ops::Range<usize>> {
+    let keys = order_keys(order, header, out, None);
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for i in 1..=keys.len() {
+        if i == keys.len() || keys[i].cmp(&keys[start]) != Ordering::Equal {
+            groups.push(start..i);
+            start = i;
+        }
+    }
+    groups
+}
+
+/// Within every group of equal keys in `out`, the records keep input order:
+/// their `XI` indices strictly ascend.
+fn assert_input_order_within_equal_keys(order: SortOrder, header: &Header, out: &[Vec<u8>]) {
+    for group in equal_key_groups(order, header, out) {
+        let xis: Vec<u32> = out[group.clone()].iter().map(|r| xi_of(r)).collect();
+        assert!(
+            xis.windows(2).all(|w| w[0] < w[1]),
+            "{order:?}: equal keys out of input order at output {group:?}: XI {xis:?}"
+        );
+    }
+}
+
+/// The size of the largest group of equal keys in `out`.
+fn max_equal_key_group(order: SortOrder, header: &Header, out: &[Vec<u8>]) -> usize {
+    equal_key_groups(order, header, out).iter().map(ExactSizeIterator::len).max().unwrap_or(0)
+}
+
+/// Whether some group of equal keys in `out` has members from two different
+/// runs, given the runs' boundaries as input record counts.
+fn equal_key_group_spans_a_boundary(
+    order: SortOrder,
+    header: &Header,
+    out: &[Vec<u8>],
+    spill_boundaries: &[u64],
+) -> bool {
+    let run_of = |record: &Vec<u8>| {
+        let xi = u64::from(xi_of(record));
+        spill_boundaries.iter().filter(|&&b| b <= xi).count()
+    };
+    equal_key_groups(order, header, out).into_iter().any(|group| {
+        let first = run_of(&out[group.start]);
+        out[group].iter().any(|r| run_of(r) != first)
+    })
+}
+
+/// A small seeded generator (splitmix64), so fixtures are reproducible
+/// without a `rand` dependency.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    /// `true` with probability `percent / 100`.
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+}
+
+/// The header every synthetic fixture uses: `N_TEST_REFS` references of 1 Mb.
+fn synthetic_header() -> Header {
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReferenceSequence;
+    use std::num::NonZeroUsize;
+    let len = NonZeroUsize::new(1_000_000).expect("nonzero");
+    let mut builder = Header::builder();
+    for i in 0..N_TEST_REFS {
+        builder =
+            builder.add_reference_sequence(format!("chr{i}"), Map::<ReferenceSequence>::new(len));
+    }
+    builder.build()
+}
+
+/// About `n` records, unsorted in every order and rich in equal keys, each
+/// ending with a unique `XI:i:<input index>` so equal-key records are never
+/// byte-identical and their input order is observable in the output.
+///
+/// Templates are read pairs with Illumina-like names. Ties come from:
+/// - secondaries (30 %) and supplementaries (20 %) — one or two each, same
+///   name and flag class; secondaries copy the first read's alignment, so they
+///   tie with it in coordinate and template-coordinate order, and with each
+///   other in queryname order;
+/// - pairs forced onto one shared coordinate (5 %);
+/// - whole templates duplicated under a new name at the same coordinates (3 %);
+/// - unmapped pairs (2 %), which all share the unmapped coordinate key.
+///
+/// The records are shuffled before the `XI` tags are assigned, so equal-key
+/// records are spread over the input, and therefore over the runs.
+fn tie_heavy_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
+    /// `(tid, pos, flags, name, mate_tid, mate_pos)` of one record, before its tag.
+    type Spec = (i32, i32, u16, Vec<u8>, i32, i32);
+    const PAIRED: u16 = 0x1;
+    const UNMAPPED: u16 = 0x4;
+    const MATE_UNMAPPED: u16 = 0x8;
+    const REVERSE: u16 = 0x10;
+    const MATE_REVERSE: u16 = 0x20;
+    const READ1: u16 = 0x40;
+    const READ2: u16 = 0x80;
+    const SECONDARY: u16 = 0x100;
+    const SUPPLEMENTARY: u16 = 0x800;
+
+    let mut rng = SplitMix(seed);
+    let mut specs: Vec<Spec> = Vec::with_capacity(n + n / 4);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    while specs.len() < n {
+        let name = format!(
+            "A00132:53:HFHJ:{}:{}:{}:{}",
+            1 + rng.below(4),
+            1101 + rng.below(1578),
+            rng.below(40_000),
+            rng.below(40_000)
+        )
+        .into_bytes();
+        if rng.chance(2) {
+            for read in [READ1, READ2] {
+                let flags = PAIRED | UNMAPPED | MATE_UNMAPPED | read;
+                specs.push((-1, -1, flags, name.clone(), -1, -1));
+            }
+            continue;
+        }
+        let shared = rng.chance(5);
+        let (t1, p1, r1) = if shared {
+            (0, 5_000, false)
+        } else {
+            (rng.below(N_TEST_REFS as u64) as i32, rng.below(1_000_000) as i32, rng.chance(50))
+        };
+        let (t2, p2, r2) = (t1, p1 + 100 + rng.below(400) as i32, !r1);
+        let strand = |reverse: bool, mate_reverse: bool| {
+            (if reverse { REVERSE } else { 0 }) | if mate_reverse { MATE_REVERSE } else { 0 }
+        };
+        let first: Spec = (t1, p1, PAIRED | READ1 | strand(r1, r2), name.clone(), t2, p2);
+        let second: Spec = (t2, p2, PAIRED | READ2 | strand(r2, r1), name.clone(), t1, p1);
+        let copies = if rng.chance(3) { 2 } else { 1 };
+        for copy in 0..copies {
+            let name = if copy == 0 { name.clone() } else { [&name[..], b"d"].concat() };
+            let (mut a, mut b) = (first.clone(), second.clone());
+            a.3.clone_from(&name);
+            b.3.clone_from(&name);
+            if rng.chance(30) {
+                for _ in 0..=rng.below(2) {
+                    specs.push((a.0, a.1, a.2 | SECONDARY, name.clone(), a.4, a.5));
+                }
+            }
+            if rng.chance(20) {
+                let pos = rng.below(1_000_000) as i32;
+                for _ in 0..=rng.below(2) {
+                    specs.push((b.0, pos, b.2 | SUPPLEMENTARY, name.clone(), b.4, b.5));
+                }
+            }
+            specs.push(a);
+            specs.push(b);
+        }
+    }
+    // Fisher-Yates, seeded.
+    for i in (1..specs.len()).rev() {
+        #[allow(clippy::cast_possible_truncation)]
+        let j = rng.below(i as u64 + 1) as usize;
+        specs.swap(i, j);
+    }
+    let records = specs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (tid, pos, flags, name, mate_tid, mate_pos))| {
+            let mut aux = b"XIi".to_vec();
+            aux.extend_from_slice(&u32::try_from(i).expect("index fits u32").to_le_bytes());
+            RawRecord::from(make_bam_bytes(
+                tid,
+                pos,
+                flags,
+                &name,
+                &[],
+                40,
+                mate_tid,
+                mate_pos,
+                &aux,
+            ))
+        })
+        .collect();
+    (synthetic_header(), records)
+}
+
+// ── Fronts ──────────────────────────────────────────────────────────────────
+
+/// The phase-1 front a test drives.
+#[derive(Clone, Copy, Debug)]
+enum Front {
+    /// `ReadBlocks` → `InflateToArena` → the order's arena steps
+    /// ([`production_arena_front`]).
+    Arena,
+    /// `SortBuffer`, the record-input front.
+    SortBuffer,
+}
+
+/// The arena steps of an order's block-input front.
+#[derive(Clone, Copy, Debug)]
+enum ArenaFront {
+    /// `FindBoundariesAndSort` over the order's `ArenaSortStrategy`.
+    Fbs,
+}
+
+/// The arena front each order ships with at this commit. When an order moves
+/// to another front, this match is the one place that changes, so every
+/// arena-front test gates the front that ships.
+fn production_arena_front(order: SortOrder) -> ArenaFront {
+    match order {
+        SortOrder::Coordinate | SortOrder::TemplateCoordinate | SortOrder::Queryname(_) => {
+            ArenaFront::Fbs
+        }
+    }
+}
+
+/// Drive the block-input front `BgzfBlockSource` → `ReadBlocks` →
+/// `InflateToArena` → `front`'s steps for `config.sort_order`, then the spill
+/// and merge steps of [`attach_spill_and_merge`]. `ReadBlocks` seals a run at
+/// `config.memory_limit`; the run sort uses `config.sort_threads`.
+#[allow(clippy::too_many_arguments)]
+fn drive_arena_chain(
+    front: ArenaFront,
+    config: SortBufferConfig,
+    header: &Header,
+    blocks: Vec<crate::types::BgzfBlock>,
+    output_byte_limit: u64,
+    threads: usize,
+    sink: MergeSink,
+    caps: &ChainCaps,
+) -> Result<ChainRun> {
+    use crate::sort::protocol::MemoryChunkErased;
+    use fgumi_sort::{RawQuerynameKey, RawQuerynameLexKey};
+
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+    let SortBufferConfig { sort_order, memory_limit, sort_threads, cell_tag, key_types } = config;
+    let builder = Pipeline::builder();
+    let head = builder
+        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(InflateToArena::new(output_byte_limit).with_phase_cap(caps.phase1.clone()));
+    let attach = |front| {
+        attach_spill_and_merge(
+            front,
+            sort_order,
+            output_byte_limit,
+            threads,
+            sink,
+            SupplyTuning::default(),
+            ZSTD_1,
+            caps,
+        )
+    };
+    let taps = match (front, sort_order) {
+        (ArenaFront::Fbs, SortOrder::Coordinate) => attach(
+            head.chain(
+                FindBoundariesAndSort::new(
+                    CoordinateStrategy::new(n_ref),
+                    sort_threads,
+                    output_byte_limit,
+                )
+                .with_phase_cap(caps.phase1.clone()),
+            ),
+        ),
+        (ArenaFront::Fbs, SortOrder::TemplateCoordinate) => {
+            let acc =
+                fgumi_sort::TemplateArenaAccumulator::from_header(header, cell_tag, key_types);
+            attach(
+                head.chain(
+                    FindBoundariesAndSort::new(
+                        TemplateStrategy::new(acc),
+                        sort_threads,
+                        output_byte_limit,
+                    )
+                    .with_phase_cap(caps.phase1.clone()),
+                ),
+            )
+        }
+        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => attach(
+            head.chain(
+                FindBoundariesAndSort::new(
+                    QuerynameStrategy::<RawQuerynameLexKey>::new(MemoryChunkErased::QuerynameLex),
+                    sort_threads,
+                    output_byte_limit,
+                )
+                .with_phase_cap(caps.phase1.clone()),
+            ),
+        ),
+        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Natural)) => attach(
+            head.chain(
+                FindBoundariesAndSort::new(
+                    QuerynameStrategy::<RawQuerynameKey>::new(MemoryChunkErased::QuerynameNatural),
+                    sort_threads,
+                    output_byte_limit,
+                )
+                .with_phase_cap(caps.phase1.clone()),
+            ),
+        ),
+    }?;
+    builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
+    Ok(taps.collect())
+}
+
+/// Drives the PRODUCTION front of `front`'s kind for `config.sort_order`:
+/// `Front::Arena` dispatches per order through [`production_arena_front`].
+/// The merge sink is `Serial`, which fits every thread count.
+fn drive_front(
+    front: Front,
+    config: SortBufferConfig,
+    header: &Header,
+    records: &[RawRecord],
+    pipeline_threads: usize,
+) -> Result<ChainRun> {
+    const OUTPUT_BYTE_LIMIT: u64 = 4 * 1024 * 1024;
+    let sink = MergeSink::Batches(StepKind::Serial);
+    match front {
+        Front::SortBuffer => drive_buffer_chain(
+            config,
+            header,
+            pack_batches(records, 256),
+            OUTPUT_BYTE_LIMIT,
+            pipeline_threads,
+            sink,
+            SupplyTuning::default(),
+            ZSTD_1,
+        ),
+        Front::Arena => {
+            let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+            drive_arena_chain(
+                production_arena_front(config.sort_order),
+                config,
+                header,
+                bgzf_blocks_for(records, n_ref, 4096),
+                OUTPUT_BYTE_LIMIT,
+                pipeline_threads,
+                sink,
+                &ChainCaps::default(),
+            )
+        }
+    }
+}
+
+// ── The output contract ─────────────────────────────────────────────────────
+
+/// Every order's output is the stable sort of its input by key — equal keys
+/// keep input order — at every thread count and across spill boundaries, on
+/// both fronts.
+#[rstest]
+fn ties_across_run_boundaries_keep_input_order(
+    #[values(
+        SortOrder::Coordinate,
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+    #[values(1usize, 4)] threads: usize,
+    #[values(Front::Arena, Front::SortBuffer)] front: Front,
+) {
+    let (header, records) = tie_heavy_records(6_000, 11);
+    let expected = reference_sort(order, &header, &records, None);
+    assert_ne!(
+        records.iter().map(|r| r.as_ref().to_vec()).collect::<Vec<_>>(),
+        expected,
+        "{order:?}: the fixture must not already be sorted"
+    );
+    let config = buffer_config(order, 96 * 1024, threads);
+    let run = drive_front(front, config, &header, &records, threads).unwrap();
+    assert!(
+        run.merge_sources >= 3,
+        "{order:?}: the fixture must merge ≥ 3 sources, got {}",
+        run.merge_sources
+    );
+    assert!(
+        equal_key_group_spans_a_boundary(order, &header, &expected, &run.spill_boundaries),
+        "{order:?}: no equal-key group straddles a spill boundary — the test cannot catch a \
+         cross-run reorder"
+    );
+    assert_record_parity(&format!("{order:?} {front:?} t{threads}"), &run.records, &expected);
+    assert_input_order_within_equal_keys(order, &header, &run.records);
+}
+
+/// The oracle itself is stable, observed through the unique `XI` tags, and the
+/// fixture really has ties in every order.
+#[rstest]
+fn reference_sort_is_stable(
+    #[values(
+        SortOrder::Coordinate,
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+) {
+    let (header, records) = tie_heavy_records(500, 3);
+    let out = reference_sort(order, &header, &records, None);
+    assert_input_order_within_equal_keys(order, &header, &out);
+    assert!(max_equal_key_group(order, &header, &out) >= 2, "{order:?}: the fixture has no ties");
+}
+
+// ── Record-input chain parity (SortBuffer → spill split → supply → merge) ────
+
+/// The record-input chain must produce the reference sort, byte for byte, for
+/// EVERY sort order, across the in-memory and multi-spill regimes at 2 and 4
+/// threads. It exercises `SortBuffer`'s streaming-spill emission, the spill
+/// split's writes and slot opens (`file_id == seq`), and the single-residual
+/// fast path all the way through the real `SortSpillDecompress` + `SortMerge`
+/// — for coordinate, template, and both queryname comparators.
 #[rstest]
 #[case::coord_inmem_t2(SortOrder::Coordinate, 5_000, 256 * 1024 * 1024, 2)]
 #[case::coord_inmem_t4(SortOrder::Coordinate, 5_000, 256 * 1024 * 1024, 4)]
@@ -498,19 +1096,15 @@ fn sort_via_legacy(
 #[case::qname_lex_spill(SortOrder::Queryname(QuerynameComparator::Lexicographic), 20_000, 256 * 1024, 2)]
 #[case::qname_nat_inmem(SortOrder::Queryname(QuerynameComparator::Natural), 5_000, 256 * 1024 * 1024, 2)]
 #[case::qname_nat_spill(SortOrder::Queryname(QuerynameComparator::Natural), 20_000, 256 * 1024, 2)]
-fn sort_buffer_chain_matches_legacy_all_orders(
+fn sort_buffer_chain_matches_reference_all_orders(
     #[case] sort_order: SortOrder,
     #[case] n: usize,
     #[case] memory_limit: usize,
     #[case] threads: usize,
 ) {
     let (header, records) = synthesize_records(n, 0x5A17_C0DE);
-    let sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(memory_limit)
-        .threads(threads)
-        .output_compression(1)
-        .temp_compression(1);
-    let new_out = drive_sort_buffer_pipeline(
+    let sorter = buffer_config(sort_order, memory_limit, threads);
+    let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
         pack_batches(&records, 256),
@@ -521,33 +1115,12 @@ fn sort_buffer_chain_matches_legacy_all_orders(
         threads,
         StepKind::Exclusive,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("buffer pipeline drives to completion");
 
-    let legacy_out =
-        sort_via_legacy(sort_order, &header, &records, memory_limit, threads).expect("legacy");
-
-    assert_eq!(new_out.len(), legacy_out.len(), "{sort_order:?} record count mismatch");
-    if is_stable_for_equal_keys(sort_order) {
-        // Coordinate / template-coordinate use a stable radix sort: equal keys
-        // keep input order deterministically, so output is byte-for-byte equal.
-        for (i, (got, want)) in new_out.iter().zip(legacy_out.iter()).enumerate() {
-            assert_eq!(got, want, "{sort_order:?} record {i} bytes differ");
-        }
-    } else {
-        // Queryname uses an UNSTABLE comparator sort: the order of equal keys
-        // (same name + segment flags) is unspecified and differs between the
-        // parallel buffer chain and the `.sort()` oracle (and run-to-run). The
-        // sound parity claim is multiset equality — same records, possibly in a
-        // different equal-key order. Sortedness is covered by the production
-        // `queryname_*_sort_matrix` integration tests.
-        let mut got = new_out.clone();
-        let mut want = legacy_out.clone();
-        got.sort_unstable();
-        want.sort_unstable();
-        assert_eq!(got, want, "{sort_order:?} record multiset differs from the oracle");
-    }
+    let expected = reference_sort(sort_order, &header, &records, None);
+    assert_record_parity(&format!("{sort_order:?}"), &new_out, &expected);
 }
 
 /// Raw BAM record carrying `MI:i:<mi>` (aux tag bytes + `i` type + i32 LE).
@@ -568,8 +1141,6 @@ pub(super) fn record_with_mi(pos: i32, name: &[u8], mi: i32) -> Vec<u8> {
 /// record with a differing MI is rejected.
 #[test]
 fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
-    use fgumi_sort::KeyTypesSpec;
-
     let records: Vec<RawRecord> = (0..8i32)
         .map(|i| {
             // Record 0 fixes the variant with MI 1; record 4 violates it.
@@ -578,10 +1149,10 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
         })
         .collect();
 
-    let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-        .memory_limit(256 * 1024 * 1024)
-        .threads(1)
-        .key_types(KeyTypesSpec::None);
+    let sorter = SortBufferConfig {
+        key_types: KeyTypesSpec::None,
+        ..buffer_config(SortOrder::TemplateCoordinate, 256 * 1024 * 1024, 1)
+    };
     // Serial sink (production's actual `WriteBgzfFile` kind), not the parity
     // matrix's `Exclusive`: a sort chain declares a Detached step (the merge), so
     // at `--threads 1` it no longer fuses (see
@@ -594,7 +1165,7 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
     // production's `WriteBgzfFile` kind — keeping the dropped-lane propagation
     // assertion meaningful at one thread. (A *lone* Exclusive step is fine at
     // `--threads 1`; only two or more exceed the budget — see `fused.rs`.)
-    let err = drive_sort_buffer_pipeline(
+    let err = drive_sort_pipeline_tuned(
         sorter,
         &Header::default(),
         pack_batches(&records, 256),
@@ -602,7 +1173,7 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
         1,
         StepKind::Serial,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect_err("a dropped-lane violation must fail the pipeline, not truncate the sort");
 
@@ -620,7 +1191,7 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
 /// production bound, but it MUST stay correct — every record emitted in sorted
 /// order, none stranded by the loop. Packs all records into ONE oversized batch
 /// against a small `memory_limit` (the case the 256-record-per-batch parity
-/// matrix never hits) and asserts byte-for-byte parity with the legacy oracle
+/// matrix never hits) and asserts byte-for-byte parity with the reference sort
 /// (coordinate is stable, so equal keys keep input order deterministically).
 #[test]
 fn sort_buffer_single_oversized_batch_seals_multiple_chunks_without_dropping() {
@@ -635,12 +1206,8 @@ fn sort_buffer_single_oversized_batch_seals_multiple_chunks_without_dropping() {
     let batches = pack_batches(&records, records.len());
     assert_eq!(batches.len(), 1, "test must drive a single oversized batch");
 
-    let sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(memory_limit)
-        .threads(threads)
-        .output_compression(1)
-        .temp_compression(1);
-    let new_out = drive_sort_buffer_pipeline(
+    let sorter = buffer_config(sort_order, memory_limit, threads);
+    let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
         batches,
@@ -648,23 +1215,22 @@ fn sort_buffer_single_oversized_batch_seals_multiple_chunks_without_dropping() {
         threads,
         StepKind::Exclusive,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("buffer pipeline drives to completion");
 
-    let legacy_out =
-        sort_via_legacy(sort_order, &header, &records, memory_limit, threads).expect("legacy");
+    let expected = reference_sort(sort_order, &header, &records, None);
 
     assert_eq!(new_out.len(), records.len(), "every record must survive — none dropped");
-    assert_eq!(new_out.len(), legacy_out.len(), "record count matches oracle");
-    for (i, (got, want)) in new_out.iter().zip(legacy_out.iter()).enumerate() {
+    assert_eq!(new_out.len(), expected.len(), "record count matches oracle");
+    for (i, (got, want)) in new_out.iter().zip(expected.iter()).enumerate() {
         assert_eq!(got, want, "record {i} bytes differ from oracle");
     }
 }
 
 /// Lever 1 parity gate: the terminal `SortMerge<BlockOutput>` path (framed
 /// `DecompressedBlock`s, wired straight to `BgzfCompress`) must carry
-/// byte-identical records to the legacy oracle for every sort order, across the
+/// byte-identical records to the reference sort for every sort order, across the
 /// in-memory and spill regimes. The framed bytes are `[u32 LE len][body]` per
 /// record (identical to the removed `SerializeRecordBatch`); un-framing them
 /// recovers the same record bodies the `RecordBatchOutput` path emits. This is
@@ -676,20 +1242,14 @@ fn sort_buffer_single_oversized_batch_seals_multiple_chunks_without_dropping() {
 #[case::template_spill(SortOrder::TemplateCoordinate, 20_000, 256 * 1024, 4)]
 #[case::qname_lex_spill(SortOrder::Queryname(QuerynameComparator::Lexicographic), 20_000, 256 * 1024, 2)]
 #[case::qname_nat_spill(SortOrder::Queryname(QuerynameComparator::Natural), 20_000, 256 * 1024, 2)]
-fn sort_merge_block_output_matches_legacy(
+fn sort_merge_block_output_matches_reference(
     #[case] sort_order: SortOrder,
     #[case] n: usize,
     #[case] memory_limit: usize,
     #[case] threads: usize,
 ) {
     let (header, records) = synthesize_records(n, 0x5A17_C0DE);
-    let make_sorter = || {
-        RawExternalSorter::new(sort_order)
-            .memory_limit(memory_limit)
-            .threads(threads)
-            .output_compression(1)
-            .temp_compression(1)
-    };
+    let make_sorter = || buffer_config(sort_order, memory_limit, threads);
 
     // Terminal framed-block path.
     let block_out = drive_sort_block_pipeline(
@@ -699,14 +1259,12 @@ fn sort_merge_block_output_matches_legacy(
         4 * 1024 * 1024,
         threads,
         StepKind::Exclusive,
-        SupplyTuning::default(),
-        SpillCodec::Zstd,
     )
     .expect("block pipeline drives to completion");
 
     // Intermediate RecordBatch path — the framed bytes must un-frame to exactly
     // the records this path emits (cross-check the two SortMerge framings agree).
-    let batch_out = drive_sort_buffer_pipeline(
+    let batch_out = drive_sort_pipeline_tuned(
         make_sorter(),
         &header,
         pack_batches(&records, 256),
@@ -714,68 +1272,30 @@ fn sort_merge_block_output_matches_legacy(
         threads,
         StepKind::Exclusive,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("buffer pipeline drives to completion");
 
-    let legacy_out =
-        sort_via_legacy(sort_order, &header, &records, memory_limit, threads).expect("legacy");
+    let expected = reference_sort(sort_order, &header, &records, None);
 
-    assert_eq!(block_out.len(), legacy_out.len(), "{sort_order:?} record count vs legacy");
-    assert_eq!(block_out.len(), batch_out.len(), "{sort_order:?} record count vs RecordBatch path");
-
-    if is_stable_for_equal_keys(sort_order) {
-        // Stable orders: byte-for-byte identical output, in order.
-        for (i, (got, want)) in block_out.iter().zip(legacy_out.iter()).enumerate() {
-            assert_eq!(got, want, "{sort_order:?} record {i} (block path vs legacy) differs");
-        }
-        assert_eq!(block_out, batch_out, "{sort_order:?} block vs RecordBatch path bytes differ");
-    } else {
-        // Queryname's comparator sort is unstable on equal keys; assert multiset
-        // equality (same records, possibly different equal-key order).
-        let mut got = block_out.clone();
-        let mut want = legacy_out.clone();
-        got.sort_unstable();
-        want.sort_unstable();
-        assert_eq!(got, want, "{sort_order:?} block-path record multiset differs from oracle");
-
-        // The two framings must also agree with EACH OTHER. Without this the
-        // unstable branch only length-checks `batch_out`, so a framing divergence
-        // between `SortMerge<BlockOutput>` and `SortMerge<RecordBatchOutput>`
-        // that preserved record count would pass the queryname cases silently.
-        let mut batch_sorted = batch_out.clone();
-        batch_sorted.sort_unstable();
-        assert_eq!(
-            got, batch_sorted,
-            "{sort_order:?} block vs RecordBatch path record multiset differs"
-        );
-    }
-}
-
-/// `true` for sort orders whose sort is stable on equal keys (so byte-for-byte
-/// output parity is deterministic). Queryname's comparator sort is unstable.
-fn is_stable_for_equal_keys(order: SortOrder) -> bool {
-    matches!(order, SortOrder::Coordinate | SortOrder::TemplateCoordinate)
+    assert_record_parity(&format!("{sort_order:?} block path"), &block_out, &expected);
+    assert_record_parity(&format!("{sort_order:?} RecordBatch path"), &batch_out, &expected);
 }
 
 /// L2.6: a `StepKind::Detached` SINK — the `WriteBgzfFile` analogue, i.e. the
 /// detached-thread runtime driving a pure consumer — yields byte-identical
-/// merged output to the legacy oracle, exactly like the pool-scheduled sink.
+/// merged output to the reference sort, exactly like the pool-scheduled sink.
 /// The chain's `SortMerge` is already `Detached`, so this drives the full chain
 /// through `pipeline.run` with TWO off-pool threads (merge + sink) over a
 /// multi-spill coordinate workload, pinning that `run_detached_driver` preserves
 /// the output bytes for both the producing (merge) and consuming (sink) roles.
 #[test]
-fn detached_sink_chain_matches_legacy_coordinate() {
+fn detached_sink_chain_matches_reference_coordinate() {
     let memory_limit = 64 * 1024; // small → forces many real spill files
     let threads = 4;
     let (header, records) = synthesize_records(20_000, 0xD17A_C4ED);
-    let sorter = RawExternalSorter::new(SortOrder::Coordinate)
-        .memory_limit(memory_limit)
-        .threads(threads)
-        .output_compression(1)
-        .temp_compression(1);
-    let detached_out = drive_sort_buffer_pipeline(
+    let sorter = buffer_config(SortOrder::Coordinate, memory_limit, threads);
+    let detached_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
         pack_batches(&records, 256),
@@ -783,16 +1303,14 @@ fn detached_sink_chain_matches_legacy_coordinate() {
         threads,
         StepKind::Detached,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("detached-sink buffer pipeline drives to completion");
 
-    let legacy_out =
-        sort_via_legacy(SortOrder::Coordinate, &header, &records, memory_limit, threads)
-            .expect("legacy");
+    let expected = reference_sort(SortOrder::Coordinate, &header, &records, None);
 
-    assert_eq!(detached_out.len(), legacy_out.len(), "record count mismatch");
-    for (i, (got, want)) in detached_out.iter().zip(legacy_out.iter()).enumerate() {
+    assert_eq!(detached_out.len(), expected.len(), "record count mismatch");
+    for (i, (got, want)) in detached_out.iter().zip(expected.iter()).enumerate() {
         assert_eq!(got, want, "detached-sink record {i} bytes differ from oracle");
     }
 }
@@ -811,16 +1329,14 @@ fn detached_sink_chain_matches_legacy_coordinate() {
     inflight_caps: Some((1, 4 << 10)),
     ..SupplyTuning::default()
 })]
-fn sort_buffer_chain_coordinate_matches_legacy_across_supply_tunings(#[case] supply: SupplyTuning) {
+fn sort_buffer_chain_coordinate_matches_reference_across_supply_tunings(
+    #[case] supply: SupplyTuning,
+) {
     let (header, records) = synthesize_records(20_000, 0xBADD_CAFE);
     let memory_limit = 256 * 1024;
     let threads = 2;
-    let sorter = RawExternalSorter::new(SortOrder::Coordinate)
-        .memory_limit(memory_limit)
-        .threads(threads)
-        .output_compression(1)
-        .temp_compression(1);
-    let new_out = drive_sort_buffer_pipeline(
+    let sorter = buffer_config(SortOrder::Coordinate, memory_limit, threads);
+    let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
         pack_batches(&records, 256),
@@ -830,16 +1346,14 @@ fn sort_buffer_chain_coordinate_matches_legacy_across_supply_tunings(#[case] sup
         threads,
         StepKind::Exclusive,
         supply,
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("buffer pipeline drives to completion");
 
-    let legacy_out =
-        sort_via_legacy(SortOrder::Coordinate, &header, &records, memory_limit, threads)
-            .expect("legacy");
+    let expected = reference_sort(SortOrder::Coordinate, &header, &records, None);
 
-    assert_eq!(new_out.len(), legacy_out.len(), "record count mismatch");
-    for (i, (got, want)) in new_out.iter().zip(legacy_out.iter()).enumerate() {
+    assert_eq!(new_out.len(), expected.len(), "record count mismatch");
+    for (i, (got, want)) in new_out.iter().zip(expected.iter()).enumerate() {
         assert_eq!(got, want, "record {i} bytes differ");
     }
 }
@@ -849,7 +1363,7 @@ fn sort_buffer_chain_coordinate_matches_legacy_across_supply_tunings(#[case] sup
 /// coordinate (tid 0, pos 0), so a stable sort must emit them in input order;
 /// the buffer chain must preserve that across multiple spill chunks (tie-broken
 /// by `file_id == seq`) and the residual. Pinned both directly (output == input
-/// order) and against the legacy oracle.
+/// order) and against the reference sort.
 #[test]
 fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
     let header = Header::default();
@@ -864,12 +1378,8 @@ fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
     let input_bytes: RecordBytes = records.iter().map(|r| r.as_ref().to_vec()).collect();
     let memory_limit = 256 * 1024;
 
-    let sorter = RawExternalSorter::new(SortOrder::Coordinate)
-        .memory_limit(memory_limit)
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1);
-    let out = drive_sort_buffer_pipeline(
+    let sorter = buffer_config(SortOrder::Coordinate, memory_limit, 2);
+    let out = drive_sort_pipeline_tuned(
         sorter,
         &header,
         pack_batches(&records, 256),
@@ -877,16 +1387,15 @@ fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
         2,
         StepKind::Exclusive,
         SupplyTuning::default(),
-        SpillCodec::Zstd,
+        ZSTD_1,
     )
     .expect("buffer pipeline drives to completion");
 
     assert_eq!(out.len(), input_bytes.len(), "record count mismatch");
     assert_eq!(out, input_bytes, "equal-key records must preserve input order across spills");
 
-    let legacy =
-        sort_via_legacy(SortOrder::Coordinate, &header, &records, memory_limit, 2).expect("legacy");
-    assert_eq!(out, legacy, "equal-key order must also match the legacy oracle");
+    let expected = reference_sort(SortOrder::Coordinate, &header, &records, None);
+    assert_eq!(out, expected, "equal-key order must also match the reference sort");
 }
 
 // ── Merge-supply fill parity (fill size × codec × read streams) ──────────────
@@ -895,10 +1404,10 @@ fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
 /// size — 1-byte and 7/3-byte fills (every frame, and every BGZF block's
 /// 18-byte header, straddles slices), a frame-sized fill, and the production
 /// sizes — for both spill codecs and one or four slices per fill, validated
-/// against the legacy reference. Tiny fills run a smaller fixture (each byte is
+/// against the reference sort. Tiny fills run a smaller fixture (each byte is
 /// a read); every fixture spills to several files.
 #[rstest]
-fn three_step_chain_fill_matrix_matches_legacy(
+fn three_step_chain_fill_matrix_matches_reference(
     #[values((1, 1), (7, 3), (64 << 10, 64 << 10), (4 << 20, 1 << 20))] fills: (u64, u64),
     #[values(SpillCodec::Zstd, SpillCodec::Bgzf)] codec: SpillCodec,
     #[values(1, 4)] read_streams: usize,
@@ -908,12 +1417,7 @@ fn three_step_chain_fill_matrix_matches_legacy(
     let tiny = fills.0 < 1024;
     let (n_records, memory_limit) = if tiny { (2_000, 32 * 1024) } else { (30_000, 256 * 1024) };
     let (header, records) = synthesize_sized_records(n_records, 0x5EED_1234, 120);
-    let sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(memory_limit)
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1)
-        .spill_codec(codec);
+    let sorter = buffer_config(sort_order, memory_limit, 2);
     let supply = SupplyTuning { fills: Some(fills), read_streams, inflight_caps: None };
     let new_out = drive_sort_pipeline_tuned(
         sorter,
@@ -923,31 +1427,25 @@ fn three_step_chain_fill_matrix_matches_legacy(
         threads,
         StepKind::Exclusive,
         supply,
-        codec,
+        (codec, 1),
     )
     .expect("pipeline drives to completion");
-    let legacy_out =
-        sort_via_legacy(sort_order, &header, &records, memory_limit, 2).expect("legacy");
-    assert_eq!(new_out.len(), legacy_out.len(), "record count mismatch ({supply:?}, {codec:?})");
-    assert_eq!(new_out, legacy_out, "sorted bytes differ ({supply:?}, {codec:?})");
+    let expected = reference_sort(sort_order, &header, &records, None);
+    assert_eq!(new_out.len(), expected.len(), "record count mismatch ({supply:?}, {codec:?})");
+    assert_eq!(new_out, expected, "sorted bytes differ ({supply:?}, {codec:?})");
 }
 
 /// Block-parallel decompression over BGZF spill files (the non-default codec)
-/// must also match the legacy sorter — the matrix/soak/proptest exercise the
+/// must also match the reference sort — the matrix/soak/proptest exercise the
 /// default zstd spills, so this confirms the block-parallel reorder path is
 /// codec-agnostic. (Output records are codec-independent: the spill codec only
 /// affects temp files, not the sorted output.)
 #[test]
-fn block_parallel_bgzf_spill_matches_legacy() {
+fn block_parallel_bgzf_spill_matches_reference() {
     let sort_order = SortOrder::Coordinate;
     let (header, records) = synthesize_sized_records(30_000, 0x5EED_BEEF, 120);
     let memory_limit = 256 * 1024;
-    let sorter = RawExternalSorter::new(sort_order)
-        .memory_limit(memory_limit)
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1)
-        .spill_codec(fgumi_sort::SpillCodec::Bgzf);
+    let sorter = buffer_config(sort_order, memory_limit, 2);
     let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
@@ -956,93 +1454,48 @@ fn block_parallel_bgzf_spill_matches_legacy() {
         8,
         StepKind::Exclusive,
         SupplyTuning { read_streams: 4, ..SupplyTuning::default() },
-        SpillCodec::Bgzf,
+        (SpillCodec::Bgzf, 1),
     )
     .expect("pipeline drives to completion");
-    let legacy_out =
-        sort_via_legacy(sort_order, &header, &records, memory_limit, 2).expect("legacy");
-    assert_eq!(new_out.len(), legacy_out.len(), "record count mismatch (bgzf block-parallel)");
-    assert_eq!(new_out, legacy_out, "sorted bytes differ (bgzf block-parallel)");
+    let expected = reference_sort(sort_order, &header, &records, None);
+    assert_eq!(new_out.len(), expected.len(), "record count mismatch (bgzf block-parallel)");
+    assert_eq!(new_out, expected, "sorted bytes differ (bgzf block-parallel)");
 }
 
 // ── Production spill split + run extension (SpillGather run-former) ────────────
 //
-// `drive_sort_buffer_pipeline` above drives the retired monolithic `CompressSpill`
-// for legacy Phase-2 coverage. The tests below drive the PRODUCTION spill split
-// (`SortBuffer` → `SpillGather` → `SpillBlockCompress` → `SpillWrite` →
-// `SortSpillDecompress` → `SortMerge`) that `fgumi sort` actually builds, so they
-// exercise the run-forming `SpillGather` end-to-end: contiguous chunks coalesce
-// into one run, and the merge sees one slot per run.
+// The tests below exercise the run-forming `SpillGather` end-to-end:
+// contiguous chunks coalesce into one run, and the merge sees one slot per run.
 
 /// Drive the production spill split and return `(merged record bytes, run count)`.
 /// The run count is the `SortMerge` stats `runs_written`, which equals the number
 /// of spill files (`SpillReady`s) the merge saw — i.e. the number of runs the
 /// `SpillGather` run-former formed. Mirrors `ChainBuilder::add_sort`'s wiring.
 fn drive_spill_split_pipeline(
-    sorter: RawExternalSorter,
+    config: SortBufferConfig,
     header: &Header,
     batches: Vec<RecordBatch>,
     output_byte_limit: u64,
     threads: usize,
 ) -> Result<(Vec<Vec<u8>>, usize)> {
-    use fgumi_sort::TmpDirAllocator;
-
-    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
-    let sort_order = sorter.sort_order();
-
-    let dir = tempfile::TempDir::new()?;
-    let alloc =
-        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
-    let temp_dirs = Arc::new(vec![dir]);
-    let codec = SpillCodec::Zstd;
-
-    let source = VecSource::new(batches, output_byte_limit);
-    let sort_buffer = SortBuffer::from_sorter(sorter, header, output_byte_limit)?;
-    let gather = SpillGather::new(output_byte_limit);
-    let compress = SpillBlockCompress::new(codec, 3, output_byte_limit);
-    let write = SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs);
-    let (planner, pread, decompress, demand) =
-        spill_supply(output_byte_limit, threads, SupplyTuning::default());
-    let merge =
-        SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256)
-            .with_stats_slot(Arc::clone(&stats_slot));
-    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None };
-
-    let builder = Pipeline::builder();
-    let fan = builder
-        .chain(source)
-        .chain(sort_buffer)
-        .chain(gather)
-        .chain(compress)
-        .chain(write)
-        .chain(planner)
-        .into_multi();
-    fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
-    let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
-
-    let collected = std::mem::take(&mut *received.lock());
-    let mut out = Vec::new();
-    for batch in collected {
-        for bytes in batch.iter_record_bytes() {
-            out.push(bytes.to_vec());
-        }
-    }
-    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
-    Ok((out, runs))
+    let run = drive_buffer_chain(
+        config,
+        header,
+        batches,
+        output_byte_limit,
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        SupplyTuning::default(),
+        ZSTD_1,
+    )?;
+    Ok((run.records, run.runs))
 }
 
 /// Records sorted into `order`, obtained by running them through the oracle and
 /// parsing its (byte-identical) sorted output back into `RawRecord`s. Feeding
 /// this back in is the already-sorted-input case the run-former must coalesce.
 fn presorted_records(order: SortOrder, header: &Header, records: &[RawRecord]) -> Vec<RawRecord> {
-    sort_via_legacy(order, header, records, 256 * 1024 * 1024, 1)
-        .expect("oracle sort")
-        .into_iter()
-        .map(RawRecord::from)
-        .collect()
+    reference_sort(order, header, records, None).into_iter().map(RawRecord::from).collect()
 }
 
 /// An already-sorted input, re-sorted under a small memory budget through the
@@ -1058,16 +1511,12 @@ fn presorted_input_coalesces_to_one_run(#[case] order: SortOrder) {
     let (header, records) = synthesize_sized_records(20_000, 0xC0FF_EE00, 40);
     let sorted = presorted_records(order, &header, &records);
 
-    let sorter = RawExternalSorter::new(order)
-        .memory_limit(256 * 1024) // small ⇒ many contiguous chunks to coalesce
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1);
+    let sorter = buffer_config(order, 256 * 1024, 2); // small ⇒ many contiguous chunks to coalesce
     let (out, runs) =
         drive_spill_split_pipeline(sorter, &header, pack_batches(&sorted, 256), 4 * 1024 * 1024, 4)
             .expect("spill-split pipeline drives to completion");
 
-    let expected = sort_via_legacy(order, &header, &sorted, 256 * 1024 * 1024, 1).expect("oracle");
+    let expected = reference_sort(order, &header, &sorted, None);
     assert_eq!(out, expected, "{order:?}: coalesced output diverged from the oracle");
     assert_eq!(
         runs, 1,
@@ -1086,11 +1535,7 @@ fn reverse_ordered_input_forms_many_runs_but_stays_byte_parity() {
     let mut reversed = presorted_records(order, &header, &records);
     reversed.reverse();
 
-    let sorter = RawExternalSorter::new(order)
-        .memory_limit(256 * 1024)
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1);
+    let sorter = buffer_config(order, 256 * 1024, 2);
     let (out, runs) = drive_spill_split_pipeline(
         sorter,
         &header,
@@ -1100,8 +1545,7 @@ fn reverse_ordered_input_forms_many_runs_but_stays_byte_parity() {
     )
     .expect("spill-split pipeline drives to completion");
 
-    let expected =
-        sort_via_legacy(order, &header, &reversed, 256 * 1024 * 1024, 1).expect("oracle");
+    let expected = reference_sort(order, &header, &reversed, None);
     assert_eq!(out, expected, "reverse-ordered sort diverged from the oracle");
     assert!(runs >= 2, "reverse-ordered chunks must not coalesce (got {runs} run(s))");
 }
@@ -1117,11 +1561,7 @@ fn reverse_ordered_input_forms_many_runs_but_stays_byte_parity() {
 fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder) {
     let (header, records) = synthesize_sized_records(20_000, 0x5EED_1234, 40);
 
-    let sorter = RawExternalSorter::new(order)
-        .memory_limit(256 * 1024)
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1);
+    let sorter = buffer_config(order, 256 * 1024, 2);
     let (out, runs) = drive_spill_split_pipeline(
         sorter,
         &header,
@@ -1131,7 +1571,7 @@ fn shuffled_input_matches_the_oracle_through_the_split(#[case] order: SortOrder)
     )
     .expect("spill-split pipeline drives to completion");
 
-    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    let expected = reference_sort(order, &header, &records, None);
     assert_eq!(out, expected, "{order:?}: shuffled-input sort diverged from the oracle");
     // Shuffled input under a tiny budget must open more than one run (partial
     // coalescing: a new run wherever a chunk cannot extend the previous one).
@@ -1146,11 +1586,7 @@ fn in_memory_input_forms_no_runs() {
     let order = SortOrder::Coordinate;
     let (header, records) = synthesize_sized_records(5_000, 0xA110_0C00, 40);
 
-    let sorter = RawExternalSorter::new(order)
-        .memory_limit(256 * 1024 * 1024) // above the whole input ⇒ no spill
-        .threads(2)
-        .output_compression(1)
-        .temp_compression(1);
+    let sorter = buffer_config(order, 256 * 1024 * 1024, 2); // above the whole input ⇒ no spill
     let (out, runs) = drive_spill_split_pipeline(
         sorter,
         &header,
@@ -1160,7 +1596,7 @@ fn in_memory_input_forms_no_runs() {
     )
     .expect("spill-split pipeline drives to completion");
 
-    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    let expected = reference_sort(order, &header, &records, None);
     assert_eq!(out, expected, "in-memory sort diverged from the oracle");
     assert_eq!(runs, 0, "a budget-sized run never spills");
 }
@@ -1178,11 +1614,7 @@ fn in_memory_input_forms_no_runs() {
 fn sorts_at_one_thread_through_the_scheduled_path(#[case] order: SortOrder) {
     let (header, records) = synthesize_sized_records(8_000, 0x0057_0001, 40);
 
-    let sorter = RawExternalSorter::new(order)
-        .memory_limit(256 * 1024) // small ⇒ spills, exercising the merge at t1
-        .threads(1)
-        .output_compression(1)
-        .temp_compression(1);
+    let sorter = buffer_config(order, 256 * 1024, 1); // small ⇒ spills, exercising the merge at t1
     let (out, runs) = drive_spill_split_pipeline(
         sorter,
         &header,
@@ -1192,7 +1624,7 @@ fn sorts_at_one_thread_through_the_scheduled_path(#[case] order: SortOrder) {
     )
     .expect("spill-split pipeline drives to completion at one thread");
 
-    let expected = sort_via_legacy(order, &header, &records, 256 * 1024 * 1024, 1).expect("oracle");
+    let expected = reference_sort(order, &header, &records, None);
     assert_eq!(out, expected, "{order:?}: single-thread scheduled sort diverged from the oracle");
     // The small budget must actually spill; otherwise this degrades to an
     // in-memory sort and no longer exercises the merge path it names.
@@ -1227,11 +1659,7 @@ mod proptests {
             // Force spilling so slots (and the reorder path) are exercised.
             let memory_limit = 256 * 1024;
             let pipeline_threads = 6;
-            let make_sorter = || RawExternalSorter::new(sort_order)
-                .memory_limit(memory_limit)
-                .threads(2)
-                .output_compression(1)
-                .temp_compression(1);
+            let make_sorter = || buffer_config(sort_order, memory_limit, 2);
             let production = drive_sort_pipeline_tuned(
                 make_sorter(),
                 &header,
@@ -1240,7 +1668,7 @@ mod proptests {
                 pipeline_threads,
                 StepKind::Exclusive,
                 SupplyTuning::default(),
-                SpillCodec::Zstd,
+                ZSTD_1,
             ).expect("production-fill pipeline");
             let small = drive_sort_pipeline_tuned(
                 make_sorter(),
@@ -1250,7 +1678,7 @@ mod proptests {
                 pipeline_threads,
                 StepKind::Exclusive,
                 SupplyTuning { fills: Some((fill, fill)), read_streams, inflight_caps: None },
-                SpillCodec::Zstd,
+                ZSTD_1,
             ).expect("small-fill pipeline");
             prop_assert_eq!(small.len(), records.len(), "no truncation");
             prop_assert_eq!(small, production, "small fills diverge from production fills");
@@ -1284,7 +1712,7 @@ fn soak_iterations(full: usize, min: usize) -> usize {
 /// decompress one file's blocks concurrently and finalize out of order).
 ///
 /// Each iteration uses a fresh random seed and is checked for *byte-identity*
-/// against the legacy `RawExternalSorter::sort` oracle — so a lost, duplicated,
+/// against the reference sort — so a lost, duplicated,
 /// or reordered block (the truncation class the `reader_eof`/`in_flight`
 /// protocol guards against) fails the assertion. Each iteration runs under a
 /// per-iteration wall-clock watchdog (via `run_watchdogged_parity`): a livelock
@@ -1295,7 +1723,7 @@ fn soak_iterations(full: usize, min: usize) -> usize {
 /// (random sizes, moderate threads) by hammering the REAL pipeline under
 /// sustained high contention for many iterations.
 #[test]
-fn block_parallel_high_contention_soak_matches_legacy() {
+fn block_parallel_high_contention_soak_matches_reference() {
     use std::time::Duration;
 
     const RECORDS_PER_ITER: usize = 15_000;
@@ -1342,7 +1770,7 @@ fn block_parallel_high_contention_soak_matches_legacy() {
 /// pipeline threads contend for the `Serial` steps. A wedge (a step parking
 /// while a downstream holds the chunk it is waiting on) trips the per-iteration
 /// watchdog and fails fast instead of hanging, and byte-parity against the
-/// legacy oracle proves nothing is lost, duplicated, or reordered under churn.
+/// reference sort proves nothing is lost, duplicated, or reordered under churn.
 ///
 /// NOTE: this drives `drive_sort_pipeline_tuned` (the record-input `SortBuffer`
 /// chain), NOT the block-input arena front. The front's capacity-1 arena cycle —
@@ -1393,7 +1821,7 @@ fn assert_record_parity(label: &str, actual: &[Vec<u8>], expected: &[Vec<u8>]) {
     if let Some((idx, (a, b))) = actual.iter().zip(expected).enumerate().find(|(_, (a, b))| a != b)
     {
         panic!(
-            "{label}: output diverges from legacy at record {idx}: \
+            "{label}: output diverges from the reference sort at record {idx}: \
              actual_len={}, expected_len={}, actual_prefix={:?}, expected_prefix={:?}",
             a.len(),
             b.len(),
@@ -1411,9 +1839,9 @@ fn assert_record_parity(label: &str, actual: &[Vec<u8>], expected: &[Vec<u8>]) {
 }
 
 /// Run one watchdog-guarded streaming sort and assert byte-identity against the
-/// legacy oracle. Owns `header`/`records` so the worker thread can take them.
+/// reference sort. Owns `header`/`records` so the worker thread can take them.
 ///
-/// Both the legacy oracle AND the streaming pipeline run *inside* the worker, so
+/// Both the reference sort AND the streaming pipeline run *inside* the worker, so
 /// the `recv_timeout` watchdog covers both — a stall in either (the path under
 /// test or, defensively, the reference sorter) fails the test fast instead of
 /// hanging the test process. The merge sink is `Serial` (every watchdog'd parity
@@ -1439,16 +1867,11 @@ fn run_watchdogged_parity(
     let worker = std::thread::Builder::new()
         .name(label.to_string())
         .spawn(move || {
-            // (pipeline_out, legacy_out) — both computed under the watchdog.
+            // (pipeline_out, expected) — both computed under the watchdog.
             let result = (|| -> Result<(RecordBytes, RecordBytes)> {
-                let legacy_out =
-                    sort_via_legacy(sort_order, &header, &records, memory_limit, sorter_threads)?;
+                let expected = reference_sort(sort_order, &header, &records, None);
                 let batches = pack_batches(&records, 256);
-                let sorter = RawExternalSorter::new(sort_order)
-                    .memory_limit(memory_limit)
-                    .threads(sorter_threads)
-                    .output_compression(1)
-                    .temp_compression(1);
+                let sorter = buffer_config(sort_order, memory_limit, sorter_threads);
                 let out = drive_sort_pipeline_tuned(
                     sorter,
                     &header,
@@ -1457,17 +1880,17 @@ fn run_watchdogged_parity(
                     pipeline_threads,
                     StepKind::Serial,
                     tuning,
-                    SpillCodec::Zstd,
+                    ZSTD_1,
                 )?;
-                Ok((out, legacy_out))
+                Ok((out, expected))
             })();
             let _ = tx.send(result);
         })
         .expect("spawn soak worker");
 
     match rx.recv_timeout(watchdog) {
-        Ok(Ok((out, legacy_out))) => {
-            assert_record_parity(label, &out, &legacy_out);
+        Ok(Ok((out, expected))) => {
+            assert_record_parity(label, &out, &expected);
             worker.join().expect("soak worker panicked");
         }
         Ok(Err(e)) => panic!("{label}: pipeline/oracle errored: {e:#}"),
@@ -1550,7 +1973,7 @@ impl SoakRegime {
 /// cold bytes) × spill regime, so the reorder/in-flight/EOF protocol is
 /// hammered across {1, 2, 8} workers, {many small, few large} spill-file
 /// shapes, and both a free-running and a cap-bound planner. Each (case × iteration) runs under a wall-clock
-/// watchdog and is checked byte-for-byte against the legacy oracle, so a
+/// watchdog and is checked byte-for-byte against the reference sort, so a
 /// livelock fails fast and any lost / duplicated / reordered block is caught.
 ///
 /// `rstest` generates the full cross product (3 × 2 × 2 = 12 cases); nextest runs
@@ -1560,7 +1983,7 @@ impl SoakRegime {
 /// (exhaustive but tiny), the proptest (random sizes), and the single-corner
 /// high-contention soak (12 threads, 1-block window).
 #[rstest]
-fn block_parallel_soak_matrix_matches_legacy(
+fn block_parallel_soak_matrix_matches_reference(
     #[values(1, 2, 8)] pipeline_threads: usize,
     #[values(false, true)] caps_bind: bool,
     #[values(SoakRegime::ManySmallFiles, SoakRegime::FewLargeFiles)] regime: SoakRegime,
@@ -1620,18 +2043,7 @@ fn synthesize_sized_records(n: usize, seed: u64, seq_len: usize) -> (Header, Vec
 
     // Reference sequences must exist for the mapped records below to carry a
     // meaningful coordinate key.
-    let header = {
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        use std::num::NonZeroUsize;
-        let len = NonZeroUsize::new(1_000_000).expect("nonzero");
-        let mut builder = Header::builder();
-        for i in 0..N_TEST_REFS {
-            builder = builder
-                .add_reference_sequence(format!("chr{i}"), Map::<ReferenceSequence>::new(len));
-        }
-        builder.build()
-    };
+    let header = synthetic_header();
     let mut records = Vec::with_capacity(n);
     for i in 0..n {
         let name = format!("rd_{}", next_u32() % 100_000);
@@ -1681,7 +2093,7 @@ fn three_step_chain_large_spill_completes(#[case] pipeline_threads: usize) {
 #[test]
 fn three_step_chain_empty_input_drains_cleanly() {
     let header = Header::default();
-    let sorter = RawExternalSorter::new(SortOrder::Coordinate).memory_limit(1024 * 1024);
+    let sorter = buffer_config(SortOrder::Coordinate, 1024 * 1024, 1);
     let out = drive_sort_pipeline(sorter, &header, Vec::new(), 64 * 1024, 3, StepKind::Exclusive)
         .expect("empty pipeline");
     assert!(out.is_empty());
@@ -3308,7 +3720,7 @@ fn drive_arena_front(
 /// End-to-end parity for the block-input arena front, driven through the real
 /// runtime rather than by poking `ingest_block`/`finalize` directly. A
 /// `memory_limit` above the whole input yields exactly ONE run, so the single
-/// residual chunk must be byte-identical to the legacy oracle's coordinate sort.
+/// residual chunk must be byte-identical to the reference sort.
 ///
 /// `payload_bytes` varies where records fall relative to block boundaries: the
 /// small case guarantees records straddle blocks (the front's carry path), the
@@ -3316,7 +3728,7 @@ fn drive_arena_front(
 #[rstest]
 #[case::straddling_blocks(4096, 20)]
 #[case::one_block_per_run(60_000, 2)]
-fn arena_front_chain_single_run_matches_legacy_oracle(
+fn arena_front_chain_single_run_matches_reference(
     #[case] payload_bytes: usize,
     #[case] min_blocks: usize,
 ) {
@@ -3338,11 +3750,9 @@ fn arena_front_chain_single_run_matches_legacy_oracle(
     assert_eq!(out.total_records, N_RECORDS as u64);
     assert_eq!(out.chunks.len(), 1, "one run ⇒ one residual chunk");
 
-    let legacy_out =
-        sort_via_legacy(SortOrder::Coordinate, &header, &records, 256 * 1024 * 1024, 1)
-            .expect("legacy oracle");
-    assert_eq!(out.chunks[0].len(), legacy_out.len(), "record count mismatch");
-    for (i, (got, want)) in out.chunks[0].iter().zip(legacy_out.iter()).enumerate() {
+    let expected = reference_sort(SortOrder::Coordinate, &header, &records, None);
+    assert_eq!(out.chunks[0].len(), expected.len(), "record count mismatch");
+    for (i, (got, want)) in out.chunks[0].iter().zip(expected.iter()).enumerate() {
         assert_eq!(got, want, "record {i} bytes differ from the oracle");
     }
 }
@@ -3377,138 +3787,33 @@ fn arena_front_chain_seals_multiple_runs_without_losing_records() {
     assert_eq!(got, want, "the sealed runs must carry every input record exactly once");
 }
 
-/// Drive the full BAM sort path — the benchmark path — end to end:
-/// `BgzfBlockSource → ReadBlocks → InflateToArena → FindBoundariesAndSort →
-/// SpillGather → SpillBlockCompress → SpillWrite → SortSpillDecompress →
-/// SortMerge`. Returns `(merged record bytes, run count)`. This is the head the
-/// 43 GB `1kg-wgs` benchmark actually uses (SAM/`SortBuffer` is the other head),
-/// so the run-former must coalesce here, not only on the `SortBuffer` path.
+/// Drive the full BAM sort path — the benchmark path — end to end for a
+/// coordinate sort: `BgzfBlockSource → ReadBlocks → InflateToArena →` the
+/// production arena front `→ SpillGather → SpillBlockCompress → SpillWrite →`
+/// merge supply `→ SortMerge`. Returns `(merged record bytes, run count)`.
+/// This is the head the 43 GB `1kg-wgs` benchmark actually uses
+/// (SAM/`SortBuffer` is the other head), so the run-former must coalesce here,
+/// not only on the `SortBuffer` path. `caps` puts the phase caps on the pool
+/// steps; the run sort uses two threads.
 fn drive_arena_split_pipeline(
     blocks: Vec<crate::types::BgzfBlock>,
-    n_ref: u32,
+    header: &Header,
     memory_limit: usize,
     output_byte_limit: u64,
     threads: usize,
+    caps: &ChainCaps,
 ) -> Result<(Vec<Vec<u8>>, usize)> {
-    use fgumi_sort::TmpDirAllocator;
-
-    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
-
-    let dir = tempfile::TempDir::new()?;
-    let alloc =
-        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
-    let temp_dirs = Arc::new(vec![dir]);
-    let codec = SpillCodec::Zstd;
-
-    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
-        SortOrder::Coordinate,
+    let run = drive_arena_chain(
+        production_arena_front(SortOrder::Coordinate),
+        buffer_config(SortOrder::Coordinate, memory_limit, 2),
+        header,
+        blocks,
         output_byte_limit,
-        256,
-    )
-    .with_stats_slot(Arc::clone(&stats_slot));
-
-    let (planner, pread, decompress, demand) =
-        spill_supply(output_byte_limit, threads, SupplyTuning::default());
-    let builder = Pipeline::builder();
-    let fan = builder
-        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
-        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
-        .chain(InflateToArena::new(output_byte_limit))
-        .chain(FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, output_byte_limit))
-        .chain(SpillGather::new(output_byte_limit))
-        .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
-        .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
-        .chain(planner)
-        .into_multi();
-    fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1
-        .chain(merge.with_merge_demand(demand))
-        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
-        .into_sink_marker();
-    let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
-
-    let collected = std::mem::take(&mut *received.lock());
-    let mut out = Vec::new();
-    for batch in collected {
-        for bytes in batch.iter_record_bytes() {
-            out.push(bytes.to_vec());
-        }
-    }
-    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
-    Ok((out, runs))
-}
-
-/// `drive_arena_split_pipeline` with one shared phase-1 cap on inflate +
-/// spill-compress and one phase-2 cap on decompress, returning the caps so
-/// tests can read their high-water marks.
-fn drive_arena_split_pipeline_capped(
-    blocks: Vec<crate::types::BgzfBlock>,
-    n_ref: u32,
-    memory_limit: usize,
-    output_byte_limit: u64,
-    threads: usize,
-    phase1_cap: &Arc<fgumi_pipeline_core::PhaseCap>,
-    phase2_cap: &Arc<fgumi_pipeline_core::PhaseCap>,
-) -> Result<(Vec<Vec<u8>>, usize)> {
-    use fgumi_sort::TmpDirAllocator;
-
-    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
-
-    let dir = tempfile::TempDir::new()?;
-    let alloc =
-        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
-    let temp_dirs = Arc::new(vec![dir]);
-    let codec = SpillCodec::Zstd;
-
-    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
-        SortOrder::Coordinate,
-        output_byte_limit,
-        256,
-    )
-    .with_stats_slot(Arc::clone(&stats_slot));
-
-    let (planner, pread, decompress, demand) =
-        spill_supply(output_byte_limit, threads, SupplyTuning::default());
-    let builder = Pipeline::builder();
-    let fan = builder
-        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
-        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
-        .chain(InflateToArena::new(output_byte_limit).with_phase_cap(Some(Arc::clone(phase1_cap))))
-        .chain(
-            FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 2, output_byte_limit)
-                .with_phase_cap(Some(Arc::clone(phase1_cap))),
-        )
-        .chain(SpillGather::new(output_byte_limit))
-        .chain(
-            SpillBlockCompress::new(codec, 3, output_byte_limit)
-                .with_phase_cap(Some(Arc::clone(phase1_cap))),
-        )
-        .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
-        .chain(planner)
-        .into_multi();
-    fan.b0
-        .chain(pread.with_phase_cap(Some(Arc::clone(phase2_cap))))
-        .chain(decompress.with_phase_cap(Some(Arc::clone(phase2_cap))))
-        .into_sink_marker();
-    fan.b1
-        .chain(merge.with_merge_demand(demand))
-        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
-        .into_sink_marker();
-    let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
-
-    let collected = std::mem::take(&mut *received.lock());
-    let mut out = Vec::new();
-    for batch in collected {
-        for bytes in batch.iter_record_bytes() {
-            out.push(bytes.to_vec());
-        }
-    }
-    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
-    Ok((out, runs))
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        caps,
+    )?;
+    Ok((run.records, run.runs))
 }
 
 /// A binding shared phase cap on a 4-worker pool — including a cap of 1 across
@@ -3532,19 +3837,25 @@ fn shared_phase_caps_bound_pool_concurrency_without_changing_output(
     // the same block stream once per arm.
     let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
 
-    let uncapped = drive_arena_split_pipeline(blocks(), n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
-        .expect("uncapped pipeline");
-
-    let phase1 = PhaseCap::new("sort-phase1", phase1_max);
-    let phase2 = PhaseCap::new("sort-phase2", phase2_max);
-    let capped = drive_arena_split_pipeline_capped(
+    let uncapped = drive_arena_split_pipeline(
         blocks(),
-        n_ref,
+        &header,
         64 * 1024,
         4 * 1024 * 1024,
         4,
-        &phase1,
-        &phase2,
+        &ChainCaps::default(),
+    )
+    .expect("uncapped pipeline");
+
+    let phase1 = PhaseCap::new("sort-phase1", phase1_max);
+    let phase2 = PhaseCap::new("sort-phase2", phase2_max);
+    let capped = drive_arena_split_pipeline(
+        blocks(),
+        &header,
+        64 * 1024,
+        4 * 1024 * 1024,
+        4,
+        &ChainCaps { phase1: Some(Arc::clone(&phase1)), phase2: Some(Arc::clone(&phase2)) },
     )
     .expect("capped pipeline must run to completion");
 
@@ -3606,11 +3917,17 @@ fn presorted_bam_coalesces_to_one_run_through_the_arena_split() {
     // Small per-block payload ⇒ many BGZF blocks; small memory ⇒ ReadBlocks seals
     // several contiguous runs the run-former must coalesce.
     let blocks = bgzf_blocks_for(&sorted, n_ref, 4096);
-    let (out, runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
-        .expect("arena-split pipeline drives to completion");
+    let (out, runs) = drive_arena_split_pipeline(
+        blocks,
+        &header,
+        64 * 1024,
+        4 * 1024 * 1024,
+        4,
+        &ChainCaps::default(),
+    )
+    .expect("arena-split pipeline drives to completion");
 
-    let expected = sort_via_legacy(SortOrder::Coordinate, &header, &sorted, 256 * 1024 * 1024, 1)
-        .expect("oracle");
+    let expected = reference_sort(SortOrder::Coordinate, &header, &sorted, None);
     assert_eq!(out, expected, "arena/BAM-path coalesced output diverged from the oracle");
     assert_eq!(runs, 1, "contiguous sealed runs must coalesce into a single run on the BAM path");
 }
@@ -3623,11 +3940,17 @@ fn shuffled_bam_matches_the_oracle_through_the_arena_split() {
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
 
     let blocks = bgzf_blocks_for(&records, n_ref, 4096);
-    let (out, runs) = drive_arena_split_pipeline(blocks, n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
-        .expect("arena-split pipeline drives to completion");
+    let (out, runs) = drive_arena_split_pipeline(
+        blocks,
+        &header,
+        64 * 1024,
+        4 * 1024 * 1024,
+        4,
+        &ChainCaps::default(),
+    )
+    .expect("arena-split pipeline drives to completion");
 
-    let expected = sort_via_legacy(SortOrder::Coordinate, &header, &records, 256 * 1024 * 1024, 1)
-        .expect("oracle");
+    let expected = reference_sort(SortOrder::Coordinate, &header, &records, None);
     assert_eq!(out, expected, "arena/BAM-path shuffled output diverged from the oracle");
     // Shuffled BAM input under a tiny per-block budget must open more than one
     // run (partial coalescing), otherwise the case no longer exercises it.
