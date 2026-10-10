@@ -5,7 +5,7 @@
 //! dispatch in the worker loop and the concrete `S::try_run` body.
 //!
 //! Each `ErasedStep` exposes the methods the runtime needs:
-//!   - `clone_boxed` — make per-worker copies for `Parallel` steps
+//!   - `clone_boxed` — make a copy of a `Parallel` step for another host worker
 //!   - `build_output_set` — construct the producer's queue set + view from
 //!     `StepProfile::output_queues` + `branch_ordering`
 //!   - `build_input_handle` — pull the consumer's typed input handle out of
@@ -29,8 +29,8 @@ use super::outputs::StepOutputs;
 use super::reorder::BranchOrdering;
 use super::signal::PipelineSignal;
 use super::step::{
-    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, Step, StepCtx, StepKind,
-    StepOutcome, StepProfile,
+    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, PoolPlacement, Step,
+    StepCtx, StepKind, StepOutcome, StepProfile,
 };
 use crate::admission::PhaseCap;
 use crate::runtime::contexts::StepCounters;
@@ -124,6 +124,11 @@ pub trait ErasedStep: Send + 'static {
     /// detached steps onto shared driver threads (the N+2 model). Only
     /// meaningful for `Detached` kinds.
     fn detached_group(&self) -> DetachedGroup;
+    /// Forward `Step::pool_placement`. Read once by `plan_parallel_hosts` at run
+    /// start. No default: every adapter and placeholder states its value, so a
+    /// new adapter that forgets the forward is a compile error rather than a
+    /// silent `AllWorkers`.
+    fn pool_placement(&self) -> PoolPlacement;
 
     /// Forward `Step::counters` / `Step2::counters` — the domain counters this
     /// step declares. Read at chain-build time to size the step's shared
@@ -147,8 +152,8 @@ pub trait ErasedStep: Send + 'static {
     /// Forwards any I/O error from the step body.
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome>;
 
-    /// Construct a fresh per-worker copy of this step. Used for Parallel
-    /// steps. Cheap — implementing types call `S::clone()`, where typical
+    /// Construct a fresh copy of this step for another host worker. Used for
+    /// Parallel steps. Cheap — implementing types call `S::clone()`, where typical
     /// state is unit-struct or `Arc<dyn Fn>` (one atomic increment).
     fn clone_boxed(&self) -> Box<dyn ErasedStep>;
 
@@ -540,6 +545,9 @@ where
     fn detached_group(&self) -> DetachedGroup {
         self.inner.detached_group()
     }
+    fn pool_placement(&self) -> PoolPlacement {
+        self.inner.pool_placement()
+    }
 
     fn counters(&self) -> &'static [CounterSpec] {
         self.inner.counters()
@@ -815,6 +823,9 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 
     fn detached_group(&self) -> DetachedGroup {
         self.inner.detached_group()
+    }
+    fn pool_placement(&self) -> PoolPlacement {
+        self.inner.pool_placement()
     }
 
     fn counters(&self) -> &'static [CounterSpec] {
@@ -1111,6 +1122,9 @@ impl<S: StepK> ErasedStep for TypedStepK<S> {
     fn detached_group(&self) -> DetachedGroup {
         self.inner.detached_group()
     }
+    fn pool_placement(&self) -> PoolPlacement {
+        self.inner.pool_placement()
+    }
 
     fn counters(&self) -> &'static [CounterSpec] {
         self.inner.counters()
@@ -1383,6 +1397,108 @@ mod tests {
             profile.sticky,
             "sticky() must match profile for {kind:?}/{sticky}"
         );
+    }
+
+    /// The profile every `Opted*` stub shares: a one-output `Parallel` step.
+    fn opted_profile(name: &'static str) -> StepProfile {
+        StepProfile {
+            name,
+            kind: StepKind::Parallel,
+            sticky: false,
+            output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    /// Single-input `Parallel` step that opts into `ExcludeReader`.
+    #[derive(Clone)]
+    struct OptedSingle;
+    impl Step for OptedSingle {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            opted_profile("OptedSingle")
+        }
+        fn pool_placement(&self) -> PoolPlacement {
+            PoolPlacement::ExcludeReader
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Two-input `Parallel` step that opts into `ExcludeReader`.
+    #[derive(Clone)]
+    struct OptedTwo;
+    impl Step2 for OptedTwo {
+        type InputA = u32;
+        type InputB = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            opted_profile("OptedTwo")
+        }
+        fn pool_placement(&self) -> PoolPlacement {
+            PoolPlacement::ExcludeReader
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// K-input `Parallel` step that opts into `ExcludeReader`.
+    #[derive(Clone)]
+    struct OptedK;
+    impl StepK for OptedK {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            opted_profile("OptedK")
+        }
+        fn input_count(&self) -> usize {
+            2
+        }
+        fn pool_placement(&self) -> PoolPlacement {
+            PoolPlacement::ExcludeReader
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtxK<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// `pool_placement` defaults to `AllWorkers` and is forwarded verbatim by
+    /// each of the three erased adapters (single-input, two-input, K-input), so
+    /// a step that opts in is seen by the runtime whatever its arity.
+    /// (`ErasedStep::pool_placement` has no default body, so a missing forward is
+    /// a compile error; this test pins that the forward returns the inner value.)
+    #[test]
+    fn pool_placement_defaults_and_forwards() {
+        let single: Box<dyn ErasedStep> = Box::new(TypedStep::new(OptedSingle));
+        let two: Box<dyn ErasedStep> = Box::new(TypedStep2::new(OptedTwo));
+        let k: Box<dyn ErasedStep> = Box::new(TypedStepK::new(OptedK));
+        for (label, step) in [("Step", &single), ("Step2", &two), ("StepK", &k)] {
+            assert_eq!(
+                step.pool_placement(),
+                PoolPlacement::ExcludeReader,
+                "{label} adapter forwards"
+            );
+            assert_eq!(
+                step.clone_boxed().pool_placement(),
+                PoolPlacement::ExcludeReader,
+                "{label} clone"
+            );
+        }
+        assert_eq!(PoolPlacement::default(), PoolPlacement::AllWorkers);
+        let default: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
+        assert_eq!(default.pool_placement(), PoolPlacement::AllWorkers, "trait default");
     }
 
     #[test]

@@ -50,6 +50,7 @@ use crate::admission::PhaseCap;
 use crate::queues::{BoundedQueueHandle, HolderQueue, SEALED};
 use crate::runtime::contexts::{RegisteredHolderOnlyQueue, RegisteredQueue};
 use crate::runtime::event_count::{NotifyOutcome, PoolEventCount};
+use crate::runtime::placement::ParallelHosts;
 use crate::runtime::stats::WakeCounts;
 use crate::runtime::wake_slot::{
     DirectParked, ParkThread, ThreadSlots, current_slot, delivery_fence, set_cap_owed,
@@ -58,10 +59,7 @@ use crate::runtime::wake_slot::{
 use crate::step::StepKind;
 use crate::topology::{BranchIdx, ChainGraph, StepIdx};
 
-/// Index of a dedicated driver thread (one per `DetachedDriverGroup`, in the
-/// order `extract_detached_steps` returns them).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DriverIdx(pub usize);
+pub use crate::runtime::placement::DriverIdx;
 
 /// Who a forward wake goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +114,12 @@ struct BranchWake {
     /// the worker would only be refused again, and the cap's release wakes the
     /// threads recorded on it.
     consumer: Option<StepIdx>,
+    /// `Some` ⇒ a `Pool` target whose consumer has clones on only some workers
+    /// (`ParallelHosts::workers`): one bit per host worker. The direct-park and
+    /// cap-parked fallbacks may claim only a worker in it — any other worker
+    /// holds no clone of the consumer, so waking it would leave the work for a
+    /// timer.
+    fallback_mask: Option<Box<[u64]>>,
 }
 
 struct ReverseWake {
@@ -240,6 +244,17 @@ fn index_caps(caps: &[Option<Arc<PhaseCap>>]) -> Box<[Arc<PhaseCap>]> {
         .collect()
 }
 
+/// One bit per host worker of `consumer` when its clones live on only some of
+/// the `n_threads` workers (`ParallelHosts::workers`); `None` when it runs on
+/// every worker (or `hosts` does not cover it).
+fn host_mask(hosts: &[ParallelHosts], consumer: StepIdx, n_threads: usize) -> Option<Box<[u64]>> {
+    let h = hosts.get(consumer.0)?;
+    if h.workers.is_empty() || h.workers.len() >= n_threads {
+        return None;
+    }
+    Some(DirectParked::mask_for(&h.workers, n_threads))
+}
+
 impl WakePlan {
     /// A plan that behaves exactly like having no plan: `on_progress` is one
     /// `notify_one`, `on_finished` one `notify_all`, nobody is registered.
@@ -278,6 +293,10 @@ impl WakePlan {
     /// Panics if `kinds`, `pinned_worker` and `driver_of` are not all
     /// `graph.n_steps()` long (a `Pipeline::run` bug), or if `caps` holds more
     /// than [`MAX_PHASE_CAPS`](crate::MAX_PHASE_CAPS) distinct caps.
+    ///
+    /// Tests and the loom models only: `Pipeline::run` and `dag_at` place
+    /// Parallel clones and call [`Self::build_with_hosts`].
+    #[cfg(any(test, loom))]
     #[allow(clippy::too_many_arguments)] // the chain's per-step inputs, one slice each
     #[must_use]
     pub fn build(
@@ -289,6 +308,44 @@ impl WakePlan {
         edges: WakeEdges<'_>,
         pool: Option<Arc<PoolEventCount>>,
         n_threads: usize,
+    ) -> Arc<Self> {
+        Self::build_with_hosts(
+            graph,
+            kinds,
+            pinned_worker,
+            driver_of,
+            caps,
+            edges,
+            pool,
+            n_threads,
+            &[],
+        )
+    }
+
+    /// `build` (same inputs) plus where each `Parallel` step's clones live
+    /// (`plan_parallel_hosts`; empty ⇒ every Parallel step on every worker). A
+    /// `Pool` forward branch whose consumer has a restricted worker set records
+    /// that set, and the direct-park and cap-parked fallbacks claim only a
+    /// worker in it. The event-count path needs no restriction because every
+    /// worker a placement leaves out is pinned, so never an event-count waiter;
+    /// `run` and `dag_at` check that with
+    /// `placement::assert_excluded_workers_are_pinned` before building the plan.
+    ///
+    /// # Panics
+    ///
+    /// As `build`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // `build`'s inputs plus the placement
+    pub fn build_with_hosts(
+        graph: &ChainGraph,
+        kinds: &[StepKind],
+        pinned_worker: &[Option<usize>],
+        driver_of: &[Option<DriverIdx>],
+        caps: &[Option<Arc<PhaseCap>>],
+        edges: WakeEdges<'_>,
+        pool: Option<Arc<PoolEventCount>>,
+        n_threads: usize,
+        hosts: &[ParallelHosts],
     ) -> Arc<Self> {
         let n = graph.n_steps();
         assert!(
@@ -355,7 +412,10 @@ impl WakePlan {
                         if gate.is_some() {
                             tracked.push((step, branch));
                         }
-                        BranchWake { target, gate, same_thread: same, consumer }
+                        let fallback_mask = consumer
+                            .filter(|_| target == WakeTarget::Pool)
+                            .and_then(|c| host_mask(hosts, c, n_threads));
+                        BranchWake { target, gate, same_thread: same, consumer, fallback_mask }
                     })
                     .collect();
                 // One list from both registries, built before `needs_fence` so a
@@ -582,7 +642,7 @@ impl WakePlan {
             return r; // Legacy: no per-step table, and Legacy is unchanged.
         };
         if self.forward(s, before, &mut r) {
-            self.deliver(s.own, None, &mut r); // `Driver`/`Worker`: an unpark of this very thread
+            self.deliver(s.own, None, None, &mut r); // `Driver`/`Worker`: an unpark of this very thread
         }
         r
     }
@@ -608,7 +668,7 @@ impl WakePlan {
                 continue;
             }
             same_thread |= wake.same_thread;
-            self.deliver(wake.target, wake.consumer, r);
+            self.deliver(wake.target, wake.consumer, wake.fallback_mask.as_deref(), r);
         }
         same_thread
     }
@@ -746,8 +806,17 @@ impl WakePlan {
         self.cap_parked.disarm(w);
     }
 
+    /// Deliver one forward wake. `fallback_mask` restricts a `Pool` wake's
+    /// direct-park and cap-parked fallbacks to the consumer's host workers
+    /// (`None`: any worker).
     #[inline]
-    fn deliver(&self, target: WakeTarget, consumer: Option<StepIdx>, r: &mut WakeCounts) {
+    fn deliver(
+        &self,
+        target: WakeTarget,
+        consumer: Option<StepIdx>,
+        fallback_mask: Option<&[u64]>,
+        r: &mut WakeCounts,
+    ) {
         match target {
             WakeTarget::None => {}
             WakeTarget::Pool => {
@@ -762,10 +831,10 @@ impl WakePlan {
                     // threads recorded on that cap. The cap's lines are read
                     // only when some worker is cap-parked.
                     if o == NotifyOutcome::NoWaiters
-                        && (self.unpark_one_direct_parked()
+                        && (self.unpark_one_direct_parked(fallback_mask)
                             || (!self.cap_parked.is_empty()
                                 && self.admits(consumer)
-                                && self.unpark_one_cap_parked()))
+                                && self.unpark_one_cap_parked(fallback_mask)))
                     {
                         r.fallback = r.fallback.saturating_add(1);
                     }
@@ -807,15 +876,16 @@ impl WakePlan {
         self.unpark_all();
     }
 
-    /// Claim one armed worker and unpark it, trying the next armed bit when a
-    /// claimed one has no registered thread.
-    fn unpark_one_direct_parked(&self) -> bool {
-        self.direct_parked.claim_one(&mut |w| self.workers.unpark(w))
+    /// Claim one armed worker — within `mask` when given — and unpark it,
+    /// trying the next armed bit when a claimed one has no registered thread.
+    fn unpark_one_direct_parked(&self, mask: Option<&[u64]>) -> bool {
+        self.direct_parked.claim_one(mask, &mut |w| self.workers.unpark(w))
     }
 
-    /// Claim one cap-parked worker and unpark it (see [`Self::arm_cap_parked`]).
-    fn unpark_one_cap_parked(&self) -> bool {
-        self.cap_parked.claim_one(&mut |w| self.workers.unpark(w))
+    /// Claim one cap-parked worker — within `mask` when given — and unpark it
+    /// (see [`Self::arm_cap_parked`]).
+    fn unpark_one_cap_parked(&self, mask: Option<&[u64]>) -> bool {
+        self.cap_parked.claim_one(mask, &mut |w| self.workers.unpark(w))
     }
 
     #[inline]
@@ -1396,6 +1466,117 @@ mod tests {
         // With nobody armed, the fallback finds nobody.
         let r = plan.on_progress(d, &PushSnapshot::default());
         assert_eq!(r.fallback, 0);
+    }
+
+    /// `host_mask` restricts only a consumer whose clones live on some of the
+    /// workers, and its bits span words past 64 workers.
+    #[test]
+    fn host_mask_sets_the_host_workers_bits_across_words() {
+        use crate::runtime::placement::ParallelHosts;
+        let all_but = |skip: &[usize]| ParallelHosts {
+            workers: (0..130).filter(|w| !skip.contains(w)).collect(),
+            driver: None,
+        };
+        let hosts = [
+            all_but(&[0, 65]),
+            all_but(&[]),
+            ParallelHosts { workers: vec![], driver: Some(DriverIdx(0)) },
+        ];
+        let mask = host_mask(&hosts, StepIdx(0), 130).expect("two workers left out");
+        assert_eq!(&*mask, &[!1u64, !(1u64 << 1), 0b11]);
+        assert_eq!(host_mask(&hosts, StepIdx(1), 130), None, "every worker: unrestricted");
+        assert_eq!(host_mask(&hosts, StepIdx(2), 130), None, "hosted on a driver: no pool wake");
+        assert_eq!(host_mask(&hosts, StepIdx(3), 130), None, "not covered");
+    }
+
+    /// The direct-park fallback for a `Pool` wake claims only a worker that
+    /// holds a clone of the consumer: with `Par` placed on worker 1 alone, an
+    /// armed worker 0 is passed over (and stays parked), and an armed worker 1
+    /// is unparked — a real thread parked for 10 s, returning in < 5 s.
+    #[test]
+    fn pool_fallback_skips_workers_without_a_clone() {
+        use crate::runtime::placement::ParallelHosts;
+        let mut g = ChainGraph::new();
+        let d = g.register_step("Det", 1);
+        let p = g.register_step("Par", 0);
+        g.wire(d, BranchIdx(0), p);
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = WakePlan::build_with_hosts(
+            &g,
+            &[StepKind::Detached, StepKind::Parallel],
+            &[None, None],
+            &[Some(DriverIdx(0)), None],
+            &[],
+            WakeEdges::NONE,
+            Some(Arc::clone(&pool)),
+            2,
+            &[ParallelHosts::default(), ParallelHosts { workers: vec![1], driver: None }],
+        );
+        assert_eq!(plan.forward_target(d, BranchIdx(0)), WakeTarget::Pool);
+        let (w0, w0_parked) = parked_thread();
+        plan.register_worker(0, w0.thread().clone());
+        assert!(plan.arm_direct(0));
+        w0_parked.recv().unwrap();
+        let r = plan.on_progress(d, &PushSnapshot::default());
+        assert_eq!((r.no_waiters, r.fallback), (1, 0), "worker 0 holds no clone of Par");
+
+        let (w1, w1_parked) = parked_thread();
+        plan.register_worker(1, w1.thread().clone());
+        assert!(plan.arm_direct(1));
+        w1_parked.recv().unwrap();
+        let r = plan.on_progress(d, &PushSnapshot::default());
+        assert_eq!(r.fallback, 1, "worker 1 hosts Par");
+        assert!(w1.join().unwrap() < Duration::from_secs(5));
+        // Worker 0 was passed over by both wakes: still parked.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!w0.is_finished(), "a wake reached worker 0, which holds no clone of Par");
+        // Release worker 0, which no wake above reached.
+        plan.disarm_direct(0);
+        plan.unpark_all();
+        let _ = w0.join().unwrap();
+    }
+
+    /// The cap-parked fallback honours the same host mask as the direct-park
+    /// one: a cap-parked worker holding no clone of the consumer is never
+    /// claimed for it (the wake would be spent on a thread that cannot run it).
+    #[test]
+    fn cap_parked_fallback_skips_workers_without_a_clone() {
+        use crate::runtime::placement::ParallelHosts;
+        let mut g = ChainGraph::new();
+        let d = g.register_step("Det", 1);
+        let p = g.register_step("Par", 0);
+        g.wire(d, BranchIdx(0), p);
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = WakePlan::build_with_hosts(
+            &g,
+            &[StepKind::Detached, StepKind::Parallel],
+            &[None, None],
+            &[Some(DriverIdx(0)), None],
+            &[],
+            WakeEdges::NONE,
+            Some(Arc::clone(&pool)),
+            2,
+            &[ParallelHosts::default(), ParallelHosts { workers: vec![1], driver: None }],
+        );
+        let (w0, w0_parked) = parked_thread();
+        plan.register_worker(0, w0.thread().clone());
+        assert!(plan.arm_cap_parked(0));
+        w0_parked.recv().unwrap();
+        let r = plan.on_progress(d, &PushSnapshot::default());
+        assert_eq!((r.no_waiters, r.fallback), (1, 0), "worker 0 holds no clone of Par");
+        assert!(plan.is_cap_parked(0), "worker 0's cap-parked bit was not claimed");
+        let (w1, w1_parked) = parked_thread();
+        plan.register_worker(1, w1.thread().clone());
+        assert!(plan.arm_cap_parked(1));
+        w1_parked.recv().unwrap();
+        let r = plan.on_progress(d, &PushSnapshot::default());
+        assert_eq!(r.fallback, 1, "worker 1 hosts Par");
+        assert!(w1.join().unwrap() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!w0.is_finished(), "a wake reached worker 0, which holds no clone of Par");
+        plan.disarm_cap_parked(0);
+        plan.unpark_all();
+        let _ = w0.join().unwrap();
     }
 
     #[test]
