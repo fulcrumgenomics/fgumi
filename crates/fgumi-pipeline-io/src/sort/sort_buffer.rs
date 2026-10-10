@@ -130,6 +130,25 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
         )
     }
 
+    /// Seal the final run of a sort that spilled as `pieces` pre-sorted chunks
+    /// (see [`ArenaSortStrategy::seal_pieces`]), under the whole phase cap.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::take_sorted_chunk`].
+    fn take_sorted_pieces(&mut self, pieces: usize) -> io::Result<Vec<MemoryChunkErased>> {
+        let arena = std::mem::replace(&mut self.arena, SegmentedBuf::new());
+        self.memory_used = 0;
+        let arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
+        crate::sort::arena_ingest::seal_pieces_under_cap(
+            &mut self.strategy,
+            self.cap.as_deref(),
+            arc,
+            self.sort_threads,
+            pieces,
+        )
+    }
+
     fn total_records(&self) -> u64 {
         self.total_records
     }
@@ -246,9 +265,13 @@ impl ChunkSorter {
         }
     }
 
-    /// Take the final residual as zero-or-one erased chunk. Every order seals one
-    /// globally-sorted chunk per run, stable by input order, so the residual is
-    /// at most one chunk.
+    /// Take the final residual. Without spills it is zero or one chunk (one
+    /// globally-sorted chunk keeps the merge's single-chunk fast path). After a
+    /// spill, at more than one sort thread, the run seals as `sort_threads`
+    /// pre-sorted pieces over contiguous input ranges: the k-way merge that
+    /// follows anyway does the final interleave, and the pieces sort in
+    /// parallel. Ties stay stable: the merge orders memory pieces after the
+    /// spills and in push order.
     ///
     /// An empty residual is normally dropped. The one EXCEPTION is
     /// template-coordinate when there were prior spills: the empty chunk still
@@ -260,7 +283,31 @@ impl ChunkSorter {
     /// empty residual is dropped as before; with no spills there is nothing to
     /// disambiguate, so the fast path (single non-empty chunk) is preserved.
     fn take_residual_chunks(&mut self, had_spills: bool) -> io::Result<Vec<MemoryChunkErased>> {
-        Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills))
+        let pieces = self.sort_threads();
+        if !had_spills || pieces <= 1 {
+            return Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills));
+        }
+        let mut chunks = match self {
+            Self::Coordinate(s) => s.take_sorted_pieces(pieces),
+            Self::Template(s) => s.take_sorted_pieces(pieces),
+            Self::QuerynameLex(s) => s.take_sorted_pieces(pieces),
+            Self::QuerynameNatural(s) => s.take_sorted_pieces(pieces),
+        }?;
+        if chunks.len() == 1 {
+            let chunk = chunks.pop().expect("one chunk");
+            return Ok(residual_chunks_for(chunk, had_spills));
+        }
+        Ok(chunks)
+    }
+
+    /// The phase-1 width the sorter seals at.
+    fn sort_threads(&self) -> usize {
+        match self {
+            Self::Coordinate(s) => s.sort_threads,
+            Self::Template(s) => s.sort_threads,
+            Self::QuerynameLex(s) => s.sort_threads,
+            Self::QuerynameNatural(s) => s.sort_threads,
+        }
     }
 
     fn total_records(&self) -> u64 {
@@ -676,6 +723,69 @@ mod tests {
             "sealed after {} records, want {want}",
             pushed + 1
         );
+    }
+
+    /// After a spill, the record-input front seals its final run as
+    /// `sort_threads` pieces; without one it keeps a single chunk (the merge's
+    /// fast path), and at one sort thread it never splits.
+    #[rstest]
+    #[case::spilled_t4(4, true, 4)]
+    #[case::unspilled_t4(4, false, 1)]
+    #[case::spilled_t1(1, true, 1)]
+    fn residual_pieces_follow_the_spill_rule(
+        #[case] sort_threads: usize,
+        #[case] had_spills: bool,
+        #[case] pieces: usize,
+    ) {
+        let config = SortBufferConfig {
+            sort_order: SortOrder::Coordinate,
+            memory_limit: 1 << 30,
+            sort_threads,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let mut sorter = ChunkSorter::new(config, &Header::default()).unwrap();
+        for i in 0..1000 {
+            let body = fgumi_raw_bam::testutil::make_bam_bytes(
+                0,
+                1000 - i,
+                0,
+                format!("rd_{i}").as_bytes(),
+                &[],
+                20,
+                -1,
+                -1,
+                &[],
+            );
+            sorter.push(&body).unwrap();
+        }
+        let chunks = sorter.take_residual_chunks(had_spills).unwrap();
+        assert_eq!(chunks.len(), pieces);
+        assert_eq!(chunks.iter().map(MemoryChunkErased::len).sum::<usize>(), 1000);
+    }
+
+    /// An empty template residual after a spill is still announced — one empty
+    /// chunk carrying the narrowed-lane variant — even at several sort threads.
+    #[test]
+    fn empty_template_residual_still_carries_the_variant() {
+        let config = SortBufferConfig {
+            sort_order: SortOrder::TemplateCoordinate,
+            memory_limit: 1 << 20,
+            sort_threads: 4,
+            cell_tag: None,
+            key_types: KeyTypesSpec::None,
+        };
+        let mut sorter = ChunkSorter::new(config, &Header::default()).unwrap();
+        sorter.push(&record_with_mi(10, b"rd_1", 1)).unwrap();
+        let spilled = sorter.take_sorted_chunk().unwrap();
+        assert_eq!(spilled.len(), 1);
+        let residual = sorter.take_residual_chunks(true).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(residual[0].is_empty());
+        assert!(matches!(
+            residual[0],
+            MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K24(_))
+        ));
     }
 
     // ── Ingest failure handling ─────────────────────────────────────────────

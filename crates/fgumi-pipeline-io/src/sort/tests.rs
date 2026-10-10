@@ -5080,14 +5080,15 @@ fn template_split_matches_reference_across_runs(
     let split =
         drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
     assert!(split.chunks.len() >= 3, "{case:?}: several runs (got {})", split.chunks.len());
-    let (_, spilled) = split.chunks.split_last().expect("chunks");
+    let spilled = &split.chunks[..split.slot_count as usize];
     assert!(
         spilled.iter().all(|c| c.len() > 64),
         "{case:?}: every spilled run spans several batches"
     );
     assert!(split.key_kinds.iter().all(|&k| k == lane), "{case:?}: {:?}", split.key_kinds);
     assert_eq!(split.total_records, records.len() as u64, "{case:?}");
-    assert_eq!(split.slot_count as usize + 1, split.chunks.len(), "{case:?}: spills + residual");
+    let pieces = if split.slot_count > 0 && threads > 1 { threads } else { 1 };
+    assert_eq!(residual_count(&split), pieces, "{case:?}: the final run's pieces");
     let merged = drive_arena_chain(
         ArenaFront::Split,
         config,
@@ -5652,4 +5653,121 @@ fn spill_boundaries_match_the_hand_computed_caps(
     let t4 = run(4);
     assert_eq!(t4, expected, "{order:?} t4");
     assert_eq!(run(4), t4, "{order:?}: two t4 runs split identically");
+}
+
+/// Residual chunks a front announced: chunks beyond the spills.
+fn residual_count(out: &ArenaFrontOutput) -> usize {
+    out.chunks.len() - out.slot_count as usize
+}
+
+/// When the sort spilled, the final in-memory run is sealed as `sort_threads`
+/// pre-sorted pieces (contiguous input ranges), each its own `Residual`; the
+/// merge of the spills and the pieces is the reference stable sort, equal keys
+/// in input order. Every order, at two and four sort threads.
+#[rstest]
+fn residual_pieces_merge_to_the_reference(
+    #[values(
+        SortOrder::Coordinate,
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+    #[values(2usize, 4)] sort_threads: usize,
+) {
+    // Queryname ties (equal name and flags) are dense in the instrument
+    // fixture's duplicated secondaries, so pieces of the final run share them.
+    let (header, records) = match order {
+        SortOrder::Queryname(_) => instrument_switching_records(8_000, 61),
+        _ => tie_heavy_records(6_000, 61),
+    };
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(order, 96 * 1024, sort_threads);
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+    let out = drive_arena_chunks(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        sort_threads,
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    assert!(out.slot_count >= 1, "{order:?}: the fixture spills");
+    assert_eq!(residual_count(&out), sort_threads, "{order:?}: one residual per piece");
+    let run = drive_arena_chain(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        4 * 1024 * 1024,
+        sort_threads,
+        MergeSink::Batches(StepKind::Serial),
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    let expected = reference_sort(order, &header, &records, None);
+    // The final run is the input tail after the last spill, split into
+    // `sort_threads` contiguous pieces; some equal-key group of the tail must
+    // straddle a piece boundary, or a cross-piece reorder would go unseen.
+    let tail_start = *run.spill_boundaries.last().expect("the fixture spills");
+    let piece = (records.len() as u64 - tail_start).div_ceil(sort_threads as u64);
+    let piece_starts: Vec<u64> = (1..sort_threads as u64).map(|k| tail_start + k * piece).collect();
+    let tail: Vec<Vec<u8>> =
+        expected.iter().filter(|r| u64::from(xi_of(r)) >= tail_start).cloned().collect();
+    assert!(
+        equal_key_group_spans_a_boundary(order, &header, &tail, &piece_starts),
+        "{order:?} t{sort_threads}: no equal-key group straddles a piece boundary"
+    );
+    assert_record_parity(&format!("{order:?} t{sort_threads}"), &run.records, &expected);
+    assert_input_order_within_equal_keys(order, &header, &run.records);
+    let buffer = drive_front(Front::SortBuffer, config, &header, &records, sort_threads).unwrap();
+    assert_record_parity(
+        &format!("{order:?} t{sort_threads} SortBuffer"),
+        &buffer.records,
+        &expected,
+    );
+}
+
+/// A sort that never spills keeps its single in-memory chunk, at any thread
+/// count: the merge's single-chunk fast path stays available.
+#[rstest]
+fn in_memory_sort_keeps_one_residual_chunk(
+    #[values(SortOrder::Coordinate, SortOrder::TemplateCoordinate)] order: SortOrder,
+    #[values(1usize, 4)] sort_threads: usize,
+) {
+    let (header, records) = tie_heavy_records(2_000, 62);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(order, 64 << 20, sort_threads);
+    let out = drive_arena_chunks(
+        ArenaFront::Split,
+        config,
+        &header,
+        bgzf_blocks_for(&records, n_ref, 4096),
+        sort_threads,
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    assert_eq!((out.slot_count, residual_count(&out)), (0, 1), "{order:?} t{sort_threads}");
+}
+
+/// At one sort thread the final run of a spilling sort is never split.
+#[rstest]
+fn t1_never_splits(
+    #[values(SortOrder::Coordinate, SortOrder::Queryname(QuerynameComparator::Natural))]
+    order: SortOrder,
+) {
+    let (header, records) = tie_heavy_records(6_000, 63);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let out = drive_arena_chunks(
+        ArenaFront::Split,
+        buffer_config(order, 96 * 1024, 1),
+        &header,
+        bgzf_blocks_for(&records, n_ref, 4096),
+        1,
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    assert!(out.slot_count >= 1);
+    assert_eq!(residual_count(&out), 1, "{order:?}");
 }

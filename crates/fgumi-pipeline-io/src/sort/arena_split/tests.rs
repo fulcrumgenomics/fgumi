@@ -546,6 +546,17 @@ impl ArenaKeyExtractor for ProbeKeys {
         Self::empty_chunk()
     }
 
+    fn seal_pieces(
+        acc: &mut u32,
+        ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+        _pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        vec![Self::seal(acc, ctx, arena, sort_threads, pool)]
+    }
+
     fn empty_chunk() -> MemoryChunkErased {
         MemoryChunkErased::Coordinate(InMemoryChunk::default())
     }

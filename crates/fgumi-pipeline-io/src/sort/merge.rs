@@ -661,7 +661,9 @@ enum SortMergeState<B> {
         next_ordinal: u64,
     },
     /// Single-source fast path: 0 spill slots and exactly one in-memory chunk, so
-    /// the chunk is already globally sorted and no k-way merge is needed. Gather
+    /// the chunk is already globally sorted and no k-way merge is needed. (A
+    /// front splits its final run into pieces only after a spill, so a sort that
+    /// fits in memory always arrives here.) Gather
     /// its records in order straight into output blocks (the dominant in-memory
     /// cost — a single-threaded k = 1 loser-tree walk — is pure overhead here).
     FastPath {

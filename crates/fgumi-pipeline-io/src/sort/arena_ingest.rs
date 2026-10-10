@@ -1070,6 +1070,16 @@ pub trait ArenaSortStrategy: Send + 'static {
     /// accumulator for the next run.
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased;
 
+    /// Seal the run as `pieces` pre-sorted chunks over contiguous input-order
+    /// ranges of its refs, sorted in parallel at `sort_threads` — the final run
+    /// of a sort that spilled. A run with no refs seals as [`Self::seal`] does.
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased>;
+
     /// Whether sealing the refs accumulated so far would sort on more than one
     /// thread at `sort_threads` — what decides whether the seal must take the
     /// whole phase cap (see `seal_under_cap`).
@@ -1134,23 +1144,45 @@ pub(crate) fn seal_under_cap<S: ArenaSortStrategy>(
     Ok(strategy.seal(arena, width))
 }
 
+/// [`seal_under_cap`] for the final run of a sort that spilled: the run seals
+/// as `pieces` chunks sorted in parallel, so with a cap it always holds the
+/// whole cap.
+///
+/// # Errors
+///
+/// As [`seal_under_cap`].
+pub(crate) fn seal_pieces_under_cap<S: ArenaSortStrategy>(
+    strategy: &mut S,
+    cap: Option<&PhaseCap>,
+    arena: Arc<PooledSegmentedBuf>,
+    sort_threads: usize,
+    pieces: usize,
+) -> io::Result<Vec<MemoryChunkErased>> {
+    let sort_threads = sort_threads.max(1);
+    let whole = reserve_for_run_sort(cap, sort_threads > 1)?;
+    let width = whole.as_ref().map_or(sort_threads, WholeCap::width);
+    Ok(strategy.seal_pieces(arena, width, pieces))
+}
+
 /// Coordinate-order strategy: extracts the fixed `u64` coordinate key inline and
 /// accumulates plain [`RecordRef`]s; seals to [`MemoryChunkErased::Coordinate`]
 /// via [`coordinate_chunk_from_refs`].
 pub struct CoordinateStrategy {
     /// BAM header reference-sequence count, used by [`extract_coordinate_key_inline`].
     n_ref: u32,
-    /// Coordinate-key refs accumulated across the current run's blocks. Filled
-    /// incrementally by the scan and consumed (via `mem::take`) at seal, leaving
-    /// an empty `Vec` for the next run.
+    /// Coordinate-key refs accumulated across the current run's blocks; the seal
+    /// clears them in place, keeping the buffer for the next run.
     refs: Vec<RecordRef>,
+    /// Bounded pool the final run's pieces sort on (the radix spawns its own
+    /// threads for a whole-run seal).
+    pieces_pool: BoundedSortPool,
 }
 
 impl CoordinateStrategy {
     /// Create a coordinate strategy for a header with `n_ref` reference sequences.
     #[must_use]
     pub fn new(n_ref: u32) -> Self {
-        Self { n_ref, refs: Vec::new() }
+        Self { n_ref, refs: Vec::new(), pieces_pool: BoundedSortPool::new("coord-sort") }
     }
 }
 
@@ -1168,6 +1200,24 @@ impl ArenaSortStrategy for CoordinateStrategy {
             std::mem::take(&mut self.refs),
             sort_threads,
         ))
+    }
+
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        if self.refs.is_empty() {
+            return vec![self.seal(arena, sort_threads)];
+        }
+        let refs = std::mem::take(&mut self.refs);
+        self.pieces_pool
+            .bounded(sort_threads)
+            .install(|| fgumi_sort::coordinate_chunks_from_refs(&arena, refs, pieces))
+            .into_iter()
+            .map(MemoryChunkErased::Coordinate)
+            .collect()
     }
 
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
@@ -1210,6 +1260,19 @@ impl ArenaSortStrategy for TemplateStrategy {
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
         MemoryChunkErased::TemplateCoordinate(self.acc.seal(arena, sort_threads))
+    }
+
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        self.acc
+            .seal_pieces(&arena, sort_threads, pieces)
+            .into_iter()
+            .map(MemoryChunkErased::TemplateCoordinate)
+            .collect()
     }
 
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
@@ -1342,6 +1405,38 @@ impl<C: QnChunkOrder> ArenaSortStrategy for QuerynameStrategy<C> {
                 keys.compare_stats(),
             ))
         })
+    }
+
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        self.close_batch();
+        if self.refs.is_empty() {
+            return vec![self.seal(arena, sort_threads)];
+        }
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, &arena, &mut self.refs[range], class);
+        }
+        let refs = std::mem::take(&mut self.refs);
+        self.batch_start = 0;
+        let keys = &self.keys;
+        self.sort_pool
+            .bounded(sort_threads)
+            .install(move || {
+                fgumi_sort::queryname_chunks_from_qn_refs::<C>(
+                    &keys.table,
+                    &arena,
+                    refs,
+                    keys.compare_stats(),
+                    pieces,
+                )
+            })
+            .into_iter()
+            .map(C::wrap)
+            .collect()
     }
 
     /// The comparator sort always runs inside the per-sort rayon pool, so it is
@@ -2112,6 +2207,14 @@ mod tests {
             let pool_refused = self.cap.try_acquire().is_none();
             self.seen.push(SealSeen { threads: sort_threads, active, pool_refused, pool_released });
             MemoryChunkErased::Coordinate(fgumi_sort::InMemoryChunk::default())
+        }
+        fn seal_pieces(
+            &mut self,
+            arena: Arc<PooledSegmentedBuf>,
+            sort_threads: usize,
+            _pieces: usize,
+        ) -> Vec<MemoryChunkErased> {
+            vec![self.seal(arena, sort_threads)]
         }
         fn sorts_in_parallel(&self, _sort_threads: usize) -> bool {
             self.parallel

@@ -621,6 +621,37 @@ pub fn queryname_chunk_from_qn_refs<C: QnComparator>(
     InMemoryChunk::from_parts(arena, refs)
 }
 
+/// The final run of a spilled sort as `pieces` pre-sorted chunks: `refs` split
+/// into contiguous input-order ranges, each sorted by [`cmp_qn_refs`] (a total
+/// order — ties break by arena offset, so each range's sort is stable), the
+/// ranges in parallel on the current rayon pool. Each range is copied into its
+/// own exactly-sized chunk over `arena` and `refs` is freed before returning,
+/// so the pieces hold the run's only ref bytes (splitting the Vec instead
+/// would leave the first piece owning the whole run's allocation). An empty
+/// `refs` yields no chunks.
+#[must_use]
+pub fn queryname_chunks_from_qn_refs<C: QnComparator>(
+    table: &QnClassTable,
+    arena: &Arc<PooledSegmentedBuf>,
+    mut refs: Vec<QnRef>,
+    stats: Option<&QnCmpStats>,
+    pieces: usize,
+) -> Vec<InMemoryChunk<QnKey>> {
+    use rayon::prelude::*;
+    let size = crate::ref_sort::piece_len(refs.len(), pieces);
+    let piece = |range: &mut [QnRef]| {
+        match stats {
+            Some(stats) => {
+                range.sort_unstable_by(|a, b| cmp_qn_refs::<C, true>(table, arena, stats, a, b));
+            }
+            None => range
+                .sort_unstable_by(|a, b| cmp_qn_refs::<C, false>(table, arena, &UNCOUNTED, a, b)),
+        }
+        InMemoryChunk::from_parts(Arc::clone(arena), range.to_vec())
+    };
+    refs.par_chunks_mut(size).map(piece).collect()
+}
+
 impl ChunkRef<RawQuerynameLexKey> for QnKey {
     #[inline]
     fn merge_key(&self, body: &[u8]) -> RawQuerynameLexKey {
@@ -1230,6 +1261,44 @@ mod tests {
         let s = stats.snapshot();
         assert!(s.window + s.cross_class > 0, "the sort counted its compares");
         assert!(s.arena_fallbacks > 0, "names with tails past the window fall back: {s:?}");
+    }
+
+    /// The final run's pieces are exactly sized and together hold the run's
+    /// refs once: the original allocation (here twice the refs) is freed, not
+    /// kept by the first piece. Each piece is its range in owned-key order.
+    #[rstest]
+    fn pieces_hold_the_refs_once(#[values(2, 3, 8)] pieces: usize) {
+        let bodies: Vec<Vec<u8>> = (0..1_001u32)
+            .map(|i| body_named(format!("r{}", (i * 7_919) % 1_001).as_bytes(), 0x41))
+            .collect();
+        let (arena, spans) = arena_of(&bodies);
+        let table = QnClassTable::new();
+        let mut refs: Vec<QnRef> = Vec::with_capacity(2 * spans.len());
+        refs.extend(spans.iter().map(|&(o, l)| {
+            QnRefBuilder::default().build(
+                &table,
+                &mut QnBatchLcp::default(),
+                arena_body(&arena, &(QnKey::default(), o, l)),
+                o,
+                l,
+            )
+        }));
+        let size = crate::ref_sort::piece_len(refs.len(), pieces);
+        let mut expected = refs.clone();
+        for range in expected.chunks_mut(size) {
+            range.sort_by(|a, b| owned_order::<QnLex>(&arena, a, b));
+        }
+        let chunks = queryname_chunks_from_qn_refs::<QnLex>(&table, &arena, refs, None, pieces);
+        assert_eq!(chunks.len(), 1_001usize.div_ceil(size));
+        let mut at = 0;
+        for chunk in &chunks {
+            assert_eq!(chunk.records_capacity(), chunk.len(), "a piece holds no spare capacity");
+            for i in 0..chunk.len() {
+                assert_eq!(chunk.record_bytes(i), arena_body(&arena, &expected[at + i]));
+            }
+            at += chunk.len();
+        }
+        assert_eq!(at, 1_001);
     }
 
     /// Exact ties — one name, one flag class — come out in ascending arena

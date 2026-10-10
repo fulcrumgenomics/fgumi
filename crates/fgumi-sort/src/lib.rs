@@ -264,8 +264,10 @@ pub use inline::{
     CbKey32, ChunkRef, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef,
     SORT_SEGMENT_SIZE, TemplateKey, TemplateKey24, TemplateLaneKey, TemplateRecordRef, TertKey32,
     extract_coordinate_key_inline, radix_sort_record_refs, radix_sort_record_refs_with_max,
-    radix_sort_template_refs, sort_template_refs_into_records,
 };
+/// The template run sort's kernels, for the `seal_allocations` test.
+#[cfg(feature = "test-utils")]
+pub use inline::{radix_sort_template_refs, sort_template_refs_into_records};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
@@ -279,14 +281,15 @@ pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use queryname_ref::{
     QN_CLASS_BATCH_RECORDS, QN_MAX_CLASSES, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
     QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, cmp_qn_refs,
-    queryname_chunk_from_qn_refs,
+    queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs,
 };
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
 };
 pub use ref_sort::{
-    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, radix_sorts_in_parallel,
+    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, coordinate_chunks_from_refs,
+    radix_sorts_in_parallel,
 };
 pub use run_bound::{RunBound, format_run_formation};
 pub use run_consolidate::{
@@ -301,7 +304,7 @@ pub use spill_block::{
 pub use spill_block_reader::{RawBlock, SpillBlockDecompressor};
 pub use template_arena::{
     TemplateArenaAccumulator, TemplateArenaRefs, TemplateMemChunk, seal_template_refs,
-    template_chunk_from_arena_refs,
+    seal_template_refs_pieces, template_chunk_from_arena_refs,
 };
 pub use template_key::{ExtractedRefs, KeyViolation, TemplateKeyContext, TemplateKeySeed};
 pub use tmp_dir_alloc::TmpDirAllocator;

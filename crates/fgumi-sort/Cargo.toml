@@ -84,6 +84,11 @@ tempfile = { workspace = true }
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
+[[test]]
+name = "seal_allocations"
+# The template run-sort kernels it measures are `test-utils` exports.
+required-features = ["test-utils"]
+
 [[bench]]
 name = "chunk_sorter"
 harness = false

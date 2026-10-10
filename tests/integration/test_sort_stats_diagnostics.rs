@@ -492,16 +492,18 @@ fn records_merged(stderr: &str) -> Option<u64> {
 }
 
 /// An in-memory sort never builds a merge driver, so under `--sort-stats` it
-/// prints no `Merge output:` line.
-#[test]
-fn fast_path_sort_prints_no_merge_output_line() {
-    let stderr = sort_and_capture_logs(4, "768M", &["--sort-stats"]);
+/// prints no `Merge output:` line — at any thread count: only a sort that
+/// spilled splits its final run into pieces, so the fast path survives.
+#[rstest]
+fn fast_path_sort_prints_no_merge_output_line(#[values("1", "4")] threads: &str) {
+    let stderr = sort_and_capture_logs(4, "768M", &["--sort-stats", "--threads", threads]);
     assert!(
         !stderr.contains("Spill runs:"),
         "fixture unexpectedly spilled; this case must exercise the fast path:\n{stderr}"
     );
     assert!(stderr.contains(FAST_PATH_DIAG_SUBSTRING), "the fast path must run:\n{stderr}");
     assert!(!stderr.contains("Merge output:"), "no merge driver ran:\n{stderr}");
+    assert!(!stderr.contains(MERGE_DIAG_SUBSTRING), "no k-way merge ran:\n{stderr}");
 }
 
 /// `Byte fetch (input):` is gated on `--sort-stats` on the native input path

@@ -38,7 +38,7 @@ use crate::external::{KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, viol
 use crate::frame_keyed_record_into;
 use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
-    TemplateRecordRef, TertKey32, sort_template_refs_into_records,
+    TemplateRecordRef, TertKey32, sort_template_refs_into_pieces, sort_template_refs_into_records,
 };
 use crate::run_bound::RunBound;
 use crate::sort_pool::BoundedSortPool;
@@ -342,6 +342,40 @@ pub fn seal_template_refs(
     })
 }
 
+/// The final run of a spilled sort as `pieces` pre-sorted chunks of `refs`'s
+/// arm (see `sort_template_refs_into_pieces`), inside `pool.install`. The
+/// refs move out of `refs`, leaving it empty with its arm and no capacity. An
+/// empty `refs` yields one empty chunk of its arm — the carrier of the
+/// narrowed-lane variant.
+#[must_use]
+pub fn seal_template_refs_pieces(
+    refs: &mut TemplateArenaRefs,
+    arena: &Arc<PooledSegmentedBuf>,
+    pool: &rayon::ThreadPool,
+    pieces: usize,
+) -> Vec<TemplateMemChunk> {
+    fn split<K: TemplateLaneKey>(
+        arena: &Arc<PooledSegmentedBuf>,
+        refs: &mut Vec<TemplateRecordRef<K>>,
+        pieces: usize,
+        wrap: fn(InMemoryChunk<K>) -> TemplateMemChunk,
+    ) -> Vec<TemplateMemChunk> {
+        if refs.is_empty() {
+            return vec![wrap(InMemoryChunk::from_parts(Arc::clone(arena), Vec::new()))];
+        }
+        sort_template_refs_into_pieces(std::mem::take(refs), pieces)
+            .into_iter()
+            .map(|records| wrap(InMemoryChunk::from_parts(Arc::clone(arena), records)))
+            .collect()
+    }
+    pool.install(move || match refs {
+        TemplateArenaRefs::K24(r) => split(arena, r, pieces, TemplateMemChunk::K24),
+        TemplateArenaRefs::Cb32(r) => split(arena, r, pieces, TemplateMemChunk::Cb32),
+        TemplateArenaRefs::Tert32(r) => split(arena, r, pieces, TemplateMemChunk::Tert32),
+        TemplateArenaRefs::K40(r) => split(arena, r, pieces, TemplateMemChunk::K40),
+    })
+}
+
 /// Arena-front template-coordinate accumulator: the template analogue of the
 /// owned [`TemplateChunkSorter`](crate::TemplateChunkSorter), accumulating
 /// arena-pointing refs instead of copying records. Produces byte-identical
@@ -452,6 +486,27 @@ impl TemplateArenaAccumulator {
         };
         let pool = self.sort_pool.bounded(sort_threads);
         seal_template_refs(refs, arena, sort_threads, pool)
+    }
+
+    /// Seal the current run as `pieces` pre-sorted chunks (see
+    /// [`seal_template_refs_pieces`]) on the bounded pool at `sort_threads`.
+    /// Unprovisioned (no record yet): one empty full-width chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bounded sort rayon pool cannot be built.
+    #[must_use]
+    pub fn seal_pieces(
+        &mut self,
+        arena: &Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<TemplateMemChunk> {
+        let Some((_, refs)) = self.state.as_mut() else {
+            return vec![TemplateMemChunk::K40(InMemoryChunk::default())];
+        };
+        let pool = self.sort_pool.bounded(sort_threads);
+        seal_template_refs_pieces(refs, arena, pool, pieces)
     }
 }
 

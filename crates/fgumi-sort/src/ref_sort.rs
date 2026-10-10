@@ -183,6 +183,40 @@ pub fn coordinate_chunk_from_refs(
     InMemoryChunk::from_parts(arena, records)
 }
 
+/// The final run of a spilled sort as `pieces` pre-sorted chunks: `refs` split
+/// into contiguous input-order ranges (`piece_len`), each radix-sorted
+/// (serially, the ranges in parallel on the current rayon pool) into its own
+/// exactly-sized chunk over `arena`. `refs` is freed before returning, so the
+/// pieces hold the run's only ref bytes. An empty `refs` yields no chunks.
+#[must_use]
+pub fn coordinate_chunks_from_refs(
+    arena: &Arc<PooledSegmentedBuf>,
+    mut refs: Vec<RecordRef>,
+    pieces: usize,
+) -> Vec<InMemoryChunk<RawCoordinateKey>> {
+    use rayon::prelude::*;
+    let size = piece_len(refs.len(), pieces);
+    refs.par_chunks_mut(size)
+        .map(|range| {
+            sort_coordinate_refs(range, 1);
+            let records = range
+                .iter()
+                .map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len))
+                .collect();
+            InMemoryChunk::from_parts(Arc::clone(arena), records)
+        })
+        .collect()
+}
+
+/// The length of each of a run's `pieces` contiguous input-order ranges (the
+/// last may be shorter): `⌈len / pieces⌉`, at least 1. Every order's
+/// final-run split uses it, so the split is a function of `len` and the
+/// configured width alone.
+#[must_use]
+pub(crate) fn piece_len(len: usize, pieces: usize) -> usize {
+    len.div_ceil(pieces.max(1)).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +351,20 @@ mod tests {
         assert_eq!(chunk.len(), n);
         assert!(std::ptr::eq(chunk.records_ptr().cast::<u8>(), at), "the tuples reuse the refs");
         assert!((1..n).all(|i| chunk.key_at(i - 1).sort_key <= chunk.key_at(i).sort_key), "sorted");
+    }
+
+    /// The final run's pieces are exactly sized: the original allocation (here
+    /// twice the refs) is freed, not kept beside them.
+    #[test]
+    fn pieces_hold_the_refs_once() {
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(2_006);
+        refs.extend((0..1_003u64).map(|i| RecordRef::new(1_003 - i, i, 1)));
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default()));
+        let chunks = coordinate_chunks_from_refs(&arena, refs, 4);
+        assert_eq!(chunks.iter().map(InMemoryChunk::len).collect::<Vec<_>>(), [251, 251, 251, 250]);
+        for chunk in &chunks {
+            assert_eq!(chunk.records_capacity(), chunk.len(), "a piece holds no spare capacity");
+        }
     }
 
     use proptest::prelude::*;

@@ -674,7 +674,7 @@ estimate: a run of much shorter records than the previous one holds more refs
 than `w × cap / m`. The published `run_bytes` span complete records only (no
 BAM header, no carried tail), so `m` is exact. Every seal moves the run's refs
 into its chunk (in place for coordinate and serial template sorts; the parallel
-template merge copies once and frees the refs), so a
+template merge and the final run's pieces copy once and free the refs), so a
 run's refs are resident once, never beside a retained buffer while the chunk
 spills or through the merge. `SortBuffer` charges each record its strategy's
 exact ref width. Queue memory and the merge's spill read-ahead are separate
@@ -682,8 +682,9 @@ budgets.
 
 Coordinate (`FindCoordinateBoundaries` → `ExtractCoordinateKeys` →
 `SortCoordinateRun`) extracts 24-byte `RecordRef`s and radix-sorts each run;
-the radix spawns its own `sort_threads` threads, so the bounded pool the trait
-hands it is unused. The single-step front these replace is gone; SAM and fused
+the radix spawns its own `sort_threads` threads, so a whole-run seal leaves the
+bounded pool the trait hands it unused; the final run's pieces after a spill
+(`seal_pieces`) sort on it. The single-step front these replace is gone; SAM and fused
 inputs still sort through `SortBuffer` and its per-order `ArenaSortStrategy`.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)

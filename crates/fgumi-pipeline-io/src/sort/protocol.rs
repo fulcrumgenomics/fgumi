@@ -219,10 +219,15 @@ pub enum SortChunkEvent {
     /// which block.
     Spill { seq: u32, chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// A sorted in-memory residual chunk to pass straight through as a
-    /// `SortPhase1Event::MemoryChunk` — no disk round-trip (the fast path).
+    /// `SortPhase1Event::MemoryChunk` — no disk round-trip. A sort that never
+    /// spilled seals its one run as one residual (the merge's single-chunk fast
+    /// path); a sort that spilled seals its final run as one residual per
+    /// pre-sorted piece (contiguous input ranges, emitted in input order, so
+    /// the merge keeps ties stable).
     Residual { chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// Terminal sentinel carrying the final counts (number of `Spill` chunks =
-    /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`).
+    /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`: one
+    /// without spills, the final run's piece count with them).
     /// Forwarded verbatim to `SortPhase1Event::AllAnnounced`.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }

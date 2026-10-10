@@ -53,8 +53,9 @@ use fgumi_sort::{
     BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf, QnBatchLcp,
     QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, RecordRef,
     TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateKeyVariant, TemplateMemChunk,
-    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
-    radix_sorts_in_parallel, seal_template_refs,
+    coordinate_chunk_from_refs, coordinate_chunks_from_refs, extract_coordinate_key_inline,
+    queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs, radix_sorts_in_parallel,
+    seal_template_refs, seal_template_refs_pieces,
 };
 use log::{debug, info};
 
@@ -130,6 +131,18 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
         sort_threads: usize,
         pool: &BoundedSortPool,
     ) -> MemoryChunkErased;
+    /// Seal the final run of a sort that spilled as `pieces` pre-sorted chunks
+    /// over contiguous input-order ranges of `acc`, sorted in parallel at
+    /// `sort_threads` on the order's pool, leaving `acc` empty. An empty `acc`
+    /// always seals one chunk.
+    fn seal_pieces(
+        acc: &mut Self::Accum,
+        ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased>;
     /// The chunk a run sort that saw no record at all seals to.
     fn empty_chunk() -> MemoryChunkErased;
     /// The bounded sort pool's thread-name prefix.
@@ -1038,17 +1051,31 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
             let records: u64 = self.run_batches.iter().map(|(n, _)| n).sum();
             ledger.publish_seal(end.run_bytes, records);
         }
-        let chunk = match self.ctx.as_ref() {
+        // The final run of a sort that spilled is sealed as `sort_threads`
+        // pieces: the k-way merge interleaves them with the spills anyway, and
+        // the pieces sort in parallel. The piece count is the configured width,
+        // so the split is deterministic. A sort that never spilled keeps one
+        // chunk (the merge's single-chunk fast path).
+        let pieces = if !end.seals_to_spill && self.spilled_run_count > 0 && self.sort_threads > 1 {
+            self.sort_threads
+        } else {
+            1
+        };
+        let chunks = match self.ctx.as_ref() {
             Some(ctx) => {
                 let acc = self.acc.get_or_insert_with(|| X::accum_for(ctx));
-                let parallel = X::sorts_in_parallel(acc, self.sort_threads);
+                let parallel = pieces > 1 || X::sorts_in_parallel(acc, self.sort_threads);
                 // With a phase-1 cap, a parallel sort holds the whole cap: new pool
                 // admissions are refused while it waits, and it sorts at the full
                 // phase width.
                 let _whole = reserve_for_run_sort(self.cap.as_deref(), parallel)?;
-                X::seal(acc, ctx, arena, self.sort_threads, &self.pool)
+                if pieces > 1 {
+                    X::seal_pieces(acc, ctx, arena, self.sort_threads, &self.pool, pieces)
+                } else {
+                    vec![X::seal(acc, ctx, arena, self.sort_threads, &self.pool)]
+                }
             }
-            None => X::empty_chunk(),
+            None => vec![X::empty_chunk()],
         };
         for (n, keyed_at) in self.run_batches.drain(..) {
             if keyed_at < end.scan_end {
@@ -1064,6 +1091,7 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         let seq = self.next_seq;
         self.next_seq += 1;
         if end.seals_to_spill {
+            let chunk = chunks.into_iter().next().expect("a spilled run seals one chunk");
             self.pending.push_back(SortChunkEvent::Spill {
                 seq,
                 chunk,
@@ -1071,13 +1099,16 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
             });
             self.spilled_run_count += 1;
         } else {
-            self.pending.push_back(SortChunkEvent::Residual {
-                chunk,
-                records_ingested_so_far: end.records_ingested_so_far,
-            });
+            let memory_chunk_count = u32::try_from(chunks.len()).expect("pieces fit u32");
+            for chunk in chunks {
+                self.pending.push_back(SortChunkEvent::Residual {
+                    chunk,
+                    records_ingested_so_far: end.records_ingested_so_far,
+                });
+            }
             self.pending.push_back(SortChunkEvent::AllAnnounced {
                 slot_count: self.spilled_run_count,
-                memory_chunk_count: 1,
+                memory_chunk_count,
                 total_records: end.records_ingested_so_far,
             });
             self.finalized = true;
@@ -1257,6 +1288,20 @@ impl ArenaKeyExtractor for TemplateKeys {
         ))
     }
 
+    fn seal_pieces(
+        acc: &mut Self::Accum,
+        _ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        seal_template_refs_pieces(acc, &arena, pool.bounded(sort_threads), pieces)
+            .into_iter()
+            .map(MemoryChunkErased::TemplateCoordinate)
+            .collect()
+    }
+
     fn empty_chunk() -> MemoryChunkErased {
         MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K40(InMemoryChunk::default()))
     }
@@ -1354,8 +1399,8 @@ pub struct CoordinateCtx {
 /// arena offset and length) per record, radix-sorted at seal.
 ///
 /// The radix spawns exactly `sort_threads` threads itself, so the bounded pool
-/// the trait hands `seal` is unused for coordinate order; the trait stays
-/// uniform across orders.
+/// the trait hands `seal` is unused for coordinate order (the trait stays
+/// uniform across orders); `seal_pieces` sorts the final run's pieces on it.
 pub struct CoordinateKeys;
 
 impl ArenaKeyExtractor for CoordinateKeys {
@@ -1434,6 +1479,24 @@ impl ArenaKeyExtractor for CoordinateKeys {
             std::mem::take(acc),
             sort_threads,
         ))
+    }
+
+    fn seal_pieces(
+        acc: &mut Self::Accum,
+        ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        if acc.is_empty() {
+            return vec![Self::seal(acc, ctx, arena, sort_threads, pool)];
+        }
+        pool.bounded(sort_threads)
+            .install(|| coordinate_chunks_from_refs(&arena, std::mem::take(acc), pieces))
+            .into_iter()
+            .map(MemoryChunkErased::Coordinate)
+            .collect()
     }
 
     fn empty_chunk() -> MemoryChunkErased {
@@ -1565,6 +1628,33 @@ impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
         pool.bounded(sort_threads).install(move || {
             C::wrap(queryname_chunk_from_qn_refs::<C>(&ctx.table, arena, refs, ctx.compare_stats()))
         })
+    }
+
+    fn seal_pieces(
+        acc: &mut Self::Accum,
+        ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        if acc.is_empty() {
+            return vec![Self::seal(acc, ctx, arena, sort_threads, pool)];
+        }
+        let refs = std::mem::take(acc);
+        pool.bounded(sort_threads)
+            .install(move || {
+                queryname_chunks_from_qn_refs::<C>(
+                    &ctx.table,
+                    &arena,
+                    refs,
+                    ctx.compare_stats(),
+                    pieces,
+                )
+            })
+            .into_iter()
+            .map(C::wrap)
+            .collect()
     }
 
     fn empty_chunk() -> MemoryChunkErased {

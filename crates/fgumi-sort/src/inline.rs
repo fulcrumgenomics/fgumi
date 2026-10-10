@@ -108,6 +108,13 @@ impl<K> InMemoryChunk<K> {
         Self { data: Arc::new(PooledSegmentedBuf::unpooled(data)), records }
     }
 
+    /// Records the chunk's tuple Vec holds without reallocating (tests that
+    /// assert a seal leaves no spare ref capacity resident).
+    #[cfg(test)]
+    pub(crate) fn records_capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
     /// Number of records in the chunk.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -2363,6 +2370,27 @@ pub fn sort_template_refs_into_records<K: TemplateLaneKey>(
     }
 }
 
+/// Split `refs` into `pieces` contiguous input-order ranges and sort each
+/// stably by key (the serial radix per range, the ranges in parallel on the
+/// current rayon pool), returning each range's exactly-sized `(key, offset,
+/// len)` tuples in input order of the ranges. `refs` is freed before
+/// returning, so the pieces hold the run's only ref bytes. An empty `refs`
+/// yields no pieces.
+#[must_use]
+pub(crate) fn sort_template_refs_into_pieces<K: TemplateLaneKey>(
+    mut refs: Vec<TemplateRecordRef<K>>,
+    pieces: usize,
+) -> Vec<Vec<(K, u64, u32)>> {
+    use rayon::prelude::*;
+    let size = crate::ref_sort::piece_len(refs.len(), pieces);
+    refs.par_chunks_mut(size)
+        .map(|range| {
+            radix_sort_template_refs(range);
+            range.iter().map(|r| (r.key, r.offset, r.len)).collect()
+        })
+        .collect()
+}
+
 /// The pre-fusion seal (sort the refs, then collect the tuples), kept as the
 /// fused seal's test oracle.
 #[cfg(test)]
@@ -4091,6 +4119,19 @@ mod tests {
             let got = sort_template_refs_into_records(input, 1);
             assert_eq!(got.len(), 1_000);
             assert!(std::ptr::eq(got.as_ptr().cast::<u8>(), at), "the tuples reuse the refs");
+        }
+
+        /// Pieces are exactly sized: together they hold the run's refs once.
+        #[test]
+        fn pieces_are_exactly_sized() {
+            let input = refs(1_003, 11);
+            let mut big = Vec::with_capacity(4 * input.len());
+            big.extend_from_slice(&input);
+            let pieces = sort_template_refs_into_pieces(big, 4);
+            assert_eq!(pieces.iter().map(Vec::len).collect::<Vec<_>>(), [251, 251, 251, 250]);
+            for piece in &pieces {
+                assert_eq!(piece.capacity(), piece.len(), "a piece holds no spare capacity");
+            }
         }
     }
 }
