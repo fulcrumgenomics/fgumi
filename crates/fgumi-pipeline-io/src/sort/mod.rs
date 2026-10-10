@@ -2,7 +2,8 @@
 
 /// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
 /// the serial phase-1 coordination steps (`ReadBlocks` admit, `FindBoundariesAndSort`
-/// sort/seal, `SpillGather` framing) plus the phase-2 `SortMerge`. One dedicated
+/// sort/seal, `SpillGather` range planning — the pool frames and compresses the
+/// ranges) plus the phase-2 `SortMerge`. One dedicated
 /// thread runs all of them off the pool — the true N+2 model (mirrors main's
 /// single main thread). Phase 1 and phase 2 are temporally disjoint, so the
 /// coordination steps finish and leave the driver's live set before the merge
@@ -34,7 +35,7 @@ pub use arena_ingest::{
 };
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
-pub use spill_block_compress::SpillBlockCompress;
+pub use spill_block_compress::{SpillBlockCompress, SpillBufPool};
 pub use spill_decompress::SortSpillDecompress;
 pub use spill_gather::SpillGather;
 pub use spill_read_planner::SpillReadPlanner;

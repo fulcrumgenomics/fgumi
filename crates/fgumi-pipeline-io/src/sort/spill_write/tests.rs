@@ -676,3 +676,106 @@ fn try_run_bumps_spill_bytes_written_counter() {
 
     std::fs::remove_dir_all(&telemetry_dir).ok();
 }
+
+/// `SpillBlockCompress` turns every range into a compressed block, so a range
+/// reaching the writer is a wiring defect: it fails closed rather than write
+/// unframed record indices as spill bytes.
+#[test]
+fn spill_write_rejects_an_unframed_range() {
+    let (mut w, _dir) = make_writer(SpillCodec::Zstd);
+    let chunk = MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(vec![(
+        RawCoordinateKey { sort_key: 1 },
+        vec![7u8; 10],
+    )]));
+    let range = SpillBlockEvent::Range {
+        ordinal: 0,
+        file_id: 0,
+        key_kind: SpillKeyKind::Coordinate,
+        is_last_in_file: false,
+        records_ingested_so_far: 1,
+        chunk: Arc::new(chunk),
+        start: 0,
+        end: 1,
+        framed_bytes: 14,
+        frame_bytes: 0,
+    };
+    let err = w.process_event(range).expect_err("a range must not reach the writer");
+    assert!(err.to_string().contains("unframed Range"), "got: {err}");
+}
+
+/// `n` mid-file blocks of file 0, each compressing `raw_len` bytes:
+/// incompressible bytes when `noise`, so a block is about `raw_len` on disk.
+fn mid_file_blocks(n: usize, raw_len: usize, noise: bool) -> VecDeque<SpillBlockEvent> {
+    let codec = SpillCodec::Zstd;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut byte = move |i: usize| {
+        if !noise {
+            return u8::try_from(i % 251).unwrap();
+        }
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.to_le_bytes()[0]
+    };
+    (0..n)
+        .map(|i| {
+            let raw: Vec<u8> = (0..raw_len).map(|_| byte(i)).collect();
+            block(codec, 0, false, &raw)
+        })
+        .collect()
+}
+
+/// One `try_run` writes a batch: up to `WRITE_BLOCKS_PER_CALL` blocks, ending
+/// early after a file's last block, once `WRITE_BYTES_PER_CALL` bytes are
+/// written, or when the input runs dry. The bytes it reports are exactly those
+/// of the blocks it consumed.
+#[rstest]
+#[case::count_cap(WRITE_BLOCKS_PER_CALL + 36, None, 32, false, WRITE_BLOCKS_PER_CALL)]
+#[case::last_block_ends_the_batch(100, Some(10), 32, false, 11)]
+#[case::input_runs_dry(5, None, 32, false, 5)]
+#[case::byte_cap(12, None, 1 << 20, true, 8)]
+fn a_write_batch_stops_at_its_caps_and_at_a_files_last_block(
+    #[case] n: usize,
+    #[case] last_at: Option<usize>,
+    #[case] raw_len: usize,
+    #[case] noise: bool,
+    #[case] expected: usize,
+) {
+    let (mut w, _dir) = make_writer(SpillCodec::Zstd);
+    let mut input = mid_file_blocks(n, raw_len, noise);
+    if let Some(i) = last_at
+        && let SpillBlockEvent::Block { is_last_in_file, .. } = &mut input[i]
+    {
+        *is_last_in_file = true;
+    }
+    let total = input.len();
+    let expected_bytes: u64 = input
+        .iter()
+        .take(expected)
+        .map(|e| match e {
+            SpillBlockEvent::Block { bytes, .. } => bytes.len() as u64,
+            _ => 0,
+        })
+        .sum();
+    let first = input.pop_front().unwrap();
+    let written = w.write_batch(first, || input.pop_front()).unwrap();
+    assert_eq!(total - input.len(), expected, "events consumed by one batch");
+    assert_eq!(written, expected_bytes, "the batch reports the bytes it wrote");
+}
+
+/// The writer hands each written block's buffer back to the shared pool, and
+/// the pool keeps at most its cap of cleared buffers.
+#[test]
+fn written_block_buffers_return_to_the_pool() {
+    let codec = SpillCodec::Zstd;
+    let pool = SpillBufPool::new();
+    let (w, _dir) = make_writer(codec);
+    let mut w = w.with_buf_pool(Arc::clone(&pool));
+    let event = block(codec, 0, false, &[7u8; 300]);
+    let SpillBlockEvent::Block { bytes, .. } = &event else { unreachable!() };
+    let ptr = bytes.as_ptr();
+    w.process_event(event).unwrap();
+    let reused = pool.take();
+    assert_eq!(reused.as_ptr(), ptr, "the written block's buffer is reused");
+    assert!(reused.is_empty() && reused.capacity() > 0, "cleared, capacity kept");
+}

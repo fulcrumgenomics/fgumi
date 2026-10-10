@@ -4061,8 +4061,12 @@ impl<'a> ChainBuilder<'a> {
                 // head, so it never contends a pool worker — the driver frames the
                 // just-sorted chunk into blocks while the pool inflates/compresses.
                 let serialize = SpillGather::new(byte_limit);
+                // Compressed spill-block buffers circulate compress -> write ->
+                // compress instead of being allocated per block.
+                let spill_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();
                 let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit)
-                    .with_phase_cap(phase1_cap.clone());
+                    .with_phase_cap(phase1_cap.clone())
+                    .with_buf_pool(Arc::clone(&spill_bufs));
                 // `--max-temp-files` bounds the live spill runs: `SpillWrite`
                 // consolidates runs (at the spill compression level) whenever the
                 // limit would be exceeded, so the merge never opens more files than
@@ -4073,7 +4077,8 @@ impl<'a> ChainBuilder<'a> {
                 }
                 let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs)
                     .with_max_temp_files(resolved_max_temp_files, temp_compression)
-                    .with_stats(spill_stats);
+                    .with_stats(spill_stats)
+                    .with_buf_pool(spill_bufs);
                 // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
                 // detach the spill writer onto its own dedicated thread as well,
                 // so the single serial spill-write stream stops occupying a pool

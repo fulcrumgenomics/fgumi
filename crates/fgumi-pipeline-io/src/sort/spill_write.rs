@@ -59,6 +59,7 @@ use tempfile::TempDir;
 
 use crate::sort::protocol::{SortPhase1Event, SpillBlockEvent};
 use crate::sort::run_stack::{RunStack, SpillRun};
+use crate::sort::spill_block_compress::SpillBufPool;
 use fgumi_pipeline_core::{
     HeldRetry, Unpushed,
     held::HeldSlot,
@@ -85,6 +86,19 @@ const CONSOLIDATION_RECORDS_PER_CALL: usize = 16 * 1024;
 /// of 100 kb reads is ~1.6 GB to decompress and recompress), and a step that
 /// reports no progress for long enough is cancelled as wedged.
 const CONSOLIDATION_BYTES_PER_CALL: u64 = 8 * 1024 * 1024;
+
+/// Spill blocks written per `try_run`, whichever of this and
+/// [`WRITE_BYTES_PER_CALL`] is reached first. One block per call made the
+/// serial writer the phase-1 spill bound: ~12 µs of dispatch, reorder pop and
+/// wake per ~9 KiB block capped it near 750 MB/s while ingest waited for the
+/// arena. A batch stops at a file's last block, so run closing and
+/// consolidation still happen between calls.
+const WRITE_BLOCKS_PER_CALL: usize = 64;
+
+/// Compressed bytes written per `try_run` (see [`WRITE_BLOCKS_PER_CALL`]):
+/// ~10 ms of page-cache writes, short enough that the detached writer still
+/// reports progress promptly.
+const WRITE_BYTES_PER_CALL: u64 = 8 * 1024 * 1024;
 
 /// Spill-run accounting shared with the end-of-run sort summary.
 #[derive(Debug, Default)]
@@ -212,9 +226,20 @@ pub struct SpillWrite {
     /// serial write stream stops consuming a compute worker that could be
     /// compressing. Every other chain leaves it `false`.
     detached: bool,
+    /// Where each written block's buffer is returned for reuse by
+    /// `SpillBlockCompress` (`None`: dropped).
+    buf_pool: Option<Arc<SpillBufPool>>,
 }
 
 impl SpillWrite {
+    /// Return each written block's buffer to `pool` (shared with
+    /// `SpillBlockCompress`).
+    #[must_use]
+    pub fn with_buf_pool(mut self, pool: Arc<SpillBufPool>) -> Self {
+        self.buf_pool = Some(pool);
+        self
+    }
+
     /// Build a `SpillWrite`. `alloc` names spill files across the configured temp
     /// dirs; `codec` selects the on-disk format; `temp_dirs` holds the RAII
     /// handles alive for the step's lifetime. `output_byte_limit` byte-bounds the
@@ -247,6 +272,7 @@ impl SpillWrite {
                 .with_interval(256 * 1024 * 1024),
             temp_dirs,
             detached: false,
+            buf_pool: None,
         }
     }
 
@@ -325,7 +351,7 @@ impl SpillWrite {
     /// while one is open without an intervening `is_last_in_file` — a
     /// framework-ordering invariant violation that must fail loud rather than
     /// corrupt a spill — or if runs of one sort disagree on their key type.
-    fn process_event(&mut self, event: SpillBlockEvent) -> io::Result<()> {
+    pub(crate) fn process_event(&mut self, event: SpillBlockEvent) -> io::Result<()> {
         if self.announced {
             // The runs were handed downstream at `AllAnnounced`; anything after
             // it would be written to a stack nobody reads.
@@ -334,6 +360,9 @@ impl SpillWrite {
             ));
         }
         match event {
+            SpillBlockEvent::Range { .. } => Err(io::Error::other(
+                "SpillWrite received an unframed Range; SpillBlockCompress frames every range",
+            )),
             SpillBlockEvent::Block {
                 file_id,
                 key_kind,
@@ -364,6 +393,9 @@ impl SpillWrite {
                 }
                 open.writer.write_all(&bytes)?;
                 self.spill_progress.log_if_needed(bytes.len() as u64);
+                if let Some(pool) = &self.buf_pool {
+                    pool.give(bytes);
+                }
 
                 if is_last_in_file {
                     self.close_run(records_ingested_so_far)?;
@@ -392,6 +424,53 @@ impl SpillWrite {
 
     /// Finish the open spill file, record it as a live run, and start a
     /// consolidation if the policy now calls for one.
+    /// Process `first` and then events from `next` as one batch, returning the
+    /// spill bytes written (only `Block` carries any). A batch holds at most
+    /// [`WRITE_BLOCKS_PER_CALL`] events and stops once it has written
+    /// [`WRITE_BYTES_PER_CALL`] bytes, and it ends after any event that is not a
+    /// mid-file `Block`: a file's last block (which closes the run and may start
+    /// a consolidation), a residual or `AllAnnounced` (which queue output). It
+    /// also ends as soon as output is queued or a consolidation is in flight, so
+    /// `try_run` handles those before writing more.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::process_event`] errors.
+    fn write_batch(
+        &mut self,
+        first: SpillBlockEvent,
+        mut next: impl FnMut() -> Option<SpillBlockEvent>,
+    ) -> io::Result<u64> {
+        let mut spill_bytes: u64 = 0;
+        let mut events = 0usize;
+        let mut event = first;
+        loop {
+            let (len, continues) = match &event {
+                SpillBlockEvent::Block { bytes, is_last_in_file, .. } => {
+                    (bytes.len() as u64, !*is_last_in_file)
+                }
+                SpillBlockEvent::Range { .. }
+                | SpillBlockEvent::Residual { .. }
+                | SpillBlockEvent::AllAnnounced { .. } => (0, false),
+            };
+            self.process_event(event)?;
+            spill_bytes += len;
+            events += 1;
+            if !continues
+                || events >= WRITE_BLOCKS_PER_CALL
+                || spill_bytes >= WRITE_BYTES_PER_CALL
+                || !self.outbox.is_empty()
+                || self.active.is_some()
+            {
+                return Ok(spill_bytes);
+            }
+            match next() {
+                Some(following) => event = following,
+                None => return Ok(spill_bytes),
+            }
+        }
+    }
+
     fn close_run(&mut self, records_ingested_so_far: u64) -> io::Result<()> {
         let OpenSpill { file_id, key_kind, path, mut writer } =
             self.current.take().expect("open file present");
@@ -625,14 +704,9 @@ impl Step for SpillWrite {
         }
 
         if let Some(event) = ctx.input.pop() {
-            // One event per `try_run`, so this is already the batch total for
-            // this call. Only `Block` carries spill bytes; read its length
-            // before `process_event` consumes the event.
-            let spill_bytes = match &event {
-                SpillBlockEvent::Block { bytes, .. } => bytes.len() as u64,
-                SpillBlockEvent::Residual { .. } | SpillBlockEvent::AllAnnounced { .. } => 0,
-            };
-            self.process_event(event)?;
+            // A batch of blocks per call (see `write_batch`): one block per call
+            // made the per-dispatch cost, not the disk, the phase-1 spill bound.
+            let spill_bytes = self.write_batch(event, || ctx.input.pop())?;
             ctx.counters.add(SPILL_BYTES_WRITTEN, spill_bytes);
             return Ok(StepOutcome::Progress);
         }

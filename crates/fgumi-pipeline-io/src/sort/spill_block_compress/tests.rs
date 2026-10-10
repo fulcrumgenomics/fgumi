@@ -202,3 +202,200 @@ fn capped_step_follows_the_admission_contract() {
         },
     );
 }
+
+/// A coordinate chunk of `n` records with bodies of varied length.
+fn range_chunk(n: u64) -> Arc<MemoryChunkErased> {
+    let recs = (0..n)
+        .map(|k| {
+            (
+                RawCoordinateKey { sort_key: k },
+                vec![u8::try_from(k % 200).unwrap(); 20 + usize::try_from(k * 7 % 60).unwrap()],
+            )
+        })
+        .collect();
+    Arc::new(MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(recs)))
+}
+
+fn range(chunk: &Arc<MemoryChunkErased>, ordinal: u64, start: u64, end: u64) -> SpillBlockEvent {
+    let framed_bytes =
+        (start..end).map(|i| chunk.framed_len(usize::try_from(i).unwrap())).sum::<usize>();
+    SpillBlockEvent::Range {
+        ordinal,
+        file_id: 3,
+        key_kind: chunk.key_kind(),
+        is_last_in_file: false,
+        records_ingested_so_far: 99,
+        chunk: Arc::clone(chunk),
+        start,
+        end,
+        framed_bytes: u32::try_from(framed_bytes).unwrap(),
+        frame_bytes: 0,
+    }
+}
+
+/// A range compresses to exactly the bytes its framed block compresses to, and
+/// keeps its routing.
+#[rstest]
+#[case(SpillCodec::Zstd)]
+#[case(SpillCodec::Bgzf)]
+fn range_compresses_byte_identically_to_the_framed_block(#[case] codec: SpillCodec) {
+    let chunk = range_chunk(40);
+    let mut framed = Vec::new();
+    for i in 5..31 {
+        chunk.frame_record_into(i, &mut framed).unwrap();
+    }
+    let mut step = SpillBlockCompress::new(codec, 1, 1 << 20);
+    let from_range = step.compress_event(range(&chunk, 7, 5, 31)).unwrap();
+    let from_block = SpillBlockCompress::new(codec, 1, 1 << 20)
+        .compress_event(SpillBlockEvent::Block {
+            ordinal: 7,
+            file_id: 3,
+            key_kind: SpillKeyKind::Coordinate,
+            is_last_in_file: false,
+            records_ingested_so_far: 99,
+            bytes: framed,
+        })
+        .unwrap();
+    let (
+        SpillBlockEvent::Block { ordinal, file_id, records_ingested_so_far, bytes: a, .. },
+        SpillBlockEvent::Block { bytes: b, .. },
+    ) = (from_range, from_block)
+    else {
+        panic!("both arms produce compressed blocks");
+    };
+    assert_eq!((ordinal, file_id, records_ingested_so_far), (7, 3, 99));
+    assert_eq!(a, b, "{codec:?}: a range compresses like its framed block");
+}
+
+/// One worker frames every range into the same scratch buffer: after the first
+/// block its address and capacity never change.
+#[test]
+fn the_raw_scratch_is_retained_across_blocks() {
+    let chunk = range_chunk(60);
+    let mut step = SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20);
+    step.compress_event(range(&chunk, 0, 0, 20)).unwrap();
+    let first = step.raw_scratch();
+    assert!(
+        first.1 >= fgumi_bgzf::BGZF_MAX_BLOCK_SIZE,
+        "the worker keeps a full-block scratch after compressing (capacity {})",
+        first.1
+    );
+    step.compress_event(range(&chunk, 1, 20, 40)).unwrap();
+    assert_eq!(step.raw_scratch(), first, "block 2 reused the scratch");
+    step.compress_event(range(&chunk, 2, 40, 60)).unwrap();
+    assert_eq!(step.raw_scratch(), first, "block 3 reused the scratch");
+}
+
+/// A range whose framing disagrees with the planner's `framed_bytes`, or whose
+/// end runs past the chunk, is an `io::Error` in every build, as the serial
+/// run-final path's `check_run_final_block` is, never a debug-only assert or a
+/// panic.
+#[rstest]
+#[case::framed_bytes_disagree(5, 31, 1)]
+#[case::end_past_the_chunk(5, 41, 0)]
+#[case::start_after_end(31, 5, 0)]
+fn a_range_the_planner_and_framing_disagree_on_is_an_error(
+    #[case] start: u64,
+    #[case] end: u64,
+    #[case] framed_bytes_off_by: u32,
+) {
+    let chunk = range_chunk(40);
+    let SpillBlockEvent::Range { framed_bytes, .. } = range(&chunk, 7, 5, 31) else {
+        unreachable!("range() builds a Range");
+    };
+    let event = SpillBlockEvent::Range {
+        ordinal: 7,
+        file_id: 3,
+        key_kind: chunk.key_kind(),
+        is_last_in_file: false,
+        records_ingested_so_far: 99,
+        chunk: Arc::clone(&chunk),
+        start,
+        end,
+        framed_bytes: framed_bytes + framed_bytes_off_by,
+        frame_bytes: 0,
+    };
+    let Err(err) = SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).compress_event(event)
+    else {
+        panic!("a disagreeing range must be rejected");
+    };
+    assert!(err.to_string().starts_with("SpillBlockCompress: "), "{err}");
+}
+
+/// A range spanning several frames compresses to exactly the concatenation of
+/// those frames compressed one range each: the planner's cut rule re-cuts it,
+/// and each frame stays an independent unit, so the spill bytes do not change.
+#[rstest]
+#[case(SpillCodec::Zstd)]
+#[case(SpillCodec::Bgzf)]
+fn a_multi_frame_range_compresses_like_its_frames_one_by_one(#[case] codec: SpillCodec) {
+    const FRAME: usize = 300;
+    let chunk = range_chunk(60);
+    let mut cuts = vec![2usize];
+    while *cuts.last().unwrap() < 55 {
+        let next =
+            crate::sort::spill_gather::plan_next_block(&chunk, *cuts.last().unwrap(), FRAME).0;
+        cuts.push(next.min(55));
+    }
+    assert!(cuts.len() > 3, "the range spans several frames: {cuts:?}");
+    let mut whole = range(&chunk, 7, 2, 55);
+    if let SpillBlockEvent::Range { frame_bytes, .. } = &mut whole {
+        *frame_bytes = u32::try_from(FRAME).unwrap();
+    }
+    let mut step = SpillBlockCompress::new(codec, 1, 1 << 20);
+    let SpillBlockEvent::Block { bytes: multi, ordinal, .. } = step.compress_event(whole).unwrap()
+    else {
+        panic!("a range compresses to a block");
+    };
+    let mut one_by_one = Vec::new();
+    for pair in cuts.windows(2) {
+        let event = range(&chunk, 0, pair[0] as u64, pair[1] as u64);
+        let SpillBlockEvent::Block { bytes, .. } = step.compress_event(event).unwrap() else {
+            panic!("a range compresses to a block");
+        };
+        one_by_one.extend_from_slice(&bytes);
+    }
+    assert_eq!(ordinal, 7);
+    assert_eq!(multi, one_by_one, "{codec:?}: a multi-frame range is its frames concatenated");
+}
+
+/// With a buffer pool, the compressed block is written into a recycled buffer.
+#[test]
+fn compressed_blocks_reuse_pooled_buffers() {
+    let pool = SpillBufPool::new();
+    let recycled = Vec::with_capacity(1 << 20);
+    let ptr = recycled.as_ptr();
+    pool.give(recycled);
+    let mut step =
+        SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).with_buf_pool(Arc::clone(&pool));
+    let chunk = range_chunk(40);
+    let SpillBlockEvent::Block { bytes, .. } =
+        step.compress_event(range(&chunk, 0, 0, 20)).unwrap()
+    else {
+        panic!("a range compresses to a block");
+    };
+    assert_eq!(bytes.as_ptr(), ptr, "the block reused the pooled buffer");
+    assert!(pool.take().capacity() == 0, "the pool's one buffer was taken");
+}
+
+/// The pool hands back what it was given (cleared), ignores empty buffers, and
+/// keeps at most `SPILL_BUF_POOL_CAP` buffers.
+#[test]
+fn the_buffer_pool_is_bounded_and_skips_empty_buffers() {
+    let pool = SpillBufPool::new();
+    pool.give(Vec::new());
+    assert_eq!(pool.take().capacity(), 0, "an unallocated buffer is not kept");
+    for _ in 0..SPILL_BUF_POOL_CAP + 10 {
+        pool.give(vec![1u8; 16]);
+    }
+    let mut kept = 0;
+    loop {
+        let buf = pool.take();
+        if buf.capacity() == 0 {
+            break;
+        }
+        assert!(buf.is_empty(), "a recycled buffer comes back cleared");
+        kept += 1;
+    }
+    assert_eq!(kept, SPILL_BUF_POOL_CAP);
+}

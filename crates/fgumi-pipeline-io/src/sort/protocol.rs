@@ -116,6 +116,42 @@ impl MemoryChunkErased {
         }
     }
 
+    /// The framed size of record `i` in a spill block — `[key][u32 len][body]`,
+    /// the key present only for template lanes — from the length index alone,
+    /// without touching the record body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    #[inline]
+    #[must_use]
+    pub fn framed_len(&self, i: usize) -> usize {
+        self.key_kind().serialized_key_bytes() + 4 + self.record_len(i) as usize
+    }
+
+    /// Append record `i` to `out` in the spill framing `[key][u32 len][body]`
+    /// (exactly [`Self::framed_len`] bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record is too long for its `u32` length prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    pub fn frame_record_into(&self, i: usize, out: &mut Vec<u8>) -> std::io::Result<()> {
+        match self {
+            Self::Coordinate(c) => {
+                fgumi_sort::frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
+            }
+            // Queryname keys are embedded in the record: no key bytes are framed.
+            Self::QuerynameLex(c) | Self::QuerynameNatural(c) => {
+                fgumi_sort::frame_embedded_record_into(out, c.record_bytes(i))
+            }
+            Self::TemplateCoordinate(c) => c.frame_record_into(i, out),
+        }
+    }
+
     /// The chunk's minimum sort key (its first record's) as an owned
     /// [`RunBound`], or `None` if the chunk is empty. Records are pre-sorted at seal, so this is
     /// `O(1)`. Used by the arena spill run-former to decide whether this chunk
@@ -236,6 +272,30 @@ impl SortChunkEvent {
 /// **contiguous** in the ordinal stream — so `SpillWrite` only ever has one
 /// spill file open at a time.
 pub enum SpillBlockEvent {
+    /// A planned raw block: records `[start, end)` of `chunk`, framed
+    /// `[key][u32 len][body]` and compressed by `SpillBlockCompress` in one
+    /// `try_run`, which turns it into a compressed [`Block`](Self::Block).
+    /// `framed_bytes` is the exact raw size the planner's cut rule computed.
+    /// Never the last block of its file: `SpillGather` frames a run's final
+    /// block itself and sends it as a raw `Block`.
+    ///
+    /// A range may span several spill frames: when `frame_bytes` is non-zero,
+    /// `SpillBlockCompress` re-cuts `[start, end)` with the planner's cut rule at
+    /// `frame_bytes` and compresses each frame independently, concatenating them
+    /// into one `Block`. The bytes on disk are identical to one range per frame;
+    /// only the number of pipeline items changes. `0` means one frame.
+    Range {
+        ordinal: u64,
+        file_id: u32,
+        key_kind: SpillKeyKind,
+        is_last_in_file: bool,
+        records_ingested_so_far: u64,
+        chunk: Arc<MemoryChunkErased>,
+        start: u64,
+        end: u64,
+        framed_bytes: u32,
+        frame_bytes: u32,
+    },
     /// One raw (pre-compression) or compressed (post-`SpillBlockCompress`) block of a
     /// spill file. `file_id` is the spill `seq` (the eventual slot `file_id`),
     /// `is_last_in_file` marks the final block so `SpillWrite` can finalize the
@@ -264,7 +324,8 @@ impl SpillBlockEvent {
     #[must_use]
     pub fn ordinal(&self) -> u64 {
         match self {
-            Self::Block { ordinal, .. }
+            Self::Range { ordinal, .. }
+            | Self::Block { ordinal, .. }
             | Self::Residual { ordinal, .. }
             | Self::AllAnnounced { ordinal, .. } => *ordinal,
         }
@@ -278,6 +339,9 @@ impl HeapSize for SpillBlockEvent {
         // payload: a block's bytes, or a residual chunk's records.
         let base = std::mem::size_of::<Self>();
         match self {
+            // The bytes a range commits a worker to materialise; its chunk's
+            // records are the arena, already charged.
+            Self::Range { framed_bytes, .. } => base + *framed_bytes as usize,
             Self::Block { bytes, .. } => base + bytes.capacity(),
             Self::Residual { chunk, .. } => base + chunk.approx_heap_bytes(),
             Self::AllAnnounced { .. } => base,

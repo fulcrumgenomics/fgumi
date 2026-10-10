@@ -114,8 +114,9 @@ pub enum SpillBlockCompressor {
     /// bgzf: each block becomes one or more framed BGZF blocks (header + deflate
     /// + footer). No EOF marker — that is the file trailer (see [`spill_trailer`]).
     Bgzf(InlineBgzfCompressor),
-    /// zstd: each block becomes one `[u32 LE frame-len][zstd frame]` unit.
-    Zstd(ZstdCompressor<'static>),
+    /// zstd: each block becomes one `[u32 LE frame-len][zstd frame]` unit. The
+    /// `Vec` is a reused scratch frame buffer, so a block costs no allocation.
+    Zstd(ZstdCompressor<'static>, Vec<u8>),
 }
 
 impl SpillBlockCompressor {
@@ -133,7 +134,7 @@ impl SpillBlockCompressor {
                 let compressor = ZstdCompressor::new(compression as i32).map_err(|e| {
                     io::Error::other(format!("zstd compressor init (level {compression}): {e}"))
                 })?;
-                Ok(Self::Zstd(compressor))
+                Ok(Self::Zstd(compressor, Vec::new()))
             }
         }
     }
@@ -152,8 +153,22 @@ impl SpillBlockCompressor {
     /// or if `raw` exceeds `MAX_SPILL_BLOCK_LEN` — see that constant for why
     /// the write side is where that has to fail.
     pub fn compress_block(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.compress_block_into(raw, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::compress_block`], appending the unit to `out` instead of
+    /// returning a fresh `Vec`: with a reused `out`, compressing a block
+    /// allocates nothing. Appending several units to one `out` yields the same
+    /// bytes as writing each unit separately.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compress_block`].
+    pub fn compress_block_into(&mut self, raw: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         if raw.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         // Fail here rather than let the reader fail later. The block boundary is
         // the serialize step's free choice (see the module doc), so nothing in
@@ -177,19 +192,17 @@ impl SpillBlockCompressor {
                 // Flush forces a block boundary at the end of this raw block, so
                 // the unit is independently decodable.
                 compressor.flush()?;
-                let mut out = Vec::new();
                 for block in compressor.take_blocks() {
                     out.extend_from_slice(&block.data);
-                    // The bytes are copied into `out`, so the block buffer is
-                    // free; hand it back so the next block reuses the allocation
-                    // instead of allocating a fresh output `Vec` per 64 KiB block.
                     compressor.recycle_buffer(block.data);
                 }
-                Ok(out)
+                Ok(())
             }
-            Self::Zstd(compressor) => {
-                let frame = compressor
-                    .compress(raw)
+            Self::Zstd(compressor, frame) => {
+                frame.clear();
+                frame.reserve(zstd::zstd_safe::compress_bound(raw.len()));
+                compressor
+                    .compress_to_buffer(raw, frame)
                     .map_err(|e| io::Error::other(format!("zstd compress: {e}")))?;
                 let frame_len = u32::try_from(frame.len()).map_err(|_| {
                     io::Error::new(
@@ -197,10 +210,10 @@ impl SpillBlockCompressor {
                         "zstd frame larger than 4 GiB cannot fit a u32 length prefix",
                     )
                 })?;
-                let mut out = Vec::with_capacity(4 + frame.len());
+                out.reserve(4 + frame.len());
                 out.extend_from_slice(&frame_len.to_le_bytes());
-                out.extend_from_slice(&frame);
-                Ok(out)
+                out.extend_from_slice(frame);
+                Ok(())
             }
         }
     }

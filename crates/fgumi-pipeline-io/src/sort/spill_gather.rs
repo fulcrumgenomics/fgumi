@@ -1,11 +1,15 @@
 //! `SpillGather` — first step of the block-parallel spill-write split
 //! (`SpillGather` → `SpillBlockCompress` → `SpillWrite`).
 //!
-//! `SpillGather` (`Serial`) consumes the [`SortChunkEvent`]s `SortBuffer`
-//! emits and fans each `Spill` chunk into record-aligned **raw** (uncompressed)
-//! [`SpillBlockEvent::Block`]s of ≤`BGZF_MAX_BLOCK_SIZE`, so the downstream
-//! `Parallel` `SpillBlockCompress` can compress them across the framework pool. The
-//! in-memory `Residual` and the terminal `AllAnnounced` pass straight through.
+//! `SpillGather` (`Detached`, on the `sort-coord` driver) consumes the
+//! [`SortChunkEvent`]s a phase-1 front emits and **plans** each `Spill` chunk
+//! into record-aligned block ranges of ≤`BGZF_MAX_BLOCK_SIZE` framed bytes
+//! ([`SpillBlockEvent::Range`]), from the chunk's length index alone — it never
+//! touches a record body for them. The downstream `Parallel`
+//! `SpillBlockCompress` frames and compresses each range on a pool worker. Only
+//! a run's final block is framed here, serially, as a raw
+//! [`SpillBlockEvent::Block`] (see below). The in-memory `Residual` and the
+//! terminal `AllAnnounced` pass straight through.
 //!
 //! # Run extension (spill coalescing)
 //!
@@ -42,26 +46,27 @@
 //! this step (Serial) drains them in order, each file's blocks are contiguous in
 //! the ordinal stream.
 //!
-//! # Bounded memory (incremental framing)
+//! # Bounded memory (incremental planning)
 //!
-//! A spill chunk is large (≈ the per-thread sort budget). Framing it **all** into
-//! `pending` at once would duplicate the whole chunk in memory and then drain
-//! that copy slowly through the byte-bounded queue while `SortBuffer` races ahead
-//! filling the next multi-GB buffer — a ~2× peak-RSS blow-up. Instead the chunk
-//! is held in `active` and framed **incrementally**: each `try_run` frames at most
-//! `MAX_EVENTS_PER_LOCK` blocks into `pending`, drains them, and only frees the
-//! source chunk once its last record is framed. `pending` therefore holds ≤ a
-//! handful of 64 KiB blocks (~½ MiB) regardless of chunk size, and the chunk
-//! drains as fast as `SpillBlockCompress` consumes blocks. Run extension adds
-//! one more retained block — `held_last_block`, the withheld run-final block —
-//! which is O(1) (a single ~64 KiB block across a chunk boundary), not a
-//! per-chunk or per-run accumulation.
+//! A spill chunk is large (≈ the per-thread sort budget). The chunk is held in
+//! `active` (shared, behind an `Arc`, with the ranges planned from it) and
+//! planned **incrementally**: each `try_run` plans at most
+//! `MAX_EVENTS_PER_LOCK` ranges into `pending` and drains them, so `pending`
+//! holds a few small descriptors whatever the chunk's size, and the output
+//! queue — byte-bounded by each range's framed size — throttles planning to the
+//! pace `SpillBlockCompress` frames at. The chunk, and its arena, is freed when
+//! the last range planned from it has been compressed. Run extension retains one
+//! raw block — `held_last_block`, the withheld run-final block — which is O(1)
+//! (a single ~64 KiB block across a chunk boundary), not a per-chunk or per-run
+//! accumulation. Framing that block here is what lets the step drop its own
+//! reference to the chunk before the next run's chunk arrives.
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{RunBound, SpillKeyKind, frame_embedded_record_into, frame_keyed_record_into};
+use fgumi_sort::{RunBound, SpillKeyKind};
 use log::info;
 
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent, SpillBlockEvent};
@@ -79,20 +84,14 @@ use fgumi_pipeline_core::{
 /// slices rather than holding the step lock for the whole spill.
 const MAX_EVENTS_PER_LOCK: usize = 8;
 
-/// Frame the `i`th record of a type-erased chunk into `out` in the spill layout
-/// `[key?][u32 LE len][record]`, dispatching over the sort-key variant.
-fn frame_record_at(chunk: &MemoryChunkErased, i: usize, out: &mut Vec<u8>) -> io::Result<()> {
-    match chunk {
-        MemoryChunkErased::Coordinate(c) => {
-            frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
-        }
-        // Queryname keys are embedded in the record: no key bytes are framed.
-        MemoryChunkErased::QuerynameLex(c) | MemoryChunkErased::QuerynameNatural(c) => {
-            frame_embedded_record_into(out, c.record_bytes(i))
-        }
-        MemoryChunkErased::TemplateCoordinate(c) => c.frame_record_into(i, out),
-    }
-}
+/// Spill frames per planned [`SpillBlockEvent::Range`]. One range per ~64 KiB
+/// frame made each spill frame a separate pipeline item (~9 KiB compressed),
+/// so the byte-bounded edges into and out of `SpillBlockCompress` hit their
+/// fixed 1024-slot count cap at ~67 MB / ~9 MB, and the serial `SpillWrite`
+/// paid one dispatch per 9 KiB. Eight frames per range (~512 KiB raw, ~72 KiB
+/// compressed) cuts the item count 8x; the frames, and so the spill bytes on
+/// disk, are unchanged.
+const FRAMES_PER_RANGE: usize = 8;
 
 /// Frame records `[start..)` of `chunk` into a single block `out` of at most
 /// `block_size` bytes, returning the index of the next un-framed record (==
@@ -113,7 +112,7 @@ fn frame_one_block(
     let mut i = start;
     while i < len {
         let before = out.len();
-        frame_record_at(chunk, i, out)?;
+        chunk.frame_record_into(i, out)?;
         if before != 0 && out.len() > block_size {
             // This record overflowed a non-empty block — roll it back so it
             // starts the next block, and finish this one.
@@ -130,9 +129,89 @@ fn frame_one_block(
     Ok(i)
 }
 
-/// Frame an entire chunk into blocks (convenience for tests; production frames
-/// incrementally via [`SpillGather::produce_blocks`]). Returns one `Vec<u8>`
-/// per block; an empty chunk yields no blocks.
+/// The run-final block's framing (`framed`: end record, byte count) must be
+/// exactly the planner's cut (`planned`): the gather releases the chunk right
+/// after it, so records the framing skipped would be lost from the spill
+/// without a trace. Fails the sort instead.
+fn check_run_final_block(
+    start: usize,
+    planned: (usize, usize),
+    framed: (usize, usize),
+) -> io::Result<()> {
+    if planned == framed {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "SpillGather: the run-final block framed records [{start}, {}) ({} bytes) but the \
+         planner cut [{start}, {}) ({} bytes); refusing to drop records",
+        framed.0, framed.1, planned.0, planned.1
+    )))
+}
+
+/// The cut rule of [`frame_one_block`], from the length index alone (no body
+/// touch): append while the block stays ≤ `block_size`; the record that would
+/// push a NON-EMPTY block past it starts the next block; a lone oversized
+/// record forms its own block; a block reaching `block_size` exactly closes.
+/// Returns `(end, framed_bytes)`: the block holds records `[start, end)`.
+pub(crate) fn plan_next_block(
+    chunk: &MemoryChunkErased,
+    start: usize,
+    block_size: usize,
+) -> (usize, u32) {
+    let n = chunk.len();
+    let mut end = start;
+    let mut bytes = 0usize;
+    while end < n {
+        let framed = chunk.framed_len(end);
+        if bytes > 0 && bytes + framed > block_size {
+            break;
+        }
+        bytes += framed;
+        end += 1;
+        if bytes >= block_size {
+            break;
+        }
+    }
+    (end, u32::try_from(bytes).expect("a planned block fits u32"))
+}
+
+/// Plan every block of `chunk` at `block_size`, returning the block count — the
+/// planner's whole per-run cost, for the `spill_gather` bench.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_plan_ranges(chunk: &MemoryChunkErased, block_size: usize) -> usize {
+    let (mut start, mut blocks) = (0, 0);
+    while start < chunk.len() {
+        start = plan_next_block(chunk, start, block_size).0;
+        blocks += 1;
+    }
+    blocks
+}
+
+/// Frame every block of `chunk` at `block_size` with [`frame_one_block`] into
+/// one reused buffer, returning the block count — the serial framing the
+/// planner replaced, for the `spill_gather` bench.
+///
+/// # Errors
+///
+/// Propagates framing errors.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn bench_frame_blocks(chunk: &MemoryChunkErased, block_size: usize) -> io::Result<usize> {
+    let (mut start, mut blocks) = (0, 0);
+    let mut out = Vec::with_capacity(block_size + 1024);
+    while start < chunk.len() {
+        out.clear();
+        start = frame_one_block(chunk, start, block_size, &mut out)?;
+        blocks += 1;
+    }
+    Ok(blocks)
+}
+
+/// Frame an entire chunk into blocks (convenience for tests; production plans
+/// ranges via [`SpillGather::plan_ranges`] and frames them on the pool).
+/// Returns one `Vec<u8>` per block; an empty chunk yields no blocks.
 #[cfg(test)]
 fn frame_chunk_into_blocks(
     chunk: &MemoryChunkErased,
@@ -151,11 +230,13 @@ fn frame_chunk_into_blocks(
     Ok(blocks)
 }
 
-/// One spill chunk being framed incrementally into blocks across `try_run` calls.
+/// One spill chunk being planned incrementally into blocks across `try_run` calls.
 struct ActiveSpill {
-    /// The source sorted chunk, held until its last record is framed.
-    chunk: MemoryChunkErased,
-    /// Index of the next un-framed record.
+    /// The source sorted chunk, shared with every range planned from it. The
+    /// step drops its own reference once the run-final block is framed, so the
+    /// chunk — and its arena — goes when the last range has been compressed.
+    chunk: Arc<MemoryChunkErased>,
+    /// Index of the next unplanned record.
     next_idx: usize,
     /// This chunk's run `file_id` — the open run's when the chunk extends it, or
     /// the chunk's own spill `seq` when it starts a new run.
@@ -174,7 +255,8 @@ struct HeldBlock {
     records_ingested_so_far: u64,
 }
 
-/// `Serial` step that fans sorted spill chunks into raw blocks for `SpillBlockCompress`.
+/// `Detached` step that plans sorted spill chunks into block ranges for
+/// `SpillBlockCompress`, which frames and compresses them.
 pub struct SpillGather {
     /// The spill chunk currently being framed incrementally (`None` between
     /// chunks). Holding it here — rather than materializing all its blocks into
@@ -212,6 +294,8 @@ pub struct SpillGather {
     summary_logged: bool,
     /// Raw-block size threshold (records are cut into blocks of ≤ this many bytes).
     block_size: usize,
+    /// Frames (blocks of `block_size`) planned into one range.
+    frames_per_range: usize,
     output_byte_limit: u64,
 }
 
@@ -231,6 +315,7 @@ impl SpillGather {
             chunks_spilled: 0,
             summary_logged: false,
             block_size: BGZF_MAX_BLOCK_SIZE,
+            frames_per_range: FRAMES_PER_RANGE,
             output_byte_limit,
         }
     }
@@ -307,8 +392,12 @@ impl SpillGather {
                     seq
                 };
                 self.open_run = Some((file_id, chunk_max));
-                self.active =
-                    Some(ActiveSpill { chunk, next_idx: 0, file_id, records_ingested_so_far });
+                self.active = Some(ActiveSpill {
+                    chunk: Arc::new(chunk),
+                    next_idx: 0,
+                    file_id,
+                    records_ingested_so_far,
+                });
             }
             SortChunkEvent::Residual { chunk, records_ingested_so_far } => {
                 // A residual (in-memory, not spilled) ends any open spill run.
@@ -338,38 +427,43 @@ impl SpillGather {
         }
     }
 
-    /// Frame up to `MAX_EVENTS_PER_LOCK` non-final blocks of the `active` chunk
-    /// into `pending`, minting dense ordinals. The chunk's **final** framed block
-    /// is not pushed: it is withheld into `held_last_block` (its `is_last_in_file`
-    /// is not yet known — it depends on whether the next chunk extends this run),
-    /// and the chunk is freed (`active = None`). No-op when there is no active
+    /// Plan up to `MAX_EVENTS_PER_LOCK` non-final blocks of the `active` chunk
+    /// into `pending` as [`SpillBlockEvent::Range`]s, minting dense ordinals.
+    /// The chunk's **final** block is framed here, serially, and withheld into
+    /// `held_last_block` (its `is_last_in_file` is not yet known — it depends on
+    /// whether the next chunk extends this run); the step then drops its
+    /// reference to the chunk (`active = None`). No-op when there is no active
     /// chunk.
     ///
     /// # Errors
     ///
     /// Propagates framing errors (e.g. a record too large for the `u32` length
-    /// prefix).
-    fn produce_blocks(&mut self) -> io::Result<()> {
+    /// prefix), and fails if the run-final block's framing disagrees with the
+    /// planner's cut (records would otherwise be dropped).
+    fn plan_ranges(&mut self) -> io::Result<()> {
         let block_size = self.block_size;
         while self.pending.len() < MAX_EVENTS_PER_LOCK {
-            // Frame one block, scoping the borrow of `active` so `next_ordinal`
-            // (a `&mut self` method) can run afterward.
-            let framed = {
-                let Some(active) = self.active.as_ref() else { return Ok(()) };
-                let len = active.chunk.len();
-                let mut bytes = Vec::with_capacity(block_size + 1024);
-                let next = frame_one_block(&active.chunk, active.next_idx, block_size, &mut bytes)?;
-                let key_kind = active.chunk.key_kind();
-                (bytes, next, next >= len, active.file_id, key_kind, active.records_ingested_so_far)
-            };
-            let (bytes, next_idx, is_last, file_id, key_kind, records_ingested_so_far) = framed;
-            if is_last {
-                // Withhold the run's final block: it is closed lazily once we know
-                // whether the next chunk extends this run (see `stage_event` /
-                // `flush_held_block`). The previous run's block was already flushed
-                // before this chunk was staged, so nothing is being overwritten —
-                // `HeldSlot::put` hard-asserts that invariant (overwriting would
-                // silently drop a whole spill block, i.e. lose records).
+            let Some(active) = self.active.as_ref() else { return Ok(()) };
+            let start = active.next_idx;
+            let (end, framed_bytes) = plan_next_block(&active.chunk, start, block_size);
+            let (file_id, records_ingested_so_far) =
+                (active.file_id, active.records_ingested_so_far);
+            let key_kind = active.chunk.key_kind();
+            if end >= active.chunk.len() {
+                // Frame and withhold the run's final block: it is closed lazily
+                // once we know whether the next chunk extends this run (see
+                // `stage_event` / `flush_held_block`). The previous run's block
+                // was already flushed before this chunk was staged, so nothing
+                // is being overwritten — `HeldSlot::put` hard-asserts that
+                // invariant (overwriting would silently drop a whole spill
+                // block, i.e. lose records).
+                let mut bytes = Vec::with_capacity(framed_bytes as usize);
+                let framed_end = frame_one_block(&active.chunk, start, block_size, &mut bytes)?;
+                check_run_final_block(
+                    start,
+                    (end, framed_bytes as usize),
+                    (framed_end, bytes.len()),
+                )?;
                 self.held_last_block.put(HeldBlock {
                     bytes,
                     file_id,
@@ -379,17 +473,32 @@ impl SpillGather {
                 self.active = None;
                 return Ok(());
             }
+            // Extend the range by up to `frames_per_range - 1` further frames,
+            // stopping before the run-final frame (framed above, serially).
+            let (mut end, mut framed_bytes) = (end, framed_bytes);
+            for _ in 1..self.frames_per_range {
+                let (next_end, next_bytes) = plan_next_block(&active.chunk, end, block_size);
+                if next_end >= active.chunk.len() {
+                    break;
+                }
+                end = next_end;
+                framed_bytes += next_bytes;
+            }
+            let chunk = Arc::clone(&active.chunk);
             let ordinal = self.next_ordinal();
-            self.pending.push_back(SpillBlockEvent::Block {
+            self.pending.push_back(SpillBlockEvent::Range {
                 ordinal,
                 file_id,
                 key_kind,
                 is_last_in_file: false,
                 records_ingested_so_far,
-                bytes,
+                chunk,
+                start: start as u64,
+                end: end as u64,
+                framed_bytes,
+                frame_bytes: u32::try_from(block_size).expect("a frame size fits u32"),
             });
-            // Advance the cursor for the next block.
-            self.active.as_mut().expect("active present (not last)").next_idx = next_idx;
+            self.active.as_mut().expect("active present (not last)").next_idx = end;
         }
         Ok(())
     }
@@ -447,18 +556,18 @@ impl Step for SpillGather {
             return Ok(self.emit_pending(ctx));
         }
 
-        // Continue framing the active chunk (incrementally), if any.
+        // Continue planning the active chunk (incrementally), if any.
         if self.active.is_some() {
-            self.produce_blocks()?;
+            self.plan_ranges()?;
             return Ok(self.emit_pending(ctx));
         }
 
         // No active chunk and nothing pending — ingest the next event.
         if let Some(event) = ctx.input.pop() {
             self.stage_event(event);
-            // Frame the first blocks of a freshly-parked chunk so we make progress.
+            // Plan the first blocks of a freshly-parked chunk so we make progress.
             if self.active.is_some() {
-                self.produce_blocks()?;
+                self.plan_ranges()?;
             }
             if !self.pending.is_empty() {
                 return Ok(self.emit_pending(ctx));

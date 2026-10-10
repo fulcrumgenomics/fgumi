@@ -597,6 +597,18 @@ and macOS only):
   `--sort-stats` logs that bound (`Spill supply:`), the spill byte fetch, disk
   reads, and stash/claim counts.
 
+### Spill framing
+
+`SpillGather` (on the `sort-coord` driver) does not frame spill records: it
+plans each sorted chunk into record ranges of at most one BGZF block of framed
+bytes, from the chunk's length index alone (`plan_next_block`, the cut rule of
+`frame_one_block`), and sends them as `SpillBlockEvent::Range`.
+`SpillBlockCompress` frames each range into a per-worker scratch buffer and
+compresses it on the pool. Only a run's final block is framed by the gather,
+serially, and withheld until the next chunk shows whether the run extends —
+which is what lets the gather drop the chunk, so its arena returns as soon as
+the last range is compressed. Spill files are byte-identical to serial framing.
+
 ### Queryname sort refs
 
 A queryname run sorts 40-byte refs, not owned name keys
