@@ -187,3 +187,18 @@ fn consecutive_blocks_reuse_one_compressor_and_stay_independent(#[case] codec: S
     }
     assert!(step.compressor.is_some(), "the compressor is built once and retained");
 }
+
+/// Spill compression under `--sort-threads`: the phase-1 admission contract.
+#[test]
+fn capped_step_follows_the_admission_contract() {
+    fgumi_pipeline_core::testing::assert_admission_contract(
+        "sort-phase1",
+        |cap| SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).with_phase_cap(cap),
+        SpillBlockEvent::AllAnnounced {
+            ordinal: 0,
+            slot_count: 0,
+            memory_chunk_count: 0,
+            total_records: 0,
+        },
+    );
+}

@@ -2433,7 +2433,13 @@ impl RawExternalSorter {
     /// `bwa mem -t 32 | fgumi sort` can lower this to cede cores to the producer
     /// during ingest while leaving the merge at full width.
     ///
-    /// This is purely a scheduling knob: output is byte-identical regardless.
+    /// The override is used as-is: this engine does **not** cap it by
+    /// [`threads`](Self::threads), so a larger value sizes Phase 1 above the
+    /// base count. (`fgumi sort` and `fgumi runall` no longer sort through
+    /// this engine; they resolve per-phase counts with their own
+    /// `PhaseThreads`, which caps each override at the worker pool and warns.
+    /// `fgumi simulate` and `fgumi merge` still use this engine, without the
+    /// per-phase overrides.) Output is byte-identical regardless.
     #[must_use]
     pub fn sort_threads(mut self, n: usize) -> Self {
         self.sort_threads = Some(n);
@@ -2443,14 +2449,17 @@ impl RawExternalSorter {
     /// Set the Phase-2 (merge/write) worker count, overriding
     /// [`threads`](Self::threads) for that phase only.
     ///
-    /// This is purely a scheduling knob: output is byte-identical regardless.
+    /// Used as-is, not capped by [`threads`](Self::threads) (see
+    /// [`sort_threads`](Self::sort_threads) for how the `fgumi` CLI differs).
+    /// Output is byte-identical regardless.
     #[must_use]
     pub fn merge_threads(mut self, n: usize) -> Self {
         self.merge_threads = Some(n);
         self
     }
 
-    /// Effective Phase-1 worker count: `sort_threads` if set, else `threads`.
+    /// Effective Phase-1 worker count: `sort_threads` if set (uncapped by
+    /// `threads`), else `threads`, at least 1.
     ///
     /// Public so the streaming arena front (`SortBuffer::from_sorter`) sizes its
     /// per-chunk sort with the resolved `--sort-threads` override rather than the
@@ -2460,7 +2469,8 @@ impl RawExternalSorter {
         self.sort_threads.unwrap_or(self.threads).max(1)
     }
 
-    /// Effective Phase-2 worker count: `merge_threads` if set, else `threads`.
+    /// Effective Phase-2 worker count: `merge_threads` if set (uncapped by
+    /// `threads`), else `threads`, at least 1.
     #[must_use]
     pub fn phase2_threads(&self) -> usize {
         self.merge_threads.unwrap_or(self.threads).max(1)

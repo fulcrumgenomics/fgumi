@@ -314,7 +314,7 @@ pub fn run_fused_single_thread(
                     finished[i] = true;
                     progressed = true;
                 }
-                Ok(StepOutcome::NoProgress | StepOutcome::Contention) => {}
+                Ok(StepOutcome::NoProgress | StepOutcome::Contention | StepOutcome::Capped) => {}
                 Err(io_err) => {
                     signal
                         .record_error(PipelineError::Io { step: steps[i].name(), source: io_err });

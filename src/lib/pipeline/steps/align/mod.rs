@@ -565,6 +565,31 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
     builder.build()
 }
 
+/// The pool-worker floor of the align backend `opts` selects — the same preset
+/// → backend mapping [`AlignerOptions::resolve`](crate::aligner::AlignerOptions::resolve)
+/// applies, without validating files or building a command: the in-process
+/// bwa-mem3 preset runs on the shared pool alone (1); every subprocess preset
+/// and `--aligner::command` needs the subprocess backend's floor (4). Lives
+/// here, beside the backends whose `MIN_WORKERS` it reads, so `aligner` does
+/// not depend on the pipeline.
+#[must_use]
+pub(crate) fn min_workers_for(opts: &crate::aligner::AlignerOptions) -> usize {
+    if matches!(opts.preset, Some(crate::aligner::AlignerPreset::BwaMem3InProc)) {
+        #[cfg(feature = "aligner-bwa-mem3")]
+        {
+            inproc::InProcessBwaMem3Backend::MIN_WORKERS
+        }
+        // Without the feature `resolve` rejects this preset before any chain
+        // is built; 1 is what the backend would report.
+        #[cfg(not(feature = "aligner-bwa-mem3"))]
+        {
+            1
+        }
+    } else {
+        subprocess::SubprocessBackend::MIN_WORKERS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +838,34 @@ mod tests {
             Some("aligner"),
             "aligner @PG with a non-duplicate ID must be appended"
         );
+    }
+
+    /// `min_workers_for` applies the same preset → backend mapping as
+    /// `resolve`: command mode resolves to the subprocess backend and reports
+    /// its floor; the subprocess presets report it too; the in-process preset
+    /// runs on the shared pool alone.
+    #[test]
+    fn test_min_workers_for_follows_the_resolved_backend() {
+        use crate::aligner::{AlignerOptions, AlignerPreset, ResolvedBackend};
+        use crate::pipeline::steps::align::subprocess::SubprocessBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let command = AlignerOptions {
+            command: Some("bwa-mem3 mem {ref} /dev/stdin".to_string()),
+            ..AlignerOptions::default()
+        };
+        assert_eq!(min_workers_for(&command), SubprocessBackend::MIN_WORKERS);
+        let resolved = command.resolve(&ref_path, 4, None).unwrap();
+        assert!(matches!(resolved.backend, ResolvedBackend::Subprocess { .. }));
+        for preset in [AlignerPreset::Bwa, AlignerPreset::BwaMem3] {
+            let opts = AlignerOptions { preset: Some(preset), ..AlignerOptions::default() };
+            assert_eq!(min_workers_for(&opts), SubprocessBackend::MIN_WORKERS, "{preset:?}");
+        }
+        let inproc = AlignerOptions {
+            preset: Some(AlignerPreset::BwaMem3InProc),
+            ..AlignerOptions::default()
+        };
+        assert_eq!(min_workers_for(&inproc), 1);
     }
 }

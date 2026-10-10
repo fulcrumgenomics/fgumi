@@ -1480,6 +1480,32 @@ impl RunAll {
                         sort_opts.max_memory =
                             crate::commands::common::parse_memory("768M").expect("valid default");
                     }
+                    // Same contract as standalone sort: `--sort::sort-threads` /
+                    // `--sort::merge-threads` are caps within the pool the chain
+                    // will run — `--threads`, raised by a zipper / subprocess
+                    // aligner floor (`chain_worker_floor`, the prediction
+                    // `add_sort` debug-asserts against the built pool). Warn here
+                    // (once per run, naming the `--sort::` flags) — the chain
+                    // builder only logs the effective split at debug. `bag.aligner`
+                    // is already set: Align precedes Sort in `stages`.
+                    let threads = self.threading.num_threads();
+                    let pool = threads.max(crate::pipeline::chains::builder::chain_worker_floor(
+                        stages,
+                        bag.aligner.as_ref(),
+                    ));
+                    crate::commands::common::PhaseThreads::resolve_in_pool(
+                        threads,
+                        pool,
+                        sort_opts.sort_threads,
+                        sort_opts.merge_threads,
+                    )
+                    .warn_if_clamped(
+                        "sort::",
+                        crate::commands::common::PhaseThreads::budget_scales_per_thread(
+                            sort_opts.max_memory,
+                            sort_opts.memory_per_thread,
+                        ),
+                    );
                     // Inherent cross-field check (mirrors the Codec/Extract
                     // branches below): reject `--sort::temp-codec zstd` paired
                     // with `--sort::temp-compression 0` here, before the chain

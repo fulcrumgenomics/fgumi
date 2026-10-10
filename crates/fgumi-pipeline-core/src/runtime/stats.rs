@@ -16,6 +16,11 @@
 //!   - `contention_count` — `StepOutcome::Contention` (Serial step mutex
 //!     held by another worker; or skipped via `try_lock`). Always 0 under the
 //!     fused single-thread driver, which holds no mutex and never contends.
+//!   - `capped_count` — `StepOutcome::Capped` (a `Parallel` step refused
+//!     admission by its shared `PhaseCap`). Kept apart from `contention_count`
+//!     so a deliberately binding `--sort-threads`/`--merge-threads` cap is
+//!     reported as a cap, not as mutex thrash. Not a column of the step table
+//!     (its layout is stable for log parsers); listed below it when nonzero.
 //!   - `finished_count` — `StepOutcome::Finished` (any step on end-of-stream:
 //!     source, mid, or sink all record `Finished` once their inputs drain).
 //!   - `error_count` — `try_run_erased` returned `Err`.
@@ -54,6 +59,8 @@ pub struct StepStats {
     pub no_progress_count: AtomicU64,
     /// Dispatches that returned `StepOutcome::Contention`.
     pub contention_count: AtomicU64,
+    /// Dispatches that returned `StepOutcome::Capped`.
+    pub capped_count: AtomicU64,
     /// Dispatches that returned `StepOutcome::Finished`.
     pub finished_count: AtomicU64,
     /// Dispatches that returned an error from `try_run_erased`.
@@ -77,6 +84,7 @@ impl Default for StepStats {
             progress_count: AtomicU64::new(0),
             no_progress_count: AtomicU64::new(0),
             contention_count: AtomicU64::new(0),
+            capped_count: AtomicU64::new(0),
             finished_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             total_run_ns: AtomicU64::new(0),
@@ -93,6 +101,7 @@ impl StepStats {
             progress_count: self.progress_count.load(Ordering::Relaxed),
             no_progress_count: self.no_progress_count.load(Ordering::Relaxed),
             contention_count: self.contention_count.load(Ordering::Relaxed),
+            capped_count: self.capped_count.load(Ordering::Relaxed),
             finished_count: self.finished_count.load(Ordering::Relaxed),
             error_count: self.error_count.load(Ordering::Relaxed),
             total_run_ns: self.total_run_ns.load(Ordering::Relaxed),
@@ -290,6 +299,9 @@ impl PipelineStats {
             }
             StepOutcome::Contention => {
                 s.contention_count.fetch_add(1, Ordering::Relaxed);
+            }
+            StepOutcome::Capped => {
+                s.capped_count.fetch_add(1, Ordering::Relaxed);
             }
             StepOutcome::Finished => {
                 s.finished_count.fetch_add(1, Ordering::Relaxed);
@@ -567,6 +579,8 @@ pub struct StepStatsSnapshot {
     pub no_progress_count: u64,
     /// Dispatches that returned `StepOutcome::Contention`.
     pub contention_count: u64,
+    /// Dispatches that returned `StepOutcome::Capped`.
+    pub capped_count: u64,
     /// Dispatches that returned `StepOutcome::Finished`.
     pub finished_count: u64,
     /// Dispatches that returned an error from `try_run_erased`.
@@ -694,6 +708,27 @@ pub(crate) fn bottleneck_verdict(snap: &StatsSnapshot) -> Vec<Finding> {
         }
     }
 
+    // Info: a binding phase cap. A `Capped` dispatch is a worker the step's
+    // shared `PhaseCap` deferred — the configured `--sort-threads` /
+    // `--merge-threads` limit doing its job, not mutex thrash, so it is
+    // reported as a cap and never as SPIN (which reads `contention_count`).
+    for (name, s) in &snap.steps {
+        if s.try_run_total > 0 {
+            let capped = s.capped_count as f64 / s.try_run_total as f64;
+            if capped >= SPIN_THRESHOLD {
+                findings.push(Finding {
+                    severity: Severity::Info,
+                    message: format!(
+                        "CAPPED: step `{name}` was deferred by its phase cap on {:.0}% of \
+                         dispatches — the --sort-threads / --merge-threads limit is binding \
+                         (expected when set below the pool)",
+                        capped * 100.0
+                    ),
+                });
+            }
+        }
+    }
+
     // Secondary: starvation (consumer of an edge frequently finds it empty).
     for e in &snap.edges {
         if matches!(e.class, Starved) {
@@ -801,6 +836,13 @@ impl StatsSnapshot {
                 cpu_pct,
                 first_str,
                 last_str,
+            )?;
+        }
+        for (name, s) in self.steps.iter().filter(|(_, s)| s.capped_count > 0) {
+            writeln!(
+                f,
+                "  cap refusals: {name} {} (polls deferred by its phase cap)",
+                s.capped_count
             )?;
         }
         Ok(())
@@ -1018,6 +1060,7 @@ mod tests {
             progress_count: 0,
             no_progress_count: 0,
             contention_count: 0,
+            capped_count: 0,
             finished_count: 0,
             error_count: 0,
             total_run_ns: 0,
@@ -1124,6 +1167,7 @@ mod tests {
                 progress_count: tries,
                 no_progress_count: 0,
                 contention_count: contention,
+                capped_count: 0,
                 finished_count: 1,
                 error_count: 0,
                 total_run_ns,
@@ -1234,6 +1278,57 @@ mod tests {
             v.iter().any(|f| f.message.contains("STARVATION") && f.message.contains("Consumer")),
             "starvation finding present"
         );
+    }
+
+    /// A binding phase cap shows up as `Capped` dispatches, which the verdict
+    /// reports as a cap — never as SPIN mutex thrash (that rule reads only
+    /// `contention_count`) — and the step table lists the refusals below it.
+    #[test]
+    fn verdict_reports_a_binding_cap_as_capped_not_spin() {
+        let (name, mut snap_step) = step_stat("InflateToArena", 100, 0, 10);
+        snap_step.capped_count = 8;
+        let snap = StatsSnapshot {
+            steps: vec![(name, snap_step)],
+            workers: vec![],
+            detached: vec![],
+            edges: vec![],
+        };
+        let v = bottleneck_verdict(&snap);
+        assert!(
+            v.iter().any(|f| f.message.contains("CAPPED") && f.message.contains("InflateToArena")),
+            "binding cap reported as CAPPED: {v:?}"
+        );
+        assert!(!v.iter().any(|f| f.message.contains("SPIN")), "never SPIN: {v:?}");
+    }
+
+    /// `record` buckets `Capped` apart from `Contention`.
+    #[test]
+    fn capped_outcome_is_counted_apart_from_contention() {
+        let stats = PipelineStats::new(vec!["s"]);
+        stats.record(StepIdx(0), StepOutcome::Capped, 20, 3);
+        let s = &stats.snapshot().steps[0].1;
+        assert_eq!((s.capped_count, s.contention_count), (1, 0));
+    }
+
+    /// The step table lists a `cap refusals:` line for each step whose phase
+    /// cap deferred a poll, and none for a step that was never refused.
+    #[test]
+    fn step_table_lists_cap_refusals_only_for_refused_steps() {
+        let stats = PipelineStats::new(vec!["InflateToArena", "SpillWrite"]);
+        for _ in 0..8 {
+            stats.record(StepIdx(0), StepOutcome::Capped, 0, 1);
+        }
+        stats.record(StepIdx(1), StepOutcome::Progress, 0, 1);
+        let text = format!("{}", stats.snapshot());
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("cap refusals:")).collect();
+        assert_eq!(
+            lines,
+            ["  cap refusals: InflateToArena 8 (polls deferred by its phase cap)"],
+            "{text}"
+        );
+        let none = PipelineStats::new(vec!["SpillWrite"]);
+        none.record(StepIdx(0), StepOutcome::Progress, 0, 1);
+        assert!(!format!("{}", none.snapshot()).contains("cap refusals:"));
     }
 
     #[test]

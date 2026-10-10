@@ -14,6 +14,9 @@
 //! tempfile bridge between AAM and the downstream sort).
 
 use std::io;
+use std::sync::Arc;
+
+use crate::pipeline::core::{PhaseCap, admit_input};
 
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
@@ -33,18 +36,32 @@ use crate::pipeline::steps::types::{BamTemplateBatch, RecordBatch, RecordBatchBu
 pub struct TemplatesToRecordBatch {
     held: HeldSlot<Unpushed<RecordBatch>>,
     output_byte_limit: u64,
+    /// Phase-1 admission cap, set by the chain builder only when this step
+    /// is sort ingest (`None` = uncapped, every other chain).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl TemplatesToRecordBatch {
+    /// Share the sort's phase-1 admission cap (see `ChainBuilder::add_sort`).
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
     #[must_use]
     pub fn new(output_byte_limit: u64) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit }
+        Self { held: HeldSlot::new(), output_byte_limit, cap: None }
     }
 }
 
 impl Clone for TemplatesToRecordBatch {
     fn clone(&self) -> Self {
-        Self { held: HeldSlot::new(), output_byte_limit: self.output_byte_limit }
+        Self {
+            held: HeldSlot::new(),
+            output_byte_limit: self.output_byte_limit,
+            cap: self.cap.clone(),
+        }
     }
 }
 
@@ -78,6 +95,14 @@ impl Step for TemplatesToRecordBatch {
                 }
             }
         }
+
+        // Phase-1 admission when the chain builder capped this step (sort
+        // ingest under `--sort-threads`); a no-op otherwise. See the
+        // pipeline-core `admission` module.
+        let _permit = match admit_input(ctx.input, self.cap.as_deref()) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
 
         let Some(batch) = ctx.input.pop() else {
             // No input this call. If upstream is drained, every item has been
@@ -125,6 +150,10 @@ impl Step for TemplatesToRecordBatch {
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
@@ -192,5 +221,15 @@ mod tests {
         let rb = builder.build();
         assert_eq!(rb.batch_serial(), 42);
         assert_eq!(rb.len(), 4, "4 records flattened from 2 paired templates");
+    }
+
+    /// Sort ingest under `--sort-threads`: the phase-1 admission contract.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        crate::pipeline::core::testing::assert_admission_contract(
+            "sort-phase1",
+            |cap| TemplatesToRecordBatch::new(1 << 20).with_phase_cap(cap),
+            BamTemplateBatch::new(0, vec![make_paired_template(b"q1")]),
+        );
     }
 }

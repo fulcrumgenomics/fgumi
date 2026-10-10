@@ -923,6 +923,7 @@ dependencies = [
  "anyhow",
  "crossbeam-queue",
  "log",
+ "loom",
  "noodles",
  "parking_lot",
  "proptest",

@@ -24,6 +24,7 @@ use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::{PhaseCap, admit_input};
 use crate::pipeline::steps::types::{DecodedRecordBatch, SamChunk};
 use fgumi_bam_io::{DecodedRecord, GroupKeyConfig, key_and_umi_for_mode};
 
@@ -154,16 +155,33 @@ pub struct ParseSamChunk {
     /// See `DecodeRecords::closed_batches`: marks emitted batches closed under
     /// queryname when the upstream `ReadSamChunks` runs the queryname cut.
     closed_batches: bool,
+    /// Phase-1 admission cap, set by the chain builder only when this step
+    /// is sort ingest (`None` = uncapped, every other chain).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl ParseSamChunk {
+    /// Share the sort's phase-1 admission cap (see `ChainBuilder::add_sort`).
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
     #[must_use]
     pub fn new(
         header: Arc<sam::Header>,
         key_config: GroupKeyConfig,
         output_byte_limit: u64,
     ) -> Self {
-        Self { header, key_config, held: HeldSlot::new(), output_byte_limit, closed_batches: false }
+        Self {
+            header,
+            key_config,
+            held: HeldSlot::new(),
+            output_byte_limit,
+            closed_batches: false,
+            cap: None,
+        }
     }
 
     /// See `DecodeRecords::with_closed_batches`.
@@ -182,6 +200,7 @@ impl Clone for ParseSamChunk {
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
             closed_batches: self.closed_batches,
+            cap: self.cap.clone(),
         }
     }
 }
@@ -211,6 +230,14 @@ impl Step for ParseSamChunk {
             }
         }
 
+        // Phase-1 admission when the chain builder capped this step (sort
+        // ingest under `--sort-threads`); a no-op otherwise. See the
+        // pipeline-core `admission` module.
+        let _permit = match admit_input(ctx.input, self.cap.as_deref()) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
         let Some(chunk) = ctx.input.pop() else {
             // No input this call. If upstream is drained, every item has been
             // processed (held output was flushed by the Contention preamble
@@ -237,6 +264,10 @@ impl Step for ParseSamChunk {
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
@@ -554,5 +585,22 @@ read2\t16\tchr1\t20\t60\t5M\t*\t0\t0\tTGCAT\t!!!!!\n";
             profile.output_queues[0],
             crate::pipeline::core::queues::QueueSpec::ByteBounded { .. }
         ));
+    }
+
+    /// Sort-first SAM ingest under `--sort-threads`: the phase-1 admission
+    /// contract.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        let header = parse_header(SAM_TEXT);
+        let key_config = key_config_for(&header);
+        let header = Arc::new(header);
+        crate::pipeline::core::testing::assert_admission_contract(
+            "sort-phase1",
+            |cap| {
+                ParseSamChunk::new(Arc::clone(&header), key_config.clone(), 1 << 20)
+                    .with_phase_cap(cap)
+            },
+            sam_chunk_from_records(0),
+        );
     }
 }

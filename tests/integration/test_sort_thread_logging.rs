@@ -1,11 +1,10 @@
 //! Integration tests for what `fgumi sort` reports about its thread counts and
 //! the memory budget they scale.
 //!
-//! `--sort-threads` and `--merge-threads` each default to `--threads`, so the
-//! flag alone does not describe a run that set only the per-phase overrides.
-//! These tests pin the reported counts to the ones the phases actually use, and
-//! pin the reported per-thread memory budget to the sort-phase count that fills
-//! the buffer.
+//! `--sort-threads` and `--merge-threads` are caps within `--threads` (each
+//! defaults to it). These tests pin the reported counts to the ones the phases
+//! actually use, the clamp warning for an override above `--threads`, and the
+//! per-thread memory budget to the effective sort-phase count.
 
 use rstest::rstest;
 use std::fmt::Write as _;
@@ -64,72 +63,78 @@ fn threads_lines(stderr: &str) -> Vec<String> {
 }
 
 /// Every `Threads:` line a run logs must name the counts its phases actually
-/// used.
-///
-/// * `per_phase_overrides_without_threads` — overrides with `--threads` left
-///   alone used to report `Threads: 1` while the phases ran 8 and 16 workers.
-/// * `sort_override_below_threads` — a phase override below `--threads` is the
-///   documented use (cede cores to an upstream producer, keep the merge wide),
-///   so both counts must still show.
-/// * `matching_phase_counts` — with no overrides the phases agree, so the report
-///   stays a single count rather than repeating it twice.
+/// used: overrides above `--threads` are clamped to it, below are honoured.
 #[rstest]
-#[case::per_phase_overrides_without_threads(
+#[case::overrides_above_unset_threads_clamp_to_one(
     &["--sort-threads", "8", "--merge-threads", "16"],
-    "sort 8, merge 16"
+    "1"
 )]
 #[case::sort_override_below_threads(&["--threads", "6", "--sort-threads", "2"], "sort 2, merge 6")]
+#[case::merge_override_below_threads(&["--threads", "6", "--merge-threads", "3"], "sort 6, merge 3")]
 #[case::matching_phase_counts(&["--threads", "4"], "4")]
+#[case::sort_above_threads_clamps(&["--threads", "4", "--sort-threads", "32"], "4")]
 fn reported_thread_counts_match_the_phases(#[case] extra_args: &[&str], #[case] expected: &str) {
     let stderr = sort_and_capture_logs(extra_args);
     let reported = threads_lines(&stderr);
-
     assert!(!reported.is_empty(), "no `Threads:` line was logged:\n{stderr}");
     for counts in &reported {
         assert_eq!(counts, expected, "misreported thread counts:\n{stderr}");
     }
 }
 
-/// The `Max memory:` line names the multiplier the budget resolved with.
-///
-/// * `sort_threads_above_threads` — `--sort-threads 8` with `--threads` unset
-///   used to report (and resolve) a one-thread budget while sorting with eight.
-/// * `sort_threads_below_threads` — lowering only the sort phase is the
-///   documented way to cede cores to an upstream producer, and must not shrink
-///   the budget `--threads` already earned.
-///
-/// This pins the *reported* multiplier only. The line is printed from the same
-/// local that feeds `resolve_memory_budget`, so it cannot tell a correctly wired
-/// budget from one that logs the sort-phase count and resolves `--threads`; the
-/// resolved byte count is pinned independently by the unit test
-/// `test_memory_budget_threads_resolves_the_scaled_budget`.
-///
-/// `expected_multiplier` also pins the flag the line attributes the count to,
-/// and is asserted separately from `expected_line` because the total goes
-/// through `bytesize`'s `Display`: pinning only the fully rendered line would
-/// report "the budget did not scale" for a rounding or unit-style change in that
-/// crate.
+/// An override above `--threads` warns exactly once per flag, naming the
+/// requested and effective counts; an override within `--threads` is silent.
 #[rstest]
-#[case::sort_threads_above_threads(
-    &["--max-memory", "100M", "--sort-threads", "8"],
-    "MiB/thread x 8 threads, from --sort-threads)",
-    "Max memory: 762.9 MiB (95.4 MiB/thread x 8 threads, from --sort-threads)"
+#[case::sort_clamped(&["--threads", "4", "--sort-threads", "32"], &[
+    "--sort-threads 32 exceeds --threads 4; the sort phase cannot use more workers than the pool has, using 4 (raise --threads to widen the pool)",
+])]
+#[case::both_clamped(&["--threads", "2", "--sort-threads", "8", "--merge-threads", "8"], &[
+    "--sort-threads 8 exceeds --threads 2; the sort phase cannot use more workers than the pool has, using 2 (raise --threads to widen the pool)",
+    "--merge-threads 8 exceeds --threads 2; the merge phase cannot use more workers than the pool has, using 2 (raise --threads to widen the pool)",
+])]
+#[case::within_threads_is_silent(&["--threads", "4", "--sort-threads", "2", "--merge-threads", "4"], &[])]
+fn clamped_overrides_warn_once_per_flag(#[case] extra_args: &[&str], #[case] expected: &[&str]) {
+    let stderr = sort_and_capture_logs(extra_args);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| {
+            l.contains(" WARN ") && (l.contains("sort-threads") || l.contains("merge-threads"))
+        })
+        .map(|l| l.split_once("] ").map_or(l, |(_, msg)| msg))
+        .collect();
+    assert_eq!(warnings, expected, "clamp warnings:\n{stderr}");
+}
+
+/// The `Max memory:` line names the multiplier the budget resolved with: the
+/// effective sort-phase count, attributed to `--sort-threads` only when it
+/// lowered the count. The resolved byte count is pinned independently by
+/// `test_memory_budget_follows_effective_phase1`; `expected_line` is asserted
+/// separately because the total goes through `bytesize`'s `Display`.
+#[rstest]
+#[case::sort_threads_above_threads_clamps(
+    &["--max-memory", "100M", "--threads", "16", "--sort-threads", "32"],
+    "MiB/thread x 16 threads, from --threads)",
+    "Max memory: 1.5 GiB (95.4 MiB/thread x 16 threads, from --threads)"
 )]
-#[case::sort_threads_below_threads(
+#[case::sort_threads_below_threads_shrinks(
     &["--max-memory", "100M", "--threads", "4", "--sort-threads", "2"],
-    "MiB/thread x 4 threads, from --threads)",
-    "Max memory: 381.5 MiB (95.4 MiB/thread x 4 threads, from --threads)"
+    "MiB/thread x 2 threads, from --sort-threads)",
+    "Max memory: 190.7 MiB (95.4 MiB/thread x 2 threads, from --sort-threads)"
 )]
-fn reported_memory_budget_scales_by_the_sort_phase(
+#[case::sort_threads_zero_is_one(
+    &["--max-memory", "100M", "--threads", "4", "--sort-threads", "0"],
+    "MiB/thread x 1 threads, from --sort-threads)",
+    "Max memory: 95.4 MiB (95.4 MiB/thread x 1 threads, from --sort-threads)"
+)]
+fn reported_memory_budget_scales_by_the_effective_sort_phase(
     #[case] extra_args: &[&str],
     #[case] expected_multiplier: &str,
     #[case] expected_line: &str,
 ) {
     let stderr = sort_and_capture_logs(extra_args);
-
     assert!(
         stderr.contains(expected_multiplier),
-        "budget did not scale by the sort-phase count:\n{stderr}"
+        "budget did not scale by the effective sort-phase count:\n{stderr}"
     );
     assert!(
         stderr.contains(expected_line),

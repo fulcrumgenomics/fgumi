@@ -21,6 +21,15 @@ use crate::keys::{RawCoordinateKey, RawSortKey};
 /// radix fronts fall back to the serial path at the same input size.
 pub(crate) const PARALLEL_SORT_THRESHOLD: usize = 256 * 1024;
 
+/// Whether a run of `n_refs` refs sorts on more than one thread at
+/// `sort_threads`: the radix sorts (coordinate, template-coordinate) go
+/// parallel only above `PARALLEL_SORT_THRESHOLD`. A caller that budgets
+/// threads around a sort (the sort's phase cap) asks this first.
+#[must_use]
+pub fn radix_sorts_in_parallel(n_refs: usize, sort_threads: usize) -> bool {
+    sort_threads > 1 && n_refs >= PARALLEL_SORT_THRESHOLD
+}
+
 /// `repr(transparent)` view of a [`RecordRef`] that orders by the
 /// `(sort_key, offset)` **composite** rather than by `sort_key` alone.  This lets
 /// `voracious`'s (unstable) parallel radix produce a STABLE-equivalent coordinate
@@ -97,7 +106,7 @@ impl Radixable<u128> for CoordSortRef {
 /// which includes `parallel_coordinate_sort_matches_serial_radix_at_threshold`
 /// (it constructs `offset: i`). Hence the debug assertion rather than a comment.
 fn sort_coordinate_refs(refs: &mut [RecordRef], sort_threads: usize) {
-    if sort_threads > 1 && refs.len() >= PARALLEL_SORT_THRESHOLD {
+    if radix_sorts_in_parallel(refs.len(), sort_threads) {
         debug_assert!(
             refs.windows(2).all(|w| w[0].offset <= w[1].offset),
             "parallel coordinate sort requires `offset` to ascend with input order: it breaks \

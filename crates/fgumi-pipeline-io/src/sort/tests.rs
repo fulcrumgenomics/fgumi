@@ -1879,6 +1879,111 @@ fn test_fastpath_parallel_matches_serial(
     }
 }
 
+/// A `Parallel` pass-through for gathered blocks that takes a permit of `cap`
+/// for each block it forwards — the role `BgzfCompress` plays beside the
+/// fast-path gather in a capped standalone sort.
+#[derive(Clone)]
+struct CappedBlockPassThrough {
+    cap: Arc<fgumi_pipeline_core::PhaseCap>,
+}
+
+impl Step for CappedBlockPassThrough {
+    type Input = crate::types::DecompressedBlock;
+    type Outputs = fgumi_pipeline_core::outputs::Single<crate::types::DecompressedBlock>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "CappedBlockPassThrough",
+            kind: StepKind::Parallel,
+            sticky: false,
+            output_queues: vec![QueueSpec::Unbounded],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        let Some(_permit) = self.cap.try_acquire() else {
+            return Ok(StepOutcome::Capped);
+        };
+        match ctx.input.pop() {
+            Some(block) => {
+                assert!(ctx.outputs.push(block).is_ok(), "unbounded queue accepts");
+                Ok(StepOutcome::Progress)
+            }
+            None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+            None => Ok(StepOutcome::NoProgress),
+        }
+    }
+
+    fn phase_cap(&self) -> Option<&fgumi_pipeline_core::PhaseCap> {
+        Some(&self.cap)
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+/// The capped parallel fast-path gather takes the WHOLE phase-2 cap for each
+/// burst, completes beside a capped pool step sharing that cap, and is
+/// byte-identical to the uncapped serial gather. The pool has 2 workers, so
+/// pool steps alone can never hold more than 2 of the cap's 4 permits: a
+/// high-water mark of 4 is reachable only through `acquire_whole`, so dropping
+/// it from the gather fails this test.
+#[test]
+fn capped_parallel_fast_path_gather_holds_the_whole_phase2_cap() {
+    use crate::sort::merge::BlockOutput;
+    use fgumi_pipeline_core::PhaseCap;
+
+    const GATHER_THREADS: usize = 4;
+    const POOL_THREADS: usize = 2;
+    let (_header, records) = synthesize_sized_records(4000, 0x0FA5_7CA9, 120);
+    let events = || {
+        vec![
+            coordinate_memory_chunk_event(records.clone()),
+            crate::sort::protocol::SortPhase2Event::AllAnnounced {
+                slot_count: 0,
+                memory_chunk_count: 1,
+                total_records: records.len() as u64,
+            },
+        ]
+    };
+    let serial =
+        collect_fastpath_blocks(events(), 1 << 30, 128, 1, 0).expect("uncapped serial gather");
+
+    let cap = PhaseCap::new("sort-phase2", GATHER_THREADS);
+    let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let merge =
+        SortMerge::<BlockOutput>::with_target_batch_count(SortOrder::Coordinate, 1 << 30, 128)
+            .with_fast_path_threads(GATHER_THREADS)
+            .with_fast_path_min_records(0)
+            .with_fast_path_cap(Some(Arc::clone(&cap)));
+    let builder = Pipeline::builder();
+    builder
+        .chain(Phase2EventSource::new(events(), 1 << 30))
+        .chain(merge)
+        .chain(CappedBlockPassThrough { cap: Arc::clone(&cap) })
+        .chain(BlockSink { received: Arc::clone(&received), kind: StepKind::Serial })
+        .into_sink_marker();
+    builder
+        .build()
+        .expect("build")
+        .run(PipelineConfig { threads: POOL_THREADS, ..Default::default() })
+        .expect("the capped gather completes beside the capped pool step");
+
+    let mut capped: Vec<(u64, Vec<u8>)> = std::mem::take(&mut *received.lock())
+        .into_iter()
+        .map(|b| (b.batch_serial, b.bytes))
+        .collect();
+    capped.sort_by_key(|(ordinal, _)| *ordinal);
+    assert!(serial.len() > 1, "fixture must plan several blocks");
+    assert_eq!(capped, serial, "the capped parallel gather is byte-identical");
+    assert_eq!(cap.peak(), GATHER_THREADS, "only the whole-cap gather reaches the full cap");
+    assert!(cap.peak() > POOL_THREADS);
+    assert_eq!(cap.active(), 0, "every permit released");
+}
+
 /// Like [`collect_fastpath_blocks`] but for the default `SortMerge<RecordBatchOutput>`
 /// (the intermediate-sort output feeding group/consensus), whose byte-cap plan
 /// relies on `FRAME_OVERHEAD_PER_RECORD = 0` rather than `BlockOutput`'s `4`.
@@ -2444,6 +2549,153 @@ fn drive_arena_split_pipeline(
     }
     let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
     Ok((out, runs))
+}
+
+/// `drive_arena_split_pipeline` with one shared phase-1 cap on inflate +
+/// spill-compress and one phase-2 cap on decompress, returning the caps so
+/// tests can read their high-water marks.
+fn drive_arena_split_pipeline_capped(
+    blocks: Vec<crate::types::BgzfBlock>,
+    n_ref: u32,
+    memory_limit: usize,
+    output_byte_limit: u64,
+    threads: usize,
+    phase1_cap: &Arc<fgumi_pipeline_core::PhaseCap>,
+    phase2_cap: &Arc<fgumi_pipeline_core::PhaseCap>,
+) -> Result<(Vec<Vec<u8>>, usize)> {
+    use fgumi_sort::TmpDirAllocator;
+
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let stats_slot: Arc<Mutex<Option<fgumi_sort::SortStats>>> = Arc::new(Mutex::new(None));
+
+    let dir = tempfile::TempDir::new()?;
+    let alloc =
+        TmpDirAllocator::with_probe(vec![dir.path().to_path_buf()], Box::new(|_| Ok(u64::MAX)), 0)?;
+    let temp_dirs = Arc::new(vec![dir]);
+    let codec = SpillCodec::Zstd;
+
+    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        256,
+    )
+    .with_stats_slot(Arc::clone(&stats_slot));
+
+    let builder = Pipeline::builder();
+    builder
+        .chain(BgzfBlockSource::new(blocks, output_byte_limit))
+        .chain(ReadBlocks::new(memory_limit, output_byte_limit))
+        .chain(InflateToArena::new(output_byte_limit).with_phase_cap(Some(Arc::clone(phase1_cap))))
+        .chain(
+            FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 2, output_byte_limit)
+                .with_phase_cap(Some(Arc::clone(phase1_cap))),
+        )
+        .chain(SpillGather::new(output_byte_limit))
+        .chain(
+            SpillBlockCompress::new(codec, 3, output_byte_limit)
+                .with_phase_cap(Some(Arc::clone(phase1_cap))),
+        )
+        .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
+        .chain(
+            SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default())
+                .with_phase_cap(Some(Arc::clone(phase2_cap))),
+        )
+        .chain(merge)
+        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial })
+        .into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads, ..Default::default() })?;
+
+    let collected = std::mem::take(&mut *received.lock());
+    let mut out = Vec::new();
+    for batch in collected {
+        for bytes in batch.iter_record_bytes() {
+            out.push(bytes.to_vec());
+        }
+    }
+    let runs = stats_slot.lock().take().expect("SortMerge published its stats").runs_written;
+    Ok((out, runs))
+}
+
+/// A binding shared phase cap on a 4-worker pool — including a cap of 1 across
+/// `InflateToArena` AND `SpillBlockCompress` — still runs to completion (a
+/// refused clone keeps the drain hand-off), delivers every record and is
+/// byte-identical to the uncapped run. The caps' high-water marks are a sanity
+/// check of the counter, not proof that each step honours it; the per-step
+/// `full_cap_refuses_without_popping_*` tests pin that.
+#[rstest]
+#[case::phase1_capped_to_one(1, 4)]
+#[case::both_capped_to_two(2, 2)]
+#[case::phase2_capped_to_one(4, 1)]
+fn shared_phase_caps_bound_pool_concurrency_without_changing_output(
+    #[case] phase1_max: usize,
+    #[case] phase2_max: usize,
+) {
+    use fgumi_pipeline_core::PhaseCap;
+    let (header, records) = synthesize_sized_records(8_000, 0xCA9_0001, 40);
+    let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
+    // `BgzfBlock` is not `Clone`; `bgzf_blocks_for` is deterministic, so build
+    // the same block stream once per arm.
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+
+    let uncapped = drive_arena_split_pipeline(blocks(), n_ref, 64 * 1024, 4 * 1024 * 1024, 4)
+        .expect("uncapped pipeline");
+
+    let phase1 = PhaseCap::new("sort-phase1", phase1_max);
+    let phase2 = PhaseCap::new("sort-phase2", phase2_max);
+    let capped = drive_arena_split_pipeline_capped(
+        blocks(),
+        n_ref,
+        64 * 1024,
+        4 * 1024 * 1024,
+        4,
+        &phase1,
+        &phase2,
+    )
+    .expect("capped pipeline must run to completion");
+
+    assert_eq!(capped.0.len(), records.len(), "every record delivered under the cap");
+    assert_eq!(capped, uncapped, "caps must not change the output or the run count");
+    assert!(capped.1 > 1, "fixture must spill so both phases do real work (runs={})", capped.1);
+    assert!(
+        phase1.peak() >= 1 && phase1.peak() <= phase1_max,
+        "phase-1 peak {} > cap {phase1_max}",
+        phase1.peak()
+    );
+    assert!(
+        phase2.peak() >= 1 && phase2.peak() <= phase2_max,
+        "phase-2 peak {} > cap {phase2_max}",
+        phase2.peak()
+    );
+    assert_eq!(phase1.active(), 0);
+    assert_eq!(phase2.active(), 0);
+}
+
+/// `new_worker_copy` must carry the cap, or only the seed clone would be
+/// capped. Pinned by identity for all three steps: with the shared counter
+/// exhausted, every copy's cap refuses too (an equal-looking new `PhaseCap`
+/// would admit).
+#[test]
+fn worker_copies_share_the_phase_cap() {
+    use fgumi_pipeline_core::PhaseCap;
+    let cap = PhaseCap::new("sort-phase1", 2);
+    let inflate = InflateToArena::new(4096).with_phase_cap(Some(Arc::clone(&cap)));
+    let compress =
+        SpillBlockCompress::new(SpillCodec::Zstd, 1, 4096).with_phase_cap(Some(Arc::clone(&cap)));
+    let decompress = SortSpillDecompress::new(4096, SortDecompressTuning::default())
+        .with_phase_cap(Some(Arc::clone(&cap)));
+    let copies =
+        (inflate.new_worker_copy(), compress.new_worker_copy(), decompress.new_worker_copy());
+    let _p1 = cap.try_acquire().expect("1 of 2");
+    let _p2 = cap.try_acquire().expect("2 of 2");
+    for (name, copy_cap) in [
+        ("InflateToArena", copies.0.phase_cap()),
+        ("SpillBlockCompress", copies.1.phase_cap()),
+        ("SortSpillDecompress", copies.2.phase_cap()),
+    ] {
+        let copy_cap = copy_cap.unwrap_or_else(|| panic!("{name} copy lost its cap"));
+        assert!(copy_cap.try_acquire().is_none(), "{name} copy must share the exhausted counter");
+    }
 }
 
 /// The benchmark case, in miniature: a pre-sorted BAM re-sorted through the full
