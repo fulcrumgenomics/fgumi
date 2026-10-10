@@ -37,8 +37,9 @@ pub use arena_ingest::{
     InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
 };
 pub use arena_split::{
-    ArenaKeyExtractor, ExtractKeys, ExtractTemplateKeys, FindRecordBoundaries,
-    FindTemplateBoundaries, KEY_BATCH_RECORDS, KeyBatch, KeyOverlapCensus, RefBatch, RunEnd,
+    ArenaKeyExtractor, ExtractKeys, ExtractQuerynameKeys, ExtractTemplateKeys,
+    FindQuerynameBoundaries, FindRecordBoundaries, FindTemplateBoundaries, KEY_BATCH_RECORDS,
+    KeyBatch, KeyOverlapCensus, QnChunkOrder, QuerynameKeys, RefBatch, RunEnd, SortQuerynameRun,
     SortRun, SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
 };
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};

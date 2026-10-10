@@ -50,8 +50,9 @@ use fgumi_pipeline_core::{HeldRetry, PhaseCap, Unpushed};
 use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
 use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
-    BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf,
-    TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateMemChunk,
+    BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf, QnBatchLcp,
+    QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, TemplateArenaRefs,
+    TemplateKeyContext, TemplateKeySeed, TemplateMemChunk, queryname_chunk_from_qn_refs,
     radix_sorts_in_parallel, seal_template_refs,
 };
 use log::{debug, info};
@@ -1220,6 +1221,174 @@ pub type SortTemplateRun = SortRun<TemplateKeys>;
 pub type TemplateKeyBatch = KeyBatch<TemplateKeys>;
 /// A template-coordinate ref batch.
 pub type TemplateRefBatch = RefBatch<TemplateKeys>;
+
+// ============================================================================
+// Queryname
+// ============================================================================
+
+/// A queryname comparator that knows the erased chunk its runs seal into.
+pub trait QnChunkOrder: QnComparator + Send + Sync + 'static {
+    /// Erase a sorted queryname chunk into this order's variant.
+    fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased;
+}
+
+impl QnChunkOrder for QnLex {
+    fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased {
+        MemoryChunkErased::QuerynameLex(chunk)
+    }
+}
+
+impl QnChunkOrder for QnNatural {
+    fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased {
+        MemoryChunkErased::QuerynameNatural(chunk)
+    }
+}
+
+/// Queryname keys: 40-byte refs over the arena (a 24-byte name window behind
+/// a learned prefix class; see `fgumi_sort::queryname_ref`). Each extraction
+/// clone carries its own class guess (`QnRefBuilder`) across the batches it
+/// extracts; every batch is classified, and re-windowed when it learns a new
+/// class, before it leaves the extractor. The order is `C`'s.
+pub struct QuerynameKeys<C>(std::marker::PhantomData<C>);
+
+/// The smallest frame a BAM record can occupy (its fixed fields).
+const MIN_QN_RECORD_LEN: usize = 32;
+
+/// An `InvalidData` error for a queryname batch whose frames do not match
+/// the scan's cut.
+fn qn_malformed(first_index: u64, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("queryname key batch at record {first_index}: {what}"),
+    )
+}
+
+impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
+    const STEP_NAMES: [&'static str; 3] =
+        ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"];
+    /// The sort's class table and counters, shared with its merge.
+    type Seed = QnSortState;
+    type Ctx = QnSortState;
+    type Refs = Vec<QnRef>;
+    type Accum = Vec<QnRef>;
+    type Scratch = QnRefBuilder;
+
+    fn provision(seed: &Self::Seed, _first_body: &[u8]) -> Self::Ctx {
+        seed.clone()
+    }
+
+    fn ref_width(_ctx: &Self::Ctx) -> usize {
+        size_of::<QnRef>()
+    }
+
+    fn extract_batch(
+        ctx: &Self::Ctx,
+        builder: &mut QnRefBuilder,
+        arena: &PooledSegmentedBuf,
+        byte_start: u64,
+        byte_end: u64,
+        n: u32,
+        first_index: u64,
+    ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
+        let start = usize::try_from(byte_start)
+            .map_err(|_| qn_malformed(first_index, "start overflows usize"))?;
+        let end = usize::try_from(byte_end)
+            .map_err(|_| qn_malformed(first_index, "end overflows usize"))?;
+        if end < start {
+            return Err(qn_malformed(first_index, "end precedes start"));
+        }
+        let span = arena.slice(start, end - start);
+        let table = &ctx.table;
+        let mut lcp = QnBatchLcp::default();
+        let mut refs: Vec<QnRef> = Vec::with_capacity(n as usize);
+        let mut cur = 0usize;
+        for _ in 0..n {
+            if cur + 4 > span.len() {
+                return Err(qn_malformed(first_index, "fewer frames than n_records"));
+            }
+            let bs = u32::from_le_bytes([span[cur], span[cur + 1], span[cur + 2], span[cur + 3]]);
+            if (bs as usize) < MIN_QN_RECORD_LEN {
+                return Err(qn_malformed(first_index, "frame shorter than a BAM record"));
+            }
+            let body_start = cur + 4;
+            let body_end = body_start + bs as usize;
+            if body_end > span.len() {
+                return Err(qn_malformed(first_index, "frame runs past byte_end"));
+            }
+            if let Some(ahead) = span.get(cur + KEY_PREFETCH_DISTANCE) {
+                prefetch_read_l1(ahead);
+            }
+            let body = &span[body_start..body_end];
+            refs.push(builder.build(table, &mut lcp, body, byte_start + body_start as u64, bs));
+            cur = body_end;
+        }
+        if cur != span.len() {
+            return Err(qn_malformed(first_index, "bytes remain after the last frame"));
+        }
+        if !refs.is_empty() {
+            let reclassified = builder.reclassify(table, arena, &mut refs, &lcp);
+            let class0 =
+                if reclassified { 0 } else { refs.iter().filter(|r| r.0.class == 0).count() };
+            ctx.stats.note_batch(refs.len(), class0, reclassified);
+        }
+        Ok((refs, None))
+    }
+
+    fn refs_len(refs: &Self::Refs) -> usize {
+        refs.len()
+    }
+
+    fn refs_byte_len(refs: &Self::Refs) -> usize {
+        refs.len() * size_of::<QnRef>()
+    }
+
+    fn accum_for(_ctx: &Self::Ctx) -> Self::Accum {
+        Vec::new()
+    }
+
+    fn reserve(acc: &mut Self::Accum, n: usize) {
+        acc.reserve(n);
+    }
+
+    fn append(acc: &mut Self::Accum, mut refs: Self::Refs) {
+        acc.append(&mut refs);
+    }
+
+    /// The comparator sort always runs on the bounded pool, so it is parallel
+    /// whenever that pool has more than one thread.
+    fn sorts_in_parallel(_acc: &Self::Accum, sort_threads: usize) -> bool {
+        sort_threads > 1
+    }
+
+    /// The run's refs move into the chunk; nothing is copied.
+    fn seal(
+        acc: &mut Self::Accum,
+        ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pool: &BoundedSortPool,
+    ) -> MemoryChunkErased {
+        let refs = std::mem::take(acc);
+        pool.bounded(sort_threads).install(move || {
+            C::wrap(queryname_chunk_from_qn_refs::<C>(&ctx.table, arena, refs, ctx.compare_stats()))
+        })
+    }
+
+    fn empty_chunk() -> MemoryChunkErased {
+        C::wrap(InMemoryChunk::default())
+    }
+
+    fn pool_name() -> &'static str {
+        "qname-sort"
+    }
+}
+
+/// The queryname boundary step, in comparator `C`'s order.
+pub type FindQuerynameBoundaries<C> = FindRecordBoundaries<QuerynameKeys<C>>;
+/// The queryname extraction step.
+pub type ExtractQuerynameKeys<C> = ExtractKeys<QuerynameKeys<C>>;
+/// The queryname run sort.
+pub type SortQuerynameRun<C> = SortRun<QuerynameKeys<C>>;
 
 /// Test probe shared by a split front's steps: can hold the scan after the
 /// sort's first batch until that batch is extracted (proving extraction runs

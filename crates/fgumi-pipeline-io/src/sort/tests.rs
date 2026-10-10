@@ -881,9 +881,9 @@ enum Front {
 enum ArenaFront {
     /// `FindBoundariesAndSort` over the order's `ArenaSortStrategy`.
     Fbs,
-    /// The split front for template-coordinate order
-    /// (`FindTemplateBoundaries` → `ExtractTemplateKeys` → `SortTemplateRun`).
-    SplitTemplate,
+    /// The split front (`FindRecordBoundaries` → `ExtractKeys` → `SortRun`)
+    /// over the order's `ArenaKeyExtractor`.
+    Split,
 }
 
 /// The arena front each order ships with at this commit. When an order moves
@@ -891,9 +891,32 @@ enum ArenaFront {
 /// arena-front test gates the front that ships.
 fn production_arena_front(order: SortOrder) -> ArenaFront {
     match order {
-        SortOrder::TemplateCoordinate => ArenaFront::SplitTemplate,
-        SortOrder::Coordinate | SortOrder::Queryname(_) => ArenaFront::Fbs,
+        SortOrder::TemplateCoordinate | SortOrder::Queryname(_) => ArenaFront::Split,
+        SortOrder::Coordinate => ArenaFront::Fbs,
     }
+}
+
+/// The split front's three steps for extractor `X`, with `caps`' test knobs.
+fn split_steps<'b, X: ArenaKeyExtractor>(
+    head: Chain<'b, OrderedBytesSingle<InflatedBlock>>,
+    seed: X::Seed,
+    sort_threads: usize,
+    output_byte_limit: u64,
+    caps: &ChainCaps,
+) -> Chain<'b, Single<SortChunkEvent>> {
+    let mut boundaries = FindRecordBoundaries::<X>::new(seed, output_byte_limit);
+    let mut extract = ExtractKeys::<X>::new(output_byte_limit).with_phase_cap(caps.phase1.clone());
+    let mut run =
+        SortRun::<X>::new(sort_threads, output_byte_limit).with_phase_cap(caps.phase1.clone());
+    if let Some(n) = caps.batch_records {
+        boundaries = boundaries.with_batch_records(n);
+    }
+    if let Some(probe) = &caps.probe {
+        boundaries = boundaries.with_probe(Arc::clone(probe));
+        extract = extract.with_probe(Arc::clone(probe));
+        run = run.with_probe(Arc::clone(probe));
+    }
+    head.chain(boundaries).chain(extract).chain(run)
 }
 
 /// Append `front`'s steps for `config.sort_order` to an arena chain head
@@ -910,24 +933,32 @@ fn arena_front<'b>(
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
     let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, .. } = config;
     match (front, sort_order) {
-        (ArenaFront::SplitTemplate, SortOrder::TemplateCoordinate) => {
-            let seed = fgumi_sort::TemplateKeySeed::from_header(header, cell_tag, key_types);
-            let mut boundaries = FindTemplateBoundaries::new(seed, output_byte_limit);
-            let mut extract =
-                ExtractTemplateKeys::new(output_byte_limit).with_phase_cap(caps.phase1.clone());
-            let mut run = SortTemplateRun::new(sort_threads, output_byte_limit)
-                .with_phase_cap(caps.phase1.clone());
-            if let Some(n) = caps.batch_records {
-                boundaries = boundaries.with_batch_records(n);
-            }
-            if let Some(probe) = &caps.probe {
-                boundaries = boundaries.with_probe(Arc::clone(probe));
-                extract = extract.with_probe(Arc::clone(probe));
-                run = run.with_probe(Arc::clone(probe));
-            }
-            head.chain(boundaries).chain(extract).chain(run)
+        (ArenaFront::Split, SortOrder::TemplateCoordinate) => split_steps::<TemplateKeys>(
+            head,
+            fgumi_sort::TemplateKeySeed::from_header(header, cell_tag, key_types),
+            sort_threads,
+            output_byte_limit,
+            caps,
+        ),
+        (ArenaFront::Split, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => {
+            split_steps::<QuerynameKeys<fgumi_sort::QnLex>>(
+                head,
+                fgumi_sort::QnSortState::new(false),
+                sort_threads,
+                output_byte_limit,
+                caps,
+            )
         }
-        (ArenaFront::SplitTemplate, order) => unreachable!("no split front for {order:?} yet"),
+        (ArenaFront::Split, SortOrder::Queryname(QuerynameComparator::Natural)) => {
+            split_steps::<QuerynameKeys<fgumi_sort::QnNatural>>(
+                head,
+                fgumi_sort::QnSortState::new(false),
+                sort_threads,
+                output_byte_limit,
+                caps,
+            )
+        }
+        (ArenaFront::Split, order) => unreachable!("no split front for {order:?} yet"),
         (ArenaFront::Fbs, SortOrder::Coordinate) => head.chain(
             FindBoundariesAndSort::new(
                 CoordinateStrategy::new(n_ref),
@@ -5038,8 +5069,7 @@ fn template_split_matches_fbs_and_reference_across_runs(
     let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
     let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
     let split =
-        drive_arena_chunks(ArenaFront::SplitTemplate, config, &header, blocks(), threads, &caps)
-            .unwrap();
+        drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
     let fbs =
         drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), threads, &caps).unwrap();
     assert!(split.chunks.len() >= 3, "{case:?}: several runs (got {})", split.chunks.len());
@@ -5053,7 +5083,7 @@ fn template_split_matches_fbs_and_reference_across_runs(
     assert!(split.chunks == fbs.chunks, "{case:?} t{threads}: chunks differ from FBS");
     assert_eq!((split.slot_count, split.total_records), (fbs.slot_count, fbs.total_records));
     let merged = drive_arena_chain(
-        ArenaFront::SplitTemplate,
+        ArenaFront::Split,
         config,
         &header,
         blocks(),
@@ -5115,7 +5145,7 @@ fn violation_report_is_identical_across_template_paths() {
     let fbs = violation(&arena_err(ArenaFront::Fbs, 2));
     assert!(fbs.starts_with("record rd_7 "), "{fbs}");
     for threads in [1, 4] {
-        assert_eq!(violation(&arena_err(ArenaFront::SplitTemplate, threads)), fbs, "t{threads}");
+        assert_eq!(violation(&arena_err(ArenaFront::Split, threads)), fbs, "t{threads}");
     }
     let buffer = drive_buffer_chain(
         config,
@@ -5138,13 +5168,19 @@ fn violation_report_is_identical_across_template_paths() {
 #[case::residual_only(500, 64 << 20, false)]
 #[case::truncated(500, 64 * 1024, true)]
 fn split_front_edge_cases_match_fbs(
+    #[values(
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
     #[case] n: usize,
     #[case] memory_limit: usize,
     #[case] truncate: bool,
 ) {
     let (header, records) = template_records(n, 0xED6E, false, false);
     let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
-    let config = buffer_config(SortOrder::TemplateCoordinate, memory_limit.min(64 << 20), 2);
+    let config = buffer_config(order, memory_limit.min(64 << 20), 2);
     let blocks = || {
         if truncate {
             bgzf_blocks_truncated(&records, n_ref, 4096, 5)
@@ -5153,7 +5189,7 @@ fn split_front_edge_cases_match_fbs(
         }
     };
     let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
-    let split = drive_arena_chunks(ArenaFront::SplitTemplate, config, &header, blocks(), 2, &caps);
+    let split = drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), 2, &caps);
     let fbs = drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), 2, &caps);
     match (split, fbs) {
         (Ok(s), Ok(f)) => {
@@ -5174,15 +5210,22 @@ fn split_front_edge_cases_match_fbs(
 /// Under a phase-1 cap of one with four workers — inflate, extraction and
 /// spill compression share one permit and the run sort reserves it — the
 /// split front still completes, with the reference output.
-#[test]
-fn a_one_permit_phase1_cap_completes_on_the_split_front() {
+#[rstest]
+fn a_one_permit_phase1_cap_completes_on_the_split_front(
+    #[values(
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+) {
     let (header, records) = tie_heavy_records(4_000, 21);
     let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
     let cap = fgumi_pipeline_core::PhaseCap::new("sort-phase1", 1);
     let caps = ChainCaps { phase1: Some(Arc::clone(&cap)), ..ChainCaps::default() };
     let run = drive_arena_chain(
-        ArenaFront::SplitTemplate,
-        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, 4),
+        ArenaFront::Split,
+        buffer_config(order, 96 * 1024, 4),
         &header,
         bgzf_blocks_for(&records, n_ref, 4096),
         4 * 1024 * 1024,
@@ -5192,11 +5235,7 @@ fn a_one_permit_phase1_cap_completes_on_the_split_front() {
     )
     .unwrap();
     assert!(run.merge_sources >= 2, "the fixture spills");
-    assert_record_parity(
-        "cap 1",
-        &run.records,
-        &reference_sort(SortOrder::TemplateCoordinate, &header, &records, None),
-    );
+    assert_record_parity("cap 1", &run.records, &reference_sort(order, &header, &records, None));
     assert_eq!(cap.peak(), 1);
 }
 
@@ -5206,7 +5245,15 @@ fn a_one_permit_phase1_cap_completes_on_the_split_front() {
 /// be extracted and the 30 s watchdog would fire. The census reports
 /// overlapped records.
 #[rstest]
-fn split_extracts_while_the_scan_continues(#[values(2usize, 4)] threads: usize) {
+fn split_extracts_while_the_scan_continues(
+    #[values(
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+    #[values(2usize, 4)] threads: usize,
+) {
     let (header, records) = tie_heavy_records(3_000, 31);
     let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
     let probe = Arc::new(crate::sort::arena_split::SplitProbe::holding_scan());
@@ -5218,8 +5265,8 @@ fn split_extracts_while_the_scan_continues(#[values(2usize, 4)] threads: usize) 
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let out = drive_arena_chain(
-            ArenaFront::SplitTemplate,
-            buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, threads),
+            ArenaFront::Split,
+            buffer_config(order, 96 * 1024, threads),
             &header,
             bgzf_blocks_for(&records, n_ref, 4096),
             4 * 1024 * 1024,
@@ -5242,16 +5289,23 @@ fn split_extracts_while_the_scan_continues(#[values(2usize, 4)] threads: usize) 
 
 /// At one thread the reader holds the only pool worker, so extraction runs on
 /// the `sort-coord` driver — the thread that did the work before the split.
-#[test]
-fn t1_split_runs_extract_on_the_coord_driver() {
+#[rstest]
+fn t1_split_runs_extract_on_the_coord_driver(
+    #[values(
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
+) {
     let (header, records) = tie_heavy_records(2_000, 41);
     let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
     let probe = Arc::new(crate::sort::arena_split::SplitProbe::default());
     let caps =
         ChainCaps { probe: Some(Arc::clone(&probe)), reader_source: true, ..ChainCaps::default() };
     let run = drive_arena_chain(
-        ArenaFront::SplitTemplate,
-        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, 1),
+        ArenaFront::Split,
+        buffer_config(order, 96 * 1024, 1),
         &header,
         bgzf_blocks_for(&records, n_ref, 4096),
         4 * 1024 * 1024,
@@ -5274,6 +5328,12 @@ fn t1_split_runs_extract_on_the_coord_driver() {
 /// extraction).
 #[rstest]
 fn split_front_at_one_and_two_threads(
+    #[values(
+        SortOrder::TemplateCoordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        SortOrder::Queryname(QuerynameComparator::Natural)
+    )]
+    order: SortOrder,
     #[values(1usize, 2)] threads: usize,
     #[values(false, true)] capped: bool,
 ) {
@@ -5285,8 +5345,8 @@ fn split_front_at_one_and_two_threads(
         ..ChainCaps::default()
     };
     let run = drive_arena_chain(
-        ArenaFront::SplitTemplate,
-        buffer_config(SortOrder::TemplateCoordinate, 96 * 1024, if capped { 1 } else { threads }),
+        ArenaFront::Split,
+        buffer_config(order, 96 * 1024, if capped { 1 } else { threads }),
         &header,
         bgzf_blocks_for(&records, n_ref, 4096),
         4 * 1024 * 1024,
@@ -5299,7 +5359,7 @@ fn split_front_at_one_and_two_threads(
     assert_record_parity(
         &format!("t{threads} capped={capped}"),
         &run.records,
-        &reference_sort(SortOrder::TemplateCoordinate, &header, &records, None),
+        &reference_sort(order, &header, &records, None),
     );
 }
 
@@ -5316,7 +5376,7 @@ fn three_step_chain_large_spill_completes_on_the_arena_split(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let out = drive_arena_chain(
-            ArenaFront::SplitTemplate,
+            ArenaFront::Split,
             buffer_config(SortOrder::TemplateCoordinate, 1 << 20, pipeline_threads),
             &header,
             bgzf_blocks_for(&records, n_ref, 16 * 1024),
@@ -5333,4 +5393,93 @@ fn three_step_chain_large_spill_completes_on_the_arena_split(
         .unwrap();
     assert!(merge_sources >= 4, "the soak spills several runs (got {merge_sources})");
     assert_record_parity(&format!("t{pipeline_threads}"), &out, &expected);
+}
+
+/// Queryname records whose instrument prefix changes every 700 records of
+/// input (so key batches re-learn their class mid-run), shuffled within each
+/// prefix block, with read pairs, secondary copies sharing a name and flags
+/// (ties), and digit runs of varying width (natural order). Each record
+/// carries a unique `XI` tag, so tie order is observable.
+fn instrument_switching_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
+    const PREFIXES: [&str; 3] = ["A00132:53:HFHJ", "M04567:12:000000000-ABCDE", "NB551:7:HXY"];
+    let mut rng = SplitMix(seed);
+    let mut specs: Vec<(u16, Vec<u8>)> = Vec::with_capacity(n + 8);
+    let mut block = Vec::new();
+    while specs.len() < n {
+        let prefix = PREFIXES[(specs.len() + block.len()) / 700 % PREFIXES.len()];
+        let width = 1 + u32::try_from(rng.below(5)).unwrap();
+        let name = format!(
+            "{prefix}:{}:{}:{}:{}",
+            1 + rng.below(4),
+            1101 + rng.below(30),
+            rng.below(10u64.pow(width)),
+            rng.below(40_000)
+        )
+        .into_bytes();
+        block.push((0x41u16, name.clone()));
+        block.push((0x81u16, name.clone()));
+        if rng.chance(4) {
+            block.push((0x141u16, name));
+            block.push((0x141u16, block.last().unwrap().1.clone()));
+        }
+        if block.len() >= 700 {
+            for i in (1..block.len()).rev() {
+                #[allow(clippy::cast_possible_truncation)]
+                let j = rng.below(i as u64 + 1) as usize;
+                block.swap(i, j);
+            }
+            specs.append(&mut block);
+        }
+    }
+    specs.append(&mut block);
+    let records = specs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (flags, name))| {
+            let mut aux = b"XIi".to_vec();
+            aux.extend_from_slice(&u32::try_from(i).expect("index fits u32").to_le_bytes());
+            RawRecord::from(make_bam_bytes(-1, -1, flags | 0x4, &name, &[], 40, -1, -1, &aux))
+        })
+        .collect();
+    (synthetic_header(), records)
+}
+
+/// The queryname split front, lexicographic and natural, at one, two and four
+/// threads: every run's chunk is `FindBoundariesAndSort`'s, record for record,
+/// though key batches (64 records) re-learn their prefix class as the
+/// instrument changes; the merged output is the reference stable sort.
+#[rstest]
+fn queryname_split_matches_fbs_and_reference_across_runs(
+    #[values(QuerynameComparator::Lexicographic, QuerynameComparator::Natural)]
+    cmp: QuerynameComparator,
+    #[values(1usize, 2, 4)] threads: usize,
+) {
+    let order = SortOrder::Queryname(cmp);
+    let (header, records) = instrument_switching_records(4_000, 0x9A7E + threads as u64);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(order, 96 * 1024, threads);
+    let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+    let split =
+        drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
+    let fbs =
+        drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), threads, &caps).unwrap();
+    assert!(split.chunks.len() >= 3, "{cmp:?}: several runs (got {})", split.chunks.len());
+    assert_eq!(split.key_kinds, fbs.key_kinds, "{cmp:?}");
+    assert!(split.chunks == fbs.chunks, "{cmp:?} t{threads}: chunks differ from FBS");
+    assert_eq!((split.slot_count, split.total_records), (fbs.slot_count, fbs.total_records));
+    let merged = drive_arena_chain(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        4 * 1024 * 1024,
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    let expected = reference_sort(order, &header, &records, None);
+    assert_record_parity(&format!("{cmp:?} t{threads}"), &merged.records, &expected);
+    assert_input_order_within_equal_keys(order, &header, &merged.records);
 }

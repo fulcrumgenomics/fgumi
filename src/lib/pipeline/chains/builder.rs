@@ -3947,16 +3947,15 @@ impl<'a> ChainBuilder<'a> {
                 let byte_limit = self.tuning.per_step_byte_limit;
                 // Sort head: two cases depending on the source tail kind.
                 // BgzfBlockArena (BAM): use the parallel-inflate front
-                // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
+                // (ReadBlocks → InflateToArena → the order's arena steps).
                 // Else (RecordBatch from SAM or upstream stage): use SortBuffer.
                 let head_tail = if self.chain_tail_kind == ChainTailKind::BgzfBlockArena {
                     // BAM sort through the parallel-inflate arena front
-                    // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
-                    // Each order selects its per-order strategy.
-                    use fgumi_pipeline_io::sort::protocol::MemoryChunkErased;
+                    // (ReadBlocks → InflateToArena → …). Template-coordinate and
+                    // queryname run on the split front (boundaries → extraction →
+                    // run sort); coordinate on FindBoundariesAndSort.
                     use fgumi_pipeline_io::sort::{
-                        CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
-                        QuerynameStrategy, ReadBlocks,
+                        CoordinateStrategy, FindBoundariesAndSort, InflateToArena, ReadBlocks,
                     };
                     use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
@@ -3982,6 +3981,13 @@ impl<'a> ChainBuilder<'a> {
                     let extract_placement = extract_placement_from_env(
                         std::env::var("FGUMI_SORT_EXTRACT_ALL_WORKERS").ok().as_deref(),
                     );
+                    let split_front = || SplitFront {
+                        sort_threads,
+                        byte_limit,
+                        sort_stats: sort.sort_stats,
+                        cap: phase1_cap.clone(),
+                        placement: extract_placement,
+                    };
                     let t = self.pipeline.append_step(read_blocks, tail);
                     let t = self.pipeline.append_step(inflate, t);
                     let out = match sort_order {
@@ -3999,44 +4005,25 @@ impl<'a> ChainBuilder<'a> {
                                 &self.pipeline,
                                 t,
                                 seed,
-                                SplitFront {
-                                    sort_threads,
-                                    byte_limit,
-                                    sort_stats: sort.sort_stats,
-                                    cap: phase1_cap.clone(),
-                                    placement: extract_placement,
-                                },
+                                split_front(),
                             )
                         }
                         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-                            // Queryname (lexicographic): the read name IS the key,
-                            // embedded in the record; the strategy sorts 40-byte
-                            // arena refs into an InMemoryChunk<QnKey>.
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<fgumi_sort::QnLex>::new(
-                                        MemoryChunkErased::QuerynameLex,
-                                        qn_keys.clone(),
-                                    ),
-                                    sort_threads,
-                                    byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
+                            // Queryname: the read name IS the key, embedded in the
+                            // record; runs sort 40-byte arena refs. The key state
+                            // (class table, counters) is shared with the merge.
+                            append_split::<fgumi_pipeline_io::sort::QuerynameKeys<fgumi_sort::QnLex>>(
+                                &self.pipeline,
                                 t,
+                                qn_keys.clone(),
+                                split_front(),
                             )
                         }
                         SortOrder::Queryname(QuerynameComparator::Natural) => {
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<fgumi_sort::QnNatural>::new(
-                                        MemoryChunkErased::QuerynameNatural,
-                                        qn_keys.clone(),
-                                    ),
-                                    sort_threads,
-                                    byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
-                                t,
+                            append_split::<
+                                fgumi_pipeline_io::sort::QuerynameKeys<fgumi_sort::QnNatural>,
+                            >(
+                                &self.pipeline, t, qn_keys.clone(), split_front()
                             )
                         }
                         SortOrder::Coordinate => self.pipeline.append_step(
@@ -7808,12 +7795,30 @@ mod tests {
         sort_threads: Option<usize>,
         read_streams: fgumi_bam_io::ReadStreams,
     ) -> (Option<usize>, crate::pipeline::chains::finalize::BuiltPipeline, tempfile::TempDir) {
+        build_native_sort_in_order(
+            crate::commands::sort::SortOrderArg::TemplateCoordinate,
+            stages,
+            threads,
+            sort_threads,
+            read_streams,
+        )
+    }
+
+    /// [`build_native_sort`] in `order`.
+    fn build_native_sort_in_order(
+        order: crate::commands::sort::SortOrderArg,
+        stages: Vec<Stage>,
+        threads: usize,
+        sort_threads: Option<usize>,
+        read_streams: fgumi_bam_io::ReadStreams,
+    ) -> (Option<usize>, crate::pipeline::chains::finalize::BuiltPipeline, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let input = header_only_input(tmp.path(), false);
         let mut spec = sort_chain_spec(tmp.path(), input, stages);
         spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
         spec.read_streams = read_streams;
         spec.stage_opts.sort.as_mut().unwrap().sort_threads = sort_threads;
+        spec.stage_opts.sort.as_mut().unwrap().order = order;
         let mut chain = ChainBuilder::new(&spec).unwrap();
         chain.add_source().unwrap();
         let last = spec.stages.len() - 1;
@@ -8032,6 +8037,35 @@ mod tests {
             assert!(dag.contains(name), "t{threads}: {name} missing:\n{dag}");
         }
         assert!(!dag.contains("FindBoundariesAndSort"), "t{threads}:\n{dag}");
+    }
+
+    /// A BAM queryname sort, lexicographic or natural, runs on the split arena
+    /// front: the three queryname split steps, and no `FindBoundariesAndSort`.
+    /// Under an explicit `--sort-threads` the extraction carries the phase-1 cap.
+    #[rstest::rstest]
+    fn queryname_sort_dag_has_the_split_front(
+        #[values(
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural
+        )]
+        order: crate::commands::sort::SortOrderArg,
+        #[values(1usize, 16)] threads: usize,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            threads,
+            Some(threads.min(4)),
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(threads);
+        for name in ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"] {
+            assert!(dag.contains(name), "{order:?} t{threads}: {name} missing:\n{dag}");
+        }
+        assert!(!dag.contains("FindBoundariesAndSort"), "{order:?} t{threads}:\n{dag}");
+        let line = dag.lines().find(|l| l.contains("] ExtractQuerynameKeys")).expect("split");
+        let cap = format!("cap=sort-phase1({})", threads.min(4));
+        assert!(line.contains(&cap), "{line}");
     }
 
     /// The extraction step carries the phase-1 cap only for an explicit

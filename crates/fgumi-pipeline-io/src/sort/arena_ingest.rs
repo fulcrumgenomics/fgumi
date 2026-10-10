@@ -19,9 +19,9 @@
 //! unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)" for the
 //! full justification and SAFETY invariant.
 //!
-//! Template-coordinate order on the arena front runs on the split front in
-//! [`arena_split`](super::arena_split) (`FindTemplateBoundaries` →
-//! `ExtractTemplateKeys` → `SortTemplateRun`), not on `FindBoundariesAndSort`.
+//! Template-coordinate and queryname orders on the arena front run on the split
+//! front in [`arena_split`](super::arena_split) (boundaries → key extraction →
+//! run sort), not on `FindBoundariesAndSort`; coordinate order still does.
 //!
 //! `FindBoundariesAndSort`: serial step that scans a run's contiguous arena span
 //! directly (no copy), skips the BAM header via [`crate::boundaries::bam_header_len`],
@@ -32,8 +32,9 @@
 //!
 //! Together these three steps form the BAM sort ingest front for the block-input
 //! path.  The chain builder's `add_sort` (`src/lib/pipeline/chains/builder.rs`)
-//! wires them as `ReadBlocks → InflateToArena → FindBoundariesAndSort` (feeding
-//! the Phase-1 spill/merge tail) when the sort source is raw BGZF blocks.
+//! wires them as `ReadBlocks → InflateToArena → FindBoundariesAndSort` for
+//! coordinate order (feeding the Phase-1 spill/merge tail) when the sort source
+//! is raw BGZF blocks.
 
 use std::collections::VecDeque;
 use std::io;
@@ -1238,6 +1239,10 @@ impl ArenaSortStrategy for TemplateStrategy {
 /// wrapped into the matching erased variant. Nothing is copied or allocated
 /// per record.
 ///
+/// The arena front's queryname orders run on the split front's
+/// [`QuerynameKeys`](super::arena_split::QuerynameKeys), which extracts through
+/// the same [`QnRefBuilder`]; this strategy is the `FindBoundariesAndSort` path.
+///
 /// The prefix is learned per batch of [`QN_CLASS_BATCH_RECORDS`] records. This
 /// front pushes records one at a time with no arena to read back until the
 /// seal, so a batch whose guessed prefix failed is recorded at the batch's
@@ -1300,6 +1305,17 @@ impl<C: QnComparator> QuerynameStrategy<C> {
     #[cfg(test)]
     pub(crate) fn sort_pool_threads(&self) -> Option<usize> {
         self.sort_pool.built_threads()
+    }
+
+    /// Test-only: the run's refs as the seal would sort them — the open batch
+    /// closed and every adopted batch re-windowed.
+    #[cfg(test)]
+    pub(crate) fn refs_for_test(&mut self, arena: &PooledSegmentedBuf) -> Vec<QnRef> {
+        self.close_batch();
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, arena, &mut self.refs[range], class);
+        }
+        self.refs.clone()
     }
 
     /// Close the open batch: adopt a learned class if its guess failed (recorded

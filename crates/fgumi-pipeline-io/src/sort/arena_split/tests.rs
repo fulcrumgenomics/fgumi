@@ -11,6 +11,7 @@ use fgumi_sort::{DroppedLaneViolation, KeyTypesSpec, SegmentedBuf};
 use noodles::sam::Header;
 
 use super::*;
+use crate::sort::{ArenaSortStrategy as _, QuerynameStrategy};
 
 /// A mapped, paired template record body named `rd_{i}`.
 fn body(i: usize) -> Vec<u8> {
@@ -702,4 +703,104 @@ fn census_classifies_batches_against_their_runs_scan_end() {
     }
     let c = sort.census();
     assert_eq!((c.runs, c.records, c.overlapped_records, c.tail_records), (2, 8, 5, 3));
+}
+
+/// The record path (`QuerynameStrategy::push_record`, batch-closed every 4096
+/// records) and the split path (`QuerynameKeys::extract_batch`, one call per
+/// 4096-record batch, one builder carried across them) produce identical refs
+/// — including the batch that re-learns its prefix class when the instrument
+/// changes, and a short final batch.
+#[test]
+fn extract_queryname_keys_shares_the_one_extraction() {
+    use crate::sort::protocol::MemoryChunkErased;
+    use fgumi_sort::{QN_CLASS_BATCH_RECORDS, QnLex, QnRefBuilder, QnSortState};
+    let n = 2 * QN_CLASS_BATCH_RECORDS + 100;
+    let bodies: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let name = if i < QN_CLASS_BATCH_RECORDS {
+                format!("A00132:53:HFHJ:1:1101:{i}:7")
+            } else {
+                format!("M04567:12:000000000-ABCDE:1:1101:{i}:9")
+            };
+            make_bam_bytes(-1, -1, 0x4, name.as_bytes(), &[], 0, -1, -1, &[])
+        })
+        .collect();
+    let (arena, at) = arena_with(16, &frames(&bodies));
+
+    let mut strategy =
+        QuerynameStrategy::<QnLex>::new(MemoryChunkErased::QuerynameLex, QnSortState::new(false));
+    let mut off = at;
+    for b in &bodies {
+        let len = u32::try_from(b.len()).unwrap();
+        strategy.push_record(b, off + 4, len).unwrap();
+        off += 4 + u64::from(len);
+    }
+    let want = strategy.refs_for_test(&arena);
+
+    let ctx = QuerynameKeys::<QnLex>::provision(&QnSortState::new(false), &bodies[0]);
+    let mut builder = QnRefBuilder::default();
+    let mut got = Vec::with_capacity(n);
+    let mut start = at;
+    for (i, batch) in bodies.chunks(QN_CLASS_BATCH_RECORDS).enumerate() {
+        let bytes: u64 = batch.iter().map(|b| 4 + b.len() as u64).sum();
+        let (refs, violation) = QuerynameKeys::<QnLex>::extract_batch(
+            &ctx,
+            &mut builder,
+            &arena,
+            start,
+            start + bytes,
+            u32::try_from(batch.len()).unwrap(),
+            (i * QN_CLASS_BATCH_RECORDS) as u64,
+        )
+        .unwrap();
+        assert!(violation.is_none(), "queryname keys have no lanes to violate");
+        got.extend(refs);
+        start += bytes;
+    }
+    // Every field of every ref (QnKey has no `PartialEq`: the comparator is the
+    // only order on it).
+    let fields = |refs: &[fgumi_sort::QnRef]| -> Vec<_> {
+        refs.iter()
+            .map(|(k, off, len)| (k.window, k.flags, k.tail_len, k.class, *off, *len))
+            .collect()
+    };
+    assert_eq!(got.len(), want.len());
+    assert!(fields(&got) == fields(&want), "the split path's refs differ from the record path's");
+    assert!(want.iter().any(|r| r.0.class != 0), "the fixture learns a prefix class");
+}
+
+/// A queryname batch whose frames do not match the scan's cut is an error,
+/// not a short batch.
+#[test]
+fn queryname_extract_rejects_mismatched_frames() {
+    use fgumi_sort::{QnLex, QnRefBuilder, QnSortState};
+    let bodies: Vec<Vec<u8>> = (0..3).map(body).collect();
+    let data = frames(&bodies);
+    let (arena, at) = arena_with(16, &data);
+    let ctx = QuerynameKeys::<QnLex>::provision(&QnSortState::new(false), &bodies[0]);
+    let end = at + data.len() as u64;
+    for (n, end) in [(4, end), (2, end), (3, end - 1)] {
+        let err = QuerynameKeys::<QnLex>::extract_batch(
+            &ctx,
+            &mut QnRefBuilder::default(),
+            &arena,
+            at,
+            end,
+            n,
+            0,
+        )
+        .expect_err("mismatched frames");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "n={n}: {err}");
+    }
+}
+
+/// The queryname split steps carry their own names, and the run sort's pool
+/// is the queryname pool.
+#[test]
+fn queryname_split_step_names() {
+    use fgumi_sort::{QnLex, QnNatural};
+    for names in [QuerynameKeys::<QnLex>::STEP_NAMES, QuerynameKeys::<QnNatural>::STEP_NAMES] {
+        assert_eq!(names, ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"]);
+    }
+    assert_eq!(QuerynameKeys::<QnLex>::pool_name(), "qname-sort");
 }

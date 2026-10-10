@@ -638,11 +638,11 @@ classes, re-windowed batches and the compare shares (`arena fallbacks` is the
 share that read the arena). The spill format is unchanged: queryname keys are
 embedded in the record, and the merge rebuilds them from the body.
 
-### Split arena front (template-coordinate)
+### Split arena front (template-coordinate, queryname)
 
-Template-coordinate phase 1 runs as three steps generic over an
-`ArenaKeyExtractor` (`crates/fgumi-pipeline-io/src/sort/arena_split.rs`):
-`FindTemplateBoundaries` (serial, `sort-coord`) cuts 4096-record key batches
+Template-coordinate and queryname phase 1 run as three steps generic over an
+`ArenaKeyExtractor` (`crates/fgumi-pipeline-io/src/sort/arena_split.rs`). For
+template order: `FindTemplateBoundaries` (serial, `sort-coord`) cuts 4096-record key batches
 and run ends, `ExtractTemplateKeys` (parallel, excluded from the reader's
 worker) extracts refs under the phase-1 cap, and `SortTemplateRun` (serial,
 `sort-coord`) sorts each run behind the ordinal reorder, reserving the whole
@@ -652,6 +652,11 @@ census (records keyed before the scan reached their run's end, and the tail
 wait). `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` lets extraction run on the reader's
 worker too — a diagnostic knob for measuring the reader exclusion, not a tuning
 option.
+
+Queryname (`FindQuerynameBoundaries` → `ExtractQuerynameKeys` →
+`SortQuerynameRun`) extracts each batch's `QnRef`s with the extraction clone's
+own `QnRefBuilder` and classifies (and, on a learned prefix, re-windows) the
+batch before it leaves the extractor, so the run sort only sorts.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

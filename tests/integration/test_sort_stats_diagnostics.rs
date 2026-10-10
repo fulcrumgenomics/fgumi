@@ -505,12 +505,15 @@ fn sort_stats_gates_spill_supply_lines(
     }
 }
 
-/// The template split front's key-overlap census is logged at info only
-/// under `--sort-stats`, on a sort that spills.
+/// The split front's key-overlap census is logged at info only under
+/// `--sort-stats`, on a sort that spills, in every order on the split front.
 #[rstest]
-fn sort_stats_gates_key_overlap_census(#[values(false, true)] with_flag: bool) {
+fn sort_stats_gates_key_overlap_census(
+    #[values("template-coordinate", "queryname", "queryname::natural")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
     let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
-    let stderr = sort_spilling_with("template-coordinate", extra);
+    let stderr = sort_spilling_with(order, extra);
     let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(n >= 2, "the fixture must merge at least 2 sources (got {n}):\n{stderr}");
     let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
@@ -863,6 +866,19 @@ fn sort_stats_gates_the_queryname_keys_line(
             .unwrap_or_else(|| panic!("{order}: unparseable classes: {line}"));
         assert!(classes >= 2, "{order}: the `fam_` prefix is learned: {line}");
         assert!(line.contains("arena fallbacks"), "{order}: compares are counted: {line}");
+        // `R of B batches re-windowed; C of N refs in class 0`: every extracted
+        // batch is counted, and the batch that learned `fam_` was re-windowed.
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after = |w: &str| -> u64 {
+            let i = words.iter().position(|x| x.trim_end_matches(';') == w).expect(w);
+            words[i - 1].parse().unwrap_or_else(|_| panic!("{order}: count before `{w}`: {line}"))
+        };
+        let (rewindowed, batches) = (
+            words[words.iter().position(|w| *w == "of").unwrap() - 1].parse::<u64>().unwrap(),
+            after("batches"),
+        );
+        assert!(batches > 0 && rewindowed >= 1, "{order}: batches are counted: {line}");
+        assert!(after("refs") >= batches, "{order}: refs are counted: {line}");
     }
 }
 

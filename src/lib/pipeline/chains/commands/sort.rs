@@ -241,7 +241,10 @@ impl SortPhase {
             | "SortBuffer"
             | "FindTemplateBoundaries"
             | "ExtractTemplateKeys"
-            | "SortTemplateRun" => Some(SortPhase::InMemorySort),
+            | "SortTemplateRun"
+            | "FindQuerynameBoundaries"
+            | "ExtractQuerynameKeys"
+            | "SortQuerynameRun" => Some(SortPhase::InMemorySort),
             "SpillGather" | "SpillBlockCompress" | "SpillWrite" => Some(SortPhase::SpillWrite),
             // The merge supply (`SpillReadPlanner → PreadSpillSlices →
             // SortSpillDecompress`) is Phase-2 read-ahead of the final merge's
@@ -645,6 +648,9 @@ mod tests {
     #[case::find_template_boundaries("FindTemplateBoundaries", SortPhase::InMemorySort)]
     #[case::extract_template_keys("ExtractTemplateKeys", SortPhase::InMemorySort)]
     #[case::sort_template_run("SortTemplateRun", SortPhase::InMemorySort)]
+    #[case::find_queryname_boundaries("FindQuerynameBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_queryname_keys("ExtractQuerynameKeys", SortPhase::InMemorySort)]
+    #[case::sort_queryname_run("SortQuerynameRun", SortPhase::InMemorySort)]
     #[case::spill_gather("SpillGather", SortPhase::SpillWrite)]
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]
