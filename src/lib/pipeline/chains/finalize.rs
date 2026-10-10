@@ -90,6 +90,13 @@ pub struct BuiltPipeline {
     /// NOT an example of this: it is written inline by the `WriteBgzfFile`
     /// sink as part of the run itself, not by a finalize hook.
     pub finalize_on_success: Vec<Box<dyn FinalizeHook>>,
+    /// Per sort stage, the sort's queryname class table and the one its
+    /// `SortMerge` merges against (test support: compared by pointer).
+    #[cfg(test)]
+    pub(crate) merge_class_tables: Vec<(
+        std::sync::Arc<fgumi_sort::QnClassTable>,
+        Option<std::sync::Arc<fgumi_sort::QnClassTable>>,
+    )>,
 }
 
 impl BuiltPipeline {
@@ -112,7 +119,14 @@ impl BuiltPipeline {
     /// Returns the first pipeline-run error or, if the pipeline
     /// succeeded, the first finalize-hook error.
     pub fn run(self) -> Result<()> {
-        let BuiltPipeline { pipeline, config, finalize, finalize_on_success } = self;
+        let BuiltPipeline {
+            pipeline,
+            config,
+            finalize,
+            finalize_on_success,
+            #[cfg(test)]
+                merge_class_tables: _,
+        } = self;
 
         // Capture the run result but do not short-circuit: the finalize
         // hooks must still drain on the error path.

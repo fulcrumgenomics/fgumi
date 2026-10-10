@@ -6105,6 +6105,8 @@ pub(crate) fn slot_key_size<K: RawSortKey>() -> Result<usize> {
 /// Parse a sort key from `bytes`: extracted from the body for embedded keys, or
 /// deserialized from the `key_size`-byte prefix for non-embedded keys.
 pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
+    ctx: &K::MergeCtx,
+    hint: &mut K::MergeHint,
     key_bytes: &[u8],
     body: &[u8],
 ) -> Result<K> {
@@ -6125,7 +6127,7 @@ pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
             !body.is_empty(),
             "record body is empty and cannot carry an embedded sort key (corrupt slot)",
         );
-        Ok(K::extract_from_record(body))
+        Ok(K::extract_from_record_in(ctx, hint, body))
     } else {
         let mut r = key_bytes;
         K::read_from(&mut r).map_err(|e| anyhow::anyhow!("malformed slot key: {e}"))
@@ -6149,6 +6151,8 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
     slot: &Arc<crate::merge_slots::SortMergeSlot>,
     parser: &mut SlotParserState,
     out: &mut Vec<u8>,
+    ctx: &K::MergeCtx,
+    hint: &mut K::MergeHint,
 ) -> Result<TryRead<(K, RecLoc)>> {
     let key_size = slot_key_size::<K>()?;
 
@@ -6174,6 +6178,8 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
                 let start = p + header;
                 let end = start + len;
                 let key = slot_parse_key::<K>(
+                    ctx,
+                    hint,
                     &parser.current_buf[p..p + key_size],
                     &parser.current_buf[start..end],
                 )?;
@@ -6186,7 +6192,7 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
         parser.pending = Some(PendingRecord { key_size, ..PendingRecord::default() });
     }
 
-    Ok(match slot_collect_pending::<K>(slot, parser, out)? {
+    Ok(match slot_collect_pending::<K>(slot, parser, out, ctx, hint)? {
         TryRead::Ready(key) => TryRead::Ready(key.map(|k| (k, RecLoc::Scratch))),
         TryRead::WouldBlock => TryRead::WouldBlock,
     })
@@ -6200,6 +6206,8 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
     slot: &Arc<crate::merge_slots::SortMergeSlot>,
     parser: &mut SlotParserState,
     out: &mut Vec<u8>,
+    ctx: &K::MergeCtx,
+    hint: &mut K::MergeHint,
 ) -> Result<TryRead<K>> {
     // Stage 0: key prefix (non-embedded keys only; `key_size == 0` is a no-op).
     loop {
@@ -6303,7 +6311,7 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
 
     let key = {
         let pending = parser.pending.as_ref().expect("pending set");
-        slot_parse_key::<K>(&pending.key_buf, out)?
+        slot_parse_key::<K>(ctx, hint, &pending.key_buf, out)?
     };
     parser.pending = None;
     Ok(TryRead::Ready(Some(key)))
@@ -6315,7 +6323,13 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static, R: ChunkRef<K> = K> {
     /// Pipeline-integrated source — `SortSpillDecompress` fills
     /// `slot.decompressed` with decompressed blocks; this driver reads them
     /// in-order via the per-source [`SlotParserState`].
-    Slot { slot: Arc<crate::merge_slots::SortMergeSlot>, parser: SlotParserState },
+    /// `hint` is the key's per-source merge hint, carried from record to
+    /// record (see [`RawSortKey::MergeHint`]).
+    Slot {
+        slot: Arc<crate::merge_slots::SortMergeSlot>,
+        parser: SlotParserState,
+        hint: K::MergeHint,
+    },
     /// In-memory sorted residual records from a queryname-style sort (each
     /// record an owned `RawRecord`). Read via a zero-copy `mem::swap` bridge.
     Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
@@ -6331,10 +6345,14 @@ impl<K: RawSortKey + Default + 'static, R: ChunkRef<K>> SlotMergeSource<K, R> {
     /// its bytes live ([`RecLoc`]). Only a record that spans blocks, or an
     /// owned residual record, is placed in `scratch`. `Slot` sources may return
     /// `WouldBlock`; memory sources always return `Ready`.
-    fn try_next_record(&mut self, scratch: &mut Vec<u8>) -> Result<TryRead<(K, RecLoc)>> {
+    fn try_next_record(
+        &mut self,
+        scratch: &mut Vec<u8>,
+        ctx: &K::MergeCtx,
+    ) -> Result<TryRead<(K, RecLoc)>> {
         match self {
-            SlotMergeSource::Slot { slot, parser } => {
-                slot_try_next_record::<K>(slot, parser, scratch)
+            SlotMergeSource::Slot { slot, parser, hint } => {
+                slot_try_next_record::<K>(slot, parser, scratch, ctx, hint)
             }
             SlotMergeSource::Memory { records, idx } => {
                 if *idx < records.len() {
@@ -6473,6 +6491,9 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> 
     last_src: Option<usize>,
     /// The file the last switch predicted, scored on the next switch.
     last_predicted: Option<u32>,
+    /// The key's merge-wide context for rebuilding slot keys (see
+    /// [`RawSortKey::MergeCtx`]).
+    ctx: K::MergeCtx,
 }
 
 impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
@@ -6485,12 +6506,14 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
     /// record, so construction never blocks on a not-yet-decompressed slot.
     /// Construction is infallible (read errors surface from `try_step`), and
     /// the empty-input case is reported by the first `try_step` returning
-    /// [`MergeStep::Done`].
+    /// [`MergeStep::Done`]. `ctx` is the key's merge-wide context
+    /// ([`RawSortKey::MergeCtx`]; `()` for keys that need none).
     #[must_use]
     pub fn from_slots(
         slots: Vec<Arc<crate::merge_slots::SortMergeSlot>>,
         memory: MemorySources<K, R>,
         total_records: u64,
+        ctx: K::MergeCtx,
     ) -> Self {
         let num_slots = slots.len();
         let num_memory = memory.num_non_empty();
@@ -6515,7 +6538,11 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         let mut slots = slots;
         slots.sort_by_key(|s| s.file_id);
         for slot in slots {
-            sources.push(SlotMergeSource::Slot { slot, parser: SlotParserState::new() });
+            sources.push(SlotMergeSource::Slot {
+                slot,
+                parser: SlotParserState::new(),
+                hint: K::MergeHint::default(),
+            });
         }
         match memory {
             MemorySources::Owned(chunks) => {
@@ -6566,6 +6593,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             slot_drained,
             last_src: None,
             last_predicted: None,
+            ctx,
         }
     }
 
@@ -6656,7 +6684,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                 MergePhase::Priming { mut next, mut keys, mut rec } => {
                     let mut stalled = false;
                     while next < self.sources.len() {
-                        match self.sources[next].try_next_record(&mut rec)? {
+                        match self.sources[next].try_next_record(&mut rec, &self.ctx)? {
                             TryRead::WouldBlock => {
                                 stalled = true;
                                 self.stalled_src = Some(next);
@@ -6704,7 +6732,9 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                     if pending_refill && tree.winner_is_active() {
                         let winner = tree.winner();
                         let src = self.source_map[winner];
-                        match self.sources[src].try_next_record(&mut self.records[winner])? {
+                        match self.sources[src]
+                            .try_next_record(&mut self.records[winner], &self.ctx)?
+                        {
                             TryRead::WouldBlock => {
                                 self.stalled_src = Some(src);
                                 self.phase = MergePhase::Merging { tree, pending_refill: true };
@@ -11382,6 +11412,10 @@ mod from_slots_merge_tests {
     struct TestKey(u64);
 
     impl RawSortKey for TestKey {
+        type MergeCtx = ();
+
+        type MergeHint = ();
+
         const SERIALIZED_SIZE: Option<usize> = Some(8);
         const EMBEDDED_IN_RECORD: bool = false;
         fn extract(_bam: &[u8], _ctx: &crate::keys::SortContext) -> Self {
@@ -11484,7 +11518,8 @@ mod from_slots_merge_tests {
             populated_slot(2, &file2, 1),
         ];
 
-        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
+        let driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9, ());
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = vec![
             b"AAA-1".to_vec(),
@@ -11512,7 +11547,7 @@ mod from_slots_merge_tests {
 
         let slots = vec![populated_slot(0, &records, 4)];
         let driver =
-            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 20);
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 20, ());
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = records.into_iter().map(|(_, b)| b).collect();
         assert_eq!(emitted_bytes, expected, "cross-block parse corrupted record sequence");
@@ -11529,6 +11564,7 @@ mod from_slots_merge_tests {
             vec![empty_slot],
             MemorySources::Owned(Vec::new()),
             0,
+            (),
         );
         let emitted = drain_merge_driver_bytes(driver);
         assert!(emitted.is_empty(), "all-empty merge must emit zero records");
@@ -11557,7 +11593,7 @@ mod from_slots_merge_tests {
         slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
 
         let mut driver =
-            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1);
+            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1, ());
         let err = driver.try_step().expect_err("an implausible length must surface as Err");
         assert!(
             err.to_string().contains("implausible record length") && err.to_string().contains('5'),
@@ -11573,7 +11609,7 @@ mod from_slots_merge_tests {
     /// `out.len() >= 0` and breaks immediately with `out` still empty.
     #[test]
     fn embedded_key_on_an_empty_body_is_an_error_not_a_panic() {
-        let err = slot_parse_key::<crate::keys::RawCoordinateKey>(&[], &[])
+        let err = slot_parse_key::<crate::keys::RawCoordinateKey>(&(), &mut (), &[], &[])
             .expect_err("an empty body cannot carry an embedded key");
         assert!(
             err.to_string().contains("empty and cannot carry an embedded sort key"),
@@ -11610,7 +11646,7 @@ mod from_slots_merge_tests {
         slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
 
         let mut driver =
-            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1);
+            MergeDriver::<TestKey>::from_slots(vec![slot], MemorySources::Owned(Vec::new()), 1, ());
         let err = driver.try_step().expect_err("truncation must surface as Err");
         assert!(err.to_string().contains(expected), "expected `{expected}`, got: {err}");
     }
@@ -11629,6 +11665,7 @@ mod from_slots_merge_tests {
             vec![file1, file0], // reversed on purpose
             MemorySources::Owned(Vec::new()),
             2,
+            (),
         );
         assert_eq!(
             drain_merge_driver_bytes(driver),
@@ -11651,9 +11688,13 @@ mod from_slots_merge_tests {
         let mem =
             crate::inline::InMemoryChunk::from_owned_records(vec![(TestKey(5), b"mem".to_vec())]);
         let demand = StdArc::new(crate::MergeDemand::new());
-        let mut d =
-            MergeDriver::<TestKey>::from_slots(vec![s0, s1], MemorySources::Shared(vec![mem]), 5)
-                .with_demand(StdArc::clone(&demand));
+        let mut d = MergeDriver::<TestKey>::from_slots(
+            vec![s0, s1],
+            MemorySources::Shared(vec![mem]),
+            5,
+            (),
+        )
+        .with_demand(StdArc::clone(&demand));
         let mut seen: Vec<(Vec<u8>, Option<u32>)> = Vec::new();
         loop {
             match d.try_step().unwrap() {
@@ -11688,7 +11729,7 @@ mod from_slots_merge_tests {
         let s1 = populated_slot(1, &[(TestKey(2), b"b".to_vec())], 1);
         let demand = StdArc::new(crate::MergeDemand::new());
         let mut d =
-            MergeDriver::<TestKey>::from_slots(vec![s0, s1], MemorySources::Shared(vec![]), 2)
+            MergeDriver::<TestKey>::from_slots(vec![s0, s1], MemorySources::Shared(vec![]), 2, ())
                 .with_demand(StdArc::clone(&demand));
         assert_eq!(demand.frontier(), Some(0), "published before the first step");
         assert!(matches!(d.try_step().unwrap(), MergeStep::Produced(_)));
@@ -11710,9 +11751,13 @@ mod from_slots_merge_tests {
         }
         let s1 = populated_slot(1, &[(TestKey(2), b"b".to_vec())], 1);
         let demand = StdArc::new(crate::MergeDemand::new());
-        let mut d =
-            MergeDriver::<TestKey>::from_slots(vec![empty, s1], MemorySources::Shared(vec![]), 1)
-                .with_demand(StdArc::clone(&demand));
+        let mut d = MergeDriver::<TestKey>::from_slots(
+            vec![empty, s1],
+            MemorySources::Shared(vec![]),
+            1,
+            (),
+        )
+        .with_demand(StdArc::clone(&demand));
         assert!(matches!(d.try_step().unwrap(), MergeStep::Produced(_)));
         assert_eq!(demand.frontier(), Some(1));
     }
@@ -11728,6 +11773,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&slot_a), StdArc::clone(&slot_b)],
             MemorySources::Shared(Vec::new()),
             2,
+            (),
         );
         assert!(matches!(driver.try_step().unwrap(), MergeStep::Stalled));
         assert_eq!(driver.stalled_slot().map(|s| s.file_id), Some(1), "priming stall");
@@ -11763,6 +11809,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&slot)],
             MemorySources::Owned(Vec::new()),
             0,
+            (),
         );
 
         // Priming cannot read the slot's first record → Stalled, not a hang.
@@ -11805,6 +11852,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&slot)],
             MemorySources::Owned(Vec::new()),
             0,
+            (),
         );
 
         // Prime + emit the first record.
@@ -11852,6 +11900,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&slot)],
             MemorySources::Owned(Vec::new()),
             1,
+            (),
         );
 
         // Each step before the last byte consumes one byte into the pending
@@ -11896,6 +11945,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&slot)],
             MemorySources::Owned(Vec::new()),
             1,
+            (),
         );
 
         // Body incomplete in the first block → Stalled mid-record.
@@ -11932,6 +11982,7 @@ mod from_slots_merge_tests {
             slots,
             MemorySources::Owned(vec![memory_records]),
             6,
+            (),
         );
         let emitted_bytes = drain_merge_driver_bytes(driver);
         let expected: Vec<Vec<u8>> = vec![
@@ -11969,8 +12020,12 @@ mod from_slots_merge_tests {
         ]);
 
         let slots = vec![populated_slot(0, &slot_records, 2)];
-        let driver =
-            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Shared(vec![memory_chunk]), 6);
+        let driver = MergeDriver::<TestKey>::from_slots(
+            slots,
+            MemorySources::Shared(vec![memory_chunk]),
+            6,
+            (),
+        );
         let expected: Vec<Vec<u8>> = vec![
             b"slot-1".to_vec(),
             b"mem-2".to_vec(),
@@ -12008,6 +12063,10 @@ mod from_slots_merge_tests {
     struct TestEmbeddedKey(u64);
 
     impl RawSortKey for TestEmbeddedKey {
+        type MergeCtx = ();
+
+        type MergeHint = ();
+
         const SERIALIZED_SIZE: Option<usize> = Some(0);
         const EMBEDDED_IN_RECORD: bool = true;
         fn extract(_bam: &[u8], _ctx: &crate::keys::SortContext) -> Self {
@@ -12088,8 +12147,12 @@ mod from_slots_merge_tests {
             embedded_populated_slot(2, &file2, 1),
         ];
 
-        let driver =
-            MergeDriver::<TestEmbeddedKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 9);
+        let driver = MergeDriver::<TestEmbeddedKey>::from_slots(
+            slots,
+            MemorySources::Owned(Vec::new()),
+            9,
+            (),
+        );
         let emitted = drain_merge_driver_bytes(driver);
 
         // Verify keys are emitted in sorted order. Tail bytes prove the
@@ -12126,7 +12189,8 @@ mod from_slots_merge_tests {
         // populated slot.
         let slots = vec![empty_slot, populated_slot(0, &populated, 1)];
 
-        let driver = MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 3);
+        let driver =
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), 3, ());
         let emitted = drain_merge_driver_bytes(driver);
         assert_eq!(emitted, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
     }
@@ -12172,7 +12236,7 @@ mod from_slots_merge_tests {
 
         let slots = vec![populated_slot(0, &f0, 3), populated_slot(1, &f1, 2)];
         let mut driver =
-            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), total);
+            MergeDriver::<TestKey>::from_slots(slots, MemorySources::Owned(Vec::new()), total, ());
 
         let mut emitted = 0u64;
         loop {
@@ -12251,7 +12315,12 @@ mod from_slots_merge_tests {
     fn produced_bytes_are_borrowed_from_the_block() {
         fn check<L: Layout>() {
             let slot = layout_slot::<L>(0, &bodies::<L>(&[(1, b"AAAA"), (2, b"BBBB")]));
-            let mut d = MergeDriver::<L>::from_slots(vec![slot], MemorySources::Shared(vec![]), 2);
+            let mut d = MergeDriver::<L>::from_slots(
+                vec![slot],
+                MemorySources::Shared(vec![]),
+                2,
+                Default::default(),
+            );
             let MergeStep::Produced(b) = d.try_step().unwrap() else { panic!("a record") };
             assert_eq!(b, L::body(1, b"AAAA"));
             let p = b.as_ptr();
@@ -12284,6 +12353,7 @@ mod from_slots_merge_tests {
             vec![StdArc::clone(&fa.slot), StdArc::clone(&fb.slot)],
             MemorySources::Shared(vec![]),
             total as u64,
+            Default::default(),
         );
         let mut out = Vec::new();
         loop {
@@ -12341,6 +12411,138 @@ mod from_slots_merge_tests {
         }
     }
 
+    /// `[len][body]` frames: the slot format of an embedded key.
+    fn embedded_frames(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for body in bodies {
+            out.write_all(&u32::try_from(body.len()).unwrap().to_le_bytes()).unwrap();
+            out.write_all(body).unwrap();
+        }
+        out
+    }
+
+    /// A queryname record named `A00132:53:HFHJ:1:1101:{x}:{y}` with the R1
+    /// (`0x41`) or R2 (`0x81`) flags.
+    fn qn_record(x: u8, y: u8, r1: bool) -> Vec<u8> {
+        let name = format!("A00132:53:HFHJ:1:1101:{x}:{y}");
+        let flags = if r1 { 0x41 } else { 0x81 };
+        fgumi_raw_bam::testutil::make_bam_bytes(0, 1, flags, name.as_bytes(), &[], 4, -1, -1, &[])
+    }
+
+    /// `records` sorted by the owned lexicographic key.
+    fn qn_sorted(mut records: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        records.sort_by_key(|b| crate::keys::RawQuerynameLexKey::extract_from_record(b));
+        records
+    }
+
+    /// One run of 1..60 queryname records sorted by the owned lexicographic
+    /// key. Names are drawn from 21 values, so equal names occur within and
+    /// across runs; all share a class prefix the merge's table holds.
+    fn qn_sorted_run() -> impl proptest::strategy::Strategy<Value = Vec<Vec<u8>>> {
+        use proptest::prelude::*;
+        prop::collection::vec((0u8..7, 0u8..3, any::<bool>()), 1..60).prop_map(|names| {
+            qn_sorted(names.into_iter().map(|(x, y, r1)| qn_record(x, y, r1)).collect())
+        })
+    }
+
+    /// The sort's class table, holding the runs' common prefix.
+    fn qn_table() -> StdArc<crate::queryname_ref::QnClassTable> {
+        let table = crate::queryname_ref::QnClassTable::new();
+        table.class_for(b"A00132:53:HFHJ:1:");
+        table
+    }
+
+    /// The `QnMergeKey` path borrows a record wholly inside its block too.
+    #[test]
+    fn qn_merge_key_produced_bytes_are_borrowed_from_the_block() {
+        use crate::queryname_ref::{QnLex, QnMergeKey};
+        let a = qn_sorted(vec![qn_record(3, 1, true), qn_record(5, 0, false)]);
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
+        slot.decompressed.lock().unwrap().push_back(embedded_frames(&a));
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        let mut d = MergeDriver::<QnMergeKey<QnLex>, crate::queryname_ref::QnKey>::from_slots(
+            vec![slot],
+            MemorySources::Shared(vec![]),
+            2,
+            qn_table(),
+        );
+        let MergeStep::Produced(b) = d.try_step().unwrap() else { panic!("a record") };
+        let p = b.as_ptr();
+        assert!(d.block_contains_for_test(0, p), "the record must point into slot 0's block");
+        assert_eq!(d.scratch_capacity_for_test(0), 0, "the scratch was never used");
+        assert_eq!(d.record_counts(), (1, 0));
+    }
+
+    proptest::proptest! {
+        /// `incremental_feed_merges_identically` with the queryname merge key:
+        /// two runs fed one cut block at a time, records spanning blocks across
+        /// a `WouldBlock`, merged through the class window against the sort's
+        /// table. The output equals a stable merge by the owned key.
+        #[test]
+        fn qn_merge_key_incremental_feed_merges_identically(
+            a in qn_sorted_run(), b in qn_sorted_run(), block_a in 1usize..9, block_b in 1usize..9,
+        ) {
+            use crate::queryname_ref::{QnLex, QnMergeKey};
+            let mut oracle: Vec<Vec<u8>> = a.iter().chain(&b).cloned().collect();
+            oracle.sort_by_cached_key(|r| crate::keys::RawQuerynameLexKey::extract_from_record(r));
+            let feeder = |id: u32, bodies: &[Vec<u8>], per: usize| {
+                let bytes = embedded_frames(bodies);
+                let target = (bytes.len() / bodies.len().max(1)).max(1) * per;
+                Feeder {
+                    slot: StdArc::new(SortMergeSlot::for_test(id, crate::codec::SpillCodec::Bgzf)),
+                    blocks: std::cell::RefCell::new(
+                        bytes.chunks(target.max(1)).map(<[u8]>::to_vec).collect(),
+                    ),
+                    seq: std::cell::Cell::new(0),
+                }
+            };
+            let (fa, fb) = (feeder(0, &a, block_a), feeder(1, &b, block_b));
+            let mut d = MergeDriver::<QnMergeKey<QnLex>, crate::queryname_ref::QnKey>::from_slots(
+                vec![StdArc::clone(&fa.slot), StdArc::clone(&fb.slot)],
+                MemorySources::Shared(vec![]),
+                (a.len() + b.len()) as u64,
+                qn_table(),
+            );
+            let mut out = Vec::new();
+            loop {
+                match d.try_step().unwrap() {
+                    MergeStep::Produced(bytes) => out.push(bytes.to_vec()),
+                    MergeStep::Stalled => {
+                        let id = d.stalled_slot().expect("a slot stalled").file_id;
+                        let fed = if id == 0 { fa.feed_next() } else { fb.feed_next() };
+                        proptest::prop_assert!(fed, "fed past the end");
+                    }
+                    MergeStep::Done => break,
+                }
+            }
+            proptest::prop_assert_eq!(out, oracle);
+        }
+    }
+
+    /// A slot rebuilds an embedded key against the merge's context and carries
+    /// the source's hint: a queryname key from a slot takes the sort table's
+    /// class, and the hint follows it.
+    #[test]
+    fn slot_keys_are_rebuilt_against_the_merge_context() {
+        use crate::queryname_ref::{QnLex, QnMergeKey};
+        let table = qn_table();
+        let body = fgumi_raw_bam::testutil::make_bam_bytes(
+            0,
+            1,
+            0x41,
+            b"A00132:53:HFHJ:1:1101:5:7",
+            &[],
+            4,
+            -1,
+            -1,
+            &[],
+        );
+        let mut hint = 0u8;
+        let key = slot_parse_key::<QnMergeKey<QnLex>>(&table, &mut hint, &[], &body).unwrap();
+        assert_eq!(key.key.class, 1, "the table's class");
+        assert_eq!(hint, 1, "the hint follows the class");
+    }
+
     /// The shared residual (`MemoryShared`) is borrowed from the chunk's arena
     /// (pointer equal to `record_bytes(i)` taken before the chunk moves), with
     /// no copy; the owned residual (`Memory`) is swapped into the scratch. Both
@@ -12365,8 +12567,12 @@ mod from_slots_merge_tests {
             let ptrs: Vec<usize> =
                 (0..3).map(|i| chunk.record_bytes(i).as_ptr() as usize).collect();
             let slot = layout_slot::<L>(0, &slot_recs);
-            let mut d =
-                MergeDriver::<L>::from_slots(vec![slot], MemorySources::Shared(vec![chunk]), 5);
+            let mut d = MergeDriver::<L>::from_slots(
+                vec![slot],
+                MemorySources::Shared(vec![chunk]),
+                5,
+                Default::default(),
+            );
             let (mut out, mut chunk_ptrs) = (Vec::new(), Vec::new());
             loop {
                 match d.try_step().unwrap() {
@@ -12389,8 +12595,12 @@ mod from_slots_merge_tests {
                 .map(|(k, b)| (k, fgumi_raw_bam::RawRecord::from(b)))
                 .collect();
             let slot = layout_slot::<L>(0, &slot_recs);
-            let mut d =
-                MergeDriver::<L>::from_slots(vec![slot], MemorySources::Owned(vec![owned]), 5);
+            let mut d = MergeDriver::<L>::from_slots(
+                vec![slot],
+                MemorySources::Owned(vec![owned]),
+                5,
+                Default::default(),
+            );
             let mut out = Vec::new();
             while let MergeStep::Produced(b) = d.try_step().unwrap() {
                 out.push(b.to_vec());
@@ -12417,6 +12627,7 @@ mod from_slots_merge_tests {
             vec![slot],
             MemorySources::Shared(vec![]),
             1,
+            (),
         );
         let err = match d.try_step() {
             Err(e) => e,
@@ -12493,11 +12704,11 @@ mod from_slots_merge_tests {
             let lex: RawQuerynameLexKey = key.merge_key(&body);
             let natural: RawQuerynameKey = key.merge_key(&body);
             assert_eq!(
-                lex.cmp(&slot_parse_key::<RawQuerynameLexKey>(&[], &body).unwrap()),
+                lex.cmp(&slot_parse_key::<RawQuerynameLexKey>(&(), &mut (), &[], &body).unwrap()),
                 std::cmp::Ordering::Equal
             );
             assert_eq!(
-                natural.cmp(&slot_parse_key::<RawQuerynameKey>(&[], &body).unwrap()),
+                natural.cmp(&slot_parse_key::<RawQuerynameKey>(&(), &mut (), &[], &body).unwrap()),
                 std::cmp::Ordering::Equal
             );
         }
@@ -12531,7 +12742,7 @@ mod from_slots_merge_tests {
         let mut sorted_spill = spilled.clone();
         sorted_spill.sort_by(|a, b| {
             RawQuerynameLexKey::extract_from_record(a)
-                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+                .cmp(&crate::keys::RawQuerynameLexKey::extract_from_record(b))
         });
         let mut block = Vec::new();
         for b in &sorted_spill {
@@ -12561,11 +12772,12 @@ mod from_slots_merge_tests {
             vec![slot],
             MemorySources::Shared(vec![chunk]),
             n,
+            (),
         );
         let mut expected: Vec<Vec<u8>> = residual.iter().chain(&spilled).cloned().collect();
         expected.sort_by(|a, b| {
             RawQuerynameLexKey::extract_from_record(a)
-                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+                .cmp(&crate::keys::RawQuerynameLexKey::extract_from_record(b))
         });
         let mut d = driver;
         let mut out = Vec::new();

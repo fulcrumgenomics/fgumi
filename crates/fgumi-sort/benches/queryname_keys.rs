@@ -23,6 +23,12 @@
 //!      allocation), and `qnkey_window_cmp` / `qnkey_window_cmp_lex` sort them
 //!      through `cmp_qn_refs`, against the owned-key extracts and comparators.
 //!
+//!   4. **The merge-side key** — `merge_key_*` rebuild a `QnMergeKey` per record
+//!      as the k-way merge does for each spilled record, against a table full
+//!      of tile-level classes (`QN_MAX_CLASSES`), for names whose class is the
+//!      carried hint and for names that match no class (every record misses
+//!      the hint and searches the table).
+//!
 //!     cargo bench -p fgumi-sort --bench queryname_keys
 
 use std::cmp::Ordering;
@@ -33,8 +39,8 @@ use std::sync::Arc;
 
 use fgumi_sort::{
     PooledSegmentedBuf, QN_CLASS_BATCH_RECORDS, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
-    QnLex, QnNatural, QnRef, QnRefBuilder, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
-    SegmentedBuf, cmp_qn_refs,
+    QnLex, QnMergeKey, QnNatural, QnRef, QnRefBuilder, RawQuerynameKey, RawQuerynameLexKey,
+    RawSortKey, SegmentedBuf, cmp_qn_refs,
 };
 
 /// Number of records per bench iteration.
@@ -282,5 +288,46 @@ fn bench_sort(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ingest, bench_sort);
+fn bench_merge_key(c: &mut Criterion) {
+    // A full table: one class per (lane, tile), as tile-ordered input learns.
+    let table = QnClassTable::new();
+    for i in 0.. {
+        let lane = 1 + i / 400;
+        let tile = 1101 + i % 400;
+        table.class_for(format!("A00123:45:HGVWXDSXY:{lane}:{tile}:").as_bytes());
+        if table.len() == fgumi_sort::QN_MAX_CLASSES {
+            break;
+        }
+    }
+    // A spill run is name-sorted, so consecutive names share a tile: the
+    // carried hint is the next record's class.
+    let mut sorted = illumina_names(N / 10);
+    sorted.sort();
+    let same_tile = bam_records(&sorted);
+    let no_class: Vec<Vec<u8>> = bam_records(
+        &(0..N / 10)
+            .map(|i| {
+                format!("A00123:45:HGVWXDSXY:4:{}:{}:{}", 2201 + i / 9_000, i % 30_000, i % 977)
+            })
+            .map(String::into_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let mut group = c.benchmark_group("queryname_merge_key");
+    group.throughput(Throughput::Elements((N / 10) as u64));
+    for (name, records) in [("merge_key_hint_hit", &same_tile), ("merge_key_no_class", &no_class)] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let mut hint = 0u8;
+                for r in records {
+                    std::hint::black_box(QnMergeKey::<QnLex>::extract_from_record_in(
+                        &table, &mut hint, r,
+                    ));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_ingest, bench_sort, bench_merge_key);
 criterion_main!(benches);

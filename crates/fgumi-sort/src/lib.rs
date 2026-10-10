@@ -280,7 +280,7 @@ pub use merge_slots::{ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeS
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use queryname_ref::{
     QN_CLASS_BATCH_RECORDS, QN_MAX_CLASSES, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
-    QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, cmp_qn_refs,
+    QnKey, QnLex, QnMergeKey, QnNatural, QnRef, QnRefBuilder, QnSortState, cmp_qn_refs,
     queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs,
 };
 pub use reader::{

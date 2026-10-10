@@ -620,6 +620,10 @@ pub struct ChainBuilder<'a> {
     /// aligner's input refill (only when drain-first was chosen) and the sort
     /// merge's spill-starvation hint (under either base direction).
     refill_hints: Vec<(RefillHint, &'static str)>,
+    /// Per sort stage, the sort's queryname class table and the one its
+    /// `SortMerge` holds (test support).
+    #[cfg(test)]
+    merge_class_tables: Vec<(Arc<fgumi_sort::QnClassTable>, Option<Arc<fgumi_sort::QnClassTable>>)>,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
@@ -870,6 +874,8 @@ impl<'a> ChainBuilder<'a> {
             spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
+            #[cfg(test)]
+            merge_class_tables: Vec::new(),
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -2774,6 +2780,8 @@ impl<'a> ChainBuilder<'a> {
             config,
             finalize: self.finalize,
             finalize_on_success: self.finalize_on_success,
+            #[cfg(test)]
+            merge_class_tables: self.merge_class_tables,
         })
     }
 
@@ -4151,8 +4159,13 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
-                merge =
-                    merge.with_spill_supply(&supply).with_supply_diagnostics(supply_diagnostics);
+                merge = merge
+                    .with_spill_supply(&supply)
+                    .with_supply_diagnostics(supply_diagnostics)
+                    .with_class_table(Arc::clone(&qn_keys.table));
+                #[cfg(test)]
+                self.merge_class_tables
+                    .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -4222,7 +4235,11 @@ impl<'a> ChainBuilder<'a> {
                 merge = merge
                     .with_fast_path_cap(phase2_cap.clone())
                     .with_spill_supply(&supply)
-                    .with_supply_diagnostics(supply_diagnostics);
+                    .with_supply_diagnostics(supply_diagnostics)
+                    .with_class_table(Arc::clone(&qn_keys.table));
+                #[cfg(test)]
+                self.merge_class_tables
+                    .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
@@ -7214,6 +7231,8 @@ mod tests {
             spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
+            #[cfg(test)]
+            merge_class_tables: Vec::new(),
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -7816,6 +7835,28 @@ mod tests {
         let debug = format!("{:?}", built.config.scheduler);
         assert_eq!(debug.matches("RefillSource {").count(), 2, "align + sort hints: {debug}");
         assert_sort_refill_source_feeds_decompress(&built);
+    }
+
+    /// The merge of a queryname sort compares through the sort's own class
+    /// table — the one phase 1 windowed every key against — in every order.
+    #[rstest::rstest]
+    fn sort_merge_shares_the_sort_class_table(
+        #[values(
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural
+        )]
+        order: crate::commands::sort::SortOrderArg,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let (sort, merge) = &built.merge_class_tables[0];
+        let merge = merge.as_ref().expect("SortMerge carries a class table");
+        assert!(Arc::ptr_eq(sort, merge), "{order:?}: one table for the sort and its merge");
     }
 
     /// The step names strictly between `InflateToArena` and `SpillGather` in a

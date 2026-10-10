@@ -290,9 +290,17 @@ fn key_prefix_size<K: RawSortKey>() -> io::Result<usize> {
 }
 
 /// Recover a record's sort key exactly as the final merge's slot parser does.
+///
+/// Consolidation merges the canonical owned keys, whose merge context and hint
+/// are `()`: a default per record costs nothing.
 fn parse_key<K: RawSortKey + Default + 'static>(key_bytes: &[u8], body: &[u8]) -> io::Result<K> {
-    crate::external::slot_parse_key::<K>(key_bytes, body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))
+    crate::external::slot_parse_key::<K>(
+        &K::MergeCtx::default(),
+        &mut K::MergeHint::default(),
+        key_bytes,
+        body,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))
 }
 
 // ============================================================================

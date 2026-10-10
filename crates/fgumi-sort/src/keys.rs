@@ -73,7 +73,7 @@ use std::io::{Read, Write};
 /// short-name inputs, where CPU is unchanged.
 pub(crate) const NAME_INLINE_CAP: usize = 44;
 
-type NameBuf = SmallVec<[u8; NAME_INLINE_CAP]>;
+pub(crate) type NameBuf = SmallVec<[u8; NAME_INLINE_CAP]>;
 
 // ============================================================================
 // Generic Sorting Abstraction (Trait-based, inspired by fgbio/samtools)
@@ -93,7 +93,23 @@ type NameBuf = SmallVec<[u8; NAME_INLINE_CAP]>;
 /// - Zero-cost abstraction (no runtime dispatch)
 /// - Type safety (can't mix key types)
 /// - Compile-time optimization (inlining, etc.)
+///
+/// # Merge-side context
+///
+/// The final merge rebuilds embedded keys from each record's body
+/// ([`Self::extract_from_record_in`]). A key that compares faster with
+/// per-sort state names it as [`Self::MergeCtx`] (shared by the whole merge)
+/// and [`Self::MergeHint`] (carried per merge source from record to record):
+/// the queryname merge key passes the sort's class table and the last class a
+/// source produced. Every other key uses `()` for both, and its
+/// `extract_from_record_in` is its `extract_from_record`.
 pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
+    /// Per-merge state the merge-side rebuild reads (`()` when none).
+    type MergeCtx: Default + Send + Sync + 'static;
+    /// Per-source state the merge-side rebuild carries between consecutive
+    /// records of one source (`()` when none).
+    type MergeHint: Default + Copy + Send + Sync + 'static;
+
     /// Fixed byte size when serialized, or `None` for variable-length keys.
     ///
     /// Fixed-size keys enable O(1) reads from temp files during merge.
@@ -142,6 +158,17 @@ pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
     #[must_use]
     fn extract_from_record(_bam: &[u8]) -> Self {
         unimplemented!("extract_from_record only valid when EMBEDDED_IN_RECORD is true")
+    }
+
+    /// [`Self::extract_from_record`] with the merge's context and this source's
+    /// hint. The default ignores both.
+    #[must_use]
+    fn extract_from_record_in(
+        _ctx: &Self::MergeCtx,
+        _hint: &mut Self::MergeHint,
+        bam: &[u8],
+    ) -> Self {
+        Self::extract_from_record(bam)
     }
 
     /// Serialize the key to a writer for temp file storage.
@@ -369,6 +396,10 @@ impl PartialOrd for RawCoordinateKey {
 }
 
 impl RawSortKey for RawCoordinateKey {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(Self::SIZE);
     const EMBEDDED_IN_RECORD: bool = true;
 
@@ -560,7 +591,11 @@ fn raw_name_with_nul(bam: &[u8]) -> Option<&[u8]> {
 
 /// Serialize a queryname key as `[name_len: u16][name: bytes][flags: u16]`.
 #[inline]
-fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std::io::Result<()> {
+pub(crate) fn write_queryname_key<W: Write>(
+    name: &[u8],
+    flags: u16,
+    writer: &mut W,
+) -> std::io::Result<()> {
     let name_len = u16::try_from(name.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "queryname too long for u16")
     })?;
@@ -575,7 +610,7 @@ fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std
 /// path allocates no per-record heap for short names — the merge-side analogue
 /// of the SSO key change on the ingest path.
 #[inline]
-fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(NameBuf, u16)> {
+pub(crate) fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(NameBuf, u16)> {
     let mut len_buf = [0u8; 2];
     reader.read_exact(&mut len_buf)?;
     let name_len = u16::from_le_bytes(len_buf) as usize;
@@ -695,6 +730,10 @@ impl PartialOrd for RawQuerynameKey {
 }
 
 impl RawSortKey for RawQuerynameKey {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = None; // Variable-length
     const EMBEDDED_IN_RECORD: bool = true;
 
@@ -798,6 +837,10 @@ impl PartialOrd for RawQuerynameLexKey {
 }
 
 impl RawSortKey for RawQuerynameLexKey {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = None;
     const EMBEDDED_IN_RECORD: bool = true;
 

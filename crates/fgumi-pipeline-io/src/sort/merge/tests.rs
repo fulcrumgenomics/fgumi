@@ -39,6 +39,7 @@ fn empty_template_lane_with_spill_slots_fails_closed() {
         MemoryChunksByKind::default(),
         1,
         None,
+        None,
     ) {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         Ok(_) => panic!("empty template lane with spill slots must fail closed"),
@@ -51,6 +52,7 @@ fn empty_template_lane_with_spill_slots_fails_closed() {
             Vec::new(),
             MemoryChunksByKind::default(),
             0,
+            None,
             None
         )
         .is_ok(),

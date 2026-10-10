@@ -235,6 +235,9 @@ struct ChainRun {
     merge_sources: u64,
     /// `records_ingested_so_far` of every `Spill` the front emitted, in order.
     spill_boundaries: Vec<u64>,
+    /// Queryname classes the sort's shared class table holds after the run
+    /// (the front learned them; the merge rebuilt its slot keys against them).
+    qn_classes: usize,
 }
 
 /// The merge's output end: `SortMerge<RecordBatchOutput>` into a [`VecSink`],
@@ -315,6 +318,7 @@ struct ChainCaps {
 /// What a test chain's taps and sinks collect while it runs; read back by
 /// [`ChainTaps::collect`] once the pipeline has finished.
 struct ChainTaps {
+    class_table: Arc<fgumi_sort::QnClassTable>,
     boundaries: Arc<Mutex<Vec<u64>>>,
     spill_stats: Arc<SpillRunStats>,
     merge_stats: Arc<Mutex<Option<fgumi_sort::SortStats>>>,
@@ -343,16 +347,20 @@ impl ChainTaps {
             runs,
             merge_sources: self.spill_stats.merge_sources(),
             spill_boundaries,
+            qn_classes: self.class_table.len(),
         }
     }
 }
 
 /// Everything below a phase-1 front, shared by both fronts: the boundary tap,
 /// the spill split (`SpillGather` → `SpillBlockCompress` → `SpillWrite`), the
-/// merge supply and the merge into `sink`.
+/// merge supply and the merge into `sink`. The merge holds `class_table`, the
+/// one the front's queryname state windowed every key against, as production
+/// wires it.
 #[allow(clippy::too_many_arguments)]
 fn attach_spill_and_merge(
     front: Chain<'_, Single<SortChunkEvent>>,
+    class_table: &Arc<fgumi_sort::QnClassTable>,
     sort_order: SortOrder,
     output_byte_limit: u64,
     threads: usize,
@@ -406,7 +414,8 @@ fn attach_spill_and_merge(
                     256,
                 )
                 .with_stats_slot(Arc::clone(&merge_stats))
-                .with_merge_demand(demand),
+                .with_merge_demand(demand)
+                .with_class_table(Arc::clone(class_table)),
             )
             .chain(VecSink { received: Arc::clone(&batches), kind, progress: None })
             .into_sink_marker(),
@@ -419,12 +428,20 @@ fn attach_spill_and_merge(
                     256,
                 )
                 .with_stats_slot(Arc::clone(&merge_stats))
-                .with_merge_demand(demand),
+                .with_merge_demand(demand)
+                .with_class_table(Arc::clone(class_table)),
             )
             .chain(BlockSink { received: Arc::clone(&blocks), kind })
             .into_sink_marker(),
     }
-    Ok(ChainTaps { boundaries, spill_stats, merge_stats, batches, blocks })
+    Ok(ChainTaps {
+        class_table: Arc::clone(class_table),
+        boundaries,
+        spill_stats,
+        merge_stats,
+        batches,
+        blocks,
+    })
 }
 
 /// Drive the record-input front: `VecSource` → `SortBuffer` → the spill and
@@ -440,14 +457,14 @@ fn drive_buffer_chain(
     supply: SupplyTuning,
     spill: SpillFormat,
 ) -> Result<ChainRun> {
+    let qn_keys = fgumi_sort::QnSortState::new(false);
     let builder = Pipeline::builder();
-    let front = builder.chain(VecSource::new(batches, output_byte_limit)).chain(SortBuffer::new(
-        config,
-        header,
-        output_byte_limit,
-    )?);
+    let front = builder.chain(VecSource::new(batches, output_byte_limit)).chain(
+        SortBuffer::new(config, header, output_byte_limit)?.with_queryname_keys(qn_keys.clone()),
+    );
     let taps = attach_spill_and_merge(
         front,
+        &qn_keys.table,
         config.sort_order,
         output_byte_limit,
         threads,
@@ -933,6 +950,7 @@ fn split_steps<'b, X: ArenaKeyExtractor>(
 
 /// Append `front`'s steps for `config.sort_order` to an arena chain head
 /// (`… → InflateToArena`), returning the front's chunk-event tail.
+#[allow(clippy::too_many_arguments)]
 fn arena_front<'b>(
     head: Chain<'b, OrderedBytesSingle<InflatedBlock>>,
     front: ArenaFront,
@@ -941,6 +959,7 @@ fn arena_front<'b>(
     output_byte_limit: u64,
     caps: &ChainCaps,
     ledger: &Arc<RunLedger>,
+    qn_keys: &fgumi_sort::QnSortState,
 ) -> Chain<'b, Single<SortChunkEvent>> {
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
     let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, memory_limit } = config;
@@ -957,7 +976,7 @@ fn arena_front<'b>(
         (ArenaFront::Split, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => {
             split_steps::<QuerynameKeys<fgumi_sort::QnLex>>(
                 head,
-                fgumi_sort::QnSortState::new(false),
+                qn_keys.clone(),
                 sort_threads,
                 output_byte_limit,
                 budget,
@@ -967,7 +986,7 @@ fn arena_front<'b>(
         (ArenaFront::Split, SortOrder::Queryname(QuerynameComparator::Natural)) => {
             split_steps::<QuerynameKeys<fgumi_sort::QnNatural>>(
                 head,
-                fgumi_sort::QnSortState::new(false),
+                qn_keys.clone(),
                 sort_threads,
                 output_byte_limit,
                 budget,
@@ -1001,13 +1020,15 @@ fn drive_arena_chain(
     caps: &ChainCaps,
 ) -> Result<ChainRun> {
     let ledger = run_ledger_for(config, header);
+    let qn_keys = fgumi_sort::QnSortState::new(false);
     let builder = Pipeline::builder();
     let head = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit).reader(caps.reader_source))
         .chain(ReadBlocks::new(config.memory_limit, output_byte_limit, Arc::clone(&ledger)))
         .chain(InflateToArena::new(output_byte_limit).with_phase_cap(caps.phase1.clone()));
     let taps = attach_spill_and_merge(
-        arena_front(head, front, config, header, output_byte_limit, caps, &ledger),
+        arena_front(head, front, config, header, output_byte_limit, caps, &ledger, &qn_keys),
+        &qn_keys.table,
         config.sort_order,
         output_byte_limit,
         threads,
@@ -1039,7 +1060,8 @@ fn drive_arena_chunks(
         .chain(BgzfBlockSource::new(blocks, OUTPUT_BYTE_LIMIT).reader(caps.reader_source))
         .chain(ReadBlocks::new(config.memory_limit, OUTPUT_BYTE_LIMIT, Arc::clone(&ledger)))
         .chain(InflateToArena::new(OUTPUT_BYTE_LIMIT).with_phase_cap(caps.phase1.clone()));
-    arena_front(head, front, config, header, OUTPUT_BYTE_LIMIT, caps, &ledger)
+    let qn_keys = fgumi_sort::QnSortState::new(false);
+    arena_front(head, front, config, header, OUTPUT_BYTE_LIMIT, caps, &ledger, &qn_keys)
         .chain(ChunkEventSink { received: Arc::clone(&received) })
         .into_sink_marker();
     builder.build()?.run(PipelineConfig { threads, ..Default::default() })?;
@@ -1121,6 +1143,13 @@ fn ties_across_run_boundaries_keep_input_order(
         "{order:?}: no equal-key group straddles a spill boundary — the test cannot catch a \
          cross-run reorder"
     );
+    if matches!(order, SortOrder::Queryname(_)) {
+        assert!(
+            run.qn_classes >= 2,
+            "{order:?}: the front learned no class, so the merge's shared-table compares go \
+             unexercised"
+        );
+    }
     assert_record_parity(&format!("{order:?} {front:?} t{threads}"), &run.records, &expected);
     assert_input_order_within_equal_keys(order, &header, &run.records);
 }

@@ -956,6 +956,10 @@ impl TemplateKey {
 pub type TemplateKey40 = TemplateKey;
 
 impl RawSortKey for TemplateKey {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(40);
 
     /// # Panics
@@ -1172,6 +1176,10 @@ impl Ord for TemplateKey32 {
 }
 
 impl RawSortKey for TemplateKey24 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(24);
 
     /// # Panics
@@ -1200,6 +1208,10 @@ impl RawSortKey for TemplateKey24 {
 }
 
 impl RawSortKey for TemplateKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics
@@ -1381,6 +1393,10 @@ impl TemplateLaneKey for TertKey32 {
 }
 
 impl RawSortKey for CbKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics
@@ -1408,6 +1424,10 @@ impl RawSortKey for CbKey32 {
 }
 
 impl RawSortKey for TertKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics

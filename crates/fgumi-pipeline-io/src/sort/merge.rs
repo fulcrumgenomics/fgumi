@@ -5,8 +5,8 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep, QnKey,
-    QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, SortMergeSlot,
+    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable,
+    QnKey, QnLex, QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot,
     SortOrder, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
 
@@ -451,29 +451,34 @@ fn build_driver(
     chunks: MemoryChunksByKind,
     total_records: u64,
     demand: Option<&Arc<fgumi_sort::MergeDemand>>,
+    class_table: Option<&Arc<QnClassTable>>,
 ) -> io::Result<Box<dyn MergeDriverDyn + Send>> {
+    let table = || class_table.map_or_else(QnClassTable::new, Arc::clone);
     Ok(match sort_order {
         SortOrder::Coordinate => Box::new(attach(
             MergeDriver::<RawCoordinateKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.coordinate),
                 total_records,
+                (),
             ),
             demand,
         )),
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
-            MergeDriver::<RawQuerynameLexKey, QnKey>::from_slots(
+            MergeDriver::<QnMergeKey<QnLex>, QnKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_lex),
                 total_records,
+                table(),
             ),
             demand,
         )),
         SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
-            MergeDriver::<RawQuerynameKey, QnKey>::from_slots(
+            MergeDriver::<QnMergeKey<QnNatural>, QnKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_natural),
                 total_records,
+                table(),
             ),
             demand,
         )),
@@ -502,6 +507,7 @@ fn build_driver(
                         slots,
                         MemorySources::Shared(Vec::new()),
                         total_records,
+                        (),
                     ),
                     demand,
                 ))
@@ -511,11 +517,17 @@ fn build_driver(
                     slots,
                     MemorySources::Shared(v),
                     total_records,
+                    (),
                 ),
                 demand,
             )),
             TemplateChunks::Cb32(v) => Box::new(attach(
-                MergeDriver::<CbKey32>::from_slots(slots, MemorySources::Shared(v), total_records),
+                MergeDriver::<CbKey32>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                    (),
+                ),
                 demand,
             )),
             TemplateChunks::Tert32(v) => Box::new(attach(
@@ -523,6 +535,7 @@ fn build_driver(
                     slots,
                     MemorySources::Shared(v),
                     total_records,
+                    (),
                 ),
                 demand,
             )),
@@ -531,6 +544,7 @@ fn build_driver(
                     slots,
                     MemorySources::Shared(v),
                     total_records,
+                    (),
                 ),
                 demand,
             )),
@@ -870,6 +884,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// withdraws the registration, because the merge runs again before it
     /// parks and re-registers then.
     awaiting: bool,
+    /// The sort's queryname class table: the queryname merge keys compare
+    /// through the windows phase 1 built against it. `None` merges against an
+    /// empty table (class 0: correct, without the window shortcut).
+    class_table: Option<Arc<QnClassTable>>,
     /// The current stall episode (one episode spans every `Stalled` until the
     /// next `Produced` or `Done`).
     episode: StallEpisode,
@@ -1044,6 +1062,7 @@ impl<O: MergeOutput> SortMerge<O> {
             fast_path_cap: None,
             demand: None,
             awaiting: false,
+            class_table: None,
             episode: StallEpisode::default(),
             ledger: None,
             decomp: None,
@@ -1059,6 +1078,22 @@ impl<O: MergeOutput> SortMerge<O> {
     pub fn with_spill_supply(mut self, supply: &super::supply_ledger::SpillSupply) -> Self {
         self.demand = Some(Arc::clone(&supply.demand));
         self.ledger = Some(Arc::clone(&supply.ledger));
+        self
+    }
+
+    /// The class table this merge compares queryname keys through (test
+    /// support: wiring checks compare it by pointer with the sort's).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn class_table_for_test(&self) -> Option<&Arc<QnClassTable>> {
+        self.class_table.as_ref()
+    }
+
+    /// Merge queryname orders against the sort's class table, so spilled and
+    /// residual keys compare through the same class windows phase 1 used.
+    #[must_use]
+    pub fn with_class_table(mut self, table: Arc<QnClassTable>) -> Self {
+        self.class_table = Some(table);
         self
     }
 
@@ -1868,6 +1903,7 @@ impl<O: MergeOutput> SortMerge<O> {
             memory_chunks,
             total_records,
             self.demand.as_ref(),
+            self.class_table.as_ref(),
         )?;
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         // Seed the first buffer modestly; subsequent buffers are sized from the

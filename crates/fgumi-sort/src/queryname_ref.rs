@@ -28,15 +28,20 @@
 //! (`r1` + `0` vs `r1` + `a`).
 
 use std::cmp::Ordering;
+use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crossbeam_utils::CachePadded;
 use fgumi_raw_bam::sort::natural_cmp_bounded;
 
 use crate::arena_pool::PooledSegmentedBuf;
 use crate::inline::{ChunkRef, InMemoryChunk};
-use crate::keys::{RawQuerynameKey, RawQuerynameLexKey, RawSortKey, qn_name_and_flags};
+use crate::keys::{
+    NameBuf, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, qn_name_and_flags,
+    read_queryname_key, write_queryname_key,
+};
 use crate::run_consolidate::SpillKeyKind;
 
 /// Name bytes a [`QnKey`] carries after its class's elided common prefix.
@@ -244,24 +249,68 @@ impl QnComparator for QnNatural {
 /// for any assignment, so concurrent registration order does not matter.
 pub struct QnClassTable {
     ecps: Box<[OnceLock<Box<[u8]>>]>,
+    /// `by_prefix[n]`: classes `1..n` ordered by their prefix, for the
+    /// longest-prefix search in [`Self::class_of`]. Set for `n = registered`
+    /// before `registered` is published, so a reader that loaded `n` finds it.
+    by_prefix: Box<[OnceLock<Box<[u8]>>]>,
     /// Entries `[0, registered)` are initialised.
     registered: AtomicUsize,
     /// Serialises appends; readers never take it.
     register: parking_lot::Mutex<()>,
 }
 
+impl Default for QnClassTable {
+    /// A table holding only class 0, the empty prefix.
+    fn default() -> Self {
+        let ecps: Box<[OnceLock<Box<[u8]>>]> =
+            (0..QN_MAX_CLASSES).map(|_| OnceLock::new()).collect();
+        let _ = ecps[0].set(Box::default());
+        let by_prefix: Box<[OnceLock<Box<[u8]>>]> =
+            (0..=QN_MAX_CLASSES).map(|_| OnceLock::new()).collect();
+        let _ = by_prefix[1].set(Box::default());
+        Self {
+            ecps,
+            by_prefix,
+            registered: AtomicUsize::new(1),
+            register: parking_lot::Mutex::new(()),
+        }
+    }
+}
+
 impl QnClassTable {
     /// A table holding only class 0, the empty prefix.
     #[must_use]
     pub fn new() -> Arc<Self> {
-        let ecps: Box<[OnceLock<Box<[u8]>>]> =
-            (0..QN_MAX_CLASSES).map(|_| OnceLock::new()).collect();
-        let _ = ecps[0].set(Box::default());
-        Arc::new(Self {
-            ecps,
-            registered: AtomicUsize::new(1),
-            register: parking_lot::Mutex::new(()),
-        })
+        Arc::new(Self::default())
+    }
+
+    /// The class a merge-side key of `name` takes: `hint` when its prefix
+    /// starts `name`, else the longest registered prefix that does, else 0.
+    ///
+    /// The search is logarithmic in the classes, not a scan of every prefix:
+    /// the merge rebuilds one key per spilled record, and a source whose names
+    /// match no class (hint 0) misses the hint on every record.
+    fn class_of(&self, hint: u8, name: &[u8]) -> u8 {
+        let n = self.len();
+        if hint != 0 && usize::from(hint) < n && name.starts_with(self.ecp(hint)) {
+            return hint;
+        }
+        let sorted: &[u8] = self.by_prefix[n].get().map_or(&[], |b| b);
+        // The longest prefix of `bound` in `sorted[..hi]`. The greatest prefix
+        // `p <= bound` is it when `p` starts `bound`; otherwise no prefix of
+        // `bound` longer than `lcp(p, bound)` is registered (it would sort
+        // between `p` and `bound`), so the search narrows to that one.
+        let (mut bound, mut hi) = (name, sorted.len());
+        loop {
+            let i = sorted[..hi].partition_point(|&c| self.ecp(c) <= bound);
+            let Some(&c) = i.checked_sub(1).map(|j| &sorted[j]) else { return 0 };
+            let p = self.ecp(c);
+            if bound.starts_with(p) {
+                return c;
+            }
+            let lcp = p.iter().zip(bound).take_while(|(x, y)| x == y).count();
+            (bound, hi) = (&bound[..lcp], i - 1);
+        }
     }
 
     /// The prefix of `class`. Lock-free.
@@ -311,8 +360,13 @@ impl QnClassTable {
             return 0;
         }
         let _ = self.ecps[now].set(ecp.into());
+        let class = u8::try_from(now).expect("class ids fit u8");
+        let mut sorted = self.by_prefix[now].get().expect("set for every published count").to_vec();
+        let at = sorted.partition_point(|&c| self.ecp(c) < ecp);
+        sorted.insert(at, class);
+        let _ = self.by_prefix[now + 1].set(sorted.into_boxed_slice());
         self.registered.store(now + 1, AtomicOrdering::Release);
-        u8::try_from(now).expect("class ids fit u8")
+        class
     }
 
     fn find(&self, ecp: &[u8], from: usize, to: usize) -> Option<u8> {
@@ -652,6 +706,10 @@ pub fn queryname_chunks_from_qn_refs<C: QnComparator>(
     refs.par_chunks_mut(size).map(piece).collect()
 }
 
+/// The owned-key merge of a `QnKey` chunk, which the production merge
+/// replaced with [`QnMergeKey`]: kept for the tests that pin a residual's key
+/// to the key a spilled record of the same body gets.
+#[cfg(test)]
 impl ChunkRef<RawQuerynameLexKey> for QnKey {
     #[inline]
     fn merge_key(&self, body: &[u8]) -> RawQuerynameLexKey {
@@ -659,10 +717,142 @@ impl ChunkRef<RawQuerynameLexKey> for QnKey {
     }
 }
 
+#[cfg(test)]
 impl ChunkRef<RawQuerynameKey> for QnKey {
     #[inline]
     fn merge_key(&self, body: &[u8]) -> RawQuerynameKey {
         RawQuerynameKey::extract_from_record(body)
+    }
+}
+
+// ============================================================================
+// The merge key
+// ============================================================================
+
+/// The table a merge key is rebuilt against when the caller has none: class 0
+/// only.
+static EMPTY_TABLE: LazyLock<Arc<QnClassTable>> = LazyLock::new(QnClassTable::new);
+
+/// The queryname merge key: a [`QnKey`] window for the fast compare plus the
+/// full name for the fallback, so the merge compares through the class window
+/// as the run sort does.
+///
+/// Two keys of one class compare by their windows (both relative to the same
+/// prefix), falling back to the full names when the windows cannot decide;
+/// keys of different classes compare by full names. Either way the order is
+/// the owned key's (`C::Key`): name by `C`, then the flag order. A slot rebuilds
+/// its key against the sort's class table ([`RawSortKey::MergeCtx`]), trying
+/// its last class first ([`RawSortKey::MergeHint`]); a residual chunk's key
+/// keeps the class phase 1 assigned. Both sides must index the same table —
+/// the sort's — or class 0 (`EMPTY_TABLE`), so a class id names one prefix.
+#[derive(Clone, Debug)]
+pub struct QnMergeKey<C: QnComparator> {
+    /// The window, flag order, tail length and class.
+    pub key: QnKey,
+    /// The full read name (`qn_name_and_flags`), inline up to 44 bytes.
+    name: NameBuf,
+    _c: PhantomData<C>,
+}
+
+impl<C: QnComparator> QnMergeKey<C> {
+    /// The full read name.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+}
+
+impl<C: QnComparator> Default for QnMergeKey<C> {
+    fn default() -> Self {
+        Self { key: QnKey::default(), name: NameBuf::new(), _c: PhantomData }
+    }
+}
+
+impl<C: QnComparator> Ord for QnMergeKey<C> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        let names = if self.key.class == other.key.class {
+            C::cmp_same_class(&self.key, &other.key)
+                .unwrap_or_else(|| C::cmp_names(&self.name, &other.name))
+        } else {
+            C::cmp_names(&self.name, &other.name)
+        };
+        names.then_with(|| self.key.flags.cmp(&other.key.flags))
+    }
+}
+
+impl<C: QnComparator> PartialOrd for QnMergeKey<C> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<C: QnComparator> PartialEq for QnMergeKey<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl<C: QnComparator> Eq for QnMergeKey<C> {}
+
+impl<C: QnComparator> RawSortKey for QnMergeKey<C> {
+    /// The sort's class table.
+    type MergeCtx = Arc<QnClassTable>;
+    /// The class the source's last record took.
+    type MergeHint = u8;
+
+    const SERIALIZED_SIZE: Option<usize> = None;
+    const EMBEDDED_IN_RECORD: bool = true;
+
+    fn extract(bam: &[u8], _ctx: &SortContext) -> Self {
+        Self::extract_from_record(bam)
+    }
+
+    /// Against an empty table: class 0, the window the name's first bytes.
+    fn extract_from_record(bam: &[u8]) -> Self {
+        Self::extract_from_record_in(&EMPTY_TABLE, &mut 0, bam)
+    }
+
+    #[inline]
+    fn extract_from_record_in(table: &Arc<QnClassTable>, hint: &mut u8, bam: &[u8]) -> Self {
+        let (name, flags) = qn_name_and_flags(bam);
+        let class = table.class_of(*hint, name);
+        *hint = class;
+        Self {
+            key: key_in_class(table, name, flags, class),
+            name: NameBuf::from_slice(name),
+            _c: PhantomData,
+        }
+    }
+
+    /// The owned queryname keys' format: `[name_len: u16][name][flags: u16]`.
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        write_queryname_key(&self.name, self.key.flags, writer)
+    }
+
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let (name, flags) = read_queryname_key(reader)?;
+        if name.len() > 254 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a read name is at most 254 bytes",
+            ));
+        }
+        Ok(Self { key: QnKey::new(&name, flags, 0), name, _c: PhantomData })
+    }
+}
+
+/// A residual record's merge key keeps the class phase 1 gave it; the name
+/// comes from the body.
+impl<C: QnComparator> ChunkRef<QnMergeKey<C>> for QnKey {
+    #[inline]
+    fn merge_key(&self, body: &[u8]) -> QnMergeKey<C> {
+        QnMergeKey {
+            key: *self,
+            name: NameBuf::from_slice(qn_name_and_flags(body).0),
+            _c: PhantomData,
+        }
     }
 }
 
@@ -1353,5 +1543,168 @@ mod tests {
             "; 1 compares (0.00% cross-class): decided without the arena 0.00%, arena \
              fallbacks 100.00%"
         ));
+    }
+
+    mod merge_key {
+        use super::*;
+
+        /// For each record, the merge key either a slot rebuilds (through the
+        /// table and a hint carried from record to record) or a residual
+        /// chunk carries (its phase-1 `QnKey` plus the body's name): the two
+        /// routes disagree on classes for equal names whenever the hint and the
+        /// phase-1 guess do.
+        fn mixed_merge_keys<C: QnComparator>(
+            table: &Arc<QnClassTable>,
+            arena: &PooledSegmentedBuf,
+            refs: &[QnRef],
+            hint0: u8,
+        ) -> Vec<QnMergeKey<C>> {
+            let mut hint = hint0;
+            refs.iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let body = arena_body(arena, r);
+                    if i % 2 == 0 {
+                        QnMergeKey::<C>::extract_from_record_in(table, &mut hint, body)
+                    } else {
+                        <QnKey as ChunkRef<QnMergeKey<C>>>::merge_key(&r.0, body)
+                    }
+                })
+                .collect()
+        }
+
+        fn check_all_pairs<C: QnComparator>(
+            table: &Arc<QnClassTable>,
+            arena: &PooledSegmentedBuf,
+            refs: &[QnRef],
+            hint0: u8,
+        ) -> Result<(), TestCaseError>
+        where
+            C::Key: Ord,
+        {
+            let keys = mixed_merge_keys::<C>(table, arena, refs, hint0);
+            let owned: Vec<C::Key> =
+                refs.iter().map(|r| C::Key::extract_from_record(arena_body(arena, r))).collect();
+            for i in 0..keys.len() {
+                for j in 0..keys.len() {
+                    prop_assert_eq!(
+                        keys[i].cmp(&keys[j]),
+                        owned[i].cmp(&owned[j]),
+                        "{} vs {}",
+                        i,
+                        j
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        proptest! {
+            /// The merge key orders exactly like the owned key, whatever class
+            /// each side was assigned — including equal names in different
+            /// classes — for both comparators.
+            #[test]
+            fn qn_merge_key_orders_like_the_owned_key(
+                names in proptest::collection::vec(qn_name_strategy(), 2..32),
+                ecp in qn_name_strategy(),
+                prefix_p in 0.0f64..1.0,
+                guess in 0u8..3,
+                hint0 in 0u8..3,
+            ) {
+                let (arena, spans) = arena_with_named_records(&names, &ecp, prefix_p);
+                let table = QnClassTable::new();
+                let refs = build_refs_with_guess(&table, &arena, &spans, &ecp, guess);
+                let hint0 = hint0.min(u8::try_from(table.len() - 1).unwrap());
+                check_all_pairs::<QnLex>(&table, &arena, &refs, hint0)?;
+                check_all_pairs::<QnNatural>(&table, &arena, &refs, hint0)?;
+            }
+        }
+
+        proptest! {
+            /// The logarithmic search finds what a scan of every prefix finds —
+            /// the longest registered prefix that starts the name, else 0 — over
+            /// nested, sibling and diverging prefixes, at every table size up to
+            /// a full one.
+            #[test]
+            fn class_of_finds_the_longest_matching_prefix(
+                prefixes in prop::collection::vec("[AB:]{1,6}[:x]", 0..300),
+                names in prop::collection::vec("[AB:x]{0,9}[0-9]{0,3}", 1..40),
+            ) {
+                let table = QnClassTable::new();
+                for p in &prefixes {
+                    table.class_for(p.as_bytes());
+                }
+                let n = table.len();
+                for name in &names {
+                    let name = name.as_bytes();
+                    let scan = (1..n)
+                        .filter_map(|i| u8::try_from(i).ok())
+                        .filter(|&c| name.starts_with(table.ecp(c)))
+                        .max_by_key(|&c| table.ecp(c).len())
+                        .unwrap_or(0);
+                    prop_assert_eq!(table.class_of(0, name), scan, "{:?}", String::from_utf8_lossy(name));
+                }
+            }
+        }
+
+        /// A slot key takes its source's hint class when the hint's prefix
+        /// matches the name, else the longest registered prefix that does, else
+        /// class 0 — and the class it took becomes the hint.
+        #[test]
+        fn longest_matching_ecp_wins_and_the_hint_is_tried_first() {
+            let table = QnClassTable::new();
+            let short = table.class_for(b"A00132:53:");
+            let long = table.class_for(b"A00132:53:HFHJ:");
+            let key = |hint: &mut u8, name: &[u8]| {
+                QnMergeKey::<QnLex>::extract_from_record_in(&table, hint, &body_named(name, 0x41))
+                    .key
+                    .class
+            };
+            let mut hint = 0;
+            assert_eq!(key(&mut hint, b"A00132:53:HFHJ:1:1101:5:7"), long, "the longest match");
+            assert_eq!(hint, long);
+            let mut hint = short;
+            assert_eq!(key(&mut hint, b"A00132:53:HFHJ:1:1101:5:7"), short, "the hint first");
+            assert_eq!(hint, short);
+            let mut hint = long;
+            assert_eq!(key(&mut hint, b"A00132:53:XXXX:1:1101:5:7"), short, "hint misses");
+            assert_eq!(hint, short);
+            assert_eq!(key(&mut hint, b"B7:1101:5:7"), 0, "no prefix matches");
+            assert_eq!(hint, 0);
+        }
+
+        /// Without a table every key is class 0, its window the name's first
+        /// 24 bytes — correct, just undiscriminating.
+        #[test]
+        fn extract_from_record_without_a_table_is_class_0() {
+            let name = b"A00132:53:HFHJ:1:1101:23456:7890";
+            let k = QnMergeKey::<QnNatural>::extract_from_record(&body_named(name, 0x81));
+            assert_eq!(k.key.class, 0);
+            assert_eq!(&k.key.window[..], &name[..QN_WINDOW]);
+            assert_eq!(usize::from(k.key.tail_len), name.len());
+        }
+
+        /// Serialized and read back, a merge key orders as the owned key does.
+        #[test]
+        fn qn_merge_key_round_trips_through_its_serialization() {
+            let names: [&[u8]; 4] = [b"rd10", b"rd9", b"A00132:53:HFHJ:1:1101:5:7", b""];
+            let keys: Vec<QnMergeKey<QnNatural>> = names
+                .iter()
+                .map(|n| {
+                    let k = QnMergeKey::<QnNatural>::extract_from_record(&body_named(n, 0x41));
+                    let mut buf = Vec::new();
+                    k.write_to(&mut buf).unwrap();
+                    QnMergeKey::read_from(&mut buf.as_slice()).unwrap()
+                })
+                .collect();
+            for (i, a) in names.iter().enumerate() {
+                for (j, b) in names.iter().enumerate() {
+                    let owned = |n: &[u8]| {
+                        <QnNatural as QnComparator>::Key::extract_from_record(&body_named(n, 0x41))
+                    };
+                    assert_eq!(keys[i].cmp(&keys[j]), owned(a).cmp(&owned(b)), "{i} vs {j}");
+                }
+            }
+        }
     }
 }

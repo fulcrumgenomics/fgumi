@@ -639,7 +639,13 @@ not end on a digit (`trim_to_class_rule`), so a natural digit run is never split
 between prefix and window. `--sort-stats` logs a `Queryname keys:` line with the
 classes, re-windowed batches and the compare shares (`arena fallbacks` is the
 share that read the arena). The spill format is unchanged: queryname keys are
-embedded in the record, and the merge rebuilds them from the body.
+embedded in the record, and the merge rebuilds them from the body as
+`QnMergeKey<C>` — the same window against the sort's class table
+(`RawSortKey::MergeCtx`), trying the source's last class first
+(`RawSortKey::MergeHint`), with the full name kept for the fallback — so the
+merge compares through the windows as the run sort does. Residual chunks keep
+their phase-1 classes; a slot and a residual key in different classes compare
+by full name. Every other key's `MergeCtx`/`MergeHint` is `()`.
 
 ### Split arena front (every sort order)
 

@@ -33,10 +33,13 @@ pub enum MemoryChunkErased {
     /// Queryname-sort residual, lexicographic comparator. Arena-backed like
     /// [`Coordinate`](Self::Coordinate); each record's ref is a [`QnKey`] that
     /// borrows its name from the record body. The merge key is
-    /// `RawQuerynameLexKey`.
+    /// `QnMergeKey<QnLex>`, rebuilt against the sort's class table; a residual
+    /// record keeps the class phase 1 gave it. The run bounds
+    /// ([`Self::min_bound`]) use the owned `RawQuerynameLexKey`.
     QuerynameLex(InMemoryChunk<QnKey>),
     /// Queryname-sort residual, natural comparator; refs as
-    /// [`QuerynameLex`](Self::QuerynameLex). The merge key is `RawQuerynameKey`.
+    /// [`QuerynameLex`](Self::QuerynameLex). The merge key is
+    /// `QnMergeKey<QnNatural>`; the run bounds use the owned `RawQuerynameKey`.
     QuerynameNatural(InMemoryChunk<QnKey>),
     /// Template-coordinate-sort residual, carried as a variant-tagged
     /// [`TemplateMemChunk`] so the chosen `--key-types` narrow lane rides through
