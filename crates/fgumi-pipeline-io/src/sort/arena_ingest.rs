@@ -34,6 +34,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use fgumi_bam_io::pread::RawFrame;
 use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
@@ -190,6 +191,22 @@ pub struct ReadBlocks {
     finished: bool,
     /// Byte limit for the output queue.
     output_byte_limit: u64,
+    /// When the current wait for a free arena began (its first refusal);
+    /// `None` while not waiting.
+    wait_started: Option<Instant>,
+    /// Waits for a free arena that ended with an acquire.
+    arena_waits: u64,
+    /// Total time from each wait's first refusal to its acquire.
+    arena_wait_ns: u64,
+    /// Total time from the release that ended each wait to its acquire — the
+    /// wake latency, counted only for a release after the wait began.
+    arena_wake_ns: u64,
+    /// The level the arena-wait line is still to be logged at — `info` under
+    /// `--sort-stats`, `debug` otherwise; `None` once logged.
+    arena_line_level: Option<log::Level>,
+    /// Test hook run between the refused acquire and the waiter registration.
+    #[cfg(test)]
+    before_register: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ReadBlocks {
@@ -240,6 +257,74 @@ impl ReadBlocks {
             seal_pending: false,
             finished: false,
             output_byte_limit,
+            wait_started: None,
+            arena_waits: 0,
+            arena_wait_ns: 0,
+            arena_wake_ns: 0,
+            arena_line_level: Some(log::Level::Debug),
+            #[cfg(test)]
+            before_register: None,
+        }
+    }
+
+    /// Log the arena-wait line at `info` (`--sort-stats`) instead of `debug`.
+    #[must_use]
+    pub fn with_sort_stats(mut self, on: bool) -> Self {
+        self.arena_line_level = Some(if on { log::Level::Info } else { log::Level::Debug });
+        self
+    }
+
+    /// Acquire the next run's arena, registering as the pool's waiter when it
+    /// is exhausted so the release — on whichever thread drops the previous
+    /// run's last reference — unparks this step's driver. Accounts each wait
+    /// and its wake latency.
+    fn try_acquire_arena(&mut self) -> Option<PooledSegmentedBuf> {
+        let acquired = self.pool.try_acquire().or_else(|| {
+            #[cfg(test)]
+            if let Some(hook) = self.before_register.take() {
+                hook();
+            }
+            // Register, then retry: a release after the registration unparks
+            // us; one between the refused acquire and the registration is
+            // caught by the retry.
+            self.pool.register_waiter();
+            self.pool.try_acquire()
+        });
+        match acquired {
+            None => {
+                self.wait_started.get_or_insert_with(Instant::now);
+                None
+            }
+            Some(arena) => {
+                if let Some(started) = self.wait_started.take() {
+                    let now = Instant::now();
+                    self.arena_waits += 1;
+                    self.arena_wait_ns += nanos(now - started);
+                    if let Some(released) = self.pool.released_at().filter(|&r| r >= started) {
+                        self.arena_wake_ns += nanos(now.saturating_duration_since(released));
+                    }
+                }
+                Some(arena)
+            }
+        }
+    }
+
+    /// The arena-wait summary line.
+    fn arena_wait_line(&self) -> String {
+        #[allow(clippy::cast_precision_loss)] // display seconds
+        let wait_s = self.arena_wait_ns as f64 / 1e9;
+        format!(
+            "Phase 1: arena waits {} ({wait_s:.1} s waiting for a free arena; {} ms from return \
+             to reuse)",
+            self.arena_waits,
+            self.arena_wake_ns / 1_000_000
+        )
+    }
+
+    /// Log [`Self::arena_wait_line`] once.
+    fn log_arena_waits(&mut self) {
+        if let Some(level) = self.arena_line_level.take() {
+            log::log!(level, "{}", self.arena_wait_line());
         }
     }
 
@@ -265,7 +350,7 @@ impl ReadBlocks {
         if self.arena.is_some() {
             return true;
         }
-        let Some(mut arena) = self.pool.try_acquire() else {
+        let Some(mut arena) = self.try_acquire_arena() else {
             return false;
         };
         arena.reserve_full_capacity();
@@ -366,6 +451,32 @@ impl ReadBlocks {
         self.run_offset = 0;
     }
 
+    /// Test seam: acquire (or wait for) the run's arena.
+    #[cfg(test)]
+    pub(crate) fn ensure_arena_for_test(&mut self) -> bool {
+        self.ensure_arena()
+    }
+
+    /// Test seam: hand the current run's arena to the caller (as if the run
+    /// had sealed and its chunk were still downstream).
+    #[cfg(test)]
+    pub(crate) fn take_arena_for_test(&mut self) -> Option<Arc<PooledSegmentedBuf>> {
+        self.arena.take()
+    }
+
+    /// Test seam: run `hook` between the next refused acquire and the waiter
+    /// registration.
+    #[cfg(test)]
+    pub(crate) fn before_register_for_test(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.before_register = Some(hook);
+    }
+
+    /// Test seam: `(arena_waits, arena_wait_ns, arena_wake_ns)`.
+    #[cfg(test)]
+    pub(crate) fn arena_wait_stats(&self) -> (u64, u64, u64) {
+        (self.arena_waits, self.arena_wait_ns, self.arena_wake_ns)
+    }
+
     /// Test seam: admit blocks, then freeze the arena and drain all emitted
     /// [`ArenaBlock`]s into a `Vec` for direct inspection, bypassing the pipeline
     /// framework.  Uses `seals_to_spill = false` (residual) for the single flush.
@@ -374,6 +485,11 @@ impl ReadBlocks {
         self.seal_run(false);
         self.emit.drain(..).collect()
     }
+}
+
+/// A duration in whole nanoseconds, saturating.
+fn nanos(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Step for ReadBlocks {
@@ -413,6 +529,9 @@ impl Step for ReadBlocks {
         let outcome = self.try_run_inner(ctx, &mut admitted_blocks, &mut admitted_bytes);
         ctx.counters.add(READ_BLOCKS_BLOCKS, admitted_blocks);
         ctx.counters.add(READ_BLOCKS_BYTES_READ, admitted_bytes);
+        if matches!(outcome, Ok(StepOutcome::Finished)) {
+            self.log_arena_waits();
+        }
         outcome
     }
 
@@ -2899,6 +3018,43 @@ mod tests {
             step.finalize().expect("finalize must succeed").is_none(),
             "no more events after Residual + AllAnnounced"
         );
+    }
+
+    /// Lost-wake guard: a release between the refused acquire and the waiter
+    /// registration is caught by the retry, deterministically — the step gets
+    /// its arena without ever waiting.
+    #[test]
+    fn register_then_retry_catches_a_release_in_between() {
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20);
+        assert!(step.ensure_arena_for_test(), "the pool's one arena");
+        let held = step.take_arena_for_test().expect("arena");
+        step.before_register_for_test(Box::new(move || drop(held)));
+        assert!(
+            step.ensure_arena_for_test(),
+            "the retry after registering finds the released arena"
+        );
+        assert_eq!(step.arena_wait_stats().0, 0, "no wait was recorded");
+    }
+
+    /// Wait vs wake latency: the wait spans first refusal → acquire; the wake
+    /// latency spans release → acquire. Refuse, wait ≥ 100 ms, release, wait
+    /// ≥ 30 ms, then acquire.
+    #[test]
+    fn read_blocks_separates_arena_wait_from_wake_latency() {
+        use std::time::Duration;
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20);
+        assert!(step.ensure_arena_for_test());
+        let held = step.take_arena_for_test().expect("arena");
+        assert!(!step.ensure_arena_for_test(), "refused while the arena is held");
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(step.ensure_arena_for_test(), "acquired after the release");
+        let (waits, wait_ns, wake_ns) = step.arena_wait_stats();
+        assert_eq!(waits, 1);
+        assert!(wait_ns >= 130_000_000, "wait {wait_ns} ns");
+        assert!(wake_ns >= 30_000_000, "wake {wake_ns} ns");
+        assert!(wake_ns <= wait_ns - 100_000_000, "wake {wake_ns} ns within wait {wait_ns} ns");
     }
 
     /// The record-input front cannot re-window a batch when it closes (it has

@@ -18,7 +18,10 @@
 //! arena freed — exactly legacy's behaviour, and the RSS-gate-safe footprint.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::Thread;
+use std::time::Instant;
 
 use crate::segmented_buf::SegmentedBuf;
 
@@ -30,6 +33,14 @@ pub struct ArenaPool {
     capacity: usize,
     /// Segment size for freshly-allocated arenas.
     segment_size: usize,
+    /// The thread waiting for a free arena (see [`Self::register_waiter`]),
+    /// unparked by every release.
+    waiter: parking_lot::Mutex<Option<Thread>>,
+    /// When an arena last returned, in nanoseconds since `epoch`, plus one so
+    /// that 0 means "never".
+    released_at_ns: AtomicU64,
+    /// The origin of `released_at_ns`.
+    epoch: Instant,
 }
 
 struct PoolInner {
@@ -51,7 +62,31 @@ impl ArenaPool {
             // 0 here would otherwise be silently accepted at this boundary and
             // corrected somewhere else.
             segment_size: segment_size.max(1),
+            waiter: parking_lot::Mutex::new(None),
+            released_at_ns: AtomicU64::new(0),
+            epoch: Instant::now(),
         })
+    }
+
+    /// Register the calling thread as the one waiting for a free arena: every
+    /// later release unparks it. A release can return the arena on any thread
+    /// (whichever drops the last reference to a run's chunk), so this is the
+    /// waiter's only wake that is not a timer.
+    ///
+    /// Lost-wake protocol: register, then call [`Self::try_acquire`] once more.
+    /// A release after the registration unparks the waiter; one between the
+    /// failed acquire and the registration is caught by that retry.
+    pub fn register_waiter(&self) {
+        *self.waiter.lock() = Some(std::thread::current());
+    }
+
+    /// When an arena last returned to the pool, or `None` if none has.
+    #[must_use]
+    pub fn released_at(&self) -> Option<Instant> {
+        match self.released_at_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(self.epoch + std::time::Duration::from_nanos(ns - 1)),
+        }
     }
 
     /// Acquire a reset-for-reuse arena, or `None` if all `capacity` arenas are
@@ -122,12 +157,19 @@ impl ArenaPool {
         );
         buf.reset_for_reuse();
         self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).free.push(buf);
+        // Stamp the return, then wake the registered waiter: it may be parked on
+        // another thread (the coordination driver) while this one released.
+        let ns = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.released_at_ns.store(ns + 1, Ordering::Release);
+        if let Some(waiter) = self.waiter.lock().as_ref() {
+            waiter.unpark();
+        }
     }
 
     /// Number of arenas currently available in the free-list (test/diagnostic).
     ///
     /// Does not panic on a poisoned mutex — see the comment in the body.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn free_len(&self) -> usize {
         // Recovers like `release` rather than panicking: this exists to observe
@@ -350,5 +392,46 @@ mod tests {
         assert!(reused.is_empty(), "reset for reuse");
         assert_eq!(reused.num_segments(), segs, "retained segments");
         assert_eq!(reused.allocated_capacity(), cap, "no realloc");
+    }
+
+    /// A registered waiter is unparked by the release itself (not a timer): it
+    /// parks with a 10 s timeout and wakes within 1 s of another thread dropping
+    /// the pooled buffer. Stale tokens are drained by looping on the condition.
+    #[test]
+    fn arena_return_unparks_the_registered_waiter() {
+        use std::time::{Duration, Instant};
+        let pool = ArenaPool::new(1, 1 << 16);
+        let held = pool.try_acquire().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = Arc::clone(&pool);
+        let h = std::thread::spawn(move || {
+            p.register_waiter();
+            tx.send(()).unwrap();
+            let t0 = Instant::now();
+            while p.free_len() == 0 {
+                std::thread::park_timeout(Duration::from_secs(10));
+                assert!(t0.elapsed() < Duration::from_secs(5), "watchdog: no wake");
+            }
+            t0.elapsed()
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+        let woke_after = h.join().unwrap();
+        assert!(
+            woke_after < Duration::from_secs(1),
+            "woken by the release, not the 10 s timer: {woke_after:?}"
+        );
+    }
+
+    /// Every release stamps when it happened.
+    #[test]
+    fn release_stamps_released_at() {
+        let pool = ArenaPool::new(1, 1 << 16);
+        assert!(pool.released_at().is_none());
+        let before = std::time::Instant::now();
+        drop(pool.try_acquire().unwrap());
+        let at = pool.released_at().expect("stamped");
+        assert!(at >= before && at <= std::time::Instant::now());
     }
 }

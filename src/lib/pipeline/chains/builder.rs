@@ -3965,7 +3965,8 @@ impl<'a> ChainBuilder<'a> {
                     // the effective sort-phase thread count). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
-                    let read_blocks = ReadBlocks::new(total_memory, byte_limit);
+                    let read_blocks =
+                        ReadBlocks::new(total_memory, byte_limit).with_sort_stats(sort.sort_stats);
                     // The arena front is the only decode path standalone sort
                     // takes, so the chain's CRC policy has to reach it here --
                     // `BgzfDecompress` (which also honors `spec.verify_crc`) is

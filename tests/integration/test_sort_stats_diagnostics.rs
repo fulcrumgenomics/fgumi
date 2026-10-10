@@ -850,3 +850,18 @@ fn sort_stats_gates_the_queryname_keys_line(
         assert!(line.contains("arena fallbacks"), "{order}: compares are counted: {line}");
     }
 }
+
+/// The arena-wait line — waits for a free arena and the latency from each
+/// release to its reuse — is logged under `--sort-stats` and not without it.
+#[rstest]
+fn read_blocks_logs_the_arena_line_only_with_sort_stats(#[values(false, true)] with_flag: bool) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with("coordinate", extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "the fixture must spill several runs (got {n}):\n{stderr}");
+    let line = stderr.lines().map(log_body).find(|l| l.starts_with("Phase 1: arena waits "));
+    assert_eq!(line.is_some(), with_flag, "`Phase 1: arena waits` presence:\n{stderr}");
+    if let Some(line) = line {
+        assert!(line.contains("from return to reuse"), "{line}");
+    }
+}
