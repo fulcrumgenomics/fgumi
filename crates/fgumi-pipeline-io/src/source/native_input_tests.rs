@@ -324,3 +324,56 @@ fn every_read_runs_on_a_pool_worker(#[values(1usize, 4)] threads: usize) {
     assert!(!names.is_empty());
     assert!(names.iter().all(|n| n.starts_with("fgumi-worker-") || *n == caller), "{names:?}");
 }
+
+/// Frame `stream` cut into `cut`-byte slices leased from a fresh pool, through
+/// `FrameBgzfBlocks` driven by hand; returns the blocks and the pool.
+fn frame_with_cuts(stream: &[u8], cut: usize) -> (Vec<BgzfBlock>, Arc<SliceBufferPool>) {
+    use crate::pread::{ReadSlice, ReadTarget};
+    use fgumi_pipeline_core::testing::StepProbe;
+    let pool = SliceBufferPool::new(64);
+    let mut step = FrameBgzfBlocks::new(Arc::new(InputLedger::default()), 1 << 40);
+    let mut probe = StepProbe::new(&step);
+    let n = stream.len().div_ceil(cut);
+    for (i, chunk) in stream.chunks(cut).enumerate() {
+        probe.push_input(ReadSlice {
+            ordinal: i as u64,
+            stream: 0,
+            seq: u32::try_from(i).unwrap(),
+            offset: (i * cut) as u64,
+            bytes: pool.lease(chunk.to_vec()),
+            last: i + 1 == n,
+            target: ReadTarget::Input,
+        });
+    }
+    probe.close_input();
+    while probe.try_run(&mut step).unwrap() != StepOutcome::Finished {}
+    let out = probe.take_output::<BgzfBlock>(0);
+    let mut blocks = Vec::new();
+    while let Some(b) = fgumi_pipeline_core::InputHandle::pop(&out) {
+        blocks.push(b);
+    }
+    drop(step);
+    (blocks, pool)
+}
+
+/// Blocks wholly inside a slice are borrowed (zero copy); only a block
+/// that straddled two slices is owned; every slice returns to the pool after
+/// the blocks drop; the bytes equal the sequential reader's.
+#[test]
+fn framed_blocks_borrow_their_slice() {
+    use fgumi_bam_io::pread::RawFrame;
+    let stream = bgzf_stream(40 << 16);
+    let (blocks, pool) = frame_with_cuts(&stream, 1 << 20);
+    let oracle = fgumi_bgzf::read_raw_blocks(&mut &stream[..], 1024).unwrap();
+    assert_eq!(blocks.len(), oracle.len());
+    for (b, o) in blocks.iter().zip(&oracle) {
+        assert_eq!(&b.bytes[..], &o.data[..]);
+    }
+    let borrowed = blocks.iter().filter(|b| matches!(b.bytes, RawFrame::Borrowed { .. })).count();
+    let slices = stream.len().div_ceil(1 << 20);
+    assert!(borrowed >= blocks.len() - (slices - 1), "≤ one straddler per slice boundary");
+    assert!(borrowed > 0);
+    assert!(pool.resident_bytes() > 0, "borrowed blocks keep their slices leased");
+    drop(blocks);
+    assert_eq!(pool.resident_bytes(), 0, "every slice returned once its blocks dropped");
+}

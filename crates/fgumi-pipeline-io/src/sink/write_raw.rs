@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(RawBytesBlock::bytes(&plain), b"ACGT");
         let bgzf = BgzfBlock {
             batch_serial: 0,
-            bytes: b"\x1f\x8b".to_vec(),
+            bytes: b"\x1f\x8b".to_vec().into(),
             uncompressed_size: 4,
             index: None,
         };

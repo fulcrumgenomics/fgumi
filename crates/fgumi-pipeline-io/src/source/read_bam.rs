@@ -162,7 +162,7 @@ impl Step for ReadBgzfBlocks {
                         ),
                     )
                 })?,
-                bytes: raw.data,
+                bytes: raw.data.into(),
                 index: None,
             });
         }
@@ -411,7 +411,7 @@ mod tests {
 
         // Concatenating the payloads reproduces the file minus its BGZF EOF block,
         // which is what `FindBamBoundaries` downstream expects to receive.
-        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
+        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.to_vec()).collect();
         assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
     }
 
@@ -436,7 +436,11 @@ mod tests {
         for (a, b) in actual.iter().zip(baseline.iter()) {
             assert_eq!(a.batch_serial, b.batch_serial);
             assert_eq!(a.uncompressed_size, b.uncompressed_size);
-            assert_eq!(a.bytes, b.bytes, "block bytes must be identical across read-streams");
+            assert_eq!(
+                a.bytes[..],
+                b.bytes[..],
+                "block bytes must be identical across read-streams"
+            );
         }
     }
 
@@ -448,7 +452,7 @@ mod tests {
         assert_eq!(one.len(), many.len(), "block count must not depend on threads");
         for (a, b) in one.iter().zip(many.iter()) {
             assert_eq!(a.batch_serial, b.batch_serial);
-            assert_eq!(a.bytes, b.bytes);
+            assert_eq!(a.bytes[..], b.bytes[..]);
         }
     }
 
@@ -457,7 +461,7 @@ mod tests {
         const BGZF_EOF_LEN: usize = 28;
         let (path, on_disk) = temp_bam(0);
         let blocks = drive(&path, DEFAULT_BLOCKS_PER_BATCH, 1);
-        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
+        let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.to_vec()).collect();
         assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
     }
 
