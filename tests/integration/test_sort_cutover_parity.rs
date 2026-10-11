@@ -1107,12 +1107,13 @@ fn cutover_sort_stats_and_read_streams_are_active() {
 
 /// The `--read-streams` count changes only *how* the input is read (disk queue
 /// depth), never *what* is read. Sorted output must be byte-identical across
-/// `1`, `4`, and `auto` — the load-bearing correctness gate for the concurrent
-/// scatter reader on the real sort command path. `-m 32K` forces the *sort* to
-/// spill through the external-merge path (it does not resize the reader's fill
+/// `1`, `4`, and `auto` — the load-bearing correctness gate for the chain-native
+/// input reads on the real sort command path. `-m 32K` forces the *sort* to
+/// spill through the external-merge path (it does not resize the reads' fill
 /// window, which is fixed at 4 MiB), so this exercises `--read-streams` end to
-/// end through spill+merge. The scatter reader's own multi-fill / multi-slice
-/// behaviour is covered directly by the unit proptests in `scatter_reader`.
+/// end through spill+merge. The slicing and framing are covered directly by the
+/// unit tests in `fgumi_bam_io::pread`, `fgumi_bgzf` (`BgzfSliceFramer`) and
+/// `fgumi-pipeline-io`'s native-input tests.
 #[rstest]
 #[case::coordinate("coordinate")]
 #[case::queryname_natural("queryname-natural")]

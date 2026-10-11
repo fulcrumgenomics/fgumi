@@ -165,9 +165,60 @@ fn drive_sort_pipeline(
         output_byte_limit,
         threads,
         sink_kind,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
+}
+
+/// The merge-supply knobs the parity tests vary; production resolves them
+/// from `--max-memory`, the slot count and the read-stream policy.
+#[derive(Clone, Copy, Debug)]
+struct SupplyTuning {
+    /// `(hot_fill, cold_fill)` replacing the resolved budget's fill sizes.
+    fills: Option<(u64, u64)>,
+    /// Slices per fill (`--read-streams`).
+    read_streams: usize,
+    /// `(max_inflight_slices, cold_inflight_bytes)`, forced small.
+    inflight_caps: Option<(u32, u64)>,
+}
+
+impl Default for SupplyTuning {
+    fn default() -> Self {
+        Self { fills: None, read_streams: 1, inflight_caps: None }
+    }
+}
+
+/// The merge supply as `add_sort` builds it — `SpillReadPlanner` (fan-out:
+/// read requests on branch 0, phase events on branch 1) → `PreadSpillSlices`
+/// → `SortSpillDecompress` — sharing one `MergeDemand` and ledger with the
+/// merge the caller wires to the planner's branch 1.
+fn spill_supply(
+    output_byte_limit: u64,
+    threads: usize,
+    tuning: SupplyTuning,
+) -> (SpillReadPlanner, crate::pread::PreadSlices, SortSpillDecompress, Arc<fgumi_sort::MergeDemand>)
+{
+    let supply = SpillSupply::new();
+    let demand = Arc::clone(&supply.demand);
+    let slices = fgumi_bam_io::pread::SliceBufferPool::new(2 * threads + 8);
+    let mut planner = SpillReadPlanner::new(
+        768 << 20,
+        threads,
+        threads,
+        output_byte_limit,
+        &supply,
+        Arc::clone(&slices),
+    )
+    .with_read_streams(fgumi_bam_io::pread::ReadStreamsPolicy::fixed(tuning.read_streams));
+    if let Some((hot, cold)) = tuning.fills {
+        planner = planner.with_fills_for_test(hot, cold);
+    }
+    if let Some((slices, cold_bytes)) = tuning.inflight_caps {
+        planner = planner.with_inflight_caps_for_test(slices, cold_bytes);
+    }
+    let pread = crate::pread::PreadSlices::spill(slices, output_byte_limit);
+    let decompress = SortSpillDecompress::new(output_byte_limit, &supply);
+    (planner, pread, decompress, demand)
 }
 
 /// Drive the production sort chain (`VecSource` → `SortBuffer` →
@@ -183,7 +234,7 @@ fn drive_sort_pipeline_tuned(
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
-    decompress_tuning: SortDecompressTuning,
+    supply: SupplyTuning,
     spill_codec: SpillCodec,
 ) -> Result<Vec<Vec<u8>>> {
     drive_sort_buffer_pipeline(
@@ -193,7 +244,7 @@ fn drive_sort_pipeline_tuned(
         output_byte_limit,
         threads,
         sink_kind,
-        decompress_tuning,
+        supply,
         spill_codec,
     )
 }
@@ -211,7 +262,7 @@ fn drive_sort_buffer_pipeline(
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
-    decompress_tuning: SortDecompressTuning,
+    supply: SupplyTuning,
     spill_codec: SpillCodec,
 ) -> Result<Vec<Vec<u8>>> {
     use fgumi_sort::TmpDirAllocator;
@@ -239,20 +290,15 @@ fn drive_sort_buffer_pipeline(
         output_byte_limit,
         temp_dirs,
     );
-    let decompress = SortSpillDecompress::new(output_byte_limit, decompress_tuning);
+    let (planner, pread, decompress, demand) = spill_supply(output_byte_limit, threads, supply);
     let merge =
         SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256);
     let sink = VecSink { received: Arc::clone(&received), kind: sink_kind, progress: None };
 
     let builder = Pipeline::builder();
-    builder
-        .chain(source)
-        .chain(sort_buffer)
-        .chain(compress)
-        .chain(decompress)
-        .chain(merge)
-        .chain(sink)
-        .into_sink_marker();
+    let fan = builder.chain(source).chain(sort_buffer).chain(compress).chain(planner).into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads, ..Default::default() })?;
 
@@ -329,7 +375,7 @@ fn drive_sort_block_pipeline(
     output_byte_limit: u64,
     threads: usize,
     sink_kind: StepKind,
-    decompress_tuning: SortDecompressTuning,
+    supply: SupplyTuning,
     spill_codec: SpillCodec,
 ) -> Result<Vec<Vec<u8>>> {
     use fgumi_sort::TmpDirAllocator;
@@ -352,20 +398,15 @@ fn drive_sort_block_pipeline(
         output_byte_limit,
         temp_dirs,
     );
-    let decompress = SortSpillDecompress::new(output_byte_limit, decompress_tuning);
+    let (planner, pread, decompress, demand) = spill_supply(output_byte_limit, threads, supply);
     let merge =
         SortMerge::<BlockOutput>::with_target_batch_count(sort_order, output_byte_limit, 256);
     let sink = BlockSink { received: Arc::clone(&received), kind: sink_kind };
 
     let builder = Pipeline::builder();
-    builder
-        .chain(source)
-        .chain(sort_buffer)
-        .chain(compress)
-        .chain(decompress)
-        .chain(merge)
-        .chain(sink)
-        .into_sink_marker();
+    let fan = builder.chain(source).chain(sort_buffer).chain(compress).chain(planner).into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads, ..Default::default() })?;
 
@@ -479,7 +520,7 @@ fn sort_buffer_chain_matches_legacy_all_orders(
         // test must too.
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("buffer pipeline drives to completion");
@@ -560,7 +601,7 @@ fn sort_buffer_chain_fails_the_pipeline_on_a_dropped_lane_violation() {
         4 * 1024 * 1024,
         1,
         StepKind::Serial,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect_err("a dropped-lane violation must fail the pipeline, not truncate the sort");
@@ -606,7 +647,7 @@ fn sort_buffer_single_oversized_batch_seals_multiple_chunks_without_dropping() {
         4 * 1024 * 1024,
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("buffer pipeline drives to completion");
@@ -658,7 +699,7 @@ fn sort_merge_block_output_matches_legacy(
         4 * 1024 * 1024,
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("block pipeline drives to completion");
@@ -672,7 +713,7 @@ fn sort_merge_block_output_matches_legacy(
         4 * 1024 * 1024,
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("buffer pipeline drives to completion");
@@ -741,7 +782,7 @@ fn detached_sink_chain_matches_legacy_coordinate() {
         4 * 1024 * 1024,
         threads,
         StepKind::Detached,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("detached-sink buffer pipeline drives to completion");
@@ -756,20 +797,21 @@ fn detached_sink_chain_matches_legacy_coordinate() {
     }
 }
 
-/// The buffer chain must hold coordinate parity across BOTH decompress
-/// granularities × block batches, with a multi-spill workload that forces real
-/// spill files (so `CompressSpill`'s written chunks feed the block-parallel
-/// reorder path). Guards against any spill-format / slot-ordering drift between
-/// `CompressSpill` and the proven `SortSpillDecompress` reader.
+/// The buffer chain must hold coordinate parity across the merge supply's
+/// knobs — fills small enough that frames straddle slices, four slices per
+/// fill, and in-flight caps forced to bind — with a multi-spill workload that
+/// forces real spill files. Guards against any spill-format / slot-ordering
+/// drift between `CompressSpill` and the supply.
 #[rstest]
-#[case::file_b1(true, 1)]
-#[case::file_b4(true, 4)]
-#[case::block_b1(false, 1)]
-#[case::block_b4(false, 4)]
-fn sort_buffer_chain_coordinate_matches_legacy_across_decompress_tunings(
-    #[case] file_granularity: bool,
-    #[case] block_batch: usize,
-) {
+#[case::default(SupplyTuning::default())]
+#[case::fills_64k(SupplyTuning { fills: Some((64 << 10, 64 << 10)), ..SupplyTuning::default() })]
+#[case::streams_4(SupplyTuning { read_streams: 4, ..SupplyTuning::default() })]
+#[case::caps_bind(SupplyTuning {
+    fills: Some((4 << 10, 4 << 10)),
+    inflight_caps: Some((1, 4 << 10)),
+    ..SupplyTuning::default()
+})]
+fn sort_buffer_chain_coordinate_matches_legacy_across_supply_tunings(#[case] supply: SupplyTuning) {
     let (header, records) = synthesize_records(20_000, 0xBADD_CAFE);
     let memory_limit = 256 * 1024;
     let threads = 2;
@@ -787,7 +829,7 @@ fn sort_buffer_chain_coordinate_matches_legacy_across_decompress_tunings(
         // runs the pipeline with `num_threads`, no `max(3)` floor.
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning { file_granularity, block_batch },
+        supply,
         SpillCodec::Zstd,
     )
     .expect("buffer pipeline drives to completion");
@@ -834,7 +876,7 @@ fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
         4 * 1024 * 1024,
         2,
         StepKind::Exclusive,
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         SpillCodec::Zstd,
     )
     .expect("buffer pipeline drives to completion");
@@ -847,39 +889,32 @@ fn sort_buffer_chain_preserves_equal_key_input_order_across_spills() {
     assert_eq!(out, legacy, "equal-key order must also match the legacy oracle");
 }
 
-// ── Decompression-granularity parity (file-granularity × block-batch) ────────
+// ── Merge-supply fill parity (fill size × codec × read streams) ──────────────
 
-/// The streaming sort must produce byte-identical output for BOTH decompression
-/// granularities (`file_granularity ∈ {true, false}`) across `block_batch ∈
-/// {1, 4}`, validated against the legacy reference. The multi-spill workload
-/// forces real spill files so the block-parallel reorder path is exercised (the
-/// in-memory-only path never opens a slot reader).
+/// The streaming sort must produce byte-identical output whatever the fill
+/// size — 1-byte and 7/3-byte fills (every frame, and every BGZF block's
+/// 18-byte header, straddles slices), a frame-sized fill, and the production
+/// sizes — for both spill codecs and one or four slices per fill, validated
+/// against the legacy reference. Tiny fills run a smaller fixture (each byte is
+/// a read); every fixture spills to several files.
 #[rstest]
-#[case::file_b1(true, 1)]
-#[case::file_b4(true, 4)]
-#[case::block_b1(false, 1)]
-#[case::block_b4(false, 4)]
-// block_batch == 0 is clamped to 1 in `SortSpillDecompress::new`. Without the
-// clamp, the inline path declares a phantom EOF after reading zero blocks
-// (silent record loss) and the block-parallel path livelocks (queue_eof never
-// finalizes). These cases assert the clamp holds: identical to legacy, no hang.
-#[case::file_b0(true, 0)]
-#[case::block_b0(false, 0)]
-fn three_step_chain_granularity_matrix_matches_legacy(
-    #[case] file_granularity: bool,
-    #[case] block_batch: usize,
+fn three_step_chain_fill_matrix_matches_legacy(
+    #[values((1, 1), (7, 3), (64 << 10, 64 << 10), (4 << 20, 1 << 20))] fills: (u64, u64),
+    #[values(SpillCodec::Zstd, SpillCodec::Bgzf)] codec: SpillCodec,
+    #[values(1, 4)] read_streams: usize,
 ) {
     let sort_order = SortOrder::Coordinate;
     let threads = 4;
-    let (header, records) = synthesize_sized_records(30_000, 0x5EED_1234, 120);
-    // Small per-thread memory ⇒ many spill files ⇒ many slot blocks.
-    let memory_limit = 256 * 1024;
-
+    let tiny = fills.0 < 1024;
+    let (n_records, memory_limit) = if tiny { (2_000, 32 * 1024) } else { (30_000, 256 * 1024) };
+    let (header, records) = synthesize_sized_records(n_records, 0x5EED_1234, 120);
     let sorter = RawExternalSorter::new(sort_order)
         .memory_limit(memory_limit)
         .threads(2)
         .output_compression(1)
-        .temp_compression(1);
+        .temp_compression(1)
+        .spill_codec(codec);
+    let supply = SupplyTuning { fills: Some(fills), read_streams, inflight_caps: None };
     let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
@@ -887,23 +922,14 @@ fn three_step_chain_granularity_matrix_matches_legacy(
         4 * 1024 * 1024,
         threads,
         StepKind::Exclusive,
-        SortDecompressTuning { file_granularity, block_batch },
-        SpillCodec::Zstd,
+        supply,
+        codec,
     )
     .expect("pipeline drives to completion");
-
     let legacy_out =
         sort_via_legacy(sort_order, &header, &records, memory_limit, 2).expect("legacy");
-
-    assert_eq!(
-        new_out.len(),
-        legacy_out.len(),
-        "record count mismatch (file_granularity={file_granularity}, block_batch={block_batch})"
-    );
-    assert_eq!(
-        new_out, legacy_out,
-        "sorted bytes differ (file_granularity={file_granularity}, block_batch={block_batch})"
-    );
+    assert_eq!(new_out.len(), legacy_out.len(), "record count mismatch ({supply:?}, {codec:?})");
+    assert_eq!(new_out, legacy_out, "sorted bytes differ ({supply:?}, {codec:?})");
 }
 
 /// Block-parallel decompression over BGZF spill files (the non-default codec)
@@ -929,7 +955,7 @@ fn block_parallel_bgzf_spill_matches_legacy() {
         4 * 1024 * 1024,
         8,
         StepKind::Exclusive,
-        SortDecompressTuning { file_granularity: false, block_batch: 2 },
+        SupplyTuning { read_streams: 4, ..SupplyTuning::default() },
         SpillCodec::Bgzf,
     )
     .expect("pipeline drives to completion");
@@ -976,23 +1002,24 @@ fn drive_spill_split_pipeline(
     let gather = SpillGather::new(output_byte_limit);
     let compress = SpillBlockCompress::new(codec, 3, output_byte_limit);
     let write = SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs);
-    let decompress = SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default());
+    let (planner, pread, decompress, demand) =
+        spill_supply(output_byte_limit, threads, SupplyTuning::default());
     let merge =
         SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256)
             .with_stats_slot(Arc::clone(&stats_slot));
     let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None };
 
     let builder = Pipeline::builder();
-    builder
+    let fan = builder
         .chain(source)
         .chain(sort_buffer)
         .chain(gather)
         .chain(compress)
         .chain(write)
-        .chain(decompress)
-        .chain(merge)
-        .chain(sink)
-        .into_sink_marker();
+        .chain(planner)
+        .into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads, ..Default::default() })?;
 
@@ -1172,13 +1199,13 @@ fn sorts_at_one_thread_through_the_scheduled_path(#[case] order: SortOrder) {
     assert!(runs >= 1, "{order:?}: the small budget must spill (got {runs} run(s))");
 }
 
-/// Block-parallel decompression completes out of order (workers decompress one
-/// file's blocks concurrently), yet the reassembled output must be byte-
-/// identical to the in-order (file-granularity) result. Property test over a
-/// range of record counts and `block_batch` sizes and a high pipeline-thread
-/// count (more concurrent decompressors ⇒ more out-of-order completion). A
-/// straggler worker hitting reader-EOF while another holds an in-flight block
-/// must not truncate the output (record count is asserted equal).
+/// Out-of-order supply — slices land out of order (four per fill), workers
+/// decompress one file's blocks concurrently, and small fills make frames
+/// straddle slices — must reassemble byte-identically to the production-size
+/// single-stream supply. Property test over record counts, fill sizes and a
+/// high pipeline-thread count; a straggler finalizing EOF while another
+/// worker holds an in-flight block must not truncate the output (record count
+/// is asserted equal).
 #[cfg(test)]
 // Soak/matrix/proptest suites: multi-minute, so gated off the default test
 // target and run on the nightly `cargo ci-test-stress` job instead.
@@ -1186,14 +1213,13 @@ fn sorts_at_one_thread_through_the_scheduled_path(#[case] order: SortOrder) {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
-
     proptest! {
         #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
-
         #[test]
-        fn block_parallel_matches_file_granularity(
+        fn small_fill_supply_matches_production_fills(
             n_records in 2_000usize..18_000,
-            block_batch in 1usize..=6,
+            fill in 512u64..=65_536,
+            read_streams in 1usize..=4,
             seed in any::<u64>(),
         ) {
             let sort_order = SortOrder::Coordinate;
@@ -1201,41 +1227,36 @@ mod proptests {
             // Force spilling so slots (and the reorder path) are exercised.
             let memory_limit = 256 * 1024;
             let pipeline_threads = 6;
-
             let make_sorter = || RawExternalSorter::new(sort_order)
                 .memory_limit(memory_limit)
                 .threads(2)
                 .output_compression(1)
                 .temp_compression(1);
-
-            let in_order = drive_sort_pipeline_tuned(
+            let production = drive_sort_pipeline_tuned(
                 make_sorter(),
                 &header,
                 pack_batches(&records, 256),
                 4 * 1024 * 1024,
                 pipeline_threads,
                 StepKind::Exclusive,
-                SortDecompressTuning { file_granularity: true, block_batch },
+                SupplyTuning::default(),
                 SpillCodec::Zstd,
-            ).expect("file-granularity pipeline");
-
-            let out_of_order = drive_sort_pipeline_tuned(
+            ).expect("production-fill pipeline");
+            let small = drive_sort_pipeline_tuned(
                 make_sorter(),
                 &header,
                 pack_batches(&records, 256),
                 4 * 1024 * 1024,
                 pipeline_threads,
                 StepKind::Exclusive,
-                SortDecompressTuning { file_granularity: false, block_batch },
+                SupplyTuning { fills: Some((fill, fill)), read_streams, inflight_caps: None },
                 SpillCodec::Zstd,
-            ).expect("block-parallel pipeline");
-
-            prop_assert_eq!(out_of_order.len(), records.len(), "no truncation");
-            prop_assert_eq!(out_of_order, in_order, "block-parallel diverges from in-order");
+            ).expect("small-fill pipeline");
+            prop_assert_eq!(small.len(), records.len(), "no truncation");
+            prop_assert_eq!(small, production, "small fills diverge from production fills");
         }
     }
 }
-
 /// Soak-iteration count, collapsed to a minimal pass under coverage
 /// instrumentation.
 ///
@@ -1253,12 +1274,12 @@ fn soak_iterations(full: usize, min: usize) -> usize {
 }
 
 #[cfg(feature = "stress-tests")]
-/// Maximum-contention soak for the block-parallel decompress path
-/// (`file_granularity == false`). Drives the path repeatedly under the most
+/// Maximum-contention soak for the merge supply. Drives the path repeatedly under the most
 /// adversarial settings the knobs allow — many spill files, a tiny reorder
-/// window (so stragglers continuously hit `bp_reorder_admits` backpressure and
-/// the Phase-B drain-only path), `block_batch == 1` (maximum per-block churn and
-/// the most frequent `reader_eof`/`in_flight` transitions), and far more
+/// window (so stragglers continuously hit the reorder-window backpressure and
+/// the drain-only path), 4 KiB fills in four slices with the in-flight caps at
+/// two slices (maximum per-slice churn and the most frequent `reader_eof` /
+/// `in_flight` transitions), and far more
 /// pipeline worker threads (12) than sorter threads (so many workers race to
 /// decompress one file's blocks concurrently and finalize out of order).
 ///
@@ -1286,7 +1307,11 @@ fn block_parallel_high_contention_soak_matches_legacy() {
     // ~1 block, so `bp_reorder_admits` backpressures aggressively and workers
     // are repeatedly forced through the Phase-B drain-only path.
     const OUTPUT_BYTE_LIMIT: u64 = 64 * 1024;
-    const BLOCK_BATCH: usize = 1;
+    const SUPPLY: SupplyTuning = SupplyTuning {
+        fills: Some((4 << 10, 4 << 10)),
+        read_streams: 4,
+        inflight_caps: Some((2, 8 << 10)),
+    };
     // Per-iteration watchdog: a livelock in any single iteration fails fast.
     const WATCHDOG: Duration = Duration::from_secs(60);
 
@@ -1304,7 +1329,7 @@ fn block_parallel_high_contention_soak_matches_legacy() {
             SORTER_THREADS,
             PIPELINE_THREADS,
             OUTPUT_BYTE_LIMIT,
-            SortDecompressTuning { file_granularity: false, block_batch: BLOCK_BATCH },
+            SUPPLY,
             WATCHDOG,
         );
     }
@@ -1353,7 +1378,7 @@ fn sort_buffer_chain_tight_memory_soak_no_deadlock() {
             SORTER_THREADS,
             PIPELINE_THREADS,
             OUTPUT_BYTE_LIMIT,
-            SortDecompressTuning { file_granularity: false, block_batch: 1 },
+            SupplyTuning { fills: Some((4 << 10, 4 << 10)), ..SupplyTuning::default() },
             WATCHDOG,
         );
     }
@@ -1405,7 +1430,7 @@ fn run_watchdogged_parity(
     sorter_threads: usize,
     pipeline_threads: usize,
     output_byte_limit: u64,
-    tuning: SortDecompressTuning,
+    tuning: SupplyTuning,
     watchdog: std::time::Duration,
 ) {
     use std::sync::mpsc;
@@ -1479,7 +1504,8 @@ struct SoakParams {
     seq_len: usize,
     memory_limit: usize,
     output_byte_limit: u64,
-    block_batch: usize,
+    /// Fill size of the supply.
+    fill: u64,
 }
 
 #[cfg(feature = "stress-tests")]
@@ -1496,34 +1522,34 @@ impl SoakRegime {
     fn params(self) -> SoakParams {
         match self {
             // ~40k records ≈ 10 MB spilled into many (~100) small files at a
-            // 96 KiB budget, with a tiny reorder window and block_batch == 1
-            // (max per-block churn and the most `reader_eof`/`in_flight` events).
+            // 96 KiB budget, with a tiny reorder window and 4 KiB fills (max
+            // per-slice churn and the most `reader_eof`/`in_flight` events).
             SoakRegime::ManySmallFiles => SoakParams {
                 records: 40_000,
                 seq_len: 150,
                 memory_limit: 96 * 1024,
                 output_byte_limit: 128 * 1024,
-                block_batch: 1,
+                fill: 4 << 10,
             },
             // ~12k × 150B ≈ 1.8 MB spilled into ~4 large files at a 512 KiB
-            // budget, with a roomy window and block_batch == 4.
+            // budget, with a roomy window and production-size fills.
             SoakRegime::FewLargeFiles => SoakParams {
                 records: 12_000,
                 seq_len: 150,
                 memory_limit: 512 * 1024,
                 output_byte_limit: 4 * 1024 * 1024,
-                block_batch: 4,
+                fill: 1 << 20,
             },
         }
     }
 }
 
 #[cfg(feature = "stress-tests")]
-/// External-watchdog soak MATRIX for the Phase-2 decompress path. Crosses
-/// pipeline-thread count × decompress granularity × spill regime, so both the
-/// block-parallel reorder/in-flight/EOF protocol and the file-granularity FIFO
-/// are hammered across {1, 2, 8} workers, {many small, few large} spill-file
-/// shapes, and both code paths. Each (case × iteration) runs under a wall-clock
+/// External-watchdog soak MATRIX for the merge supply. Crosses pipeline-thread
+/// count × in-flight caps (production, or forced to one slice and one fill of
+/// cold bytes) × spill regime, so the reorder/in-flight/EOF protocol is
+/// hammered across {1, 2, 8} workers, {many small, few large} spill-file
+/// shapes, and both a free-running and a cap-bound planner. Each (case × iteration) runs under a wall-clock
 /// watchdog and is checked byte-for-byte against the legacy oracle, so a
 /// livelock fails fast and any lost / duplicated / reordered block is caught.
 ///
@@ -1536,7 +1562,7 @@ impl SoakRegime {
 #[rstest]
 fn block_parallel_soak_matrix_matches_legacy(
     #[values(1, 2, 8)] pipeline_threads: usize,
-    #[values(true, false)] file_granularity: bool,
+    #[values(false, true)] caps_bind: bool,
     #[values(SoakRegime::ManySmallFiles, SoakRegime::FewLargeFiles)] regime: SoakRegime,
 ) {
     use std::time::Duration;
@@ -1546,20 +1572,23 @@ fn block_parallel_soak_matrix_matches_legacy(
 
     let iterations = soak_iterations(4, 1);
     let sort_order = SortOrder::Coordinate;
-    let SoakParams { records, seq_len, memory_limit, output_byte_limit, block_batch } =
-        regime.params();
+    let SoakParams { records, seq_len, memory_limit, output_byte_limit, fill } = regime.params();
+    let supply = SupplyTuning {
+        fills: Some((4 * fill, fill)),
+        read_streams: 4,
+        inflight_caps: caps_bind.then_some((1, fill)),
+    };
 
     for iter in 0..iterations {
         // Distinct seed per (regime, threads, granularity, iter).
         let seed = 0x50A4_0000_u64
             .wrapping_add((iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .wrapping_add((pipeline_threads as u64) << 40)
-            .wrapping_add(u64::from(file_granularity) << 32)
+            .wrapping_add(u64::from(caps_bind) << 32)
             ^ regime.seed_salt();
         let (header, recs) = synthesize_sized_records(records, seed, seq_len);
-        let label = format!(
-            "soak-{regime:?}-t{pipeline_threads}-fg{file_granularity}-bb{block_batch}-i{iter}"
-        );
+        let label =
+            format!("soak-{regime:?}-t{pipeline_threads}-caps{caps_bind}-fill{fill}-i{iter}");
         run_watchdogged_parity(
             &label,
             sort_order,
@@ -1569,7 +1598,7 @@ fn block_parallel_soak_matrix_matches_legacy(
             SORTER_THREADS,
             pipeline_threads,
             output_byte_limit,
-            SortDecompressTuning { file_granularity, block_batch },
+            supply,
             WATCHDOG,
         );
     }
@@ -1633,8 +1662,7 @@ fn three_step_chain_large_spill_completes(#[case] pipeline_threads: usize) {
     use std::time::Duration;
 
     let (header, records) = synthesize_sized_records(60_000, 0xBADD_CAFE, 200);
-    // Default decompress tuning (block-parallel, block_batch 4) under a
-    // per-case watchdog: the regression this pins is a deadlock at high
+    // Production supply tuning under a per-case watchdog: the regression this pins is a deadlock at high
     // pipeline-thread counts, so the watchdog converts a hang into a failure.
     run_watchdogged_parity(
         &format!("large-spill-t{pipeline_threads}"),
@@ -1645,7 +1673,7 @@ fn three_step_chain_large_spill_completes(#[case] pipeline_threads: usize) {
         2,           // sorter_threads
         pipeline_threads,
         256 * 1024 * 1024, // output queue limit
-        SortDecompressTuning::default(),
+        SupplyTuning::default(),
         Duration::from_secs(90),
     );
 }
@@ -1780,6 +1808,8 @@ fn collect_merge_batches(
 #[derive(Default)]
 struct MergeRunOptions {
     demand: Option<Arc<fgumi_sort::MergeDemand>>,
+    /// The supply ledger handed to `SortMerge` (self-serve claims).
+    ledger: Option<Arc<crate::sort::supply_ledger::SupplyLedger>>,
     /// `0` means one thread.
     threads: usize,
     test_backoff: Vec<fgumi_pipeline_core::runtime::TestBackoff>,
@@ -1830,8 +1860,13 @@ fn collect_merge_batches_with(
         output_byte_limit,
         target_batch_count,
     );
-    if let Some(d) = opts.demand {
-        merge = merge.with_merge_demand(d);
+    match (opts.demand, opts.ledger) {
+        (Some(demand), Some(ledger)) => {
+            merge = merge.with_spill_supply(&SpillSupply { demand, ledger });
+        }
+        (Some(demand), None) => merge = merge.with_merge_demand(demand),
+        (None, Some(_)) => panic!("a supply ledger needs the supply's merge demand"),
+        (None, None) => {}
     }
     let sink = VecSink {
         received: Arc::clone(&received),
@@ -1880,13 +1915,7 @@ fn gated_block(pos: usize) -> Vec<u8> {
 /// Two empty, open `SortMergeSlot`s over tempfiles (file ids 0 and 1).
 fn two_open_slots() -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
     (0..2u32)
-        .map(|file_id| {
-            Arc::new(fgumi_sort::SortMergeSlot::new(
-                file_id,
-                std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
-                SpillCodec::Bgzf,
-            ))
-        })
+        .map(|file_id| Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf)))
         .collect()
 }
 
@@ -1944,7 +1973,7 @@ fn gated_two_slot_feed(
             }
             std::thread::sleep(delay);
             let slot = &slots[j % 2];
-            slot.decompressed.lock().unwrap().push_back(gated_block(j));
+            slot.push_decompressed_for_test(gated_block(j));
             demand.notify_delivered(slot.file_id);
         }
         while progress.load(Ordering::Acquire) < total - 1 {
@@ -1952,10 +1981,7 @@ fn gated_two_slot_feed(
         }
         std::thread::sleep(delay);
         for slot in &slots {
-            {
-                let _g = slot.decompressed.lock().unwrap();
-                slot.queue_eof.store(true, Ordering::Release);
-            }
+            slot.set_queue_eof_for_test();
             demand.notify_delivered(slot.file_id);
         }
     });
@@ -1984,15 +2010,12 @@ impl FeedShared {
         let mut blocks = self.blocks.lock();
         if let Some((slot_idx, block)) = blocks.pop_front() {
             let slot = &self.slots[slot_idx];
-            slot.decompressed.lock().unwrap().push_back(block);
+            slot.push_decompressed_for_test(block);
             self.demand.notify_delivered(slot.file_id);
             return true;
         }
         for slot in &self.slots {
-            {
-                let _g = slot.decompressed.lock().unwrap();
-                slot.queue_eof.store(true, Ordering::Release);
-            }
+            slot.set_queue_eof_for_test();
             self.demand.notify_delivered(slot.file_id);
         }
         self.eof_sent.store(true, Ordering::Release);
@@ -2277,12 +2300,9 @@ fn run_end_eof_wake_finishes_the_merge_without_a_timer_park() {
     let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let slots = two_open_slots();
     // Slot 0: record 0, then EOF. Slot 1: record 1, left open.
-    {
-        let mut d = slots[0].decompressed.lock().unwrap();
-        d.push_back(gated_block(0));
-        slots[0].queue_eof.store(true, Ordering::Release);
-    }
-    slots[1].decompressed.lock().unwrap().push_back(gated_block(1));
+    slots[0].push_decompressed_for_test(gated_block(0));
+    slots[0].set_queue_eof_for_test();
+    slots[1].push_decompressed_for_test(gated_block(1));
     let events = announce_slots(&slots, 2);
     let feeder = {
         let (slot, demand, progress) =
@@ -2293,10 +2313,7 @@ fn run_end_eof_wake_finishes_the_merge_without_a_timer_park() {
             while progress.load(Ordering::Acquire) < 2 {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            {
-                let _g = slot.decompressed.lock().unwrap();
-                slot.queue_eof.store(true, Ordering::Release);
-            }
+            slot.set_queue_eof_for_test();
             demand.notify_delivered(slot.file_id);
         })
     };
@@ -2410,12 +2427,8 @@ fn stalled_after_one_record(
     .with_merge_demand(Arc::clone(demand));
     let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
     for file_id in 0..2u32 {
-        let slot = Arc::new(fgumi_sort::SortMergeSlot::new(
-            file_id,
-            std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
-            SpillCodec::Bgzf,
-        ));
-        slot.decompressed.lock().unwrap().push_back(gated_block(file_id as usize));
+        let slot = Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
+        slot.push_decompressed_for_test(gated_block(file_id as usize));
         probe.push_input(SortPhase2Event::SpillReady {
             slot,
             path: std::path::PathBuf::new(),
@@ -2428,6 +2441,52 @@ fn stalled_after_one_record(
         total_records: 2,
     });
     (step, probe)
+}
+
+/// A merge that ends short of the records ingested fails, not exits clean: two
+/// slots each deliver their one record and a clean EOF, but three records were
+/// announced (a run that finalized early would look exactly like this).
+#[rstest]
+#[case::exact(2, true)]
+#[case::short(3, false)]
+fn a_merge_that_ends_short_of_the_ingested_records_fails(#[case] announced: u64, #[case] ok: bool) {
+    use crate::sort::protocol::SortPhase2Event;
+    let mut step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        256,
+    );
+    let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
+    for file_id in 0..2u32 {
+        let slot = Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
+        slot.push_decompressed_for_test(gated_block(file_id as usize));
+        slot.set_queue_eof_for_test();
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot,
+            path: std::path::PathBuf::new(),
+            records_ingested_so_far: 2,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: announced,
+    });
+    probe.close_input();
+    let mut result = Ok(StepOutcome::Progress);
+    for _ in 0..100 {
+        result = probe.try_run(&mut step);
+        if !matches!(result, Ok(StepOutcome::Progress | StepOutcome::Contention)) {
+            break;
+        }
+    }
+    match (ok, result) {
+        (true, Ok(_)) => {}
+        (false, Err(e)) => {
+            assert!(e.to_string().contains("sort lost records: read 3 but merged 2"), "{e}");
+        }
+        (_, other) => panic!("announced {announced}: unexpected {other:?}"),
+    }
 }
 
 /// A registration counts as a parking registration only when the merge parks:
@@ -2455,6 +2514,169 @@ fn only_a_registration_the_merge_parks_on_counts_as_parking() {
         "an empty builder: nothing delivered, so the merge parks: {s:?}"
     );
     assert_eq!(demand.awaited(), Some(0), "a parked merge stays registered on slot 0");
+}
+
+/// Two BGZF spill files whose blocks each hold one coordinate record (record
+/// `j` at position `j` in slot `j % 2`, so the merge switches slots every
+/// record), opened with the production opener and ingested whole into their
+/// raw stashes: every block is read and parsed, none decompressed. With
+/// `corrupt`, slot 1's first block carries a bad CRC.
+fn stashed_two_slots(
+    dir: &std::path::Path,
+    per_slot: usize,
+    corrupt: bool,
+) -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+    let pool = fgumi_bam_io::pread::SliceBufferPool::new(0);
+    (0..2usize)
+        .map(|id| {
+            let path = dir.join(format!("run{id}.spill"));
+            let mut file = std::fs::File::create(&path).expect("create spill file");
+            file.write_all(fgumi_sort::spill_magic(SpillCodec::Bgzf)).unwrap();
+            let mut compressor =
+                fgumi_sort::SpillBlockCompressor::new(SpillCodec::Bgzf, 1).unwrap();
+            for k in 0..per_slot {
+                let mut block = compressor.compress_block(&gated_block(2 * k + id)).unwrap();
+                if corrupt && id == 1 && k == 0 {
+                    let crc = block.len() - 8;
+                    block[crc] ^= 0xFF;
+                }
+                file.write_all(&block).unwrap();
+            }
+            file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
+            drop(file);
+            let slot = fgumi_sort::open_spill_slot(&path, u32::try_from(id).unwrap())
+                .expect("open spill slot");
+            let start = slot.body_start();
+            let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
+            slot.source().read_exact_at(&mut body, start).unwrap();
+            slot.bp_note_issued(body.len() as u64);
+            let out = slot.bp_ingest_slice(0, pool.lease(body), true).expect("ingest");
+            assert_eq!(out.frames, per_slot, "every block stashed");
+            slot
+        })
+        .collect()
+}
+
+/// Run `SortMerge` alone (no decompress step: nothing but the merge itself can
+/// decompress a stashed block) over `slots` under a 30 s watchdog.
+fn merge_alone_over_stashes(
+    slots: &[Arc<fgumi_sort::SortMergeSlot>],
+    total: usize,
+    demand: &Arc<fgumi_sort::MergeDemand>,
+    ledger: &Arc<crate::sort::supply_ledger::SupplyLedger>,
+) -> Result<MergeRun> {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let events = announce_slots(slots, total);
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(demand)),
+        ledger: Some(Arc::clone(ledger)),
+        threads: 2,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 4, opts));
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("WEDGED: the merge parked on a slot whose blocks it could decompress itself")
+}
+
+/// With the merge stalled on a slot whose stash holds blocks and no
+/// decompress worker in the chain, the merge serves itself and finishes:
+/// every record in key order, every block decompressed by the merge, and the
+/// claims booked to the consumer.
+#[test]
+fn stalled_merge_self_serves_from_the_stash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 40, false);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 80, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), (0..80).collect::<Vec<i32>>(), "every record, in key order");
+    let s = demand.snapshot();
+    assert_eq!(s.self_served_blocks, 80, "{s:?}");
+    assert!(s.self_served_episodes >= 1, "{s:?}");
+    assert_eq!(ledger.claims(), (0, 80), "every claim by the consumer");
+    // The `--sort-stats` line reports it.
+    let line = s
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("Consumer served itself: "))
+        .expect("the self-serve line");
+    assert!(
+        line.ends_with(&format!(
+            "{} parks avoided by decompressing already-read blocks inline (80 blocks \
+             decompressed by the merge)",
+            s.self_served_episodes
+        )),
+        "{line}"
+    );
+    // A stall the merge served itself never parks: its registration is
+    // withdrawn, not counted as a parking registration.
+    assert!(s.registrations >= s.self_served_episodes, "{s:?}");
+    assert_eq!(s.parking_registrations, 0, "no stall parked: {s:?}");
+    assert_eq!(demand.awaited(), None, "every self-served registration withdrawn");
+}
+
+/// Self-serve never reads the spill file: with every slot's file truncated to
+/// zero and unlinked after its bytes were stashed, the merge still completes
+/// from the stash alone.
+#[test]
+fn self_serve_never_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 40, false);
+    for id in 0..2 {
+        let path = tmp.path().join(format!("run{id}.spill"));
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 80, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), (0..80).collect::<Vec<i32>>());
+}
+
+/// Self-serve runs the drain-only path: slot 0's last block was claimed (the
+/// front, over a full FIFO) and decompressed by a worker, so it waits in
+/// `reorder` with the stash empty. Once the merge pops the FIFO and stalls on
+/// slot 0, no claim remains; only the drain moves the block and finalizes the
+/// slot, without any worker.
+#[test]
+fn self_serve_drains_a_block_waiting_behind_a_full_fifo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 2, false);
+    let s0 = &slots[0];
+    s0.set_fifo_cap(1);
+    let mut dec = fgumi_sort::SpillBlockDecompressor::new();
+    for _ in 0..2 {
+        let b = s0.bp_claim_raw(u64::MAX).expect("block 0, then the front over the cap");
+        b.decompress_and_publish(&mut dec).unwrap();
+    }
+    assert_eq!((s0.fifo_len(), s0.reorder_len_relaxed()), (1, 1), "block 1 waits in reorder");
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 4, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), vec![0, 1, 2, 3]);
+}
+
+/// A self-serve decompress error marks the slot failed and fails the merge
+/// with the slot's error text.
+#[test]
+fn self_serve_decompress_error_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 4, true);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let Err(err) = merge_alone_over_stashes(&slots, 8, &demand, &ledger) else {
+        panic!("a corrupt stashed block must fail the merge");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("spill decompression error on slot 1"), "{msg}");
+    assert!(slots[1].has_error(), "the slot is marked failed");
 }
 
 /// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`
@@ -3069,7 +3291,7 @@ fn bgzf_blocks_for(
             assert_eq!(blocks.len(), 1, "payload must fit one BGZF block");
             crate::types::BgzfBlock {
                 batch_serial: i as u64,
-                bytes: blocks.remove(0).data,
+                bytes: blocks.remove(0).data.into(),
                 uncompressed_size: u32::try_from(payload.len()).expect("payload fits u32"),
                 index: None,
             }
@@ -3206,8 +3428,10 @@ fn drive_arena_split_pipeline(
     )
     .with_stats_slot(Arc::clone(&stats_slot));
 
+    let (planner, pread, decompress, demand) =
+        spill_supply(output_byte_limit, threads, SupplyTuning::default());
     let builder = Pipeline::builder();
-    builder
+    let fan = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
         .chain(ReadBlocks::new(memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit))
@@ -3215,8 +3439,11 @@ fn drive_arena_split_pipeline(
         .chain(SpillGather::new(output_byte_limit))
         .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
-        .chain(SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default()))
-        .chain(merge)
+        .chain(planner)
+        .into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1
+        .chain(merge.with_merge_demand(demand))
         .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
         .into_sink_marker();
     let pipeline = builder.build()?;
@@ -3263,8 +3490,10 @@ fn drive_arena_split_pipeline_capped(
     )
     .with_stats_slot(Arc::clone(&stats_slot));
 
+    let (planner, pread, decompress, demand) =
+        spill_supply(output_byte_limit, threads, SupplyTuning::default());
     let builder = Pipeline::builder();
-    builder
+    let fan = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
         .chain(ReadBlocks::new(memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit).with_phase_cap(Some(Arc::clone(phase1_cap))))
@@ -3278,11 +3507,14 @@ fn drive_arena_split_pipeline_capped(
                 .with_phase_cap(Some(Arc::clone(phase1_cap))),
         )
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
-        .chain(
-            SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default())
-                .with_phase_cap(Some(Arc::clone(phase2_cap))),
-        )
-        .chain(merge)
+        .chain(planner)
+        .into_multi();
+    fan.b0
+        .chain(pread.with_phase_cap(Some(Arc::clone(phase2_cap))))
+        .chain(decompress.with_phase_cap(Some(Arc::clone(phase2_cap))))
+        .into_sink_marker();
+    fan.b1
+        .chain(merge.with_merge_demand(demand))
         .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
         .into_sink_marker();
     let pipeline = builder.build()?;
@@ -3364,7 +3596,7 @@ fn worker_copies_share_the_phase_cap() {
     let inflate = InflateToArena::new(4096).with_phase_cap(Some(Arc::clone(&cap)));
     let compress =
         SpillBlockCompress::new(SpillCodec::Zstd, 1, 4096).with_phase_cap(Some(Arc::clone(&cap)));
-    let decompress = SortSpillDecompress::new(4096, SortDecompressTuning::default())
+    let decompress = SortSpillDecompress::new(4096, &crate::sort::SpillSupply::new())
         .with_phase_cap(Some(Arc::clone(&cap)));
     let copies =
         (inflate.new_worker_copy(), compress.new_worker_copy(), decompress.new_worker_copy());
@@ -3512,8 +3744,10 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let stem = telemetry_dir.join("run");
 
+    let (planner, pread, decompress, demand) =
+        spill_supply(output_byte_limit, 1, SupplyTuning::default());
     let builder = Pipeline::builder();
-    builder
+    let fan = builder
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
         .chain(ReadBlocks::new(memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit))
@@ -3521,10 +3755,10 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         .chain(SpillGather::new(output_byte_limit))
         .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
-        .chain(SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default()))
-        .chain(merge)
-        .chain(sink)
-        .into_sink_marker();
+        .chain(planner)
+        .into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
     let pipeline = builder.build().expect("pipeline builds");
     pipeline
         .run(PipelineConfig {
@@ -3545,8 +3779,8 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
 
     // Step indices, in declaration order: source=0, ReadBlocks=1,
     // InflateToArena=2, FindBoundariesAndSort=3, SpillGather=4,
-    // SpillBlockCompress=5, SpillWrite=6, SortSpillDecompress=7, SortMerge=8,
-    // sink=9.
+    // SpillBlockCompress=5, SpillWrite=6, SpillReadPlanner=7,
+    // PreadSpillSlices=8, SortSpillDecompress=9, SortMerge=10, sink=11.
     let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();
     let last_value_for = |step: &str, counter: &str| -> Option<u64> {
         counters
@@ -3581,11 +3815,153 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         last_value_for("6", "0").expect("SpillWrite spill_bytes_written counter recorded");
     assert!(spill_bytes_written > 0, "spill_bytes_written={spill_bytes_written}");
 
-    let merge_records = last_value_for("8", "0").expect("SortMerge records counter recorded");
+    let merge_records = last_value_for("10", "0").expect("SortMerge records counter recorded");
     assert!(
         merge_records > 0 && merge_records <= N_RECORDS as u64,
         "merge_records={merge_records}"
     );
 
     std::fs::remove_dir_all(&telemetry_dir).ok();
+}
+
+/// `Exclusive` source of a fixed `SortPhase1Event` list (in order).
+struct Phase1EventSource {
+    events: std::collections::VecDeque<crate::sort::protocol::SortPhase1Event>,
+    held: HeldSlot<Unpushed<crate::sort::protocol::SortPhase1Event>>,
+    output_byte_limit: u64,
+}
+
+impl Step for Phase1EventSource {
+    type Input = ();
+    type Outputs = fgumi_pipeline_core::outputs::Single<crate::sort::protocol::SortPhase1Event>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "Phase1EventSource",
+            kind: StepKind::Exclusive,
+            sticky: true,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(unpushed) = self.held.take()
+            && let Err(again) = ctx.outputs.retry(unpushed)
+        {
+            self.held.put(again);
+            return Ok(StepOutcome::Contention);
+        }
+        let Some(event) = self.events.pop_front() else {
+            return Ok(StepOutcome::Finished);
+        };
+        if let Err(unpushed) = ctx.outputs.push(event) {
+            self.held.put(unpushed);
+        }
+        Ok(StepOutcome::Progress)
+    }
+}
+
+/// A BGZF spill file whose records are at positions `file_id + k × stride`
+/// (`per_block` records per block, `blocks` blocks), keyed by position.
+fn interleaved_spill(
+    dir: &std::path::Path,
+    file_id: u32,
+    stride: usize,
+    blocks: usize,
+    per_block: usize,
+) -> Arc<fgumi_sort::SortMergeSlot> {
+    use std::io::Write;
+    let path = dir.join(format!("interleaved{file_id}.spill"));
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(fgumi_sort::spill_magic(SpillCodec::Bgzf)).unwrap();
+    let mut compressor = fgumi_sort::SpillBlockCompressor::new(SpillCodec::Bgzf, 1).unwrap();
+    for b in 0..blocks {
+        let mut raw = Vec::new();
+        for i in 0..per_block {
+            let pos = file_id as usize + (b * per_block + i) * stride;
+            let p = i32::try_from(pos).unwrap();
+            let record =
+                make_bam_bytes(0, p, 0, format!("r{pos:06}").as_bytes(), &[], 4, -1, -1, &[]);
+            let key = fgumi_sort::RawCoordinateKey { sort_key: pos as u64 };
+            fgumi_sort::frame_keyed_record_into(&mut raw, &key, &record).unwrap();
+        }
+        file.write_all(&compressor.compress_block(&raw).unwrap()).unwrap();
+    }
+    file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
+    drop(file);
+    fgumi_sort::open_spill_slot(&path, file_id).unwrap()
+}
+
+/// Liveness of the planner after its input drains: once every phase event
+/// has been forwarded, the planner is revisited only when a worker passes over
+/// it — the claims that lower a slot's stash below its allowance push nothing
+/// to any queue. Four spill files of at least four cold allowances each (fills
+/// shrunk so the files stay small), two threads, every worker and driver on
+/// 10 s park timers, a Detached sink (the merge's output wakes no worker): the
+/// run must finish, every record in key order, within the 10 s watchdog.
+#[test]
+fn planner_tops_up_after_input_drains_with_long_timers() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    const K: usize = 4;
+    const PER_BLOCK: usize = 8;
+    const BLOCKS: usize = 300;
+    const COLD_FILL: u64 = 1 << 10;
+    let tmp = tempfile::tempdir().unwrap();
+    let slots: Vec<_> = (0..K)
+        .map(|f| interleaved_spill(tmp.path(), u32::try_from(f).unwrap(), K, BLOCKS, PER_BLOCK))
+        .collect();
+    for s in &slots {
+        assert!(s.len() - s.body_start() >= 4 * 2 * COLD_FILL, "four cold allowances");
+    }
+    let mut events: std::collections::VecDeque<_> = slots
+        .iter()
+        .map(|s| crate::sort::protocol::SortPhase1Event::SpillReady {
+            slot: Arc::clone(s),
+            path: std::path::PathBuf::from("unused"),
+            records_ingested_so_far: 0,
+        })
+        .collect();
+    let total = K * BLOCKS * PER_BLOCK;
+    events.push_back(crate::sort::protocol::SortPhase1Event::AllAnnounced {
+        slot_count: u32::try_from(K).unwrap(),
+        memory_chunk_count: 0,
+        total_records: total as u64,
+    });
+    let limit = 1 << 20;
+    let source = Phase1EventSource { events, held: HeldSlot::new(), output_byte_limit: limit };
+    let tuning =
+        SupplyTuning { fills: Some((4 * COLD_FILL, COLD_FILL)), ..SupplyTuning::default() };
+    let (planner, pread, decompress, demand) = spill_supply(limit, 2, tuning);
+    let merge =
+        SortMerge::<RecordBatchOutput>::with_target_batch_count(SortOrder::Coordinate, limit, 64)
+            .with_merge_demand(demand);
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink =
+        VecSink { received: Arc::clone(&received), kind: StepKind::Detached, progress: None };
+    let builder = Pipeline::builder();
+    let fan = builder.chain(source).chain(planner).into_multi();
+    fan.b0.chain(pread).chain(decompress).into_sink_marker();
+    fan.b1.chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(pipeline.run(PipelineConfig {
+            threads: 2,
+            test_backoff: vec![
+                TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 },
+                TestBackoff { target: TestBackoffTarget::AllWorkers, us: 10_000_000 },
+            ],
+            ..Default::default()
+        }));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("WEDGED: the planner was not revisited after its input drained")
+        .unwrap();
+    let positions: Vec<i32> = received
+        .lock()
+        .iter()
+        .flat_map(|b| b.iter_record_bytes().map(fgumi_raw_bam::pos).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(positions, (0..i32::try_from(total).unwrap()).collect::<Vec<_>>());
 }

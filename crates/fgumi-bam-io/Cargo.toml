@@ -27,7 +27,13 @@ bstr = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+# Exposes `pread::test_sources` (in-memory and fault-injecting positional
+# sources) to downstream crates' tests.
+test-utils = []
 
 # `unistd::close` (checked close of output files, all Unix) needs no feature;
 # `fs` (the workspace default) is for `posix_fadvise`, used on Linux only.

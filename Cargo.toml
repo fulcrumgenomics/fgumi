@@ -55,6 +55,7 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 csv = "1.1"
+dhat = "0.3"
 fgoxide = "0.6.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 itertools = "0.14.0"
@@ -163,7 +164,7 @@ ahash = { workspace = true }
 bytemuck = { workspace = true }
 rand_distr = "0.6"
 flate2 = { workspace = true }
-dhat = { version = "0.3", optional = true }
+dhat = { workspace = true, optional = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
@@ -254,6 +255,9 @@ syn = { workspace = true }
 quote = { workspace = true }
 criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
+# `test-utils` exposes `plan_input_reads::test_hooks`, which
+# test_sort_native_reads.rs uses to count OS threads at each input read fill.
+fgumi-pipeline-io = { workspace = true, features = ["test-utils"] }
 # "bgzf" is needed by test_sort_cutover_parity.rs, which decompresses a sort
 # output BAM's raw BGZF stream directly (via `noodles::bgzf::io::Reader`) to
 # compare cutover vs. baseline-binary output byte-for-byte after stripping the

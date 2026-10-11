@@ -20,12 +20,12 @@ pub mod mem_estimate;
 pub mod os_hints;
 pub mod output;
 pub mod paths;
+pub mod pread;
 pub mod prefetch_reader;
 pub mod progress;
 pub mod reader;
 pub mod reorder;
 pub mod sam_input;
-pub mod scatter_reader;
 pub mod writer;
 
 pub(crate) mod vendored;

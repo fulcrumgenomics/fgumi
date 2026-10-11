@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
+use fgumi_bam_io::pread::RawFrame;
 use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
 use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
 use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
@@ -651,8 +652,9 @@ pub struct ArenaBlock {
     pub offset: u64,
     /// Uncompressed size (ISIZE from the BGZF footer == slot length).
     pub len: u32,
-    /// Complete raw BGZF block bytes (header + deflate payload + footer).
-    pub block: Vec<u8>,
+    /// Complete raw BGZF block bytes (header + deflate payload + footer),
+    /// borrowed from its read slice on the native input path.
+    pub block: RawFrame,
     /// `true` if this is the last block of the current run (e.g. a BAM file
     /// segment); used by downstream steps to detect run boundaries.
     pub is_last_of_run: bool,
@@ -664,8 +666,10 @@ pub struct ArenaBlock {
 }
 
 impl HeapSize for ArenaBlock {
+    /// The frame's charge ([`crate::types::raw_frame_heap_size`]): an owned
+    /// (carried) frame's allocation, a borrowed frame's range.
     fn heap_size(&self) -> usize {
-        self.block.len()
+        crate::types::raw_frame_heap_size(&self.block)
     }
 }
 
@@ -1841,13 +1845,31 @@ mod tests {
             ordinal: 7,
             offset: 64,
             len: 128,
-            block: vec![0xAB; 40],
+            block: vec![0xAB; 40].into(),
             is_last_of_run: true,
             run_seq: 2,
             seals_to_spill: false,
         };
         assert_eq!(block.heap_size(), 40, "only the owned BGZF bytes are charged");
         assert_eq!(block.ordinal(), 7, "ordinal drives ByItemOrdinal reordering");
+    }
+
+    /// An owned (carried) frame is charged its allocation, like `BgzfBlock`'s.
+    #[test]
+    fn arena_block_charges_an_owned_frame_its_capacity() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0xAB; 40]);
+        let block = ArenaBlock {
+            arena: test_arena(),
+            ordinal: 0,
+            offset: 0,
+            len: 128,
+            block: bytes.into(),
+            is_last_of_run: false,
+            run_seq: 0,
+            seals_to_spill: false,
+        };
+        assert_eq!(block.heap_size(), 64);
     }
 
     #[test]
@@ -1973,7 +1995,12 @@ mod tests {
         let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
         let probe = StepProbe::new(&step);
         let stolen = step.pool.try_acquire().expect("the pool's one arena");
-        probe.push_input(BgzfBlock { batch_serial: 0, bytes, uncompressed_size: isz, index: None });
+        probe.push_input(BgzfBlock {
+            batch_serial: 0,
+            bytes: bytes.into(),
+            uncompressed_size: isz,
+            index: None,
+        });
         assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
         assert!(probe.input_is_empty(), "the block was popped");
         assert!(step.deferred_block.is_some(), "...and deferred, not dropped");
@@ -2003,7 +2030,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 0,
-                bytes: blk0.clone(),
+                bytes: blk0.clone().into(),
                 uncompressed_size: u32::try_from(isz0).unwrap(),
                 index: None,
             })
@@ -2012,7 +2039,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 1,
-                bytes: blk1.clone(),
+                bytes: blk1.clone().into(),
                 uncompressed_size: u32::try_from(isz1).unwrap(),
                 index: None,
             })
@@ -2085,7 +2112,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 0,
-                bytes: blk0.clone(),
+                bytes: blk0.clone().into(),
                 uncompressed_size: u32::try_from(isz0).unwrap(),
                 index: None,
             })
@@ -2094,7 +2121,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 1,
-                bytes: blk1.clone(),
+                bytes: blk1.clone().into(),
                 uncompressed_size: u32::try_from(isz1).unwrap(),
                 index: None,
             })
@@ -2140,7 +2167,7 @@ mod tests {
             let probe_isz = uncompressed_size_of(&probe_blk);
             let result = step.admit_block(BgzfBlock {
                 batch_serial: 99,
-                bytes: probe_blk,
+                bytes: probe_blk.into(),
                 uncompressed_size: u32::try_from(probe_isz).unwrap(),
                 index: None,
             });
@@ -2159,7 +2186,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 2,
-                bytes: blk2.clone(),
+                bytes: blk2.clone().into(),
                 uncompressed_size: u32::try_from(isz2).unwrap(),
                 index: None,
             })
@@ -2169,7 +2196,7 @@ mod tests {
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 3,
-                bytes: blk3.clone(),
+                bytes: blk3.clone().into(),
                 uncompressed_size: u32::try_from(isz3).unwrap(),
                 index: None,
             })
@@ -2683,7 +2710,7 @@ mod tests {
             ordinal: 0,
             offset,
             len: isize,
-            block,
+            block: block.into(),
             is_last_of_run: true,
             run_seq: 0,
             seals_to_spill: false,
@@ -2905,7 +2932,7 @@ mod tests {
             ordinal: 0,
             offset,
             len: u32::try_from(payload_len).unwrap(),
-            block,
+            block: block.into(),
             is_last_of_run: true,
             run_seq: 0,
             seals_to_spill: false,

@@ -571,6 +571,31 @@ on it. In the `compare bams` work, the sampling profile and `tricorder` agreed
 that BGZF decode dominates (~61% self time; `mean_load=98%`), which is what made
 the conclusion trustworthy — not the profile alone.
 
+### Sort engine reads and merge read-ahead
+
+Both of the sort's read paths are positional reads on the pipeline's worker pool
+(no reader threads; `PositionalSource` is Unix-only, so the sort builds on Linux
+and macOS only):
+
+- **Input.** A seekable BGZF input (decided by `stat` plus a header sniff, never
+  by opening a FIFO) is read as `PlanInputReads → PreadInputSlices →
+  FrameBgzfBlocks`. `--read-streams auto` starts at one stream and doubles (up
+  to 8) when the device starves the framer; SAM, plain gzip, stdin and FIFOs are
+  read sequentially.
+- **Merge.** `SpillReadPlanner → PreadSpillSlices → SortSpillDecompress` feeds
+  each spill slot's raw stash; the merge pops the slots' FIFOs. The read-ahead
+  target is `R = clamp(total / 16, 64 MiB, 512 MiB)` of `--max-memory`, and it
+  adds to the sort buffer: the last run is merged from memory, so up to one
+  full buffer stays resident through the merge. Every slot may hold its cold
+  allowance (an even share of `R` after a 48 MiB hot reserve, never below one
+  256 KiB IOP); everything a slot holds above that is charged to one pool,
+  `P = max(R - k x cold, 3 x 16 MiB)`, which the hot slots (the ones the merge
+  needs next) top up from. A slot keeps its charge until it is drained, so
+  hot-set churn cannot grow read-ahead past `k x cold + P`. The merge's peak
+  above the buffer is at most `k x (cold + one carried frame) + P + decoded`.
+  `--sort-stats` logs that bound (`Spill supply:`), the spill byte fetch, disk
+  reads, and stash/claim counts.
+
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 
 Baseline on M2 Max (12 core), 20.1M records/file, ~2 GB BAMs, page-cached,

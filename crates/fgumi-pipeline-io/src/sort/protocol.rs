@@ -478,11 +478,7 @@ mod tests {
     #[test]
     fn records_ingested_so_far_accessors() {
         let dummy_path = std::path::PathBuf::from("/tmp/x");
-        let slot = Arc::new(SortMergeSlot::new(
-            0,
-            std::io::BufReader::new(tempfile::tempfile().unwrap()),
-            fgumi_sort::SpillCodec::Bgzf,
-        ));
+        let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
         let ev1 = SortPhase1Event::SpillReady {
             slot: Arc::clone(&slot),
             path: dummy_path.clone(),

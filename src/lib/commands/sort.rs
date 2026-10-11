@@ -284,10 +284,15 @@ pub struct Sort {
     /// consumer, reported on the "Max memory" log line) and the bytes held in the
     /// queues between pipeline stages (applied, but not separately logged). It is
     /// not a hard cap on total process RSS: ingest decompression/parse buffers add
-    /// a few percent, and the final k-way merge's per-file read-ahead is separate
-    /// again, so peak RSS runs somewhat above this value. When sorting in a pipe
-    /// alongside an aligner, size the budget to leave headroom for the aligner's
-    /// resident index on top of this.
+    /// a few percent, and the final k-way merge's spill read-ahead adds to the
+    /// buffer rather than being subtracted from it. The last sorted run is merged
+    /// from memory, so up to one full buffer stays resident through the merge,
+    /// alongside the read-ahead: a target R of one sixteenth of the total
+    /// (between 64 MiB and 512 MiB), at most max(R, k x cold + 48 MiB) for k
+    /// spill runs, plus one carried block per run and their decompressed blocks
+    /// (the --sort-stats "Spill supply" line prints the bound for a run). When
+    /// sorting in a pipe alongside an aligner, size the budget to leave headroom
+    /// for the aligner's resident index on top of this.
     ///
     /// The two budgets scale by different thread counts: the record buffer by
     /// the effective sort-phase thread count, min(--threads, --sort-threads)
@@ -456,17 +461,20 @@ pub struct Sort {
     /// streams, while on a direct-attached instance-store SSD one stream is
     /// already faster than four are on gp3 and adding more costs 1.8%.
     ///
-    /// `auto` therefore measures instead of guessing. It reads the first several
-    /// fills at a single stream -- exactly the pre-existing behaviour -- then
-    /// commits once to a count of `ceil(target-throughput / measured)`, capped at
-    /// 8. It lands on four for gp3 and stays at one for `NVMe` without being told
-    /// which is which, and does not revisit the choice afterwards.
+    /// `auto` therefore measures instead of guessing. It starts at one stream
+    /// and doubles the count (up to 8) whenever the device starved the input
+    /// framer for more than 25% of a window of eight 4 MiB fills; it never
+    /// decreases. It
+    /// climbs to four or more on gp3 and stays at one on `NVMe` without being
+    /// told which is which.
     ///
-    /// Each active stream is served by a scoped OS thread spawned per fill window,
-    /// bounded by the chosen count (at most 8) -- this is independent of
-    /// `--threads`. Applies to the input BAM only, not the merge's spill files.
-    /// Ignored for stdin and other non-seekable inputs, where positional reads do
-    /// not exist.
+    /// Streams are not extra threads: each read is a task on the pipeline's
+    /// worker pool, so concurrency is bounded by the pool (and by
+    /// `--sort-threads`). The merge's spill reads adopt the input's stream
+    /// count; when the input is read sequentially, an explicit count still
+    /// applies to the spill reads (spill files are always seekable) and `auto`
+    /// reads them with one stream. SAM, plain-gzip, stdin and other non-seekable
+    /// inputs are read sequentially.
     #[arg(long = "read-streams", default_value_t = fgumi_sort::ReadStreams::Auto)]
     pub read_streams: fgumi_sort::ReadStreams,
 
@@ -479,14 +487,21 @@ pub struct Sort {
     /// registered to be woken), contention (dispatches that produced nothing),
     /// and output-backpressure counts. When the merge reads spill files it is
     /// followed by the merge-demand lines ("Merge demand:", "Awaited slot at
-    /// stall:", "Pool at stall:", "Merge output:"): stall episodes and their
-    /// time, wakes the spill supply delivered to the parked merge, the awaited
-    /// spill file's state at each stall, the merge's requests for a pool worker,
-    /// and partial batches flushed on a stall (see the performance tuning
-    /// guide). Only when the sort
+    /// stall:", "Pool at stall:", "Merge prediction:", "Consumer served
+    /// itself:", "Merge output:"): stall episodes and their time, wakes the
+    /// spill supply delivered to the parked merge, the awaited spill file's
+    /// state at each stall, the merge's requests for a pool worker, how often
+    /// its next-file prediction was right, the stalls it served itself from
+    /// already-read blocks, and partial batches flushed on a stall (see the
+    /// performance tuning guide). Only when the sort
     /// spills nothing *and* fits in a single in-memory chunk is there no merge
     /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
     /// diag: ...") saying the single-chunk in-memory fast path was taken.
+    /// A merge over spill files also reports its supply: the read-ahead budget
+    /// and the merge's memory bound above the sort buffer ("Spill supply:
+    /// read-ahead budget ..."), the spill reads ("Byte fetch: ...", "Spill
+    /// blocks: ...", "Spill disk read: ...") and the raw stash ("Spill supply:
+    /// frames ...").
     /// Off by default: it is instrumentation for performance work, read from a
     /// log with a grep, and it is not something a normal run should show.
     ///
@@ -519,36 +534,12 @@ pub struct Sort {
     /// (default `pipeline-trace.tsv` in the working directory).
     #[arg(long = "pipeline-trace-out", hide = true)]
     pub pipeline_trace_out: Option<std::path::PathBuf>,
-
-    /// Raw spill blocks claimed per reader-lock acquisition during Phase-2
-    /// spill-merge decompression (chain-engine `MAX_BATCH_PER_CALL`). A "block"
-    /// is one BGZF block or one zstd frame, depending on `--temp-codec`.
-    ///
-    /// Hidden expert knob for fleet/benchmark tuning; defaults to the engine's 4.
-    /// Wired to [`SortOptions::block_batch`] via [`Self::to_sort_options`].
-    #[arg(long = "block-batch", default_value_t = 4usize, hide = true)]
-    pub block_batch: usize,
-
-    /// Spill at file rather than block granularity (chain-engine knob).
-    ///
-    /// Hidden expert knob for fleet/benchmark tuning; defaults to `false`
-    /// (block-parallel). Wired to [`SortOptions::file_granularity`] via
-    /// [`Self::to_sort_options`].
-    #[arg(long = "file-granularity", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, hide = true)]
-    pub file_granularity: bool,
 }
 
 /// Sort-stage tuning, projected out of the [`Sort`] CLI struct for the chain
 /// builder's `add_sort` (which reads these values from the
 /// [`crate::pipeline::chains::StageOptionsBag`] rather than from `Sort`
 /// directly).
-///
-/// `block_batch` and `file_granularity` are chain-engine knobs. The standalone
-/// `Sort` command exposes them as the hidden `--block-batch` / `--file-granularity`
-/// flags and projects them here via [`Sort::to_sort_options`]; on the flattened
-/// (`runall`) path they are not surfaced and take the engine defaults
-/// (`block_batch = 4`, the original `MAX_BATCH_PER_CALL`; `file_granularity = false`,
-/// block-parallel).
 #[fgumi_cli_macros::multi_options("sort", "Sort Options")]
 #[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)]
@@ -725,18 +716,6 @@ pub struct SortOptions {
     #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
     pub max_temp_files: MaxTempFiles,
 
-    /// Raw spill blocks claimed per reader-lock acquisition during Phase-2
-    /// spill-merge decompression (a BGZF block or zstd frame per `--temp-codec`).
-    /// Not a flag on this struct; populated from the standalone command's hidden
-    /// `--block-batch` (see [`Sort::to_sort_options`]), and the engine default on
-    /// the `runall` path.
-    #[arg(skip = 4usize)]
-    pub block_batch: usize,
-    /// Spill at file rather than block granularity (chain engine). Not a flag on
-    /// this struct; populated from the standalone command's hidden
-    /// `--file-granularity` (see [`Sort::to_sort_options`]), engine default on `runall`.
-    #[arg(skip)]
-    pub file_granularity: bool,
     /// Emit the sort's performance diagnostics (`--sort-stats`).
     #[arg(long = "sort-stats", default_value_t = false, hide = true)]
     pub sort_stats: bool,
@@ -756,8 +735,6 @@ impl Default for SortOptions {
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::Zstd,
             max_temp_files: parse_max_temp_files("auto").expect("valid default"),
-            block_batch: 4,
-            file_granularity: false,
             sort_stats: false,
         }
     }
@@ -819,10 +796,6 @@ impl Sort {
             temp_compression: self.temp_compression,
             temp_codec: self.temp_codec,
             max_temp_files: self.max_temp_files,
-            // Chain-engine knobs, exposed as hidden `--block-batch` /
-            // `--file-granularity` flags on the standalone `sort` command.
-            block_batch: self.block_batch,
-            file_granularity: self.file_granularity,
             sort_stats: self.sort_stats,
         }
     }
@@ -933,8 +906,9 @@ impl Sort {
             queue_memory: self.queue_memory_options(),
             async_reader: false,
             // Thread the sort command's --read-streams into the chain's BAM
-            // source: Auto probes the device and picks a concurrent-read count,
-            // Fixed(n) pins it, Fixed(1) is the plain sequential reader.
+            // source: anything but Fixed(1) over a regular BGZF file selects the
+            // chain-native input reads (Auto ratchets the stream count, Fixed(n)
+            // pins it); Fixed(1) is the plain sequential reader.
             read_streams: self.read_streams,
             // Same policy every other BAM command uses (`resolve_check_crc`):
             // explicit flag wins, else verify file input and trust stdin. This
@@ -1546,77 +1520,18 @@ mod tests {
         assert_eq!(sort.merge_threads, expected_merge);
     }
 
-    /// `--block-batch` is a hidden chain-engine knob (raw spill blocks claimed
-    /// per reader-lock acquisition during Phase-2 decompression). It must parse
-    /// and reach the command struct, defaulting to 4 (the engine
-    /// `MAX_BATCH_PER_CALL`) when the flag is omitted.
+    /// The spill read depth is derived from `--max-memory`; the former hidden
+    /// `--block-batch` and `--file-granularity` decompress knobs are gone, and
+    /// clap rejects them by name rather than accepting a silent no-op.
     #[rstest]
-    #[case::default_omitted(&[], 4)]
-    #[case::explicit_override(&["--block-batch", "8"], 8)]
-    #[case::explicit_one(&["--block-batch", "1"], 1)]
-    fn test_parse_block_batch(#[case] extra: &[&str], #[case] expected: usize) {
+    #[case::block_batch(&["--block-batch", "4"], "--block-batch")]
+    #[case::file_granularity(&["--file-granularity"], "--file-granularity")]
+    fn removed_decompress_knobs_are_rejected(#[case] extra: &[&str], #[case] flag: &str) {
         let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
         let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
-        let sort = Sort::try_parse_from(args).expect("parse should succeed");
-        assert_eq!(sort.block_batch, expected);
-    }
-
-    /// `--file-granularity` is a hidden chain-engine knob (spill at file rather
-    /// than block granularity). It must parse and reach the command struct,
-    /// defaulting to `false` (block-parallel) when the flag is omitted.
-    #[rstest]
-    #[case::default_omitted(&[], false)]
-    #[case::bare_flag(&["--file-granularity"], true)]
-    #[case::explicit_true(&["--file-granularity", "true"], true)]
-    #[case::explicit_false(&["--file-granularity", "false"], false)]
-    fn test_parse_file_granularity(#[case] extra: &[&str], #[case] expected: bool) {
-        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
-        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
-        let sort = Sort::try_parse_from(args).expect("parse should succeed");
-        assert_eq!(sort.file_granularity, expected);
-    }
-
-    /// The hidden `--block-batch` / `--file-granularity` flags must reach the
-    /// engine through `to_sort_options`, not be dropped back to hardcoded
-    /// defaults (the bug that would make the flags silently no-ops).
-    #[rstest]
-    #[case::defaults(&[], 4, false)]
-    #[case::overrides(&["--block-batch", "16", "--file-granularity", "true"], 16, true)]
-    fn test_to_sort_options_carries_chain_engine_knobs(
-        #[case] extra: &[&str],
-        #[case] expected_batch: usize,
-        #[case] expected_granularity: bool,
-    ) {
-        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
-        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
-        let sort = Sort::try_parse_from(args).expect("parse should succeed");
-        let opts = sort.to_sort_options();
-        assert_eq!(opts.block_batch, expected_batch);
-        assert_eq!(opts.file_granularity, expected_granularity);
-    }
-
-    /// Both chain-engine knobs are exposed for fleet/benchmark tuning but must
-    /// stay hidden from `--help` (they are expert overrides, not everyday flags).
-    #[rstest]
-    #[case::block_batch("block-batch")]
-    #[case::file_granularity("file-granularity")]
-    fn test_chain_engine_flags_are_hidden(#[case] flag: &str) {
-        use clap::CommandFactory;
-        let command = Sort::command();
-        let arg = command
-            .get_arguments()
-            .find(|arg| arg.get_long() == Some(flag))
-            .unwrap_or_else(|| panic!("--{flag} should be a defined argument"));
-        assert!(arg.is_hide_set(), "--{flag} should be hidden from --help");
-
-        // `is_hide_set()` only inspects clap metadata; assert the flag is also
-        // absent from the actually-rendered help, so a future change that
-        // surfaces it (e.g. dropping `hide = true`) fails here regardless.
-        let help = Sort::command().render_long_help().to_string();
-        assert!(
-            !help.contains(&format!("--{flag}")),
-            "--{flag} must not appear in generated `fgumi sort` help"
-        );
+        let err = Sort::try_parse_from(args).expect_err("a removed flag must not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+        assert!(err.to_string().contains(flag), "the error must name {flag}: {err}");
     }
 
     /// The single `--max-memory` knob must drive the pipeline's queue budget too,
@@ -1852,42 +1767,6 @@ mod tests {
             err.to_string().contains("invalid instrumentation level"),
             "expected the FromStr error to name the invalid level; got: {err}"
         );
-    }
-
-    /// The hidden `--block-batch` / `--file-granularity` overrides must survive
-    /// into the built `ChainSpec`, not just into `to_sort_options`. `add_sort`
-    /// reads `spec.stage_opts.sort` to build the `SortDecompressTuning`, so
-    /// reverting `build_sort_chain_spec` to bake the engine defaults after the
-    /// projection would leave the parse/`to_sort_options` tests green while the
-    /// flags silently do nothing. Assert on the built spec directly.
-    #[test]
-    fn build_sort_chain_spec_carries_chain_engine_knob_overrides() {
-        let sort = Sort::try_parse_from([
-            "sort",
-            "-i",
-            "in.bam",
-            "-o",
-            "out.bam",
-            "--order",
-            "coordinate",
-            "--block-batch",
-            "16",
-            "--file-granularity",
-            "true",
-        ])
-        .expect("parse should succeed");
-
-        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
-        let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
-            Vec::new(),
-            resolved_max_temp_files,
-            "fgumi sort (test)",
-        );
-
-        let bag_sort = spec.stage_opts.sort.as_ref().expect("sort options must be set");
-        assert_eq!(bag_sort.block_batch, 16, "--block-batch must reach the chain spec");
-        assert!(bag_sort.file_granularity, "--file-granularity must reach the chain spec");
     }
 
     /// The standalone-sort `ChainSpec` for a header-only BAM written into `dir`
@@ -2333,8 +2212,6 @@ mod tests {
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
-            block_batch: 4,
-            file_granularity: false,
         }
     }
 
@@ -2836,6 +2713,20 @@ mod tests {
         assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
     }
 
+    /// `--read-streams` describes the starvation ratchet on the worker pool,
+    /// not the retired one-shot probe on per-fill threads.
+    #[test]
+    fn read_streams_help_describes_the_ratchet() {
+        use clap::CommandFactory;
+        let help = long_help_of(&Sort::command(), "read-streams");
+        for gone in ["scoped OS thread", "independent of `--threads`", "commits once"] {
+            assert!(!help.contains(gone), "stale {gone:?} in --read-streams help:\n{help}");
+        }
+        for needle in ["doubles", "pool", "spill", "sequentially"] {
+            assert!(help.contains(needle), "--read-streams help lacks {needle:?}:\n{help}");
+        }
+    }
+
     /// The runall-side `--sort::` flags carry the same contract (generated from
     /// `SortOptions`'s docs), naming the chain's worker pool (which a zipper
     /// or aligner floor can raise above --threads) and saying output
@@ -2869,9 +2760,7 @@ mod tests {
     /// The re-exposed `MultiSortOptions` defaults must equal the standalone
     /// `sort` command's defaults, projected through `to_sort_options`. This is
     /// the strong oracle: it fails on a dropped default, a misclassified field,
-    /// or a value that only happens to match by coincidence — including the two
-    /// chain-engine skip fields (`block_batch`, `file_granularity`), which have
-    /// no CLI flag on `Sort` at all.
+    /// or a value that only happens to match by coincidence.
     #[test]
     fn multi_sort_options_defaults_match_command() {
         let base = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "o.bam"])
@@ -2893,10 +2782,6 @@ mod tests {
         assert_eq!(multi.temp_compression, base.temp_compression);
         assert_eq!(multi.temp_codec, base.temp_codec);
         assert_eq!(multi.max_temp_files, base.max_temp_files);
-        assert_eq!(multi.block_batch, base.block_batch);
-        assert_eq!(multi.block_batch, 4);
-        assert_eq!(multi.file_granularity, base.file_granularity);
-        assert!(!multi.file_granularity);
         assert_eq!(multi.sort_stats, base.sort_stats);
         assert!(!multi.sort_stats);
     }
@@ -2919,9 +2804,8 @@ mod tests {
 
     /// Guards the hand-written `impl Default for SortOptions` against drifting
     /// from the standalone `sort` command's `#[arg(default_value...)]` literals.
-    /// Asserts every default-bearing field (plus the chain-engine skip fields,
-    /// whose defaults are checked directly against the struct) matches the
-    /// standalone command's own default, parsed with only its required flags.
+    /// Asserts every default-bearing field matches the standalone command's own
+    /// default, parsed with only its required flags.
     #[test]
     fn sort_options_default_matches_cli_defaults() {
         let parsed = Sort::try_parse_from(["sort", "-i", "in.bam", "-o", "o.bam"])
@@ -2937,9 +2821,5 @@ mod tests {
         assert_eq!(d.max_temp_files, parsed.max_temp_files);
         assert_eq!(d.sort_stats, parsed.sort_stats);
         assert!(!d.sort_stats);
-        // Chain-engine skip fields: no CLI flag on `Sort` exists to parse, so
-        // compare directly against the struct's documented defaults.
-        assert_eq!(d.block_batch, 4);
-        assert!(!d.file_granularity);
     }
 }

@@ -41,6 +41,22 @@ const FAST_PATH_PARALLEL_MIN_RECORDS: usize = 64 * 1024;
 /// `try_run` body cooperative.
 const FAST_PATH_BLOCKS_PER_WORKER_WINDOW: usize = 4;
 
+/// Every record ingested must come out of the merge: a slot that finalized a
+/// clean EOF early (a truncated or misparsed spill run) would otherwise end the
+/// merge short with a clean exit.
+fn ensure_all_records_merged(ingested: u64, merged: u64) -> io::Result<()> {
+    if merged == ingested {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "sort lost records: read {ingested} but merged {merged} (differ by {})",
+            ingested.abs_diff(merged)
+        ),
+    ))
+}
+
 /// `SortMerge` counter slot index: records merged/gathered this call.
 const RECORDS: usize = 0;
 
@@ -434,27 +450,33 @@ fn build_driver(
     slots: Vec<Arc<SortMergeSlot>>,
     chunks: MemoryChunksByKind,
     total_records: u64,
+    demand: Option<&Arc<fgumi_sort::MergeDemand>>,
 ) -> io::Result<Box<dyn MergeDriverDyn + Send>> {
     Ok(match sort_order {
-        SortOrder::Coordinate => Box::new(MergeDriver::<RawCoordinateKey>::from_slots(
-            slots,
-            MemorySources::Shared(chunks.coordinate),
-            total_records,
+        SortOrder::Coordinate => Box::new(attach(
+            MergeDriver::<RawCoordinateKey>::from_slots(
+                slots,
+                MemorySources::Shared(chunks.coordinate),
+                total_records,
+            ),
+            demand,
         )),
-        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-            Box::new(MergeDriver::<RawQuerynameLexKey>::from_slots(
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
+            MergeDriver::<RawQuerynameLexKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_lex),
                 total_records,
-            ))
-        }
-        SortOrder::Queryname(QuerynameComparator::Natural) => {
-            Box::new(MergeDriver::<RawQuerynameKey>::from_slots(
+            ),
+            demand,
+        )),
+        SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
+            MergeDriver::<RawQuerynameKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_natural),
                 total_records,
-            ))
-        }
+            ),
+            demand,
+        )),
         SortOrder::TemplateCoordinate => match chunks.template_coordinate {
             // `Empty` means no residual chunk identified the `--key-types` lane.
             // For valid input this only happens with empty input (no spill files
@@ -475,34 +497,57 @@ fn build_driver(
                          Phase-1 seal-logic regression.",
                     ));
                 }
-                Box::new(MergeDriver::<TemplateKey>::from_slots(
-                    slots,
-                    MemorySources::Shared(Vec::new()),
-                    total_records,
+                Box::new(attach(
+                    MergeDriver::<TemplateKey>::from_slots(
+                        slots,
+                        MemorySources::Shared(Vec::new()),
+                        total_records,
+                    ),
+                    demand,
                 ))
             }
-            TemplateChunks::K24(v) => Box::new(MergeDriver::<TemplateKey24>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::K24(v) => Box::new(attach(
+                MergeDriver::<TemplateKey24>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
-            TemplateChunks::Cb32(v) => Box::new(MergeDriver::<CbKey32>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::Cb32(v) => Box::new(attach(
+                MergeDriver::<CbKey32>::from_slots(slots, MemorySources::Shared(v), total_records),
+                demand,
             )),
-            TemplateChunks::Tert32(v) => Box::new(MergeDriver::<TertKey32>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::Tert32(v) => Box::new(attach(
+                MergeDriver::<TertKey32>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
-            TemplateChunks::K40(v) => Box::new(MergeDriver::<TemplateKey>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::K40(v) => Box::new(attach(
+                MergeDriver::<TemplateKey>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
         },
     })
+}
+
+/// Hand the sort's merge demand to `driver`, which publishes its predictions
+/// and frontier through it.
+fn attach<K: fgumi_sort::RawSortKey + Default + Send + 'static>(
+    driver: MergeDriver<K>,
+    demand: Option<&Arc<fgumi_sort::MergeDemand>>,
+) -> MergeDriver<K> {
+    match demand {
+        Some(d) => driver.with_demand(Arc::clone(d)),
+        None => driver,
+    }
 }
 
 enum NextBatch<I> {
@@ -759,6 +804,8 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// attached). Off by default -- it is instrumentation for performance investigations, not
     /// something a normal run should show. See [`Self::with_sort_stats`].
     sort_stats: bool,
+    /// The merge supply's end-of-merge lines (`--sort-stats` only).
+    supply_diagnostics: Option<super::supply_ledger::SupplyDiagnostics>,
     /// Total records ingested, captured at the merge transition (the summary's
     /// "records processed").
     processed: u64,
@@ -819,6 +866,68 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// The current stall episode (one episode spans every `Stalled` until the
     /// next `Produced` or `Done`).
     episode: StallEpisode,
+    /// The merge supply's ledger: self-serve claims are booked to the
+    /// consumer. Set with the demand by [`Self::with_spill_supply`], so the
+    /// merge cannot book to a ledger the planner does not read; `None` in unit
+    /// tests that drive the merge alone.
+    ledger: Option<Arc<super::supply_ledger::SupplyLedger>>,
+    /// Decompressor for self-serve, built on the first self-served block.
+    decomp: Option<fgumi_sort::SpillBlockDecompressor>,
+    /// The per-slot reorder-window byte budget self-serve claims under (the
+    /// decompress step's).
+    window_budget: u64,
+}
+
+/// The merge's own supply path: on a stall it claims, decompresses and
+/// publishes the awaited slot's stashed blocks itself, through the same
+/// [`fgumi_sort::ClaimedBlock::decompress_and_publish`] a `SortSpillDecompress`
+/// worker uses (same claim admission, same publish), and never reads the spill
+/// file.
+struct SelfServe<'a> {
+    decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
+    ledger: Option<&'a super::supply_ledger::SupplyLedger>,
+    window_budget: u64,
+}
+
+impl SelfServe<'_> {
+    /// Serve `slot` until it can make progress or nothing more is claimable or
+    /// drainable. Returns the blocks served and whether the slot now has a
+    /// block or EOF.
+    ///
+    /// The drain-only call before giving up moves a block that waits in
+    /// `reorder` behind a full FIFO (the consumer has just emptied it) without
+    /// any worker.
+    ///
+    /// # Errors
+    /// A decompress failure: the slot is marked failed first, and the error
+    /// names the slot as the merge's own failed-slot error does.
+    fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
+        let mut served = 0u64;
+        loop {
+            if let Some(block) = slot.bp_claim_raw(self.window_budget) {
+                if let Some(l) = self.ledger {
+                    l.sub_stash(block.frame.len() as u64, true);
+                }
+                let decomp =
+                    self.decomp.get_or_insert_with(fgumi_sort::SpillBlockDecompressor::new);
+                block.decompress_and_publish(decomp).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "SortMerge: spill decompression error on slot {}: {e}",
+                            slot.file_id
+                        ),
+                    )
+                })?;
+                served += 1;
+            } else if !slot.bp_drain_and_finalize() {
+                return Ok((served, slot.has_block_or_eof()));
+            }
+            if slot.has_block_or_eof() {
+                return Ok((served, true));
+            }
+        }
+    }
 }
 
 /// Bookkeeping for one stall episode of the merge: when it began, and whether
@@ -917,6 +1026,7 @@ impl<O: MergeOutput> SortMerge<O> {
             stats_slot: None,
             spill_stats: None,
             sort_stats: false,
+            supply_diagnostics: None,
             processed: 0,
             chunk_count: 0,
             dbg: MergeDiag::default(),
@@ -928,7 +1038,21 @@ impl<O: MergeOutput> SortMerge<O> {
             demand: None,
             awaiting: false,
             episode: StallEpisode::default(),
+            ledger: None,
+            decomp: None,
+            window_budget: super::spill_decompress::reorder_window_budget(output_byte_limit),
         }
+    }
+
+    /// Join the merge supply: share its merge demand (a stalled merge parks
+    /// until the block it awaits lands) and book self-serve claims in its
+    /// ledger — one value, so the merge cannot pair one supply's demand with
+    /// another's ledger.
+    #[must_use]
+    pub fn with_spill_supply(mut self, supply: &super::supply_ledger::SpillSupply) -> Self {
+        self.demand = Some(Arc::clone(&supply.demand));
+        self.ledger = Some(Arc::clone(&supply.ledger));
+        self
     }
 
     /// Share the sort's [`fgumi_sort::MergeDemand`] with the spill supply, so a
@@ -1004,6 +1128,17 @@ impl<O: MergeOutput> SortMerge<O> {
     #[must_use]
     pub fn with_sort_stats(mut self, enabled: bool) -> Self {
         self.sort_stats = enabled;
+        self
+    }
+
+    /// Log the merge supply's lines at the end of the merge (built only under
+    /// `--sort-stats`).
+    #[must_use]
+    pub fn with_supply_diagnostics(
+        mut self,
+        d: Option<super::supply_ledger::SupplyDiagnostics>,
+    ) -> Self {
+        self.supply_diagnostics = d;
         self
     }
 
@@ -1109,6 +1244,11 @@ impl<O: MergeOutput> SortMerge<O> {
         let demand = self.demand.as_deref();
         let awaiting = &mut self.awaiting;
         let episode = &mut self.episode;
+        let mut serve = SelfServe {
+            decomp: &mut self.decomp,
+            ledger: self.ledger.as_deref(),
+            window_budget: self.window_budget,
+        };
         let SortMergeState::Merging { driver, builder, next_ordinal } = &mut self.state else {
             unreachable!("next_batch called outside Merging state");
         };
@@ -1151,6 +1291,15 @@ impl<O: MergeOutput> SortMerge<O> {
                         // that already landed means keep merging; otherwise the
                         // delivery to this slot unparks the driver.
                         if d.await_slot(slot) {
+                            continue;
+                        }
+                        // Before parking, decompress the slot's already-read
+                        // blocks on this thread; the slot stays awaited, so a
+                        // worker's delivery meanwhile still wakes the driver.
+                        let (served, ready) = serve.run(slot)?;
+                        d.stats().record_self_serve(served, ready);
+                        if ready {
+                            d.clear_awaited();
                             continue;
                         }
                         *awaiting = true;
@@ -1255,6 +1404,7 @@ impl<O: MergeOutput> SortMerge<O> {
                         self.held.put(unpushed);
                         return Ok(StepOutcome::Progress);
                     }
+                    ensure_all_records_merged(self.processed, merged)?;
                     log::info!("Sort merge complete: {merged} records merged");
                     // INSTRUMENTATION (lever-2): is the serial merge starved on
                     // decompress (stalls/contention high) or blocked on the
@@ -1281,6 +1431,11 @@ impl<O: MergeOutput> SortMerge<O> {
                         );
                         if let Some(d) = &self.demand {
                             for line in d.snapshot().log_lines() {
+                                log::info!("{line}");
+                            }
+                        }
+                        if let Some(s) = &self.supply_diagnostics {
+                            for line in s.lines() {
                                 log::info!("{line}");
                             }
                         }
@@ -1708,7 +1863,13 @@ impl<O: MergeOutput> SortMerge<O> {
                 SortMergeState::FastPath { chunk, cursor: 0, total, builder, next_ordinal: 0 };
             return Ok(());
         }
-        let driver = build_driver(self.sort_order, slots, memory_chunks, total_records)?;
+        let driver = build_driver(
+            self.sort_order,
+            slots,
+            memory_chunks,
+            total_records,
+            self.demand.as_ref(),
+        )?;
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         // Seed the first buffer modestly; subsequent buffers are sized from the
         // prior batch's actual byte length (see `next_batch`).

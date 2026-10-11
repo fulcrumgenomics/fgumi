@@ -556,6 +556,31 @@ pub struct ChainBuilder<'a> {
     /// sets it: standalone sort streams through the normal multi-step pipeline
     /// and uses the requested thread count like every other stage.
     override_pipeline_threads: Option<usize>,
+    /// The input when the sort reads it chain-natively
+    /// (`PlanInputReads → PreadInputSlices → FrameBgzfBlocks`), decided once
+    /// in [`Self::new`] by [`Self::native_input_path`]; `None` for every other
+    /// source.
+    native_input: Option<NativeInput>,
+    /// The resolved `--read-streams` policy, created by the first stage that
+    /// needs it and shared by the input and spill read planners.
+    read_streams_policy: Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
+    /// The native input path's request-size histogram; `Some` only under
+    /// `--sort-stats`.
+    input_slice_hist: Option<Arc<fgumi_pipeline_io::pread::RequestSizeHist>>,
+    /// The `PreadInputSlices` clone count the native input path was sized for
+    /// (test support).
+    #[cfg(test)]
+    input_eligible_clones: Option<usize>,
+    /// The read-stream policy the spill planner adopted (test support).
+    #[cfg(test)]
+    spill_read_streams: Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
+    /// The spill planner's outstanding-slice cap (test support).
+    #[cfg(test)]
+    spill_inflight_slices: Option<u32>,
+    /// The `PreadSpillSlices` clone count the spill reads were sized for
+    /// (test support).
+    #[cfg(test)]
+    spill_eligible_clones: Option<usize>,
 
     /// Set for a chain whose drain-bound shape benefits from downstream-first
     /// dispatch. [`Self::build`] reads it to select the
@@ -791,7 +816,8 @@ impl<'a> ChainBuilder<'a> {
         // relies on). The former sort-terminal skip (where `SortBamFile` opened
         // the input itself) is gone: standalone sort now streams through the
         // normal source path, so `@PG` injection applies to it too.
-        let (raw_header, pending_source) = Self::open_source(spec)?;
+        let native_input = Self::native_input_path(spec);
+        let (raw_header, pending_source) = Self::open_source(spec, native_input.as_ref())?;
         // A FASTQ source detects the input quality encoding while opening its
         // readers; pull it out here so `add_extract` can override the placeholder
         // in `ExtractOptions`. Non-FASTQ sources leave this `None`.
@@ -825,6 +851,17 @@ impl<'a> ChainBuilder<'a> {
             pending_source,
             paired_tail: None,
             override_pipeline_threads: None,
+            native_input,
+            read_streams_policy: None,
+            input_slice_hist: None,
+            #[cfg(test)]
+            input_eligible_clones: None,
+            #[cfg(test)]
+            spill_read_streams: None,
+            #[cfg(test)]
+            spill_inflight_slices: None,
+            #[cfg(test)]
+            spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             pending_header_handle: None,
@@ -846,13 +883,75 @@ impl<'a> ChainBuilder<'a> {
         })
     }
 
+    /// The input when a sort-first chain reads it chain-natively: the spec
+    /// asks for concurrent reads (`--read-streams` other than `1`), and the
+    /// source is a regular file (decided by `stat` before it is opened — an
+    /// open blocks on a FIFO with no writer) whose content is BGZF. The file is
+    /// opened once here; the header parse and the positional reads both use
+    /// that open file, so they cannot come from two different files.
+    ///
+    /// Everything else — stdin, FIFOs, SAM, plain gzip — keeps the sequential
+    /// reader, and this is the one place that says so: an explicit
+    /// `Fixed(n>1)` it cannot honour warns here (`Auto` falls back silently).
+    /// A missing or unreadable file is left to [`Self::open_source`] to report.
+    fn native_input_path(spec: &ChainSpec) -> Option<NativeInput> {
+        use std::io::Seek as _;
+
+        if spec.read_streams == fgumi_bam_io::ReadStreams::Fixed(1)
+            || !matches!(spec.stages.as_slice(), [Stage::Sort, ..])
+        {
+            return None;
+        }
+        let (SourceSpec::Bam(path) | SourceSpec::Sam(path)) = &spec.source else {
+            return None;
+        };
+        let unavailable = |subject: &str, reason: &str| {
+            if let fgumi_bam_io::ReadStreams::Fixed(n) = spec.read_streams
+                && n > 1
+            {
+                log::warn!(
+                    "--read-streams={n} applies only to seekable BGZF input, and {subject} \
+                     {reason}; reading the input sequentially"
+                );
+            }
+        };
+        if fgumi_bam_io::is_stdin_path(path) {
+            unavailable("stdin", "is not a seekable regular file");
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() {
+            unavailable(&path.display().to_string(), "is not a seekable regular file");
+            return None;
+        }
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut prefix = [0u8; fgumi_bam_io::FORMAT_PREFIX_LEN];
+        let n = fgumi_bam_io::read_prefix(&mut file, &mut prefix).ok()?;
+        if fgumi_bam_io::classify_input(&prefix[..n]) != fgumi_bam_io::InputFormat::Bgzf {
+            unavailable(&path.display().to_string(), "is not BGZF");
+            return None;
+        }
+        file.rewind().ok()?;
+        let len = fgumi_bam_io::pread::PositionalSource::byte_len(&file).ok()?;
+        Some(NativeInput { file: Arc::new(file), len })
+    }
+
     /// Open the input source and extract the header. For `Bam`/`Sam` specs,
     /// opens the file and wraps it in [`PendingSource::Single`]. For
     /// `PairedBams`, opens both inputs, resolves the dict path, builds the
     /// merged output header via `build_output_header`, and wraps them in
     /// [`PendingSource::Paired`]. For `Fastqs`, builds the FASTQ header from the
     /// extract options and wraps the paths in [`PendingSource::Fastq`].
-    fn open_source(spec: &ChainSpec) -> Result<(Header, Option<PendingSource>)> {
+    ///
+    /// `native_input` (see [`Self::native_input_path`]): the body will be read
+    /// positionally from that open file, so the header is parsed from the same
+    /// open file (a duplicate handle; positional reads ignore its offset) and
+    /// without the async prefetch thread (`--async-reader` would spawn it only
+    /// for it to be dropped).
+    fn open_source(
+        spec: &ChainSpec,
+        native_input: Option<&NativeInput>,
+    ) -> Result<(Header, Option<PendingSource>)> {
         use crate::pipeline::steps::source::InputSource;
 
         match &spec.source {
@@ -861,15 +960,23 @@ impl<'a> ChainBuilder<'a> {
                 if !fgumi_bam_io::is_stdin_path(path) {
                     crate::validation::validate_file_exists(path, "input BAM/SAM file")?;
                 }
-                let input = InputSource::open_with_opts(
-                    path,
-                    fgumi_bam_io::PipelineReaderOpts {
-                        async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|e| anyhow!("open input: {e}"))?;
+                let input = if let Some(native) = native_input {
+                    if spec.async_reader {
+                        log::debug!(
+                            "--async-reader ignored: the native input path reads positionally"
+                        );
+                    }
+                    native.file.try_clone().and_then(|f| InputSource::open_bgzf_file(f, path))
+                } else {
+                    InputSource::open_with_opts(
+                        path,
+                        fgumi_bam_io::PipelineReaderOpts {
+                            async_reader: spec.async_reader,
+                            ..Default::default()
+                        },
+                    )
+                };
+                let input = input.map_err(|e| anyhow!("open input: {e}"))?;
                 let header = input.header().clone();
                 Ok((header, Some(PendingSource::Single(Box::new(input)))))
             }
@@ -891,7 +998,6 @@ impl<'a> ChainBuilder<'a> {
                     unmapped,
                     fgumi_bam_io::PipelineReaderOpts {
                         async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
                         ..Default::default()
                     },
                 )
@@ -909,7 +1015,6 @@ impl<'a> ChainBuilder<'a> {
                     mapped,
                     fgumi_bam_io::PipelineReaderOpts {
                         async_reader: spec.async_reader,
-                        read_streams: spec.read_streams,
                         ..Default::default()
                     },
                 )
@@ -1229,19 +1334,27 @@ impl<'a> ChainBuilder<'a> {
                     InputSource::Bam { reader, .. } => {
                         if sort_is_first_intermediate {
                             // All four sort orders use the arena-backed
-                            // parallel-inflate front (ReadBgzfBlocks only — no
+                            // parallel-inflate front (raw BGZF blocks only — no
                             // BgzfDecompress); ReadBlocks → InflateToArena →
                             // FindBoundariesAndSort (with the per-order strategy)
                             // are wired in add_sort. Leave the BgzfBlock tail for
                             // that front. SAM / fused inputs still use SortBuffer.
-                            let (read_step, _) = read_bam_from_reader(
-                                reader,
-                                self.header.clone(),
-                                self.tuning.blocks_per_batch,
-                                self.tuning.per_step_byte_limit,
-                            );
-                            let tail = self.pipeline.append_source(read_step);
-                            self.current_tail = Some(tail);
+                            if let Some(native) = self.native_input.clone() {
+                                // The header is parsed; the raw stream is re-read
+                                // from byte 0 (the header blocks are stripped
+                                // downstream, as for `read_bam`).
+                                drop(reader);
+                                self.add_native_input(&native);
+                            } else {
+                                let (read_step, _) = read_bam_from_reader(
+                                    reader,
+                                    self.header.clone(),
+                                    self.tuning.blocks_per_batch,
+                                    self.tuning.per_step_byte_limit,
+                                );
+                                let tail = self.pipeline.append_source(read_step);
+                                self.current_tail = Some(tail);
+                            }
                             self.chain_tail_kind = ChainTailKind::BgzfBlockArena;
                         } else if self.first_stage_uses_raw_record_fast_path() {
                             // Decode-free fast path: the first stage is a
@@ -1924,6 +2037,75 @@ impl<'a> ChainBuilder<'a> {
             .pipeline
             .append_step(FindBamBoundaries::new(self.tuning.per_step_byte_limit), tail);
         self.pipeline.append_step(ParseBamRecords::new(self.tuning.per_step_byte_limit), tail)
+    }
+
+    /// Append the sort's chain-native input reads over `path`:
+    /// `PlanInputReads` (the planner, reader-affine) → `PreadInputSlices` (the
+    /// reads, on every pool worker but the reader's, under the phase-1 cap when
+    /// `--sort-threads` was given) → `FrameBgzfBlocks` (the framer). Slices per
+    /// fill are bounded by the clones that can read at once: the
+    /// `ExcludeReader` hosts in the pool, within the phase-1 thread count.
+    fn add_native_input(&mut self, native: &NativeInput) {
+        use fgumi_pipeline_core::PoolPlacement;
+        use fgumi_pipeline_io::pread::{InputLedger, PreadSlices, RequestSizeHist};
+        use fgumi_pipeline_io::source::{FrameBgzfBlocks, PlanInputReads};
+
+        let policy = Arc::clone(self.read_streams_policy.get_or_insert_with(|| {
+            fgumi_bam_io::pread::ReadStreamsPolicy::from_flag(self.spec.read_streams)
+        }));
+        let SortPlan { pool, phases, caps } =
+            self.sort_plan().expect("the native input path is chosen only for a sort-first chain");
+        // A sort-first chain has no stage before the sort to raise the pool,
+        // and the stages after it raise no floor, so the pool is final here.
+        let num_threads = self.spec.threading.num_threads();
+        debug_assert_eq!(
+            pool,
+            self.override_pipeline_threads.map_or(num_threads, |t| t.max(num_threads)),
+            "the native input path is sized from the pool the chain runs"
+        );
+        // The runtime's `ExcludeReader` rule for this chain: the reader-affine
+        // planner and framer are pinned to worker 0 (`Affinity::Reader`), and
+        // the source runs on the pool, not a driver. Pinned against the built
+        // pipeline's own placement plan by
+        // `native_input_eligible_clones_match_the_planned_placement`.
+        let eligible = fgumi_pipeline_core::runtime::parallel_hosts(
+            PoolPlacement::ExcludeReader,
+            Some(0),
+            pool,
+            None,
+        )
+        .clone_count()
+        .min(phases.phase1);
+        #[cfg(test)]
+        {
+            self.input_eligible_clones = Some(eligible);
+        }
+        let sort_stats = self.spec.stage_opts.sort.as_ref().is_some_and(|s| s.sort_stats);
+        let hist = sort_stats.then(|| Arc::new(RequestSizeHist::default()));
+        self.input_slice_hist.clone_from(&hist);
+        let byte_limit = self.tuning.per_step_byte_limit;
+        let ledger = Arc::new(InputLedger::default());
+        let plan = PlanInputReads::from_source(
+            Arc::clone(&native.file) as Arc<dyn fgumi_bam_io::pread::PositionalSource>,
+            native.len,
+            policy,
+            Arc::clone(&ledger),
+            eligible,
+            byte_limit,
+        );
+        let mut pread = PreadSlices::input(
+            fgumi_bam_io::pread::SliceBufferPool::new(2 * pool + 8),
+            Arc::clone(&ledger),
+            byte_limit,
+        )
+        .with_phase_cap(caps.phase1);
+        if let Some(h) = hist {
+            pread = pread.with_hist(h);
+        }
+        let t = self.pipeline.append_source(plan);
+        let t = self.pipeline.append_step(pread, t);
+        let t = self.pipeline.append_step(FrameBgzfBlocks::new(ledger, byte_limit), t);
+        self.current_tail = Some(t);
     }
 
     /// The sort's per-phase counts and caps, resolved once from the spec —
@@ -3474,8 +3656,9 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::core::step::Affinity;
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
-                BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
-                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite,
+                BlockOutput, RecordBatchOutput, SortBuffer, SortMerge, SortSpillDecompress,
+                SpillBlockCompress, SpillGather, SpillReadPlanner, SpillRunStats, SpillSupply,
+                SpillWrite, SupplyDiagnostics,
             };
             use fgumi_sort::SortOrder;
 
@@ -3601,26 +3784,83 @@ impl<'a> ChainBuilder<'a> {
 
             let affinity = if num_threads >= 3 { Affinity::Worker(1) } else { Affinity::Reader };
 
-            // Phase-2 decompression granularity knobs (`--sort::file-granularity`,
-            // `--sort::block-batch`). The default is the block-parallel path
-            // (P5c, hardened by loom/TSan + the soak matrix); its reorder window
-            // is bounded by the per-step byte limit (see SortSpillDecompress).
-            // `block_batch` defaults to 4 (the original MAX_BATCH_PER_CALL),
-            // pending a fleet decompress-throughput bench.
-            let decompress_tuning = SortDecompressTuning {
-                file_granularity: sort.file_granularity,
-                block_batch: sort.block_batch,
-            };
-            // One merge-wide demand per sort, shared by the supply
-            // (`notify_delivered` after each delivery) and the merge
-            // (`await_slot` on a stall; the thread the delivery unparks).
-            let merge_demand = Arc::new(fgumi_sort::MergeDemand::new());
-            // Phase-2 cap (`--merge-threads`): bounds concurrent spill
+            // One merge-wide demand and supply ledger per sort, shared by the
+            // supply (`notify_delivered` after each delivery; the ledger's
+            // outstanding-read bound) and the merge (`await_slot` on a stall;
+            // the thread the delivery unparks). `SpillSupply` hands every
+            // participant the same pair.
+            let supply = SpillSupply::new();
+            let merge_demand = Arc::clone(&supply.demand);
+            // The merge supply: `SpillReadPlanner` (pool Serial) plans byte-range
+            // reads of the spill files from the merge's demand and a read-ahead
+            // budget derived from `--max-memory`; `PreadSpillSlices` performs
+            // them on the pool; `SortSpillDecompress` parses the slices into
+            // each slot's raw stash and decompresses its blocks. The spill reads
+            // adopt the input's read-stream policy (the native input path's
+            // ratchet); with no native input, an explicit `--read-streams N`
+            // still applies to the spills (always seekable) and `auto` is one
+            // stream.
+            let spill_policy =
+                self.read_streams_policy.clone().unwrap_or_else(|| match self.spec.read_streams {
+                    fgumi_bam_io::ReadStreams::Auto => {
+                        fgumi_bam_io::pread::ReadStreamsPolicy::fixed(1)
+                    }
+                    fgumi_bam_io::ReadStreams::Fixed(n) => {
+                        fgumi_bam_io::pread::ReadStreamsPolicy::fixed(n)
+                    }
+                });
+            #[cfg(test)]
+            {
+                self.spill_read_streams = Some(Arc::clone(&spill_policy));
+            }
+            // The runtime's `AllWorkers` rule: one `PreadSpillSlices` clone per
+            // pool worker. Pinned against the built pipeline's own placement
+            // plan by `spill_eligible_clones_match_the_planned_placement`.
+            let spill_eligible = fgumi_pipeline_core::runtime::parallel_hosts(
+                fgumi_pipeline_core::PoolPlacement::AllWorkers,
+                None,
+                pool,
+                None,
+            )
+            .clone_count()
+            .min(phases.phase2);
+            let spill_slices = fgumi_bam_io::pread::SliceBufferPool::new(2 * pool + 8);
+            let spill_hist = sort
+                .sort_stats
+                .then(|| Arc::new(fgumi_pipeline_io::pread::RequestSizeHist::default()));
+            let supply_diagnostics = spill_hist.as_ref().map(|hist| SupplyDiagnostics {
+                ledger: Arc::clone(&supply.ledger),
+                pool: Arc::clone(&spill_slices),
+                hist: Arc::clone(hist),
+                policy: Arc::clone(&spill_policy),
+            });
+            let planner = SpillReadPlanner::new(
+                total_memory as u64,
+                phases.phase2,
+                spill_eligible,
+                self.tuning.per_step_byte_limit,
+                &supply,
+                Arc::clone(&spill_slices),
+            )
+            .with_read_streams(Arc::clone(&spill_policy))
+            .with_sort_stats(sort.sort_stats);
+            #[cfg(test)]
+            {
+                self.spill_inflight_slices = Some(planner.max_inflight_slices());
+                self.spill_eligible_clones = Some(spill_eligible);
+            }
+            // Phase-2 cap (`--merge-threads`): bounds concurrent spill reads and
             // decompression together with the terminal output compressor.
-            let decompress =
-                SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
-                    .with_phase_cap(phase2_cap.clone())
-                    .with_merge_demand(Arc::clone(&merge_demand));
+            let mut pread = fgumi_pipeline_io::pread::PreadSlices::spill(
+                Arc::clone(&spill_slices),
+                self.tuning.per_step_byte_limit,
+            )
+            .with_phase_cap(phase2_cap.clone());
+            if let Some(h) = &spill_hist {
+                pread = pread.with_hist(Arc::clone(h));
+            }
+            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit, &supply)
+                .with_phase_cap(phase2_cap.clone());
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -3827,7 +4067,13 @@ impl<'a> ChainBuilder<'a> {
                 let tail = self.pipeline.append_step(compress, tail);
                 self.pipeline.append_step(write, tail)
             };
-            let decompress_tail = self.pipeline.append_step(decompress, phase1_tail);
+            // Fan-out (as for a rejects branch): the planner's read requests
+            // (branch 0) feed `PreadSpillSlices → SortSpillDecompress`, a leaf;
+            // its phase events (branch 1) go straight to `SortMerge`.
+            let planner_tail = self.pipeline.append_step(planner, phase1_tail);
+            let pread_tail = self.pipeline.append_step(pread, planner_tail);
+            let decompress_tail = self.pipeline.append_step(decompress, pread_tail);
+            let merge_input = (planner_tail.0, BranchIdx(1));
             // While the merge is starved, pool workers walk the spill supply
             // (`SortSpillDecompress` and the steps before it) before the steps
             // after it, such as the output compressor — the merge parks on a
@@ -3866,8 +4112,9 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
-                merge = merge.with_merge_demand(Arc::clone(&merge_demand));
-                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
+                merge =
+                    merge.with_spill_supply(&supply).with_supply_diagnostics(supply_diagnostics);
+                let merge_tail = self.pipeline.append_step(merge, merge_input);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
                 // SortMerge → SerializedBytes.
@@ -3895,6 +4142,16 @@ impl<'a> ChainBuilder<'a> {
                             output_path,
                             timer: crate::logging::OperationTimer::new("Sorting BAM"),
                             phase_caps: phase1_cap.iter().chain(&phase2_cap).cloned().collect(),
+                            input_fetch: self
+                                .input_slice_hist
+                                .clone()
+                                .zip(self.read_streams_policy.clone())
+                                .map(|(hist, policy)| {
+                                    crate::pipeline::chains::commands::sort::InputFetchReport {
+                                        hist,
+                                        policy,
+                                    }
+                                }),
                         },
                     ));
                 }
@@ -3922,8 +4179,9 @@ impl<'a> ChainBuilder<'a> {
                 .with_fast_path_threads(phases.phase2);
                 merge = merge
                     .with_fast_path_cap(phase2_cap.clone())
-                    .with_merge_demand(Arc::clone(&merge_demand));
-                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
+                    .with_spill_supply(&supply)
+                    .with_supply_diagnostics(supply_diagnostics);
+                let merge_tail = self.pipeline.append_step(merge, merge_input);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
@@ -6574,6 +6832,17 @@ fn grouping_stage_wants_drain_first(stage: Stage, position: StagePosition) -> bo
     )
 }
 
+/// A sort-first chain's input read chain-natively (see
+/// `ChainBuilder::native_input_path`): one open file, shared by the header
+/// parse and the positional reads.
+#[derive(Clone, Debug)]
+struct NativeInput {
+    /// The open file.
+    file: Arc<std::fs::File>,
+    /// Its length when opened.
+    len: u64,
+}
+
 /// The sort's resolved per-phase counts and caps (see `ChainBuilder::sort_plan`).
 #[derive(Clone)]
 struct SortPlan {
@@ -6833,6 +7102,13 @@ mod tests {
             pending_source: None,
             paired_tail: None,
             override_pipeline_threads: None,
+            native_input: None,
+            read_streams_policy: None,
+            input_slice_hist: None,
+            input_eligible_clones: None,
+            spill_read_streams: None,
+            spill_inflight_slices: None,
+            spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             pending_header_handle: None,
@@ -7339,8 +7615,6 @@ mod tests {
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::default(),
             max_temp_files: MaxTempFiles::Auto,
-            block_batch: 4,
-            file_granularity: false,
             sort_stats: false,
         });
         spec.stage_opts.group = Some(crate::commands::group::GroupOptions::default());
@@ -7438,6 +7712,344 @@ mod tests {
         let debug = format!("{:?}", built.config.scheduler);
         assert_eq!(debug.matches("RefillSource {").count(), 2, "align + sort hints: {debug}");
         assert_sort_refill_source_feeds_decompress(&built);
+    }
+
+    /// Build a sort chain over a header-only BGZF BAM at `threads`, with an
+    /// optional `--sort-threads` and the given `--read-streams`; returns the
+    /// `PreadInputSlices` clone count `add_source` sized the native path for
+    /// and the built pipeline.
+    fn build_native_sort(
+        stages: Vec<Stage>,
+        threads: usize,
+        sort_threads: Option<usize>,
+        read_streams: fgumi_bam_io::ReadStreams,
+    ) -> (Option<usize>, crate::pipeline::chains::finalize::BuiltPipeline, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let mut spec = sort_chain_spec(tmp.path(), input, stages);
+        spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+        spec.read_streams = read_streams;
+        spec.stage_opts.sort.as_mut().unwrap().sort_threads = sort_threads;
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        let last = spec.stages.len() - 1;
+        for (i, &stage) in spec.stages.iter().enumerate() {
+            let position =
+                if i == last { StagePosition::Terminal } else { StagePosition::Intermediate };
+            chain.add_stage(stage, position).unwrap();
+        }
+        chain.add_sink().unwrap();
+        let eligible = chain.input_eligible_clones;
+        (eligible, chain.build().unwrap(), tmp)
+    }
+
+    /// The native input pread shares the SAME phase-1 cap as the phase-1 pool
+    /// steps (pointer identity), sized from `--sort-threads`.
+    #[test]
+    fn native_input_shares_the_phase1_cap() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, Some(4), fgumi_bam_io::ReadStreams::Fixed(4));
+        let caps = built.pipeline.phase_caps();
+        let pread = caps.iter().find(|(n, _)| *n == "PreadInputSlices").expect("capped").1;
+        let inflate = caps.iter().find(|(n, _)| *n == "InflateToArena").expect("capped").1;
+        assert!(std::ptr::eq(pread, inflate), "one phase-1 cap");
+        assert_eq!(pread.max(), 4);
+    }
+
+    /// No `--sort-threads` → no phase-1 cap anywhere, including the input pread
+    /// (no `cap=` token on its dag line).
+    #[test]
+    fn unset_sort_threads_leaves_the_input_pread_uncapped() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, None, fgumi_bam_io::ReadStreams::Fixed(4));
+        let dag = built.pipeline.dag();
+        let line = dag.lines().find(|l| l.contains("PreadInputSlices")).expect("native path");
+        assert!(!line.contains("cap="), "{line}");
+        assert!(built.pipeline.phase_caps().is_empty(), "no caps without explicit flags");
+    }
+
+    /// Slices per fill are bounded by the `ExcludeReader` hosts within the
+    /// phase-1 count.
+    #[rstest::rstest]
+    #[case::cap_binds(16, Some(4), 4)]
+    #[case::pool_minus_reader(8, None, 7)]
+    #[case::two_threads(2, None, 1)]
+    #[case::one_thread(1, None, 1)]
+    fn native_input_eligible_clones_match_the_pool(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+        #[case] want: usize,
+    ) {
+        let (eligible, _built, _tmp) = build_native_sort(
+            vec![Stage::Sort],
+            threads,
+            sort_threads,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        assert_eq!(eligible, Some(want));
+    }
+
+    /// The native input's header comes from the same open file its body is
+    /// read from: replacing the path between the native-input decision and
+    /// the header parse (an atomic rename by an upstream writer) cannot pair
+    /// one file's header with another's body.
+    #[test]
+    fn native_input_header_comes_from_the_file_the_body_is_read_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let mut spec = sort_chain_spec(tmp.path(), input.clone(), vec![Stage::Sort]);
+        spec.read_streams = fgumi_bam_io::ReadStreams::Auto;
+        let native = ChainBuilder::native_input_path(&spec).expect("a regular BGZF file");
+        let other = tmp.path().join("other.bam");
+        let header = noodles::sam::Header::builder()
+            .add_reference_sequence(
+                bstr::BString::from("chrX"),
+                noodles::sam::header::record::value::Map::<
+                    noodles::sam::header::record::value::map::ReferenceSequence,
+                >::new(std::num::NonZeroUsize::new(5).unwrap()),
+            )
+            .build();
+        fgumi_bam_io::create_raw_bam_writer(&other, &header, 1, 1).unwrap().finish().unwrap();
+        std::fs::rename(&other, &input).unwrap();
+        let (got, _) = ChainBuilder::open_source(&spec, Some(&native)).unwrap();
+        let names: Vec<_> = got.reference_sequences().keys().cloned().collect();
+        assert_eq!(names, vec![bstr::BString::from("chr1")], "the header of the file opened");
+    }
+
+    /// The builder sizes the input slices by its own `ExcludeReader`
+    /// prediction; it must equal the built pipeline's real placement plan for
+    /// `PreadInputSlices` (within the phase-1 count), so a change in where the
+    /// runtime puts the reader cannot silently mis-size the reads.
+    #[rstest::rstest]
+    #[case::cap_binds(16, Some(4))]
+    #[case::pool_minus_reader(8, None)]
+    #[case::two_threads(2, None)]
+    #[case::one_thread(1, None)]
+    fn native_input_eligible_clones_match_the_planned_placement(
+        #[case] threads: usize,
+        #[case] sort_threads: Option<usize>,
+    ) {
+        let (eligible, built, _tmp) = build_native_sort(
+            vec![Stage::Sort],
+            threads,
+            sort_threads,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let planned = built.pipeline.planned_clone_counts(built.config.threads);
+        let clones = planned
+            .iter()
+            .find(|(n, _)| *n == "PreadInputSlices")
+            .map(|&(_, c)| c)
+            .expect("native path");
+        let phase1 = sort_threads.unwrap_or(clones);
+        assert_eq!(eligible, Some(clones.min(phase1)), "{planned:?}");
+    }
+
+    /// The builder sizes spill slices by its own `AllWorkers` prediction; it
+    /// must equal the built pipeline's real placement plan for
+    /// `PreadSpillSlices` (within the phase-2 count).
+    #[rstest::rstest]
+    #[case::cap_binds(16, Some(4))]
+    #[case::whole_pool(8, None)]
+    #[case::one_thread(1, None)]
+    fn spill_eligible_clones_match_the_planned_placement(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let mut spec = sort_chain_spec(tmp.path(), input, vec![Stage::Sort]);
+        spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+        spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        chain.add_sink().unwrap();
+        let eligible = chain.spill_eligible_clones.expect("add_sort ran");
+        let built = chain.build().unwrap();
+        let planned = built.pipeline.planned_clone_counts(built.config.threads);
+        let clones = planned
+            .iter()
+            .find(|(n, _)| *n == "PreadSpillSlices")
+            .map(|&(_, c)| c)
+            .expect("the spill reads");
+        assert_eq!(eligible, clones.min(merge_threads.unwrap_or(clones)), "{planned:?}");
+    }
+
+    /// The native input path is taken exactly when `--read-streams` asks for
+    /// concurrency: runall pins `Fixed(1)` on every chain (its `ChainSpec`), so a
+    /// runall `sort → group` chain keeps `ReadBgzfBlocks`, while the same chain
+    /// at `auto` reads natively.
+    #[rstest::rstest]
+    #[case::runall_pin(fgumi_bam_io::ReadStreams::Fixed(1), false)]
+    #[case::auto(fgumi_bam_io::ReadStreams::Auto, true)]
+    fn runall_never_takes_the_native_input_path(
+        #[case] read_streams: fgumi_bam_io::ReadStreams,
+        #[case] native: bool,
+    ) {
+        let (eligible, built, _tmp) =
+            build_native_sort(vec![Stage::Sort, Stage::Group], 4, None, read_streams);
+        let dag = built.pipeline.dag();
+        assert_eq!(dag.contains("PlanInputReads"), native, "{dag}");
+        assert_eq!(dag.contains("ReadBgzfBlocks"), !native, "{dag}");
+        assert_eq!(eligible.is_some(), native);
+    }
+
+    /// Build a template-coordinate sort chain over a header-only input (SAM
+    /// when `sam`) after `edit` adjusts its spec; returns the chain's spill
+    /// read-stream policy, its input read-stream policy, the spill planner's
+    /// outstanding-slice cap, and the built pipeline.
+    #[allow(clippy::type_complexity)]
+    fn build_sort_with(
+        sam: bool,
+        stages: Vec<Stage>,
+        edit: impl FnOnce(&mut ChainSpec),
+    ) -> (
+        Arc<fgumi_bam_io::pread::ReadStreamsPolicy>,
+        Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
+        u32,
+        crate::pipeline::chains::finalize::BuiltPipeline,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), sam);
+        let mut spec = sort_chain_spec(tmp.path(), input, stages);
+        edit(&mut spec);
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        let last = spec.stages.len() - 1;
+        for (i, &stage) in spec.stages.iter().enumerate() {
+            let position =
+                if i == last { StagePosition::Terminal } else { StagePosition::Intermediate };
+            chain.add_stage(stage, position).unwrap();
+        }
+        chain.add_sink().unwrap();
+        let spill = chain.spill_read_streams.clone().expect("add_sort ran");
+        let input_policy = chain.read_streams_policy.clone();
+        let slices = chain.spill_inflight_slices.expect("add_sort ran");
+        (spill, input_policy, slices, chain.build().unwrap(), tmp)
+    }
+
+    /// `add_sort` fans the planner out: read requests (branch 0) to
+    /// `PreadSpillSlices → SortSpillDecompress` (a leaf), phase events
+    /// (branch 1) to `SortMerge`, in both stage positions.
+    #[rstest::rstest]
+    #[case::terminal(vec![Stage::Sort], "BgzfCompress")]
+    #[case::intermediate(vec![Stage::Sort, Stage::Group], "DecodeFromRecords")]
+    fn add_sort_fans_the_planner_out_to_pread_and_merge(
+        #[case] stages: Vec<Stage>,
+        #[case] after_merge: &str,
+    ) {
+        let (_, _, _, built, _tmp) = build_sort_with(false, stages, |_| {});
+        let dag = built.pipeline.dag();
+        // A step's block: its `[i] Name …` header and the branch and wake
+        // lines up to the next header.
+        let block = |name: &str| {
+            let lines: Vec<&str> = dag.lines().collect();
+            let start = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('[') && l.contains(&format!("] {name} ")))
+                .unwrap_or_else(|| panic!("no {name} step:\n{dag}"));
+            let end = lines[start + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |n| start + 1 + n);
+            lines[start..end].join("\n")
+        };
+        let planner = block("SpillReadPlanner");
+        assert!(planner.contains("branches=2"), "{planner}");
+        assert!(planner.contains(".0: ") && planner.contains("→ PreadSpillSlices"), "{planner}");
+        assert!(planner.contains(".1: ") && planner.contains("→ SortMerge"), "{planner}");
+        assert!(block("PreadSpillSlices").contains("→ SortSpillDecompress"), "{dag}");
+        let decompress = block("SortSpillDecompress");
+        assert!(decompress.contains("branches=0 (sink)"), "{decompress}");
+        assert!(decompress.contains("wake: (sink) Pool"), "the zero-output cascade: {decompress}");
+        assert!(block("SortMerge").contains(&format!("→ {after_merge}")), "{dag}");
+        let names: Vec<&str> =
+            built.pipeline.stats().snapshot().steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        let at = |n: &str| names.iter().position(|&s| s == n).unwrap_or_else(|| panic!("{n}"));
+        assert!(at("SpillReadPlanner") < at("PreadSpillSlices"));
+        assert!(at("PreadSpillSlices") < at("SortSpillDecompress"));
+        assert!(at("SortSpillDecompress") < at("SortMerge"));
+    }
+
+    /// `PreadSpillSlices` holds the SAME phase-2 cap as `SortSpillDecompress`
+    /// (pointer identity) when `--merge-threads` is given.
+    #[test]
+    fn preadspillslices_has_the_phase2_cap() {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(8) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = Some(4);
+        });
+        let caps = built.pipeline.phase_caps();
+        let cap = |n: &str| caps.iter().find(|(s, _)| *s == n).unwrap_or_else(|| panic!("{n}")).1;
+        assert!(std::ptr::eq(cap("PreadSpillSlices"), cap("SortSpillDecompress")));
+        assert_eq!(cap("PreadSpillSlices").max(), 4);
+    }
+
+    /// The planner's outstanding-slice cap is twice the phase-2 thread count,
+    /// read from `PhaseThreads` — present whether or not a phase-2 cap exists.
+    #[rstest::rstest]
+    #[case::no_merge_threads(8, None, 16)]
+    #[case::merge_threads(8, Some(2), 4)]
+    #[case::one_thread(1, None, 2)]
+    fn planner_sizes_from_phase_threads_without_a_cap(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+        #[case] want: u32,
+    ) {
+        let (_, _, slices, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        });
+        assert_eq!(slices, want);
+        if merge_threads.is_none() {
+            assert!(built.pipeline.phase_caps().is_empty(), "no cap without the flag");
+        }
+    }
+
+    /// The spill reads adopt the native input's ratchet;
+    /// with no input planner (SAM here; stdin and plain gzip decide the same
+    /// way, by having no native input), `auto` is one stream and an explicit
+    /// `--read-streams N` still applies to the spills (always seekable).
+    #[rstest::rstest]
+    #[case::sam_auto(true, fgumi_bam_io::ReadStreams::Auto, 1, false)]
+    #[case::sam_fixed4(true, fgumi_bam_io::ReadStreams::Fixed(4), 4, false)]
+    #[case::sam_fixed2(true, fgumi_bam_io::ReadStreams::Fixed(2), 2, false)]
+    #[case::native_auto(false, fgumi_bam_io::ReadStreams::Auto, 1, true)]
+    #[case::native_fixed4(false, fgumi_bam_io::ReadStreams::Fixed(4), 4, true)]
+    fn spill_planner_policy_for_non_native_input(
+        #[case] sam: bool,
+        #[case] read_streams: fgumi_bam_io::ReadStreams,
+        #[case] streams: usize,
+        #[case] shared: bool,
+    ) {
+        let (spill, input, _, _, _tmp) =
+            build_sort_with(sam, vec![Stage::Sort], |spec| spec.read_streams = read_streams);
+        assert_eq!(spill.streams(), streams);
+        assert_eq!(input.as_ref().is_some_and(|p| Arc::ptr_eq(p, &spill)), shared);
+        assert_eq!(spill.is_auto(), shared && read_streams == fgumi_bam_io::ReadStreams::Auto);
+    }
+
+    /// While the merge is starved the refill walk visits the
+    /// steps at or before its feed forward first (`refill_split` partitions on
+    /// `StepIdx <= through`), so the feed must be the highest-indexed supply
+    /// step: the planner, the spill pread and the decompress step all walk
+    /// before `BgzfCompress`.
+    #[rstest::rstest]
+    #[case::bam_arena_front(false)]
+    #[case::sort_buffer_front(true)]
+    fn starved_walk_visits_planner_pread_and_decompress_before_bgzf_compress(#[case] sam: bool) {
+        let (_, _, _, built, _tmp) = build_sort_with(sam, vec![Stage::Sort], |_| {});
+        assert_sort_refill_source_feeds_decompress(&built);
+        let names: Vec<&str> =
+            built.pipeline.stats().snapshot().steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        let at = |n: &str| names.iter().position(|&s| s == n).unwrap_or_else(|| panic!("{n}"));
+        let through = at("SortSpillDecompress");
+        for supply in ["SpillReadPlanner", "PreadSpillSlices", "SortSpillDecompress"] {
+            assert!(at(supply) <= through, "{supply} walks with the refill: {names:?}");
+        }
+        assert!(at("BgzfCompress") > through, "BgzfCompress walks after the supply: {names:?}");
     }
 
     /// Two stages may each add a hint; the same stage adding twice is a bug.

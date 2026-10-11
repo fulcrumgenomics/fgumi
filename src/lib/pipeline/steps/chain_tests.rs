@@ -132,7 +132,7 @@ fn bgzf_blocks_for(records: &[RawRecord], payload_bytes: usize) -> Vec<BgzfBlock
             assert_eq!(blocks.len(), 1, "payload must fit one BGZF block");
             BgzfBlock {
                 batch_serial: i as u64,
-                bytes: blocks.remove(0).data,
+                bytes: blocks.remove(0).data.into(),
                 uncompressed_size: u32::try_from(payload.len()).expect("payload fits u32"),
                 index: None,
             }
@@ -454,7 +454,7 @@ fn compress_chain_output_decompresses_back_to_the_record_stream(#[values(1, 4)] 
         .lock()
         .expect("mutex not poisoned")
         .iter()
-        .flat_map(|b| b.bytes.clone())
+        .flat_map(|b| b.bytes.to_vec())
         .collect();
     // Read in bounded batches: `read_raw_blocks` pre-allocates `max_blocks`,
     // so it must be given a sane cap rather than "everything".
@@ -668,7 +668,7 @@ fn the_no_header_boundary_variant_consumes_a_header_stripped_stream(
             assert_eq!(blocks.len(), 1);
             BgzfBlock {
                 batch_serial: i as u64,
-                bytes: blocks.remove(0).data,
+                bytes: blocks.remove(0).data.into(),
                 uncompressed_size: u32::try_from(payload.len()).expect("fits u32"),
                 index: None,
             }
@@ -822,7 +822,7 @@ fn a_truncated_record_stream_fails_the_run(#[values(1, 4)] threads: usize) {
             assert_eq!(blocks.len(), 1);
             BgzfBlock {
                 batch_serial: i as u64,
-                bytes: blocks.remove(0).data,
+                bytes: blocks.remove(0).data.into(),
                 uncompressed_size: u32::try_from(payload.len()).expect("fits u32"),
                 index: None,
             }
