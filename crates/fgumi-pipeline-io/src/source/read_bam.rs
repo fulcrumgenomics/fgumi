@@ -363,7 +363,7 @@ mod tests {
         drive_with_opts(path, blocks_per_batch, threads, PipelineReaderOpts::default())
     }
 
-    /// `drive` with explicit reader opts (used to exercise `--read-streams`).
+    /// `drive` with explicit reader opts.
     fn drive_with_opts(
         path: &Path,
         blocks_per_batch: usize,
@@ -413,6 +413,31 @@ mod tests {
         // which is what `FindBamBoundaries` downstream expects to receive.
         let concatenated: Vec<u8> = blocks.iter().flat_map(|b| b.bytes.clone()).collect();
         assert_eq!(concatenated, on_disk[..on_disk.len() - BGZF_EOF_LEN]);
+    }
+
+    #[rstest]
+    #[case::sequential(fgumi_bam_io::ReadStreams::Fixed(1))]
+    #[case::four_streams(fgumi_bam_io::ReadStreams::Fixed(4))]
+    #[case::auto(fgumi_bam_io::ReadStreams::Auto)]
+    fn read_streams_emit_identical_blocks(#[case] read_streams: fgumi_bam_io::ReadStreams) {
+        // The sort's chain-native trio (`PlanInputReads → PreadInputSlices →
+        // FrameBgzfBlocks`) under every `--read-streams` value must yield
+        // byte-identical blocks to this sequential reader. 2000 records keep the
+        // file comfortably larger than the 64-record fixture while staying fast
+        // to build.
+        let (path, _) = temp_bam(2000);
+        let baseline = drive(&path, 4, 1);
+        let actual = crate::source::native_input_tests::read_with_native_trio(
+            &path,
+            fgumi_bam_io::pread::ReadStreamsPolicy::from_flag(read_streams),
+            4,
+        );
+        assert_eq!(actual.len(), baseline.len(), "block count must not depend on read-streams");
+        for (a, b) in actual.iter().zip(baseline.iter()) {
+            assert_eq!(a.batch_serial, b.batch_serial);
+            assert_eq!(a.uncompressed_size, b.uncompressed_size);
+            assert_eq!(a.bytes, b.bytes, "block bytes must be identical across read-streams");
+        }
     }
 
     #[test]

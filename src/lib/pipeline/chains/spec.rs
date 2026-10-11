@@ -30,13 +30,17 @@ pub struct ChainSpec {
     /// When true, the BAM/SAM source is opened with a userspace async
     /// prefetch reader (`--async-reader`), overlapping disk I/O with compute.
     /// Inert for FASTQ sources: both FASTQ decode fronts read the extract
-    /// options' `async_reader` instead (see [`Self::verify_crc`]).
+    /// options' `async_reader` instead (see [`Self::verify_crc`]). Ignored by
+    /// the sort's chain-native input path, which reads positionally on the
+    /// pool (see [`Self::read_streams`]).
     pub async_reader: bool,
-    /// Concurrent positional-read policy for a seekable file source. `Fixed(1)`
-    /// (the default every command but `sort` uses) is the plain
-    /// sequential/async reader; `sort` sets this from its `--read-streams` flag
-    /// to raise the device read queue depth (see
-    /// [`fgumi_bam_io::pread`]).
+    /// Concurrent positional-read policy for a seekable BGZF file source.
+    /// `Fixed(1)` (the default every command but `sort` uses) is the plain
+    /// sequential/async reader; `sort` sets this from its `--read-streams` flag,
+    /// and any other value over a regular BGZF file selects the sort's
+    /// chain-native input path (`PlanInputReads → PreadInputSlices →
+    /// FrameBgzfBlocks`, built from [`fgumi_bam_io::pread`]'s primitives),
+    /// which raises the device read queue depth on the worker pool.
     pub read_streams: ReadStreams,
     /// Whether the BAM source's BGZF decode verifies each block's CRC32. Set
     /// from the command's `--check-crc`/`--no-check-crc` policy (via

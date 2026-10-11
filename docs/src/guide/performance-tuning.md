@@ -314,6 +314,8 @@ When the merge reads spill files, the diag line is followed by the merge-demand 
 - `Pool at stall:` the merge asks the pool for one sleeping worker once per stall episode, before it parks; the outcomes of those requests (`woken`, `all-awake`: no worker was asleep where a request reaches it, `pending`: an earlier request was still unanswered, `unavailable`: no pool to ask), the share of requests that found a sleeping worker (parked on the pool's shared wait, or idling on its own timer), and the stall time of the episodes whose request did. The same outcomes, per step, are the `req_*` columns of the `--pipeline-stats` wake table.
 - `Merge output:` how many output batches the merge flushed early, short of their target size, because it stalled with records already merged.
 
+When the input is read positionally -- a seekable BGZF file at a `--read-streams` other than `1` -- the sort summary also logs `Byte fetch (input):` the input's read requests (count, request size p50 / p90 / min, reads in flight) and the read-stream count: `4 (fixed)` for a pinned count, `1 (auto)` for a ratchet that never rose, or the ratchet's history (`1 -> 2 (fill 8) -> 4 (fill 16); starved 31% -> 28%`: each step, the fill it happened at, and the share of each window the device starved the framer).
+
 Only when the sort spills nothing *and* fits in a single in-memory chunk does no k-way merge run; there it instead prints one `Sort fast-path diag: ...` line noting the single-chunk in-memory fast path was taken. Off by default; it is instrumentation for performance work, read from a log with a `grep`.
 
 ### Scheduler Strategy (legacy, inert)

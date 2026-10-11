@@ -245,6 +245,18 @@ impl InputSource {
         }
     }
 
+    /// Parse the BAM header from an already-open BGZF file, read from its
+    /// current offset (the sort's native input path, which reads the body
+    /// positionally from the same open file, so header and body cannot come
+    /// from two different files). `path` names the file in errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the read or the BAM-header parse.
+    pub fn open_bgzf_file(file: File, path: &Path) -> io::Result<Self> {
+        open_bam_from_boxed_buf(buffered(file), &path.display().to_string())
+    }
+
     /// Borrow the parsed header. Common for both variants.
     #[must_use]
     pub fn header(&self) -> &sam::Header {
@@ -354,6 +366,12 @@ fn buffered<R: Read + Send + 'static>(reader: R) -> Box<dyn BufRead + Send> {
 /// re-open-at-byte-0 path via `create_bam_reader_for_pipeline_with_opts`
 /// and never reach this function.
 fn open_bam_from_stdin_boxed_buf(buf: Box<dyn BufRead + Send>) -> io::Result<InputSource> {
+    open_bam_from_boxed_buf(buf, "stdin")
+}
+
+/// [`open_bam_from_stdin_boxed_buf`] for any buffered BAM stream; `subject`
+/// names it in the header-parse error.
+fn open_bam_from_boxed_buf(buf: Box<dyn BufRead + Send>, subject: &str) -> io::Result<InputSource> {
     let tee = TeeReader::new(buf);
     let bgzf = BgzfReader::new(tee);
     let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
@@ -362,7 +380,7 @@ fn open_bam_from_stdin_boxed_buf(buf: Box<dyn BufRead + Send>) -> io::Result<Inp
         // Preserve the source kind: a truncated header arrives as
         // `UnexpectedEof`, and flattening it to `Other` loses the one signal a
         // caller can branch on. Same policy as `open_error`/`open_bam_error`.
-        .map_err(|e| io::Error::new(e.kind(), format!("read BAM header from stdin: {e}")))?;
+        .map_err(|e| io::Error::new(e.kind(), format!("read BAM header from {subject}: {e}")))?;
     let bgzf = bam_reader.into_inner();
     let tee = bgzf.into_inner();
     let (buffered, remaining) = tee.into_parts();

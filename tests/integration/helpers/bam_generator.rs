@@ -321,6 +321,38 @@ pub fn create_umi_family_at_pos(
         .collect()
 }
 
+/// `SplitMix64`: a fixed, dependency-free mixer for seeded fixture shuffles.
+/// Deliberately not a `rand` generator: `StdRng`'s stream may change between
+/// `rand` releases, and the tests that need several merge sources or a
+/// parks/`gated_off` split must keep reading the same, reviewed input.
+#[must_use]
+pub fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// `families` three-read UMI families at `seed`ed pseudo-random positions on
+/// `chr1`, in generation order, so the records are NOT coordinate-sorted.
+/// Every tenth family reuses the previous family's position, so equal
+/// coordinate keys exist across families; names are hashed, so name order is
+/// not index order either. Frozen: the sort-stats and native-read suites
+/// depend on these exact records.
+#[must_use]
+pub fn shuffled_umi_families(families: usize, seed: u64) -> Vec<RawRecord> {
+    let mut pos = 1usize;
+    (0..families)
+        .flat_map(|i| {
+            let h = splitmix64(seed ^ (i as u64));
+            if i % 10 != 9 {
+                pos = 1 + usize::try_from(h % 90_000).expect("fits");
+            }
+            create_umi_family_at_pos("ACGT", 3, &format!("fam_{h:016x}"), "ACGTACGTAC", 35, pos)
+        })
+        .collect()
+}
+
 /// Like [`create_umi_family`] but tags each read with an arbitrary `SamTag`
 /// (e.g. `SamTag::RX` for UMI mode or `SamTag::BC` for barcode mode).
 pub fn create_family_with_tag(
