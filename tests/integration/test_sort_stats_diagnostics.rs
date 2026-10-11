@@ -408,7 +408,6 @@ fn sort_stats_gates_merge_demand_lines(
         "Pool at stall:",
         "Merge prediction:",
         "Consumer served itself:",
-        "Merge output:",
     ] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
     }

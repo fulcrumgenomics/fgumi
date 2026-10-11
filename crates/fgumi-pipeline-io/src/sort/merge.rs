@@ -552,7 +552,9 @@ fn attach<K: fgumi_sort::RawSortKey + Default + Send + 'static>(
 
 enum NextBatch<I> {
     Batch(I),
-    Stalled(Option<I>),
+    /// The driver stalled on a slot. Nothing is emitted: the partial batch
+    /// stays in the builder until it fills or the merge is `Done`.
+    Stalled,
     Done(Option<I>, u64),
 }
 
@@ -1146,10 +1148,9 @@ impl<O: MergeOutput> SortMerge<O> {
     /// outcome is known. A `Contention` parks the driver until the awaited
     /// slot's delivery (or its idle timer), so it is a parking registration.
     /// Any other outcome runs the merge again before it parks — after a stall
-    /// that flushed a partial batch, or with that batch held on a full output
-    /// edge — so the registration is withdrawn: a delivery must not unpark a
-    /// merge that is not waiting on it, and the next stall re-registers (and
-    /// re-checks) before any park.
+    /// in a dispatch that delivered a batch — so the registration is
+    /// withdrawn: a delivery must not unpark a merge that is not waiting on
+    /// it, and the next stall re-registers (and re-checks) before any park.
     fn settle_await(&mut self, outcome: &io::Result<StepOutcome>) {
         if !std::mem::take(&mut self.awaiting) {
             return;
@@ -1305,13 +1306,11 @@ impl<O: MergeOutput> SortMerge<O> {
                         *awaiting = true;
                         episode.begin(d, slot);
                     }
-                    let partial = flush_partial(builder, next_ordinal);
-                    if partial.is_some()
-                        && let Some(d) = demand
-                    {
-                        d.stats().record_partial_flush();
-                    }
-                    return Ok(NextBatch::Stalled(partial));
+                    // The partial batch stays in the builder: a batch closes
+                    // only when it is full (count or byte cap) or at `Done`.
+                    // The state persists in `Merging`, so the next call keeps
+                    // filling it.
+                    return Ok(NextBatch::Stalled);
                 }
                 MergeStep::Done => {
                     // The last episode (typically a run-end EOF stall) ends here.
@@ -1351,26 +1350,11 @@ impl<O: MergeOutput> SortMerge<O> {
                         return Ok(StepOutcome::Progress);
                     }
                 }
-                NextBatch::Stalled(partial) => {
+                NextBatch::Stalled => {
                     // INPUT-STARVED: the driver couldn't advance because the
-                    // winning source's next block isn't decompressed yet.
+                    // winning source's next block isn't decompressed yet. The
+                    // partial batch stays in the builder.
                     self.dbg.stalls += 1;
-                    if let Some(batch) = partial {
-                        if let Err(unpushed) = ctx.outputs.push(batch) {
-                            self.dbg.output_full += 1;
-                            self.held.put(unpushed);
-                            // Blocked on the output edge now, not on the
-                            // supply: until the held batch goes out, refilling
-                            // the spill supply first would only starve the
-                            // steps that drain this edge. The episode stays
-                            // open; the next stall raises `starved` again.
-                            if let Some(d) = &self.demand {
-                                d.set_starved(false);
-                            }
-                            return Ok(StepOutcome::Progress);
-                        }
-                        delivered += 1;
-                    }
                     return Ok(if delivered > 0 {
                         self.dbg.progress_dispatches += 1;
                         StepOutcome::Progress
@@ -1540,7 +1524,7 @@ impl<O: MergeOutput> SortMerge<O> {
                         return Ok(StepOutcome::Progress);
                     }
                 }
-                NextBatch::Stalled(_) => unreachable!("FastPath never stalls (all in memory)"),
+                NextBatch::Stalled => unreachable!("FastPath never stalls (all in memory)"),
                 NextBatch::Done(partial, count) => {
                     if let Some(batch) = partial {
                         if let Err(unpushed) = ctx.outputs.push(batch) {
