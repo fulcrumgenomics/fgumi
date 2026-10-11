@@ -29,6 +29,7 @@ pub(crate) use drain::StepDrainCounter;
 pub(crate) use driver::run_worker_loop;
 pub use event_count::{NotifyOutcome, PoolEventCount, WaitKey, WaitOutcome};
 pub(crate) use fused::{run_fused_single_thread, should_fuse_single_thread};
+pub use placement::{ParallelHosts, parallel_hosts};
 pub(crate) use pool::{assign_exclusive_owners, assign_sticky_owners};
 pub use scheduler::{
     ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, RefillSource, Scheduler,

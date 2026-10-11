@@ -19,6 +19,8 @@ pub mod pread;
 pub mod sink;
 pub mod sort;
 pub mod source;
+#[cfg(any(test, feature = "test-utils"))]
+mod test_hook;
 pub mod types;
 
 pub use fgumi_pipeline_core::HeaderHandle;

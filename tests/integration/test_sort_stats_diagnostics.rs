@@ -32,7 +32,8 @@ use fgumi_lib::sam::SamTag;
 
 use crate::helpers::assertions::{assert_bam_sorted, string_tag};
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_umi_family, create_umi_family_at_pos, write_bam,
+    create_minimal_header, create_umi_family, create_umi_family_at_pos, shuffled_umi_families,
+    write_bam,
 };
 
 /// The stable substring pinning the `SortMerge` k-way-merge diagnostic line
@@ -206,34 +207,13 @@ fn log_body(line: &str) -> &str {
     line.split_once("] ").map_or(line, |(_, body)| body)
 }
 
-/// `SplitMix64`: a fixed, dependency-free mixer for seeded fixture shuffles.
-/// Deliberately not a `rand` generator: `StdRng`'s stream may change between
-/// `rand` releases, and the tests that need several merge sources or a
-/// parks/`gated_off` split must keep reading the same, reviewed input.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
 /// Writes a BAM of `families` three-read UMI families at seeded pseudo-random
 /// positions, in generation order, so the file is NOT coordinate-sorted. Every
 /// tenth family reuses the previous family's position, so equal coordinate keys
 /// exist across families. Names are hashed so name order is not index order either.
 fn write_shuffled_bam_fixture(path: &Path, families: usize, seed: u64) {
     let header = create_minimal_header("chr1", 100_000);
-    let mut pos = 1usize;
-    let records: Vec<_> = (0..families)
-        .flat_map(|i| {
-            let h = splitmix64(seed ^ (i as u64));
-            if i % 10 != 9 {
-                pos = 1 + usize::try_from(h % 90_000).expect("fits");
-            }
-            create_umi_family_at_pos("ACGT", 3, &format!("fam_{h:016x}"), "ACGTACGTAC", 35, pos)
-        })
-        .collect();
-    write_bam(path, &header, &records);
+    write_bam(path, &header, &shuffled_umi_families(families, seed));
 }
 
 /// Runs `fgumi sort --order <order>` on the shuffled fixture at info verbosity
@@ -424,6 +404,22 @@ fn sort_stats_gates_merge_demand_lines(
     assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
     for needle in ["Merge demand:", "Awaited slot at stall:", "Pool at stall:", "Merge output:"] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
+    }
+}
+
+/// `Byte fetch (input):` is gated on `--sort-stats` on the native input path
+/// (the fixture is a regular BGZF file at the default `--read-streams auto`),
+/// and its request histogram is populated, not merely rendered.
+#[rstest]
+fn sort_stats_gates_the_input_byte_fetch_line(#[values(false, true)] with_flag: bool) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with("coordinate", extra);
+    let line =
+        stderr.lines().map(log_body).find_map(|l| l.trim().strip_prefix("Byte fetch (input): "));
+    assert_eq!(line.is_some(), with_flag, "`Byte fetch (input):` presence:\n{stderr}");
+    if let Some(rest) = line {
+        let slices: u64 = rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap();
+        assert!(slices > 0, "the input histogram recorded no reads: {rest}");
     }
 }
 

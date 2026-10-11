@@ -934,8 +934,9 @@ impl Sort {
             queue_memory: self.queue_memory_options(),
             async_reader: false,
             // Thread the sort command's --read-streams into the chain's BAM
-            // source: Auto probes the device and picks a concurrent-read count,
-            // Fixed(n) pins it, Fixed(1) is the plain sequential reader.
+            // source: anything but Fixed(1) over a regular BGZF file selects the
+            // chain-native input reads (Auto ratchets the stream count, Fixed(n)
+            // pins it); Fixed(1) is the plain sequential reader.
             read_streams: self.read_streams,
             // Same policy every other BAM command uses (`resolve_check_crc`):
             // explicit flag wins, else verify file input and trust stdin. This

@@ -51,12 +51,68 @@ pub(crate) struct SortSummaryFinalizeHook {
     /// `--merge-threads` — reported as high-water marks. Empty when neither
     /// flag was given (no cap exists).
     pub(crate) phase_caps: Vec<Arc<fgumi_pipeline_core::PhaseCap>>,
+    /// The chain-native input path's request sizes and read-stream policy,
+    /// reported as the `Byte fetch (input):` line; `Some` only under
+    /// `--sort-stats` on that path.
+    pub(crate) input_fetch: Option<InputFetchReport>,
+}
+
+/// What the `Byte fetch (input):` line reports.
+pub(crate) struct InputFetchReport {
+    pub(crate) hist: Arc<fgumi_pipeline_io::pread::RequestSizeHist>,
+    pub(crate) policy: Arc<fgumi_bam_io::pread::ReadStreamsPolicy>,
+}
+
+impl InputFetchReport {
+    /// `Byte fetch (input): N slices, request size p50 … p90 … min …; in-flight
+    /// slices mean … max …; read streams: …`, where the read-streams history is
+    /// `1 -> 2 (fill 8) -> 4 (fill 16); starved 31% -> 28%` for a ratchet that
+    /// rose, `1 (auto)` for one that never did, and `4 (fixed)` for a pinned
+    /// count.
+    pub(crate) fn line(&self) -> String {
+        let (p50, p90, min) = self.hist.p50_p90_min();
+        let (mean, max) = self.hist.inflight_mean_max();
+        let history = self.policy.history();
+        let streams = if !self.policy.is_auto() {
+            format!("{} (fixed)", self.policy.streams())
+        } else if history.is_empty() {
+            format!("{} (auto)", self.policy.streams())
+        } else {
+            let steps = history.iter().fold(String::new(), |mut acc, h| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, " -> {} (fill {})", h.streams, h.fill_index);
+                acc
+            });
+            let starved: Vec<String> =
+                history.iter().map(|h| format!("{}%", h.starved_pct)).collect();
+            format!("1{steps}; starved {}", starved.join(" -> "))
+        };
+        format!(
+            "Byte fetch (input): {} slices, request size p50 {} p90 {} min {}; in-flight \
+             slices mean {mean:.1} max {max}; read streams: {streams}",
+            self.hist.count(),
+            kib(p50),
+            kib(p90),
+            kib(min),
+        )
+    }
+}
+
+/// `n` bytes as whole KiB (`"512 KiB"`).
+fn kib(n: u64) -> String {
+    format!("{} KiB", n >> 10)
 }
 
 impl FinalizeHook for SortSummaryFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let SortSummaryFinalizeHook { stats_slot, spill_stats, output_path, timer, phase_caps } =
-            *self;
+        let SortSummaryFinalizeHook {
+            stats_slot,
+            spill_stats,
+            output_path,
+            timer,
+            phase_caps,
+            input_fetch,
+        } = *self;
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
         info!("Records processed: {}", stats.total_records);
@@ -75,6 +131,9 @@ impl FinalizeHook for SortSummaryFinalizeHook {
                 );
             }
             info!("Merge sources: {}", spill.merge_sources());
+        }
+        if let Some(fetch) = &input_fetch {
+            info!("{}", fetch.line());
         }
         if !phase_caps.is_empty() {
             // `peak` = most workers inside the phase at once, against its
@@ -183,7 +242,10 @@ impl SortPhase {
     /// only when the new name is added to both this match and that case table).
     fn from_step_name(name: &str) -> Option<SortPhase> {
         match name {
-            "ReadBlocks" | "InflateToArena" => Some(SortPhase::ReadDecompress),
+            // The chain-native input reads (`PlanInputReads → PreadInputSlices →
+            // FrameBgzfBlocks`) are the read half of this phase.
+            "PlanInputReads" | "PreadInputSlices" | "FrameBgzfBlocks" | "ReadBlocks"
+            | "InflateToArena" => Some(SortPhase::ReadDecompress),
             "FindBoundariesAndSort" | "SortBuffer" => Some(SortPhase::InMemorySort),
             // `CompressSpill` is the fused compress-and-write spill variant
             // (`SortBuffer → CompressSpill → …`); `add_sort` currently wires the
@@ -306,6 +368,51 @@ mod tests {
     // `cargo t`, which runs every test in one process.
     use crate::commands::common::test_log_capture::{capture_logs, captured};
 
+    /// The `Byte fetch (input):` line renders each policy kind and the
+    /// request-size histogram (sizes as bucket lower bounds, in KiB).
+    #[rstest]
+    #[case::fixed(fgumi_bam_io::ReadStreams::Fixed(4), false, "read streams: 4 (fixed)")]
+    #[case::auto_flat(fgumi_bam_io::ReadStreams::Auto, false, "read streams: 1 (auto)")]
+    #[case::auto_rose(
+        fgumi_bam_io::ReadStreams::Auto,
+        true,
+        "read streams: 1 -> 2 (fill 8) -> 4 (fill 16); starved "
+    )]
+    fn input_fetch_line_renders_the_policy(
+        #[case] rs: fgumi_bam_io::ReadStreams,
+        #[case] starve: bool,
+        #[case] want: &str,
+    ) {
+        let policy = fgumi_bam_io::pread::ReadStreamsPolicy::from_flag(rs);
+        if starve {
+            let mut now = std::time::Instant::now();
+            for _ in 0..17 {
+                now += std::time::Duration::from_millis(1);
+                policy.observe_at(now, true, 1);
+            }
+        }
+        let hist = Arc::new(fgumi_pipeline_io::pread::RequestSizeHist::default());
+        hist.record(1 << 20);
+        hist.record(1 << 20);
+        hist.record(512 << 10);
+        let line = InputFetchReport { hist, policy }.line();
+        assert!(
+            line.starts_with(
+                "Byte fetch (input): 3 slices, request size p50 1024 KiB p90 1024 KiB min 512 KiB;"
+            ),
+            "{line}"
+        );
+        // The first window's share depends on when the policy was created
+        // relative to the first visit, so the rose case pins the history and
+        // stops before the percentages.
+        assert!(line.contains(want), "{line}");
+        if starve {
+            assert!(line.ends_with("% -> 100%"), "{line}");
+        } else {
+            assert!(line.ends_with(want), "{line}");
+        }
+    }
+
     /// `SortSummaryFinalizeHook::finalize` must log the "Spill runs:" wording
     /// the owned `execute_sort` engine uses (`src/lib/commands/sort.rs`), not
     /// the chain's former "Temporary runs:" wording -- `test_streaming_output`
@@ -324,6 +431,7 @@ mod tests {
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
+            input_fetch: None,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -361,6 +469,7 @@ mod tests {
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
+            input_fetch: None,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -389,6 +498,7 @@ mod tests {
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: vec![phase1, phase2],
+            input_fetch: None,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
         let logs = captured();
@@ -527,6 +637,9 @@ mod tests {
     /// arm); it does catch an accidental change to which phase an existing name
     /// maps to.
     #[rstest]
+    #[case::plan_input_reads("PlanInputReads", SortPhase::ReadDecompress)]
+    #[case::pread_input_slices("PreadInputSlices", SortPhase::ReadDecompress)]
+    #[case::frame_bgzf_blocks("FrameBgzfBlocks", SortPhase::ReadDecompress)]
     #[case::read_blocks("ReadBlocks", SortPhase::ReadDecompress)]
     #[case::inflate("InflateToArena", SortPhase::ReadDecompress)]
     #[case::find_and_sort("FindBoundariesAndSort", SortPhase::InMemorySort)]
