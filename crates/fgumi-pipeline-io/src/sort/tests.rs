@@ -3069,7 +3069,7 @@ fn bgzf_blocks_for(
             assert_eq!(blocks.len(), 1, "payload must fit one BGZF block");
             crate::types::BgzfBlock {
                 batch_serial: i as u64,
-                bytes: blocks.remove(0).data,
+                bytes: blocks.remove(0).data.into(),
                 uncompressed_size: u32::try_from(payload.len()).expect("payload fits u32"),
                 index: None,
             }

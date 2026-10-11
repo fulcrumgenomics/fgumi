@@ -151,7 +151,7 @@ impl BgzfCompress {
             (self.assemble_output_bytes(), None)
         };
 
-        let out = BgzfBlock { batch_serial, bytes, uncompressed_size, index };
+        let out = BgzfBlock { batch_serial, bytes: bytes.into(), uncompressed_size, index };
         match ctx.outputs.push(out) {
             Ok(()) => Ok(StepOutcome::Progress),
             Err(unpushed) => {

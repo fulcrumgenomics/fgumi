@@ -3,7 +3,10 @@
 //! Consumes the [`ReadSlice`]s `PreadInputSlices` produces, in file order (its
 //! edge is ordinal-ordered), and emits [`BgzfBlock`]s exactly as
 //! `ReadBgzfBlocks` does: `batch_serial` dense from 0, EOF-marker blocks
-//! skipped, `uncompressed_size` from the footer, `index: None`. The framing
+//! skipped, `uncompressed_size` from the footer, `index: None` — except that a
+//! block lying wholly inside its slice borrows it ([`RawFrame::Borrowed`])
+//! instead of being copied, and only a block that straddled two slices is
+//! owned. The framing
 //! is [`BgzfSliceFramer`]'s, which applies the same header checks as the
 //! sequential reader; a stream that ends inside a block fails with
 //! `UnexpectedEof`.
@@ -18,6 +21,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use fgumi_bam_io::pread::RawFrame;
 use fgumi_bgzf::reader::{BgzfSliceFramer, SliceFrame, uncompressed_size};
 use fgumi_pipeline_core::{
     HeldRetry, Unpushed,
@@ -69,9 +73,12 @@ impl FrameBgzfBlocks {
         self.frames.clear();
         self.framer.push(&slice.bytes, &mut self.frames)?;
         for frame in self.frames.drain(..) {
+            // A block wholly inside the slice borrows it (zero copy; the slice
+            // returns to its pool when the last such block drops); only a block
+            // that straddled slices was reassembled into an owned buffer.
             let bytes = match frame {
-                SliceFrame::Within(r) => slice.bytes[r].to_vec(),
-                SliceFrame::Carried(v) => v,
+                SliceFrame::Within(r) => RawFrame::borrowed(&slice.bytes, r),
+                SliceFrame::Carried(v) => RawFrame::Owned(v),
             };
             // Checked: rejects a footer claiming more than one BGZF block's
             // worth (64 KiB), so the cast below cannot truncate.
