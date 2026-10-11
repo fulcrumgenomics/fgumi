@@ -1,14 +1,16 @@
 //! `StepDrainCounter`: coordinates last-worker-wins for closing a step's
 //! shared output queue when it reports `StepOutcome::Finished`.
 //!
-//! For `Parallel` steps, init to N (= worker count). Each clone returns
+//! For `Parallel` steps, init to the clone count (`ParallelHosts::clone_count()`:
+//! the step's host workers, or 1 when its clone is hosted on a driver). Each
+//! clone returns
 //! `Finished` independently when the shared input edge drains; each calls
 //! `observe_drain`, and the clone that takes the counter to 0 is the "last
 //! worker" — only it calls `mark_outputs_drained` (closing the shared output).
 //! Otherwise a clone could close the output while a sibling is still pushing.
 //!
-//! For `Serial` / `Exclusive` steps, init to 1. The single finisher wins on
-//! its first call.
+//! For `Serial` / `Exclusive` / `Detached` steps, init to 1. The single
+//! finisher wins on its first call.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -24,6 +26,14 @@ impl StepDrainCounter {
     #[must_use]
     pub fn new(initial: usize) -> Arc<Self> {
         Arc::new(Self { remaining: AtomicUsize::new(initial) })
+    }
+
+    /// The clones still to finish: the initial budget until the first
+    /// `observe_drain`. Read before a run to check a counter matches the
+    /// instances that will observe it.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.remaining.load(AtomicOrdering::Acquire)
     }
 
     /// Called by a worker when it observes drain on this step. Returns
@@ -68,6 +78,14 @@ mod tests {
         assert!(!counter.observe_drain());
         assert!(!counter.observe_drain());
         assert!(counter.observe_drain());
+    }
+
+    #[test]
+    fn remaining_reports_the_budget_left() {
+        let counter = StepDrainCounter::new(3);
+        assert_eq!(counter.remaining(), 3);
+        counter.observe_drain();
+        assert_eq!(counter.remaining(), 2);
     }
 
     #[test]

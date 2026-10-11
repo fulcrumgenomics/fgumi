@@ -244,6 +244,12 @@ of records) and a safe rewrite measurably regresses sort throughput.
   identical ref order yields identical output bytes. That is a sound inference,
   but it is an inference, and a change that broke the materialization step would
   not be caught by either test.
+- **`crates/fgumi-sort/src/prefetch.rs`** — two cfg-gated `#[allow(unsafe_code)]`
+  sites in `prefetch_read_l1`: one `prfm pldl1keep` (`aarch64`) / `_mm_prefetch`
+  (`x86_64`) per call. SAFETY: both are non-faulting hints over a live `&u8`; they
+  never read or write observable memory. The one copy for the sort engine (the
+  arena boundary scan in `fgumi-pipeline-io` and the batched template key
+  extraction both import it).
 - **`crates/fgumi-sort/src/segmented_buf.rs`** — two `#[allow(unsafe_code)]`
   sites backing the arena record buffer (a segmented, append-only `Vec<u8>` the
   sort engine decompresses/frames records into without per-record allocation):
@@ -284,6 +290,37 @@ of records) and a safe rewrite measurably regresses sort throughput.
     ingest runs once per record over millions-to-billions of records, and a safe
     rewrite (zero-fill on grow, or an owning `Vec` per slot) measurably regresses
     sort throughput.
+
+### Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)
+
+The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`)
+inflates BGZF blocks in parallel straight into one shared arena segment and scans
+the records in place. It calls the two approved `SegmentedBuf` methods above
+(`grow_uninit`, `slice_mut`) at three production `#[allow(unsafe_code)]` sites,
+under their documented contracts. Approved for the same reason as those methods:
+the ingest runs once per BGZF block over millions of blocks, and the safe
+alternatives (zero-filling the segment, or inflating into an owned buffer and
+copying it into the arena) add a full extra pass over every inflated byte.
+
+- `ReadBlocks::ensure_arena` — one `grow_uninit(segment_size)` that grows the
+  whole segment once, on the serial admit path, before the arena is wrapped in an
+  `Arc` or any slot is handed out. SAFETY: sole writer with no live borrow;
+  `reserve_full_capacity` just guaranteed the capacity, so the grow cannot
+  reallocate; every live byte is written exactly once (block slots by their
+  inflate worker, the front region by the straddler carry) before any read, and
+  bytes never written are never sliced.
+- `InflateToArena::inflate_one` — one `slice_mut(offset, len)` over the block's
+  slot. SAFETY: the slot was grown before the block was enqueued; the ISIZE
+  prefix sum partitions the arena into disjoint slots, so no two workers' `&mut`
+  overlap; `decompress_into_slice_with_crc` fills every byte before any read.
+- `FindBoundariesAndSort::ingest_block` — one `slice_mut` writing the previous
+  run's straddler carry right-aligned into `[FRONT_REGION - l, FRONT_REGION)`.
+  SAFETY: that range lies strictly below `FRONT_REGION`, where no inflate slot
+  ever lies, so it aliases no slot a worker is writing; the segment was frozen by
+  `reserve_full_capacity` before sharing, so no grow can move it.
+
+The prefetch hint this front also uses is `fgumi-sort`'s `prefetch_read_l1`
+(listed above); `fgumi-pipeline-io` has no intrinsic of its own.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 
@@ -413,8 +450,10 @@ directly. In `fgumi-sort` those are `segmented_buf.rs` (8), `ref_sort.rs` (3),
 and `chunk_sorter.rs` (2), all of them driving `SegmentedBuf::grow_uninit` /
 `slice_mut` to check a reserve-then-write round-trip, or that a sorted chunk
 matches its oracle. In `fgumi-raw-bam` they are the `compare_nul` helper and the
-`proptest` agreement test in `src/sort.rs`, both already named above. They add no
-new `unsafe` *surface*: each calls a function already justified above, under that
+`proptest` agreement test in `src/sort.rs`, both already named above. In
+`fgumi-pipeline-io` they are the eight test functions in `sort/arena_ingest.rs`
+that build an arena by hand with `grow_uninit` / `slice_mut`. They add no new
+`unsafe` *surface*: each calls a function already justified above, under that
 function's documented contract.
 
 A raw `grep -c 'allow(unsafe_code)'` over either crate therefore reports more

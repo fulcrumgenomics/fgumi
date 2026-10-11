@@ -24,7 +24,10 @@
 //! of the pool loop. Several detached steps sharing a
 //! [`DetachedGroup::Shared`](crate::step::DetachedGroup) label are driven by ONE
 //! thread that round-robins them; [`DetachedGroup::PerStep`] (the default) keeps
-//! one thread per step.
+//! one thread per step. A driver group may also host one `Parallel` step's
+//! single clone (`PoolPlacement::ExcludeReader` at one worker, on its Detached
+//! producer's driver): [`extract_hosted_parallel_steps`] inserts it in chain
+//! order, and its drain counter is 1.
 //!
 //! Because the group's steps and their phases are temporally disjoint (e.g. the
 //! sort's phase-1 admit/sort/frame finish and leave the live set before the
@@ -62,24 +65,30 @@ use crate::erased::{ErasedStep, ErasedStepCtx};
 use crate::runtime::contexts::ChainContexts;
 use crate::runtime::drain::StepDrainCounter;
 use crate::runtime::driver::run_worker_loop;
+use crate::runtime::placement::ParallelHosts;
 use crate::runtime::scheduler::DrainFirstScheduler;
 use crate::runtime::stats::PipelineStats;
 use crate::runtime::storage::WorkerStepEntry;
 use crate::runtime::worker_core::WorkerCore;
 use crate::signal::PipelineSignal;
-use crate::step::{Affinity, DetachedGroup, OutputsViewAny, StepKind, StepOutcome, StepProfile};
+use crate::step::{
+    Affinity, DetachedGroup, OutputsViewAny, PoolPlacement, StepKind, StepOutcome, StepProfile,
+};
 use crate::topology::StepIdx;
 
-/// Sentinel left in the chain's `steps` vec in place of a `Detached` step after
-/// its real instance has been extracted for its dedicated thread (see
-/// [`extract_detached_steps`]). Keeping a same-position placeholder preserves
-/// the `step_idx`-aligned indexing that `build_worker_storage` and
-/// `ChainContexts` rely on. `build_worker_storage` only reads `kind()` (matches
-/// `Detached` → every worker gets `Skip`) and then drops the box, so the
-/// placeholder never has any other method invoked; they panic to catch a
-/// framework bug if one ever is.
-struct DetachedPlaceholder {
+/// Sentinel left in the chain's `steps` vec in place of a step whose real
+/// instance moved onto a driver thread: a `Detached` step
+/// ([`extract_detached_steps`]) or a `Parallel` step's single hosted clone
+/// ([`extract_hosted_parallel_steps`]). Keeping a same-position placeholder
+/// preserves the `step_idx`-aligned indexing that `build_worker_storage` and
+/// `ChainContexts` rely on. It reports the moved step's cached `name`, `kind`,
+/// `detached_group` and `pool_placement` — `build_worker_storage` reads only
+/// `kind()` (`Detached`, or a `Parallel` step with no host worker: every worker
+/// gets `Skip`) and then drops the box — and every other method panics, to
+/// catch a framework bug if one is ever invoked.
+struct ExtractedPlaceholder {
     name: &'static str,
+    kind: StepKind,
     /// The real step's group, carried through the swap.
     ///
     /// Not consulted on the run path — `extract_detached_steps` reads the real
@@ -90,20 +99,42 @@ struct DetachedPlaceholder {
     /// group across separate driver threads. `profile()` panics for the same
     /// class of reason — returning fabricated metadata misinforms that caller.
     group: DetachedGroup,
+    /// The real step's placement, carried through the swap like `group`.
+    placement: PoolPlacement,
 }
 
-impl ErasedStep for DetachedPlaceholder {
+impl ExtractedPlaceholder {
+    /// The placeholder of `real`, which is about to move onto a driver thread.
+    fn of(real: &dyn ErasedStep) -> Self {
+        Self {
+            name: real.name(),
+            kind: real.kind(),
+            group: real.detached_group(),
+            placement: real.pool_placement(),
+        }
+    }
+
+    fn moved(&self, method: &str) -> ! {
+        panic!(
+            "ExtractedPlaceholder::{method} invoked for {:?} ({:?}) — the real instance runs on \
+             its driver thread",
+            self.name, self.kind
+        );
+    }
+}
+
+impl ErasedStep for ExtractedPlaceholder {
     fn profile(&self) -> StepProfile {
         // Panics like every other placeholder method rather than returning empty
-        // `output_queues` / `branch_ordering`. `Pipeline::run` reads
-        // `step.profile().kind` for the drain counters BEFORE
-        // `extract_detached_steps` swaps these in, and everything after reads the
-        // cached `kind()` / `name()` accessors — so nothing on the run path calls
-        // this. But `extract_detached_steps` is `pub` and leaves placeholders in
-        // the caller's slice: silently reporting "no outputs" for a step that
+        // `output_queues` / `branch_ordering`. `Pipeline::run` computes the drain
+        // counters AFTER the steps are extracted, from the cached `kind()`
+        // accessor, and everything else after extraction reads the cached
+        // accessors too — so nothing on the run path calls this. But
+        // `extract_detached_steps` is `pub` and leaves placeholders in the
+        // caller's slice: silently reporting "no outputs" for a step that
         // declares them would misinform any later caller.
         panic!(
-            "DetachedPlaceholder::profile invoked for {:?} — the real instance was extracted; \
+            "ExtractedPlaceholder::profile invoked for {:?} — the real instance was extracted; \
              read the cached kind()/name() accessors instead",
             self.name
         );
@@ -112,7 +143,7 @@ impl ErasedStep for DetachedPlaceholder {
         self.name
     }
     fn kind(&self) -> StepKind {
-        StepKind::Detached
+        self.kind
     }
     fn sticky(&self) -> bool {
         false
@@ -125,61 +156,66 @@ impl ErasedStep for DetachedPlaceholder {
         // step that declared `Shared(..)`.
         self.group
     }
+    fn pool_placement(&self) -> PoolPlacement {
+        self.placement
+    }
     fn try_run_erased(&mut self, _ctx: &mut ErasedStepCtx<'_>) -> std::io::Result<StepOutcome> {
-        panic!("DetachedPlaceholder::try_run_erased invoked — the real instance was extracted");
+        self.moved("try_run_erased")
     }
     fn clone_boxed(&self) -> Box<dyn ErasedStep> {
-        panic!("DetachedPlaceholder::clone_boxed invoked — placeholder is never cloned");
+        self.moved("clone_boxed")
     }
     fn build_input_handle(
         &self,
         _producer_set: &mut crate::handles::OutputQueueSet,
         _branch_idx: usize,
     ) -> Box<dyn Any + Send + Sync> {
-        panic!("DetachedPlaceholder::build_input_handle invoked");
+        self.moved("build_input_handle")
     }
     fn build_output_set(
         &self,
         _level: crate::builder::InstrumentationLevel,
     ) -> (crate::handles::OutputQueueSet, OutputsViewAny) {
-        panic!("DetachedPlaceholder::build_output_set invoked");
+        self.moved("build_output_set")
     }
     fn build_fused_output_set(
         &self,
         _level: crate::builder::InstrumentationLevel,
     ) -> (crate::handles::OutputQueueSet, OutputsViewAny) {
-        panic!("DetachedPlaceholder::build_fused_output_set invoked");
+        self.moved("build_fused_output_set")
     }
     fn wrap_outputs_view(&self, _view: OutputsViewAny) -> Box<dyn Any + Send + Sync> {
-        panic!("DetachedPlaceholder::wrap_outputs_view invoked");
+        self.moved("wrap_outputs_view")
     }
     fn mark_outputs_drained(&self, _outputs: &(dyn Any + Send + Sync)) {
-        panic!("DetachedPlaceholder::mark_outputs_drained invoked");
+        self.moved("mark_outputs_drained")
     }
     fn is_source(&self) -> bool {
         false
     }
 }
 
-/// One dedicated driver thread's worth of extracted detached steps, in chain
+/// One dedicated driver thread's worth of extracted steps, in chain
 /// (`StepIdx`) order. The caller spawns one OS thread per group and drives it
 /// with `run_detached_driver`.
 pub struct DetachedDriverGroup {
-    /// The steps this one driver thread runs, in chain order. Always non-empty
-    /// and all [`StepKind::Detached`]. Private so those invariants — enforced by
-    /// [`Self::new`] — cannot be bypassed by an external caller building the
-    /// struct directly (which could otherwise trigger `steps[0]` panics in
-    /// `primary_step` / `label`, or run non-detached work on an off-pool driver).
+    /// Members in chain order: the group's `Detached` steps, plus any
+    /// `Parallel` step whose single clone is hosted on this driver (added by
+    /// [`Self::insert_hosted`] after [`Self::new`]). Never empty, and the first
+    /// member is always `Detached` (a hosted step comes after its Detached
+    /// producer). Private so those invariants cannot be bypassed by an external
+    /// caller building the struct directly (which could otherwise trigger
+    /// `steps[0]` panics in `primary_step` / `label`, or name the driver after a
+    /// hosted step).
     steps: Vec<(StepIdx, Box<dyn ErasedStep>)>,
 }
 
 impl DetachedDriverGroup {
-    /// Wrap a driver thread's extracted steps, enforcing the invariants every
-    /// consumer relies on: the group is **non-empty** (`primary_step` / `label`
-    /// index `steps[0]`) and **every step is [`StepKind::Detached`]** (a
-    /// non-detached step must not run off-pool on a dedicated driver thread, and
-    /// a `Parallel` step would hang its shared output — see
-    /// [`build_driver_storage`]).
+    /// Wrap a driver thread's extracted Detached steps, enforcing the invariants
+    /// every consumer relies on: the group is **non-empty** (`primary_step` /
+    /// `label` index `steps[0]`) and **every step is [`StepKind::Detached`]** (a
+    /// non-detached step must not run off-pool on a dedicated driver thread). A
+    /// hosted `Parallel` clone joins later, through [`Self::insert_hosted`].
     ///
     /// # Panics
     ///
@@ -194,7 +230,35 @@ impl DetachedDriverGroup {
         Self { steps }
     }
 
-    /// The group's step indices in chain order (for `WakePlan::build`'s `driver_of`).
+    /// Add a `Parallel` step whose single clone `plan_parallel_hosts` placed on
+    /// this driver, at its chain position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `step` is not [`StepKind::Parallel`], or if it would precede
+    /// every member (the first member must stay the group's `Detached` step: it
+    /// names the driver thread and keys its stats; `PipelineBuilder` registers
+    /// a consumer after its producer, so a hosted step always follows it).
+    pub fn insert_hosted(&mut self, idx: StepIdx, step: Box<dyn ErasedStep>) {
+        assert_eq!(
+            step.kind(),
+            StepKind::Parallel,
+            "only a Parallel step's clone is hosted on a driver (`{}`)",
+            step.name()
+        );
+        let at = self.steps.partition_point(|(i, _)| i.0 < idx.0);
+        assert!(
+            at > 0,
+            "hosted Parallel step `{}` (step {}) must follow its Detached producer in the \
+             driver group",
+            step.name(),
+            idx.0
+        );
+        self.steps.insert(at, (idx, step));
+    }
+
+    /// The group's step indices in chain order, hosted members included.
+    #[cfg(test)]
     pub fn step_indices(&self) -> impl Iterator<Item = StepIdx> + '_ {
         self.steps.iter().map(|(idx, _)| *idx)
     }
@@ -222,16 +286,70 @@ impl DetachedDriverGroup {
         self.steps[0].1.detached_group()
     }
 
-    /// Consume the group, yielding its steps for [`build_driver_storage`].
+    /// Consume the group, yielding its members for [`build_driver_storage`].
     #[must_use]
     fn into_steps(self) -> Vec<(StepIdx, Box<dyn ErasedStep>)> {
         self.steps
     }
 }
 
+/// The label a driver is known by: its [`DetachedGroup::Shared`] label, or for
+/// a [`DetachedGroup::PerStep`] driver the name of its one Detached step.
+/// `group` and `primary_name` are the group's first step's (a hosted step never
+/// comes first). `Pipeline::run` names the driver thread from it
+/// ([`driver_thread_name`]) and `dag_at` renders it as `host=driver(<label>)`,
+/// so the two cannot disagree.
+#[must_use]
+pub(crate) fn driver_label(group: DetachedGroup, primary_name: &'static str) -> &'static str {
+    match group {
+        DetachedGroup::Shared(label) => label,
+        DetachedGroup::PerStep => primary_name,
+    }
+}
+
+/// The driver thread's OS name: `fgumi-driver-<label>` for a shared group,
+/// `fgumi-detached-<label>` for a per-step driver ([`driver_label`]).
+#[must_use]
+pub(crate) fn driver_thread_name(group: DetachedGroup, primary_name: &'static str) -> String {
+    let label = driver_label(group, primary_name);
+    match group {
+        DetachedGroup::Shared(_) => format!("fgumi-driver-{label}"),
+        DetachedGroup::PerStep => format!("fgumi-detached-{label}"),
+    }
+}
+
+/// Move each Parallel step whose hosts name a driver into that driver's group
+/// ([`DetachedDriverGroup::insert_hosted`]), leaving an `ExtractedPlaceholder`
+/// so the surviving slots keep their `step_idx` positions. Called by
+/// `Pipeline::run` after [`extract_detached_steps`] and `plan_parallel_hosts`,
+/// before `build_worker_storage` consumes `steps`.
+///
+/// # Panics
+///
+/// Panics if `hosts` does not cover every step, if a host names a driver index
+/// with no group, or as [`DetachedDriverGroup::insert_hosted`] does (the step
+/// is not `Parallel`, or would precede its group's Detached steps).
+pub fn extract_hosted_parallel_steps(
+    steps: &mut [Box<dyn ErasedStep>],
+    hosts: &[ParallelHosts],
+    groups: &mut [DetachedDriverGroup],
+) {
+    assert_eq!(hosts.len(), steps.len(), "hosts must cover every step");
+    for (idx, h) in hosts.iter().enumerate() {
+        let Some(d) = h.driver else { continue };
+        let placeholder: Box<dyn ErasedStep> =
+            Box::new(ExtractedPlaceholder::of(steps[idx].as_ref()));
+        let real = std::mem::replace(&mut steps[idx], placeholder);
+        groups
+            .get_mut(d.0)
+            .expect("host driver index has a group")
+            .insert_hosted(StepIdx(idx), real);
+    }
+}
+
 /// Remove every [`StepKind::Detached`] step's
-/// real instance from `steps`, replacing each in place with a
-/// `DetachedPlaceholder` so the surviving slots keep their `step_idx`
+/// real instance from `steps`, replacing each in place with an
+/// `ExtractedPlaceholder` so the surviving slots keep their `step_idx`
 /// positions (which `build_worker_storage` and `ChainContexts` index by).
 ///
 /// Groups the extracted steps by their [`DetachedGroup`]: every
@@ -255,9 +373,7 @@ pub fn extract_detached_steps(steps: &mut [Box<dyn ErasedStep>]) -> Vec<Detached
         (0..n_groups).map(|_| Vec::new()).collect();
     for (idx, (slot, driver)) in steps.iter_mut().zip(driver_of).enumerate() {
         let Some(driver) = driver else { continue };
-        let group = slot.detached_group();
-        let placeholder: Box<dyn ErasedStep> =
-            Box::new(DetachedPlaceholder { name: slot.name(), group });
+        let placeholder: Box<dyn ErasedStep> = Box::new(ExtractedPlaceholder::of(slot.as_ref()));
         let real = std::mem::replace(slot, placeholder);
         group_steps[driver.0].push((StepIdx(idx), real));
     }
@@ -298,24 +414,30 @@ pub(crate) fn driver_index_of(
 }
 
 /// Build a driver thread's storage row: a full-length `Vec<WorkerStepEntry>`
-/// (length `n_total_steps`, indexed by global `step_idx` like every other row)
-/// where each of `group_steps` is `Owned` and every other slot is `Skip`. The
-/// driver thread runs `run_worker_loop` over this row exactly as a pool worker
-/// runs over its own row.
+/// (one entry per step of `drain_counters`, indexed by global `step_idx` like
+/// every other row) where each of `group_steps` is `Owned` and every other slot
+/// is `Skip`. The driver thread runs `run_worker_loop` over this row exactly as
+/// a pool worker runs over its own row.
 ///
 /// # Panics
 ///
-/// - if a group step's kind is `Parallel` — a 1-thread driver's
-///   [`StepDrainCounter`] is init 1 (single finisher), which would never close a
-///   `Parallel` step's shared output (that needs init N, all clones finishing),
-///   hanging the downstream consumer;
+/// - if a group step's `StepDrainCounter` is not 1. The driver runs exactly one
+///   instance of each member, so only a counter of 1 reaches 0 and closes the
+///   member's output: a Detached step's always is, and a `Parallel` step's is
+///   only when `plan_parallel_hosts` gave its single clone to this driver. A
+///   Parallel step that also has pool clones counts them, and a driver running
+///   one more instance would never take that counter to 0, hanging the
+///   downstream consumer. Checked before the driver runs anything, while no
+///   other thread can have touched the counter (every pool worker `Skip`s a
+///   driver's members);
 /// - if two group steps map to the same `step_idx` (a double registration), or a
 ///   step index is out of range.
 #[must_use]
 pub fn build_driver_storage(
     group_steps: Vec<(StepIdx, Box<dyn ErasedStep>)>,
-    n_total_steps: usize,
+    drain_counters: &[Arc<StepDrainCounter>],
 ) -> Vec<WorkerStepEntry> {
+    let n_total_steps = drain_counters.len();
     let mut row: Vec<WorkerStepEntry> = (0..n_total_steps).map(|_| WorkerStepEntry::Skip).collect();
     for (idx, step) in group_steps {
         assert!(
@@ -323,12 +445,14 @@ pub fn build_driver_storage(
             "driver group step index {} out of range (chain has {n_total_steps} steps)",
             idx.0
         );
-        assert_ne!(
-            step.kind(),
-            StepKind::Parallel,
-            "driver group step `{}` is Parallel; a 1-thread driver's StepDrainCounter (init 1) \
-             would never close its shared output — group only single-runner steps",
-            step.name()
+        let remaining = drain_counters[idx.0].remaining();
+        assert_eq!(
+            remaining,
+            1,
+            "driver group step `{}` ({:?}) has drain counter {remaining}, not 1; a driver runs \
+             one instance of it, so its shared output would never close",
+            step.name(),
+            step.kind()
         );
         assert!(
             matches!(row[idx.0], WorkerStepEntry::Skip),
@@ -347,11 +471,12 @@ pub fn build_driver_storage(
 /// backoff, off-pool stats) and the [`DrainFirstScheduler`] (drain/seal
 /// downstream before producing more — frees the sort's capacity-1 arena fastest).
 ///
-/// `drain_counters` is the full per-step slice (init 1 for each detached step, so
-/// the single finisher closes its output edges — the downstream consumer's
-/// end-of-stream signal). On a cancel before `Finished`, outputs are NOT closed
-/// (the run is tearing down; the recorded error/cancel is what propagates) —
-/// `run_worker_loop`'s top-of-loop `is_done` break upholds this.
+/// `drain_counters` is the full per-step slice (init 1 for each detached step and
+/// each hosted Parallel clone, so the single finisher closes its output edges —
+/// the downstream consumer's end-of-stream signal). On a cancel before
+/// `Finished`, outputs are NOT closed (the run is tearing down; the recorded
+/// error/cancel is what propagates) — `run_worker_loop`'s top-of-loop `is_done`
+/// break upholds this.
 ///
 /// `board` / `state_slot` — the per-thread state board for scheduling telemetry
 /// and this driver thread's slot in it; `None` (telemetry off) keeps stamping a
@@ -377,7 +502,8 @@ pub(crate) fn run_detached_driver(
     backoff_override: Option<u64>,
 ) {
     let primary = group.primary_step();
-    let mut row = build_driver_storage(group.into_steps(), contexts.inputs.len());
+    debug_assert_eq!(drain_counters.len(), contexts.inputs.len(), "one counter per step");
+    let mut row = build_driver_storage(group.into_steps(), drain_counters);
     let mut worker = WorkerCore::driver(primary).with_backoff_override(backoff_override);
     run_worker_loop(
         &mut worker,
@@ -728,7 +854,7 @@ mod tests {
         }
     }
 
-    /// A `Parallel` step — must never be placed on a 1-thread driver.
+    /// A `Parallel` step — on a driver only as a clone hosted there alone.
     #[derive(Clone)]
     struct ParallelStub;
     impl Step for ParallelStub {
@@ -846,12 +972,17 @@ mod tests {
         let _ = DetachedDriverGroup::new(vec![(StepIdx(0), step)]);
     }
 
+    /// `n` drain counters, each initialized to `init`.
+    fn counters(n: usize, init: usize) -> Vec<Arc<StepDrainCounter>> {
+        (0..n).map(|_| StepDrainCounter::new(init)).collect()
+    }
+
     /// `build_driver_storage` makes the group's steps `Owned` and every other
     /// slot `Skip`, at the correct global indices.
     #[test]
     fn build_driver_storage_owns_group_skips_rest() {
         let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
-        let row = build_driver_storage(vec![(StepIdx(2), det)], 5);
+        let row = build_driver_storage(vec![(StepIdx(2), det)], &counters(5, 1));
         assert_eq!(row.len(), 5);
         assert!(matches!(row[2], WorkerStepEntry::Owned { .. }), "group step is Owned");
         for i in [0usize, 1, 3, 4] {
@@ -859,13 +990,82 @@ mod tests {
         }
     }
 
-    /// G3: a `Parallel` step must never be grouped onto a 1-thread driver (its
-    /// init-1 counter would never close the shared output).
+    /// G3: a member whose drain counter counts pool clones (here a `Parallel`
+    /// step at 2) is rejected: one driver instance could never take it to 0.
     #[test]
-    #[should_panic(expected = "is Parallel")]
+    #[should_panic(expected = "has drain counter 2, not 1")]
     fn build_driver_storage_rejects_parallel_group_step() {
         let par: Box<dyn ErasedStep> = Box::new(TypedStep::new(ParallelStub));
-        let _ = build_driver_storage(vec![(StepIdx(0), par)], 2);
+        let _ = build_driver_storage(vec![(StepIdx(0), par)], &counters(2, 2));
+    }
+
+    /// A `Parallel` member whose counter is 1 — a clone `plan_parallel_hosts`
+    /// hosted on this driver alone — is accepted; the same step at 2 is the
+    /// panic above.
+    #[test]
+    fn build_driver_storage_accepts_a_hosted_parallel_member() {
+        let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
+        let par: Box<dyn ErasedStep> = Box::new(TypedStep::new(ParallelStub));
+        let row = build_driver_storage(vec![(StepIdx(0), det), (StepIdx(1), par)], &counters(2, 1));
+        assert!(matches!(row[1], WorkerStepEntry::Owned { .. }));
+    }
+
+    /// A hosted clone joins its driver's group at its chain position and leaves
+    /// a `Parallel`-reporting placeholder in `steps`; a Parallel step with worker
+    /// hosts stays where it is.
+    #[test]
+    fn extract_hosted_parallel_steps_inserts_in_chain_order() {
+        use crate::runtime::wake::DriverIdx;
+        // One shared driver over steps 1 and 3, so the hosted step 2 must land
+        // BETWEEN them (an append would put it last).
+        let mut steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(SrcStub { capacity: 1 })),
+            Box::new(TypedStep::new(SharedDetached { label: "g" })),
+            Box::new(TypedStep::new(ParallelStub)),
+            Box::new(TypedStep::new(SharedDetached { label: "g" })),
+            Box::new(TypedStep::new(ParallelStub)),
+        ];
+        let mut groups = extract_detached_steps(&mut steps);
+        assert_eq!(groups.len(), 1, "one Shared label, one driver");
+        let hosts = vec![
+            ParallelHosts::default(),
+            ParallelHosts::default(),
+            ParallelHosts { workers: vec![], driver: Some(DriverIdx(0)) },
+            ParallelHosts::default(),
+            ParallelHosts { workers: vec![0], driver: None },
+        ];
+        extract_hosted_parallel_steps(&mut steps, &hosts, &mut groups);
+        let members: Vec<(usize, StepKind)> =
+            groups[0].steps.iter().map(|(i, s)| (i.0, s.kind())).collect();
+        assert_eq!(
+            members,
+            vec![(1, StepKind::Detached), (2, StepKind::Parallel), (3, StepKind::Detached)]
+        );
+        assert_eq!(groups[0].primary_step(), StepIdx(1), "the first member stays Detached");
+        assert_eq!(steps[2].kind(), StepKind::Parallel, "placeholder reports Parallel");
+        assert_eq!(steps[2].name(), "ParallelStub", "placeholder keeps the name");
+        assert_eq!(steps[2].pool_placement(), steps[4].pool_placement(), "and the placement");
+        // The pool-placed step is still the real instance (cloning it works).
+        let _ = steps[4].clone_boxed();
+    }
+
+    /// A hosted step may not become a group's first member: the first member
+    /// names the driver thread and keys its stats, and must stay Detached.
+    #[test]
+    #[should_panic(expected = "must follow its Detached producer")]
+    fn insert_hosted_rejects_a_step_before_the_groups_detached_steps() {
+        let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
+        let mut group = DetachedDriverGroup::new(vec![(StepIdx(3), det)]);
+        group.insert_hosted(StepIdx(1), Box::new(TypedStep::new(ParallelStub)));
+    }
+
+    /// Only a `Parallel` step's clone is hosted.
+    #[test]
+    #[should_panic(expected = "only a Parallel step's clone is hosted")]
+    fn insert_hosted_rejects_a_non_parallel_step() {
+        let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
+        let mut group = DetachedDriverGroup::new(vec![(StepIdx(0), det)]);
+        group.insert_hosted(StepIdx(1), Box::new(TypedStep::new(SrcStub { capacity: 1 })));
     }
 
     /// G3: two group steps at the same index is a dual registration — rejected.
@@ -874,16 +1074,16 @@ mod tests {
     fn build_driver_storage_rejects_dual_registration() {
         let a: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
         let b: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
-        let _ = build_driver_storage(vec![(StepIdx(1), a), (StepIdx(1), b)], 3);
+        let _ = build_driver_storage(vec![(StepIdx(1), a), (StepIdx(1), b)], &counters(3, 1));
     }
 
-    /// G3: a group step index past `n_total_steps` is the documented out-of-range
+    /// G3: a group step index past the step count is the documented out-of-range
     /// panic, matching the guard the sibling `build_worker_storage` applies —
     /// without it the bare `row[idx.0]` index would panic with an opaque message.
     #[test]
     #[should_panic(expected = "out of range")]
     fn build_driver_storage_rejects_out_of_range_index() {
         let det: Box<dyn ErasedStep> = Box::new(TypedStep::new(PassThroughDetached { held: None }));
-        let _ = build_driver_storage(vec![(StepIdx(5), det)], 3);
+        let _ = build_driver_storage(vec![(StepIdx(5), det)], &counters(3, 1));
     }
 }

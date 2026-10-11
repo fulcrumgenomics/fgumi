@@ -40,6 +40,7 @@ use crate::arena_pool::ArenaPool;
 use crate::external::{
     KeyTypesSpec, LibraryLookup, TemplateKeyVariant, dropped_lane_error,
     extract_template_key_inline, select_template_variant, verify_dropped_lanes,
+    violation_read_name,
 };
 use crate::inline::{
     CbKey32, InMemoryChunk, RecordBuffer, TemplateKey, TemplateKey24, TemplateKey40,
@@ -478,8 +479,7 @@ impl TemplateChunkSorter {
             // Subsequent records: verify the lanes the chosen variant drops are
             // constant relative to the first record, then buffer.
             if let Some(violation) = verify_dropped_lanes(&state.first_key, &key, state.variant) {
-                let name = fgumi_raw_bam::RawRecordView::new(bam_bytes).read_name();
-                return Err(dropped_lane_error(&String::from_utf8_lossy(name), violation));
+                return Err(dropped_lane_error(&violation_read_name(bam_bytes), violation));
             }
             state.buffer.push_full(bam_bytes, &key)?;
             state.buffer.memory_usage()
@@ -829,6 +829,27 @@ mod tests {
             msg.contains("MI") && msg.contains("--key-types mi"),
             "unexpected dropped-lane error: {msg}"
         );
+    }
+
+    /// A violating record whose `l_read_name` overruns its body is rejected
+    /// under a placeholder name, not a slice panic in the violation branch.
+    #[test]
+    fn template_chunk_sorter_reports_a_violation_whose_read_name_overruns_its_body() {
+        use crate::external::KeyTypesSpec;
+        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(256 * 1024 * 1024)
+            .threads(1)
+            .key_types(KeyTypesSpec::None)
+            .into_template_chunk_sorter(&Header::default())
+            .expect("build template chunk sorter");
+        let mut mi = vec![b'M', b'I', b'i'];
+        mi.extend_from_slice(&1i32.to_le_bytes());
+        let r1 = make_bam_bytes(0, 10, 0, b"r1", &[], 40, -1, -1, &mi);
+        let mut r2 = make_bam_bytes(0, 10, 0, b"r2", &[], 40, -1, -1, &[]);
+        r2[8] = 200;
+        assert!(!sorter.push(&r1).expect("first push provisions the variant"));
+        let err = sorter.push(&r2).expect_err("the missing MI violates the dropped lane");
+        assert!(err.to_string().contains("record <malformed read name> carries a MI"), "{err}");
     }
 
     /// With a consistent input (the dropped lanes are constant), `--key-types`
