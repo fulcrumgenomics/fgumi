@@ -18,7 +18,11 @@
 //! charge until the merge drains it — so however often the hot set changes,
 //! read-ahead never grows past `k × cold + P`. The awaited slot can always
 //! read within its cold terms, so a full pool never starves the merge. Idle
-//! slice buffers waiting for reuse are charged to the pool too.
+//! slice buffers waiting for reuse are charged to the pool too, and so are
+//! decompressed blocks above the cold FIFO cap: a hot slot's FIFO cap rises
+//! from [`FIFO_CAP_COLD`] to [`FIFO_CAP_HOT`] only while the pool has room for
+//! the difference, and a slot demoted back to the cold cap stays charged for
+//! the blocks it still holds above it.
 //!
 //! A slot is charged what it holds (`SortMergeSlot::stash_bytes` plus its
 //! requested bytes): every read slice with a frame still stashed or being
@@ -32,7 +36,9 @@
 //! k × (cold + one carried frame) + P + decoded
 //! ```
 //!
-//! with `decoded` the decompressed FIFOs ([`ReadAheadBudget::decoded_ceiling`]).
+//! with `decoded` the cold FIFOs, `k × FIFO_CAP_COLD` blocks
+//! ([`ReadAheadBudget::decoded_ceiling`]; every block above that is in the
+//! pool).
 //! Since `k × cold + P = max(R, k × cold + HOT_SLOTS × hot)`, the read-ahead is
 //! `R` unless the IOP floor (very large `k`) or the hot reserve forces more;
 //! the `Spill supply` budget line reports every term.
@@ -60,8 +66,11 @@ pub const R_CEIL: u64 = 512 << 20;
 pub const R_DIVISOR: u64 = 16;
 /// Decompressed FIFO cap of a hot slot.
 pub const FIFO_CAP_HOT: u32 = 32;
-/// Decompressed FIFO cap of a cold slot.
-pub const FIFO_CAP_COLD: u32 = 32;
+/// Decompressed FIFO cap of a cold slot: 8 blocks (≈ 512 KiB of 64 KiB
+/// blocks). A cold slot is not next in the merge, so it needs only enough
+/// decoded runway to cover the time the merge takes to promote it to the hot
+/// set; every block above that is memory held across all `k − 3` cold slots.
+pub const FIFO_CAP_COLD: u32 = 8;
 /// The carried partial frame a slot may hold above its allowance: a BGZF
 /// block is at most 64 KiB, and a zstd frame holds one ~64 KiB sort block
 /// (larger only for a single record longer than that).
@@ -69,13 +78,11 @@ pub const CARRIED_FRAME_BYTES: u64 = 64 << 10;
 /// Bytes of one decompressed block, for the decoded ceiling.
 pub const DECOMPRESSED_BLOCK_BYTES: u64 = 64 << 10;
 
-/// The decompressed FIFO cap of a slot of class `c` (independent of `R`).
+/// The pool charge of a decompressed FIFO of `blocks` (its cap, or its length
+/// when that is larger): the blocks above [`FIFO_CAP_COLD`].
 #[must_use]
-pub fn fifo_cap_for(c: SpillClass) -> u32 {
-    match c {
-        SpillClass::Hot => FIFO_CAP_HOT,
-        SpillClass::Cold => FIFO_CAP_COLD,
-    }
+pub fn fifo_charge(blocks: u64) -> u64 {
+    blocks.saturating_sub(u64::from(FIFO_CAP_COLD)) * DECOMPRESSED_BLOCK_BYTES
 }
 
 /// The resolved split of `R` over `k` merge slots.
@@ -154,7 +161,9 @@ impl ReadAheadBudget {
         self.k as u64 * self.cold_allowance + self.pool
     }
 
-    /// Worst-case decompressed FIFO bytes: `k × FIFO_CAP_COLD × 64 KiB`.
+    /// Worst-case decompressed FIFO bytes outside the pool:
+    /// `k × FIFO_CAP_COLD × 64 KiB` (blocks above the cold cap are pool
+    /// charges).
     #[must_use]
     pub fn decoded_ceiling(&self) -> u64 {
         self.k as u64 * u64::from(FIFO_CAP_COLD) * DECOMPRESSED_BLOCK_BYTES
@@ -249,14 +258,15 @@ mod tests {
         assert!(b.cold_fill >= COLD_FILL_MIN_BYTES);
     }
 
-    /// The ceiling worked by hand: `k × (cold + 64 KiB) + P + k × 32 × 64 KiB`.
+    /// The ceiling worked by hand: `k × (cold + 64 KiB) + P + k × 8 × 64 KiB`
+    /// (hot FIFO blocks above the cold cap are in the pool).
     #[rstest]
-    #[case::t16_k27(768 << 20, 16, 27, 27 * (2 * MIB + 64 * KIB) + 458 * MIB + 27 * 2 * MIB)]
+    #[case::t16_k27(768 << 20, 16, 27, 27 * (2 * MIB + 64 * KIB) + 458 * MIB + 27 * 512 * KIB)]
     #[case::t16_k1024(
         768 << 20,
         16,
         1024,
-        1024 * (475_136 + 64 * KIB) + 48 * MIB + 1024 * 2 * MIB
+        1024 * (475_136 + 64 * KIB) + 48 * MIB + 1024 * 512 * KIB
     )]
     fn ceiling_matches_the_design_formula(
         #[case] per_thread: u64,
@@ -287,15 +297,40 @@ mod tests {
         }
     }
 
+    /// `350 × 8 × 64 KiB = 183_500_800` B (175 MiB) at k = 350.
+    #[test]
+    fn budget_rows_decoded_ceiling_at_k350_is_175_mib() {
+        let b = ReadAheadBudget::resolve(768 << 24, 350);
+        assert_eq!(b.decoded_ceiling(), 183_500_800);
+    }
+
+    /// At k = 1024 with the defaults (t16 × 768 MiB): `1024 × (475_136 +
+    /// 65_536) = 553_648_128` + pool 48 MiB + decoded `1024 × 512 KiB =
+    /// 512 MiB` = `1_140_850_688` B (1088 MiB ≈ 1.06 GiB), under 1.1 GiB.
+    #[test]
+    fn k1024_default_ceiling_is_at_most_1_1_gib() {
+        let b = ReadAheadBudget::resolve(768 << 24, 1024);
+        assert_eq!(b.ceiling(), 1_140_850_688);
+        assert!(b.ceiling() * 10 <= 11 << 30, "{} B > 1.1 GiB", b.ceiling());
+    }
+
+    /// The FIFO charge is the blocks above the cold cap.
+    #[test]
+    fn fifo_charge_counts_blocks_above_the_cold_cap() {
+        assert_eq!(fifo_charge(0), 0);
+        assert_eq!(fifo_charge(u64::from(FIFO_CAP_COLD)), 0);
+        assert_eq!(fifo_charge(u64::from(FIFO_CAP_HOT)), 24 * 64 * KIB);
+    }
+
     #[test]
     fn budget_line_names_target_pool_and_ceiling() {
         let line = ReadAheadBudget::resolve(768 << 24, 27).budget_line();
         assert_eq!(
             line,
             "Spill supply: read-ahead budget R=512 MiB over 27 slots (derived from --max-memory, \
-             adds to the sort buffer) -> cold 2 MiB per slot (fill 1 MiB, FIFO 32), hot pool 458 \
+             adds to the sort buffer) -> cold 2 MiB per slot (fill 1 MiB, FIFO 8), hot pool 458 \
              MiB (up to 16 MiB per hot slot, fill 4 MiB, FIFO 32); peak above the sort buffer <= \
-             567.7 MiB = 27 x (2 MiB + 64 KiB carried frame) + pool 458 MiB + decoded 54 MiB"
+             527.2 MiB = 27 x (2 MiB + 64 KiB carried frame) + pool 458 MiB + decoded 13.5 MiB"
         );
     }
 }
