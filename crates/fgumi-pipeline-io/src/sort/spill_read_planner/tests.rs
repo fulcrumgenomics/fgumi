@@ -128,23 +128,94 @@ fn shape(reqs: &[ReadRequest]) -> Vec<(u32, u32, u64, u32)> {
     reqs.iter().map(|r| (r.stream, r.seq, r.offset, r.len)).collect()
 }
 
-/// The hot set is the awaited slot: it is topped up to 16 MiB in 4 MiB fills;
-/// every other slot gets the 2 MiB cold allowance in 1 MiB fills.
-#[test]
-fn hot_set_is_the_awaited_slot() {
-    let mut f = fixture(&[64 * MIB, 64 * MIB, 64 * MIB], 16, 1);
-    await_file(&f.demand, 1);
-    let reqs = f.planner.plan_pass_for_test();
-    let hot = for_slot(&reqs, 1);
-    assert_eq!(hot.len(), 4, "{:?}", shape(&reqs));
-    assert!(hot.iter().all(|r| u64::from(r.len) == 4 * MIB && class(r) == SpillClass::Hot));
-    assert_eq!(bytes(&hot), 16 * MIB);
-    for id in [0, 2] {
-        let cold = for_slot(&reqs, id);
-        assert_eq!(cold.len(), 2, "slot {id}: {:?}", shape(&reqs));
-        assert!(cold.iter().all(|r| u64::from(r.len) == MIB && class(r) == SpillClass::Cold));
+/// The hot set is the awaited, predicted and frontier slots, in that order,
+/// deduplicated: each is topped up to 16 MiB in 4 MiB fills at the hot FIFO
+/// cap; every other slot gets the 2 MiB cold allowance in 1 MiB fills.
+#[rstest::rstest]
+#[case::three_distinct(Some(1), Some(2), Some(3), &[1, 2, 3])]
+#[case::predicted_is_awaited(Some(1), Some(1), Some(3), &[1, 3])]
+#[case::frontier_is_predicted(Some(1), Some(2), Some(2), &[1, 2])]
+#[case::all_one(Some(4), Some(4), Some(4), &[4])]
+#[case::no_awaited(None, Some(2), Some(0), &[2, 0])]
+fn hot_set_is_awaited_then_predicted_then_frontier(
+    #[case] awaited: Option<u32>,
+    #[case] predicted: Option<u32>,
+    #[case] frontier: Option<u32>,
+    #[case] hot: &[u32],
+) {
+    let mut f = fixture(&[64 * MIB; 5], 16, 1);
+    if let Some(a) = awaited {
+        await_file(&f.demand, a);
     }
-    assert_eq!(f.slots[1].fifo_cap(), 32);
+    f.demand.set_predicted(predicted);
+    f.demand.set_frontier(frontier);
+    assert_eq!(f.planner.hot_set_for_test(), hot, "deduplicated, at most three");
+    let reqs = f.planner.plan_pass_for_test();
+    let first: Vec<u32> = {
+        let mut seen = Vec::new();
+        for r in reqs.iter().filter(|r| class(r) == SpillClass::Hot) {
+            if !seen.contains(&r.stream) {
+                seen.push(r.stream);
+            }
+        }
+        seen
+    };
+    assert_eq!(first, hot, "hot slots, in issue order: {:?}", shape(&reqs));
+    for id in 0..5u32 {
+        let mine = for_slot(&reqs, id);
+        let cap = f.slots[id as usize].fifo_cap();
+        if hot.contains(&id) {
+            assert_eq!(bytes(&mine), HOT_ALLOWANCE_BYTES, "slot {id}");
+            assert!(mine.iter().all(|r| u64::from(r.len) == HOT_FILL_BYTES), "slot {id}");
+            assert_eq!(cap, 32, "slot {id}");
+        } else {
+            assert_eq!(bytes(&mine), 2 * MIB, "slot {id}: {:?}", shape(&reqs));
+            assert!(mine.iter().all(|r| class(r) == SpillClass::Cold), "slot {id}");
+            assert_eq!(cap, 8, "slot {id}");
+        }
+    }
+}
+
+/// A slot whose bytes are all issued, or that reached EOF, is not hot: the
+/// next demand slot takes no reads from it, and it holds no hot FIFO cap.
+#[test]
+fn hot_set_skips_a_slot_at_eof() {
+    let mut f = fixture(&[0, 64 * MIB, 64 * MIB], 16, 1);
+    await_file(&f.demand, 0);
+    f.demand.set_predicted(Some(1));
+    let reqs = f.planner.plan_pass_for_test();
+    assert_eq!(f.slots[0].fifo_cap(), 8, "an EOF slot is not hot");
+    assert_eq!(bytes(&for_slot(&reqs, 1)), HOT_ALLOWANCE_BYTES);
+}
+
+/// A prediction that moves away does not evict: the former predicted slot
+/// keeps what it has read and stashed, drops to the cold class (and FIFO cap),
+/// and is issued nothing new until its read-ahead falls below the cold
+/// allowance.
+#[test]
+fn prediction_move_does_not_evict() {
+    let mut f = fixture(&[64 * MIB; 3], 16, 1);
+    await_file(&f.demand, 0);
+    f.demand.set_predicted(Some(1));
+    let _ = f.planner.plan_pass_for_test();
+    let s1 = &f.slots[1];
+    assert_eq!(s1.issued_bytes(), HOT_ALLOWANCE_BYTES);
+    // Everything issued lands and is stashed (unclaimed).
+    s1.set_read_ahead_for_test(0, HOT_ALLOWANCE_BYTES);
+    for _ in 0..4 {
+        f.ledger.land(SpillClass::Hot, HOT_FILL_BYTES);
+    }
+    f.demand.set_predicted(Some(2));
+    let reqs = f.planner.plan_pass_for_test();
+    assert!(for_slot(&reqs, 1).is_empty(), "16 MiB stashed > 2 MiB cold allowance");
+    assert_eq!(s1.stash_bytes(), HOT_ALLOWANCE_BYTES, "nothing evicted");
+    assert_eq!(s1.fifo_cap(), 8);
+    // The merge claims it down to one cold fill: one more cold fill is issued.
+    s1.set_read_ahead_for_test(0, MIB);
+    let reqs = f.planner.plan_pass_for_test();
+    let again = for_slot(&reqs, 1);
+    assert_eq!(again.len(), 1, "{:?}", shape(&reqs));
+    assert_eq!((class(again[0]), u64::from(again[0].len)), (SpillClass::Cold, MIB));
 }
 
 /// A cold slot is never issued past its allowance (`issued + stashed + fill ≤
@@ -425,11 +496,11 @@ fn serve_until_refused(slot: &SortMergeSlot) -> usize {
 /// on the next pass. Every block still reaches the consumer once, in order.
 #[test]
 fn cold_slot_fifo_stops_at_8_hot_at_32() {
-    let mut f = fixture(&[64 * MIB, 64 * MIB], 16, 1);
+    let mut f = fixture(&[64 * MIB, 64 * MIB, 64 * MIB], 16, 1);
     await_file(&f.demand, 1);
     let _ = f.planner.plan_pass_for_test();
     let caps = |f: &Fixture| -> Vec<u32> { f.slots.iter().map(|s| s.fifo_cap()).collect() };
-    assert_eq!(caps(&f), vec![8, 32]);
+    assert_eq!(caps(&f), vec![8, 32, 8]);
     for (s, cap) in f.slots.iter().zip([8usize, 32]) {
         s.bp_stash_frames_for_test((0..40u8).map(|i| vec![i]).collect(), true);
         serve_until_refused(s);
@@ -456,9 +527,9 @@ fn cold_slot_fifo_stops_at_8_hot_at_32() {
     // Saturate the outstanding-slice cap so the cold rotation visits no slot:
     // only the demotion itself can lower slot 1's cap.
     f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.max_inflight_slices());
-    await_file(&f.demand, 0);
+    await_file(&f.demand, 2);
     assert!(f.planner.plan_pass_for_test().is_empty(), "no read: the slice cap binds");
-    assert_eq!(caps(&f), vec![32, 8], "the former hot slot is demoted on the next pass");
+    assert_eq!(caps(&f), vec![8, 8, 32], "the former hot slot is demoted on the next pass");
 }
 
 /// A slot registered before the budget exists already carries the cold cap,

@@ -6366,6 +6366,18 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
     /// `sources` index of the slot that caused the last `Stalled`; cleared on
     /// `Produced`.
     stalled_src: Option<usize>,
+    /// The sort's merge-wide demand; the driver publishes predictions and the
+    /// frontier through it. `None` publishes nothing.
+    demand: Option<Arc<crate::MergeDemand>>,
+    /// Per `sources` index, the spill file it reads (`None` for a memory
+    /// source, which has no file to read ahead).
+    source_file_id: Vec<Option<u32>>,
+    /// Per `sources` index, whether a slot source has reached its end.
+    slot_drained: Vec<bool>,
+    /// `sources` index of the last record's source (a change is a switch).
+    last_src: Option<usize>,
+    /// The file the last switch predicted, scored on the next switch.
+    last_predicted: Option<u32>,
 }
 
 impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
@@ -6430,6 +6442,14 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
         let progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
+        let source_file_id: Vec<Option<u32>> = sources
+            .iter()
+            .map(|s| match s {
+                SlotMergeSource::Slot { slot, .. } => Some(slot.file_id),
+                SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+            })
+            .collect();
+        let slot_drained = vec![false; sources.len()];
 
         Self {
             sources,
@@ -6444,6 +6464,63 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
             records_merged: 0,
             progress,
             stalled_src: None,
+            demand: None,
+            source_file_id,
+            slot_drained,
+            last_src: None,
+            last_predicted: None,
+        }
+    }
+
+    /// The sort's merge-wide demand; the driver publishes predictions and the
+    /// frontier through it. Publishes the initial frontier (the lowest slot's
+    /// file) at once, so a reader never sees "every file drained" before the
+    /// merge has read anything.
+    #[must_use]
+    pub fn with_demand(mut self, demand: Arc<crate::MergeDemand>) -> Self {
+        self.demand = Some(demand);
+        self.publish_frontier();
+        self
+    }
+
+    /// Mark `src` as having reached its end; a slot source's drain moves the
+    /// frontier.
+    fn on_source_end(&mut self, src: usize) {
+        if self.source_file_id[src].is_some() {
+            self.slot_drained[src] = true;
+            self.publish_frontier();
+        }
+    }
+
+    /// On a source switch publish the runner-up's file (a memory source is
+    /// never predicted — it has no file to read — so it publishes `None`) and
+    /// score the previous switch's prediction: a hit when the new winner is
+    /// the source it named, a memory source included. The first record's
+    /// switch has no earlier prediction to score. This runs on every switch,
+    /// which in an interleaved merge is most records: the caller's
+    /// `runner_up` walk (O(log k) key compares), one or two relaxed stat
+    /// increments, and a store only when the prediction changes.
+    fn on_source_switch(&mut self, runner_up_src: Option<usize>, src: usize) {
+        let first = self.last_src.is_none();
+        self.last_src = Some(src);
+        let Some(d) = &self.demand else { return };
+        let now = self.source_file_id[src];
+        if !first {
+            d.stats().record_prediction(now == self.last_predicted);
+        }
+        let next = runner_up_src.and_then(|s| self.source_file_id[s]);
+        self.last_predicted = next;
+        d.set_predicted(next);
+    }
+
+    /// Publish the lowest undrained slot source's file id (slot sources come
+    /// first, in `file_id` order). O(k), run only on a drain.
+    fn publish_frontier(&self) {
+        if let Some(d) = &self.demand {
+            let frontier = (0..self.sources.len())
+                .find(|&i| self.source_file_id[i].is_some() && !self.slot_drained[i])
+                .and_then(|i| self.source_file_id[i]);
+            d.set_frontier(frontier);
         }
     }
 }
@@ -6474,6 +6551,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                             }
                             TryRead::Ready(None) => {
                                 rec.clear();
+                                self.on_source_end(next);
                                 next += 1;
                             }
                         }
@@ -6505,13 +6583,21 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                                 return Ok(MergeStep::Stalled);
                             }
                             TryRead::Ready(Some(key)) => tree.replace_winner(key),
-                            TryRead::Ready(None) => tree.remove_winner(),
+                            TryRead::Ready(None) => {
+                                tree.remove_winner();
+                                self.on_source_end(src);
+                            }
                         }
                     }
                     if !tree.winner_is_active() {
                         return Ok(MergeStep::Done);
                     }
                     let winner = tree.winner();
+                    let src = self.source_map[winner];
+                    if self.last_src != Some(src) {
+                        let runner_up = tree.runner_up().map(|leaf| self.source_map[leaf]);
+                        self.on_source_switch(runner_up, src);
+                    }
                     self.records_merged += 1;
                     self.progress.log_if_needed(1);
                     // Defer this winner's refill to the next call so the
@@ -11391,6 +11477,86 @@ mod from_slots_merge_tests {
             vec![b"from-file-0".to_vec(), b"from-file-1".to_vec()],
             "equal-key ties must resolve by file_id, not by caller push order",
         );
+    }
+
+    /// Predictions: published only on a source switch, naming the runner-up's
+    /// file, never a memory source. The expected switch count and hits are
+    /// read off the output (each record names its source), independently of
+    /// the driver.
+    #[test]
+    fn predictions_skip_memory_sources_and_track_switches() {
+        // Slot 0: keys 1,2 ; slot 1: keys 3,4 ; memory chunk: key 5.
+        let s0 =
+            populated_slot(0, &[(TestKey(1), b"src0".to_vec()), (TestKey(2), b"src0".to_vec())], 1);
+        let s1 =
+            populated_slot(1, &[(TestKey(3), b"src1".to_vec()), (TestKey(4), b"src1".to_vec())], 1);
+        let mem =
+            crate::inline::InMemoryChunk::from_owned_records(vec![(TestKey(5), b"mem".to_vec())]);
+        let demand = StdArc::new(crate::MergeDemand::new());
+        let mut d =
+            MergeDriver::<TestKey>::from_slots(vec![s0, s1], MemorySources::Shared(vec![mem]), 5)
+                .with_demand(StdArc::clone(&demand));
+        let mut seen: Vec<(Vec<u8>, Option<u32>)> = Vec::new();
+        loop {
+            match d.try_step().unwrap() {
+                MergeStep::Produced(b) => seen.push((b.to_vec(), demand.predicted())),
+                MergeStep::Done => break,
+                MergeStep::Stalled => unreachable!("pre-populated EOF slots never stall"),
+            }
+        }
+        let labels: Vec<&[u8]> = seen.iter().map(|(b, _)| b.as_slice()).collect();
+        let expected: [&[u8]; 5] = [b"src0", b"src0", b"src1", b"src1", b"mem"];
+        assert_eq!(labels, expected);
+        // While draining slot 0 the runner-up is slot 1's file.
+        assert_eq!(seen[0].1, Some(1));
+        assert_eq!(seen[1].1, Some(1), "no switch, no new prediction");
+        // While draining slot 1 the runner-up is the memory source: not a file.
+        assert_eq!(seen[2].1, None, "a memory source is never predicted");
+        assert_eq!(seen[4].1, None, "nothing remains behind the last source");
+        let switches = labels.windows(2).filter(|w| w[0] != w[1]).count() as u64;
+        let s = demand.snapshot();
+        assert_eq!(s.predictions, switches, "each switch after the first scores one prediction");
+        // s0→s1 was predicted (Some(1)), and so was the switch to memory
+        // (None: a memory source).
+        assert_eq!(s.prediction_hits, 2);
+    }
+
+    /// The frontier is the lowest undrained slot's file id: published when the
+    /// demand is attached, advanced on each drain, and `None` once every slot
+    /// is drained.
+    #[test]
+    fn frontier_advances_on_drain_and_clears_at_the_end() {
+        let s0 = populated_slot(0, &[(TestKey(1), b"a".to_vec())], 1);
+        let s1 = populated_slot(1, &[(TestKey(2), b"b".to_vec())], 1);
+        let demand = StdArc::new(crate::MergeDemand::new());
+        let mut d =
+            MergeDriver::<TestKey>::from_slots(vec![s0, s1], MemorySources::Shared(vec![]), 2)
+                .with_demand(StdArc::clone(&demand));
+        assert_eq!(demand.frontier(), Some(0), "published before the first step");
+        assert!(matches!(d.try_step().unwrap(), MergeStep::Produced(_)));
+        assert_eq!(demand.frontier(), Some(0));
+        assert!(matches!(d.try_step().unwrap(), MergeStep::Produced(_)));
+        assert_eq!(demand.frontier(), Some(1), "slot 0 drained on the refill");
+        assert!(matches!(d.try_step().unwrap(), MergeStep::Done));
+        assert_eq!(demand.frontier(), None);
+    }
+
+    /// A slot that is empty at EOF from the start is drained during priming:
+    /// the frontier skips it before the first record.
+    #[test]
+    fn frontier_skips_a_slot_drained_while_priming() {
+        let empty = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
+        {
+            let _g = empty.decompressed.lock().unwrap();
+            empty.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let s1 = populated_slot(1, &[(TestKey(2), b"b".to_vec())], 1);
+        let demand = StdArc::new(crate::MergeDemand::new());
+        let mut d =
+            MergeDriver::<TestKey>::from_slots(vec![empty, s1], MemorySources::Shared(vec![]), 1)
+                .with_demand(StdArc::clone(&demand));
+        assert!(matches!(d.try_step().unwrap(), MergeStep::Produced(_)));
+        assert_eq!(demand.frontier(), Some(1));
     }
 
     /// `stalled_slot` names the slot whose empty FIFO stalled the merge, in

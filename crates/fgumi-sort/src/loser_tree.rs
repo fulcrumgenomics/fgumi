@@ -134,6 +134,48 @@ impl<K: Ord> LoserTree<K> {
         self.losers[0]
     }
 
+    /// The source most likely to be consumed after the winner, or `None` when
+    /// fewer than two sources remain.
+    ///
+    /// The runner-up is always among the losers stored along the winner's
+    /// root-to-leaf path -- anything eliminated elsewhere in the tree lost to a
+    /// source that itself lost to the winner. So this is O(log k) comparisons over
+    /// existing state, ~6 for a 44-way merge, and needs no new bookkeeping.
+    ///
+    /// `losers[1]` alone is NOT the answer, which is the tempting O(1) shortcut:
+    /// after a replay that node holds whoever lost the final comparison of *that*
+    /// replay, not the global second-smallest. With keys `[50, 100, 30, 20]` the
+    /// winner is source 3 and `losers[1]` is source 0 (key 50), while the true
+    /// runner-up is source 2 (key 30).
+    ///
+    /// It is read *predictively*: the merge publishes the runner-up's spill file
+    /// on each source switch, so the supply can get that file's blocks ready
+    /// before the merge arrives at it (the merge starves at run transitions,
+    /// when the next file's read has not started yet).
+    #[must_use]
+    pub fn runner_up(&self) -> Option<usize> {
+        if self.num_active < 2 {
+            return None;
+        }
+        let winner = self.losers[0];
+        let mut node = self.leaf_to_node(winner);
+        let mut best: Option<usize> = None;
+        // No `active` filter: `is_greater` ranks an exhausted source after
+        // every live one, and with two or more live sources the runner-up —
+        // live — is on this path, so an exhausted candidate never survives.
+        while node > 0 {
+            let candidate = self.losers[node];
+            if candidate != EMPTY {
+                best = Some(match best {
+                    Some(b) if self.is_greater(candidate, b) => b,
+                    _ => candidate,
+                });
+            }
+            node >>= 1;
+        }
+        best
+    }
+
     /// Check if the winner is still an active source.
     #[inline]
     #[must_use]
@@ -384,5 +426,72 @@ mod tests {
         }
 
         assert_eq!(result, (1..=10).collect::<Vec<i32>>());
+    }
+    /// The runner-up is the source the merge will consume after the current
+    /// winner run; predicting the wrong one readies the wrong file.
+    #[test]
+    fn test_runner_up_is_the_second_smallest_key() {
+        let tree = LoserTree::new(vec![50u32, 10, 30, 20]);
+        assert_eq!(tree.winner(), 1, "guard: 10 is the winner");
+        assert_eq!(tree.runner_up(), Some(3), "20 is next, at source 3");
+    }
+
+    /// Must track the tree, not a stale snapshot: after the winner advances the
+    /// prediction has to move with it.
+    #[test]
+    fn test_runner_up_follows_the_tree_as_the_winner_advances() {
+        let mut tree = LoserTree::new(vec![50u32, 10, 30, 20]);
+        tree.replace_winner(100);
+        assert_eq!(tree.winner(), 3, "20 now wins");
+        assert_eq!(tree.runner_up(), Some(2), "30 is next, at source 2");
+    }
+
+    /// One source has no next source; predicting one would point at the file
+    /// already being drained.
+    #[test]
+    fn test_runner_up_is_none_with_a_single_source() {
+        assert_eq!(LoserTree::new(vec![7u32]).runner_up(), None);
+    }
+
+    /// Exhausted sources are never predicted: with one live source there is
+    /// no runner-up, and with more the exhausted source that lies on the
+    /// winner's path (source 0 lost to source 1 at their shared node before it
+    /// was exhausted) loses to the live one there.
+    #[test]
+    fn test_runner_up_skips_an_exhausted_source() {
+        let mut two = LoserTree::new(vec![10u32, 20]);
+        two.remove_winner();
+        assert_eq!(two.winner(), 1, "guard: source 0 is gone");
+        assert_eq!(two.runner_up(), None, "no live source remains behind the winner");
+
+        let mut three = LoserTree::new(vec![10u32, 20, 30]);
+        assert_eq!(three.winner(), 0);
+        three.remove_winner();
+        assert_eq!(three.winner(), 1, "guard: source 0 is gone");
+        assert_eq!(three.runner_up(), Some(2), "the live source, never the exhausted one");
+    }
+
+    /// `losers[1]` is NOT the runner-up (the doc's counter-example), and a
+    /// brute-force second-smallest (key, then source index — the tree's
+    /// tie-break) agrees with `runner_up` over many replays.
+    #[test]
+    fn test_runner_up_matches_brute_force_over_replays() {
+        let doc_example = LoserTree::new(vec![50u32, 100, 30, 20]);
+        assert_eq!(doc_example.winner(), 3);
+        assert_eq!(doc_example.runner_up(), Some(2), "key 30, not losers[1]'s key 50");
+
+        let keys = vec![50u32, 100, 30, 20, 70, 10, 90];
+        let mut tree = LoserTree::new(keys.clone());
+        let mut cur = keys;
+        for step in 0..20u32 {
+            let w = tree.winner();
+            let mut live: Vec<(u32, usize)> =
+                cur.iter().enumerate().filter(|(i, _)| *i != w).map(|(i, &k)| (k, i)).collect();
+            live.sort_unstable();
+            assert_eq!(tree.runner_up(), live.first().map(|&(_, i)| i), "step {step}");
+            let next = cur[w] + 37 + step;
+            cur[w] = next;
+            tree.replace_winner(next);
+        }
     }
 }

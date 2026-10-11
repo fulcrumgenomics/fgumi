@@ -1,8 +1,12 @@
 //! Merge-wide demand facts shared by the k-way merge consumer (`SortMerge` /
 //! `MergeDriver`) and the spill supply (`SortSpillDecompress`): which file the
 //! merge is waiting on and the consumer's thread handle, so the worker that
-//! delivers the awaited block can unpark it. Only a delivery to the awaited
-//! file wakes the merge: waking on every delivery costs a park per unrelated
+//! delivers the awaited block can unpark it; whether the merge is starved; and
+//! which file it will need next (`predicted`) and the lowest file it has not
+//! drained (`frontier`), which `SpillReadPlanner`'s hot set and
+//! `SortSpillDecompress`'s scan order put first ([`MergeDemand::hot_ids`]).
+//! Only a delivery to the awaited file wakes the
+//! merge: waking on every delivery costs a park per unrelated
 //! block (v0.7.0 paid ~1.9 parks per stall that way). Created once per sort by
 //! the chain builder's `add_sort`.
 //!
@@ -104,6 +108,8 @@ pub struct MergeDemandStats {
     wakes_delivered: StdAtomicU64,
     /// Indexed by [`AwaitedSlotState::bucket`].
     awaited: [StdAtomicU64; STALL_BUCKETS],
+    predictions: StdAtomicU64,
+    prediction_hits: StdAtomicU64,
     /// Indexed by `MergePoolRequest as usize`.
     pool: [StdAtomicU64; MergePoolRequest::COUNT],
     requests_with_sleeper: StdAtomicU64,
@@ -130,6 +136,16 @@ impl MergeDemandStats {
     /// parks until the awaited slot's delivery or its idle timer).
     pub fn record_park(&self) {
         self.parking_registrations.fetch_add(1, Relaxed);
+    }
+
+    /// A source switch scored the prediction the previous switch published:
+    /// `hit` when the merge switched to the source it named (a spill file, or
+    /// `None` for a memory source).
+    pub fn record_prediction(&self, hit: bool) {
+        self.predictions.fetch_add(1, Relaxed);
+        if hit {
+            self.prediction_hits.fetch_add(1, Relaxed);
+        }
     }
 
     /// The merge asked the pool for a worker and got `r`, with
@@ -196,6 +212,11 @@ pub struct MergeDemandSnapshot {
     /// Stall episodes whose awaited slot had blocks being decompressed (a
     /// stash the merge could not serve at the stall has its front in flight).
     pub awaited_decompressing: u64,
+    /// Predictions a later source switch scored (every switch but the first
+    /// publishes one; the last is never scored).
+    pub predictions: u64,
+    /// Scored predictions that named the source the merge switched to.
+    pub prediction_hits: u64,
     /// Pool requests that woke a parked worker.
     pub pool_woken: u64,
     /// Pool requests that found every worker awake.
@@ -237,8 +258,10 @@ fn secs(ns: u64) -> f64 {
 
 impl MergeDemandSnapshot {
     /// The `--sort-stats` lines, in their fixed order: demand, awaited slot
-    /// state, pool requests at stalls, consumer self-serve, partial flushes. Line 2's percentages
-    /// are of `stall_episodes`; line 3's sleeper share is of pool requests.
+    /// state, pool requests at stalls, next-source predictions, consumer
+    /// self-serve, partial flushes. Line 2's percentages are of
+    /// `stall_episodes`; line 3's sleeper share is of pool requests; line 4's
+    /// hit rate is of scored predictions.
     #[must_use]
     pub fn log_lines(&self) -> Vec<String> {
         let requests =
@@ -269,6 +292,11 @@ impl MergeDemandSnapshot {
                 self.pool_unavailable,
                 pct(self.requests_with_sleeper, requests),
                 secs(self.stall_ns_with_sleeper)
+            ),
+            format!(
+                "Merge prediction: {} predictions, hit {:.1}%",
+                self.predictions,
+                pct(self.prediction_hits, self.predictions)
             ),
             format!(
                 "Consumer served itself: {} parks avoided by decompressing already-read blocks \
@@ -320,11 +348,36 @@ pub struct MergeDemand {
     /// before other pool work. A plain std atomic even under loom: it steers
     /// scheduling only and is not part of the wake protocol.
     starved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The merge's scan-order hints, on their own cache line: decompress
+    /// workers read them on every planning pass, and the merge writes the
+    /// stats beside them on every source switch.
+    hints: CachePadded<ScanHints>,
     stats: MergeDemandStats,
 }
 
-/// `awaited` value meaning "not waiting".
+/// The merge's scan-order hints (`file_id + 1`; [`NONE`] = no file). Plain std
+/// atomics even under loom: a stale value costs a read in the wrong order,
+/// never correctness.
+struct ScanHints {
+    /// The file the merge will need after the current winner run.
+    predicted: StdAtomicU64,
+    /// The lowest-numbered spill file the merge has not drained ([`NONE`] =
+    /// every file drained).
+    frontier: StdAtomicU64,
+}
+
+/// `awaited` / `predicted` / `frontier` value meaning "no file".
 const NONE: u64 = 0;
+
+/// A file id as stored in the demand's atomics: `file_id + 1`, or [`NONE`].
+fn encode(file_id: Option<u32>) -> u64 {
+    file_id.map_or(NONE, |id| u64::from(id) + 1)
+}
+
+/// The inverse of [`encode`].
+fn decode(v: u64) -> Option<u32> {
+    (v != NONE).then(|| u32::try_from(v - 1).expect("demand atomics encode a u32 file id"))
+}
 
 impl Default for MergeDemand {
     fn default() -> Self {
@@ -340,6 +393,10 @@ impl MergeDemand {
             awaited: CachePadded::new(AtomicU64::new(NONE)),
             consumer: Mutex::new(None),
             starved: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hints: CachePadded::new(ScanHints {
+                predicted: StdAtomicU64::new(NONE),
+                frontier: StdAtomicU64::new(NONE),
+            }),
             stats: MergeDemandStats::default(),
         }
     }
@@ -411,7 +468,7 @@ impl MergeDemand {
     #[must_use]
     pub fn hot_ids(&self) -> HotIds {
         let mut hot = HotIds::default();
-        for id in [self.awaited()].into_iter().flatten() {
+        for id in [self.awaited(), self.predicted(), self.frontier()].into_iter().flatten() {
             hot.push(id);
         }
         hot
@@ -472,6 +529,35 @@ impl MergeDemand {
         woke
     }
 
+    /// Publish the file the merge will need next (`None`: no spill file —
+    /// the next source is in memory, or none remains). Stores only on a
+    /// change: the merge publishes on every source switch, often the same
+    /// file again, and every worker reads this line.
+    pub fn set_predicted(&self, file_id: Option<u32>) {
+        let v = encode(file_id);
+        if self.hints.predicted.load(Relaxed) != v {
+            self.hints.predicted.store(v, Relaxed);
+        }
+    }
+
+    /// The file the merge will need next, if any.
+    #[must_use]
+    pub fn predicted(&self) -> Option<u32> {
+        decode(self.hints.predicted.load(Relaxed))
+    }
+
+    /// Publish the lowest-numbered file the merge has not drained (`None`:
+    /// every file is drained).
+    pub fn set_frontier(&self, file_id: Option<u32>) {
+        self.hints.frontier.store(encode(file_id), Relaxed);
+    }
+
+    /// The lowest-numbered file the merge has not drained, if any.
+    #[must_use]
+    pub fn frontier(&self) -> Option<u32> {
+        decode(self.hints.frontier.load(Relaxed))
+    }
+
     /// The demand counters.
     #[must_use]
     pub fn stats(&self) -> &MergeDemandStats {
@@ -492,6 +578,8 @@ impl MergeDemand {
             awaited_starved: ld(&s.awaited[AwaitedSlotState::Starved.bucket()]),
             awaited_issued: ld(&s.awaited[AwaitedSlotState::Issued.bucket()]),
             awaited_decompressing: ld(&s.awaited[AwaitedSlotState::Decompressing.bucket()]),
+            predictions: ld(&s.predictions),
+            prediction_hits: ld(&s.prediction_hits),
             pool_woken: ld(&s.pool[MergePoolRequest::Woken as usize]),
             pool_all_awake: ld(&s.pool[MergePoolRequest::AllAwake as usize]),
             pool_pending: ld(&s.pool[MergePoolRequest::Pending as usize]),
@@ -521,14 +609,19 @@ mod tests {
 
     use super::*;
 
-    /// The hot set is the merge's demand, in priority order: nothing before a
-    /// stall, the awaited file after one.
+    /// The hot set is the merge's demand in priority order — awaited, then
+    /// predicted, then frontier — without repeats.
     #[test]
-    fn hot_ids_name_the_awaited_file() {
+    fn hot_ids_name_awaited_predicted_and_frontier_once_each() {
         let d = MergeDemand::new();
         assert!(d.hot_ids().as_slice().is_empty());
         d.set_awaited(7);
         assert_eq!(d.hot_ids().as_slice(), &[7]);
+        d.set_predicted(Some(3));
+        d.set_frontier(Some(7));
+        assert_eq!(d.hot_ids().as_slice(), &[7, 3], "the frontier repeats the awaited file");
+        d.set_frontier(Some(9));
+        assert_eq!(d.hot_ids().as_slice(), &[7, 3, 9]);
     }
 
     #[test]
@@ -640,6 +733,19 @@ mod tests {
         assert_eq!(d.consumer_id_for_test(), Some(other));
     }
 
+    /// Prediction and frontier round-trip every value, including `None` and
+    /// the largest file id.
+    #[test]
+    fn predicted_and_frontier_round_trip() {
+        let d = MergeDemand::new();
+        assert_eq!((d.predicted(), d.frontier()), (None, None));
+        for v in [Some(0), Some(7), Some(u32::MAX), None] {
+            d.set_predicted(v);
+            d.set_frontier(v);
+            assert_eq!((d.predicted(), d.frontier()), (v, v));
+        }
+    }
+
     #[test]
     fn starved_signal_is_shared_and_toggles() {
         let d = MergeDemand::new();
@@ -685,7 +791,7 @@ mod tests {
             (2, 1, 0, 1)
         );
         let lines = s.log_lines();
-        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines.len(), 6, "{lines:?}");
         assert!(lines[0].starts_with("Merge demand: 4 stall episodes (2.0 s exact)"), "{lines:?}");
         assert_eq!(lines[1], "Awaited slot at stall: starved 25% / issued 25% / decompressing 50%");
         assert_eq!(
@@ -693,11 +799,15 @@ mod tests {
             "Pool at stall: requests woken 2 / all-awake 1 / pending 0 / unavailable 1; a \
              worker was asleep at 50.0% of requests (0.5 s)"
         );
+        assert_eq!(lines[3], "Merge prediction: 0 predictions, hit 0.0%");
+        d.stats().record_prediction(true);
+        d.stats().record_prediction(false);
+        assert_eq!(d.snapshot().log_lines()[3], "Merge prediction: 2 predictions, hit 50.0%");
         assert_eq!(
-            lines[3],
+            lines[4],
             "Consumer served itself: 2 parks avoided by decompressing already-read blocks inline \
              (9 blocks decompressed by the merge)"
         );
-        assert_eq!(lines[4], "Merge output: 1 partial flushes on stall");
+        assert_eq!(lines[5], "Merge output: 1 partial flushes on stall");
     }
 }
