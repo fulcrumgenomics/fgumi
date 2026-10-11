@@ -2,9 +2,8 @@
 
 /// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
 /// the serial phase-1 coordination steps (`ReadBlocks` admit, the split front's
-/// boundary scan and run sort — `FindTemplateBoundaries` / `SortTemplateRun`, with
-/// key extraction on the pool between them — `FindBoundariesAndSort` for the
-/// orders not yet split, `SpillGather` range planning — the pool frames and
+/// boundary scan and run sort — `Find*Boundaries` / `Sort*Run`, with key
+/// extraction on the pool between them — and `SpillGather` range planning — the pool frames and
 /// compresses the ranges) plus the phase-2 `SortMerge`. One dedicated
 /// thread runs all of them off the pool — the true N+2 model (mirrors main's
 /// single main thread). Phase 1 and phase 2 are temporally disjoint, so the
@@ -33,14 +32,15 @@ pub mod spill_write;
 pub mod supply_ledger;
 
 pub use arena_ingest::{
-    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
-    InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
+    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, InflateToArena, InflatedBlock,
+    QuerynameStrategy, ReadBlocks, TemplateStrategy,
 };
 pub use arena_split::{
-    ArenaKeyExtractor, ExtractKeys, ExtractQuerynameKeys, ExtractTemplateKeys,
-    FindQuerynameBoundaries, FindRecordBoundaries, FindTemplateBoundaries, KEY_BATCH_RECORDS,
-    KeyBatch, KeyOverlapCensus, QnChunkOrder, QuerynameKeys, RefBatch, RunEnd, SortQuerynameRun,
-    SortRun, SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
+    ArenaKeyExtractor, CoordinateCtx, CoordinateKeys, ExtractCoordinateKeys, ExtractKeys,
+    ExtractQuerynameKeys, ExtractTemplateKeys, FindCoordinateBoundaries, FindQuerynameBoundaries,
+    FindRecordBoundaries, FindTemplateBoundaries, KEY_BATCH_RECORDS, KeyBatch, KeyOverlapCensus,
+    QnChunkOrder, QuerynameKeys, RefBatch, RunEnd, SortCoordinateRun, SortQuerynameRun, SortRun,
+    SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
 };
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};

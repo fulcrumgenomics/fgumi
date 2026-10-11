@@ -160,7 +160,8 @@ impl FinalizeHook for SortSummaryFinalizeHook {
 // `=== Sort Phase Timing ===` per-phase wall-time breakdown at `info!` on every
 // sort. Standalone `fgumi sort` now runs through the declarative chain, whose
 // sort phases are modeled as discrete pipeline steps
-// (`ReadBlocks`/`InflateToArena` → `FindBoundariesAndSort`/`SortBuffer` →
+// (`ReadBlocks`/`InflateToArena` → the split front (`Find*Boundaries` /
+// `Extract*Keys` / `Sort*Run`) or `SortBuffer` →
 // `SpillGather`/`SpillBlockCompress`/`SpillWrite` → `SortSpillDecompress` →
 // `SortMerge` → `BgzfCompress`/`WriteBgzfFile`). The pipeline already records
 // each step's cumulative `try_run` busy time
@@ -237,8 +238,10 @@ impl SortPhase {
             // FrameBgzfBlocks`) are the read half of this phase.
             "PlanInputReads" | "PreadInputSlices" | "FrameBgzfBlocks" | "ReadBlocks"
             | "InflateToArena" => Some(SortPhase::ReadDecompress),
-            "FindBoundariesAndSort"
-            | "SortBuffer"
+            "SortBuffer"
+            | "FindCoordinateBoundaries"
+            | "ExtractCoordinateKeys"
+            | "SortCoordinateRun"
             | "FindTemplateBoundaries"
             | "ExtractTemplateKeys"
             | "SortTemplateRun"
@@ -550,8 +553,8 @@ mod tests {
     fn summarize_sort_phases_buckets_every_step_into_its_phase() {
         let snap = snapshot_with_steps(vec![
             ("ReadBlocks", 100),
-            ("InflateToArena", 200),        // read + decompress = 300
-            ("FindBoundariesAndSort", 400), // in-memory sort = 400
+            ("InflateToArena", 200),    // read + decompress = 300
+            ("SortCoordinateRun", 400), // in-memory sort = 400
             ("SpillGather", 10),
             ("SpillBlockCompress", 20),
             ("SpillWrite", 30),          // spill write = 60, less consolidation
@@ -581,8 +584,8 @@ mod tests {
     }
 
     /// The `SortBuffer` ingest step (the SAM/RecordBatch arena front) buckets
-    /// into in-memory sort, exercising the branch the BAM path's
-    /// `FindBoundariesAndSort` does not.
+    /// into in-memory sort, exercising the branch the BAM path's split front
+    /// does not.
     #[test]
     fn summarize_maps_sort_buffer_ingest_to_in_memory_sort() {
         let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![("SortBuffer", 42)]), 0);
@@ -643,11 +646,13 @@ mod tests {
     #[case::frame_bgzf_blocks("FrameBgzfBlocks", SortPhase::ReadDecompress)]
     #[case::read_blocks("ReadBlocks", SortPhase::ReadDecompress)]
     #[case::inflate("InflateToArena", SortPhase::ReadDecompress)]
-    #[case::find_and_sort("FindBoundariesAndSort", SortPhase::InMemorySort)]
     #[case::sort_buffer("SortBuffer", SortPhase::InMemorySort)]
     #[case::find_template_boundaries("FindTemplateBoundaries", SortPhase::InMemorySort)]
     #[case::extract_template_keys("ExtractTemplateKeys", SortPhase::InMemorySort)]
     #[case::sort_template_run("SortTemplateRun", SortPhase::InMemorySort)]
+    #[case::find_coordinate_boundaries("FindCoordinateBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_coordinate_keys("ExtractCoordinateKeys", SortPhase::InMemorySort)]
+    #[case::sort_coordinate_run("SortCoordinateRun", SortPhase::InMemorySort)]
     #[case::find_queryname_boundaries("FindQuerynameBoundaries", SortPhase::InMemorySort)]
     #[case::extract_queryname_keys("ExtractQuerynameKeys", SortPhase::InMemorySort)]
     #[case::sort_queryname_run("SortQuerynameRun", SortPhase::InMemorySort)]

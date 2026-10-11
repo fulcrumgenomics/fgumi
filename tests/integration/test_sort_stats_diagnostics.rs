@@ -283,7 +283,7 @@ fn detached_parks(stderr: &str, step: &str) -> Option<(u64, u64, u64)> {
 /// booked to the step that last made progress on it, not to the first step of
 /// its group (`ReadBlocks`). Before the attribution fix every park of the
 /// shared `sort-coord` driver showed up under `ReadBlocks` and its other steps
-/// (`FindBoundariesAndSort`, `SpillGather`, `SortMerge`) all printed `0 parks`.
+/// (the run sort, `SpillGather`, `SortMerge`) all printed `0 parks`.
 /// Which of them parks depends on scheduling (the merge may never wait on a
 /// loaded host), so the check is on the group, not on one step.
 #[test]
@@ -297,7 +297,9 @@ fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
             .unwrap_or_else(|| panic!("no `detached \\`{step}\\`` line:\n{stderr}"))
     };
     // Every park ended one of two ways, so each line's split must add up.
-    for step in ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"] {
+    for step in
+        ["ReadBlocks", "FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+    {
         let (n, unparked, timed_out) = parks(step);
         assert_eq!(
             unparked + timed_out,
@@ -306,7 +308,10 @@ fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
         );
     }
     let booked_past_the_primary: u64 =
-        ["FindBoundariesAndSort", "SpillGather", "SortMerge"].iter().map(|s| parks(s).0).sum();
+        ["FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+            .iter()
+            .map(|s| parks(s).0)
+            .sum();
     assert!(
         booked_past_the_primary > 0,
         "coord-driver parks must be booked to the step that last progressed, not all to \
@@ -360,10 +365,11 @@ fn sort_stats_render_the_wake_table_under_pipeline_stats() {
     let (parks, unparked, timed_out) =
         detached_parks(&stderr, "SortMerge").expect("SortMerge park split");
     assert_eq!(unparked + timed_out, parks, "every SortMerge park ended one way:\n{stderr}");
-    let group_parks: u64 = ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"]
-        .iter()
-        .map(|s| detached_parks(&stderr, s).map_or(0, |p| p.0))
-        .sum();
+    let group_parks: u64 =
+        ["ReadBlocks", "FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+            .iter()
+            .map(|s| detached_parks(&stderr, s).map_or(0, |p| p.0))
+            .sum();
     assert!(group_parks > 0, "the coordination driver parked at least once:\n{stderr}");
 }
 
@@ -509,7 +515,7 @@ fn sort_stats_gates_spill_supply_lines(
 /// `--sort-stats`, on a sort that spills, in every order on the split front.
 #[rstest]
 fn sort_stats_gates_key_overlap_census(
-    #[values("template-coordinate", "queryname", "queryname::natural")] order: &str,
+    #[values("coordinate", "template-coordinate", "queryname", "queryname::natural")] order: &str,
     #[values(false, true)] with_flag: bool,
 ) {
     let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };

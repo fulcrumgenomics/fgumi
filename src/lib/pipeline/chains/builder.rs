@@ -259,9 +259,9 @@ pub(crate) enum ChainTailKind {
     /// decompressed), with an arena-backed front waiting for the parallel-inflate
     /// sort ingest steps. Set by `add_source` when the first stage is a sort over
     /// a BAM source (all four orders): `ReadBgzfBlocks` is emitted but
-    /// `BgzfDecompress` is NOT — the new front (`ReadBlocks` → `InflateToArena`
-    /// → `FindBoundariesAndSort`) handles decompression + boundary-find + sort
-    /// inline.
+    /// `BgzfDecompress` is NOT — the arena front (`ReadBlocks` → `InflateToArena`
+    /// → the order's split front) handles decompression, boundary-find, key
+    /// extraction and sort inline.
     ///
     /// `add_sort` consumes this tail for every BAM sort order.
     BgzfBlockArena,
@@ -590,7 +590,7 @@ pub struct ChainBuilder<'a> {
     /// scheduler — see [`Self::refill_hints`]). Two shapes set it:
     ///
     /// - A BAM sort source wired through the parallel-inflate arena front
-    ///   (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any sort
+    ///   (`ReadBlocks → InflateToArena →` the split front), for any sort
     ///   order — set in [`Self::add_sort`]. This opts the ENTIRE sort-first
     ///   pipeline (including fused `Sort → Group/Simplex/Duplex/Codec` chains)
     ///   in, so the sort's serial boundary/key scan overlaps the parallel inflate
@@ -1312,8 +1312,8 @@ impl<'a> ChainBuilder<'a> {
         // only one). When it is over a BAM source, the preamble stops at the
         // raw `ReadBgzfBlocks` step (tail = `ChainTailKind::BgzfBlockArena`)
         // instead of `DecodeRecords → DecodedRecordBatch`, so `add_sort`'s
-        // parallel-inflate arena front (`ReadBlocks → InflateToArena →
-        // FindBoundariesAndSort`) can consume it directly without an extra
+        // parallel-inflate arena front (`ReadBlocks → InflateToArena →` the
+        // split front) can consume it directly without an extra
         // round-trip. SAM sort-first is supported too (see the `Sam` arm
         // below): it decodes through the same `ParseSamChunk` preamble as
         // every other SAM ingest, and `add_sort` bridges the resulting
@@ -1343,8 +1343,7 @@ impl<'a> ChainBuilder<'a> {
                             // All four sort orders use the arena-backed
                             // parallel-inflate front (raw BGZF blocks only — no
                             // BgzfDecompress); ReadBlocks → InflateToArena →
-                            // FindBoundariesAndSort (with the per-order strategy)
-                            // are wired in add_sort. Leave the BgzfBlock tail for
+                            // the order's split front are wired in add_sort. Leave the BgzfBlock tail for
                             // that front. SAM / fused inputs still use SortBuffer.
                             if let Some(native) = self.native_input.clone() {
                                 // The header is parsed; the raw stream is re-read
@@ -3592,7 +3591,8 @@ impl<'a> ChainBuilder<'a> {
     /// RecordBatch (SAM) │ BgzfBlockArena (BAM)
     ///     ↓ arena sort ingest:
     ///        SAM → SortBuffer (Serial)
-    ///        BAM → ReadBlocks → InflateToArena → FindBoundariesAndSort
+    ///        BAM → ReadBlocks → InflateToArena → Find*Boundaries →
+    ///              Extract*Keys (Parallel) → Sort*Run
     ///     ↓ SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite (Serial)
     /// SortPhase1Event
     ///     ↓ SortSpillDecompress (Parallel)
@@ -3642,7 +3642,7 @@ impl<'a> ChainBuilder<'a> {
             //          DecodedRecordBatchToRecordBatch if DecodedRecordBatch — SAM source)
             //   RecordBatch (SAM, or fused non-Align/Correct upstream) │ BgzfBlockArena (BAM)
             //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
-            //         InflateToArena → FindBoundariesAndSort for BAM)
+            //         InflateToArena → the split front for BAM)
             //       ↓
             //   SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite
             //       (Serial) → SortPhase1Event
@@ -3951,12 +3951,9 @@ impl<'a> ChainBuilder<'a> {
                 // Else (RecordBatch from SAM or upstream stage): use SortBuffer.
                 let head_tail = if self.chain_tail_kind == ChainTailKind::BgzfBlockArena {
                     // BAM sort through the parallel-inflate arena front
-                    // (ReadBlocks → InflateToArena → …). Template-coordinate and
-                    // queryname run on the split front (boundaries → extraction →
-                    // run sort); coordinate on FindBoundariesAndSort.
-                    use fgumi_pipeline_io::sort::{
-                        CoordinateStrategy, FindBoundariesAndSort, InflateToArena, ReadBlocks,
-                    };
+                    // (ReadBlocks → InflateToArena → …). Every order runs on the
+                    // split front (boundaries → key extraction → run sort).
+                    use fgumi_pipeline_io::sort::{InflateToArena, ReadBlocks};
                     use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
@@ -4026,14 +4023,10 @@ impl<'a> ChainBuilder<'a> {
                                 &self.pipeline, t, qn_keys.clone(), split_front()
                             )
                         }
-                        SortOrder::Coordinate => self.pipeline.append_step(
-                            FindBoundariesAndSort::new(
-                                CoordinateStrategy::new(n_ref),
-                                sort_threads,
-                                byte_limit,
-                            )
-                            .with_phase_cap(phase1_cap.clone()),
-                            t,
+                        SortOrder::Coordinate => append_split::<
+                            fgumi_pipeline_io::sort::CoordinateKeys,
+                        >(
+                            &self.pipeline, t, n_ref, split_front()
                         ),
                     };
                     // The serial `sort-coord` driver (boundary scan, run sort, range
@@ -7785,6 +7778,21 @@ mod tests {
         assert_sort_refill_source_feeds_decompress(&built);
     }
 
+    /// The step names strictly between `InflateToArena` and `SpillGather` in a
+    /// rendered sort DAG: the order's in-memory sort front.
+    fn front_steps(dag: &str) -> Vec<String> {
+        let names: Vec<&str> = dag
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix('[')?.split_once("] "))
+            .filter_map(|(_, rest)| rest.split_whitespace().next())
+            .collect();
+        let at = |name: &str| names.iter().position(|n| *n == name).expect(name);
+        names[at("InflateToArena") + 1..at("SpillGather")]
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect()
+    }
+
     /// Build a sort chain over a header-only BGZF BAM at `threads`, with an
     /// optional `--sort-threads` and the given `--read-streams`; returns the
     /// `PreadInputSlices` clone count `add_source` sized the native path for
@@ -8027,20 +8035,68 @@ mod tests {
     }
 
     /// A BAM template-coordinate sort runs on the split arena front at every
-    /// thread count: the three split steps, and no `FindBoundariesAndSort`.
+    /// thread count: exactly the three split steps sit between `InflateToArena`
+    /// and `SpillGather`.
     #[rstest::rstest]
     fn template_sort_dag_has_the_split_front(#[values(1usize, 16)] threads: usize) {
         let (_, built, _tmp) =
             build_native_sort(vec![Stage::Sort], threads, None, fgumi_bam_io::ReadStreams::Auto);
         let dag = built.pipeline.dag_at(threads);
-        for name in ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"] {
-            assert!(dag.contains(name), "t{threads}: {name} missing:\n{dag}");
-        }
-        assert!(!dag.contains("FindBoundariesAndSort"), "t{threads}:\n{dag}");
+        assert_eq!(
+            front_steps(&dag),
+            ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"],
+            "t{threads}:\n{dag}"
+        );
+    }
+
+    /// Every order's BAM sort runs on the split arena front: exactly three
+    /// steps — boundaries, key extraction, run sort — between `InflateToArena`
+    /// and `SpillGather`, with no single-step front.
+    #[rstest::rstest]
+    fn every_order_builds_the_split_front(
+        #[values(
+            crate::commands::sort::SortOrderArg::Coordinate,
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural,
+            crate::commands::sort::SortOrderArg::TemplateCoordinate
+        )]
+        order: crate::commands::sort::SortOrderArg,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(4);
+        let front = front_steps(&dag);
+        assert_eq!(front.len(), 3, "{order:?}:\n{dag}");
+        assert!(front[0].starts_with("Find") && front[0].ends_with("Boundaries"), "{front:?}");
+        assert!(front[1].starts_with("Extract") && front[1].ends_with("Keys"), "{front:?}");
+        assert!(front[2].starts_with("Sort") && front[2].ends_with("Run"), "{front:?}");
+    }
+
+    /// The coordinate split front's three steps.
+    #[test]
+    fn coordinate_sort_dag_has_the_split_front() {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            crate::commands::sort::SortOrderArg::Coordinate,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(4);
+        assert_eq!(
+            front_steps(&dag),
+            ["FindCoordinateBoundaries", "ExtractCoordinateKeys", "SortCoordinateRun"],
+            "{dag}"
+        );
     }
 
     /// A BAM queryname sort, lexicographic or natural, runs on the split arena
-    /// front: the three queryname split steps, and no `FindBoundariesAndSort`.
+    /// front: exactly the three queryname split steps.
     /// Under an explicit `--sort-threads` the extraction carries the phase-1 cap.
     #[rstest::rstest]
     fn queryname_sort_dag_has_the_split_front(
@@ -8059,10 +8115,11 @@ mod tests {
             fgumi_bam_io::ReadStreams::Auto,
         );
         let dag = built.pipeline.dag_at(threads);
-        for name in ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"] {
-            assert!(dag.contains(name), "{order:?} t{threads}: {name} missing:\n{dag}");
-        }
-        assert!(!dag.contains("FindBoundariesAndSort"), "{order:?} t{threads}:\n{dag}");
+        assert_eq!(
+            front_steps(&dag),
+            ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"],
+            "{order:?} t{threads}:\n{dag}"
+        );
         let line = dag.lines().find(|l| l.contains("] ExtractQuerynameKeys")).expect("split");
         let cap = format!("cap=sort-phase1({})", threads.min(4));
         assert!(line.contains(&cap), "{line}");
@@ -8157,8 +8214,11 @@ mod tests {
             fgumi_bam_io::ReadStreams::Fixed(1),
         );
         let dag = built.pipeline.dag();
-        assert!(dag.contains("FindTemplateBoundaries"), "{dag}");
-        assert!(!dag.contains("FindBoundariesAndSort"), "{dag}");
+        assert_eq!(
+            front_steps(&dag),
+            ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"],
+            "{dag}"
+        );
     }
 
     /// `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` puts key extraction on every worker,

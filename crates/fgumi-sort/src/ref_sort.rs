@@ -156,9 +156,9 @@ pub fn coordinate_chunk_from_arena_refs(
 /// `arena`).  Radix-sorts the refs and wraps `arena` into the returned chunk —
 /// NO walk of the arena and NO record-byte copies.
 ///
-/// This is the fused entry point: the caller (`FindBoundariesAndSort`) extracts
-/// the key during its single boundary scan and hands the refs here, so the arena
-/// is walked exactly once for the whole run (the previous two-step
+/// This is the fused entry point: the split front extracts the key in
+/// `ExtractCoordinateKeys` (and the record-input front as it pushes each record)
+/// and hands the refs here, so the arena is walked once for the keys (the previous two-step
 /// [`coordinate_chunk_from_arena_refs`] re-walked it to re-derive each key).
 #[must_use]
 pub fn coordinate_chunk_from_refs(

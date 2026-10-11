@@ -1762,7 +1762,7 @@ mod tests {
     // live step until it yields, then park" loop would wedge the coordination
     // driver: it parks on a step whose input isn't ready yet while a *sibling*
     // step on the same driver holds the work that would unblock it (e.g. park on
-    // `FindBoundariesAndSort` while `SpillGather` holds the chunk that frees the
+    // the run sort while `SpillGather` holds the chunk that frees the
     // capacity-1 arena). These two steps pin that the whole-pass discipline holds.
 
     /// `Owned` step wedged on `NoProgress` until `gate` is flipped by a sibling,

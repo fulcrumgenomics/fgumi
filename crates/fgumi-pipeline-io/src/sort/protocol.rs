@@ -24,7 +24,7 @@ use fgumi_pipeline_core::item::HeapSize;
 const PER_MEMORY_RECORD_OVERHEAD: usize = 354;
 
 /// In-memory sorted residual chunk produced by the Phase-1 sort head
-/// (`SortBuffer` or `FindBoundariesAndSort`), type-erased over the sort-key
+/// (`SortBuffer` or the split front's `Sort*Run`), type-erased over the sort-key
 /// variant `K`.
 pub enum MemoryChunkErased {
     /// Coordinate-sort residual. `K = RawCoordinateKey`. Zero-copy arena-backed

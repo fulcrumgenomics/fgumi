@@ -1308,7 +1308,9 @@ mod tests {
     /// planner): two Shared driver groups (coord = {1,3,4,8}, io = {6,10}),
     /// `ReadBgzfBlocks` pinned to w0, every edge byte-bounded. It mirrors no
     /// production chain today and nothing checks it against one; it is kept
-    /// as a mixed-kind fixture whose expectations are its own.
+    /// as a mixed-kind fixture whose expectations are its own. One Detached
+    /// `ArenaSort` step stands for the arena front's serial sort work on the
+    /// coordination driver.
     /// [`native_input_sort_topology`] models the current chain.
     pub(super) fn synthetic_sort_topology() -> Topology {
         use StepKind::{Detached as D, Parallel as P, Serial as S};
@@ -1316,7 +1318,7 @@ mod tests {
             "ReadBgzfBlocks",
             "ReadBlocks",
             "InflateToArena",
-            "FindBoundariesAndSort",
+            "ArenaSort",
             "SpillGather",
             "SpillBlockCompress",
             "SpillWrite",
@@ -1488,7 +1490,7 @@ mod tests {
             (1, Pool, true, &[0]),
             (2, coord, true, &[1]),
             (3, NoneT, true, &[2]),
-            (4, Pool, true, &[]), // from FBS: same thread → omitted
+            (4, Pool, true, &[]), // from ArenaSort: same thread → omitted
             (5, io, true, &[4]),
             (6, Pool, true, &[5]),
             (7, coord, true, &[6]),
@@ -1509,8 +1511,8 @@ mod tests {
             assert_eq!(plan.reverse_producers(StepIdx(i)), want, "reverse of step {i}");
         }
         // Every edge is tracked: every producer with a byte-bounded output is
-        // gated, whatever its kind — the same-thread FBS → SpillGather edge has
-        // no reverse wake, but FBS is a gated producer, so it is counted.
+        // gated, whatever its kind — the same-thread ArenaSort → SpillGather edge
+        // has no reverse wake, but ArenaSort is a gated producer, so it is counted.
         for (i, rq) in queues.iter().enumerate() {
             assert!(plan.tracks(rq), "tracking of edge {i}");
         }
@@ -1970,7 +1972,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "      wake: .0 → FindBoundariesAndSort Driver(0) [gated]; reverse: ReadBlocks (holder)"
+            "      wake: .0 → ArenaSort Driver(0) [gated]; reverse: ReadBlocks (holder)"
         );
         assert_eq!(lines[10], "      wake: (sink); reverse: BgzfCompress (holder)");
         let legacy = WakePlan::legacy(None);
@@ -2265,7 +2267,7 @@ mod tests {
                 // the registration and let the test pass without `on_progress`'s
                 // fence.
                 work.store(true, std::sync::atomic::Ordering::Relaxed);
-                // InflateToArena (2) → FindBoundariesAndSort on Driver(0). The
+                // InflateToArena (2) → ArenaSort on Driver(0). The
                 // branch is push-gated; a snapshot no counter can equal stands
                 // for a dispatch that pushed.
                 let pushed = PushSnapshot([u64::MAX; MAX_GATED_BRANCHES]);

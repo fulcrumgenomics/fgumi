@@ -296,7 +296,7 @@ of records) and a safe rewrite measurably regresses sort throughput.
 The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`
 and `sort/arena_split.rs`) inflates BGZF blocks in parallel straight into one
 shared arena segment and scans the records in place. It calls the two approved
-`SegmentedBuf` methods above (`grow_uninit`, `slice_mut`) at four production
+`SegmentedBuf` methods above (`grow_uninit`, `slice_mut`) at three production
 `#[allow(unsafe_code)]` sites, under their documented contracts. Approved for
 the same reason as those methods: the ingest runs once per BGZF block over
 millions of blocks, and the safe alternatives (zero-filling the segment, or
@@ -314,12 +314,12 @@ pass over every inflated byte.
   slot. SAFETY: the slot was grown before the block was enqueued; the ISIZE
   prefix sum partitions the arena into disjoint slots, so no two workers' `&mut`
   overlap; `decompress_into_slice_with_crc` fills every byte before any read.
-- `FindBoundariesAndSort::ingest_block` and `FindRecordBoundaries::ingest_block`
-  (`arena_split.rs`) — one `slice_mut` each, writing the previous run's straddler
-  carry right-aligned into `[FRONT_REGION - l, FRONT_REGION)`. SAFETY: that
-  range lies strictly below `FRONT_REGION`, where no inflate slot ever lies, so
-  it aliases no slot a worker is writing; the segment was frozen by
-  `reserve_full_capacity` before sharing, so no grow can move it.
+- `FindRecordBoundaries::ingest_block` (`arena_split.rs`) — one `slice_mut`
+  writing the previous run's straddler carry right-aligned into
+  `[FRONT_REGION - l, FRONT_REGION)`. SAFETY: that range lies strictly below
+  `FRONT_REGION`, where no inflate slot ever lies, so it aliases no slot a worker
+  is writing; the segment was frozen by `reserve_full_capacity` before sharing,
+  so no grow can move it.
 
 The prefetch hint this front also uses is `fgumi-sort`'s `prefetch_read_l1`
 (listed above); `fgumi-pipeline-io` has no intrinsic of its own.
@@ -459,11 +459,11 @@ storing a reference whose real lifetime the struct cannot name.
 The counts above are **production** sites. Tests carry their own
 `#[allow(unsafe_code)]` where they exercise an already-approved `unsafe` API
 directly. In `fgumi-sort` those are `segmented_buf.rs` (8), `ref_sort.rs` (3),
-and `chunk_sorter.rs` (2), all of them driving `SegmentedBuf::grow_uninit` /
+and `chunk_sorter.rs` (1), all of them driving `SegmentedBuf::grow_uninit` /
 `slice_mut` to check a reserve-then-write round-trip, or that a sorted chunk
 matches its oracle. In `fgumi-raw-bam` they are the `compare_nul` helper and the
 `proptest` agreement test in `src/sort.rs`, both already named above. In
-`fgumi-pipeline-io` they are the eight test functions in `sort/arena_ingest.rs`
+`fgumi-pipeline-io` they are the three test functions in `sort/arena_ingest.rs`
 that build an arena by hand with `grow_uninit` / `slice_mut`. They add no new
 `unsafe` *surface*: each calls a function already justified above, under that
 function's documented contract.
@@ -638,9 +638,9 @@ classes, re-windowed batches and the compare shares (`arena fallbacks` is the
 share that read the arena). The spill format is unchanged: queryname keys are
 embedded in the record, and the merge rebuilds them from the body.
 
-### Split arena front (template-coordinate, queryname)
+### Split arena front (every sort order)
 
-Template-coordinate and queryname phase 1 run as three steps generic over an
+A BAM sort's phase 1 runs as three steps generic over an
 `ArenaKeyExtractor` (`crates/fgumi-pipeline-io/src/sort/arena_split.rs`). For
 template order: `FindTemplateBoundaries` (serial, `sort-coord`) cuts 4096-record key batches
 and run ends, `ExtractTemplateKeys` (parallel, excluded from the reader's
@@ -657,6 +657,12 @@ Queryname (`FindQuerynameBoundaries` → `ExtractQuerynameKeys` →
 `SortQuerynameRun`) extracts each batch's `QnRef`s with the extraction clone's
 own `QnRefBuilder` and classifies (and, on a learned prefix, re-windows) the
 batch before it leaves the extractor, so the run sort only sorts.
+
+Coordinate (`FindCoordinateBoundaries` → `ExtractCoordinateKeys` →
+`SortCoordinateRun`) extracts 24-byte `RecordRef`s and radix-sorts each run;
+the radix spawns its own `sort_threads` threads, so the bounded pool the trait
+hands it is unused. The single-step front these replace is gone; SAM and fused
+inputs still sort through `SortBuffer` and its per-order `ArenaSortStrategy`.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

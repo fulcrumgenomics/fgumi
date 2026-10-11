@@ -6,8 +6,8 @@
 //! Two fronts share one extraction ([`TemplateKeyContext::extract_one`]), one
 //! ref container ([`TemplateArenaRefs`]) and one seal ([`seal_template_refs`]):
 //!
-//! - [`TemplateArenaAccumulator`] is the per-record front. The arena-front
-//!   pipeline step (`FindBoundariesAndSort` in `fgumi-pipeline-io`) calls
+//! - [`TemplateArenaAccumulator`] is the per-record front. The record-input
+//!   sort (`SortBuffer`'s template strategy in `fgumi-pipeline-io`) calls
 //!   [`push`](TemplateArenaAccumulator::push) per record (arena offset + len)
 //!   and [`seal`](TemplateArenaAccumulator::seal) per run; the accumulator
 //!   provisions the [`TemplateKeyContext`] from the first record and calls
@@ -345,14 +345,10 @@ pub fn seal_template_refs(
 pub struct TemplateArenaAccumulator {
     seed: TemplateKeySeed,
     /// Variant + baseline and this run's refs; `None` until the first record
-    /// provisions the context, then carried (context only) by `fresh` —
-    /// provisioning is per sort, not per worker. One `Option` so "refs exist
-    /// exactly when the context does" holds by construction.
+    /// provisions the context. One `Option` so "refs exist exactly when the
+    /// context does" holds by construction.
     state: Option<(Arc<TemplateKeyContext>, TemplateArenaRefs)>,
-    /// Reserve hint received before the first record (variant unknown), applied
-    /// when the ref buffer is provisioned.
-    pending_reserve: usize,
-    /// See [`BoundedSortPool`]: shared across `fresh` copies.
+    /// See [`BoundedSortPool`].
     sort_pool: BoundedSortPool,
 }
 
@@ -366,7 +362,6 @@ impl TemplateArenaAccumulator {
         Self {
             seed: TemplateKeySeed::from_header(header, cell_tag, key_types),
             state: None,
-            pending_reserve: 0,
             sort_pool: BoundedSortPool::new("tmpl-sort"),
         }
     }
@@ -375,14 +370,6 @@ impl TemplateArenaAccumulator {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.state.as_ref().map_or(0, |(_, refs)| refs.len())
-    }
-
-    /// Reserve capacity for approximately `est_records` refs for the current run.
-    pub fn reserve(&mut self, est_records: usize) {
-        match self.state.as_mut() {
-            Some((_, refs)) => refs.reserve(est_records),
-            None => self.pending_reserve = self.pending_reserve.max(est_records),
-        }
     }
 
     /// Extract the template key from `body` (the record's BAM body, `block_size`
@@ -408,9 +395,6 @@ impl TemplateArenaAccumulator {
         let Some((ctx, refs)) = self.state.as_mut() else {
             let ctx = self.seed.provision(body);
             let mut refs = TemplateArenaRefs::for_variant(ctx.variant);
-            if self.pending_reserve > 0 {
-                refs.reserve(self.pending_reserve);
-            }
             refs.push_full(&ctx.first_key, body_off, len);
             self.state = Some((ctx, refs));
             return Ok(());
@@ -437,11 +421,10 @@ impl TemplateArenaAccumulator {
     /// # `sort_threads` is per-sort, not per-call
     ///
     /// The signature takes it per call, which reads as though each call sizes its
-    /// own execution. It does not: the value builds the shared bounded pool on
-    /// the FIRST seal across the whole worker fan-out, and every later call —
-    /// this accumulator's next run, or another worker copy — runs on that pool at
-    /// its original width, silently ignoring a different value. Pass the same
-    /// number every time; see [`BoundedSortPool`].
+    /// own execution. It does not: the value builds the bounded pool on the
+    /// FIRST seal, and every later call (this accumulator's next run) runs on
+    /// that pool at its original width, silently ignoring a different value.
+    /// Pass the same number every time; see [`BoundedSortPool`].
     ///
     /// # Panics
     ///
@@ -458,51 +441,6 @@ impl TemplateArenaAccumulator {
         };
         let pool = self.sort_pool.bounded(sort_threads);
         seal_template_refs(refs, arena, sort_threads, pool)
-    }
-
-    /// The shared bounded pool, for tests that assert copies share one (the
-    /// sharing is otherwise unobservable — `seal` returns early before touching
-    /// the pool when the accumulator was never provisioned).
-    #[cfg(test)]
-    pub fn sort_pool_for_test(&mut self, sort_threads: usize) -> &rayon::ThreadPool {
-        self.sort_pool.bounded(sort_threads)
-    }
-
-    /// A worker copy: same configuration and provisioning, empty refs.
-    ///
-    /// **Provisioning is per-sort, not per-worker, and this carries it across.**
-    /// The chosen lane variant and the dropped-lane baseline (`first_key`) are
-    /// selected once from the first record and must then be identical for every
-    /// worker in the sort. Resetting them here instead would let each `Auto`
-    /// worker select a lane from *its own* first record, so one sort could emit
-    /// chunks of two different key widths; would give each worker a different
-    /// baseline, so a lane constant within every worker but varying across them
-    /// would pass `verify_dropped_lanes`; and would seal a worker that received
-    /// no records as [`TemplateMemChunk::K40`] no matter what the others chose.
-    ///
-    /// The refs are NOT carried — each worker accumulates its own — so a copy
-    /// starts empty but already knows which lane it is filling.
-    ///
-    /// # Preconditions
-    ///
-    /// Call this only **after** the parent has been provisioned (i.e. after its
-    /// first [`push`](Self::push)). Cloning a worker from an unprovisioned
-    /// parent yields `state: None`, and that worker will provision itself
-    /// independently — the exact divergence above. The caller that fans workers
-    /// out owns honouring this.
-    #[must_use]
-    pub fn fresh(&self) -> Self {
-        Self {
-            seed: self.seed.clone(),
-            // Carry the context, not the refs: same lane, own accumulation.
-            state: self
-                .state
-                .as_ref()
-                .map(|(ctx, _)| (Arc::clone(ctx), TemplateArenaRefs::for_variant(ctx.variant))),
-            pending_reserve: 0,
-            // Share the holder, not a new one: see `BoundedSortPool`.
-            sort_pool: self.sort_pool.clone(),
-        }
     }
 }
 

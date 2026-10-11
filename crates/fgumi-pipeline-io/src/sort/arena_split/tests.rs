@@ -194,8 +194,8 @@ fn detached_split_steps_refuse_a_worker_copy(#[values(true, false)] boundaries: 
     }
 }
 
-/// A final record cut short at the end of input is the same truncation error
-/// `FindBoundariesAndSort` raises.
+/// A final record cut short at the end of input is the truncation error the
+/// record-input front raises too.
 #[test]
 fn a_truncated_final_record_is_an_error() {
     let mut step = FindTemplateBoundaries::new(seed(), 1 << 20);
@@ -712,7 +712,6 @@ fn census_classifies_batches_against_their_runs_scan_end() {
 /// changes, and a short final batch.
 #[test]
 fn extract_queryname_keys_shares_the_one_extraction() {
-    use crate::sort::protocol::MemoryChunkErased;
     use fgumi_sort::{QN_CLASS_BATCH_RECORDS, QnLex, QnRefBuilder, QnSortState};
     let n = 2 * QN_CLASS_BATCH_RECORDS + 100;
     let bodies: Vec<Vec<u8>> = (0..n)
@@ -727,8 +726,7 @@ fn extract_queryname_keys_shares_the_one_extraction() {
         .collect();
     let (arena, at) = arena_with(16, &frames(&bodies));
 
-    let mut strategy =
-        QuerynameStrategy::<QnLex>::new(MemoryChunkErased::QuerynameLex, QnSortState::new(false));
+    let mut strategy = QuerynameStrategy::<QnLex>::new(QnSortState::new(false));
     let mut off = at;
     for b in &bodies {
         let len = u32::try_from(b.len()).unwrap();
@@ -803,4 +801,212 @@ fn queryname_split_step_names() {
         assert_eq!(names, ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"]);
     }
     assert_eq!(QuerynameKeys::<QnLex>::pool_name(), "qname-sort");
+}
+
+/// A coordinate record body: `tid`/`pos` (`-1` for unmapped), reverse strand on
+/// odd `i`, named `c{i}`.
+fn coord_body(i: usize, tid: i32, pos: i32) -> Vec<u8> {
+    let flags = if i % 2 == 1 { 0x10 } else { 0 } | if tid < 0 { 0x4 } else { 0 };
+    make_bam_bytes(tid, pos, flags, format!("c{i}").as_bytes(), &[], 20, -1, -1, &[])
+}
+
+/// A coordinate run extracted in 64-record batches and sealed is the chunk the
+/// copy-based `CoordinateChunkSorter` builds over the same records — ties
+/// (equal coordinates) in input order, unmapped records last. (Twin of the
+/// deleted `find_boundaries_and_sort_single_run_matches_oracle`.)
+#[rstest::rstest]
+fn coordinate_run_matches_the_copy_based_sorter(#[values(1usize, 3)] sort_threads: usize) {
+    use fgumi_sort::CoordinateChunkSorter;
+    let n_ref = 4u32;
+    let bodies: Vec<Vec<u8>> = (0..300usize)
+        .map(|i| {
+            let tid = if i % 11 == 0 { -1 } else { i32::try_from(i * 7 % 4).unwrap() };
+            let pos = if tid < 0 { -1 } else { i32::try_from(i * 31 % 50).unwrap() };
+            coord_body(i, tid, pos)
+        })
+        .collect();
+    let (arena, at) = arena_with(16, &frames(&bodies));
+    let ctx = CoordinateKeys::provision(&n_ref, &bodies[0]);
+    let mut acc = CoordinateKeys::accum_for(&ctx);
+    let mut start = at;
+    for (b, batch) in bodies.chunks(64).enumerate() {
+        let bytes: u64 = batch.iter().map(|r| 4 + r.len() as u64).sum();
+        let (refs, violation) = CoordinateKeys::extract_batch(
+            &ctx,
+            &mut (),
+            &arena,
+            start,
+            start + bytes,
+            u32::try_from(batch.len()).unwrap(),
+            b as u64 * 64,
+        )
+        .unwrap();
+        assert!(violation.is_none());
+        assert_eq!(CoordinateKeys::refs_byte_len(&refs), batch.len() * 24);
+        CoordinateKeys::append(&mut acc, refs);
+        start += bytes;
+    }
+    let pool = BoundedSortPool::new(CoordinateKeys::pool_name());
+    let MemoryChunkErased::Coordinate(chunk) =
+        CoordinateKeys::seal(&mut acc, &ctx, arena, sort_threads, &pool)
+    else {
+        panic!("a coordinate run seals a coordinate chunk");
+    };
+    assert!(acc.is_empty(), "the seal leaves the accumulator empty for the next run");
+    let mut oracle = CoordinateChunkSorter::for_test(usize::MAX, n_ref);
+    for r in &bodies {
+        let _ = oracle.push(r).unwrap();
+    }
+    let oc = oracle.take_sorted_chunk();
+    let got: Vec<&[u8]> = (0..chunk.len()).map(|i| chunk.record_bytes(i)).collect();
+    let want: Vec<&[u8]> = (0..oc.len()).map(|i| oc.record_bytes(i)).collect();
+    assert!(got == want, "t{sort_threads}: the sealed run differs from the copy-based sorter");
+}
+
+/// A run whose input drains before `ReadBlocks` marked its last block is sealed
+/// by `finalize` as the residual: one terminal batch carrying a non-spilling
+/// `RunEnd`, and a second `finalize` cuts nothing. (Twin of the deleted
+/// `finalize_stages_residual_before_all_announced_each_once`, boundary half.)
+#[test]
+fn boundaries_finalize_cuts_the_open_run_as_the_residual() {
+    let mut step = FindCoordinateBoundaries::new(1, 1 << 20).with_batch_records(64);
+    let bodies: Vec<Vec<u8>> = (0..10).map(|i| coord_body(i, 0, 10)).collect();
+    let data = [bam_header(), frames(&bodies)].concat();
+    let (a, at) = arena_with(0, &data);
+    let mut open = block(&a, 0, at, data.len(), 0, false);
+    open.is_last_of_run = false;
+    assert_eq!(step.ingest_block(&open).unwrap(), 10);
+    assert!(step.pending.iter().all(|b| b.run_end.is_none()), "no run end before finalize");
+    step.finalize().unwrap();
+    let ends: Vec<RunEnd> = step.pending.iter().filter_map(|b| b.run_end).collect();
+    assert_eq!(ends.len(), 1);
+    assert!(!ends[0].seals_to_spill && ends[0].records_ingested_so_far == 10);
+    let n = step.pending.len();
+    step.finalize().unwrap();
+    assert_eq!(step.pending.len(), n, "a second finalize cuts nothing");
+}
+
+/// `SortRun` emits a residual run as `Residual` then `AllAnnounced`, each once
+/// and in that order, then finishes. (Twin of the deleted
+/// `finalize_stages_residual_before_all_announced_each_once`, sort half.)
+#[test]
+fn sort_run_stages_residual_before_all_announced_each_once() {
+    let bodies: Vec<Vec<u8>> =
+        (0..5).map(|i| coord_body(i, 1, 50 - i32::try_from(i).unwrap())).collect();
+    let data = frames(&bodies);
+    let (arena, at) = arena_with(16, &data);
+    let ctx = CoordinateKeys::provision(&2, &bodies[0]);
+    let (refs, _) =
+        CoordinateKeys::extract_batch(&ctx, &mut (), &arena, at, at + data.len() as u64, 5, 0)
+            .unwrap();
+    let now = Instant::now();
+    let batch = RefBatch::<CoordinateKeys> {
+        arena,
+        ctx: Some(ctx),
+        ordinal: 0,
+        run_seq: 0,
+        first_record_index: 0,
+        refs: Some(refs),
+        violation: None,
+        keyed_at: now,
+        run_end: Some(RunEnd {
+            seals_to_spill: false,
+            records_ingested_so_far: 5,
+            run_bytes: data.len() as u64,
+            scan_end: now,
+        }),
+    };
+    let mut sort = SortCoordinateRun::new(1, 1 << 20);
+    let mut sp = StepProbe::new(&sort);
+    sp.push_input(batch);
+    sp.close_input();
+    let mut last = StepOutcome::Progress;
+    for _ in 0..8 {
+        last = sp.try_run(&mut sort).unwrap();
+        if last == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(last, StepOutcome::Finished);
+    let out = sp.take_output::<SortChunkEvent>(0);
+    let events: Vec<SortChunkEvent> = std::iter::from_fn(|| out.pop()).collect();
+    assert_eq!(events.len(), 2, "Residual and AllAnnounced, once each");
+    assert!(matches!(&events[0], SortChunkEvent::Residual { chunk, .. } if chunk.len() == 5));
+    assert!(matches!(
+        events[1],
+        SortChunkEvent::AllAnnounced { slot_count: 0, memory_chunk_count: 1, total_records: 5 }
+    ));
+}
+
+/// The run sort sizes the order's bounded pool to the phase-1 width it was
+/// built with (`--sort-threads`), observed on the queryname pool, which every
+/// queryname seal installs. (Twin of the deleted
+/// `phase1_sort_threads_sizes_the_queryname_worker_pool`.)
+#[rstest::rstest]
+fn sort_run_sizes_the_queryname_pool_to_sort_threads(#[values(1usize, 3)] sort_threads: usize) {
+    use fgumi_sort::{QnLex, QnRefBuilder, QnSortState};
+    let bodies: Vec<Vec<u8>> = (0..4).map(body).collect();
+    let data = frames(&bodies);
+    let (arena, at) = arena_with(16, &data);
+    let ctx = QuerynameKeys::<QnLex>::provision(&QnSortState::new(false), &bodies[0]);
+    let (refs, _) = QuerynameKeys::<QnLex>::extract_batch(
+        &ctx,
+        &mut QnRefBuilder::default(),
+        &arena,
+        at,
+        at + data.len() as u64,
+        4,
+        0,
+    )
+    .unwrap();
+    let now = Instant::now();
+    let batch = RefBatch::<QuerynameKeys<QnLex>> {
+        arena,
+        ctx: Some(ctx),
+        ordinal: 0,
+        run_seq: 0,
+        first_record_index: 0,
+        refs: Some(refs),
+        violation: None,
+        keyed_at: now,
+        run_end: Some(RunEnd {
+            seals_to_spill: false,
+            records_ingested_so_far: 4,
+            run_bytes: data.len() as u64,
+            scan_end: now,
+        }),
+    };
+    let mut sort = SortQuerynameRun::<QnLex>::new(sort_threads, 1 << 20);
+    assert_eq!(sort.sort_pool_threads(), None, "the pool is built on the first seal");
+    let sp = StepProbe::new(&sort);
+    sp.push_input(batch);
+    sp.try_run(&mut sort).unwrap();
+    assert_eq!(sort.sort_pool_threads(), Some(sort_threads));
+}
+
+/// The coordinate split steps carry their own names and pool name.
+#[test]
+fn coordinate_split_step_names() {
+    assert_eq!(
+        CoordinateKeys::STEP_NAMES,
+        ["FindCoordinateBoundaries", "ExtractCoordinateKeys", "SortCoordinateRun"]
+    );
+    assert_eq!(CoordinateKeys::pool_name(), "coord-sort");
+    assert_eq!(CoordinateKeys::ref_width(&CoordinateKeys::provision(&1, &[])), 24);
+}
+
+/// A coordinate run sorts in parallel — and so reserves the whole phase-1 cap —
+/// exactly when the radix would spawn more than one thread for it.
+#[test]
+fn coordinate_sorts_in_parallel_exactly_when_the_radix_does() {
+    let mut saw_parallel = false;
+    for len in [0usize, 1, 1 << 10, 1 << 16, 1 << 20] {
+        let acc = vec![fgumi_sort::RecordRef::new(0, 0, 0); len];
+        for threads in [1usize, 2, 8] {
+            let want = fgumi_sort::radix_sorts_in_parallel(len, threads);
+            assert_eq!(CoordinateKeys::sorts_in_parallel(&acc, threads), want, "{len} t{threads}");
+            saw_parallel |= want;
+        }
+    }
+    assert!(saw_parallel, "some run is large enough to sort in parallel");
 }

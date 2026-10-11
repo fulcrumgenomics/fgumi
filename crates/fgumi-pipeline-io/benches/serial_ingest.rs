@@ -88,7 +88,7 @@ fn bench_serial_ingest(c: &mut Criterion) {
     });
 
     // NEW path: scan + key-extract + ref-build — NO body copy. This is the
-    // per-record work the redesign's serial FindBoundariesAndSort step does.
+    // per-record work the arena front's boundary scan and key extraction do.
     group.bench_function("scan_refbuild", |b| {
         b.iter_batched(
             || Vec::<RecordRef>::with_capacity(N),

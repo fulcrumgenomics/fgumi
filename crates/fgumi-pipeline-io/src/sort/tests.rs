@@ -879,8 +879,6 @@ enum Front {
 /// The arena steps of an order's block-input front.
 #[derive(Clone, Copy, Debug)]
 enum ArenaFront {
-    /// `FindBoundariesAndSort` over the order's `ArenaSortStrategy`.
-    Fbs,
     /// The split front (`FindRecordBoundaries` → `ExtractKeys` → `SortRun`)
     /// over the order's `ArenaKeyExtractor`.
     Split,
@@ -889,11 +887,8 @@ enum ArenaFront {
 /// The arena front each order ships with at this commit. When an order moves
 /// to another front, this match is the one place that changes, so every
 /// arena-front test gates the front that ships.
-fn production_arena_front(order: SortOrder) -> ArenaFront {
-    match order {
-        SortOrder::TemplateCoordinate | SortOrder::Queryname(_) => ArenaFront::Split,
-        SortOrder::Coordinate => ArenaFront::Fbs,
-    }
+fn production_arena_front(_order: SortOrder) -> ArenaFront {
+    ArenaFront::Split
 }
 
 /// The split front's three steps for extractor `X`, with `caps`' test knobs.
@@ -929,7 +924,6 @@ fn arena_front<'b>(
     output_byte_limit: u64,
     caps: &ChainCaps,
 ) -> Chain<'b, Single<SortChunkEvent>> {
-    use crate::sort::protocol::MemoryChunkErased;
     let n_ref = u32::try_from(header.reference_sequences().len()).expect("n_ref fits u32");
     let SortBufferConfig { sort_order, sort_threads, cell_tag, key_types, .. } = config;
     match (front, sort_order) {
@@ -958,49 +952,9 @@ fn arena_front<'b>(
                 caps,
             )
         }
-        (ArenaFront::Split, order) => unreachable!("no split front for {order:?} yet"),
-        (ArenaFront::Fbs, SortOrder::Coordinate) => head.chain(
-            FindBoundariesAndSort::new(
-                CoordinateStrategy::new(n_ref),
-                sort_threads,
-                output_byte_limit,
-            )
-            .with_phase_cap(caps.phase1.clone()),
-        ),
-        (ArenaFront::Fbs, SortOrder::TemplateCoordinate) => {
-            let acc =
-                fgumi_sort::TemplateArenaAccumulator::from_header(header, cell_tag, key_types);
-            head.chain(
-                FindBoundariesAndSort::new(
-                    TemplateStrategy::new(acc),
-                    sort_threads,
-                    output_byte_limit,
-                )
-                .with_phase_cap(caps.phase1.clone()),
-            )
+        (ArenaFront::Split, SortOrder::Coordinate) => {
+            split_steps::<CoordinateKeys>(head, n_ref, sort_threads, output_byte_limit, caps)
         }
-        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Lexicographic)) => head.chain(
-            FindBoundariesAndSort::new(
-                QuerynameStrategy::<fgumi_sort::QnLex>::new(
-                    MemoryChunkErased::QuerynameLex,
-                    fgumi_sort::QnSortState::new(false),
-                ),
-                sort_threads,
-                output_byte_limit,
-            )
-            .with_phase_cap(caps.phase1.clone()),
-        ),
-        (ArenaFront::Fbs, SortOrder::Queryname(QuerynameComparator::Natural)) => head.chain(
-            FindBoundariesAndSort::new(
-                QuerynameStrategy::<fgumi_sort::QnNatural>::new(
-                    MemoryChunkErased::QuerynameNatural,
-                    fgumi_sort::QnSortState::new(false),
-                ),
-                sort_threads,
-                output_byte_limit,
-            )
-            .with_phase_cap(caps.phase1.clone()),
-        ),
     }
 }
 
@@ -1863,7 +1817,7 @@ fn block_parallel_high_contention_soak_matches_reference() {
 ///
 /// NOTE: this drives `drive_sort_pipeline_tuned` (the record-input `SortBuffer`
 /// chain), NOT the block-input arena front. The front's capacity-1 arena cycle —
-/// `ReadBlocks` acquire+admit and `FindBoundariesAndSort` seal+free on the
+/// `ReadBlocks` acquire+admit and the split front's run sort seal+free on the
 /// coordination driver with `InflateToArena` on the pool in between — is covered
 /// by `arena_front_chain_seals_multiple_runs_without_losing_records`, which seals
 /// several runs through the real runtime and so exercises acquire/seal/free
@@ -3622,7 +3576,7 @@ fn test_sort_merge_does_not_over_reserve_on_the_kway_path() {
     );
 }
 
-// ── Arena block-input front (ReadBlocks → InflateToArena → FindBoundariesAndSort) ──
+// ── Arena block-input front (ReadBlocks → InflateToArena → the split front) ──
 
 /// `Exclusive` source draining a `Vec<BgzfBlock>` one block per `try_run`.
 struct BgzfBlockSource {
@@ -3823,8 +3777,9 @@ fn blocks_from_stream(stream: &[u8], payload_bytes: usize) -> Vec<crate::types::
         .collect()
 }
 
-/// Drive `BgzfBlockSource → ReadBlocks → InflateToArena → FindBoundariesAndSort`
-/// and return every emitted chunk's record bodies, chunk by chunk, plus the
+/// Drive `BgzfBlockSource → ReadBlocks → InflateToArena →` the coordinate
+/// split front (`FindCoordinateBoundaries → ExtractCoordinateKeys →
+/// SortCoordinateRun`, one sort thread) and return every emitted chunk's record bodies, chunk by chunk, plus the
 /// terminal `AllAnnounced` counts.
 fn drive_arena_front(
     blocks: Vec<crate::types::BgzfBlock>,
@@ -3840,7 +3795,9 @@ fn drive_arena_front(
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
         .chain(ReadBlocks::new(memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit))
-        .chain(FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, output_byte_limit))
+        .chain(FindCoordinateBoundaries::new(n_ref, output_byte_limit))
+        .chain(ExtractCoordinateKeys::new(output_byte_limit))
+        .chain(SortCoordinateRun::new(1, output_byte_limit))
         .chain(ChunkEventSink { received: Arc::clone(&received) })
         .into_sink_marker();
     let pipeline = builder.build()?;
@@ -4042,7 +3999,7 @@ fn worker_copies_share_the_phase_cap() {
 /// The benchmark case, in miniature: a pre-sorted BAM re-sorted through the full
 /// arena/BAM path under a small memory budget must coalesce every contiguous
 /// sealed run into ONE spill file, and stay byte-identical to the oracle. This is
-/// the `FindBoundariesAndSort` head (not `SortBuffer`), so it proves the
+/// the arena split front (not `SortBuffer`), so it proves the
 /// run-former covers the path the 43 GB `1kg-wgs` sort exercises.
 #[test]
 fn presorted_bam_coalesces_to_one_run_through_the_arena_split() {
@@ -4093,7 +4050,7 @@ fn shuffled_bam_matches_the_oracle_through_the_arena_split() {
     assert!(runs >= 2, "arena/BAM shuffled input must form >=2 runs (got {runs})");
 }
 
-// ── Domain counters (T-BW2): ReadBlocks / FindBoundariesAndSort / SpillWrite /
+// ── Domain counters (T-BW2): ReadBlocks / FindCoordinateBoundaries / SpillWrite /
 // SortMerge, driven together through the real arena-split chain ──────────────
 
 /// Serial sink that sleeps briefly per received `RecordBatch` before recording
@@ -4137,11 +4094,12 @@ impl Step for ThrottledVecSink {
 }
 
 /// Drives the full arena-split chain (`BgzfBlockSource -> ReadBlocks ->
-/// InflateToArena -> FindBoundariesAndSort -> SpillGather -> SpillBlockCompress
+/// InflateToArena -> FindCoordinateBoundaries -> ExtractCoordinateKeys ->
+/// SortCoordinateRun -> SpillGather -> SpillBlockCompress
 /// -> SpillWrite -> SortSpillDecompress -> SortMerge -> ThrottledVecSink`) with
 /// telemetry enabled and asserts four of its steps' T-BW2 domain counters land
 /// in the telemetry files with sane, bounded values: `ReadBlocks`
-/// (`blocks`/`bytes_read`), `FindBoundariesAndSort` (`records`), `SpillWrite`
+/// (`blocks`/`bytes_read`), `FindCoordinateBoundaries` (`records`), `SpillWrite`
 /// (`spill_bytes_written`), and `SortMerge` (`records`). A tiny `memory_limit`
 /// forces several sealed runs (several spill files), giving every one of these
 /// steps repeated, spread-out `try_run` calls rather than a single batch.
@@ -4190,7 +4148,9 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         .chain(BgzfBlockSource::new(blocks, output_byte_limit))
         .chain(ReadBlocks::new(memory_limit, output_byte_limit))
         .chain(InflateToArena::new(output_byte_limit))
-        .chain(FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, output_byte_limit))
+        .chain(FindCoordinateBoundaries::new(n_ref, output_byte_limit))
+        .chain(ExtractCoordinateKeys::new(output_byte_limit))
+        .chain(SortCoordinateRun::new(1, output_byte_limit))
         .chain(SpillGather::new(output_byte_limit))
         .chain(SpillBlockCompress::new(codec, 3, output_byte_limit))
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
@@ -4217,9 +4177,10 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
     assert_eq!(total_out_records, N_RECORDS, "every record reached the sink exactly once");
 
     // Step indices, in declaration order: source=0, ReadBlocks=1,
-    // InflateToArena=2, FindBoundariesAndSort=3, SpillGather=4,
-    // SpillBlockCompress=5, SpillWrite=6, SpillReadPlanner=7,
-    // PreadSpillSlices=8, SortSpillDecompress=9, SortMerge=10, sink=11.
+    // InflateToArena=2, FindCoordinateBoundaries=3, ExtractCoordinateKeys=4,
+    // SortCoordinateRun=5, SpillGather=6, SpillBlockCompress=7, SpillWrite=8,
+    // SpillReadPlanner=9, PreadSpillSlices=10, SortSpillDecompress=11,
+    // SortMerge=12, sink=13.
     let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();
     let last_value_for = |step: &str, counter: &str| -> Option<u64> {
         counters
@@ -4246,15 +4207,15 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         "read_blocks_bytes={read_blocks_bytes}"
     );
 
-    let fbs_records =
-        last_value_for("3", "0").expect("FindBoundariesAndSort records counter recorded");
-    assert!(fbs_records > 0 && fbs_records <= N_RECORDS as u64, "fbs_records={fbs_records}");
+    let scan_records =
+        last_value_for("3", "0").expect("FindCoordinateBoundaries records counter recorded");
+    assert!(scan_records > 0 && scan_records <= N_RECORDS as u64, "scan_records={scan_records}");
 
     let spill_bytes_written =
-        last_value_for("6", "0").expect("SpillWrite spill_bytes_written counter recorded");
+        last_value_for("8", "0").expect("SpillWrite spill_bytes_written counter recorded");
     assert!(spill_bytes_written > 0, "spill_bytes_written={spill_bytes_written}");
 
-    let merge_records = last_value_for("10", "0").expect("SortMerge records counter recorded");
+    let merge_records = last_value_for("12", "0").expect("SortMerge records counter recorded");
     assert!(
         merge_records > 0 && merge_records <= N_RECORDS as u64,
         "merge_records={merge_records}"
@@ -5036,13 +4997,12 @@ fn template_records(n: usize, seed: u64, cb: bool, mi: bool) -> (Header, Vec<Raw
     (synthetic_header(), records)
 }
 
-/// The split front at every lane width and thread count: each run's chunk is
-/// the chunk `FindBoundariesAndSort<TemplateStrategy>` seals for the same
-/// run, record for record and lane for lane, and the merged output is the
-/// reference sort. Small batches (64 records) over several runs, with records
+/// The split front at every lane width and thread count seals every run in the
+/// lane the configuration selects, and the merged output is the reference
+/// stable sort. Small batches (64 records) over several runs, with records
 /// straddling block and run boundaries.
 #[rstest]
-fn template_split_matches_fbs_and_reference_across_runs(
+fn template_split_matches_reference_across_runs(
     #[values(
         LaneCase::AutoPlain,
         LaneCase::AutoCb,
@@ -5070,8 +5030,6 @@ fn template_split_matches_fbs_and_reference_across_runs(
     let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
     let split =
         drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
-    let fbs =
-        drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), threads, &caps).unwrap();
     assert!(split.chunks.len() >= 3, "{case:?}: several runs (got {})", split.chunks.len());
     let (_, spilled) = split.chunks.split_last().expect("chunks");
     assert!(
@@ -5079,9 +5037,8 @@ fn template_split_matches_fbs_and_reference_across_runs(
         "{case:?}: every spilled run spans several batches"
     );
     assert!(split.key_kinds.iter().all(|&k| k == lane), "{case:?}: {:?}", split.key_kinds);
-    assert_eq!(split.key_kinds, fbs.key_kinds, "{case:?}");
-    assert!(split.chunks == fbs.chunks, "{case:?} t{threads}: chunks differ from FBS");
-    assert_eq!((split.slot_count, split.total_records), (fbs.slot_count, fbs.total_records));
+    assert_eq!(split.total_records, records.len() as u64, "{case:?}");
+    assert_eq!(split.slot_count as usize + 1, split.chunks.len(), "{case:?}: spills + residual");
     let merged = drive_arena_chain(
         ArenaFront::Split,
         config,
@@ -5101,9 +5058,9 @@ fn template_split_matches_fbs_and_reference_across_runs(
 }
 
 /// A dropped-lane violation under `--key-types none` is reported with the same
-/// text by every template path — the record-input front, the old arena front
-/// and the split front at one and four threads — and names the first
-/// offending record (7), though another (300) sits in a later batch.
+/// text by both template fronts — the record-input front and the split front
+/// at one and four threads — and names the first offending record (7), though
+/// another (300) sits in a later batch.
 #[test]
 fn violation_report_is_identical_across_template_paths() {
     let records: Vec<RawRecord> = (0..600i32)
@@ -5142,11 +5099,9 @@ fn violation_report_is_identical_across_template_paths() {
     let violation = |msg: &str| {
         msg.rsplit_once("record rd_").map(|(_, rest)| format!("record rd_{rest}")).expect(msg)
     };
-    let fbs = violation(&arena_err(ArenaFront::Fbs, 2));
-    assert!(fbs.starts_with("record rd_7 "), "{fbs}");
-    for threads in [1, 4] {
-        assert_eq!(violation(&arena_err(ArenaFront::Split, threads)), fbs, "t{threads}");
-    }
+    let split = violation(&arena_err(ArenaFront::Split, 1));
+    assert!(split.starts_with("record rd_7 "), "{split}");
+    assert_eq!(violation(&arena_err(ArenaFront::Split, 4)), split, "t4");
     let buffer = drive_buffer_chain(
         config,
         &header,
@@ -5158,17 +5113,19 @@ fn violation_report_is_identical_across_template_paths() {
         ZSTD_1,
     )
     .expect_err("the record-input front fails too");
-    assert_eq!(violation(&format!("{buffer:#}")), fbs);
+    assert_eq!(violation(&format!("{buffer:#}")), split);
 }
 
-/// Edge inputs behave on the split front exactly as on `FindBoundariesAndSort`:
-/// a header-only BAM, a single in-memory run, and a final record cut short.
+/// Edge inputs on the split front: a header-only BAM seals no records, a
+/// single in-memory run is the reference sort, and a final record cut short
+/// is the truncation error.
 #[rstest]
 #[case::header_only(0, usize::MAX, false)]
 #[case::residual_only(500, 64 << 20, false)]
 #[case::truncated(500, 64 * 1024, true)]
-fn split_front_edge_cases_match_fbs(
+fn split_front_edge_cases(
     #[values(
+        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5189,21 +5146,28 @@ fn split_front_edge_cases_match_fbs(
         }
     };
     let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
-    let split = drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), 2, &caps);
-    let fbs = drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), 2, &caps);
-    match (split, fbs) {
-        (Ok(s), Ok(f)) => {
+    match drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), 2, &caps) {
+        Ok(out) => {
             assert!(!truncate);
-            assert!(s.chunks == f.chunks && s.key_kinds == f.key_kinds);
-            assert_eq!((s.slot_count, s.total_records), (f.slot_count, f.total_records));
+            assert_eq!(out.slot_count, 0, "{order:?}: nothing spills");
+            assert!(!out.key_kinds.is_empty(), "{order:?}: the residual is announced");
+            assert!(
+                out.key_kinds.iter().all(|&k| key_kind_is_of(order, k)),
+                "{order:?}: every chunk is the order's kind: {:?}",
+                out.key_kinds
+            );
+            assert_eq!(out.total_records, n as u64, "{order:?}");
+            let sealed: Vec<Vec<u8>> = out.chunks.into_iter().flatten().collect();
+            assert!(
+                sealed == reference_sort(order, &header, &records, None),
+                "{order:?}: the in-memory run is the reference sort"
+            );
         }
-        (Err(s), Err(f)) => {
-            assert!(truncate);
-            let (s, f) = (format!("{s:#}"), format!("{f:#}"));
-            assert!(s.contains("truncated BAM: final record incomplete"), "{s}");
-            assert!(f.contains("truncated BAM: final record incomplete"), "{f}");
+        Err(err) => {
+            assert!(truncate, "{order:?}: {err:#}");
+            let err = format!("{err:#}");
+            assert!(err.contains("truncated BAM: final record incomplete"), "{order:?}: {err}");
         }
-        (s, f) => panic!("split {:?} vs fbs {:?}", s.map(|_| ()), f.map(|_| ())),
     }
 }
 
@@ -5213,6 +5177,7 @@ fn split_front_edge_cases_match_fbs(
 #[rstest]
 fn a_one_permit_phase1_cap_completes_on_the_split_front(
     #[values(
+        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5247,6 +5212,7 @@ fn a_one_permit_phase1_cap_completes_on_the_split_front(
 #[rstest]
 fn split_extracts_while_the_scan_continues(
     #[values(
+        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5292,6 +5258,7 @@ fn split_extracts_while_the_scan_continues(
 #[rstest]
 fn t1_split_runs_extract_on_the_coord_driver(
     #[values(
+        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5329,6 +5296,7 @@ fn t1_split_runs_extract_on_the_coord_driver(
 #[rstest]
 fn split_front_at_one_and_two_threads(
     #[values(
+        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5445,11 +5413,11 @@ fn instrument_switching_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>)
 }
 
 /// The queryname split front, lexicographic and natural, at one, two and four
-/// threads: every run's chunk is `FindBoundariesAndSort`'s, record for record,
-/// though key batches (64 records) re-learn their prefix class as the
-/// instrument changes; the merged output is the reference stable sort.
+/// threads, over 64-record key batches that re-learn their prefix class as the
+/// instrument changes: the merged output is the reference stable sort, ties in
+/// input order.
 #[rstest]
-fn queryname_split_matches_fbs_and_reference_across_runs(
+fn queryname_split_matches_reference_across_runs(
     #[values(QuerynameComparator::Lexicographic, QuerynameComparator::Natural)]
     cmp: QuerynameComparator,
     #[values(1usize, 2, 4)] threads: usize,
@@ -5462,12 +5430,13 @@ fn queryname_split_matches_fbs_and_reference_across_runs(
     let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
     let split =
         drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
-    let fbs =
-        drive_arena_chunks(ArenaFront::Fbs, config, &header, blocks(), threads, &caps).unwrap();
     assert!(split.chunks.len() >= 3, "{cmp:?}: several runs (got {})", split.chunks.len());
-    assert_eq!(split.key_kinds, fbs.key_kinds, "{cmp:?}");
-    assert!(split.chunks == fbs.chunks, "{cmp:?} t{threads}: chunks differ from FBS");
-    assert_eq!((split.slot_count, split.total_records), (fbs.slot_count, fbs.total_records));
+    let kind = match cmp {
+        QuerynameComparator::Lexicographic => fgumi_sort::SpillKeyKind::QuerynameLex,
+        QuerynameComparator::Natural => fgumi_sort::SpillKeyKind::QuerynameNatural,
+    };
+    assert!(split.key_kinds.iter().all(|&k| k == kind), "{cmp:?}: {:?}", split.key_kinds);
+    assert_eq!(split.total_records, records.len() as u64);
     let merged = drive_arena_chain(
         ArenaFront::Split,
         config,
@@ -5482,4 +5451,50 @@ fn queryname_split_matches_fbs_and_reference_across_runs(
     let expected = reference_sort(order, &header, &records, None);
     assert_record_parity(&format!("{cmp:?} t{threads}"), &merged.records, &expected);
     assert_input_order_within_equal_keys(order, &header, &merged.records);
+}
+
+/// The coordinate split front at one, two and four threads, over 64-record key
+/// batches across several runs: every run seals a coordinate chunk, and the
+/// merged output is the reference stable sort, ties in input order.
+#[rstest]
+fn coordinate_split_matches_reference(#[values(1usize, 2, 4)] threads: usize) {
+    let order = SortOrder::Coordinate;
+    let (header, records) = tie_heavy_records(4_000, 0xC0 + threads as u64);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(order, 96 * 1024, threads);
+    let caps = ChainCaps { batch_records: Some(64), ..ChainCaps::default() };
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+    let split =
+        drive_arena_chunks(ArenaFront::Split, config, &header, blocks(), threads, &caps).unwrap();
+    assert!(split.chunks.len() >= 3, "several runs (got {})", split.chunks.len());
+    assert!(split.key_kinds.iter().all(|&k| k == fgumi_sort::SpillKeyKind::Coordinate));
+    assert_eq!(split.total_records, records.len() as u64);
+    let merged = drive_arena_chain(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        4 * 1024 * 1024,
+        threads,
+        MergeSink::Batches(StepKind::Serial),
+        &caps,
+    )
+    .unwrap();
+    let expected = reference_sort(order, &header, &records, None);
+    assert_record_parity(&format!("t{threads}"), &merged.records, &expected);
+    assert_input_order_within_equal_keys(order, &header, &merged.records);
+}
+
+/// Whether a sealed chunk's key kind belongs to `order` (any lane for template
+/// order).
+fn key_kind_is_of(order: SortOrder, kind: fgumi_sort::SpillKeyKind) -> bool {
+    use fgumi_sort::SpillKeyKind as K;
+    match order {
+        SortOrder::Coordinate => kind == K::Coordinate,
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => kind == K::QuerynameLex,
+        SortOrder::Queryname(QuerynameComparator::Natural) => kind == K::QuerynameNatural,
+        SortOrder::TemplateCoordinate => {
+            matches!(kind, K::TemplateK24 | K::TemplateCb32 | K::TemplateTert32 | K::TemplateK40)
+        }
+    }
 }

@@ -3,7 +3,7 @@
 //!
 //! `SortBuffer` (`Serial`) ingests `RecordBatch`es into an in-memory arena via
 //! the order-erased `ChunkSorter` (each variant drives the same per-order
-//! [`ArenaSortStrategy`] as the block-input `FindBoundariesAndSort` front),
+//! [`ArenaSortStrategy`] the record-input front was built around),
 //! sorts each filled arena, and emits the sorted records as a [`SortChunkEvent`]
 //! — **without touching disk**. Mid-stream spill
 //! chunks (`Spill { seq, .. }`) and the final residual (`Residual`) flow to the
@@ -63,8 +63,8 @@ const PER_RECORD_REF_OVERHEAD: usize = 64;
 
 /// Record-input arena accumulator: copies each pushed record into a growing
 /// [`SegmentedBuf`] and drives an [`ArenaSortStrategy`] over the arena refs, so
-/// the record-input (SAM / fused) path uses the SAME per-order sort engine as the
-/// block-input arena front ([`FindBoundariesAndSort`](crate::sort::FindBoundariesAndSort)).
+/// the record-input (SAM / fused) path seals the same arena-backed chunks as the
+/// block-input arena front (the split front in [`arena_split`](crate::sort::arena_split)).
 /// At seal the filled arena is wrapped in an `Arc` and handed to the strategy (no
 /// further record copies), and a fresh arena starts the next run.
 struct ArenaAccum<S: ArenaSortStrategy> {
@@ -151,8 +151,8 @@ pub struct SortBufferConfig {
 }
 
 /// Order-erased record-input arena sorter. Each variant pairs an [`ArenaAccum`]
-/// with the concrete [`ArenaSortStrategy`] for its order, so `SortBuffer` drives
-/// the same per-order sort engine as the block-input `FindBoundariesAndSort`.
+/// with the concrete [`ArenaSortStrategy`] for its order; each seals the same
+/// chunk type, through the same sort, as the block-input split front.
 enum ChunkSorter {
     Coordinate(ArenaAccum<CoordinateStrategy>),
     Template(ArenaAccum<TemplateStrategy>),
@@ -186,20 +186,14 @@ impl ChunkSorter {
             }
             SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                 Self::QuerynameLex(ArenaAccum::new(
-                    QuerynameStrategy::new(
-                        MemoryChunkErased::QuerynameLex,
-                        QnSortState::new(false),
-                    ),
+                    QuerynameStrategy::new(QnSortState::new(false)),
                     memory_limit,
                     sort_threads,
                 ))
             }
             SortOrder::Queryname(QuerynameComparator::Natural) => {
                 Self::QuerynameNatural(ArenaAccum::new(
-                    QuerynameStrategy::new(
-                        MemoryChunkErased::QuerynameNatural,
-                        QnSortState::new(false),
-                    ),
+                    QuerynameStrategy::new(QnSortState::new(false)),
                     memory_limit,
                     sort_threads,
                 ))

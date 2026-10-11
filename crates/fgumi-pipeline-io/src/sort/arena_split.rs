@@ -51,8 +51,9 @@ use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
 use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
     BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf, QnBatchLcp,
-    QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, TemplateArenaRefs,
-    TemplateKeyContext, TemplateKeySeed, TemplateMemChunk, queryname_chunk_from_qn_refs,
+    QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, RecordRef,
+    TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateMemChunk,
+    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
     radix_sorts_in_parallel, seal_template_refs,
 };
 use log::{debug, info};
@@ -948,6 +949,13 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         self.census
     }
 
+    /// Test-only: the bounded sort pool's thread count, `None` until a seal
+    /// builds it.
+    #[cfg(test)]
+    pub(crate) fn sort_pool_threads(&self) -> Option<usize> {
+        self.pool.built_threads()
+    }
+
     /// Append one batch; seal the run on its last batch.
     fn accept(&mut self, batch: RefBatch<X>) -> io::Result<()> {
         debug_assert_eq!(batch.run_seq, self.next_seq, "batch of an unexpected run");
@@ -1223,6 +1231,175 @@ pub type TemplateKeyBatch = KeyBatch<TemplateKeys>;
 pub type TemplateRefBatch = RefBatch<TemplateKeys>;
 
 // ============================================================================
+// Shared frame walk
+// ============================================================================
+
+/// An `InvalidData` error for a key batch whose frames do not match the scan's
+/// cut.
+fn malformed_batch(first_index: u64, what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("key batch at record {first_index}: {what}"))
+}
+
+/// Re-walk `[byte_start, byte_end)` of `arena` as exactly `n` `[u32 len][body]`
+/// frames, calling `f(body, body_offset, len)` per record in order, with an L1
+/// prefetch ahead of the walk.
+///
+/// # Errors
+///
+/// `InvalidData` if the span holds fewer or more than `n` whole frames, or a
+/// frame is shorter than a BAM record.
+#[inline]
+fn for_each_frame(
+    arena: &PooledSegmentedBuf,
+    byte_start: u64,
+    byte_end: u64,
+    n: u32,
+    first_index: u64,
+    mut f: impl FnMut(&[u8], u64, u32),
+) -> io::Result<()> {
+    let start = usize::try_from(byte_start)
+        .map_err(|_| malformed_batch(first_index, "start overflows usize"))?;
+    let end = usize::try_from(byte_end)
+        .map_err(|_| malformed_batch(first_index, "end overflows usize"))?;
+    if end < start {
+        return Err(malformed_batch(first_index, "end precedes start"));
+    }
+    let span = arena.slice(start, end - start);
+    let mut cur = 0usize;
+    for _ in 0..n {
+        if cur + 4 > span.len() {
+            return Err(malformed_batch(first_index, "fewer frames than n_records"));
+        }
+        let bs = u32::from_le_bytes([span[cur], span[cur + 1], span[cur + 2], span[cur + 3]]);
+        if (bs as usize) < MIN_BAM_RECORD_LEN {
+            return Err(malformed_batch(first_index, "frame shorter than a BAM record"));
+        }
+        let body_start = cur + 4;
+        let body_end = body_start + bs as usize;
+        if body_end > span.len() {
+            return Err(malformed_batch(first_index, "frame runs past byte_end"));
+        }
+        if let Some(ahead) = span.get(cur + KEY_PREFETCH_DISTANCE) {
+            prefetch_read_l1(ahead);
+        }
+        f(&span[body_start..body_end], byte_start + body_start as u64, bs);
+        cur = body_end;
+    }
+    if cur != span.len() {
+        return Err(malformed_batch(first_index, "bytes remain after the last frame"));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Coordinate
+// ============================================================================
+
+/// The coordinate key's per-sort context: the header's reference count, which
+/// places unmapped records last.
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinateCtx {
+    /// BAM header reference-sequence count.
+    pub n_ref: u32,
+}
+
+/// Coordinate keys: one 24-byte `RecordRef` (a packed `u64` key, the body's
+/// arena offset and length) per record, radix-sorted at seal.
+///
+/// The radix spawns exactly `sort_threads` threads itself, so the bounded pool
+/// the trait hands `seal` is unused for coordinate order; the trait stays
+/// uniform across orders.
+pub struct CoordinateKeys;
+
+impl ArenaKeyExtractor for CoordinateKeys {
+    const STEP_NAMES: [&'static str; 3] =
+        ["FindCoordinateBoundaries", "ExtractCoordinateKeys", "SortCoordinateRun"];
+    /// The header's reference count.
+    type Seed = u32;
+    type Ctx = CoordinateCtx;
+    type Refs = Vec<RecordRef>;
+    type Accum = Vec<RecordRef>;
+    type Scratch = ();
+
+    fn provision(seed: &Self::Seed, _first_body: &[u8]) -> Self::Ctx {
+        CoordinateCtx { n_ref: *seed }
+    }
+
+    fn ref_width(_ctx: &Self::Ctx) -> usize {
+        size_of::<RecordRef>()
+    }
+
+    fn extract_batch(
+        ctx: &Self::Ctx,
+        _scratch: &mut (),
+        arena: &PooledSegmentedBuf,
+        byte_start: u64,
+        byte_end: u64,
+        n: u32,
+        first_index: u64,
+    ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(n as usize);
+        for_each_frame(arena, byte_start, byte_end, n, first_index, |body, offset, len| {
+            refs.push(RecordRef::new(extract_coordinate_key_inline(body, ctx.n_ref), offset, len));
+        })?;
+        Ok((refs, None))
+    }
+
+    fn refs_len(refs: &Self::Refs) -> usize {
+        refs.len()
+    }
+
+    fn refs_byte_len(refs: &Self::Refs) -> usize {
+        refs.len() * size_of::<RecordRef>()
+    }
+
+    fn accum_for(_ctx: &Self::Ctx) -> Self::Accum {
+        Vec::new()
+    }
+
+    fn reserve(acc: &mut Self::Accum, n: usize) {
+        acc.reserve(n);
+    }
+
+    fn append(acc: &mut Self::Accum, mut refs: Self::Refs) {
+        acc.append(&mut refs);
+    }
+
+    fn sorts_in_parallel(acc: &Self::Accum, sort_threads: usize) -> bool {
+        radix_sorts_in_parallel(acc.len(), sort_threads)
+    }
+
+    fn seal(
+        acc: &mut Self::Accum,
+        _ctx: &Self::Ctx,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        _pool: &BoundedSortPool,
+    ) -> MemoryChunkErased {
+        MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(
+            arena,
+            std::mem::take(acc),
+            sort_threads,
+        ))
+    }
+
+    fn empty_chunk() -> MemoryChunkErased {
+        MemoryChunkErased::Coordinate(InMemoryChunk::default())
+    }
+
+    fn pool_name() -> &'static str {
+        "coord-sort"
+    }
+}
+
+/// The coordinate boundary step.
+pub type FindCoordinateBoundaries = FindRecordBoundaries<CoordinateKeys>;
+/// The coordinate extraction step.
+pub type ExtractCoordinateKeys = ExtractKeys<CoordinateKeys>;
+/// The coordinate run sort.
+pub type SortCoordinateRun = SortRun<CoordinateKeys>;
+
+// ============================================================================
 // Queryname
 // ============================================================================
 
@@ -1251,18 +1428,6 @@ impl QnChunkOrder for QnNatural {
 /// class, before it leaves the extractor. The order is `C`'s.
 pub struct QuerynameKeys<C>(std::marker::PhantomData<C>);
 
-/// The smallest frame a BAM record can occupy (its fixed fields).
-const MIN_QN_RECORD_LEN: usize = 32;
-
-/// An `InvalidData` error for a queryname batch whose frames do not match
-/// the scan's cut.
-fn qn_malformed(first_index: u64, what: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("queryname key batch at record {first_index}: {what}"),
-    )
-}
-
 impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
     const STEP_NAMES: [&'static str; 3] =
         ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"];
@@ -1290,41 +1455,12 @@ impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
         n: u32,
         first_index: u64,
     ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
-        let start = usize::try_from(byte_start)
-            .map_err(|_| qn_malformed(first_index, "start overflows usize"))?;
-        let end = usize::try_from(byte_end)
-            .map_err(|_| qn_malformed(first_index, "end overflows usize"))?;
-        if end < start {
-            return Err(qn_malformed(first_index, "end precedes start"));
-        }
-        let span = arena.slice(start, end - start);
         let table = &ctx.table;
         let mut lcp = QnBatchLcp::default();
         let mut refs: Vec<QnRef> = Vec::with_capacity(n as usize);
-        let mut cur = 0usize;
-        for _ in 0..n {
-            if cur + 4 > span.len() {
-                return Err(qn_malformed(first_index, "fewer frames than n_records"));
-            }
-            let bs = u32::from_le_bytes([span[cur], span[cur + 1], span[cur + 2], span[cur + 3]]);
-            if (bs as usize) < MIN_QN_RECORD_LEN {
-                return Err(qn_malformed(first_index, "frame shorter than a BAM record"));
-            }
-            let body_start = cur + 4;
-            let body_end = body_start + bs as usize;
-            if body_end > span.len() {
-                return Err(qn_malformed(first_index, "frame runs past byte_end"));
-            }
-            if let Some(ahead) = span.get(cur + KEY_PREFETCH_DISTANCE) {
-                prefetch_read_l1(ahead);
-            }
-            let body = &span[body_start..body_end];
-            refs.push(builder.build(table, &mut lcp, body, byte_start + body_start as u64, bs));
-            cur = body_end;
-        }
-        if cur != span.len() {
-            return Err(qn_malformed(first_index, "bytes remain after the last frame"));
-        }
+        for_each_frame(arena, byte_start, byte_end, n, first_index, |body, offset, len| {
+            refs.push(builder.build(table, &mut lcp, body, offset, len));
+        })?;
         if !refs.is_empty() {
             let reclassified = builder.reclassify(table, arena, &mut refs, &lcp);
             let class0 =
