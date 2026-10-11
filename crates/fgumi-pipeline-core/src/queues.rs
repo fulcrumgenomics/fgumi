@@ -190,7 +190,7 @@ pub enum QueueSpec {
 
 /// Item-count bounded transport. Backed by `crossbeam_queue::ArrayQueue<T>`.
 ///
-/// Tracking: in a Directed chain, `Pipeline::run` installs a holder set
+/// Tracking: `Pipeline::run` installs a holder set
 /// (`HolderOnlyHandle::enable_holder_tracking`) when the wake plan
 /// reverse-wakes this edge. A refused push then records the refusing thread,
 /// fences and re-checks for room, and the consumer's pop-side `Progress` takes
@@ -204,7 +204,7 @@ pub struct CountBoundedQueue<T: Send + 'static> {
     /// counts are recorded at the `BranchInputHandle` (see `handles.rs`).
     metrics: Option<Arc<EdgeMetrics>>,
     /// The threads this edge refused, installed by `Pipeline::run` on an edge
-    /// the wake plan reverse-wakes; empty otherwise (Legacy, same-thread, fused).
+    /// the wake plan reverse-wakes; empty otherwise (same-thread, fused).
     holders: OnceLock<HolderSet>,
 }
 
@@ -427,8 +427,8 @@ pub struct ByteBoundedQueue<T: Send + HeapSize + 'static> {
     tracking: OnceLock<EdgeTracking>,
     /// Successful pushes (plus reorder-stash inserts, `note_stash_accepted`) on an edge
     /// with a holder set, bumped `Relaxed`. Read by `WakePlan` as the push gate:
-    /// in a `Directed` chain a producer's `Progress` wakes this edge's consumer
-    /// only if this advanced during the dispatch. Same struct as
+    /// a producer's `Progress` wakes this edge's consumer only if this
+    /// advanced during the dispatch. Same struct as
     /// `current_bytes`, which the push path already RMWs. Not counted on
     /// untracked edges.
     pushed_total: AtomicU64,
@@ -1571,8 +1571,8 @@ mod tests {
         assert!(!take_rejected(), "...once");
     }
 
-    /// Untracked (Legacy, same-thread, fused): a refusal records nothing and
-    /// marks nothing.
+    /// Untracked (same-thread, fused): a refusal records nothing and marks
+    /// nothing.
     #[rstest]
     #[case::byte_bounded(Kind::Byte)]
     #[case::count_bounded(Kind::Count)]
@@ -1673,10 +1673,11 @@ mod tests {
         assert!(!take_rejected(), "nothing marked");
     }
 
-    /// A Legacy byte-bounded edge under `--pipeline-stats` has a hold clock and
-    /// no holder set: its refusal books the hold but must not mark the thread,
-    /// or the Legacy idle branch would leave the event-count for a timer park
-    /// that nothing unparks.
+    /// An untracked byte-bounded edge (same-thread or fused) under
+    /// `--pipeline-stats` has a hold clock and no holder set: its refusal books
+    /// the hold but must not mark the thread. With no holder record no pop can
+    /// wake the thread through this edge, so marking it would send an unpinned
+    /// worker from the event-count to a timer park that only its timer ends.
     #[test]
     fn clock_only_reject_leaves_the_thread_unmarked() {
         use crate::runtime::stats::PipelineStats;

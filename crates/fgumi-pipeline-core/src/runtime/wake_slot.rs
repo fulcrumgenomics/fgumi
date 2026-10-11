@@ -129,8 +129,9 @@ thread_local! {
 /// A tracked edge (one with a holder set) refused this thread's push for good,
 /// so the thread is holding an item and must idle where a direct unpark
 /// reaches it. Sets the thread-local flag [`take_rejected`] reads. Called only
-/// when the edge has a holder set: a Legacy byte-bounded edge with only a hold
-/// clock (`--pipeline-stats`) must leave the idle branch on the event-count.
+/// when the edge has a holder set: an untracked byte-bounded edge with only a
+/// hold clock (`--pipeline-stats`) must leave the idle branch on the
+/// event-count.
 #[inline]
 pub(crate) fn note_held() {
     REJECTED.with(|r| r.set(true));
@@ -154,9 +155,8 @@ pub(crate) fn rejected_pending() -> bool {
 
 /// A held item was just re-pushed successfully (`BranchOutputHandle::retry`
 /// returned `Ok`) by this thread. `dispatch_one_step` takes it after the
-/// dispatch, so in a Directed plan the forward wake of that push runs even if
-/// the step then reports `NoProgress`, `Contention` or `Capped` (a Legacy plan
-/// ignores it).
+/// dispatch, so the forward wake of that push runs even if the step then
+/// reports `NoProgress`, `Contention` or `Capped`.
 #[inline]
 pub(crate) fn note_flushed() {
     FLUSHED.with(|f| f.set(true));

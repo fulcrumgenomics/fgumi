@@ -765,10 +765,11 @@ mod tests {
     }
 
     /// The count and unbounded twins of the clock-only stash-cap assertion in
-    /// `stash_cap_rejection_is_a_timed_hold`: on an untracked transport (the
-    /// Legacy shape) a stash-cap refusal must not mark the thread, or that
-    /// unpinned worker would timer-park where Legacy's event-count notify
-    /// cannot reach it.
+    /// `stash_cap_rejection_is_a_timed_hold`: on an untracked transport
+    /// (same-thread or fused: no holder set) a stash-cap refusal must not mark
+    /// the thread. No in-order pop can wake it through an edge with no holder
+    /// record, so an unpinned worker marked here would leave the event-count
+    /// for a timer park that only its timer ends.
     #[rstest]
     // Capacity 1: ordinal 1 → transport, 2 → must-accept stash (8 bytes, at the cap), 3 refused.
     #[case::count_bounded(
@@ -1279,7 +1280,7 @@ mod tests {
     /// in the transport, 2 overflows into the stash (an accepted push, so not
     /// a hold), 3 hits the stash cap (the hold starts). Once ordinals 0 and 1
     /// are popped in order, ordinal 3 is re-pushed and ends the hold. The
-    /// transport has a hold clock and no holder set (Legacy with
+    /// transport has a hold clock and no holder set (an untracked edge under
     /// `--pipeline-stats`), so the hold must not mark the thread.
     #[test]
     fn stash_cap_rejection_is_a_timed_hold() {

@@ -188,16 +188,16 @@ pub struct PhaseCap {
     /// those clears, read by every release; its words are their own
     /// allocation, away from the hot words above.
     refused_slots: HolderSet,
-    /// Whether this run delivers cap-release wakes (a Directed wake plan bound
-    /// a waker). Off: refusals are not recorded and nothing changes (an
+    /// Whether this run delivers cap-release wakes (a run bound a waker). Off
+    /// (no run bound yet): refusals are not recorded and nothing changes (an
     /// untracked cap also has no run index, so an admission notes nothing).
     tracking: AtomicBool,
     /// Delivers a cap-release wake to a recorded wake slot. Set per run by
     /// `Pipeline::run`; read only when a release has claimed a slot.
     waker: parking_lot::Mutex<Option<CapWaker>>,
     /// This cap's index among the current run's caps (`WakePlan::build`;
-    /// below [`MAX_PHASE_CAPS`]), or `usize::MAX` for a cap no Directed run
-    /// tracks: the bit a worker's thread-local record masks use for it.
+    /// below [`MAX_PHASE_CAPS`]), or `usize::MAX` for a cap no run tracks:
+    /// the bit a worker's thread-local record masks use for it.
     /// Written once per run, before any thread starts; a std atomic even under
     /// loom, since it is configuration, not protocol.
     plan_index: std::sync::atomic::AtomicUsize,
@@ -359,19 +359,16 @@ impl PhaseCap {
         self.bind_signal(signal);
     }
 
-    /// Bind this run's cap-release waker, replacing any earlier run's. `None`
-    /// (a Legacy wake plan) turns refusal recording off: a refused worker then
-    /// idles exactly as it did before cap-release wakes existed, and the cap
-    /// leaves the run's record masks (its run index is cleared). A Directed
-    /// run's index was set by `WakePlan::build`, which `Pipeline::run` calls
-    /// just before this. Called by `Pipeline::run` before any thread starts.
-    pub(crate) fn bind_waker(&self, waker: Option<CapWaker>) {
+    /// Bind this run's cap-release waker, replacing any earlier run's, and
+    /// turn refusal recording on. A cap no run has bound records nothing: a
+    /// refused worker then idles exactly as it did before cap-release wakes
+    /// existed. The run's index was set by `WakePlan::build`, which
+    /// `Pipeline::run` calls just before this. Called by `Pipeline::run`
+    /// before any thread starts.
+    pub(crate) fn bind_waker(&self, waker: CapWaker) {
         self.refused_slots.clear_all();
-        if waker.is_none() {
-            self.set_plan_index(usize::MAX);
-        }
-        self.tracking.store(waker.is_some(), Ordering::Relaxed);
-        *self.waker.lock() = waker;
+        self.tracking.store(true, Ordering::Relaxed);
+        *self.waker.lock() = Some(waker);
     }
 
     /// Whether this run delivers cap-release wakes (a waker is bound).
@@ -383,7 +380,7 @@ impl PhaseCap {
     /// [`Self::bind_waker`] for tests outside the crate.
     #[cfg(any(loom, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn bind_waker_for_test(&self, waker: Option<CapWaker>) {
+    pub fn bind_waker_for_test(&self, waker: CapWaker) {
         self.bind_waker(waker);
     }
 
@@ -408,8 +405,8 @@ impl PhaseCap {
     /// calling thread's wake slot, fences and re-checks, pairing with the
     /// fence a permit's release issues before it wakes a recorded slot; the
     /// thread is told to idle where that wake reaches it. An admission adds one
-    /// `Relaxed` load of the cap's run index and, when the cap has one (a
-    /// Directed run tracks it), one thread-local read (a write only when the
+    /// `Relaxed` load of the cap's run index and, when the cap has one (a run
+    /// tracks it), one thread-local read (a write only when the
     /// calling thread owes this cap a wake);
     /// a call that recorded and whose re-check then admitted it also withdraws
     /// the bit it set (one `fetch_and`).
@@ -526,7 +523,7 @@ impl PhaseCap {
     }
 
     /// The bit of this cap in a worker's thread-local record masks: `Some`
-    /// when a Directed run tracks the cap, its run index (below
+    /// when a run tracks the cap, its run index (below
     /// [`MAX_PHASE_CAPS`], which `WakePlan::build` enforces); `None` otherwise.
     #[inline]
     pub(crate) fn plan_bit(&self) -> Option<u32> {
@@ -841,7 +838,7 @@ impl PhaseCap {
 pub(crate) fn bind_recording_waker(cap: &PhaseCap) -> Arc<parking_lot::Mutex<Vec<Option<usize>>>> {
     let woken: Arc<parking_lot::Mutex<Vec<Option<usize>>>> = Arc::default();
     let sink = Arc::clone(&woken);
-    cap.bind_waker(Some(Arc::new(move |slot| sink.lock().push(slot))));
+    cap.bind_waker(Arc::new(move |slot| sink.lock().push(slot)));
     woken
 }
 
@@ -1032,7 +1029,7 @@ mod tests {
         );
     }
 
-    /// An untracked cap (a Legacy run) records no skip; the skip only reports
+    /// An untracked cap (no run bound) records no skip; the skip only reports
     /// whether the cap is full.
     #[test]
     fn an_untracked_cap_records_no_skip() {
@@ -1073,16 +1070,19 @@ mod tests {
     }
 
     /// A refusal records the thread and marks it for a timer park only when the
-    /// run delivers cap-release wakes. A Legacy run binds no waker: its refused
-    /// worker must stay unmarked (it idles on the event-count, where nothing
-    /// would unpark it from a timer park) and nothing is recorded.
+    /// run delivers cap-release wakes. A cap with no waker bound (no run bound
+    /// yet) must leave its refused worker unmarked (it idles on the
+    /// event-count, where nothing would unpark it from a timer park) and record
+    /// nothing.
     #[rstest::rstest]
-    #[case::legacy_no_waker(false)]
-    #[case::directed_with_waker(true)]
+    #[case::no_waker(false)]
+    #[case::with_waker(true)]
     fn only_a_tracked_cap_marks_and_records_a_refused_thread(#[case] tracked: bool) {
         use crate::runtime::wake_slot::{SlotGuard, cap_refused_pending, take_cap_refused};
         let cap = PhaseCap::new("t", 1);
-        cap.bind_waker(tracked.then(|| Arc::new(|_: Option<usize>| {}) as CapWaker));
+        if tracked {
+            cap.bind_waker(Arc::new(|_: Option<usize>| {}));
+        }
         let held = cap.try_acquire_as(9).expect("an idle cap admits");
         let (marked, recorded) = thread::spawn({
             let cap = Arc::clone(&cap);

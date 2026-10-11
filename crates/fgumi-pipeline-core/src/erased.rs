@@ -1530,7 +1530,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::Progress);
@@ -1566,7 +1566,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
         // First dispatch populates the cache; the second must hit it — and both
         // its unconditional box-address assert and the debug-only downcast
@@ -1613,7 +1613,7 @@ mod tests {
             outputs: outputs_any,
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
         assert_eq!(consumer.try_run_erased(&mut ctx).unwrap(), StepOutcome::Progress);
 
@@ -1623,7 +1623,7 @@ mod tests {
             outputs: outputs_any,
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
         let _ = consumer.try_run_erased(&mut wrong_ctx);
     }
@@ -1645,7 +1645,7 @@ mod tests {
             outputs: &consumer_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
         let outcome = consumer.try_run_erased(&mut ctx).unwrap();
         assert_eq!(outcome, StepOutcome::NoProgress);
@@ -1825,7 +1825,7 @@ mod tests {
             outputs: &splitter_outputs as &(dyn Any + Send + Sync),
             signal: &signal,
             counters: &no_counters,
-            pool: crate::runtime::wake::tests_support::legacy_pool_handle(),
+            pool: crate::runtime::wake::tests_support::standalone_pool_handle(),
         };
 
         let outcome = splitter.try_run_erased(&mut ctx).unwrap();

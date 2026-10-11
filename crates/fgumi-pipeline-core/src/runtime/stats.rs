@@ -77,7 +77,7 @@ pub struct StepStats {
     /// `0` if the step never made progress.
     pub last_progress_ns: AtomicU64,
     /// `notify_one` calls issued on this step's `Progress` or flushed retry
-    /// (any outcome). A flushed retry issues them only in a Directed plan.
+    /// (any outcome).
     pub notifies_issued: AtomicU64,
     /// Of those, calls that found no armed or parked event-count waiter.
     pub notifies_no_waiters: AtomicU64,
@@ -96,8 +96,8 @@ pub struct StepStats {
     /// (pinned, or holding an item), else one parked only because a phase cap
     /// refused it (when the consumer's cap has a free permit).
     pub direct_fallbacks: AtomicU64,
-    /// Gated output branches that pushed nothing on a `Progress` (or, in a
-    /// Directed plan, flushed-retry) dispatch, so their wake was skipped: one
+    /// Gated output branches that pushed nothing on a `Progress` (or
+    /// flushed-retry) dispatch, so their wake was skipped: one
     /// per such branch, not per dispatch.
     pub gated_off: AtomicU64,
     /// `PoolHandle::request_worker` calls from this step that woke a parked pool worker.

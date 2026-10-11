@@ -277,7 +277,7 @@ pub fn run_fused_single_thread(
 
     // The fused path has no pool and no other thread: a request reports
     // `Unavailable`.
-    let wake = WakePlan::legacy(None);
+    let wake = WakePlan::standalone();
     'drive: loop {
         // Bail promptly on an external cancel or a prior-pass error.
         if signal.is_done() {
@@ -832,8 +832,8 @@ mod tests {
     /// The fused single-thread path has no pool and no registered worker, so a
     /// step's `request_worker` reports `Unavailable`. The chain is one the
     /// policy fuses at one thread, and it is driven by the fused driver itself,
-    /// so the outcome is the fused path's, not the scheduled one-worker path's
-    /// (which a Legacy chain would also report as `Unavailable`).
+    /// so the outcome is the fused path's (the standalone plan's), not the
+    /// scheduled one-worker path's, which unparks worker 0.
     #[test]
     fn fused_path_request_worker_is_unavailable() {
         let seen = Arc::new(Mutex::new(None));

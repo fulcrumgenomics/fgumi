@@ -209,8 +209,7 @@ pub enum StepOutcome {
     /// Step did useful work: it took an item from its input, pushed one, or
     /// newly held one.
     ///
-    /// The runtime wakes whoever can now run: in a chain without a `Detached`
-    /// step, one parked pool worker; otherwise the thread that consumes what
+    /// The runtime wakes whoever can now run: the thread that consumes what
     /// was pushed — on a byte-bounded edge only if this call actually pushed
     /// to it (a new hold wakes nobody downstream) — plus any thread holding an
     /// item this step's pops made room for (see `runtime::wake`).
@@ -225,31 +224,25 @@ pub enum StepOutcome {
     /// step that keeps reporting it while stuck is revisited forever and the
     /// consumer that would drain its output is never reached.
     ///
-    /// In a chain with a `Detached` step (Directed wakes) a successful `retry`
-    /// does not by itself require `Progress`; without one (Legacy)
-    /// the flushed push's wake is delivered only on `Progress`, and an idle
-    /// outcome leaves the consumer to its idle deadline as before. Returning
-    /// `Progress` after a flush remains correct in both.
+    /// A successful `retry` does not by itself require `Progress`: the
+    /// framework delivers the flushed push's wake whatever the dispatch
+    /// reports. Returning `Progress` after a flush remains correct.
     Progress,
     /// Step had nothing to do this call (input empty, no held work).
     ///
     /// May follow a flushed held retry (the flush-first preamble finding an
-    /// empty input). In a chain with a `Detached` step (Directed wakes) the
-    /// framework still delivers that push's forward wake
-    /// (`BranchOutputHandle::retry` marks the dispatch); without one (Legacy)
-    /// it does not, and the consumer recovers on its idle deadline
-    /// as before. Returning `Progress` after a flush remains correct in both.
+    /// empty input). The framework still delivers that push's forward wake
+    /// (`BranchOutputHandle::retry` marks the dispatch). Returning `Progress`
+    /// after a flush remains correct.
     NoProgress,
     /// Step's Serial-step mutex was contended; scheduler reroutes. A step may
     /// also report it for a held retry that was rejected again (see
     /// `Progress`).
     ///
     /// May follow a flushed held retry (a multi-branch step that flushed one
-    /// branch while another is still refused). In a chain with a `Detached`
-    /// step (Directed wakes) the framework still delivers that push's forward
-    /// wake; without one (Legacy) it does not, and the consumer
-    /// recovers on its idle deadline as before. Returning `Progress` after a
-    /// flush remains correct in both.
+    /// branch while another is still refused). The framework still delivers
+    /// that push's forward wake. Returning `Progress` after a flush remains
+    /// correct.
     Contention,
     /// Work may exist, but the step's shared [`PhaseCap`] refused this worker
     /// admission (see [`crate::admission`]). Scheduled exactly like
@@ -257,11 +250,9 @@ pub enum StepOutcome {
     /// reported as mutex thrash.
     ///
     /// May follow a flushed held retry (the Process-family preamble retries,
-    /// flushes, then is refused a permit). In a chain with a `Detached` step
-    /// (Directed wakes) the framework still delivers that push's forward wake;
-    /// without one (Legacy) it does not, and the consumer recovers
-    /// on its idle deadline as before. Returning `Progress` after a flush
-    /// remains correct in both.
+    /// flushes, then is refused a permit). The framework still delivers that
+    /// push's forward wake. Returning `Progress` after a flush remains
+    /// correct.
     Capped,
     /// The step has drained all its input and holds no buffered output — it
     /// will never push again. The framework marks its output queues drained

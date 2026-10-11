@@ -666,7 +666,7 @@ mod tests {
             &crate::liveness::LivenessCounter::new(1),
             None,
             0,
-            &crate::runtime::wake::WakePlan::legacy(None),
+            &crate::runtime::wake::WakePlan::standalone(),
             None,
         );
     }

@@ -36,8 +36,8 @@ pub enum BuildError {
     },
     /// The steps report more distinct phase caps than one run can track
     /// ([`MAX_PHASE_CAPS`](crate::MAX_PHASE_CAPS)). Refused for every
-    /// pipeline, Legacy wake mode included, so the limit is one invariant
-    /// rather than a mode-dependent one; real chains use a handful.
+    /// pipeline, since every run's wake plan indexes its caps; real chains use
+    /// a handful.
     TooManyPhaseCaps {
         caps: usize,
     },
@@ -226,7 +226,20 @@ pub struct PipelineConfig {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub test_reorder_overflow_bytes: Option<u64>,
+    /// Test support (this crate's tests only): called once on the thread that
+    /// runs `Pipeline::run`, right after it spawns the pool workers and before
+    /// it joins them, with the run's wake plan and `n_threads` (multi-thread
+    /// runs only). Lets a test observe what the run itself did — e.g. that
+    /// every worker registered — without calling the plan's API on the run's
+    /// behalf. Per run, so concurrent tests in one process never see each
+    /// other's hook.
+    #[cfg(test)]
+    pub(crate) test_after_spawn: Option<AfterSpawnHook>,
 }
+
+/// [`PipelineConfig::test_after_spawn`]'s callback.
+#[cfg(test)]
+pub(crate) type AfterSpawnHook = Arc<dyn Fn(&crate::runtime::wake::WakePlan, usize) + Send + Sync>;
 
 impl std::fmt::Debug for PipelineConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -287,6 +300,8 @@ impl Default for PipelineConfig {
             test_backoff: Vec::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_reorder_overflow_bytes: None,
+            #[cfg(test)]
+            test_after_spawn: None,
         }
     }
 }
@@ -1375,6 +1390,8 @@ impl Pipeline {
         }
         let idle_overrides = IdleOverrides::of(&config);
         let n_threads = config.threads;
+        #[cfg(test)]
+        let after_spawn = config.test_after_spawn.clone();
         let stats_arc = config.stats;
         let deadlock_timeout_secs = config.deadlock_timeout_secs;
         let scheduler = Arc::clone(&config.scheduler);
@@ -1460,8 +1477,9 @@ impl Pipeline {
         // deep-park on the shared event-count: `notify_one` cannot target a
         // specific worker, so a push meant to wake a pinned step's owner could
         // wake a peer that `Skip`s it, leaving the owner asleep. Pinned workers
-        // idle with `park_timeout` (`BackoffPolicy::ParkedSleep`) and, in a
-        // chain with a Detached step, are woken directly by the wake plan.
+        // idle with `park_timeout` (`BackoffPolicy::ParkedSleep`) and are woken
+        // directly by the wake plan (a `Pool` wake that finds no event-count
+        // waiter reaches an armed one through the direct-park fallback).
         // Computed while `steps` is still alive, before `build_worker_storage`
         // consumes it, from the same per-step pins the wake plan routes by
         // (`wake_inputs`), so every worker the plan unparks directly idles where
@@ -1587,12 +1605,12 @@ impl Pipeline {
 
         // Wake plan: per-branch wake targets, built while `steps` is alive
         // (kinds and affinities come from the live steps; a Detached placeholder
-        // still reports `Detached`). `Legacy` for every chain without a Detached
-        // step. Bound to the signal so cancel unparks every registered thread.
+        // still reports `Detached`). Every scheduled chain gets one, with or
+        // without a Detached step. Bound to the signal so cancel unparks every
+        // registered thread.
         // A hosted Parallel clone routes as its driver (`wake_driver_of`), and a
         // `Pool` wake's direct-park and cap-parked fallbacks are limited to the
-        // consumer's host
-        // workers (`build_with_hosts`).
+        // consumer's host workers (`build_with_hosts`).
         let wake = {
             use crate::runtime::wake::WakePlan;
             WakePlan::build_with_hosts(
@@ -1610,26 +1628,24 @@ impl Pipeline {
         signal_arc.bind_wake_plan(&wake);
         // Cap-release wakes: a pool worker a phase cap refuses records its wake
         // slot, and the release that frees a permit unparks it through the
-        // plan (`PhaseCap::release`). Directed only — a Legacy plan has no
-        // registered threads to unpark, so its caps record nothing.
-        let cap_waker: Option<crate::admission::CapWaker> =
-            (wake.mode() == crate::runtime::wake::WakeMode::Directed).then(|| {
-                let plan = Arc::downgrade(&wake);
-                Arc::new(move |slot: Option<usize>| {
-                    if let Some(plan) = plan.upgrade() {
-                        match slot {
-                            Some(slot) => plan.deliver_slot(slot),
-                            None => plan.deliver_anonymous(),
-                        }
+        // plan (`PhaseCap::release`).
+        let cap_waker: crate::admission::CapWaker = {
+            let plan = Arc::downgrade(&wake);
+            Arc::new(move |slot: Option<usize>| {
+                if let Some(plan) = plan.upgrade() {
+                    match slot {
+                        Some(slot) => plan.deliver_slot(slot),
+                        None => plan.deliver_anonymous(),
                     }
-                }) as crate::admission::CapWaker
-            });
+                }
+            })
+        };
         // Every cap any step reports, from the list taken before the Detached
         // steps were extracted (their placeholders report no cap), so a cap
         // only a Detached step reports is bound too. A cap several steps share
         // is bound once per step; binding is idempotent.
         for cap in step_caps.iter().flatten() {
-            cap.bind_waker(cap_waker.clone());
+            cap.bind_waker(Arc::clone(&cap_waker));
         }
         install_edge_tracking(&wake, &contexts, &kinds, stats_arc.as_ref(), n_threads + n_detached);
         // A forward wake to `Worker(w)` is a `Thread::unpark`, which ends a
@@ -1641,7 +1657,7 @@ impl Pipeline {
         );
         // A reverse edge on an untracked queue would take nothing forever and
         // strand its holder on its timer. Checked right after the install, so a
-        // registry or install bug fails every Directed run at once.
+        // registry or install bug fails every run at once.
         debug_assert!(wake.reverse_edges_are_tracked(), "a reverse edge's queue is untracked");
         // A gated branch on a queue with no holder set never advances its push
         // counter, so the gate would hold every forward wake off and strand the
@@ -2032,11 +2048,10 @@ impl Pipeline {
                     .name(format!("fgumi-worker-{worker_id}"))
                     .spawn(move || {
                         // Every worker, pinned or not, registers itself before
-                        // its first pass: in a Directed chain a worker that
-                        // holds an item is woken by `unpark` (Legacy plans
-                        // ignore this). Self-registration closes the window a
-                        // spawner-side registration would leave (see the driver
-                        // spawn above).
+                        // its first pass: a worker that holds an item, or a
+                        // pinned consumer, is woken by `unpark`.
+                        // Self-registration closes the window a spawner-side
+                        // registration would leave (see the driver spawn above).
                         wake_clone.register_worker(
                             worker_id,
                             crate::runtime::wake_slot::current_thread(),
@@ -2079,6 +2094,10 @@ impl Pipeline {
                     })
                     .expect("failed to spawn worker thread");
                 handles.push(handle);
+            }
+            #[cfg(test)]
+            if let Some(hook) = &after_spawn {
+                hook(&wake, n_threads);
             }
 
             // 6. Join workers. Capture the first worker panic payload so cleanup
@@ -2729,8 +2748,8 @@ fn timer_idle_workers(
 /// their own thread, and per step for any other, whose held item any of its
 /// threads may flush (`kinds` is by step). Holder-only edges get a holder set
 /// exactly when the plan reverse-wakes them. An edge with neither keeps an
-/// empty `OnceLock` (one branch per push), so a Legacy plan, which tracks
-/// nothing, installs no holder set anywhere.
+/// empty `OnceLock` (one branch per push), so the standalone plan, which
+/// tracks nothing, installs no holder set anywhere.
 fn install_edge_tracking(
     wake: &crate::runtime::wake::WakePlan,
     contexts: &crate::runtime::contexts::ChainContexts,
@@ -3157,8 +3176,7 @@ mod tests {
         }
     }
 
-    /// The build check and the wake plan agree at the limit: a Directed
-    /// pipeline with exactly `MAX_PHASE_CAPS` distinct caps builds, and runs
+    /// The build check and the wake plan agree at the limit: a pipeline with exactly `MAX_PHASE_CAPS` distinct caps builds, and runs
     /// (its wake plan indexes every cap) to completion.
     #[test]
     fn a_pipeline_at_the_phase_cap_limit_builds_and_runs() {
@@ -3261,18 +3279,170 @@ mod tests {
 
     #[test]
     fn dag_renders_wake_targets() {
-        // Source(Exclusive) → DetachedPass → SinkU32(Exclusive): Directed mode.
+        // Source(Exclusive) → DetachedPass → SinkU32(Exclusive).
         let builder = PipelineBuilder::new();
         builder.chain(StubSource).chain(StubDetachedPass).chain(StubSinkU32).into_sink_marker();
         let pipeline = builder.build().unwrap();
         let dag = pipeline.dag_at(2);
         assert!(dag.contains("wake: .0 → DetachedPass Driver(0)"), "{dag}");
         assert!(dag.contains("wake: .0 → SinkU32 Worker(1)"), "{dag}");
-        // Legacy chain renders the mode marker on every step.
+        // A chain without a Detached step routes too: no mode marker, real targets.
         let builder = PipelineBuilder::new();
         builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
-        let dag = builder.build().unwrap().dag();
-        assert_eq!(dag.matches("wake: Legacy").count(), 2, "{dag}");
+        let dag = builder.build().unwrap().dag_at(2);
+        assert!(!dag.contains("Legacy"), "{dag}");
+        assert!(dag.contains("wake: .0 → SinkU32 Worker(1)"), "{dag}");
+        assert!(dag.contains("wake: (sink)"), "{dag}");
+    }
+
+    /// `Serial` source pinned to the reader worker: emits `0..n`.
+    struct PinnedReaderSource {
+        next: u32,
+        n: u32,
+    }
+    impl Step for PinnedReaderSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "PinnedReaderSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn affinity(&self) -> crate::step::Affinity {
+            crate::step::Affinity::Reader
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.next == self.n {
+                return Ok(StepOutcome::Finished);
+            }
+            match ctx.outputs.push(self.next) {
+                Ok(()) => {
+                    self.next += 1;
+                    Ok(StepOutcome::Progress)
+                }
+                Err(_) => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// `Parallel` pass-through that holds a refused item.
+    #[derive(Clone)]
+    struct ParPass {
+        held: Option<u32>,
+    }
+    impl Step for ParPass {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ParPass",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            let item = match self.held.take() {
+                Some(v) => v,
+                None => match ctx.input.pop() {
+                    Some(v) => v,
+                    None if ctx.input.is_drained() => return Ok(StepOutcome::Finished),
+                    None => return Ok(StepOutcome::NoProgress),
+                },
+            };
+            match ctx.outputs.push(item) {
+                Ok(()) => Ok(StepOutcome::Progress),
+                Err(u) => {
+                    self.held = Some(u.into_item());
+                    Ok(StepOutcome::NoProgress)
+                }
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { held: None }
+        }
+    }
+
+    /// `Serial` sink pinned to the writer worker; counts what it pops.
+    struct WriterSink {
+        seen: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Step for WriterSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "WriterSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn affinity(&self) -> crate::step::Affinity {
+            crate::step::Affinity::Writer
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => {
+                    self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// `PinnedReaderSource → ParPass → WriterSink` (no Detached step) under
+    /// `config`; returns how many items reached the sink.
+    fn run_plain_reader_par_writer(config: PipelineConfig, n: u32) -> u64 {
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(PinnedReaderSource { next: 0, n })
+            .chain(ParPass { held: None })
+            .chain(WriterSink { seen: Arc::clone(&seen) })
+            .into_sink_marker();
+        builder.build().expect("build").run(config).expect("run");
+        seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every worker of a real plain-chain run is registered — pinned and
+    /// unpinned — by the run itself, not by a helper calling `register_worker`.
+    /// At t2 both workers are pinned (reader w0, writer w1); at t4 w1 and w2
+    /// are unpinned. The run's own hook (`PipelineConfig::test_after_spawn`)
+    /// runs on the spawning thread after the spawn loop and waits (bounded)
+    /// for every slot to fill; it is this run's alone, so the test holds under
+    /// plain `cargo test` too, with other runs in the same process.
+    #[rstest]
+    #[case::two_workers_both_pinned(2)]
+    #[case::four_workers_mixed(4)]
+    fn every_worker_of_a_plain_run_is_registered(#[case] n: usize) {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let s2 = Arc::clone(&seen);
+        let hook: AfterSpawnHook =
+            Arc::new(move |plan: &crate::runtime::wake::WakePlan, n_threads: usize| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while (0..n_threads).any(|w| !plan.is_worker_registered(w)) {
+                    if std::time::Instant::now() >= deadline {
+                        *s2.lock() = Some(Err("a worker never registered"));
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                *s2.lock() = Some(Ok(n_threads));
+            });
+        let config =
+            PipelineConfig { threads: n, test_after_spawn: Some(hook), ..Default::default() };
+        let delivered = run_plain_reader_par_writer(config, 100);
+        assert_eq!(delivered, 100);
+        assert_eq!(*seen.lock(), Some(Ok(n)), "the run's hook saw every worker registered");
     }
 
     /// 64-byte items so a 64-byte-limit queue is full after one push.
@@ -3291,7 +3461,7 @@ mod tests {
     fn rebalancer_raise_wakes_the_holder() {
         use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, EdgeTracking, ItemQueue};
         use crate::runtime::wake_slot::{HolderSet, SlotGuard};
-        // Any Directed plan with worker 0 registered will do; the rebalancer only
+        // Any plan with worker 0 registered will do; the rebalancer only
         // needs `wake_holders`.
         let (plan, _g) = crate::runtime::wake::tests_support::directed_plan_with_workers(2);
         let full = Arc::new(ByteBoundedQueue::<Blob64>::new(64));
@@ -3373,7 +3543,7 @@ mod tests {
 
     /// `Src(Detached d0) -CB-> Mid(Detached d0) -CB-> Par(Parallel)
     /// -CB ByOrdinal-> Det(Detached d1) -Unbounded-> Par2(Parallel)
-    /// -Unbounded ByOrdinal-> Sink(Serial)`, as contexts and a Directed plan at
+    /// -Unbounded ByOrdinal-> Sink(Serial)`, as contexts and a wake plan at
     /// t2. `Src → Mid` is a same-thread holder-only edge, so "exactly the
     /// cross-thread ones are tracked" can tell a correct install from one that
     /// tracks every holder-only edge.
@@ -3489,8 +3659,9 @@ mod tests {
             crate::runtime::build_chain_contexts(&steps, &graph, InstrumentationLevel::Off, false);
         let kinds: Vec<StepKind> = steps.iter().map(|s| s.kind()).collect();
         let stats = Arc::new(PipelineStats::new(vec!["Src", "Par", "Sink"]));
-        let legacy = crate::runtime::wake::WakePlan::legacy(None);
-        install_edge_tracking(&legacy, &contexts, &kinds, Some(&stats), 4);
+        // The standalone plan tracks no edge, so only the hold clocks go in.
+        let standalone = crate::runtime::wake::WakePlan::standalone();
+        install_edge_tracking(&standalone, &contexts, &kinds, Some(&stats), 4);
         let stamps: Vec<(usize, Option<usize>)> = contexts
             .bounded_queues
             .iter()
@@ -3501,8 +3672,8 @@ mod tests {
 
     /// The install follows the plan: holder-only edges the plan reverse-wakes
     /// get a holder set, the same-thread one does not, a direct unbounded edge
-    /// is in neither registry, and a Legacy plan over the same contexts tracks
-    /// nothing.
+    /// is in neither registry, and the standalone plan over the same contexts
+    /// tracks nothing.
     #[test]
     fn install_edge_tracking_follows_the_plan() {
         let (contexts, plan, _graph) = holder_only_install_fixture();
@@ -3516,12 +3687,12 @@ mod tests {
         assert_eq!(tracked, vec![false, true, true, true], "Src → Mid is same-driver");
         assert!(plan.reverse_edges_are_tracked());
 
-        let (legacy_contexts, _, _) = holder_only_install_fixture();
-        let legacy = crate::runtime::wake::WakePlan::legacy(None);
-        install_edge_tracking(&legacy, &legacy_contexts, &[], None, 4);
+        let (standalone_contexts, _, _) = holder_only_install_fixture();
+        let standalone = crate::runtime::wake::WakePlan::standalone();
+        install_edge_tracking(&standalone, &standalone_contexts, &[], None, 4);
         assert!(
-            legacy_contexts.holder_only_queues.iter().all(|q| !q.handle.is_tracked()),
-            "a Legacy plan installs no holder set"
+            standalone_contexts.holder_only_queues.iter().all(|q| !q.handle.is_tracked()),
+            "the standalone plan installs no holder set"
         );
     }
 
@@ -3589,7 +3760,7 @@ mod tests {
         // A first install with a hold clock but no holder set wins the OnceLock.
         let (contexts, plan, kinds) = fixture();
         let stats = Arc::new(PipelineStats::new(vec!["Src", "Par", "Sink"]));
-        install_edge_tracking(&WakePlan::legacy(None), &contexts, &kinds, Some(&stats), 4);
+        install_edge_tracking(&WakePlan::standalone(), &contexts, &kinds, Some(&stats), 4);
         install_edge_tracking(&plan, &contexts, &kinds, None, plan.n_slots());
         assert!(!plan.gated_edges_are_tracked(), "a holder-less first install is caught");
     }

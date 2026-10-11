@@ -309,7 +309,7 @@ fn ordered_fast_path_without_the_second_wake_deadlocks() {
     ordered_fast_path_model(true, false);
 }
 
-/// A two-step Directed plan `P → C`: `C` runs on driver 0 (`consumer_on_driver`),
+/// A two-step plan `P → C`: `C` runs on driver 0 (`consumer_on_driver`),
 /// or `P` runs on driver 0 and `C` on the pool (two workers, so a `Pool` wake
 /// is an event-count notify with the direct-park fallback).
 fn two_step_plan(consumer_on_driver: bool) -> std::sync::Arc<WakePlan> {
@@ -367,7 +367,7 @@ fn pool_wake_model(cap_parked: bool, consumer_cap: bool) {
             thread::spawn(move || {
                 plan.register_worker(1, current_thread());
                 let armed = if cap_parked { plan.arm_cap_parked(1) } else { plan.arm_direct(1) };
-                assert!(armed, "a Directed plan with a pool arms");
+                assert!(armed, "a plan with a pool arms");
                 if !work.load(Ordering::Relaxed) {
                     thread::park(); // the re-poll found nothing
                 }
@@ -524,4 +524,82 @@ fn loom_two_producers_one_consumer_gate() {
 #[should_panic(expected = "lost wake")]
 fn the_unfenced_push_gate_loses_the_wake() {
     push_gate_model(false);
+}
+
+/// The plan of a chain with no Detached step — the shape that used to build
+/// an empty-table plan: `Par(Parallel) → Ser(Serial, pinned to worker 1)` at
+/// two workers, so `Par`'s branch targets `Worker(1)`.
+fn plain_two_step_plan() -> std::sync::Arc<WakePlan> {
+    let mut g = ChainGraph::new();
+    let p = g.register_step("Par", 1);
+    let s = g.register_step("Ser", 0);
+    g.wire(p, BranchIdx(0), s);
+    WakePlan::build(
+        &g,
+        &[StepKind::Parallel, StepKind::Serial],
+        &[None, Some(1)],
+        &[None, None],
+        &[],
+        WakeEdges::NONE,
+        Some(PoolEventCount::new(2).into()),
+        2,
+    )
+}
+
+/// A pinned worker of a plain chain (no Detached step) registering itself,
+/// raced against a producer that publishes work and runs `on_progress` for
+/// the worker's consumer — the registrations that take effect now that every
+/// chain routes wakes (a plain chain's `register_worker` used to be ignored).
+/// The real plan throughout: `register_worker` (slot store, then fence) and
+/// `on_progress` (its delivery fence, then the slot read and unpark). The
+/// worker parks (a loom park, no timer) when its first pass finds nothing, so
+/// a lost wake is a loom deadlock. `self_register = false` registers the
+/// worker from the spawner after `spawn`, unordered against its first pass —
+/// the version that loses the wake.
+fn plain_chain_registration_model(self_register: bool) {
+    // `std::sync::Arc`: see `registration_model`.
+    loom::model(move || {
+        let plan = plain_two_step_plan();
+        let work = std::sync::Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (plan, work) = (std::sync::Arc::clone(&plan), std::sync::Arc::clone(&work));
+            thread::spawn(move || {
+                if self_register {
+                    plan.register_worker(1, current_thread());
+                }
+                if !work.load(Ordering::Relaxed) {
+                    thread::park(); // first pass found nothing: park, no timer
+                }
+            })
+        };
+        let spawner = (!self_register).then(|| {
+            let (plan, handle) = (std::sync::Arc::clone(&plan), worker.thread().clone());
+            thread::spawn(move || plan.register_worker(1, handle))
+        });
+        let producer = {
+            let (plan, work) = (std::sync::Arc::clone(&plan), std::sync::Arc::clone(&work));
+            thread::spawn(move || {
+                work.store(true, Ordering::Relaxed); // publish
+                plan.on_progress_ungated(StepIdx(0));
+            })
+        };
+        producer.join().unwrap();
+        if let Some(s) = spawner {
+            s.join().unwrap();
+        }
+        worker.join().unwrap();
+    });
+}
+
+#[test]
+fn plain_chain_worker_registration_races_a_push() {
+    plain_chain_registration_model(true);
+}
+
+/// Negative control: registration from the spawner after `spawn` loses the
+/// wake for the plain chain too.
+#[test]
+#[should_panic(expected = "deadlock")]
+fn plain_chain_spawner_side_registration_loses_the_wake() {
+    plain_chain_registration_model(false);
 }

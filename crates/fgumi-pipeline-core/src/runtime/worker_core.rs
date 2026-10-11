@@ -7,9 +7,9 @@ use crate::topology::StepIdx;
 // Timer-idle bounds for pool workers that do not wait on the event-count: a
 // pinned worker (Exclusive owner, sticky owner, or the affinity target of a
 // Serial step), the lone worker of a one-worker run, and a worker holding an
-// item. Under Directed wakes (`runtime::wake`) a producer can `unpark` it
-// early; in Legacy mode nothing holds its handle and the timer is the whole
-// policy.
+// item. Its producers (and, for a holder, the consumer whose pop makes room)
+// `unpark` it through the wake plan (`runtime::wake`), so the timer is only the
+// self-heal for a wake nobody delivers.
 //
 // The initial (also the post-progress reset floor) is 20µs, NOT 1µs. A surplus
 // worker in an oversubscribed pool makes the occasional lucky pop, which resets
@@ -20,7 +20,7 @@ const SLEEP_INITIAL_US: u64 = 20;
 const SLEEP_MAX_US: u64 = 50_000; // 50 milliseconds
 
 // Dedicated-driver idle bounds. A driver drives a small step subset off the
-// pool; under Directed wakes every producer of its live steps unparks it, so
+// pool; every producer of its live steps unparks it, so
 // the deadline is the self-heal bound for a wake nobody thought of, not the
 // wake mechanism. 2 ms bounds the latency of a wake nobody delivers while keeping
 // idle timer expiries rare; `timed out` on the detached line of
