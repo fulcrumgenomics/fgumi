@@ -19,12 +19,15 @@ pub mod arena_ingest;
 pub mod compress_spill;
 pub mod merge;
 pub mod protocol;
+pub(crate) mod read_ahead_budget;
 pub(crate) mod run_stack;
 pub mod sort_buffer;
 pub mod spill_block_compress;
 pub mod spill_decompress;
 pub mod spill_gather;
+pub mod spill_read_planner;
 pub mod spill_write;
+pub mod supply_ledger;
 
 pub use arena_ingest::{
     ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
@@ -34,9 +37,11 @@ pub use compress_spill::CompressSpill;
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
 pub use spill_block_compress::SpillBlockCompress;
-pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
+pub use spill_decompress::SortSpillDecompress;
 pub use spill_gather::SpillGather;
+pub use spill_read_planner::SpillReadPlanner;
 pub use spill_write::{SpillRunStats, SpillWrite};
+pub use supply_ledger::{SpillSupply, SupplyDiagnostics, SupplyLedger};
 
 #[cfg(all(test, feature = "stress-tests"))]
 mod slot_stash_soak;

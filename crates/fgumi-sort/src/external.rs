@@ -11920,8 +11920,7 @@ mod slot_ingest_tests {
     fn serve_stash(slot: &SortMergeSlot) {
         let mut dec = SpillBlockDecompressor::new();
         while let Some(b) = slot.bp_claim_raw(0) {
-            let d = dec.decompress_one(slot.codec, &b.frame).unwrap();
-            slot.bp_insert_drain_finalize(b.seq, vec![d], 1);
+            b.decompress_and_publish(&mut dec).unwrap();
         }
     }
 
@@ -11947,7 +11946,7 @@ mod slot_ingest_tests {
         assert_eq!(slot.codec, codec);
         assert_eq!((slot.body_start(), slot.len()), (body_start, bytes.len() as u64));
         let r = slot.reader.lock().unwrap();
-        assert!(r.slices.is_empty() && r.parser.carry_len() == 0 && r.pending.is_empty());
+        assert!(r.slices.is_empty() && r.parser.carry_len() == 0);
     }
 
     /// A last slice holding only the BGZF EOF marker, after
@@ -12077,10 +12076,7 @@ mod slot_ingest_tests {
                         let mut dec = SpillBlockDecompressor::new();
                         while !slot.queue_eof.load(Ordering::Acquire) {
                             if let Some(b) = slot.bp_claim_raw(u64::MAX) {
-                                let d = dec.decompress_one(slot.codec, &b.frame).unwrap();
-                                let seq = b.seq;
-                                drop(b);
-                                slot.bp_insert_drain_finalize(seq, vec![d], 1);
+                                b.decompress_and_publish(&mut dec).unwrap();
                             } else {
                                 slot.bp_drain_and_finalize();
                                 std::thread::yield_now();

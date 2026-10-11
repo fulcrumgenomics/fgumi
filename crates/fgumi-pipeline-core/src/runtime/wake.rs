@@ -480,11 +480,13 @@ impl WakePlan {
             "WakePlan::build: an edge is in both registries"
         );
 
+        let mask_of = |c: StepIdx| host_mask(hosts, c, n_threads);
+
         let mut tracked = Vec::new();
         let steps = (0..n)
             .map(|i| {
                 let step = StepIdx(i);
-                let forward: Box<[BranchWake]> = (0..graph.branch_count(step))
+                let mut forward: Box<[BranchWake]> = (0..graph.branch_count(step))
                     .map(|b| {
                         let branch = BranchIdx(b);
                         let consumer = graph.consumer(step, branch);
@@ -506,12 +508,14 @@ impl WakePlan {
                         if gate.is_some() {
                             tracked.push((step, branch));
                         }
-                        let fallback_mask = consumer
-                            .filter(|_| target == WakeTarget::Pool)
-                            .and_then(|c| host_mask(hosts, c, n_threads));
+                        let fallback_mask =
+                            consumer.filter(|_| target == WakeTarget::Pool).and_then(mask_of);
                         BranchWake { target, gate, same_thread: same, consumer, fallback_mask }
                     })
                     .collect();
+                if forward.is_empty() && kinds[i] == StepKind::Parallel && n_threads > 1 {
+                    forward = Box::new([Self::self_cascade(step, mask_of(step))]);
+                }
                 // One list from both registries, built before `needs_fence` so a
                 // holder-only reverse edge brings the consumer's fence with it.
                 let reverse: Box<[ReverseWake]> = reverse_edges(graph, edges, step, &same_thread)
@@ -551,6 +555,24 @@ impl WakePlan {
         })
     }
 
+    /// The implicit forward branch of a `Parallel` step with no output edge.
+    /// Such a step publishes through a side channel (the sort's slot FIFOs);
+    /// its `Progress` wakes one pool worker (a `notify_one` cascade) so a peer clone
+    /// can claim the work it exposed. Ungated — there is no transport to gate
+    /// on — and built only with a peer to wake: at one thread the lone worker
+    /// is the one making the progress. A `Pool` target needs no fence. The
+    /// woken peer runs `step` itself, so `step` is the consumer whose phase cap
+    /// gates the cap-parked fallback.
+    fn self_cascade(step: StepIdx, fallback_mask: Option<Box<[u64]>>) -> BranchWake {
+        BranchWake {
+            target: WakeTarget::Pool,
+            gate: None,
+            same_thread: false,
+            consumer: Some(step),
+            fallback_mask,
+        }
+    }
+
     /// Whether this plan routes wakes or behaves as without a plan.
     #[must_use]
     pub fn mode(&self) -> WakeMode {
@@ -575,6 +597,13 @@ impl WakePlan {
     #[must_use]
     pub fn n_slots(&self) -> usize {
         self.workers.len() + self.drivers.len()
+    }
+
+    /// Forward branches in the built table for `step` (test support): a
+    /// zero-output Parallel step's implicit cascade counts as one.
+    #[cfg(test)]
+    pub(crate) fn forward_branch_count_for_test(&self, step: StepIdx) -> usize {
+        self.steps.get(step.0).map_or(0, |s| s.forward.len())
     }
 
     /// The forward target of `(step, branch)`; `Pool` for every branch in Legacy.
@@ -1093,6 +1122,12 @@ impl WakePlan {
                 let mut line = String::from("      wake: ");
                 if s.forward.is_empty() {
                     line.push_str("(sink)");
+                } else if graph.branch_count(step) == 0 {
+                    // A zero-output Parallel step's implicit self-cascade.
+                    let parts: Vec<String> =
+                        s.forward.iter().map(|w| fmt_target(w.target)).collect();
+                    line.push_str("(sink) ");
+                    line.push_str(&parts.join(", "));
                 } else {
                     let parts: Vec<String> = s
                         .forward
@@ -1273,6 +1308,81 @@ mod tests {
         let pinned = vec![Some(0), None, None, None, None, None, None, None, None, None, None];
         let queues = (0..10).map(|i| q(i, 0)).collect();
         (g, kinds, pinned, driver_of, queues)
+    }
+
+    /// `Src(Serial w0) → Det(Detached d0) → Par(Parallel, no output edge)`.
+    fn three_step_with_parallel_sink() -> Topology {
+        let mut g = ChainGraph::new();
+        let src = g.register_step("Src", 1);
+        let det = g.register_step("Det", 1);
+        let par = g.register_step("Par", 0);
+        g.wire(src, BranchIdx(0), det);
+        g.wire(det, BranchIdx(0), par);
+        let kinds = vec![StepKind::Serial, StepKind::Detached, StepKind::Parallel];
+        let pinned = vec![Some(0), None, None];
+        let driver_of = vec![None, Some(DriverIdx(0)), None];
+        let queues = (0..2).map(|i| q(i, 0)).collect();
+        (g, kinds, pinned, driver_of, queues)
+    }
+
+    /// A zero-output Parallel step gets one implicit ungated `Pool` target (read
+    /// from the built table, not from `forward_target`'s `Pool` default), and its
+    /// `Progress` reaches a real armed waiter.
+    #[test]
+    fn zero_output_parallel_step_cascades_to_the_pool() {
+        let (g, kinds, pinned, driver_of, queues) = three_step_with_parallel_sink();
+        let pool = Arc::new(PoolEventCount::new(4));
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            Some(Arc::clone(&pool)),
+            4,
+        );
+        assert_eq!(plan.forward_branch_count_for_test(StepIdx(2)), 1, "one implicit branch");
+        assert!(!plan.is_gated(StepIdx(2)), "the implicit branch is ungated");
+        assert!(plan.dag_lines(&g)[2].contains("(sink) Pool"), "{:?}", plan.dag_lines(&g));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            let key = p2.prepare_wait();
+            tx.send(()).unwrap();
+            p2.wait(key, Duration::from_secs(5))
+        });
+        rx.recv().unwrap();
+        let _ = plan.on_progress(StepIdx(2), &PushSnapshot::default());
+        assert!(
+            matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified),
+            "the Progress must wake the armed waiter before its 5 s timer"
+        );
+    }
+
+    /// Only Parallel sinks get the implicit target: a Serial/Exclusive sink is
+    /// woken by its producers, never by itself; and at one thread there is no
+    /// peer to wake.
+    #[rstest]
+    #[case::serial(StepKind::Serial, 4)]
+    #[case::exclusive(StepKind::Exclusive, 4)]
+    #[case::parallel_one_thread(StepKind::Parallel, 1)]
+    fn zero_output_cascade_only_for_parallel_sinks(#[case] kind: StepKind, #[case] threads: usize) {
+        let (g, mut kinds, pinned, driver_of, queues) = three_step_with_parallel_sink();
+        kinds[2] = kind;
+        let pool = (threads > 1).then(|| Arc::new(PoolEventCount::new(threads)));
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            pool,
+            threads,
+        );
+        assert_eq!(plan.forward_branch_count_for_test(StepIdx(2)), 0);
+        assert_eq!(plan.dag_lines(&g)[2], "      wake: (sink); reverse: Det (holder)");
     }
 
     #[test]

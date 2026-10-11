@@ -160,7 +160,7 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
     let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
         .map(|file_id| {
             let slot = Arc::new(SortMergeSlot::for_test(file_id, fgumi_sort::SpillCodec::Bgzf));
-            slot.decompressed.lock().unwrap().push_back(one_record_block(file_id as usize));
+            slot.push_decompressed_for_test(one_record_block(file_id as usize));
             slot
         })
         .collect();
@@ -188,7 +188,7 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
             break;
         }
         assert!(next < 1000, "the output edge never filled");
-        slots[next % 2].decompressed.lock().unwrap().push_back(one_record_block(next));
+        slots[next % 2].push_decompressed_for_test(one_record_block(next));
         next += 1;
     }
     assert!(
@@ -225,7 +225,7 @@ fn a_stall_books_the_awaited_slots_state(
     // Slot 0 holds a record; slot 1 has nothing decompressed, so priming
     // stalls on it.
     let ready = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
-    ready.decompressed.lock().unwrap().push_back(one_record_block(0));
+    ready.push_decompressed_for_test(one_record_block(0));
     let awaited = Arc::new(SortMergeSlot::for_test(1, fgumi_sort::SpillCodec::Bgzf));
     awaited.bp_note_issued(issued);
     awaited.bp_stash_frames_for_test(vec![vec![0u8; 16]; stashed], false);

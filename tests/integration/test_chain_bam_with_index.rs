@@ -101,8 +101,6 @@ fn bam_with_index_produces_inline_sidecar_not_reread() {
         temp_compression: 1,
         temp_codec: fgumi_sort::SpillCodec::default(),
         max_temp_files: MaxTempFiles::Auto,
-        block_batch: 4,
-        file_granularity: false,
         sort_stats: false,
     };
 
@@ -318,8 +316,6 @@ fn sort_options(max_memory: MemoryLimit, tmp_dirs: Vec<PathBuf>) -> SortOptions 
         temp_compression: 1,
         temp_codec: fgumi_sort::SpillCodec::default(),
         max_temp_files: MaxTempFiles::Auto,
-        block_batch: 4,
-        file_granularity: false,
         sort_stats: false,
     }
 }

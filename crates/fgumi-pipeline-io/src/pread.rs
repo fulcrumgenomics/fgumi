@@ -262,6 +262,47 @@ impl RequestSizeHist {
     }
 }
 
+/// The read-stream policy's course for `--sort-stats`: `4 (fixed)` for a
+/// pinned count, `1 (auto)` for a ratchet that never rose, and
+/// `1 -> 2 (fill 8) -> 4 (fill 16); starved 31% -> 28%` for one that did.
+#[must_use]
+fn read_streams_summary(policy: &fgumi_bam_io::pread::ReadStreamsPolicy) -> String {
+    use std::fmt::Write as _;
+    if !policy.is_auto() {
+        return format!("{} (fixed)", policy.streams());
+    }
+    let history = policy.history();
+    if history.is_empty() {
+        return format!("{} (auto)", policy.streams());
+    }
+    let mut out = String::from("1");
+    for h in &history {
+        let _ = write!(out, " -> {} (fill {})", h.streams, h.fill_index);
+    }
+    let starved: Vec<String> = history.iter().map(|h| format!("{}%", h.starved_pct)).collect();
+    let _ = write!(out, "; starved {}", starved.join(" -> "));
+    out
+}
+
+/// One `Byte fetch` line body: request sizes and in-flight reads from `hist`
+/// (`slices` requests), then the read-stream course.
+#[must_use]
+pub fn byte_fetch_summary(
+    hist: &RequestSizeHist,
+    policy: &fgumi_bam_io::pread::ReadStreamsPolicy,
+) -> String {
+    let (p50, p90, min) = hist.p50_p90_min();
+    let (mean, max) = hist.inflight_mean_max();
+    format!(
+        "request size p50 {} KiB p90 {} KiB min {} KiB; in-flight slices mean {mean:.1} max \
+         {max}; read streams: {}",
+        p50 >> 10,
+        p90 >> 10,
+        min >> 10,
+        read_streams_summary(policy)
+    )
+}
+
 /// `Parallel` positional-read step (see the module docs).
 pub struct PreadSlices {
     name: &'static str,

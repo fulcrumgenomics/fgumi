@@ -571,6 +571,16 @@ pub struct ChainBuilder<'a> {
     /// (test support).
     #[cfg(test)]
     input_eligible_clones: Option<usize>,
+    /// The read-stream policy the spill planner adopted (test support).
+    #[cfg(test)]
+    spill_read_streams: Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
+    /// The spill planner's outstanding-slice cap (test support).
+    #[cfg(test)]
+    spill_inflight_slices: Option<u32>,
+    /// The `PreadSpillSlices` clone count the spill reads were sized for
+    /// (test support).
+    #[cfg(test)]
+    spill_eligible_clones: Option<usize>,
 
     /// Set for a chain whose drain-bound shape benefits from downstream-first
     /// dispatch. [`Self::build`] reads it to select the
@@ -846,6 +856,12 @@ impl<'a> ChainBuilder<'a> {
             input_slice_hist: None,
             #[cfg(test)]
             input_eligible_clones: None,
+            #[cfg(test)]
+            spill_read_streams: None,
+            #[cfg(test)]
+            spill_inflight_slices: None,
+            #[cfg(test)]
+            spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             pending_header_handle: None,
@@ -3640,8 +3656,9 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::core::step::Affinity;
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
-                BlockOutput, RecordBatchOutput, SortBuffer, SortDecompressTuning, SortMerge,
-                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite,
+                BlockOutput, RecordBatchOutput, SortBuffer, SortMerge, SortSpillDecompress,
+                SpillBlockCompress, SpillGather, SpillReadPlanner, SpillRunStats, SpillSupply,
+                SpillWrite, SupplyDiagnostics,
             };
             use fgumi_sort::SortOrder;
 
@@ -3767,26 +3784,83 @@ impl<'a> ChainBuilder<'a> {
 
             let affinity = if num_threads >= 3 { Affinity::Worker(1) } else { Affinity::Reader };
 
-            // Phase-2 decompression granularity knobs (`--sort::file-granularity`,
-            // `--sort::block-batch`). The default is the block-parallel path
-            // (P5c, hardened by loom/TSan + the soak matrix); its reorder window
-            // is bounded by the per-step byte limit (see SortSpillDecompress).
-            // `block_batch` defaults to 4 (the original MAX_BATCH_PER_CALL),
-            // pending a fleet decompress-throughput bench.
-            let decompress_tuning = SortDecompressTuning {
-                file_granularity: sort.file_granularity,
-                block_batch: sort.block_batch,
-            };
-            // One merge-wide demand per sort, shared by the supply
-            // (`notify_delivered` after each delivery) and the merge
-            // (`await_slot` on a stall; the thread the delivery unparks).
-            let merge_demand = Arc::new(fgumi_sort::MergeDemand::new());
-            // Phase-2 cap (`--merge-threads`): bounds concurrent spill
+            // One merge-wide demand and supply ledger per sort, shared by the
+            // supply (`notify_delivered` after each delivery; the ledger's
+            // outstanding-read bound) and the merge (`await_slot` on a stall;
+            // the thread the delivery unparks). `SpillSupply` hands every
+            // participant the same pair.
+            let supply = SpillSupply::new();
+            let merge_demand = Arc::clone(&supply.demand);
+            // The merge supply: `SpillReadPlanner` (pool Serial) plans byte-range
+            // reads of the spill files from the merge's demand and a read-ahead
+            // budget derived from `--max-memory`; `PreadSpillSlices` performs
+            // them on the pool; `SortSpillDecompress` parses the slices into
+            // each slot's raw stash and decompresses its blocks. The spill reads
+            // adopt the input's read-stream policy (the native input path's
+            // ratchet); with no native input, an explicit `--read-streams N`
+            // still applies to the spills (always seekable) and `auto` is one
+            // stream.
+            let spill_policy =
+                self.read_streams_policy.clone().unwrap_or_else(|| match self.spec.read_streams {
+                    fgumi_bam_io::ReadStreams::Auto => {
+                        fgumi_bam_io::pread::ReadStreamsPolicy::fixed(1)
+                    }
+                    fgumi_bam_io::ReadStreams::Fixed(n) => {
+                        fgumi_bam_io::pread::ReadStreamsPolicy::fixed(n)
+                    }
+                });
+            #[cfg(test)]
+            {
+                self.spill_read_streams = Some(Arc::clone(&spill_policy));
+            }
+            // The runtime's `AllWorkers` rule: one `PreadSpillSlices` clone per
+            // pool worker. Pinned against the built pipeline's own placement
+            // plan by `spill_eligible_clones_match_the_planned_placement`.
+            let spill_eligible = fgumi_pipeline_core::runtime::parallel_hosts(
+                fgumi_pipeline_core::PoolPlacement::AllWorkers,
+                None,
+                pool,
+                None,
+            )
+            .clone_count()
+            .min(phases.phase2);
+            let spill_slices = fgumi_bam_io::pread::SliceBufferPool::new(2 * pool + 8);
+            let spill_hist = sort
+                .sort_stats
+                .then(|| Arc::new(fgumi_pipeline_io::pread::RequestSizeHist::default()));
+            let supply_diagnostics = spill_hist.as_ref().map(|hist| SupplyDiagnostics {
+                ledger: Arc::clone(&supply.ledger),
+                pool: Arc::clone(&spill_slices),
+                hist: Arc::clone(hist),
+                policy: Arc::clone(&spill_policy),
+            });
+            let planner = SpillReadPlanner::new(
+                total_memory as u64,
+                phases.phase2,
+                spill_eligible,
+                self.tuning.per_step_byte_limit,
+                &supply,
+                Arc::clone(&spill_slices),
+            )
+            .with_read_streams(Arc::clone(&spill_policy))
+            .with_sort_stats(sort.sort_stats);
+            #[cfg(test)]
+            {
+                self.spill_inflight_slices = Some(planner.max_inflight_slices());
+                self.spill_eligible_clones = Some(spill_eligible);
+            }
+            // Phase-2 cap (`--merge-threads`): bounds concurrent spill reads and
             // decompression together with the terminal output compressor.
-            let decompress =
-                SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
-                    .with_phase_cap(phase2_cap.clone())
-                    .with_merge_demand(Arc::clone(&merge_demand));
+            let mut pread = fgumi_pipeline_io::pread::PreadSlices::spill(
+                Arc::clone(&spill_slices),
+                self.tuning.per_step_byte_limit,
+            )
+            .with_phase_cap(phase2_cap.clone());
+            if let Some(h) = &spill_hist {
+                pread = pread.with_hist(Arc::clone(h));
+            }
+            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit, &supply)
+                .with_phase_cap(phase2_cap.clone());
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -3993,7 +4067,13 @@ impl<'a> ChainBuilder<'a> {
                 let tail = self.pipeline.append_step(compress, tail);
                 self.pipeline.append_step(write, tail)
             };
-            let decompress_tail = self.pipeline.append_step(decompress, phase1_tail);
+            // Fan-out (as for a rejects branch): the planner's read requests
+            // (branch 0) feed `PreadSpillSlices → SortSpillDecompress`, a leaf;
+            // its phase events (branch 1) go straight to `SortMerge`.
+            let planner_tail = self.pipeline.append_step(planner, phase1_tail);
+            let pread_tail = self.pipeline.append_step(pread, planner_tail);
+            let decompress_tail = self.pipeline.append_step(decompress, pread_tail);
+            let merge_input = (planner_tail.0, BranchIdx(1));
             // While the merge is starved, pool workers walk the spill supply
             // (`SortSpillDecompress` and the steps before it) before the steps
             // after it, such as the output compressor — the merge parks on a
@@ -4032,8 +4112,10 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
-                merge = merge.with_merge_demand(Arc::clone(&merge_demand));
-                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
+                merge = merge
+                    .with_merge_demand(Arc::clone(&merge_demand))
+                    .with_supply_diagnostics(supply_diagnostics);
+                let merge_tail = self.pipeline.append_step(merge, merge_input);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
                 // SortMerge → SerializedBytes.
@@ -4098,8 +4180,9 @@ impl<'a> ChainBuilder<'a> {
                 .with_fast_path_threads(phases.phase2);
                 merge = merge
                     .with_fast_path_cap(phase2_cap.clone())
-                    .with_merge_demand(Arc::clone(&merge_demand));
-                let merge_tail = self.pipeline.append_step(merge, decompress_tail);
+                    .with_merge_demand(Arc::clone(&merge_demand))
+                    .with_supply_diagnostics(supply_diagnostics);
+                let merge_tail = self.pipeline.append_step(merge, merge_input);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
@@ -7024,6 +7107,9 @@ mod tests {
             read_streams_policy: None,
             input_slice_hist: None,
             input_eligible_clones: None,
+            spill_read_streams: None,
+            spill_inflight_slices: None,
+            spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             pending_header_handle: None,
@@ -7530,8 +7616,6 @@ mod tests {
             temp_compression: 1,
             temp_codec: fgumi_sort::SpillCodec::default(),
             max_temp_files: MaxTempFiles::Auto,
-            block_batch: 4,
-            file_granularity: false,
             sort_stats: false,
         });
         spec.stage_opts.group = Some(crate::commands::group::GroupOptions::default());
@@ -7762,6 +7846,37 @@ mod tests {
         assert_eq!(eligible, Some(clones.min(phase1)), "{planned:?}");
     }
 
+    /// The builder sizes spill slices by its own `AllWorkers` prediction; it
+    /// must equal the built pipeline's real placement plan for
+    /// `PreadSpillSlices` (within the phase-2 count).
+    #[rstest::rstest]
+    #[case::cap_binds(16, Some(4))]
+    #[case::whole_pool(8, None)]
+    #[case::one_thread(1, None)]
+    fn spill_eligible_clones_match_the_planned_placement(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let mut spec = sort_chain_spec(tmp.path(), input, vec![Stage::Sort]);
+        spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+        spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        chain.add_sink().unwrap();
+        let eligible = chain.spill_eligible_clones.expect("add_sort ran");
+        let built = chain.build().unwrap();
+        let planned = built.pipeline.planned_clone_counts(built.config.threads);
+        let clones = planned
+            .iter()
+            .find(|(n, _)| *n == "PreadSpillSlices")
+            .map(|&(_, c)| c)
+            .expect("the spill reads");
+        assert_eq!(eligible, clones.min(merge_threads.unwrap_or(clones)), "{planned:?}");
+    }
+
     /// The native input path is taken exactly when `--read-streams` asks for
     /// concurrency: runall pins `Fixed(1)` on every chain (its `ChainSpec`), so a
     /// runall `sort → group` chain keeps `ReadBgzfBlocks`, while the same chain
@@ -7779,6 +7894,163 @@ mod tests {
         assert_eq!(dag.contains("PlanInputReads"), native, "{dag}");
         assert_eq!(dag.contains("ReadBgzfBlocks"), !native, "{dag}");
         assert_eq!(eligible.is_some(), native);
+    }
+
+    /// Build a template-coordinate sort chain over a header-only input (SAM
+    /// when `sam`) after `edit` adjusts its spec; returns the chain's spill
+    /// read-stream policy, its input read-stream policy, the spill planner's
+    /// outstanding-slice cap, and the built pipeline.
+    #[allow(clippy::type_complexity)]
+    fn build_sort_with(
+        sam: bool,
+        stages: Vec<Stage>,
+        edit: impl FnOnce(&mut ChainSpec),
+    ) -> (
+        Arc<fgumi_bam_io::pread::ReadStreamsPolicy>,
+        Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
+        u32,
+        crate::pipeline::chains::finalize::BuiltPipeline,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), sam);
+        let mut spec = sort_chain_spec(tmp.path(), input, stages);
+        edit(&mut spec);
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        let last = spec.stages.len() - 1;
+        for (i, &stage) in spec.stages.iter().enumerate() {
+            let position =
+                if i == last { StagePosition::Terminal } else { StagePosition::Intermediate };
+            chain.add_stage(stage, position).unwrap();
+        }
+        chain.add_sink().unwrap();
+        let spill = chain.spill_read_streams.clone().expect("add_sort ran");
+        let input_policy = chain.read_streams_policy.clone();
+        let slices = chain.spill_inflight_slices.expect("add_sort ran");
+        (spill, input_policy, slices, chain.build().unwrap(), tmp)
+    }
+
+    /// `add_sort` fans the planner out: read requests (branch 0) to
+    /// `PreadSpillSlices → SortSpillDecompress` (a leaf), phase events
+    /// (branch 1) to `SortMerge`, in both stage positions.
+    #[rstest::rstest]
+    #[case::terminal(vec![Stage::Sort], "BgzfCompress")]
+    #[case::intermediate(vec![Stage::Sort, Stage::Group], "DecodeFromRecords")]
+    fn add_sort_fans_the_planner_out_to_pread_and_merge(
+        #[case] stages: Vec<Stage>,
+        #[case] after_merge: &str,
+    ) {
+        let (_, _, _, built, _tmp) = build_sort_with(false, stages, |_| {});
+        let dag = built.pipeline.dag();
+        // A step's block: its `[i] Name …` header and the branch and wake
+        // lines up to the next header.
+        let block = |name: &str| {
+            let lines: Vec<&str> = dag.lines().collect();
+            let start = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('[') && l.contains(&format!("] {name} ")))
+                .unwrap_or_else(|| panic!("no {name} step:\n{dag}"));
+            let end = lines[start + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |n| start + 1 + n);
+            lines[start..end].join("\n")
+        };
+        let planner = block("SpillReadPlanner");
+        assert!(planner.contains("branches=2"), "{planner}");
+        assert!(planner.contains(".0: ") && planner.contains("→ PreadSpillSlices"), "{planner}");
+        assert!(planner.contains(".1: ") && planner.contains("→ SortMerge"), "{planner}");
+        assert!(block("PreadSpillSlices").contains("→ SortSpillDecompress"), "{dag}");
+        let decompress = block("SortSpillDecompress");
+        assert!(decompress.contains("branches=0 (sink)"), "{decompress}");
+        assert!(decompress.contains("wake: (sink) Pool"), "the zero-output cascade: {decompress}");
+        assert!(block("SortMerge").contains(&format!("→ {after_merge}")), "{dag}");
+        let names: Vec<&str> =
+            built.pipeline.stats().snapshot().steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        let at = |n: &str| names.iter().position(|&s| s == n).unwrap_or_else(|| panic!("{n}"));
+        assert!(at("SpillReadPlanner") < at("PreadSpillSlices"));
+        assert!(at("PreadSpillSlices") < at("SortSpillDecompress"));
+        assert!(at("SortSpillDecompress") < at("SortMerge"));
+    }
+
+    /// `PreadSpillSlices` holds the SAME phase-2 cap as `SortSpillDecompress`
+    /// (pointer identity) when `--merge-threads` is given.
+    #[test]
+    fn preadspillslices_has_the_phase2_cap() {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(8) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = Some(4);
+        });
+        let caps = built.pipeline.phase_caps();
+        let cap = |n: &str| caps.iter().find(|(s, _)| *s == n).unwrap_or_else(|| panic!("{n}")).1;
+        assert!(std::ptr::eq(cap("PreadSpillSlices"), cap("SortSpillDecompress")));
+        assert_eq!(cap("PreadSpillSlices").max(), 4);
+    }
+
+    /// The planner's outstanding-slice cap is twice the phase-2 thread count,
+    /// read from `PhaseThreads` — present whether or not a phase-2 cap exists.
+    #[rstest::rstest]
+    #[case::no_merge_threads(8, None, 16)]
+    #[case::merge_threads(8, Some(2), 4)]
+    #[case::one_thread(1, None, 2)]
+    fn planner_sizes_from_phase_threads_without_a_cap(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+        #[case] want: u32,
+    ) {
+        let (_, _, slices, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        });
+        assert_eq!(slices, want);
+        if merge_threads.is_none() {
+            assert!(built.pipeline.phase_caps().is_empty(), "no cap without the flag");
+        }
+    }
+
+    /// The spill reads adopt the native input's ratchet;
+    /// with no input planner (SAM here; stdin and plain gzip decide the same
+    /// way, by having no native input), `auto` is one stream and an explicit
+    /// `--read-streams N` still applies to the spills (always seekable).
+    #[rstest::rstest]
+    #[case::sam_auto(true, fgumi_bam_io::ReadStreams::Auto, 1, false)]
+    #[case::sam_fixed4(true, fgumi_bam_io::ReadStreams::Fixed(4), 4, false)]
+    #[case::sam_fixed2(true, fgumi_bam_io::ReadStreams::Fixed(2), 2, false)]
+    #[case::native_auto(false, fgumi_bam_io::ReadStreams::Auto, 1, true)]
+    #[case::native_fixed4(false, fgumi_bam_io::ReadStreams::Fixed(4), 4, true)]
+    fn spill_planner_policy_for_non_native_input(
+        #[case] sam: bool,
+        #[case] read_streams: fgumi_bam_io::ReadStreams,
+        #[case] streams: usize,
+        #[case] shared: bool,
+    ) {
+        let (spill, input, _, _, _tmp) =
+            build_sort_with(sam, vec![Stage::Sort], |spec| spec.read_streams = read_streams);
+        assert_eq!(spill.streams(), streams);
+        assert_eq!(input.as_ref().is_some_and(|p| Arc::ptr_eq(p, &spill)), shared);
+        assert_eq!(spill.is_auto(), shared && read_streams == fgumi_bam_io::ReadStreams::Auto);
+    }
+
+    /// While the merge is starved the refill walk visits the
+    /// steps at or before its feed forward first (`refill_split` partitions on
+    /// `StepIdx <= through`), so the feed must be the highest-indexed supply
+    /// step: the planner, the spill pread and the decompress step all walk
+    /// before `BgzfCompress`.
+    #[rstest::rstest]
+    #[case::bam_arena_front(false)]
+    #[case::sort_buffer_front(true)]
+    fn starved_walk_visits_planner_pread_and_decompress_before_bgzf_compress(#[case] sam: bool) {
+        let (_, _, _, built, _tmp) = build_sort_with(sam, vec![Stage::Sort], |_| {});
+        assert_sort_refill_source_feeds_decompress(&built);
+        let names: Vec<&str> =
+            built.pipeline.stats().snapshot().steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        let at = |n: &str| names.iter().position(|&s| s == n).unwrap_or_else(|| panic!("{n}"));
+        let through = at("SortSpillDecompress");
+        for supply in ["SpillReadPlanner", "PreadSpillSlices", "SortSpillDecompress"] {
+            assert!(at(supply) <= through, "{supply} walks with the refill: {names:?}");
+        }
+        assert!(at("BgzfCompress") > through, "BgzfCompress walks after the supply: {names:?}");
     }
 
     /// Two stages may each add a hint; the same stage adding twice is a bug.

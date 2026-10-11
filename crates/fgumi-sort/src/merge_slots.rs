@@ -1,9 +1,9 @@
 //! Per-spill-file shared state for the chain merge phase.
 //!
 //! `SortMergeSlot` is the per-spill-file shared state shuttled between
-//! `SortSpillDecompress` (producer side: reads the spill file
-//! positionally, parses and decompresses its frames, pushes to the slot's
-//! bounded queue) and
+//! `SortSpillDecompress` (producer side: ingests the read slices
+//! `SpillReadPlanner` asked for, parses and decompresses their frames, pushes
+//! to the slot's bounded queue) and
 //! `SortMerge` (consumer side: pops decompressed blocks from the
 //! queue, parses records, drives the k-way merge) via
 //! `Arc<SortMergeSlot>` clones.
@@ -35,8 +35,8 @@
 //! The "consumer would block" path is reachable only when
 //! `decompressed.len() == 0 && !queue_eof`, in which case the
 //! producer will eventually flip the state to either (1) (push more
-//! blocks) or (3) (set `queue_eof` on the read returning fewer
-//! bytes than asked), and the next consumer dispatch observes it. No
+//! blocks) or (3) (set `queue_eof` once the file's last slice is parsed
+//! and every block delivered), and the next consumer dispatch observes it. No
 //! "transient cap with all-workers-Skip" window.
 //!
 //! ## Atomic ordering (`decomp_error` / `queue_eof`)
@@ -108,13 +108,13 @@ use std::sync::Arc;
 #[cfg(loom)]
 use loom::sync::Mutex;
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::Mutex;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use fgumi_bam_io::pread::{RawFrame, SliceLease};
+use fgumi_bam_io::pread::SliceLease;
 use fgumi_bam_io::reorder::ReorderBuffer;
 
 use crate::codec::SpillCodec;
@@ -131,10 +131,12 @@ use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 /// copy (the `cfg(test)`/library oracle path) is intentionally left at 8 — these
 /// two are no longer equal.
 ///
-/// Hard cap — there is no admission escape. Producers skip a slot
-/// when its queue is at this cap, returning to it on a later
-/// `try_run` after the consumer has drained. It stays a per-slot, independent
-/// bound (deadlock-safety is unchanged — see the module header).
+/// The ceiling of each slot's FIFO cap ([`SortMergeSlot::fifo_cap`], which the
+/// read planner sets per slot): claims stop at the cap, and a drain never moves
+/// more than this many blocks into a FIFO. A claim of the reorder front is
+/// admitted over the cap ([`SortMergeSlot::bp_claim_raw`]); its block then
+/// waits in `reorder` until the consumer makes room. It stays a per-slot,
+/// independent bound (deadlock-safety is unchanged — see the module header).
 ///
 /// # Not the only bound of that name
 ///
@@ -153,39 +155,31 @@ pub const PHASE2_DECOMP_CAP: usize = 32;
 /// the frame parser, and the raw-block sequence. Mutex'd separately from
 /// `decompressed` so parsing never blocks the consumer's pop. The slot holds no
 /// read buffer of its own: the bytes arrive as leased read slices.
-pub struct SortMergeReader {
+pub(crate) struct SortMergeReader {
     /// Slices that landed ahead of their predecessors, keyed by their per-slot
     /// slice sequence (the read edge is unordered), with each slice's `last`
     /// flag.
-    pub slices: ReorderBuffer<(SliceLease, bool)>,
+    pub(crate) slices: ReorderBuffer<(SliceLease, bool)>,
     /// Frame parser over the in-order slices (carries a frame that straddles
     /// two slices).
-    pub parser: SpillFrameParser,
+    pub(crate) parser: SpillFrameParser,
     /// Next per-slot sequence number to stamp on a parsed raw block: dense and
     /// in file order, because parsing is serialized under this lock. The
     /// slot's [`SortMergeSlot::reorder`] buffer reassembles the out-of-order
     /// decompression results back into this order.
-    pub next_seq: u64,
+    pub(crate) next_seq: u64,
     /// Heap bytes of the parser's carried partial frame, as last charged to
     /// [`SortMergeSlot::stash_bytes`].
     carry_charge: u64,
-    /// File cursor of the positional window reader (`SortSpillDecompress`'s
-    /// read-on-demand path).
-    pub next_offset: u64,
-    /// Frames the window reader parsed past what its caller asked for, handed
-    /// out first on its next read.
-    pub pending: VecDeque<RawFrame>,
 }
 
 impl SortMergeReader {
-    fn new(codec: SpillCodec, body_start: u64) -> Self {
+    fn new(codec: SpillCodec) -> Self {
         Self {
             slices: ReorderBuffer::new(),
             parser: SpillFrameParser::new(codec),
             next_seq: 0,
             carry_charge: 0,
-            next_offset: body_start,
-            pending: VecDeque::new(),
         }
     }
 }
@@ -231,38 +225,42 @@ pub struct SortMergeSlot {
     /// Parse state. Lock order (outermost first): `reader` → `raw_stash` →
     /// `reorder` → `decompressed`; the consumer takes only `raw_stash` and
     /// `decompressed`.
-    pub reader: Mutex<SortMergeReader>,
+    pub(crate) reader: Mutex<SortMergeReader>,
     /// Parsed, not yet claimed raw frames, in sequence order. A raw block is
     /// owned by the slot from its parse (`bp_commit_read`) until its
     /// decompressed bytes are inserted (`bp_insert_drain_finalize`).
-    pub raw_stash: Mutex<VecDeque<RawBlock>>,
-    /// Lock-free mirror: resident bytes the stash holds — every read slice with
-    /// a frame still in `raw_stash` (a borrowed frame pins its whole slice),
-    /// every owned frame's allocation, and the parser's carried partial frame.
-    /// Charged as frames are stashed and released as they are claimed (the
-    /// slice with its last stashed frame; see [`RawBlock::charge`]), so it is
-    /// what the slot holds, not the frames' lengths.
-    pub stash_bytes: AtomicU64,
+    pub(crate) raw_stash: Mutex<VecDeque<RawBlock>>,
+    /// Lock-free mirror: resident bytes the slot's read-ahead holds — every
+    /// read slice with a frame still stashed or being decompressed (a borrowed
+    /// frame pins its whole slice), every owned frame's allocation, and the
+    /// parser's carried partial frame. Charged as frames are stashed and
+    /// released as each claimed frame is dropped ([`ClaimedBlock`]; a slice
+    /// with its last stashed frame, see [`RawBlock::charge`]), so it is what
+    /// the slot holds, not the frames' lengths.
+    pub(crate) stash_bytes: AtomicU64,
+    /// Lock-free mirror: the heap bytes of the parser's carried partial frame
+    /// (included in `stash_bytes`), stored under `reader`.
+    pub(crate) carry_bytes: AtomicU64,
     /// Lock-free mirror: frames in `raw_stash`.
-    pub stash_len: AtomicU32,
+    pub(crate) stash_len: AtomicU32,
     /// Bytes requested from the file but not yet parsed (the read planner adds
     /// on issue, [`Self::bp_ingest_slice`] subtracts on parse).
-    pub issued_bytes: AtomicU64,
+    pub(crate) issued_bytes: AtomicU64,
     /// Lock-free mirror of `decompressed.len()`, stored under that lock.
-    pub fifo_len_mirror: AtomicU32,
+    pub(crate) fifo_len_mirror: AtomicU32,
     /// Lock-free mirror of the blocks waiting in `reorder`, stored under that
     /// lock.
-    pub reorder_len_mirror: AtomicU32,
-    /// Soft cap on the decompressed FIFO, at most [`PHASE2_DECOMP_CAP`].
-    pub fifo_cap: AtomicU32,
-    /// The slot's read-ahead class (diagnostics).
-    pub class: AtomicU8,
+    pub(crate) reorder_len_mirror: AtomicU32,
+    /// Soft cap on the decompressed FIFO, at most [`PHASE2_DECOMP_CAP`]
+    /// (set by the read planner, [`Self::set_fifo_cap`]).
+    pub(crate) fifo_cap: AtomicU32,
     /// Bounded queue of decompressed blocks (each a BGZF block or a zstd
-    /// frame, per this slot's `codec`), FIFO. Pushed by the producer
-    /// (`SortSpillDecompress`) after read + inline decompress; popped by the
-    /// consumer (`SortMerge` via `slot_try_load_block`). Bounded at
-    /// `PHASE2_DECOMP_CAP`; producer skips when at cap.
-    pub decompressed: Mutex<VecDeque<Vec<u8>>>,
+    /// frame, per this slot's `codec`), FIFO. Filled by the in-order drain of
+    /// `reorder` after a claimed block is decompressed (by `SortSpillDecompress`
+    /// or the merge itself); popped by the consumer (`SortMerge` via
+    /// `slot_try_load_block`). Bounded by `fifo_cap` (at most
+    /// `PHASE2_DECOMP_CAP`).
+    pub(crate) decompressed: Mutex<VecDeque<Vec<u8>>>,
     /// Set true once the producer detects EOF on the disk reader
     /// AND has pushed any final batch of decompressed blocks to
     /// `decompressed`. After this transition, the slot will never
@@ -272,7 +270,7 @@ pub struct SortMergeSlot {
     /// **Atomic ordering:** producer must hold the `decompressed`
     /// mutex while storing this. Consumer reads it under the same
     /// mutex. Mutex release-acquire creates happens-before.
-    pub queue_eof: AtomicBool,
+    pub(crate) queue_eof: AtomicBool,
     /// Set true if BGZF decompression of a raw block fails. Consumer
     /// surfaces this as `Err` rather than the silent `Ok(false)` that
     /// an empty queue + `queue_eof` would look like.
@@ -280,13 +278,12 @@ pub struct SortMergeSlot {
     /// **Atomic ordering:** identical to `queue_eof`. Producer
     /// stores while holding `decompressed`; consumer reads under
     /// the same lock.
-    pub decomp_error: AtomicBool,
+    pub(crate) decomp_error: AtomicBool,
 
-    // ── Block-parallel decompression state (file_granularity == false) ───────
+    // ── Block-parallel decompression state ───────────────────────────────────
     //
-    // These three fields are inert in the inline (file-granularity) path. In
-    // the block-parallel path multiple workers decompress one file's blocks
-    // concurrently: the READ is serialized under `reader` (sequence-tagged via
+    // Multiple workers decompress one file's blocks concurrently: parsing is
+    // serialized under `reader` (sequence-tagged via
     // `SortMergeReader::next_seq`), but the decompression happens outside the
     // lock, so results complete out of order and are reassembled here.
     /// Number of raw blocks that have been READ (under the reader lock) but not
@@ -295,22 +292,22 @@ pub struct SortMergeSlot {
     /// `reorder`. The slot may declare EOF only once this reaches zero — a
     /// worker that observes reader-EOF must not truncate the merge while another
     /// worker still holds an in-flight (read-but-undelivered) block.
-    pub in_flight: AtomicUsize,
-    /// Set true once a read returns fewer raw blocks than requested, i.e. the
-    /// disk reader reached a clean EOF. Distinct from `queue_eof`: `reader_eof`
+    pub(crate) in_flight: AtomicUsize,
+    /// Set true once the file's last slice has been parsed with no partial
+    /// frame left, i.e. the read side reached a clean EOF. Distinct from `queue_eof`: `reader_eof`
     /// means "no more blocks will be read", whereas `queue_eof` means "every
     /// block has been read, decompressed, reassembled, and delivered to the
     /// FIFO". `queue_eof` is set only when `reader_eof && in_flight == 0 &&
     /// reorder.is_empty()`. Stored under the reader lock (Release), read in the
     /// finalize path (Acquire); being an atomic it does not participate in lock
     /// ordering.
-    pub reader_eof: AtomicBool,
+    pub(crate) reader_eof: AtomicBool,
     /// Per-slot reorder buffer that reassembles out-of-order decompression
     /// results back into read (sequence) order before they are drained into the
     /// FIFO. Lock order: acquire `reorder` BEFORE `decompressed` (never the
     /// reverse); the reader lock, when held, is outermost. The consumer never
     /// touches this — it only pops the in-order FIFO.
-    pub reorder: Mutex<ReorderBuffer<Vec<u8>>>,
+    pub(crate) reorder: Mutex<ReorderBuffer<Vec<u8>>>,
 }
 
 impl SortMergeSlot {
@@ -331,15 +328,15 @@ impl SortMergeSlot {
             source,
             body_start,
             len,
-            reader: Mutex::new(SortMergeReader::new(codec, body_start)),
+            reader: Mutex::new(SortMergeReader::new(codec)),
             raw_stash: Mutex::new(VecDeque::new()),
             stash_bytes: AtomicU64::new(0),
+            carry_bytes: AtomicU64::new(0),
             stash_len: AtomicU32::new(0),
             issued_bytes: AtomicU64::new(0),
             fifo_len_mirror: AtomicU32::new(0),
             reorder_len_mirror: AtomicU32::new(0),
             fifo_cap: AtomicU32::new(mirror(PHASE2_DECOMP_CAP)),
-            class: AtomicU8::new(0),
             decompressed: Mutex::new(VecDeque::with_capacity(PHASE2_DECOMP_CAP)),
             queue_eof: AtomicBool::new(false),
             decomp_error: AtomicBool::new(false),
@@ -426,6 +423,71 @@ impl SortMergeSlot {
         self.reorder_len_mirror.load(Ordering::Relaxed) as usize
     }
 
+    /// Every block has been delivered to the FIFO (or the slot failed): the
+    /// slot will receive no more blocks. Lock-free (`Acquire`); a consumer
+    /// deciding EOF reads it under `decompressed` ([`Self::is_drained`]).
+    #[must_use]
+    pub fn queue_eof(&self) -> bool {
+        self.queue_eof.load(Ordering::Acquire)
+    }
+
+    /// The file's last slice has been parsed with no partial frame left.
+    #[must_use]
+    pub fn reader_eof(&self) -> bool {
+        self.reader_eof.load(Ordering::Acquire)
+    }
+
+    /// Parsed blocks not yet inserted into the reorder buffer (stashed or
+    /// being decompressed).
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Frames in the raw stash, read lock-free.
+    #[must_use]
+    pub fn stash_len_relaxed(&self) -> usize {
+        self.stash_len.load(Ordering::Acquire) as usize
+    }
+
+    /// Resident bytes the slot's read-ahead holds (see the `stash_bytes`
+    /// field), read lock-free.
+    #[must_use]
+    pub fn stash_bytes(&self) -> u64 {
+        self.stash_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Heap bytes of the carried partial frame (part of [`Self::stash_bytes`]),
+    /// read lock-free. A read planner leaves it out of the slot's allowance:
+    /// the carry completes only with the next read, so charging it could
+    /// block the very read that releases it.
+    #[must_use]
+    pub fn carry_bytes(&self) -> u64 {
+        self.carry_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes requested from the file and not yet parsed, read lock-free.
+    #[must_use]
+    pub fn issued_bytes(&self) -> u64 {
+        self.issued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The decompressed FIFO's current soft cap.
+    #[must_use]
+    pub fn fifo_cap(&self) -> u32 {
+        self.fifo_cap.load(Ordering::Relaxed)
+    }
+
+    /// Set the decompressed FIFO's soft cap (the read planner's per-slot
+    /// class). Stored only when it changes, so a planner pass that leaves a
+    /// slot's class alone does not take the line other threads read. May be
+    /// lowered below the FIFO's current length, which then drains naturally.
+    pub fn set_fifo_cap(&self, cap: u32) {
+        if self.fifo_cap.load(Ordering::Relaxed) != cap {
+            self.fifo_cap.store(cap, Ordering::Relaxed);
+        }
+    }
+
     /// Record `bytes` requested from the file (the read planner's side of
     /// `issued_bytes`).
     pub fn bp_note_issued(&self, bytes: u64) {
@@ -488,6 +550,7 @@ impl SortMergeSlot {
             }
             let carry = r.parser.carry_capacity() as u64;
             let carry_before = std::mem::replace(&mut r.carry_charge, carry);
+            self.carry_bytes.store(carry, Ordering::Relaxed);
             let mut stash = lock_ranked(&self.raw_stash, LockRank::RawStash);
             let n = frames.len();
             let mut charged = 0u64;
@@ -634,14 +697,7 @@ impl SortMergeSlot {
     /// decompress worker skip the very slot the merge is waiting on.
     /// `Decompressing` when some claimed block is in flight, else `Stashed`
     /// when frames wait in the stash, else `Issued` when reads are
-    /// outstanding, else `Starved`. Only the block-parallel path raises these
-    /// mirrors, so under
-    /// `--sort::file-granularity` (inline decompress) every stall reports
-    /// [`AwaitedSlotState::Starved`]; the `--sort-stats` awaited-slot line says
-    /// the buckets are not classified there
-    /// ([`crate::MergeDemandStats::mark_inline_decompress`]).
-    ///
-    /// [`AwaitedSlotState::Starved`]: crate::AwaitedSlotState::Starved
+    /// outstanding, else `Starved`.
     #[must_use]
     pub fn awaited_state(&self) -> crate::AwaitedSlotState {
         use crate::AwaitedSlotState as S;
@@ -661,21 +717,7 @@ impl SortMergeSlot {
         }
     }
 
-    // ── Block-parallel decompression helpers (file_granularity == false) ─────
-
-    /// Block-parallel admission control for the fused read path: may a worker
-    /// read another batch of raw blocks (whose first block would be tagged
-    /// `next_seq`) into this slot's reorder window? The same rule
-    /// [`Self::bp_claim_raw`] applies to a claim (`window_admits`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `reorder` mutex is poisoned.
-    #[must_use]
-    pub fn bp_reorder_admits(&self, next_seq: u64, window_budget: u64) -> bool {
-        let rb = lock_ranked(&self.reorder, LockRank::Reorder);
-        window_admits(&rb, next_seq, window_budget)
-    }
+    // ── Block-parallel decompression helpers ─────────────────────────────────
 
     /// Reserve `count` in-flight blocks just read under the reader lock.
     ///
@@ -693,7 +735,7 @@ impl SortMergeSlot {
     }
 
     /// Mark the disk reader as having reached a clean EOF (called under the
-    /// reader lock when a read returns fewer blocks than requested).
+    /// reader lock when the file's last slice has been parsed).
     ///
     /// **Ordering requirement:** call this AFTER [`Self::bp_add_in_flight`] has
     /// reserved the current batch — see that method's note. Publishing
@@ -719,8 +761,7 @@ impl SortMergeSlot {
     /// blocks FIRST, then (on a short read) set `reader_eof`.
     ///
     /// This is the single source of truth for the publish order — both the
-    /// production worker (`SortSpillDecompress::try_fill_block_parallel_slot`)
-    /// and the loom model (`tests/loom_merge_slots.rs`) call it, so the ordering
+    /// production ingest ([`Self::bp_ingest_slice`]) and the loom model (`tests/loom_merge_slots.rs`) call it, so the ordering
     /// is model-checked against the real code and the two cannot drift.
     ///
     /// **Why this order (loom-verified).** The lock-free finalizer in
@@ -739,18 +780,6 @@ impl SortMergeSlot {
         if hit_eof {
             self.bp_set_reader_eof();
         }
-    }
-
-    /// Number of additional decompressed blocks the FIFO can accept before it
-    /// hits [`PHASE2_DECOMP_CAP`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `decompressed` mutex is poisoned.
-    #[must_use]
-    pub fn bp_fifo_room(&self) -> usize {
-        let dec = lock_ranked(&self.decompressed, LockRank::Decompressed);
-        PHASE2_DECOMP_CAP.saturating_sub(dec.len())
     }
 
     /// Tracked reorder-window heap bytes (for tests / diagnostics).
@@ -788,7 +817,7 @@ impl SortMergeSlot {
     ///
     /// Both are caller contract violations with no in-band signal, so they are
     /// asserted here. A caller that decompresses fewer blocks than it reserved
-    /// must store `true` into [`SortMergeSlot::decomp_error`] while holding the
+    /// must store `true` into `decomp_error` ([`SortMergeSlot::mark_failed`]) while holding the
     /// `decompressed` mutex — see the module header's ordering rules — rather
     /// than short-batching this call.
     ///
@@ -865,11 +894,14 @@ impl SortMergeSlot {
     /// claims pop its head, so the head is the lowest unclaimed sequence:
     /// either it is the front, or the front is already in flight. Lock order
     /// `raw_stash` → `reorder`. The claimed block stays in flight until its
-    /// decompressed bytes are inserted (`bp_insert_drain_finalize`).
+    /// decompressed bytes are inserted (`bp_insert_drain_finalize`; see
+    /// [`ClaimedBlock::decompress_and_publish`]), and keeps its share of
+    /// `stash_bytes` charged until it is dropped, because its frame still
+    /// pins its read slice while it is decompressed.
     ///
     /// # Panics
     /// If a slot mutex is poisoned.
-    pub fn bp_claim_raw(&self, window_budget: u64) -> Option<RawBlock> {
+    pub fn bp_claim_raw(&self, window_budget: u64) -> Option<ClaimedBlock<'_>> {
         let mut stash = lock_ranked(&self.raw_stash, LockRank::RawStash);
         let head = stash.front()?.seq;
         let admitted = {
@@ -883,8 +915,7 @@ impl SortMergeSlot {
         }
         let block = stash.pop_front()?;
         self.stash_len.store(mirror(stash.len()), Ordering::Relaxed);
-        self.stash_bytes.fetch_sub(block.charge, Ordering::Relaxed);
-        Some(block)
+        Some(ClaimedBlock { slot: self, block: Some(block) })
     }
 
     /// Stash `frames` (owned) exactly as [`Self::bp_ingest_slice`] does after
@@ -902,13 +933,101 @@ impl SortMergeSlot {
         for frame in frames {
             let charge = frame.capacity() as u64;
             self.stash_bytes.fetch_add(charge, Ordering::Relaxed);
-            stash.push_back(RawBlock { seq: r.next_seq, frame: RawFrame::Owned(frame), charge });
+            stash.push_back(RawBlock {
+                seq: r.next_seq,
+                frame: fgumi_bam_io::pread::RawFrame::Owned(frame),
+                charge,
+            });
             r.next_seq += 1;
         }
         self.publish_stashed(stash.len(), n, last);
         drop(stash);
         if last {
             self.bp_drain_and_finalize();
+        }
+    }
+
+    /// Whether the parse state is empty: no out-of-order slice waiting, no
+    /// carried partial frame (test support).
+    ///
+    /// # Panics
+    /// If the `reader` mutex is poisoned.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    #[must_use]
+    pub fn parse_state_is_empty_for_test(&self) -> bool {
+        let r = lock_ranked(&self.reader, LockRank::Reader);
+        r.slices.is_empty() && r.parser.carry_len() == 0
+    }
+
+    /// Push `block` onto the decompressed FIFO directly, as a drain would
+    /// (test support: a merge test that feeds a slot by hand).
+    ///
+    /// # Panics
+    /// If the `decompressed` mutex is poisoned.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    pub fn push_decompressed_for_test(&self, block: Vec<u8>) {
+        let mut dec = lock_ranked(&self.decompressed, LockRank::Decompressed);
+        dec.push_back(block);
+        self.fifo_len_mirror.store(mirror(dec.len()), Ordering::Relaxed);
+    }
+
+    /// Finalize `queue_eof` directly, under `decompressed` (test support: a
+    /// hand-fed slot whose last block has been pushed).
+    ///
+    /// # Panics
+    /// If the `decompressed` mutex is poisoned.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    pub fn set_queue_eof_for_test(&self) {
+        let _g = lock_ranked(&self.decompressed, LockRank::Decompressed);
+        self.queue_eof.store(true, Ordering::Release);
+    }
+
+    /// Overwrite the read-ahead mirrors the read planner reads (test support:
+    /// a planner test that simulates reads landing and frames being claimed).
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    pub fn set_read_ahead_for_test(&self, issued_bytes: u64, stash_bytes: u64) {
+        self.issued_bytes.store(issued_bytes, Ordering::Relaxed);
+        self.stash_bytes.store(stash_bytes, Ordering::Relaxed);
+    }
+
+    /// Simulate one read of up to `batch` blocks of a `total`-block file under
+    /// the real `reader` lock, publishing the accounting through
+    /// [`Self::bp_commit_read`]; a read short of `batch` is the EOF read.
+    /// Returns `(start_seq, blocks)`, or `None` when the reader is already at
+    /// EOF (loom/test support for the read-batch protocol model).
+    ///
+    /// # Panics
+    /// If the `reader` mutex is poisoned.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    pub fn bp_read_batch_for_test(&self, total: u64, batch: u64) -> Option<(u64, u64)> {
+        let mut reader = lock_ranked(&self.reader, LockRank::Reader);
+        if self.reader_eof.load(Ordering::Acquire) {
+            return None;
+        }
+        let start = reader.next_seq;
+        let got = batch.min(total - start);
+        reader.next_seq += got;
+        self.bp_commit_read(usize::try_from(got).expect("a test batch fits usize"), got < batch);
+        Some((start, got))
+    }
+
+    /// Hold every slot lock, taken without the lock-order checker (test
+    /// support: proving a scan takes no slot lock, by holding them all from
+    /// another thread, several slots at once).
+    ///
+    /// # Panics
+    /// If a slot mutex is poisoned.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    #[must_use]
+    pub fn lock_all_for_test(&self) -> SlotLocksForTest<'_> {
+        fn plain<T>(m: &Mutex<T>) -> Guard<'_, T> {
+            m.lock().unwrap_or_else(|_| panic!("SortMergeSlot mutex poisoned"))
+        }
+        SlotLocksForTest {
+            _reader: plain(&self.reader),
+            _raw_stash: plain(&self.raw_stash),
+            _reorder: plain(&self.reorder),
+            _decompressed: plain(&self.decompressed),
         }
     }
 
@@ -941,6 +1060,104 @@ impl SortMergeSlot {
         }
         drained > 0 || finalized
     }
+}
+
+/// A stash frame claimed by [`SortMergeSlot::bp_claim_raw`] for
+/// decompression. It is in flight until its decompressed bytes are published
+/// ([`Self::decompress_and_publish`]), and holds its share of the slot's
+/// `stash_bytes` until it is dropped, since its frame pins its read slice
+/// until then.
+pub struct ClaimedBlock<'a> {
+    slot: &'a SortMergeSlot,
+    /// `Some` until dropped or detached.
+    block: Option<RawBlock>,
+}
+
+impl ClaimedBlock<'_> {
+    /// Decompress this frame with `dec`, release it (its slice's charge, and
+    /// the hold on the slice), then publish the bytes
+    /// ([`SortMergeSlot::bp_insert_drain_finalize`]). Returns whether the
+    /// publish made progress (a block drained or EOF finalized), in which
+    /// case the caller wakes a merge awaiting the slot.
+    ///
+    /// The one claim → decompress → publish sequence, shared by the
+    /// decompress workers and the merge's self-serve; each caller keeps only
+    /// its own ledger booking and wake.
+    ///
+    /// # Errors
+    /// A decompression failure: the slot is marked failed first
+    /// ([`SortMergeSlot::mark_failed`]), so the caller must wake a merge
+    /// awaiting it.
+    ///
+    /// # Panics
+    /// If a slot mutex is poisoned (a claim always holds its block until it
+    /// is consumed here or dropped).
+    pub fn decompress_and_publish(
+        mut self,
+        dec: &mut crate::spill_block_reader::SpillBlockDecompressor,
+    ) -> io::Result<bool> {
+        let slot = self.slot;
+        let block = self.block.as_ref().expect("a live claim");
+        let (seq, decoded) = (block.seq, dec.decompress_one(slot.codec, &block.frame));
+        self.release();
+        match decoded {
+            Ok(d) => Ok(slot.bp_insert_drain_finalize(seq, vec![d], 1)),
+            Err(e) => {
+                slot.mark_failed();
+                Err(e)
+            }
+        }
+    }
+
+    /// Drop the frame and release its charge.
+    fn release(&mut self) {
+        if let Some(b) = self.block.take() {
+            let charge = b.charge;
+            drop(b);
+            self.slot.stash_bytes.fetch_sub(charge, Ordering::Relaxed);
+        }
+    }
+
+    /// The raw block, its charge released now (test support: a model that
+    /// moves a claim to another thread).
+    ///
+    /// # Panics
+    /// Never: a claim holds its block until it is consumed.
+    #[cfg(any(test, loom, feature = "test-utils"))]
+    #[must_use]
+    pub fn detach(mut self) -> RawBlock {
+        let b = self.block.take().expect("a live claim");
+        self.slot.stash_bytes.fetch_sub(b.charge, Ordering::Relaxed);
+        b
+    }
+}
+
+impl std::ops::Deref for ClaimedBlock<'_> {
+    type Target = RawBlock;
+    fn deref(&self) -> &RawBlock {
+        self.block.as_ref().expect("a live claim")
+    }
+}
+
+impl Drop for ClaimedBlock<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl std::fmt::Debug for ClaimedBlock<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimedBlock").field("block", &self.block).finish_non_exhaustive()
+    }
+}
+
+/// Every lock of one slot, held (see [`SortMergeSlot::lock_all_for_test`]).
+#[cfg(any(test, loom, feature = "test-utils"))]
+pub struct SlotLocksForTest<'a> {
+    _reader: Guard<'a, SortMergeReader>,
+    _raw_stash: Guard<'a, VecDeque<RawBlock>>,
+    _reorder: Guard<'a, ReorderBuffer<Vec<u8>>>,
+    _decompressed: Guard<'a, VecDeque<Vec<u8>>>,
 }
 
 /// The slot's locks, in the one order they may be taken (outermost first).
@@ -1336,9 +1553,10 @@ mod tests {
     }
 
     /// The reorder window stays bounded when the front sequence straggles: a
-    /// worker keeps decompressing ahead-of-gap blocks, but `bp_reorder_admits`
-    /// refuses new reads once `heap_bytes` reaches the window budget, so the
-    /// buffer never balloons past `budget + one batch`.
+    /// worker keeps decompressing ahead-of-gap blocks, but the window rule
+    /// ([`window_admits`], the one `bp_claim_raw` applies) refuses once
+    /// `heap_bytes` reaches the window budget, so the buffer never balloons
+    /// past `budget + one batch`.
     #[test]
     fn bp_reorder_window_is_bounded_under_straggler() {
         const BLOCK: usize = 1024;
@@ -1361,7 +1579,7 @@ mod tests {
         // Workers race ahead delivering seqs 1,2,3,… as long as admission allows.
         let mut next = 1u64;
         let mut admitted = 0;
-        while slot.bp_reorder_admits(next, BUDGET) {
+        while window_admits(&slot.reorder.lock().unwrap(), next, BUDGET) {
             slot.bp_add_in_flight(1);
             slot.bp_insert_drain_finalize(next, vec![block_for(next)], 1);
             // Front gap at seq 0 ⇒ nothing drains.
@@ -1417,6 +1635,43 @@ mod tests {
         );
     }
 
+    /// The production claim path obeys the same window: with the front
+    /// claimed and held (a straggling worker), `bp_claim_raw` admits later
+    /// heads only while the reorder window is under budget, then refuses them
+    /// — and delivering the straggler drains everything, in order.
+    #[test]
+    fn claims_respect_the_reorder_window_under_a_straggler() {
+        const BLOCK: usize = 1024;
+        const BUDGET: u64 = 4 * BLOCK as u64;
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Bgzf);
+        let block_for = |seq: u64| vec![u8::try_from(seq).unwrap(); BLOCK];
+        slot.bp_stash_frames_for_test((0..10u64).map(block_for).collect(), true);
+        let straggler = slot.bp_claim_raw(BUDGET).expect("the front is always admitted");
+        assert_eq!(straggler.seq, 0);
+        let mut admitted = Vec::new();
+        while let Some(b) = slot.bp_claim_raw(BUDGET) {
+            let seq = b.seq;
+            drop(b);
+            slot.bp_insert_drain_finalize(seq, vec![block_for(seq)], 1);
+            admitted.push(seq);
+            assert!(slot.bp_reorder_heap_bytes() <= BUDGET, "the window stayed within budget");
+            assert!(admitted.len() < 10, "the window must refuse before the stash runs out");
+        }
+        assert_eq!(admitted, vec![1, 2, 3, 4], "admitted until the window held its budget");
+        assert!(slot.fifo_len() == 0 && !slot.queue_eof(), "nothing passes the seq-0 gap");
+        drop(straggler.detach());
+        slot.bp_insert_drain_finalize(0, vec![block_for(0)], 1);
+        while let Some(b) = slot.bp_claim_raw(BUDGET) {
+            let seq = b.seq;
+            drop(b);
+            slot.bp_insert_drain_finalize(seq, vec![block_for(seq)], 1);
+        }
+        assert!(slot.queue_eof(), "every block delivered");
+        let delivered: Vec<u8> =
+            slot.decompressed.lock().unwrap().drain(..).map(|b| b[0]).collect();
+        assert_eq!(delivered, (0..10u8).collect::<Vec<_>>());
+    }
+
     /// The drain stops at [`PHASE2_DECOMP_CAP`], so a slot can sit at
     /// reader-EOF with `in_flight == 0` and *still* owe blocks that did not fit
     /// in the FIFO. Finalizing `queue_eof` there would strand them: the
@@ -1465,7 +1720,7 @@ mod tests {
             DEFERRED.len() - drained_now,
         );
         assert!(!slot.is_drained(), "a slot that still owes blocks is not drained");
-        assert_eq!(slot.bp_fifo_room(), 0, "the drain ran until the FIFO had no room left");
+        assert_eq!(slot.fifo_len(), PHASE2_DECOMP_CAP, "the drain ran until the FIFO was full");
 
         // The consumer pops; the driver's follow-up drain must deliver the
         // remainder in read order and only then finalize.

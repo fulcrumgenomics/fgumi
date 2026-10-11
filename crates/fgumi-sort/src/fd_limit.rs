@@ -73,16 +73,14 @@ const _: () = assert!(MIN_TEMP_FILES > 3, "floor must not sit in the quadratic r
 /// deepest cells and re-impose exactly that cost, so it is set above the
 /// measured range rather than at it.
 ///
-/// The competing cost is that each spill file open at the final merge carries
-/// per-file read-ahead not charged against `--max-memory`. Measured, that is far
-/// smaller than a naive per-file estimate suggests, because peak RSS is normally
-/// set by the phase-1 sort buffer and the merge's buffers land after that memory
-/// is released: widening 346 runs from consolidating to not cost +104 MB. It
-/// only bites at the smallest budgets, where phase 1 is too small to dominate --
-/// at 692 runs on a 512 MiB total budget, a 1024-wide merge reached 2309 MB
-/// against 1257 MB for a 256-wide one. Sizing phase-2 read-ahead as a total
-/// budget divided across files, rather than a per-file constant, would remove
-/// that and is the reason this is a ceiling rather than no cap at all.
+/// The competing cost is that each spill file open at the final merge holds
+/// read-ahead. The merge sizes it as one total budget derived from
+/// `--max-memory` and divided across the open files (a few hot files get a deep
+/// allowance, every other file an even share that never drops below one
+/// storage IOP), so a wider merge spreads the same budget thinner instead of
+/// adding a per-file constant. Only the IOP floor grows with the file count,
+/// which is why this is a ceiling rather than no cap at all: at 1024 files the
+/// floor alone is 256 MiB of compressed read-ahead.
 const MAX_DERIVED_TEMP_FILES: usize = 1024;
 
 const _: () = assert!(MIN_TEMP_FILES <= MAX_DERIVED_TEMP_FILES);

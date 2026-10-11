@@ -465,7 +465,7 @@ impl SpillBlockDecompressor {
         }
     }
 
-    /// Decompress a single raw block/frame (one parsed by [`SpillFrameParser`]).
+    /// Decompress a single raw block/frame (one parsed from a spill slice).
     ///
     /// `raw` is one BGZF raw block (header + compressed data + footer) or one
     /// zstd frame body, per `codec`. Returns the decompressed bytes. Uses the
