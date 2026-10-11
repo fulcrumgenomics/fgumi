@@ -9,8 +9,8 @@
 //! for each `(step, output branch)` *who* consumes it and therefore who to
 //! wake: nobody (same thread), the pool event-count, a driver thread, or one
 //! pinned pool worker. Drivers and workers are woken with
-//! `std::thread::Thread::unpark` — an atomic swap plus a futex wake only when
-//! the target is actually parked, so a wake is useful by construction.
+//! `std::thread::Thread::unpark`, and only when armed for their timer park
+//! (the parking bit, below).
 //!
 //! A forward wake is push-gated: a producer's branch with a byte-bounded
 //! transport wakes its consumer only when the dispatch actually pushed to it
@@ -34,10 +34,23 @@
 //! workers are all pinned still runs on wakes. The fused single-thread path
 //! uses [`WakePlan::standalone`], which routes nothing.
 //!
+//! A directed wake (a `Worker`/`Driver` forward target, a holder or
+//! cap-release wake) unparks only a thread armed for its timer park — one bit
+//! per wake slot (`parking`). A running thread costs the deliverer a load, not
+//! an `unpark`: every timer park first sets its bit, fences and re-polls, so a
+//! wake that finds the bit clear is seen by that re-poll. A holder wake reads
+//! the bit behind a second fence, after its claim (`WakePlan::deliver_holder`).
+//! A plan with one thread neither arms nor gates: its lone thread is unparked
+//! by every directed wake, since the queue-memory rebalancer, outside the
+//! plan, still delivers there.
+//!
 //! Lost-wakeup arguments, in short: the pool path is the event-count's own
 //! fence pair; the unpark path is closed by the std park token (`unpark` before
-//! `park` makes the park return at once) plus a `SeqCst` fence pair between
-//! registration and delivery (`ThreadSlots`); the reverse path is a Dekker
+//! `park` makes the park return at once) plus two `SeqCst` fence pairs with the
+//! delivery — registration's (`ThreadSlots`) and the park arm's (`parking`:
+//! the thread sets its bit, fences and re-polls; the deliverer fences and
+//! reads the bit; a holder take fences once more between its claim and that
+//! read); the reverse path is a Dekker
 //! pair — the producer latches its slot, fences and re-checks for room
 //! (`HolderSet::latch_and_recheck`, one implementation for every transport);
 //! the consumer pops, fences and takes the latches; the direct-park fallback is
@@ -62,7 +75,7 @@ use crate::runtime::event_count::{NotifyOutcome, PoolEventCount};
 use crate::runtime::placement::ParallelHosts;
 use crate::runtime::stats::WakeCounts;
 use crate::runtime::wake_slot::{
-    DirectParked, ParkThread, ThreadSlots, current_slot, delivery_fence, set_cap_owed,
+    DirectParked, ParkThread, ThreadSlots, arm_fence, current_slot, delivery_fence, set_cap_owed,
     take_cap_owed, take_cap_recorded,
 };
 use crate::step::StepKind;
@@ -287,6 +300,24 @@ pub struct WakePlan {
     /// refused them: claimed after `direct_parked`, and only for a `Pool` wake
     /// whose consumer is uncapped or capped by a cap with a free permit.
     cap_parked: DirectParked,
+    /// One bit per wake slot (workers `0..n`, then drivers): the threads
+    /// armed for a timer park. A directed wake (a `Worker`/`Driver` forward
+    /// target, a holder or cap-release wake through [`Self::deliver_slot`])
+    /// unparks only a thread whose bit is set; a running thread costs the
+    /// deliverer one shared load instead of an `unpark`. Sound because every
+    /// timer park arms first: set the bit, fence, re-poll ([`Self::arm_direct`],
+    /// [`Self::arm_cap_parked`], [`Self::arm_driver`]), and every deliverer
+    /// fences after its publish and before it reads the bit, so a delivery
+    /// either finds the bit or the re-poll finds the work. Cleared by the owner
+    /// after it wakes. Not used in a plan with one thread ([`Self::gates`]).
+    parking: DirectParked,
+    /// Whether directed wakes are gated on `parking`: the plan has more than
+    /// one thread (workers plus drivers). A plan with one thread never arms —
+    /// its own steps deliver nothing across threads — and delivers every
+    /// directed wake unconditionally instead, because threads outside the plan
+    /// still deliver there: the queue-memory rebalancer's holder wakes
+    /// ([`Self::wake_holders`]) reach the lone worker of a one-thread run.
+    gates: bool,
     /// By `StepIdx`: the phase cap the step reports, if any. Empty in the
     /// standalone plan.
     caps: Box<[Option<Arc<PhaseCap>>]>,
@@ -357,6 +388,8 @@ impl WakePlan {
             workers: ThreadSlots::new(0),
             direct_parked: DirectParked::new(0),
             cap_parked: DirectParked::new(0),
+            parking: DirectParked::new(0),
+            gates: false,
             caps: Box::new([]),
             distinct_caps: Box::new([]),
             pool: None,
@@ -543,6 +576,8 @@ impl WakePlan {
             workers: ThreadSlots::new(n_threads),
             direct_parked: DirectParked::new(n_threads),
             cap_parked: DirectParked::new(n_threads),
+            parking: DirectParked::new(n_threads + n_drivers),
+            gates: n_threads + n_drivers > 1,
             caps,
             distinct_caps,
             pool,
@@ -735,7 +770,9 @@ impl WakePlan {
         };
         let _ = self.forward(s, before, &mut r);
         for rev in &s.reverse {
-            let n = rev.queue.take_holders(&mut |slot| self.deliver_slot(slot));
+            let n = rev.queue.take_holders(&mut |slot| {
+                let _ = self.deliver_holder(slot);
+            });
             r.reverse = r.reverse.saturating_add(u8::try_from(n).unwrap_or(u8::MAX));
         }
         r
@@ -769,7 +806,16 @@ impl WakePlan {
             return r; // the standalone plan: no per-step table
         };
         if self.forward(s, before, &mut r) {
-            self.deliver(s.own, None, None, &mut r); // `Driver`/`Worker`: an unpark of this very thread
+            // `Driver`/`Worker`: an unpark of this very thread, which is
+            // running, so its parking bit is clear — unconditional.
+            let woke = match s.own {
+                WakeTarget::Worker(w) => self.workers.unpark(w),
+                WakeTarget::Driver(d) => self.drivers.unpark(d.0),
+                WakeTarget::None | WakeTarget::Pool => false,
+            };
+            if woke {
+                r.unparked = r.unparked.saturating_add(1);
+            }
         }
         r
     }
@@ -801,10 +847,18 @@ impl WakePlan {
     }
 
     /// A capacity release that is not a pop (the queue-memory rebalancer raised
-    /// `q`'s limit): wake `q`'s recorded holders. Fences first.
+    /// `q`'s limit): claim `q`'s recorded holders and deliver each through
+    /// [`Self::deliver_holder`] (an `unpark` only for one armed for its timer
+    /// park, or the lone thread of a one-thread plan; a running holder
+    /// re-polls on its own). Fences first. Returns the records claimed.
     pub fn wake_holders(&self, q: &dyn BoundedQueueHandle) -> usize {
         delivery_fence();
-        q.take_holders(&mut |slot| self.deliver_slot(slot), SEALED)
+        q.take_holders(
+            &mut |slot| {
+                let _ = self.deliver_holder(slot);
+            },
+            SEALED,
+        )
     }
 
     /// A `Finished` closed an edge: broadcast to the pool and unpark every
@@ -824,19 +878,87 @@ impl WakePlan {
         self.workers.unpark_all();
     }
 
-    /// Worker `w` is about to park on its timer: make it reachable by a `Pool`
-    /// wake that finds no event-count waiter. Returns `true` when armed — the
-    /// caller must then re-poll once before parking (the arm's fence orders it
-    /// before that re-poll). `false` when no event-count exists (one worker, or
-    /// the standalone plan): nothing to arm, no extra pass.
+    /// Worker `w` is about to park on its timer: set its parking bit, so a
+    /// directed wake reaches it, and — when an event-count exists — its
+    /// direct-parked bit, so a `Pool` wake that finds no event-count waiter
+    /// does too; then fence once. Returns `true` when armed: the caller must
+    /// then re-poll once before parking (the fence orders the arm before that
+    /// re-poll), and that one re-poll serves both bits. `false` in a plan with
+    /// one thread and no event-count (the lone worker of a run with no driver,
+    /// or the standalone plan): such a plan does not gate its directed wakes
+    /// (they unpark the lone worker unconditionally), so there is nothing to
+    /// arm and no extra pass.
     #[must_use]
     pub fn arm_direct(&self, w: usize) -> bool {
-        self.pool.is_some() && self.direct_parked.arm(w)
+        let parking = self.mark_parking(w);
+        let direct = self.pool.is_some() && self.direct_parked.mark(w);
+        Self::fence_arm(parking || direct)
     }
 
     /// Worker `w` is running again.
     pub fn disarm_direct(&self, w: usize) {
         self.direct_parked.disarm(w);
+        self.parking.disarm(w);
+    }
+
+    /// Driver `d` is about to park on its timer: set its parking bit and
+    /// fence. Same protocol as [`Self::arm_direct`]: `true` means armed, and
+    /// the caller re-polls once before parking. `false` only in a plan with
+    /// one thread (the standalone plan of a test driving a driver loop by
+    /// hand), which gates nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the plan gates its wakes and has no driver `d`: such a driver would
+    /// park with no bit of its own, so every directed wake would skip it.
+    #[must_use]
+    pub fn arm_driver(&self, d: DriverIdx) -> bool {
+        if !self.gates {
+            return false;
+        }
+        assert!(
+            d.0 < self.drivers.len(),
+            "arm_driver: driver {} is not in this plan ({} drivers)",
+            d.0,
+            self.drivers.len()
+        );
+        let parking = self.mark_parking(self.workers.len() + d.0);
+        Self::fence_arm(parking)
+    }
+
+    /// Driver `d` is running again.
+    pub fn disarm_driver(&self, d: DriverIdx) {
+        self.parking.disarm(self.workers.len() + d.0);
+    }
+
+    /// Set wake slot `slot`'s parking bit, unless the plan has one thread
+    /// (which does not gate on the bit).
+    #[inline]
+    fn mark_parking(&self, slot: usize) -> bool {
+        self.gates && self.parking.mark(slot)
+    }
+
+    /// The one fence of a park arm, when it set any bit; returns `armed`.
+    #[inline]
+    fn fence_arm(armed: bool) -> bool {
+        if armed {
+            arm_fence();
+        }
+        armed
+    }
+
+    /// Whether wake slot `slot` is armed for a timer park (tests).
+    #[cfg(test)]
+    pub(crate) fn is_parking(&self, slot: usize) -> bool {
+        self.parking.is_set(slot)
+    }
+
+    /// [`Self::arm_direct`]'s parking bit without its fence: the negative
+    /// control of the loom parking model, which must lose a wake.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn mark_parking_unfenced(&self, w: usize) {
+        let _ = self.mark_parking(w);
     }
 
     /// Worker `w`, refused by a phase cap and holding nothing, is about to park
@@ -847,7 +969,9 @@ impl WakePlan {
     /// caller re-polls once before parking.
     #[must_use]
     pub fn arm_cap_parked(&self, w: usize) -> bool {
-        self.pool.is_some() && self.cap_parked.arm(w)
+        let parking = self.mark_parking(w);
+        let cap = self.pool.is_some() && self.cap_parked.mark(w);
+        Self::fence_arm(parking || cap)
     }
 
     /// The phase cap `step` reports, if any (`None` in the standalone plan).
@@ -930,6 +1054,7 @@ impl WakePlan {
     /// Worker `w` is running again.
     pub fn disarm_cap_parked(&self, w: usize) {
         self.cap_parked.disarm(w);
+        self.parking.disarm(w);
     }
 
     /// Deliver one forward wake. `fallback_mask` restricts a `Pool` wake's
@@ -971,31 +1096,72 @@ impl WakePlan {
                     }
                 }
             }
-            WakeTarget::Driver(d) => {
-                if self.drivers.unpark(d.0) {
-                    r.unparked = r.unparked.saturating_add(1);
-                }
-            }
-            WakeTarget::Worker(w) => {
-                if self.workers.unpark(w) {
+            WakeTarget::Driver(_) | WakeTarget::Worker(_) => {
+                if self.unpark_if_parking(target) {
                     r.unparked = r.unparked.saturating_add(1);
                 }
             }
         }
     }
 
-    /// Unpark the holder in wake slot `slot` (worker, driver, or — for a thread
-    /// without a slot — everyone).
+    /// Unpark `target` (a `Driver` or `Worker`) only if it is armed for a
+    /// timer park (`parking`); `false` when it is running or unregistered.
+    /// The caller has fenced after its publish: a thread whose bit is clear
+    /// here sets it, fences and re-polls before it parks, and that re-poll
+    /// sees the publish. A plan with one thread does not gate
+    /// ([`Self::gates`]): its lone thread is unparked whenever registered.
     #[inline]
-    pub(crate) fn deliver_slot(&self, slot: usize) {
+    fn unpark_if_parking(&self, target: WakeTarget) -> bool {
+        let armed = |slot: usize| !self.gates || self.parking.is_set(slot);
+        match target {
+            WakeTarget::Worker(w) => armed(w) && self.workers.unpark(w),
+            WakeTarget::Driver(d) => armed(self.workers.len() + d.0) && self.drivers.unpark(d.0),
+            WakeTarget::None | WakeTarget::Pool => false,
+        }
+    }
+
+    /// Unpark the holder in wake slot `slot` (worker, driver, or — for a thread
+    /// without a slot — everyone). A worker or driver is unparked only if it
+    /// is armed for a timer park (in a plan with one thread, whenever it is
+    /// registered): a running holder's next pass, or the re-poll it runs
+    /// before it parks, retries on its own. The caller has fenced. Returns
+    /// whether an `unpark` was issued (`true` for the broadcast).
+    #[inline]
+    pub fn deliver_slot(&self, slot: usize) -> bool {
         let nw = self.workers.len();
         if slot < nw {
-            self.workers.unpark(slot);
+            self.unpark_if_parking(WakeTarget::Worker(slot))
         } else if slot - nw < self.drivers.len() {
-            self.drivers.unpark(slot - nw);
+            self.unpark_if_parking(WakeTarget::Driver(DriverIdx(slot - nw)))
         } else {
             self.deliver_anonymous();
+            true
         }
+    }
+
+    /// Deliver a holder wake for `slot`, whose record the caller has just
+    /// claimed from an edge's holder set (after its own fence): fence again,
+    /// then [`Self::deliver_slot`].
+    ///
+    /// The second fence is what makes the parking gate sound for holder
+    /// claims. A claim need not come with room for the holder (an in-order pop
+    /// that leaves the next ordinal buffered, a pop that frees too little), and
+    /// it can claim a record the holder wrote after the caller's first fence —
+    /// one its re-poll made after it armed. Reading the parking bit unfenced
+    /// there can miss that arm: the holder is skipped, its record is gone, and
+    /// its re-check saw no room, so it parks with nothing left to wake it.
+    /// With the fence, either the claimed record was written after the
+    /// holder's arm (the arm's fence then orders the bit before this read, and
+    /// the holder is unparked) or every record its re-poll writes after the
+    /// arm lands after this claim and stands for the next take. A cap release
+    /// needs no such fence: it always frees a permit, and a thread whose
+    /// claimed cap record went unwoken owes that wake and forwards it
+    /// (`WakePlan::start_pass`). `tests/loom_wake.rs`'s ordered fast-path
+    /// model loses the wake without it.
+    #[inline]
+    pub fn deliver_holder(&self, slot: usize) -> bool {
+        delivery_fence();
+        self.deliver_slot(slot)
     }
 
     /// Wake a holder whose slot is unknown: every thread, pool waiters
@@ -1642,9 +1808,11 @@ mod tests {
         edge.queue.try_push(Sized8).unwrap(); // full
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let queue_h = Arc::clone(&edge.queue);
+        let plan_h = Arc::clone(&plan);
         let holder = std::thread::spawn(move || {
             let _slot = SlotGuard::enter(1); // worker 1 holds
             assert!(queue_h.try_push(Sized8).is_err(), "rejected → latched as slot 1");
+            assert!(plan_h.arm_direct(1), "armed for its timer park");
             ready_tx.send(()).unwrap();
             let t = std::time::Instant::now();
             std::thread::park_timeout(Duration::from_secs(10));
@@ -1878,6 +2046,146 @@ mod tests {
         // sizes `workers` to `n_threads`, so a caller bug here must not take down a run.
         plan.register_worker(99, std::thread::current());
         assert!(!plan.is_worker_registered(99));
+    }
+
+    /// `Par(Parallel) → Ser(Serial, pinned to worker 1)` at two workers, plus
+    /// `Feed(Parallel) → Det(Detached, driver 0) → Par2(Parallel)` so the plan
+    /// has a driver: `Par`'s branch targets `Worker(1)` and `Feed`'s targets
+    /// `Driver(0)`.
+    fn worker_and_driver_plan() -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let par = g.register_step("Par", 1);
+        let ser = g.register_step("Ser", 0);
+        let feed = g.register_step("Feed", 1);
+        let det = g.register_step("Det", 1);
+        let par2 = g.register_step("Par2", 0);
+        g.wire(par, BranchIdx(0), ser);
+        g.wire(feed, BranchIdx(0), det);
+        g.wire(det, BranchIdx(0), par2);
+        WakePlan::build(
+            &g,
+            &[
+                StepKind::Parallel,
+                StepKind::Serial,
+                StepKind::Parallel,
+                StepKind::Detached,
+                StepKind::Parallel,
+            ],
+            &[None, Some(1), None, None, None],
+            &[None, None, None, Some(DriverIdx(0)), None],
+            &[],
+            WakeEdges::NONE,
+            Some(Arc::new(PoolEventCount::new(2))),
+            2,
+        )
+    }
+
+    /// Drain this thread's park token, so the next check starts clean.
+    fn drain_token() {
+        std::thread::park_timeout(Duration::ZERO);
+    }
+
+    /// A park of this thread ended before its 10 s timeout: an unpark reached it.
+    fn was_unparked() -> bool {
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_secs(10));
+        t.elapsed() < Duration::from_secs(5)
+    }
+
+    /// A directed wake unparks only a thread armed for its timer park. While
+    /// worker 1 runs (its parking bit clear) a `Worker(1)` forward wake and a
+    /// holder wake through `deliver_slot` issue no unpark; once it arms they
+    /// do; disarming clears the bit again. The same for driver 0, whose bit is
+    /// its wake slot `n_workers + 0`, through a `Driver(0)` forward wake and
+    /// `deliver_slot(2)`. The skips are asserted through the returned counts,
+    /// not through a park's timing.
+    #[test]
+    fn a_directed_wake_unparks_only_an_armed_thread() {
+        let plan = worker_and_driver_plan();
+        assert_eq!(plan.forward_target(StepIdx(0), BranchIdx(0)), WakeTarget::Worker(1));
+        assert_eq!(plan.forward_target(StepIdx(2), BranchIdx(0)), WakeTarget::Driver(DriverIdx(0)));
+        plan.register_worker(1, std::thread::current());
+        plan.register_driver(DriverIdx(0), std::thread::current());
+        drain_token();
+
+        // Worker 1.
+        assert!(!plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(0), &PushSnapshot::default()).unparked, 0);
+        assert!(!plan.deliver_slot(1), "a running worker was unparked");
+        assert!(plan.arm_direct(1));
+        assert!(plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(0), &PushSnapshot::default()).unparked, 1);
+        assert!(was_unparked(), "the armed worker was not unparked");
+        assert!(plan.deliver_slot(1), "deliver_slot skipped an armed worker");
+        drain_token();
+        plan.disarm_direct(1);
+        assert!(!plan.is_parking(1));
+        assert!(!plan.deliver_slot(1), "a disarmed worker was unparked");
+
+        assert!(plan.arm_cap_parked(1));
+        assert!(plan.is_parking(1), "a cap-parked worker is armed for directed wakes too");
+        assert!(plan.deliver_slot(1), "a cap-release wake skipped a cap-parked worker");
+        drain_token();
+        plan.disarm_cap_parked(1);
+        assert!(!plan.is_parking(1));
+
+        // Driver 0, wake slot 2.
+        assert!(!plan.is_parking(2));
+        assert_eq!(plan.on_progress(StepIdx(2), &PushSnapshot::default()).unparked, 0);
+        assert!(!plan.deliver_slot(2), "a running driver was unparked");
+        assert!(plan.arm_driver(DriverIdx(0)));
+        assert!(plan.is_parking(2), "driver 0 is wake slot n_workers + 0");
+        assert!(!plan.is_parking(0) && !plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(2), &PushSnapshot::default()).unparked, 1);
+        assert!(was_unparked(), "the armed driver was not unparked");
+        assert!(plan.deliver_slot(2), "deliver_slot skipped an armed driver");
+        drain_token();
+        plan.disarm_driver(DriverIdx(0));
+        assert!(!plan.is_parking(2));
+        assert!(!plan.deliver_slot(2), "a disarmed driver was unparked");
+    }
+
+    /// A driver index the plan does not have is loud: a driver parked with no
+    /// bit of its own would be skipped by every directed wake, silently.
+    #[test]
+    #[should_panic(expected = "arm_driver: driver 1 is not in this plan (1 drivers)")]
+    fn arming_a_driver_the_plan_lacks_panics() {
+        let _ = worker_and_driver_plan().arm_driver(DriverIdx(1));
+    }
+
+    /// A plan with one thread arms nothing (the arm and its re-poll would be
+    /// pure cost) and gates nothing: a directed wake to its lone worker is an
+    /// unconditional unpark, since a thread outside the plan (the queue-memory
+    /// rebalancer) still delivers there. One driver beside the lone worker
+    /// makes the arm, and the gate, real. The standalone plan arms nothing.
+    #[test]
+    fn a_one_thread_plan_arms_nothing_and_gates_nothing() {
+        let one_step = |driver: bool| {
+            let mut g = ChainGraph::new();
+            let a = g.register_step("A", 1);
+            let b = g.register_step("B", 0);
+            g.wire(a, BranchIdx(0), b);
+            let kinds =
+                [if driver { StepKind::Detached } else { StepKind::Serial }, StepKind::Serial];
+            let driver_of = [driver.then_some(DriverIdx(0)), None];
+            WakePlan::build(&g, &kinds, &[None, None], &driver_of, &[], WakeEdges::NONE, None, 1)
+        };
+        let lone = one_step(false);
+        assert!(!lone.arm_direct(0) && !lone.arm_cap_parked(0));
+        assert!(!lone.is_parking(0));
+        lone.register_worker(0, std::thread::current());
+        drain_token();
+        assert!(lone.deliver_slot(0), "the unarmed lone worker is still unparked");
+        assert!(was_unparked());
+
+        let with_driver = one_step(true);
+        with_driver.register_worker(0, std::thread::current());
+        assert!(!with_driver.deliver_slot(0), "a plan with two threads gates the lone worker");
+        assert!(with_driver.arm_direct(0) && with_driver.is_parking(0));
+        assert!(with_driver.deliver_slot(0));
+        drain_token();
+        assert!(with_driver.arm_driver(DriverIdx(0)) && with_driver.is_parking(1));
+        assert!(!WakePlan::standalone().arm_direct(0));
     }
 
     #[test]
@@ -2171,8 +2479,11 @@ mod tests {
                 let work = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
                 let work_t = Arc::clone(&work);
+                let plan_t = Arc::clone(&plan);
                 let target = std::thread::spawn(move || {
                     registered_rx.recv().unwrap(); // first pass after registration
+                    // The driver arms for its timer park before that pass.
+                    assert!(plan_t.arm_driver(DriverIdx(0)));
                     // `Relaxed`, as a queue publish is: only the registration
                     // and delivery fences may order this load against the store.
                     if !work_t.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2307,6 +2618,7 @@ mod tests {
 
         let (ready_tx, ready_rx) = channel::<()>();
         let stage_h = Arc::clone(&stage);
+        let plan_h = Arc::clone(&plan);
         let holder = std::thread::spawn(move || {
             let _slot = SlotGuard::enter(1);
             let _ = crate::runtime::wake_slot::take_rejected();
@@ -2323,6 +2635,7 @@ mod tests {
             assert!(!rejected_pending(), "the stash inserts mark nothing");
             assert!(stage_h.try_push(4, Sized8).is_err(), "stash at its cap: ordinal 4 is held");
             assert!(rejected_pending(), "a stash-cap hold marks the thread");
+            assert!(plan_h.arm_direct(1), "armed for its timer park");
             ready_tx.send(()).unwrap();
             let t = std::time::Instant::now();
             std::thread::park_timeout(Duration::from_secs(10));
@@ -2523,10 +2836,18 @@ mod tests {
             );
         }
         let me = std::thread::current();
+        // The consumer's thread is registered and, for a directed target,
+        // armed for its timer park (a running target is not unparked).
         match fwd {
             Fwd::Pool | Fwd::Terminal => plan.register_worker(0, me),
-            Fwd::Driver => plan.register_driver(DriverIdx(0), me),
-            Fwd::Worker => plan.register_worker(1, me),
+            Fwd::Driver => {
+                plan.register_driver(DriverIdx(0), me);
+                assert!(plan.arm_driver(DriverIdx(0)));
+            }
+            Fwd::Worker => {
+                plan.register_worker(1, me);
+                assert!(plan.arm_direct(1));
+            }
             Fwd::GatedPushed
             | Fwd::GatedNotPushed
             | Fwd::GatedPoolPushed
@@ -3077,7 +3398,7 @@ mod tests {
         };
         let ec = plan.pool().expect("two workers: an event-count");
         let k = ec.prepare_wait();
-        plan.deliver_slot(plan.n_slots()); // the anonymous bit
+        assert!(plan.deliver_slot(plan.n_slots())); // the anonymous bit
         assert_eq!(ec.wait(k, Duration::ZERO), WaitOutcome::Woken, "the event-count is notified");
         for (who, h) in [("driver", driver), ("worker", worker)] {
             assert!(h.join().unwrap() < Duration::from_secs(5), "the {who} was unparked");
@@ -3576,6 +3897,7 @@ mod tests {
         let p = Arc::clone(&plan);
         std::thread::spawn(move || {
             p.register_worker(1, std::thread::current());
+            assert!(p.arm_direct(1), "armed for its timer park");
             ready_tx.send(()).unwrap();
             let t0 = std::time::Instant::now();
             std::thread::park_timeout(Duration::from_secs(10));
@@ -3633,6 +3955,26 @@ pub(crate) mod tests_support {
             &[],
             WakeEdges::NONE,
             Some(pool),
+            n,
+        )
+    }
+
+    /// The plan of a plain chain (no Detached step) at `n` threads:
+    /// `A(Serial) → B(Serial)`, a pool event-count only when `n > 1`. At one
+    /// thread it is the lone worker's plan, with nothing else in it.
+    pub(crate) fn plain_plan(n: usize) -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let a = g.register_step("A", 1);
+        let b = g.register_step("B", 0);
+        g.wire(a, BranchIdx(0), b);
+        WakePlan::build(
+            &g,
+            &[StepKind::Serial, StepKind::Serial],
+            &[None, None],
+            &[None, None],
+            &[],
+            WakeEdges::NONE,
+            (n > 1).then(|| Arc::new(PoolEventCount::new(n))),
             n,
         )
     }
@@ -4472,6 +4814,105 @@ mod e2e {
         assert!(cap.refused() >= 1, "the scenario needs a refusal");
     }
 
+    /// A Detached step that takes a permit of `cap` for every item
+    /// ([`crate::admit_input`]) and passes it on. Before its first try at its
+    /// second item it waits (bounded) until another thread holds the cap, so
+    /// that admission is refused.
+    struct DetachedAdmitted {
+        cap: Arc<crate::PhaseCap>,
+        admitted: u32,
+        waited: bool,
+    }
+    impl Step for DetachedAdmitted {
+        type Input = Blob;
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedAdmitted",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.admitted == 1 && !self.waited && !ctx.input.is_empty() {
+                self.waited = true;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while self.cap.active() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let _permit = match crate::admit_input(ctx.input, Some(&self.cap)) {
+                Ok(p) => p,
+                Err(outcome) => return Ok(outcome),
+            };
+            match ctx.input.pop() {
+                Some(b) => {
+                    self.admitted += 1;
+                    assert!(ctx.outputs.push(b).is_ok(), "the output edge holds every item");
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
+            Some(&self.cap)
+        }
+    }
+
+    /// A cap release wakes a refused driver: the driver arms its parking bit
+    /// for a cap-only park (`arm_driver`), and the release's
+    /// `deliver_slot(n_workers + 0)` finds it. A cap of 1 shared by a Detached
+    /// step (driver 0, 10 s timer) and the Parallel step after it. The driver
+    /// passes item 1 on and, before item 2, waits until the pool step holds
+    /// the cap, so its admission is refused and it parks. The pool step waits
+    /// for that refusal, lets the driver park, and releases. Nothing else
+    /// reaches the driver: the source pushed both items before, finishes only
+    /// after the sink has seen them (no `Finished` broadcast), and the pool
+    /// step's own wakes go to the sink. A driver that parked unarmed would be
+    /// skipped by the release and sleep its 10 s timer.
+    #[test]
+    fn cap_release_wakes_a_refused_driver() {
+        let cap = crate::PhaseCap::new("test-cap", 1);
+        let done = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(AtomicU64::new(0));
+        let (cap2, done2, seen2) = (Arc::clone(&cap), Arc::clone(&done), Arc::clone(&seen));
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let snap2 = Arc::clone(&snap);
+        run_under_watchdog("cap-release driver", 5, move || {
+            let capped = CappedStep {
+                cap: Arc::clone(&cap2),
+                work: Duration::ZERO,
+                settle: Duration::from_millis(20),
+                first: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                done: done2,
+                total: 2,
+            };
+            *snap2.lock() = Some(run(2, slow(T::Driver(0)), |b| {
+                b.chain(Source::exclusive_finishing_last(2, 0, &seen2))
+                    .chain(DetachedAdmitted { cap: cap2, admitted: 0, waited: false })
+                    .chain(capped)
+                    .chain(Sink::new(StepKind::Serial, &seen2))
+                    .into_sink_marker();
+            }));
+        });
+        assert_eq!(done.load(AO::Relaxed), 2);
+        assert_eq!(seen.load(AO::Relaxed), 2);
+        assert!(cap.refused() >= 1, "the scenario needs the driver refused");
+        let snap = snap.lock().take().expect("snapshot");
+        assert!(row(&snap, "DetachedAdmitted").capped_count >= 1, "the driver was refused");
+        assert!(
+            snap.detached_park_outcomes
+                .iter()
+                .any(|&(step, unparked, _)| step == 1 && unparked > 0),
+            "the refused driver parked and was unparked: {:?}",
+            snap.detached_park_outcomes
+        );
+    }
+
     /// A Detached step that consumes every item and pushes nothing: its
     /// `Progress` is push-gated, so it wakes no pool worker.
     struct Swallow;
@@ -5216,11 +5657,18 @@ mod e2e {
         let vacuous = counts.vacuous.load(AO::Relaxed);
         assert!(flushed_idle >= 1, "at least one round must exercise the flushed path");
         assert_eq!(flushed_idle + vacuous, 8, "every round is flushed or vacuous");
+        // At most one unpark of the sink's driver per Progress and per flushed
+        // idle dispatch. Not exactly one: a delivery that finds the sink
+        // running (its parking bit clear) is skipped and not counted, and
+        // whether the sink has armed by then is scheduling. That every round's
+        // flushed wake reached it is the watchdog's to show: the sink's only
+        // other way out of its park is the 10 s timer.
         let f = row(&snap, "FanOutTwo");
-        assert_eq!(
+        assert!(
+            f.unparks_issued <= f.progress_count + flushed_idle,
+            "more unparks than deliveries: {} > {} + {flushed_idle}",
             f.unparks_issued,
-            f.progress_count + flushed_idle,
-            "one unpark of the sink's driver per Progress and per flushed idle dispatch"
+            f.progress_count
         );
         if matches!(case, FlushCase::DetachedProducerGated) {
             assert_eq!(f.gated_off, 0, "a flushed push counts as a push for the gate");
@@ -5262,11 +5710,18 @@ mod e2e {
         let vacuous = counts.vacuous.load(AO::Relaxed);
         assert!(flushed_idle >= 1, "at least one round must exercise the flushed path");
         assert_eq!(flushed_idle + vacuous, 8, "every round is flushed or vacuous");
+        // At most one unpark of the sink's worker per Progress and per flushed
+        // idle dispatch. Not exactly one: a delivery that finds the sink
+        // running (its parking bit clear) is skipped and not counted, and
+        // whether the sink has armed by then is scheduling. That every round's
+        // flushed wake reached it is the watchdog's to show: the sink's only
+        // other way out of its park is the 10 s timer.
         let f = row(&snap, "FanOutTwo");
-        assert_eq!(
+        assert!(
+            f.unparks_issued <= f.progress_count + flushed_idle,
+            "more unparks than deliveries: {} > {} + {flushed_idle}",
             f.unparks_issued,
-            f.progress_count + flushed_idle,
-            "one unpark of the sink's worker per Progress and per flushed idle dispatch"
+            f.progress_count
         );
     }
 

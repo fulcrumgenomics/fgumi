@@ -483,7 +483,7 @@ pub(crate) fn run_worker_loop(
                         stats.record_ec_wait(worker.thread_id, outcome);
                         match worker.role() {
                             WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
-                            WorkerRole::Driver { primary_step } => {
+                            WorkerRole::Driver { primary_step, .. } => {
                                 let step = diag.attributed(primary_step, &live);
                                 stats.record_detached_idle(step, ns);
                                 stats.record_detached_park(step);
@@ -494,9 +494,15 @@ pub(crate) fn run_worker_loop(
                 }
             }
 
-            // Timer park: pinned workers, holders, the lone worker, drivers. A
-            // pool worker arms and re-polls first, so a `Pool` wake that finds
-            // no event-count waiter can reach it.
+            // Timer park: pinned workers, holders, the lone worker, drivers.
+            // Every one arms and re-polls first: its parking bit is what lets a
+            // directed wake (a forward unpark, a holder or cap-release wake)
+            // reach it — a deliverer skips a thread whose bit is clear — and a
+            // pool worker's direct-parked bit lets a `Pool` wake that finds no
+            // event-count waiter reach it. One fence and one re-poll serve both
+            // bits. The one exception is the lone worker of a one-thread run
+            // with no driver: its plan gates nothing (every directed wake
+            // unparks it), so it arms nothing and parks with no extra pass.
             //
             // A worker parked only because a cap refused it arms the separate
             // cap-parked set instead: a `Pool` wake claims it only after every
@@ -504,16 +510,20 @@ pub(crate) fn run_worker_loop(
             // (uncapped, or a free permit). A wake for a step whose cap is full
             // would only see it refused again; the release that frees a permit
             // on that cap wakes it, through the record its refusal or its
-            // re-poll's skip left.
+            // re-poll's skip left. (A driver has no cap-parked set: it arms
+            // its parking bit only.)
             let cap_only = cap_refused && !holding;
-            let armed = matches!(worker.role(), WorkerRole::Pool)
-                && if cap_only {
-                    wake.arm_cap_parked(worker.thread_id)
-                } else {
-                    wake.arm_direct(worker.thread_id)
-                };
-            let disarm = |wake: &WakePlan, w: usize| {
-                if cap_only { wake.disarm_cap_parked(w) } else { wake.disarm_direct(w) }
+            let cap_parked = cap_only && !is_driver;
+            let role = worker.role();
+            let armed = match role {
+                WorkerRole::Pool if cap_parked => wake.arm_cap_parked(worker.thread_id),
+                WorkerRole::Pool => wake.arm_direct(worker.thread_id),
+                WorkerRole::Driver { driver, .. } => wake.arm_driver(driver),
+            };
+            let disarm = |wake: &WakePlan, w: usize| match role {
+                WorkerRole::Driver { driver, .. } => wake.disarm_driver(driver),
+                WorkerRole::Pool if cap_parked => wake.disarm_cap_parked(w),
+                WorkerRole::Pool => wake.disarm_direct(w),
             };
             if armed {
                 // A new pass: it re-records on every cap it is refused by or
@@ -540,7 +550,7 @@ pub(crate) fn run_worker_loop(
                     state_slot,
                     wake,
                     &mut diag,
-                    cap_only,
+                    cap_parked,
                 );
                 wake.end_pass();
                 if recheck.removed_sticky_owner {
@@ -559,7 +569,7 @@ pub(crate) fn run_worker_loop(
                 // the normal path (the event-count, or direct-parked), where
                 // every `Pool` wake reaches it. No idle is recorded for this
                 // round.
-                if cap_only && !crate::runtime::wake_slot::cap_recorded_pending() {
+                if cap_parked && !crate::runtime::wake_slot::cap_recorded_pending() {
                     disarm(wake, worker.thread_id);
                     continue;
                 }
@@ -589,7 +599,7 @@ pub(crate) fn run_worker_loop(
                         stats.record_worker_idle(worker.thread_id, ns);
                         stats.record_timer_park(worker.thread_id, timed_out);
                     }
-                    WorkerRole::Driver { primary_step } => {
+                    WorkerRole::Driver { primary_step, .. } => {
                         let step = diag.attributed(primary_step, &live);
                         stats.record_detached_idle(step, ns);
                         stats.record_detached_park(step);
@@ -1876,7 +1886,7 @@ mod tests {
         // Forward walk (ChainOrderScheduler) tries `wedged` (idx 0) first: it
         // yields NoProgress, and the loop MUST proceed to `opener` in the same
         // pass, flip the gate, then finish `wedged` on the next pass.
-        let mut worker = WorkerCore::driver(wedged);
+        let mut worker = WorkerCore::driver(wedged, crate::runtime::placement::DriverIdx(0));
         run_worker_loop(
             &mut worker,
             &mut entries,
@@ -2951,7 +2961,9 @@ mod tests {
         cap.bind_waker({
             let plan = Arc::clone(&plan);
             Arc::new(move |slot: Option<usize>| match slot {
-                Some(s) => plan.deliver_slot(s),
+                Some(s) => {
+                    let _ = plan.deliver_slot(s);
+                }
                 None => plan.deliver_anonymous(),
             })
         });
@@ -3305,7 +3317,7 @@ mod tests {
             let stats = Arc::clone(&stats);
             let drain_counters = drain_counters.clone();
             std::thread::spawn(move || {
-                let mut worker = WorkerCore::driver(a);
+                let mut worker = WorkerCore::driver(a, crate::runtime::placement::DriverIdx(0));
                 run_worker_loop(
                     &mut worker,
                     &mut row,
@@ -3860,6 +3872,9 @@ mod tests {
             2,
         );
         plan.register_driver(DriverIdx(0), std::thread::current());
+        // The driver (this thread) is armed for its timer park, so a delivered
+        // forward wake unparks it rather than finding it running.
+        assert!(plan.arm_driver(DriverIdx(0)));
         let stats = Arc::new(PipelineStats::new(vec!["Src", "Finish", "Sink"]));
         clear_dispatch_flags();
         let mut entry = if let Some(flush) = flush {

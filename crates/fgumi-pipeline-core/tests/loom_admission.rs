@@ -12,7 +12,14 @@
 //! It also drives the cap-release wake of a refused pool worker: the refusal
 //! records the worker's wake slot, fences and re-checks; the release fences
 //! and claims the slot, and the bound waker unparks it (`loom::thread::park`
-//! stands in for the worker's timer park, with no timeout).
+//! stands in for the worker's timer park, with no timeout). The waker here
+//! unparks unconditionally: these models check the cap's own record, claim and
+//! forward protocol against an ideal delivery. `Pipeline::run` binds
+//! `WakePlan::deliver_slot`, which unparks only a thread armed for its timer
+//! park; that composition — the worker's arm and re-poll pass against a
+//! release, and a skipped wake's forward — is model-checked in
+//! `tests/loom_wake.rs` (`cap_release_gated_model`,
+//! `forwarded_cap_wake_gated_model`).
 //!
 //! And the owner side of the per-pass record: the pass-start clear
 //! (`PhaseCap::clear_own_record`) raced against a release; the forward of a

@@ -1634,7 +1634,9 @@ impl Pipeline {
             Arc::new(move |slot: Option<usize>| {
                 if let Some(plan) = plan.upgrade() {
                     match slot {
-                        Some(slot) => plan.deliver_slot(slot),
+                        Some(slot) => {
+                            let _ = plan.deliver_slot(slot);
+                        }
                         None => plan.deliver_anonymous(),
                     }
                 }
@@ -1956,6 +1958,7 @@ impl Pipeline {
                                     state_slot,
                                     &wake_clone,
                                     driver_override,
+                                    crate::runtime::wake::DriverIdx(driver_idx),
                                 );
                             }))
                         {
@@ -3457,13 +3460,24 @@ mod tests {
     /// release with no pop: the holder must be unparked by it, not by its timer.
     /// Driven through the rebalancer thread's own body (`run_queue_rebalancer`),
     /// so the test fails if the loop stops waking the raised queue's holders.
-    #[test]
-    fn rebalancer_raise_wakes_the_holder() {
+    ///
+    /// `lone_worker`: the plan of a one-thread run with no driver, whose lone
+    /// worker never arms a parking bit (`arm_direct` is `false`). The
+    /// rebalancer is a thread outside the plan, and it runs at one thread too
+    /// (`queue_memory_total` set, scheduled path), so its wake must still reach
+    /// that worker.
+    #[rstest]
+    #[case::two_workers(false)]
+    #[case::lone_worker(true)]
+    fn rebalancer_raise_wakes_the_holder(#[case] lone_worker: bool) {
         use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, EdgeTracking, ItemQueue};
         use crate::runtime::wake_slot::{HolderSet, SlotGuard};
-        // Any plan with worker 0 registered will do; the rebalancer only
-        // needs `wake_holders`.
-        let (plan, _g) = crate::runtime::wake::tests_support::directed_plan_with_workers(2);
+        // The rebalancer only needs `wake_holders` and worker 0 registered.
+        let plan = if lone_worker {
+            crate::runtime::wake::tests_support::plain_plan(1)
+        } else {
+            crate::runtime::wake::tests_support::directed_plan_with_workers(2).0
+        };
         let full = Arc::new(ByteBoundedQueue::<Blob64>::new(64));
         // Above the rebalancer's 1 MiB per-queue floor, so it has room to give.
         let empty = Arc::new(ByteBoundedQueue::<Blob64>::new(16 << 20));
@@ -3476,9 +3490,12 @@ mod tests {
         assert!(full.try_push(Blob64).is_ok());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let full_h = Arc::clone(&full);
+        let plan_h = Arc::clone(&plan);
         let holder = std::thread::spawn(move || {
             let _slot = SlotGuard::enter(0);
             assert!(full_h.try_push(Blob64).is_err());
+            // The timer park's arm, as the worker loop runs it.
+            assert_eq!(plan_h.arm_direct(0), !lone_worker, "a lone worker arms nothing");
             ready_tx.send(()).unwrap();
             let t = std::time::Instant::now();
             std::thread::park_timeout(std::time::Duration::from_secs(10));

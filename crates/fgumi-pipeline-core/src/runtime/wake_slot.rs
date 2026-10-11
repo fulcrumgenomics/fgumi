@@ -43,10 +43,20 @@ pub fn current_thread() -> ParkThread {
 /// (a push, a pop that made room, a limit raise) and before reading who to
 /// wake (a [`ThreadSlots`] slot, a [`HolderSet`]). Pairs with the fence in
 /// [`ThreadSlots::register`], [`HolderSet::latch_and_recheck`] and
-/// [`DirectParked::arm`]: of each pair, whichever runs second sees the other's
+/// [`arm_fence`]: of each pair, whichever runs second sees the other's
 /// write.
 #[inline]
 pub fn delivery_fence() {
+    holder_fence(Ordering::SeqCst);
+}
+
+/// The fence of a park arm (`WakePlan::arm_direct`, `arm_cap_parked`,
+/// `arm_driver`): issued once after the arm sets its bits and before the
+/// re-poll. Pairs with the deliverer's fence (a [`delivery_fence`], or the one
+/// inside `PoolEventCount::notify_one`): whichever runs second sees the other's
+/// write, so a delivery either finds the bit or the re-poll finds the work.
+#[inline]
+pub(crate) fn arm_fence() {
     holder_fence(Ordering::SeqCst);
 }
 
@@ -626,12 +636,35 @@ impl DirectParked {
 
     /// Arm worker `w` (it is about to re-poll, then park on its timer), then
     /// fence: the fence orders the arm before the re-poll. `false` (nothing
-    /// armed) when `w` is out of range.
+    /// armed) when `w` is out of range. (Production arms through the wake
+    /// plan, which may set two sets' bits under one [`arm_fence`].)
+    #[cfg(test)]
     pub fn arm(&self, w: usize) -> bool {
+        let armed = self.mark(w);
+        if armed {
+            holder_fence(Ordering::SeqCst);
+        }
+        armed
+    }
+
+    /// Set bit `w` with no fence: the caller fences ([`arm_fence`]) once
+    /// after setting every bit of one arm, so a worker arming two sets pays
+    /// one fence. `false` (nothing set) when `w` is out of range.
+    #[inline]
+    pub(crate) fn mark(&self, w: usize) -> bool {
         let Some(word) = self.words.get(w / 64) else { return false };
         word.0.fetch_or(1u64 << (w % 64), Ordering::Relaxed);
-        holder_fence(Ordering::SeqCst);
         true
+    }
+
+    /// Whether bit `w` is set: one `Relaxed` load. A deliverer reads it after
+    /// its own `SeqCst` fence, so it sees every arm whose fence came first.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_set(&self, w: usize) -> bool {
+        self.words
+            .get(w / 64)
+            .is_some_and(|word| word.0.load(Ordering::Relaxed) & (1 << (w % 64)) != 0)
     }
 
     /// A claim mask for [`Self::claim_one`] with one bit set per worker in
@@ -661,9 +694,7 @@ impl DirectParked {
     /// Whether worker `w` is armed (tests).
     #[cfg(test)]
     pub(crate) fn is_armed(&self, w: usize) -> bool {
-        self.words
-            .get(w / 64)
-            .is_some_and(|word| word.0.load(Ordering::Relaxed) & (1 << (w % 64)) != 0)
+        self.is_set(w)
     }
 
     /// Whether no worker is armed: one `Relaxed` load per word.

@@ -86,10 +86,17 @@ pub struct StepStats {
     pub notifies_suppressed: AtomicU64,
     /// `Thread::unpark` calls issued on this step's `Progress` or flushed retry
     /// (driver / pinned-worker targets, or the step's own thread, for a
-    /// same-thread consumer of a flushed retry).
+    /// same-thread consumer of a flushed retry). A forward wake to a driver or
+    /// pinned worker is issued only when the target is armed for its timer
+    /// park (`WakePlan`'s parking bit, unconditional in a one-thread plan): a
+    /// wake to a running target is skipped, and not counted, since that
+    /// target's re-poll sees the push. So this is not one per `Progress`.
     pub unparks_issued: AtomicU64,
-    /// Holders this step's pops woke: threads whose push into this step's input
-    /// was rejected, unparked directly when the pop made room.
+    /// Holder records this step's pops claimed: threads whose push into this
+    /// step's input was rejected, taken when the pop made room. A claimed
+    /// holder is `unpark`ed only if it is armed for its timer park (the
+    /// parking bit); a running one re-polls on its own. So this counts claims,
+    /// not unparks.
     pub reverse_wakes: AtomicU64,
     /// `Pool` wakes that found no event-count waiter and unparked a worker that
     /// was idling on its own timer instead: one armed for a timer park
@@ -152,7 +159,8 @@ pub(crate) struct WakeCounts {
     pub suppressed: u8,
     /// Direct `Thread::unpark` forward wakes (driver or pinned worker).
     pub unparked: u8,
-    /// Holders woken by this dispatch's pop.
+    /// Holder records this dispatch's pop claimed (each `unpark`ed only if
+    /// armed for its timer park; see [`StepStats::reverse_wakes`]).
     pub reverse: u8,
     /// `Pool` wakes delivered by unparking a timer-parked worker.
     pub fallback: u8,
