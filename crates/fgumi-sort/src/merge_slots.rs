@@ -10,8 +10,9 @@
 //!
 //! # Per-slot bounded queue design (v4 — see commit `9c39dea` / PR #389)
 //!
-//! Each slot carries a bounded queue of decompressed BGZF blocks
-//! (`PHASE2_DECOMP_CAP` entries). Backpressure lives here — the
+//! Each slot carries a bounded queue of decompressed BGZF blocks (at most
+//! its `fifo_cap` entries, itself at most `PHASE2_DECOMP_CAP`). Backpressure
+//! lives here — the
 //! producer is **non-blocking**: pushes only when the queue has
 //! space; otherwise skips this slot and tries the next. The consumer
 //! is also **non-blocking**: when the queue is empty but the slot is
@@ -28,7 +29,7 @@
 //!
 //! For any slot at any wall-clock time, one of the following is true:
 //!
-//! 1. `decompressed.len() < PHASE2_DECOMP_CAP` — producer can push.
+//! 1. `decompressed.len() < fifo_cap` — producer can push.
 //! 2. `decompressed.len() > 0` — consumer can pop.
 //! 3. `queue_eof == true` — slot is done; consumer returns EOF.
 //!
@@ -120,10 +121,11 @@ use fgumi_bam_io::reorder::ReorderBuffer;
 use crate::codec::SpillCodec;
 use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 
-/// Per-slot decompressed-block queue cap. Bounds in-flight
-/// decompressed memory: `num_slots × PHASE2_DECOMP_CAP ×` per-entry size,
-/// where each entry is a decompressed BGZF block or zstd frame ranging from
-/// ~64 KB (BGZF) up to 256 KB (zstd worst case).
+/// Upper bound of every slot's decompressed-block queue cap. With the read
+/// planner's per-slot caps, decompressed memory is bounded by
+/// `Σ min(fifo_cap, PHASE2_DECOMP_CAP) ×` per-entry size over the slots, where
+/// each entry is a decompressed BGZF block or zstd frame ranging from ~64 KB
+/// (BGZF) up to 256 KB (zstd worst case).
 ///
 /// Raised from 8 to 32 (increment 1a) to give the work-stealing decompressor
 /// more runway ahead of the `Detached` merge, which was input-starved
@@ -132,8 +134,9 @@ use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 /// two are no longer equal.
 ///
 /// The ceiling of each slot's FIFO cap ([`SortMergeSlot::fifo_cap`], which the
-/// read planner sets per slot): claims stop at the cap, and a drain never moves
-/// more than this many blocks into a FIFO. A claim of the reorder front is
+/// read planner sets per slot — 32 for the slots the merge needs next, 8 for
+/// the rest): claims stop at the cap, and a drain fills a FIFO only up to
+/// `min(fifo_cap, PHASE2_DECOMP_CAP)`. A claim of the reorder front is
 /// admitted over the cap ([`SortMergeSlot::bp_claim_raw`]); its block then
 /// waits in `reorder` until the consumer makes room. It stays a per-slot,
 /// independent bound (deadlock-safety is unchanged — see the module header).
@@ -251,8 +254,11 @@ pub struct SortMergeSlot {
     /// Lock-free mirror of the blocks waiting in `reorder`, stored under that
     /// lock.
     pub(crate) reorder_len_mirror: AtomicU32,
-    /// Soft cap on the decompressed FIFO, at most [`PHASE2_DECOMP_CAP`]
-    /// (set by the read planner, [`Self::set_fifo_cap`]).
+    /// Cap on the decompressed FIFO (the drain fills it to
+    /// `min(fifo_cap, PHASE2_DECOMP_CAP)`; claims other than the reorder
+    /// front stop at it). Set by the read planner per slot class
+    /// ([`Self::set_fifo_cap`]); may be lowered below the FIFO's current
+    /// length, which then drains naturally.
     pub(crate) fifo_cap: AtomicU32,
     /// Bounded queue of decompressed blocks (each a BGZF block or a zstd
     /// frame, per this slot's `codec`), FIFO. Filled by the in-order drain of
@@ -782,6 +788,14 @@ impl SortMergeSlot {
         }
     }
 
+    /// Room left in a FIFO of `len` blocks under the effective cap
+    /// (`min(fifo_cap, PHASE2_DECOMP_CAP)`); zero, not an underflow, when the
+    /// cap was lowered below the current length.
+    fn fifo_room(&self, len: usize) -> usize {
+        let cap = (self.fifo_cap.load(Ordering::Relaxed) as usize).min(PHASE2_DECOMP_CAP);
+        cap.saturating_sub(len)
+    }
+
     /// Tracked reorder-window heap bytes (for tests / diagnostics).
     ///
     /// # Panics
@@ -794,7 +808,7 @@ impl SortMergeSlot {
 
     /// Insert a freshly-decompressed batch `[start_seq, start_seq + count)` into
     /// the reorder buffer, release the in-flight reservation, drain any now-ready
-    /// (in-order) blocks into the FIFO (bounded by [`PHASE2_DECOMP_CAP`]), and
+    /// (in-order) blocks into the FIFO (bounded by its cap), and
     /// finalize `queue_eof` if the slot is fully delivered.
     ///
     /// `count` is the reservation being released and **must** equal
@@ -1036,7 +1050,7 @@ impl SortMergeSlot {
     /// stored under the same mutex the consumer reads it under.
     fn drain_locked_and_finalize(&self, rb: &mut ReorderBuffer<Vec<u8>>) -> bool {
         let mut dec = lock_ranked(&self.decompressed, LockRank::Decompressed);
-        let mut room = PHASE2_DECOMP_CAP.saturating_sub(dec.len());
+        let mut room = self.fifo_room(dec.len());
         let mut drained = 0usize;
         while room > 0 {
             let Some(block) = rb.try_pop_next() else { break };
@@ -1672,7 +1686,8 @@ mod tests {
         assert_eq!(delivered, (0..10u8).collect::<Vec<_>>());
     }
 
-    /// The drain stops at [`PHASE2_DECOMP_CAP`], so a slot can sit at
+    /// The drain stops at the FIFO cap (here [`PHASE2_DECOMP_CAP`], the
+    /// default), so a slot can sit at
     /// reader-EOF with `in_flight == 0` and *still* owe blocks that did not fit
     /// in the FIFO. Finalizing `queue_eof` there would strand them: the
     /// consumer stops at `is_drained()`, and the blocks left in `reorder` are
@@ -1750,6 +1765,50 @@ mod tests {
             DEFERRED.map(|b| vec![b]),
             "the deferred blocks arrive behind the prefill, in read order",
         );
+    }
+
+    /// A FIFO cap lowered below the FIFO's current length (a slot leaving the
+    /// hot set) never underflows the drain's room: nothing new is pushed until
+    /// the consumer has popped below the cap, no block is lost, and the stash
+    /// front is still claimable over the cap.
+    #[test]
+    fn cap_lowered_below_current_len_drains_naturally() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Bgzf);
+        slot.bp_stash_frames_for_test((0..30u8).map(|i| vec![i]).collect(), true);
+        for _ in 0..20 {
+            let b = slot.bp_claim_raw(u64::MAX).unwrap();
+            slot.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+        }
+        assert_eq!(slot.fifo_len(), 20);
+        slot.set_fifo_cap(8);
+        assert!(!slot.bp_drain_and_finalize(), "no room, and no underflow");
+        let front = slot.bp_claim_raw(u64::MAX).expect("the front is admitted over the cap");
+        assert!(slot.bp_claim_raw(u64::MAX).is_none(), "a later head waits for room");
+        assert!(!slot.bp_insert_drain_finalize(front.seq, vec![front.frame.to_vec()], 1));
+        assert_eq!(slot.fifo_len(), 20, "the front's block waits in reorder");
+        let mut popped = Vec::new();
+        for _ in 0..12 {
+            popped.push(slot.pop_decompressed().unwrap()[0]);
+            assert!(!slot.bp_drain_and_finalize(), "FIFO still at or above the cap");
+        }
+        popped.push(slot.pop_decompressed().unwrap()[0]);
+        assert_eq!(slot.fifo_len(), 7);
+        assert!(slot.bp_drain_and_finalize(), "below the cap: the waiting block drains");
+        assert_eq!(slot.fifo_len(), 8);
+        loop {
+            while let Some(b) = slot.pop_decompressed() {
+                popped.push(b[0]);
+            }
+            while let Some(b) = slot.bp_claim_raw(u64::MAX) {
+                slot.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+            }
+            slot.bp_drain_and_finalize();
+            assert!(slot.fifo_len() <= 8);
+            if slot.is_drained() {
+                break;
+            }
+        }
+        assert_eq!(popped, (0..30u8).collect::<Vec<_>>(), "every block once, in order");
     }
 
     /// The two caller-contract violations the assertions exist to catch: a

@@ -23,6 +23,9 @@
 //! only lock-free state ([`fgumi_sort::MergeDemand`]'s published slots, each
 //! slot's mirrors and the slice pool's gauge).
 //!
+//! The planner retires once every spill byte is requested, so the FIFO caps
+//! are frozen for the merge's tail (see `try_run`).
+//!
 //! Slices per fill adopt the input's `--read-streams` count
 //! ([`ReadStreamsPolicy::slices_for`]); the planner never moves the ratchet.
 
@@ -40,7 +43,9 @@ use fgumi_pipeline_core::{
 use fgumi_sort::{MergeDemand, SortMergeSlot};
 
 use super::protocol::{SortPhase1Event, SortPhase2Event};
-use super::read_ahead_budget::{COLD_INFLIGHT_BYTES, ReadAheadBudget, fifo_cap_for};
+use super::read_ahead_budget::{
+    COLD_INFLIGHT_BYTES, FIFO_CAP_COLD, FIFO_CAP_HOT, ReadAheadBudget, fifo_charge,
+};
 use super::supply_ledger::{SpillSupply, SupplyLedger};
 use crate::pread::{ReadRequest, ReadTarget, SpillClass};
 
@@ -72,6 +77,9 @@ pub struct SpillReadPlanner {
     cold_inflight_bytes: u64,
     eligible_clones: usize,
     budget: Option<ReadAheadBudget>,
+    /// The hot set of the previous pass, demoted to the cold FIFO cap when
+    /// it leaves the set.
+    hot_prev: Vec<usize>,
     cursor: usize,
     next_ordinal: u64,
     outbox: VecDeque<ReadRequest>,
@@ -116,6 +124,7 @@ impl SpillReadPlanner {
             cold_inflight_bytes: COLD_INFLIGHT_BYTES,
             eligible_clones: eligible_clones.max(1),
             budget: None,
+            hot_prev: Vec::new(),
             cursor: 0,
             next_ordinal: 0,
             outbox: VecDeque::new(),
@@ -199,11 +208,14 @@ impl SpillReadPlanner {
         self.on_event(e)
     }
 
-    /// Register a spill slot; an empty one is finalized here without a read.
+    /// Register a spill slot at the cold FIFO cap (it holds a hot-sized FIFO
+    /// only while in the hot set); an empty one is finalized here without a
+    /// read.
     fn register(&mut self, slot: &Arc<SortMergeSlot>) {
         if self.by_file_id.contains_key(&slot.file_id) {
             return;
         }
+        slot.set_fifo_cap(FIFO_CAP_COLD);
         let empty = slot.is_empty();
         if empty {
             slot.bp_commit_read(0, true);
@@ -276,18 +288,48 @@ impl SpillReadPlanner {
         Self::held(s).saturating_sub(budget.cold_allowance)
     }
 
-    /// The pool in use: every slot's charge above its cold allowance, plus the
-    /// idle slice buffers waiting for reuse. One pass over the slots' mirrors,
-    /// as the cold rotation already makes.
-    fn pool_used(&self, budget: &ReadAheadBudget) -> u64 {
-        self.slots.iter().map(|s| Self::excess(s, budget)).sum::<u64>() + self.slices.idle_bytes()
+    /// What slot `s`'s decompressed FIFO is charged to the pool: its blocks
+    /// above the cold cap — the hot cap it was granted, or what a demoted slot
+    /// still holds.
+    fn fifo_excess(s: &PlannedSlot) -> u64 {
+        fifo_charge(u64::from(s.slot.fifo_cap()).max(s.slot.fifo_len_relaxed() as u64))
     }
 
-    /// One pass: top up the hot set, then the cold rotation. Returns the
-    /// number of fills queued.
+    /// The pool in use: every slot's charge above its cold terms (read-ahead
+    /// and FIFO), plus the idle slice buffers waiting for reuse. One pass over
+    /// the slots' mirrors, as the cold rotation already makes.
+    fn pool_used(&self, budget: &ReadAheadBudget) -> u64 {
+        self.slots.iter().map(|s| Self::excess(s, budget) + Self::fifo_excess(s)).sum::<u64>()
+            + self.slices.idle_bytes()
+    }
+
+    /// Give hot slot `i` the hot FIFO cap if it lacks it and the pool has room
+    /// for the blocks above the cold cap (charging them to `pool_used`); else
+    /// it keeps the cold cap, which still lets the merge's awaited slot fill.
+    fn grant_hot_fifo(&mut self, i: usize, budget: &ReadAheadBudget, pool_used: &mut u64) {
+        let s = &self.slots[i];
+        if s.slot.fifo_cap() == FIFO_CAP_HOT {
+            return;
+        }
+        let before = Self::fifo_excess(s);
+        let after = fifo_charge(u64::from(FIFO_CAP_HOT).max(s.slot.fifo_len_relaxed() as u64));
+        if pool_used.saturating_sub(before) + after <= budget.pool {
+            s.slot.set_fifo_cap(FIFO_CAP_HOT);
+            *pool_used = pool_used.saturating_sub(before) + after;
+        }
+    }
+
+    /// One pass: demote the slots that left the hot set, top up the hot set,
+    /// then the cold rotation. Returns the number of fills queued.
     fn plan_pass(&mut self) -> u64 {
         let Some(budget) = self.budget else { return 0 };
         let hot = self.hot_set();
+        for &i in &self.hot_prev {
+            if !hot.contains(&i) {
+                self.slots[i].slot.set_fifo_cap(FIFO_CAP_COLD);
+            }
+        }
+        self.hot_prev.clone_from(&hot);
         if let Some(&awaited) = hot.first()
             && self.demand.awaited() == Some(self.slots[awaited].slot.file_id)
         {
@@ -299,6 +341,7 @@ impl SpillReadPlanner {
         let mut pool_used = self.pool_used(&budget);
         let mut fills = 0;
         for &i in &hot {
+            self.grant_hot_fifo(i, &budget, &mut pool_used);
             fills += self.top_up(i, SpillClass::Hot, &budget, &mut pool_used);
         }
         let k = self.slots.len();
@@ -366,7 +409,9 @@ impl SpillReadPlanner {
         budget: &ReadAheadBudget,
         pool_used: &mut u64,
     ) -> u64 {
-        self.slots[i].slot.set_fifo_cap(fifo_cap_for(class));
+        if class == SpillClass::Cold {
+            self.slots[i].slot.set_fifo_cap(FIFO_CAP_COLD);
+        }
         let mut fills = 0;
         while let Some(fill) = self.next_fill(i, class, budget, *pool_used) {
             let excess_before = Self::excess(&self.slots[i], budget);
@@ -473,6 +518,12 @@ impl Step for SpillReadPlanner {
         if progressed {
             return Ok(StepOutcome::Progress);
         }
+        // Retire once every byte is requested. From then on no pass runs, so
+        // FIFO caps freeze where they are: a slot hot at that moment keeps the
+        // hot cap (still charged to the pool, so the memory bound holds), and
+        // one that becomes hot later keeps the cold cap. Only the merge's tail
+        // — what is already read ahead — runs under frozen caps; staying alive
+        // to keep promoting would cost an O(k) pass per poll for that tail.
         if ctx.input.is_drained()
             && self.announced
             && self.all_issued()

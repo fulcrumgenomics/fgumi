@@ -483,6 +483,9 @@ fn loom_front_escape_unsticks_the_window() {
         let b1 = claimer.join().unwrap();
         assert_eq!(b1.seq, 1, "the front is admitted over a full FIFO and window");
         assert!(slot.bp_claim_raw(1).is_none(), "seq 2 is not the front (1 is in flight)");
+        // The consumer pops seq 0, so seq 1 drains into the FIFO (refilling it
+        // to its cap) and seq 2 becomes the front; only the escape admits it.
+        assert_eq!(slot.pop_decompressed(), Some(payload(0)));
         let s = Arc::clone(&slot);
         let inserter = loom::thread::spawn(move || {
             s.bp_insert_drain_finalize(b1.seq, vec![payload(1)], 1);

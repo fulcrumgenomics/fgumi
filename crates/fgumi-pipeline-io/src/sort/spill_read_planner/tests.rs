@@ -403,3 +403,105 @@ fn idle_slice_buffers_are_charged_to_the_pool() {
     let reqs = p.plan_pass_for_test();
     assert_eq!(bytes(&reqs.iter().collect::<Vec<_>>()), 2 * MIB, "only the cold terms");
 }
+
+/// Claim every admissible stash head of `slot`, decompress it (identity) and
+/// publish it, until nothing more is admitted. Returns the claims made.
+fn serve_until_refused(slot: &SortMergeSlot) -> usize {
+    let mut n = 0;
+    while let Some(b) = slot.bp_claim_raw(u64::MAX) {
+        let seq = b.seq;
+        let block = b.frame.to_vec();
+        drop(b);
+        slot.bp_insert_drain_finalize(seq, vec![block], 1);
+        n += 1;
+    }
+    n
+}
+
+/// The planner gives the awaited slot the hot FIFO cap (32) and every
+/// other slot the cold one (8). Serving a 40-block stash never fills a FIFO
+/// past its cap (the front may be claimed over it, but its block waits in
+/// `reorder`), and a slot that leaves the hot set is demoted to the cold cap
+/// on the next pass. Every block still reaches the consumer once, in order.
+#[test]
+fn cold_slot_fifo_stops_at_8_hot_at_32() {
+    let mut f = fixture(&[64 * MIB, 64 * MIB], 16, 1);
+    await_file(&f.demand, 1);
+    let _ = f.planner.plan_pass_for_test();
+    let caps = |f: &Fixture| -> Vec<u32> { f.slots.iter().map(|s| s.fifo_cap()).collect() };
+    assert_eq!(caps(&f), vec![8, 32]);
+    for (s, cap) in f.slots.iter().zip([8usize, 32]) {
+        s.bp_stash_frames_for_test((0..40u8).map(|i| vec![i]).collect(), true);
+        serve_until_refused(s);
+        assert_eq!(
+            s.fifo_len(),
+            cap,
+            "slot {}: the FIFO fills to its cap and no further",
+            s.file_id
+        );
+        let mut popped = Vec::new();
+        loop {
+            while let Some(b) = s.pop_decompressed() {
+                popped.push(b[0]);
+            }
+            serve_until_refused(s);
+            s.bp_drain_and_finalize();
+            assert!(s.fifo_len() <= cap, "slot {}: {} > cap {cap}", s.file_id, s.fifo_len());
+            if s.is_drained() {
+                break;
+            }
+        }
+        assert_eq!(popped, (0..40u8).collect::<Vec<_>>(), "slot {}", s.file_id);
+    }
+    // Saturate the outstanding-slice cap so the cold rotation visits no slot:
+    // only the demotion itself can lower slot 1's cap.
+    f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.max_inflight_slices());
+    await_file(&f.demand, 0);
+    assert!(f.planner.plan_pass_for_test().is_empty(), "no read: the slice cap binds");
+    assert_eq!(caps(&f), vec![32, 8], "the former hot slot is demoted on the next pass");
+}
+
+/// A slot registered before the budget exists already carries the cold cap,
+/// so no slot holds a hot-sized FIFO without being in the hot set.
+#[test]
+fn registered_slots_start_at_the_cold_fifo_cap() {
+    let mut p = planner(TOTAL, 4, 4, &SpillSupply::new());
+    let s = slot(0, 8 * MIB);
+    assert_eq!(s.fifo_cap(), 32, "the slot's own default");
+    let _ = p.on_event_for_test(spill_ready(&s));
+    assert_eq!(s.fifo_cap(), 8);
+}
+
+/// The hot FIFO cap is charged to the pool: with no room for its 24 blocks
+/// above the cold cap, the awaited slot keeps the cold cap (and still reads
+/// its cold terms); a demoted slot that still holds more than 8 decoded
+/// blocks stays charged for them, which keeps the next hot slot's FIFO cold.
+#[test]
+fn the_hot_fifo_cap_is_granted_only_from_the_pool() {
+    let fifo_reserve = 24 * (64 << 10);
+    let mut f = fixture_with(&[64 * MIB; 2], 16, 1, TOTAL, Some(fifo_reserve - 1));
+    await_file(&f.demand, 0);
+    let reqs = f.planner.plan_pass_for_test();
+    assert_eq!(f.slots[0].fifo_cap(), 8, "no room for the hot FIFO");
+    assert_eq!(bytes(&for_slot(&reqs, 0)), 2 * MIB, "the cold terms: {:?}", shape(&reqs));
+
+    let mut f = fixture_with(&[64 * MIB; 2], 16, 1, TOTAL, Some(fifo_reserve));
+    await_file(&f.demand, 0);
+    let _ = f.planner.plan_pass_for_test();
+    assert_eq!(f.slots[0].fifo_cap(), 32, "exactly room for the hot FIFO");
+    // Slot 0 fills its hot FIFO, then leaves the hot set holding 32 blocks.
+    f.slots[0].bp_stash_frames_for_test((0..40u8).map(|i| vec![i]).collect(), false);
+    serve_until_refused(&f.slots[0]);
+    assert_eq!(f.slots[0].fifo_len(), 32);
+    // Its reads landed long ago (within its cold allowance, not the pool).
+    f.slots[0].set_read_ahead_for_test(0, f.slots[0].stash_bytes());
+    await_file(&f.demand, 1);
+    let _ = f.planner.plan_pass_for_test();
+    assert_eq!((f.slots[0].fifo_cap(), f.slots[1].fifo_cap()), (8, 8), "still charged");
+    // The merge pops slot 0 down to its cold cap: the charge is released.
+    for _ in 0..24 {
+        f.slots[0].pop_decompressed().unwrap();
+    }
+    let _ = f.planner.plan_pass_for_test();
+    assert_eq!(f.slots[1].fifo_cap(), 32, "granted from the released charge");
+}
