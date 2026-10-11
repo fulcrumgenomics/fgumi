@@ -4112,9 +4112,8 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
-                merge = merge
-                    .with_merge_demand(Arc::clone(&merge_demand))
-                    .with_supply_diagnostics(supply_diagnostics);
+                merge =
+                    merge.with_spill_supply(&supply).with_supply_diagnostics(supply_diagnostics);
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -4180,7 +4179,7 @@ impl<'a> ChainBuilder<'a> {
                 .with_fast_path_threads(phases.phase2);
                 merge = merge
                     .with_fast_path_cap(phase2_cap.clone())
-                    .with_merge_demand(Arc::clone(&merge_demand))
+                    .with_spill_supply(&supply)
                     .with_supply_diagnostics(supply_diagnostics);
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 let group_key_config = self.bam_group_key_config()?;

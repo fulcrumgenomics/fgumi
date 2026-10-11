@@ -1808,6 +1808,8 @@ fn collect_merge_batches(
 #[derive(Default)]
 struct MergeRunOptions {
     demand: Option<Arc<fgumi_sort::MergeDemand>>,
+    /// The supply ledger handed to `SortMerge` (self-serve claims).
+    ledger: Option<Arc<crate::sort::supply_ledger::SupplyLedger>>,
     /// `0` means one thread.
     threads: usize,
     test_backoff: Vec<fgumi_pipeline_core::runtime::TestBackoff>,
@@ -1858,8 +1860,13 @@ fn collect_merge_batches_with(
         output_byte_limit,
         target_batch_count,
     );
-    if let Some(d) = opts.demand {
-        merge = merge.with_merge_demand(d);
+    match (opts.demand, opts.ledger) {
+        (Some(demand), Some(ledger)) => {
+            merge = merge.with_spill_supply(&SpillSupply { demand, ledger });
+        }
+        (Some(demand), None) => merge = merge.with_merge_demand(demand),
+        (None, Some(_)) => panic!("a supply ledger needs the supply's merge demand"),
+        (None, None) => {}
     }
     let sink = VecSink {
         received: Arc::clone(&received),
@@ -2507,6 +2514,169 @@ fn only_a_registration_the_merge_parks_on_counts_as_parking() {
         "an empty builder: nothing delivered, so the merge parks: {s:?}"
     );
     assert_eq!(demand.awaited(), Some(0), "a parked merge stays registered on slot 0");
+}
+
+/// Two BGZF spill files whose blocks each hold one coordinate record (record
+/// `j` at position `j` in slot `j % 2`, so the merge switches slots every
+/// record), opened with the production opener and ingested whole into their
+/// raw stashes: every block is read and parsed, none decompressed. With
+/// `corrupt`, slot 1's first block carries a bad CRC.
+fn stashed_two_slots(
+    dir: &std::path::Path,
+    per_slot: usize,
+    corrupt: bool,
+) -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+    let pool = fgumi_bam_io::pread::SliceBufferPool::new(0);
+    (0..2usize)
+        .map(|id| {
+            let path = dir.join(format!("run{id}.spill"));
+            let mut file = std::fs::File::create(&path).expect("create spill file");
+            file.write_all(fgumi_sort::spill_magic(SpillCodec::Bgzf)).unwrap();
+            let mut compressor =
+                fgumi_sort::SpillBlockCompressor::new(SpillCodec::Bgzf, 1).unwrap();
+            for k in 0..per_slot {
+                let mut block = compressor.compress_block(&gated_block(2 * k + id)).unwrap();
+                if corrupt && id == 1 && k == 0 {
+                    let crc = block.len() - 8;
+                    block[crc] ^= 0xFF;
+                }
+                file.write_all(&block).unwrap();
+            }
+            file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
+            drop(file);
+            let slot = fgumi_sort::open_spill_slot(&path, u32::try_from(id).unwrap())
+                .expect("open spill slot");
+            let start = slot.body_start();
+            let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
+            slot.source().read_exact_at(&mut body, start).unwrap();
+            slot.bp_note_issued(body.len() as u64);
+            let out = slot.bp_ingest_slice(0, pool.lease(body), true).expect("ingest");
+            assert_eq!(out.frames, per_slot, "every block stashed");
+            slot
+        })
+        .collect()
+}
+
+/// Run `SortMerge` alone (no decompress step: nothing but the merge itself can
+/// decompress a stashed block) over `slots` under a 30 s watchdog.
+fn merge_alone_over_stashes(
+    slots: &[Arc<fgumi_sort::SortMergeSlot>],
+    total: usize,
+    demand: &Arc<fgumi_sort::MergeDemand>,
+    ledger: &Arc<crate::sort::supply_ledger::SupplyLedger>,
+) -> Result<MergeRun> {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let events = announce_slots(slots, total);
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(demand)),
+        ledger: Some(Arc::clone(ledger)),
+        threads: 2,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 4, opts));
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("WEDGED: the merge parked on a slot whose blocks it could decompress itself")
+}
+
+/// With the merge stalled on a slot whose stash holds blocks and no
+/// decompress worker in the chain, the merge serves itself and finishes:
+/// every record in key order, every block decompressed by the merge, and the
+/// claims booked to the consumer.
+#[test]
+fn stalled_merge_self_serves_from_the_stash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 40, false);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 80, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), (0..80).collect::<Vec<i32>>(), "every record, in key order");
+    let s = demand.snapshot();
+    assert_eq!(s.self_served_blocks, 80, "{s:?}");
+    assert!(s.self_served_episodes >= 1, "{s:?}");
+    assert_eq!(ledger.claims(), (0, 80), "every claim by the consumer");
+    // The `--sort-stats` line reports it.
+    let line = s
+        .log_lines()
+        .into_iter()
+        .find(|l| l.starts_with("Consumer served itself: "))
+        .expect("the self-serve line");
+    assert!(
+        line.ends_with(&format!(
+            "{} parks avoided by decompressing already-read blocks inline (80 blocks \
+             decompressed by the merge)",
+            s.self_served_episodes
+        )),
+        "{line}"
+    );
+    // A stall the merge served itself never parks: its registration is
+    // withdrawn, not counted as a parking registration.
+    assert!(s.registrations >= s.self_served_episodes, "{s:?}");
+    assert_eq!(s.parking_registrations, 0, "no stall parked: {s:?}");
+    assert_eq!(demand.awaited(), None, "every self-served registration withdrawn");
+}
+
+/// Self-serve never reads the spill file: with every slot's file truncated to
+/// zero and unlinked after its bytes were stashed, the merge still completes
+/// from the stash alone.
+#[test]
+fn self_serve_never_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 40, false);
+    for id in 0..2 {
+        let path = tmp.path().join(format!("run{id}.spill"));
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 80, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), (0..80).collect::<Vec<i32>>());
+}
+
+/// Self-serve runs the drain-only path: slot 0's last block was claimed (the
+/// front, over a full FIFO) and decompressed by a worker, so it waits in
+/// `reorder` with the stash empty. Once the merge pops the FIFO and stalls on
+/// slot 0, no claim remains; only the drain moves the block and finalizes the
+/// slot, without any worker.
+#[test]
+fn self_serve_drains_a_block_waiting_behind_a_full_fifo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 2, false);
+    let s0 = &slots[0];
+    s0.set_fifo_cap(1);
+    let mut dec = fgumi_sort::SpillBlockDecompressor::new();
+    for _ in 0..2 {
+        let b = s0.bp_claim_raw(u64::MAX).expect("block 0, then the front over the cap");
+        b.decompress_and_publish(&mut dec).unwrap();
+    }
+    assert_eq!((s0.fifo_len(), s0.reorder_len_relaxed()), (1, 1), "block 1 waits in reorder");
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let run = merge_alone_over_stashes(&slots, 4, &demand, &ledger).unwrap();
+    assert_eq!(run.positions(), vec![0, 1, 2, 3]);
+}
+
+/// A self-serve decompress error marks the slot failed and fails the merge
+/// with the slot's error text.
+#[test]
+fn self_serve_decompress_error_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slots = stashed_two_slots(tmp.path(), 4, true);
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let ledger = Arc::new(crate::sort::supply_ledger::SupplyLedger::default());
+    let Err(err) = merge_alone_over_stashes(&slots, 8, &demand, &ledger) else {
+        panic!("a corrupt stashed block must fail the merge");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("spill decompression error on slot 1"), "{msg}");
+    assert!(slots[1].has_error(), "the slot is marked failed");
 }
 
 /// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`

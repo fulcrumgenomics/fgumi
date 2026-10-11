@@ -837,6 +837,68 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// The current stall episode (one episode spans every `Stalled` until the
     /// next `Produced` or `Done`).
     episode: StallEpisode,
+    /// The merge supply's ledger: self-serve claims are booked to the
+    /// consumer. Set with the demand by [`Self::with_spill_supply`], so the
+    /// merge cannot book to a ledger the planner does not read; `None` in unit
+    /// tests that drive the merge alone.
+    ledger: Option<Arc<super::supply_ledger::SupplyLedger>>,
+    /// Decompressor for self-serve, built on the first self-served block.
+    decomp: Option<fgumi_sort::SpillBlockDecompressor>,
+    /// The per-slot reorder-window byte budget self-serve claims under (the
+    /// decompress step's).
+    window_budget: u64,
+}
+
+/// The merge's own supply path: on a stall it claims, decompresses and
+/// publishes the awaited slot's stashed blocks itself, through the same
+/// [`fgumi_sort::ClaimedBlock::decompress_and_publish`] a `SortSpillDecompress`
+/// worker uses (same claim admission, same publish), and never reads the spill
+/// file.
+struct SelfServe<'a> {
+    decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
+    ledger: Option<&'a super::supply_ledger::SupplyLedger>,
+    window_budget: u64,
+}
+
+impl SelfServe<'_> {
+    /// Serve `slot` until it can make progress or nothing more is claimable or
+    /// drainable. Returns the blocks served and whether the slot now has a
+    /// block or EOF.
+    ///
+    /// The drain-only call before giving up moves a block that waits in
+    /// `reorder` behind a full FIFO (the consumer has just emptied it) without
+    /// any worker.
+    ///
+    /// # Errors
+    /// A decompress failure: the slot is marked failed first, and the error
+    /// names the slot as the merge's own failed-slot error does.
+    fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
+        let mut served = 0u64;
+        loop {
+            if let Some(block) = slot.bp_claim_raw(self.window_budget) {
+                if let Some(l) = self.ledger {
+                    l.sub_stash(block.frame.len() as u64, true);
+                }
+                let decomp =
+                    self.decomp.get_or_insert_with(fgumi_sort::SpillBlockDecompressor::new);
+                block.decompress_and_publish(decomp).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "SortMerge: spill decompression error on slot {}: {e}",
+                            slot.file_id
+                        ),
+                    )
+                })?;
+                served += 1;
+            } else if !slot.bp_drain_and_finalize() {
+                return Ok((served, slot.has_block_or_eof()));
+            }
+            if slot.has_block_or_eof() {
+                return Ok((served, true));
+            }
+        }
+    }
 }
 
 /// Bookkeeping for one stall episode of the merge: when it began, and whether
@@ -947,7 +1009,21 @@ impl<O: MergeOutput> SortMerge<O> {
             demand: None,
             awaiting: false,
             episode: StallEpisode::default(),
+            ledger: None,
+            decomp: None,
+            window_budget: super::spill_decompress::reorder_window_budget(output_byte_limit),
         }
+    }
+
+    /// Join the merge supply: share its merge demand (a stalled merge parks
+    /// until the block it awaits lands) and book self-serve claims in its
+    /// ledger — one value, so the merge cannot pair one supply's demand with
+    /// another's ledger.
+    #[must_use]
+    pub fn with_spill_supply(mut self, supply: &super::supply_ledger::SpillSupply) -> Self {
+        self.demand = Some(Arc::clone(&supply.demand));
+        self.ledger = Some(Arc::clone(&supply.ledger));
+        self
     }
 
     /// Share the sort's [`fgumi_sort::MergeDemand`] with the spill supply, so a
@@ -1139,6 +1215,11 @@ impl<O: MergeOutput> SortMerge<O> {
         let demand = self.demand.as_deref();
         let awaiting = &mut self.awaiting;
         let episode = &mut self.episode;
+        let mut serve = SelfServe {
+            decomp: &mut self.decomp,
+            ledger: self.ledger.as_deref(),
+            window_budget: self.window_budget,
+        };
         let SortMergeState::Merging { driver, builder, next_ordinal } = &mut self.state else {
             unreachable!("next_batch called outside Merging state");
         };
@@ -1181,6 +1262,15 @@ impl<O: MergeOutput> SortMerge<O> {
                         // that already landed means keep merging; otherwise the
                         // delivery to this slot unparks the driver.
                         if d.await_slot(slot) {
+                            continue;
+                        }
+                        // Before parking, decompress the slot's already-read
+                        // blocks on this thread; the slot stays awaited, so a
+                        // worker's delivery meanwhile still wakes the driver.
+                        let (served, ready) = serve.run(slot)?;
+                        d.stats().record_self_serve(served, ready);
+                        if ready {
+                            d.clear_awaited();
                             continue;
                         }
                         *awaiting = true;

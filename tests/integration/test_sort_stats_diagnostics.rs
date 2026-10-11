@@ -402,7 +402,13 @@ fn sort_stats_gates_merge_demand_lines(
     let stderr = sort_spilling_with(order, extra);
     let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
-    for needle in ["Merge demand:", "Awaited slot at stall:", "Pool at stall:", "Merge output:"] {
+    for needle in [
+        "Merge demand:",
+        "Awaited slot at stall:",
+        "Pool at stall:",
+        "Consumer served itself:",
+        "Merge output:",
+    ] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
     }
 }
@@ -447,6 +453,41 @@ fn sort_stats_gates_spill_supply_lines(
         let present = bodies.iter().any(|b| b.starts_with(prefix));
         assert_eq!(present, with_flag, "{order}: `{prefix}` presence:\n{stderr}");
     }
+}
+
+/// On a multi-source merge, `--sort-stats` reports how often the merge served
+/// itself from a stalled slot's stash. Whether a stall finds stashed blocks is
+/// scheduling (the unit test `stalled_merge_self_serves_from_the_stash` forces
+/// it), but the line must agree with itself and with the supply line whatever
+/// the schedule: a park avoided served at least one block, and every block the
+/// merge decompressed is a claim booked to the consumer.
+#[rstest]
+fn sort_stats_reports_self_serve(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+) {
+    let stderr = sort_spilling_with(order, &["--sort-stats"]);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let body = |prefix: &str| -> &str {
+        stderr
+            .lines()
+            .map(log_body)
+            .find_map(|b| b.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("{order}: no `{prefix}` line:\n{stderr}"))
+    };
+    // "{E} parks avoided by decompressing already-read blocks inline ({B} blocks ..."
+    let line = body("Consumer served itself: ");
+    let episodes: u64 = line.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap();
+    let blocks: u64 =
+        line.split_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()).unwrap();
+    assert!(blocks >= episodes, "{order}: {line}");
+    // "... claims {W} by workers + {C} by the consumer; ..."
+    let supply = body("Spill supply: frames ");
+    let consumer: u64 = supply
+        .split_once(" by workers + ")
+        .and_then(|(_, r)| r.split_whitespace().next()?.parse().ok())
+        .unwrap();
+    assert_eq!(consumer, blocks, "{order}: every merge-decompressed block is a consumer claim");
 }
 
 /// On a sort that fits entirely in memory (the single-chunk fast path, no
