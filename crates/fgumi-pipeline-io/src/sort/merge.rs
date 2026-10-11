@@ -41,6 +41,22 @@ const FAST_PATH_PARALLEL_MIN_RECORDS: usize = 64 * 1024;
 /// `try_run` body cooperative.
 const FAST_PATH_BLOCKS_PER_WORKER_WINDOW: usize = 4;
 
+/// Every record ingested must come out of the merge: a slot that finalized a
+/// clean EOF early (a truncated or misparsed spill run) would otherwise end the
+/// merge short with a clean exit.
+fn ensure_all_records_merged(ingested: u64, merged: u64) -> io::Result<()> {
+    if merged == ingested {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "sort lost records: read {ingested} but merged {merged} (differ by {})",
+            ingested.abs_diff(merged)
+        ),
+    ))
+}
+
 /// `SortMerge` counter slot index: records merged/gathered this call.
 const RECORDS: usize = 0;
 
@@ -759,6 +775,8 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// attached). Off by default -- it is instrumentation for performance investigations, not
     /// something a normal run should show. See [`Self::with_sort_stats`].
     sort_stats: bool,
+    /// The merge supply's end-of-merge lines (`--sort-stats` only).
+    supply_diagnostics: Option<super::supply_ledger::SupplyDiagnostics>,
     /// Total records ingested, captured at the merge transition (the summary's
     /// "records processed").
     processed: u64,
@@ -917,6 +935,7 @@ impl<O: MergeOutput> SortMerge<O> {
             stats_slot: None,
             spill_stats: None,
             sort_stats: false,
+            supply_diagnostics: None,
             processed: 0,
             chunk_count: 0,
             dbg: MergeDiag::default(),
@@ -1004,6 +1023,17 @@ impl<O: MergeOutput> SortMerge<O> {
     #[must_use]
     pub fn with_sort_stats(mut self, enabled: bool) -> Self {
         self.sort_stats = enabled;
+        self
+    }
+
+    /// Log the merge supply's lines at the end of the merge (built only under
+    /// `--sort-stats`).
+    #[must_use]
+    pub fn with_supply_diagnostics(
+        mut self,
+        d: Option<super::supply_ledger::SupplyDiagnostics>,
+    ) -> Self {
+        self.supply_diagnostics = d;
         self
     }
 
@@ -1255,6 +1285,7 @@ impl<O: MergeOutput> SortMerge<O> {
                         self.held.put(unpushed);
                         return Ok(StepOutcome::Progress);
                     }
+                    ensure_all_records_merged(self.processed, merged)?;
                     log::info!("Sort merge complete: {merged} records merged");
                     // INSTRUMENTATION (lever-2): is the serial merge starved on
                     // decompress (stalls/contention high) or blocked on the
@@ -1281,6 +1312,11 @@ impl<O: MergeOutput> SortMerge<O> {
                         );
                         if let Some(d) = &self.demand {
                             for line in d.snapshot().log_lines() {
+                                log::info!("{line}");
+                            }
+                        }
+                        if let Some(s) = &self.supply_diagnostics {
+                            for line in s.lines() {
                                 log::info!("{line}");
                             }
                         }

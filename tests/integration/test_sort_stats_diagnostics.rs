@@ -423,6 +423,32 @@ fn sort_stats_gates_the_input_byte_fetch_line(#[values(false, true)] with_flag: 
     }
 }
 
+/// The merge supply's lines — the read-ahead budget, the spill byte fetch,
+/// the measured spill block size, the disk reads, and the stash and claims —
+/// are gated on `--sort-stats`, on a sort that merges at least two sources, in
+/// every order.
+#[rstest]
+fn sort_stats_gates_spill_supply_lines(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
+    for prefix in [
+        "Spill supply: read-ahead budget R=",
+        "Byte fetch: ",
+        "Spill blocks: ",
+        "Spill disk read: ",
+        "Spill supply: frames ",
+    ] {
+        let present = bodies.iter().any(|b| b.starts_with(prefix));
+        assert_eq!(present, with_flag, "{order}: `{prefix}` presence:\n{stderr}");
+    }
+}
+
 /// On a sort that fits entirely in memory (the single-chunk fast path, no
 /// k-way merge), `--sort-stats` gates the fast-path note: absent by default,
 /// present when the flag is passed. It must not be a silent no-op with the
@@ -593,8 +619,6 @@ fn fused_sort_then_group_chain_exercises_intermediate_add_sort_branch() {
         temp_compression: 1,
         temp_codec: fgumi_sort::SpillCodec::default(),
         max_temp_files: MaxTempFiles::Auto,
-        block_batch: 4,
-        file_granularity: false,
         // The point of this test: exercise `with_sort_stats(true)` on the
         // intermediate branch too, not just the flag being threaded through
         // without effect.

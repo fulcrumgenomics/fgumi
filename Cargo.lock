@@ -939,6 +939,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "dhat",
  "fgumi-bam-io",
  "fgumi-bgzf",
  "fgumi-pipeline-core",

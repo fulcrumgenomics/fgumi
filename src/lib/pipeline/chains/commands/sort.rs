@@ -70,37 +70,12 @@ impl InputFetchReport {
     /// rose, `1 (auto)` for one that never did, and `4 (fixed)` for a pinned
     /// count.
     pub(crate) fn line(&self) -> String {
-        let (p50, p90, min) = self.hist.p50_p90_min();
-        let (mean, max) = self.hist.inflight_mean_max();
-        let history = self.policy.history();
-        let streams = if !self.policy.is_auto() {
-            format!("{} (fixed)", self.policy.streams())
-        } else if history.is_empty() {
-            format!("{} (auto)", self.policy.streams())
-        } else {
-            let steps = history.iter().fold(String::new(), |mut acc, h| {
-                use std::fmt::Write as _;
-                let _ = write!(acc, " -> {} (fill {})", h.streams, h.fill_index);
-                acc
-            });
-            let starved: Vec<String> =
-                history.iter().map(|h| format!("{}%", h.starved_pct)).collect();
-            format!("1{steps}; starved {}", starved.join(" -> "))
-        };
         format!(
-            "Byte fetch (input): {} slices, request size p50 {} p90 {} min {}; in-flight \
-             slices mean {mean:.1} max {max}; read streams: {streams}",
+            "Byte fetch (input): {} slices, {}",
             self.hist.count(),
-            kib(p50),
-            kib(p90),
-            kib(min),
+            fgumi_pipeline_io::pread::byte_fetch_summary(&self.hist, &self.policy)
         )
     }
-}
-
-/// `n` bytes as whole KiB (`"512 KiB"`).
-fn kib(n: u64) -> String {
-    format!("{} KiB", n >> 10)
 }
 
 impl FinalizeHook for SortSummaryFinalizeHook {
@@ -254,11 +229,14 @@ impl SortPhase {
             "SpillGather" | "SpillBlockCompress" | "SpillWrite" | "CompressSpill" => {
                 Some(SortPhase::SpillWrite)
             }
-            // `SortSpillDecompress` is Phase-2 read-ahead of the final merge's
+            // The merge supply (`SpillReadPlanner → PreadSpillSlices →
+            // SortSpillDecompress`) is Phase-2 read-ahead of the final merge's
             // sources, not consolidation; consolidation runs inside `SpillWrite`
             // and is split out of the spill-write bucket by
             // `summarize_sort_phases`.
-            "SortSpillDecompress" | "SortMerge" => Some(SortPhase::KWayMerge),
+            "SpillReadPlanner" | "PreadSpillSlices" | "SortSpillDecompress" | "SortMerge" => {
+                Some(SortPhase::KWayMerge)
+            }
             "BgzfCompress" | "WriteBgzfFile" => Some(SortPhase::WriteOutput),
             _ => None,
         }
@@ -648,6 +626,8 @@ mod tests {
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]
     #[case::compress_spill("CompressSpill", SortPhase::SpillWrite)]
+    #[case::spill_read_planner("SpillReadPlanner", SortPhase::KWayMerge)]
+    #[case::pread_spill_slices("PreadSpillSlices", SortPhase::KWayMerge)]
     #[case::spill_decompress("SortSpillDecompress", SortPhase::KWayMerge)]
     #[case::merge("SortMerge", SortPhase::KWayMerge)]
     #[case::bgzf_compress("BgzfCompress", SortPhase::WriteOutput)]

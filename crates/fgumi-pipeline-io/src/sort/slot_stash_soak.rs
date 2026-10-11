@@ -4,8 +4,6 @@
 //! its FIFO is empty, under a random FIFO cap. Every block must be delivered
 //! exactly once in file order and every slice must return to its pool.
 
-use std::sync::atomic::Ordering;
-
 use fgumi_bam_io::pread::SliceBufferPool;
 use fgumi_sort::{SpillBlockDecompressor, SpillCodec};
 
@@ -21,7 +19,7 @@ fn soak_once(dir: &std::path::Path, bytes: &[u8], oracle: &[Vec<u8>], seed: u64)
     let path = dir.join("run.spill");
     let slot = fgumi_sort::open_spill_slot(&path, 0).unwrap();
     let caps = [1u32, 2, 8];
-    slot.fifo_cap.store(caps[usize::try_from(seed % 3).unwrap()], Ordering::Relaxed);
+    slot.set_fifo_cap(caps[usize::try_from(seed % 3).unwrap()]);
     let pool = SliceBufferPool::new(16);
     let body = &bytes[4..];
     // Random cuts of 1 B .. 64 KiB, ingested in a locally shuffled order.
@@ -45,10 +43,9 @@ fn soak_once(dir: &std::path::Path, bytes: &[u8], oracle: &[Vec<u8>], seed: u64)
             let slot = &slot;
             sc.spawn(move || {
                 let mut dec = SpillBlockDecompressor::new();
-                while !slot.queue_eof.load(Ordering::Acquire) {
+                while !slot.queue_eof() {
                     if let Some(b) = slot.bp_claim_raw(1 << 20) {
-                        let d = dec.decompress_one(SpillCodec::Zstd, &b.frame).unwrap();
-                        slot.bp_insert_drain_finalize(b.seq, vec![d], 1);
+                        b.decompress_and_publish(&mut dec).unwrap();
                     } else {
                         slot.bp_drain_and_finalize();
                         std::thread::yield_now();
@@ -82,8 +79,7 @@ fn soak_once(dir: &std::path::Path, bytes: &[u8], oracle: &[Vec<u8>], seed: u64)
             }
             assert!(!slot.has_error());
             if let Some(b) = slot.bp_claim_raw(1 << 20) {
-                let d = dec.decompress_one(SpillCodec::Zstd, &b.frame).unwrap();
-                slot.bp_insert_drain_finalize(b.seq, vec![d], 1);
+                b.decompress_and_publish(&mut dec).unwrap();
             } else {
                 slot.bp_drain_and_finalize();
                 std::thread::yield_now();
@@ -93,6 +89,7 @@ fn soak_once(dir: &std::path::Path, bytes: &[u8], oracle: &[Vec<u8>], seed: u64)
     });
     assert_eq!(got.len(), oracle.len(), "seed {seed}");
     assert!(got == oracle, "seed {seed}: blocks differ");
+    assert_eq!(slot.stash_bytes(), 0, "seed {seed}: a stash charge was never released");
     drop(slot);
     assert_eq!(pool.resident_bytes(), 0, "seed {seed}: a slice was never returned");
 }

@@ -22,6 +22,9 @@ fn open_spill_slot_allocates_no_read_buffer() {
     let slot = fgumi_sort::open_spill_slot(&path, 0).unwrap();
     let allocated = dhat::HeapStats::get().total_bytes - before;
     assert!(allocated < 8 * 1024, "opening a slot allocated {allocated} bytes (no 8 KiB reader)");
-    let r = slot.reader.lock().unwrap();
-    assert!(r.slices.is_empty() && r.parser.carry_len() == 0 && r.pending.is_empty());
+    // The parse-state seam is test support (`test-utils`, on in the workspace
+    // test build); the allocation check above stands without it.
+    #[cfg(feature = "test-utils")]
+    assert!(slot.parse_state_is_empty_for_test());
+    drop(slot);
 }
