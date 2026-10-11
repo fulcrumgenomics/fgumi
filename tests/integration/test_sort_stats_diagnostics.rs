@@ -391,8 +391,13 @@ fn sort_stats_gates_merge_diagnostics(#[case] extra_args: &[&str], #[case] expec
     );
 }
 
-/// The merge-demand lines are gated on `--sort-stats`, on a sort that merges
-/// at least two sources, in every order.
+/// The merge-demand lines and the `Merge output:` line are gated on
+/// `--sort-stats`, on a sort that merges at least two sources, in every order.
+/// `Merge output:` splits the merged records into borrowed and assembled, so
+/// the two counts sum to the merge's own record total. The fixture's short
+/// records under the default spill codec never span a spill block, and the
+/// in-memory residual is a shared chunk, so every record is borrowed: a merge
+/// that copied records into its scratch again would fail here.
 #[rstest]
 fn sort_stats_gates_merge_demand_lines(
     #[values("coordinate", "queryname", "template-coordinate")] order: &str,
@@ -408,9 +413,54 @@ fn sort_stats_gates_merge_demand_lines(
         "Pool at stall:",
         "Merge prediction:",
         "Consumer served itself:",
+        "Merge output:",
     ] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
     }
+    if with_flag {
+        let (borrowed, assembled) = merge_output_counts(&stderr)
+            .unwrap_or_else(|| panic!("{order}: unparseable `Merge output:` line:\n{stderr}"));
+        let merged = records_merged(&stderr)
+            .unwrap_or_else(|| panic!("{order}: no `Sort merge complete:` line:\n{stderr}"));
+        assert_eq!(borrowed + assembled, merged, "{order}: borrowed + assembled:\n{stderr}");
+        assert!(merged > 0, "{order}: the merge emitted nothing:\n{stderr}");
+        assert_eq!(assembled, 0, "{order}: no fixture record should be assembled:\n{stderr}");
+    }
+}
+
+/// `(borrowed, assembled)` from `Merge output: records borrowed B / assembled A`.
+fn merge_output_counts(stderr: &str) -> Option<(u64, u64)> {
+    let body = stderr
+        .lines()
+        .map(log_body)
+        .find_map(|b| b.trim().strip_prefix("Merge output: records borrowed "))?;
+    let (borrowed, assembled) = body.split_once(" / assembled ")?;
+    Some((borrowed.trim().parse().ok()?, assembled.trim().parse().ok()?))
+}
+
+/// `N` from `Sort merge complete: N records merged`.
+fn records_merged(stderr: &str) -> Option<u64> {
+    stderr
+        .lines()
+        .map(log_body)
+        .find_map(|b| b.trim().strip_prefix("Sort merge complete: "))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// An in-memory sort never builds a merge driver, so under `--sort-stats` it
+/// prints no `Merge output:` line.
+#[test]
+fn fast_path_sort_prints_no_merge_output_line() {
+    let stderr = sort_and_capture_logs(4, "768M", &["--sort-stats"]);
+    assert!(
+        !stderr.contains("Spill runs:"),
+        "fixture unexpectedly spilled; this case must exercise the fast path:\n{stderr}"
+    );
+    assert!(stderr.contains(FAST_PATH_DIAG_SUBSTRING), "the fast path must run:\n{stderr}");
+    assert!(!stderr.contains("Merge output:"), "no merge driver ran:\n{stderr}");
 }
 
 /// `Byte fetch (input):` is gated on `--sort-stats` on the native input path

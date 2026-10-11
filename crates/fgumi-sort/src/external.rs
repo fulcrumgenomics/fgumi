@@ -1010,7 +1010,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 ///
 /// Inline-buffer sorts (coordinate, template) produce
 /// `Shared` chunks that share an `Arc<SegmentedBuf>` backing store —
-/// zero per-record allocation, one memcpy per record at merge time.
+/// zero per-record allocation; the merge reads each record in place.
 ///
 /// The queryname streaming path accumulates records upstream as
 /// individual `RawRecord`s and produces `Owned` chunks — the
@@ -5972,12 +5972,29 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
 /// Result of a non-blocking source read. `WouldBlock` is only ever produced by
 /// `Slot` sources whose decompressed queue is momentarily empty and not yet at
 /// EOF; the in-memory source always returns `Ready`.
-pub(crate) enum TryRead<K> {
+pub(crate) enum TryRead<T> {
     /// A record was read (`Some`) or the source is at clean EOF (`None`).
-    Ready(Option<K>),
+    Ready(Option<T>),
     /// The source has no bytes available right now but is not at EOF; the
     /// caller should yield and retry on a later dispatch.
     WouldBlock,
+}
+
+/// Where a merge source's current record lives, so the driver can emit it by
+/// reference instead of copying it. The slot-driver counterpart of the
+/// pool-merge path's `CurRecord`, kept separate because the pool path has no
+/// shared-chunk location: one enum would give it an unreachable `Chunk` arm
+/// and lose the exhaustiveness check on both matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecLoc {
+    /// `[start, end)` of the source's `SlotParserState::current_buf`: the
+    /// record lies wholly inside the current block.
+    Block { start: usize, end: usize },
+    /// Record `idx` of the source's shared residual chunk (`MemoryShared`).
+    Chunk { idx: usize },
+    /// The leaf's scratch buffer: a record that spanned blocks, or the owned
+    /// residual's swapped-in body.
+    Scratch,
 }
 
 /// Per-slot byte-stream parser state for the non-blocking merge reader.
@@ -6014,7 +6031,7 @@ struct PendingRecord {
     /// Count of `len_buf` bytes filled.
     len_got: usize,
     /// Total body length, known once `len_got == 4`. The body accumulates
-    /// directly into the caller's record buffer; progress is `out.len()`.
+    /// directly into the caller's scratch buffer; progress is `out.len()`.
     body_len: Option<usize>,
 }
 
@@ -6114,9 +6131,12 @@ pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
 
 /// Non-blocking, resumable read of the next record from a slot.
 ///
-/// Returns `Ready(Some(key))` with the record body in `out`, `Ready(None)` at
-/// clean source EOF, or `WouldBlock` when a needed block is not yet available
-/// (progress is saved in `parser.pending` so the next call resumes).
+/// Returns `Ready(Some((key, loc)))` with `loc` naming where the record body
+/// lives: [`RecLoc::Block`] for a record wholly inside the current block (left
+/// in place, not copied), or [`RecLoc::Scratch`] for one assembled in `out`
+/// because it spans blocks. Returns `Ready(None)` at clean source EOF, or
+/// `WouldBlock` when a needed block is not yet available (progress is saved in
+/// `parser.pending` so the next call resumes).
 ///
 /// # Errors
 ///
@@ -6126,7 +6146,7 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
     slot: &Arc<crate::merge_slots::SortMergeSlot>,
     parser: &mut SlotParserState,
     out: &mut Vec<u8>,
-) -> Result<TryRead<K>> {
+) -> Result<TryRead<(K, RecLoc)>> {
     let key_size = slot_key_size::<K>()?;
 
     if parser.pending.is_none() {
@@ -6140,7 +6160,7 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
             }
         }
         // Fast path: the entire record lives in the current block → parse in
-        // place with a single copy of the body into `out`.
+        // place and leave the body there; the driver emits it by reference.
         let header = key_size + 4;
         if parser.remaining() >= header {
             let p = parser.current_pos;
@@ -6148,11 +6168,14 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
                 parser.current_buf[p + key_size..p + header].try_into().expect("4-byte slice"),
             ) as usize;
             if parser.remaining() >= header + len {
-                out.clear();
-                out.extend_from_slice(&parser.current_buf[p + header..p + header + len]);
-                let key = slot_parse_key::<K>(&parser.current_buf[p..p + key_size], out)?;
-                parser.current_pos += header + len;
-                return Ok(TryRead::Ready(Some(key)));
+                let start = p + header;
+                let end = start + len;
+                let key = slot_parse_key::<K>(
+                    &parser.current_buf[p..p + key_size],
+                    &parser.current_buf[start..end],
+                )?;
+                parser.current_pos = end;
+                return Ok(TryRead::Ready(Some((key, RecLoc::Block { start, end }))));
             }
         }
         // Slow path: record spans a block boundary (or fewer than `header`
@@ -6160,7 +6183,10 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
         parser.pending = Some(PendingRecord { key_size, ..PendingRecord::default() });
     }
 
-    slot_collect_pending::<K>(slot, parser, out)
+    Ok(match slot_collect_pending::<K>(slot, parser, out)? {
+        TryRead::Ready(key) => TryRead::Ready(key.map(|k| (k, RecLoc::Scratch))),
+        TryRead::WouldBlock => TryRead::WouldBlock,
+    })
 }
 
 /// Resumable continuation of [`slot_try_next_record`]'s slow path. Collects the
@@ -6291,40 +6317,43 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static> {
     /// record an owned `RawRecord`). Read via a zero-copy `mem::swap` bridge.
     Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// In-memory sorted residual from an inline-buffer (coordinate / template)
-    /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. Read
-    /// copies each record's bytes into the caller's reused `buf`.
+    /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. A
+    /// read names the record's index; the driver emits its bytes straight from
+    /// the shared buffer.
     MemoryShared { chunk: InMemoryChunk<K>, idx: usize },
 }
 
 impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
-    /// Non-blocking read of the next record into `buf`, returning the sort key.
-    /// `Slot` sources may return `WouldBlock`; `Memory` always returns `Ready`.
-    fn try_next_record(&mut self, buf: &mut Vec<u8>) -> Result<TryRead<K>> {
+    /// Non-blocking read of the next record, returning its sort key and where
+    /// its bytes live ([`RecLoc`]). Only a record that spans blocks, or an
+    /// owned residual record, is placed in `scratch`. `Slot` sources may return
+    /// `WouldBlock`; memory sources always return `Ready`.
+    fn try_next_record(&mut self, scratch: &mut Vec<u8>) -> Result<TryRead<(K, RecLoc)>> {
         match self {
-            SlotMergeSource::Slot { slot, parser } => slot_try_next_record::<K>(slot, parser, buf),
+            SlotMergeSource::Slot { slot, parser } => {
+                slot_try_next_record::<K>(slot, parser, scratch)
+            }
             SlotMergeSource::Memory { records, idx } => {
                 if *idx < records.len() {
                     let (ref mut key, ref mut data) = records[*idx];
                     // Bridge: RawRecord wraps Vec<u8>; swap via the inner vec to
-                    // avoid re-allocating. The caller's buf is a plain Vec<u8>.
-                    std::mem::swap(buf, data.as_mut_vec());
+                    // avoid re-allocating. The scratch is a plain Vec<u8>.
+                    std::mem::swap(scratch, data.as_mut_vec());
                     let key = std::mem::take(key);
                     *idx += 1;
-                    Ok(TryRead::Ready(Some(key)))
+                    Ok(TryRead::Ready(Some((key, RecLoc::Scratch))))
                 } else {
                     Ok(TryRead::Ready(None))
                 }
             }
             SlotMergeSource::MemoryShared { chunk, idx } => {
                 if *idx < chunk.len() {
-                    // Bytes are borrowed from the shared `Arc<SegmentedBuf>`, so
-                    // copy them into the caller's reused `buf` (one memcpy, no
-                    // per-record allocation — the materialise-time copy is gone).
-                    buf.clear();
-                    buf.extend_from_slice(chunk.record_bytes(*idx));
+                    // The bytes stay in the shared `Arc<SegmentedBuf>`; the
+                    // driver emits them from there by index.
                     let key = chunk.take_key(*idx);
+                    let loc = RecLoc::Chunk { idx: *idx };
                     *idx += 1;
-                    Ok(TryRead::Ready(Some(key)))
+                    Ok(TryRead::Ready(Some((key, loc))))
                 } else {
                     Ok(TryRead::Ready(None))
                 }
@@ -6335,10 +6364,12 @@ impl<K: RawSortKey + Default + 'static> SlotMergeSource<K> {
 
 /// One step of a non-blocking k-way merge.
 pub enum MergeStep<'a> {
-    /// The next merged record. The bytes borrow the driver's internal winner
-    /// buffer and are valid only until the next `try_step` call — the caller
-    /// must copy them out before stepping again. The borrow checker enforces
-    /// this, which is what makes the deferred-refill protocol sound.
+    /// The next merged record. The bytes borrow the winning source's current
+    /// block, its shared residual chunk, or the driver's scratch buffer (a
+    /// record that spanned blocks), and are valid only until the next
+    /// `try_step` call — the caller must copy them out before stepping again.
+    /// The borrow checker enforces this, which is what makes the
+    /// deferred-refill protocol sound.
     Produced(&'a [u8]),
     /// A source's decompressed queue is momentarily empty (and not at EOF), or
     /// a source hasn't been primed yet. No record is available right now; the
@@ -6378,15 +6409,20 @@ pub trait MergeDriverDyn: Send {
     /// `None` after a `Produced` (a memory source never stalls). The merge
     /// awaits this slot so the delivery that refills it can wake the merge.
     fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>>;
+    /// `(borrowed, assembled)`: records emitted by reference to a source's
+    /// block or shared residual chunk, and records emitted from the driver's
+    /// scratch buffer.
+    fn record_counts(&self) -> (u64, u64);
 }
 
 /// Internal phase of the [`MergeDriver`] non-blocking state machine.
 enum MergePhase<K> {
     /// Lazily priming the loser tree: each source's first record is pulled one
     /// at a time (non-blocking). `next` is the index of the next source to
-    /// prime; `keys` accumulates the primed initial keys; `rec` is the partial
-    /// record buffer for the source currently being primed (retained across a
-    /// `Stalled` so a spanning first record resumes correctly).
+    /// prime; `keys` accumulates the primed initial keys; `rec` is the scratch
+    /// for the source currently being primed, which holds a first record that
+    /// spans blocks (retained across a `Stalled` so it resumes correctly) and
+    /// becomes that leaf's scratch.
     Priming { next: usize, keys: Vec<K>, rec: Vec<u8> },
     /// Active k-way merge. `pending_refill` is set after a record is emitted
     /// (`Produced`) and means the winner's source must be refilled before the
@@ -6401,9 +6437,18 @@ enum MergePhase<K> {
 /// `SortMerge` step via [`MergeDriverDyn::try_step`].
 pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
     sources: Vec<SlotMergeSource<K>>,
-    /// Per-active-source current record buffer, indexed by loser-tree leaf
-    /// (parallel to `source_map`). Grows during `Priming`.
+    /// Per-active-source scratch buffer, indexed by loser-tree leaf (parallel
+    /// to `source_map`): holds the leaf's current record only when `locs` says
+    /// [`RecLoc::Scratch`]. Grows during `Priming`. While a deferred refill is
+    /// `WouldBlock`ed on a record that spans blocks, the scratch holds that
+    /// partial *next* record and `locs` still names the already-emitted one;
+    /// no `Produced` reads it until the refill completes and updates `locs`.
     records: Vec<Vec<u8>>,
+    /// Per loser-tree leaf, where its current record lives.
+    locs: Vec<RecLoc>,
+    /// Records emitted from a scratch buffer. The rest of `records_merged`
+    /// were emitted by reference (see [`MergeDriverDyn::record_counts`]).
+    assembled: u64,
     /// Loser-tree leaf → `sources` index. Built during `Priming`.
     source_map: Vec<usize>,
     /// Non-blocking merge state machine.
@@ -6501,6 +6546,8 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
         Self {
             sources,
             records: Vec::with_capacity(num_sources),
+            locs: Vec::with_capacity(num_sources),
+            assembled: 0,
             source_map: Vec::with_capacity(num_sources),
             // Lazy priming: tree built on first try_step as sources yield.
             phase: MergePhase::Priming {
@@ -6560,6 +6607,26 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
         d.set_predicted(next);
     }
 
+    /// The current record bytes of loser-tree `leaf`. Valid until that leaf's
+    /// source is next read, which only `try_step`'s deferred refill or priming
+    /// does, after the caller has consumed the `Produced` borrow (`Produced`
+    /// borrows `&mut self`). A source's block is replaced only by its own read
+    /// (`slot_try_load_block`); prediction and frontier publishing never touch
+    /// a source's parser.
+    fn record_bytes(&self, leaf: usize) -> &[u8] {
+        match self.locs[leaf] {
+            RecLoc::Scratch => &self.records[leaf],
+            RecLoc::Block { start, end } => match &self.sources[self.source_map[leaf]] {
+                SlotMergeSource::Slot { parser, .. } => &parser.current_buf[start..end],
+                _ => unreachable!("a block location on a non-slot source"),
+            },
+            RecLoc::Chunk { idx } => match &self.sources[self.source_map[leaf]] {
+                SlotMergeSource::MemoryShared { chunk, .. } => chunk.record_bytes(idx),
+                _ => unreachable!("a chunk location on a non-chunk source"),
+            },
+        }
+    }
+
     /// Publish the lowest undrained slot source's file id (slot sources come
     /// first, in `file_id` order). O(k), run only on a drain.
     fn publish_frontier(&self) {
@@ -6590,9 +6657,18 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                                 self.stalled_src = Some(next);
                                 break;
                             }
-                            TryRead::Ready(Some(key)) => {
+                            TryRead::Ready(Some((key, loc))) => {
                                 keys.push(key);
-                                self.records.push(std::mem::take(&mut rec));
+                                // Only a scratch-held record hands its buffer to
+                                // the leaf; otherwise `rec` (empty) serves the
+                                // next source.
+                                let scratch = if loc == RecLoc::Scratch {
+                                    std::mem::take(&mut rec)
+                                } else {
+                                    Vec::new()
+                                };
+                                self.records.push(scratch);
+                                self.locs.push(loc);
                                 self.source_map.push(next);
                                 next += 1;
                             }
@@ -6629,7 +6705,10 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                                 self.phase = MergePhase::Merging { tree, pending_refill: true };
                                 return Ok(MergeStep::Stalled);
                             }
-                            TryRead::Ready(Some(key)) => tree.replace_winner(key),
+                            TryRead::Ready(Some((key, loc))) => {
+                                self.locs[winner] = loc;
+                                tree.replace_winner(key);
+                            }
                             TryRead::Ready(None) => {
                                 tree.remove_winner();
                                 self.on_source_end(src);
@@ -6651,7 +6730,10 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                     // returned borrow stays valid until the caller copies it.
                     self.phase = MergePhase::Merging { tree, pending_refill: true };
                     self.stalled_src = None;
-                    return Ok(MergeStep::Produced(&self.records[winner]));
+                    if self.locs[winner] == RecLoc::Scratch {
+                        self.assembled += 1;
+                    }
+                    return Ok(MergeStep::Produced(self.record_bytes(winner)));
                 }
                 MergePhase::Done => return Ok(MergeStep::Done),
             }
@@ -6662,11 +6744,35 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
         self.records_merged
     }
 
+    fn record_counts(&self) -> (u64, u64) {
+        // Every `Produced` counts in `records_merged`; only a scratch one also
+        // counts in `assembled`, so the borrowed share is the difference.
+        (self.records_merged - self.assembled, self.assembled)
+    }
+
     fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
         match self.sources.get(self.stalled_src?)? {
             SlotMergeSource::Slot { slot, .. } => Some(slot),
             SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
+    /// Whether `ptr` lies inside loser-tree `leaf`'s slot source's current block.
+    fn block_contains_for_test(&self, leaf: usize, ptr: *const u8) -> bool {
+        match &self.sources[self.source_map[leaf]] {
+            SlotMergeSource::Slot { parser, .. } => {
+                parser.current_buf.as_ptr_range().contains(&ptr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Capacity of loser-tree `leaf`'s scratch buffer.
+    fn scratch_capacity_for_test(&self, leaf: usize) -> usize {
+        self.records[leaf].capacity()
     }
 }
 
@@ -11841,8 +11947,8 @@ mod from_slots_merge_tests {
     /// arm carrying two of the three sort orders had no coverage here at all.
     ///
     /// The two arms differ in mechanism, not just in type: `Owned` swaps the
-    /// record vec out, while `Shared` copies `chunk.record_bytes(idx)` into the
-    /// caller's buffer and takes the key by index. A defect in that copy, or in
+    /// record vec out, while `Shared` takes the key by index and the driver
+    /// emits `chunk.record_bytes(idx)` in place. A defect in that index, or in
     /// the `idx`/`len` pairing, is invisible to the `Owned` tests.
     #[test]
     fn from_slots_merges_slots_with_shared_memory_chunks() {
@@ -12077,6 +12183,287 @@ mod from_slots_merge_tests {
             total,
             "records_merged must equal the emitted record count"
         );
+    }
+
+    /// The two spill-frame layouts the slot parser distinguishes: a separate
+    /// key prefix (`TestKey`, `[key(8)][len(4)][body]`) or a key embedded in
+    /// the body (`TestEmbeddedKey`, `[len(4)][body]`, the layout of every
+    /// production key), whose fast path parses the key from the borrowed body.
+    trait Layout: RawSortKey + Default + Send + 'static {
+        /// The key `k`.
+        fn key(k: u64) -> Self;
+        /// The record body for key `k` with `tail`.
+        fn body(k: u64, tail: &[u8]) -> Vec<u8>;
+        /// The spill frame of a record `body` with key `k`.
+        fn frame(k: u64, body: &[u8]) -> Vec<u8>;
+    }
+
+    impl Layout for TestKey {
+        fn key(k: u64) -> Self {
+            TestKey(k)
+        }
+        fn body(_k: u64, tail: &[u8]) -> Vec<u8> {
+            tail.to_vec()
+        }
+        fn frame(k: u64, body: &[u8]) -> Vec<u8> {
+            serialize_records(&[(TestKey(k), body.to_vec())])
+        }
+    }
+
+    impl Layout for TestEmbeddedKey {
+        fn key(k: u64) -> Self {
+            TestEmbeddedKey(k)
+        }
+        fn body(k: u64, tail: &[u8]) -> Vec<u8> {
+            embedded_record(k, tail)
+        }
+        fn frame(_k: u64, body: &[u8]) -> Vec<u8> {
+            serialize_embedded(&[body.to_vec()])
+        }
+    }
+
+    /// A run of `(key, body)` records.
+    type KeyedBodies = Vec<(u64, Vec<u8>)>;
+
+    /// `(key, L::body(key, tail))` for each `(key, tail)`.
+    fn bodies<L: Layout>(records: &[(u64, &[u8])]) -> KeyedBodies {
+        records.iter().map(|&(k, tail)| (k, L::body(k, tail))).collect()
+    }
+
+    /// A populated, EOF-marked slot holding `records` framed in `L`'s layout
+    /// as one block.
+    fn layout_slot<L: Layout>(file_id: u32, records: &KeyedBodies) -> StdArc<SortMergeSlot> {
+        let bytes: Vec<u8> = records.iter().flat_map(|(k, b)| L::frame(*k, b)).collect();
+        let slot = StdArc::new(SortMergeSlot::for_test(file_id, crate::codec::SpillCodec::Bgzf));
+        slot.decompressed.lock().unwrap().push_back(bytes);
+        slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        slot
+    }
+
+    /// A record wholly inside its block is emitted by reference to that block,
+    /// with no copy into the per-leaf scratch, in both key layouts.
+    #[test]
+    fn produced_bytes_are_borrowed_from_the_block() {
+        fn check<L: Layout>() {
+            let slot = layout_slot::<L>(0, &bodies::<L>(&[(1, b"AAAA"), (2, b"BBBB")]));
+            let mut d = MergeDriver::<L>::from_slots(vec![slot], MemorySources::Shared(vec![]), 2);
+            let MergeStep::Produced(b) = d.try_step().unwrap() else { panic!("a record") };
+            assert_eq!(b, L::body(1, b"AAAA"));
+            let p = b.as_ptr();
+            assert!(d.block_contains_for_test(0, p), "the record must point into slot 0's block");
+            assert_eq!(d.scratch_capacity_for_test(0), 0, "the scratch was never used");
+            assert_eq!(d.record_counts(), (1, 0));
+        }
+        check::<TestKey>();
+        check::<TestEmbeddedKey>();
+    }
+
+    /// Two runs fed one block at a time; on `Stalled`, the stalled slot gets
+    /// its next block and the driver steps again. Blocks are cut at arbitrary
+    /// byte boundaries, so records spanning blocks are completed across a
+    /// `WouldBlock` while the other source's record stays borrowed. The output
+    /// equals a stable merge computed here, and the `(borrowed, assembled)`
+    /// split equals the one computed from the cuts: exactly the records whose
+    /// frame crosses a block boundary are assembled.
+    fn check_incremental_feed<L: Layout>(
+        runs: &[KeyedBodies; 2],
+        block_records: [usize; 2],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let total: usize = runs.iter().map(Vec::len).sum();
+        let mut oracle: Vec<&(u64, Vec<u8>)> = runs.iter().flatten().collect();
+        oracle.sort_by_key(|(k, _)| *k);
+        let oracle: Vec<Vec<u8>> = oracle.into_iter().map(|(_, b)| b.clone()).collect();
+        let (fa, spans_a) = incremental_slot::<L>(0, &runs[0], block_records[0]);
+        let (fb, spans_b) = incremental_slot::<L>(1, &runs[1], block_records[1]);
+        let mut d = MergeDriver::<L>::from_slots(
+            vec![StdArc::clone(&fa.slot), StdArc::clone(&fb.slot)],
+            MemorySources::Shared(vec![]),
+            total as u64,
+        );
+        let mut out = Vec::new();
+        loop {
+            match d.try_step().unwrap() {
+                MergeStep::Produced(bytes) => out.push(bytes.to_vec()),
+                MergeStep::Stalled => {
+                    let id = d.stalled_slot().expect("a slot stalled").file_id;
+                    let fed = if id == 0 { fa.feed_next() } else { fb.feed_next() };
+                    proptest::prop_assert!(fed, "fed past the end");
+                }
+                MergeStep::Done => break,
+            }
+        }
+        proptest::prop_assert_eq!(out, oracle);
+        let assembled = spans_a + spans_b;
+        proptest::prop_assert_eq!(d.record_counts(), (total as u64 - assembled, assembled));
+        Ok(())
+    }
+
+    /// One sorted run: 1..60 records, keys in 0..64 (so the runs tie), bodies
+    /// built by `L` from a tail of `tag` then 0..300 arbitrary bytes.
+    fn sorted_run<L: Layout>(tag: u8) -> impl proptest::strategy::Strategy<Value = KeyedBodies> {
+        use proptest::prelude::*;
+        prop::collection::vec((0u64..64, prop::collection::vec(any::<u8>(), 0..300)), 1..60)
+            .prop_map(move |mut records| {
+                records.sort_by_key(|(k, _)| *k);
+                records
+                    .into_iter()
+                    .map(|(k, rest)| {
+                        let mut tail = vec![tag];
+                        tail.extend(rest);
+                        (k, L::body(k, &tail))
+                    })
+                    .collect()
+            })
+    }
+
+    proptest::proptest! {
+        /// [`check_incremental_feed`] with a separate key prefix.
+        #[test]
+        fn incremental_feed_merges_identically(
+            a in sorted_run::<TestKey>(b'A'), b in sorted_run::<TestKey>(b'B'),
+            block_a in 1usize..9, block_b in 1usize..9,
+        ) {
+            check_incremental_feed::<TestKey>(&[a, b], [block_a, block_b])?;
+        }
+
+        /// [`check_incremental_feed`] with the key embedded in the body.
+        #[test]
+        fn incremental_feed_merges_identically_with_an_embedded_key(
+            a in sorted_run::<TestEmbeddedKey>(b'A'), b in sorted_run::<TestEmbeddedKey>(b'B'),
+            block_a in 1usize..9, block_b in 1usize..9,
+        ) {
+            check_incremental_feed::<TestEmbeddedKey>(&[a, b], [block_a, block_b])?;
+        }
+    }
+
+    /// The shared residual (`MemoryShared`) is borrowed from the chunk's arena
+    /// (pointer equal to `record_bytes(i)` taken before the chunk moves), with
+    /// no copy; the owned residual (`Memory`) is swapped into the scratch. Both
+    /// outputs equal the oracle, in both key layouts.
+    #[test]
+    fn memory_sources_borrow_or_swap() {
+        fn check<L: Layout>() {
+            let chunk_recs = bodies::<L>(&[(1, b"c-1"), (3, b"c-3"), (5, b"c-5")]);
+            let slot_recs = bodies::<L>(&[(2, b"s-2"), (4, b"s-4")]);
+            let oracle: Vec<Vec<u8>> =
+                [(1, b"c-1"), (2, b"s-2"), (3, b"c-3"), (4, b"s-4"), (5, b"c-5")]
+                    .iter()
+                    .map(|&(k, t)| L::body(k, t))
+                    .collect();
+            let keyed = |recs: &KeyedBodies| -> Vec<(L, Vec<u8>)> {
+                recs.iter().map(|(k, b)| (L::key(*k), b.clone())).collect()
+            };
+            // Chunk records carry `c` three bytes from the end of the body.
+            let from_chunk = |b: &[u8]| b[b.len() - 3] == b'c';
+            // Shared (production): borrowed from the chunk arena.
+            let chunk = InMemoryChunk::from_owned_records(keyed(&chunk_recs));
+            let ptrs: Vec<usize> =
+                (0..3).map(|i| chunk.record_bytes(i).as_ptr() as usize).collect();
+            let slot = layout_slot::<L>(0, &slot_recs);
+            let mut d =
+                MergeDriver::<L>::from_slots(vec![slot], MemorySources::Shared(vec![chunk]), 5);
+            let (mut out, mut chunk_ptrs) = (Vec::new(), Vec::new());
+            loop {
+                match d.try_step().unwrap() {
+                    MergeStep::Produced(b) => {
+                        if from_chunk(b) {
+                            chunk_ptrs.push(b.as_ptr() as usize);
+                        }
+                        out.push(b.to_vec());
+                    }
+                    MergeStep::Stalled => panic!("populated slots never stall"),
+                    MergeStep::Done => break,
+                }
+            }
+            assert_eq!(out, oracle);
+            assert_eq!(chunk_ptrs, ptrs, "chunk records must be borrowed from the arena");
+            assert_eq!(d.record_counts(), (5, 0), "two block-borrowed + three chunk-borrowed");
+            // Owned (tests/legacy): swapped into the scratch.
+            let owned: Vec<(L, fgumi_raw_bam::RawRecord)> = keyed(&chunk_recs)
+                .into_iter()
+                .map(|(k, b)| (k, fgumi_raw_bam::RawRecord::from(b)))
+                .collect();
+            let slot = layout_slot::<L>(0, &slot_recs);
+            let mut d =
+                MergeDriver::<L>::from_slots(vec![slot], MemorySources::Owned(vec![owned]), 5);
+            let mut out = Vec::new();
+            while let MergeStep::Produced(b) = d.try_step().unwrap() {
+                out.push(b.to_vec());
+            }
+            assert_eq!(out, oracle);
+            assert_eq!(d.record_counts(), (2, 3), "owned records are assembled in the scratch");
+        }
+        check::<TestKey>();
+        check::<TestEmbeddedKey>();
+    }
+
+    /// The driver-level twin of
+    /// `embedded_key_on_an_empty_body_is_an_error_not_a_panic`: an
+    /// embedded-key `RawCoordinateKey` slot whose single record has length
+    /// prefix 0. The borrowed path returns the same corrupt-slot error, not a
+    /// panic.
+    #[test]
+    fn empty_body_on_the_borrowed_path_is_the_same_error() {
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
+        slot.bp_commit_read(1, true);
+        // [len = 0][no body]
+        slot.bp_insert_drain_finalize(0, vec![0u32.to_le_bytes().to_vec()], 1);
+        let mut d = MergeDriver::<crate::keys::RawCoordinateKey>::from_slots(
+            vec![slot],
+            MemorySources::Shared(vec![]),
+            1,
+        );
+        let err = match d.try_step() {
+            Err(e) => e,
+            Ok(step) => panic!("an empty embedded-key body must be an error, got {step:?}"),
+        };
+        assert!(err.to_string().contains("empty and cannot carry an embedded sort key"), "{err}");
+    }
+
+    /// A slot plus its pre-cut blocks, inserted one at a time on demand.
+    struct Feeder {
+        slot: StdArc<SortMergeSlot>,
+        blocks: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
+        seq: std::cell::Cell<u64>,
+    }
+
+    impl Feeder {
+        /// Insert the next block; `false` when none is left.
+        fn feed_next(&self) -> bool {
+            let Some(block) = self.blocks.borrow_mut().pop_front() else { return false };
+            let last = self.blocks.borrow().is_empty();
+            self.slot.bp_commit_read(1, last);
+            self.slot.bp_insert_drain_finalize(self.seq.get(), vec![block], 1);
+            self.seq.set(self.seq.get() + 1);
+            true
+        }
+    }
+
+    /// An empty slot and a feeder holding `records` framed in `L`'s layout and
+    /// cut into blocks of about `block_records` records each, at arbitrary byte
+    /// boundaries so records span blocks; plus how many records' frames cross
+    /// a block boundary (the parser's slow path, so the driver's `assembled`).
+    fn incremental_slot<L: Layout>(
+        id: u32,
+        records: &KeyedBodies,
+        block_records: usize,
+    ) -> (Feeder, u64) {
+        let frames: Vec<Vec<u8>> = records.iter().map(|(k, b)| L::frame(*k, b)).collect();
+        let bytes = frames.concat();
+        let target = ((bytes.len() / records.len().max(1)).max(1) * block_records).max(1);
+        let (mut spanning, mut start) = (0u64, 0usize);
+        for frame in &frames {
+            let end = start + frame.len();
+            if start / target != (end - 1) / target {
+                spanning += 1;
+            }
+            start = end;
+        }
+        let blocks = bytes.chunks(target).map(<[u8]>::to_vec).collect();
+        let slot = StdArc::new(SortMergeSlot::for_test(id, crate::codec::SpillCodec::Bgzf));
+        let feeder =
+            Feeder { slot, blocks: std::cell::RefCell::new(blocks), seq: std::cell::Cell::new(0) };
+        (feeder, spanning)
     }
 }
 

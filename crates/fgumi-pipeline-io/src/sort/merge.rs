@@ -803,8 +803,11 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// Whether to log the `--sort-stats` merge-loop performance diagnostic
     /// (`Sort merge diag: ...`: stalls/contention/backpressure counters, then
     /// the merge demand's `MergeDemandSnapshot::log_lines` when a demand is
-    /// attached). Off by default -- it is instrumentation for performance investigations, not
-    /// something a normal run should show. See [`Self::with_sort_stats`].
+    /// attached, then the `MergeDriver`'s `Merge output: records borrowed B /
+    /// assembled A` split, printed whenever the k-way merge ran and never on
+    /// the single-chunk fast path). Off by default -- it is instrumentation for
+    /// performance investigations, not something a normal run should show. See
+    /// [`Self::with_sort_stats`].
     sort_stats: bool,
     /// The merge supply's end-of-merge lines (`--sort-stats` only).
     supply_diagnostics: Option<super::supply_ledger::SupplyDiagnostics>,
@@ -1126,7 +1129,8 @@ impl<O: MergeOutput> SortMerge<O> {
     }
 
     /// Enable or disable the `--sort-stats` merge-loop performance diagnostic
-    /// (`Sort merge diag: ...` and the merge-demand lines). Off by default.
+    /// (`Sort merge diag: ...`, the merge-demand lines, and the k-way merge's
+    /// `Merge output:` borrowed/assembled line). Off by default.
     #[must_use]
     pub fn with_sort_stats(mut self, enabled: bool) -> Self {
         self.sort_stats = enabled;
@@ -1418,6 +1422,15 @@ impl<O: MergeOutput> SortMerge<O> {
                                 log::info!("{line}");
                             }
                         }
+                        // This function runs only in `Merging` (the fast path has
+                        // its own `Done`), and the state leaves it only below.
+                        let SortMergeState::Merging { driver, .. } = &self.state else {
+                            unreachable!("emit_batches_cooperative runs only while Merging")
+                        };
+                        let (borrowed, assembled) = driver.record_counts();
+                        log::info!(
+                            "Merge output: records borrowed {borrowed} / assembled {assembled}"
+                        );
                         if let Some(s) = &self.supply_diagnostics {
                             for line in s.lines() {
                                 log::info!("{line}");

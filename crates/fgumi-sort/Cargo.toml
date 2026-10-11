@@ -95,3 +95,7 @@ harness = false
 [[bench]]
 name = "template_key"
 harness = false
+
+[[bench]]
+name = "merge_driver"
+harness = false

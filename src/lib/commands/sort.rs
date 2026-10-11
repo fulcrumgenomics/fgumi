@@ -492,7 +492,11 @@ pub struct Sort {
     /// delivered to the parked merge, the awaited spill file's state at each
     /// stall, the merge's requests for a pool worker, how often its next-file
     /// prediction was right, and the stalls it served itself from already-read
-    /// blocks (see the performance tuning guide). Only when the sort
+    /// blocks (see the performance tuning guide). Every k-way merge, spilled or
+    /// not, then prints "Merge output: ...": how many merged records it emitted
+    /// in place from a decompressed spill block or a shared in-memory chunk
+    /// (borrowed) versus first copied into its scratch buffer (assembled).
+    /// Only when the sort
     /// spills nothing *and* fits in a single in-memory chunk is there no merge
     /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
     /// diag: ...") saying the single-chunk in-memory fast path was taken.
