@@ -40,15 +40,19 @@ use crate::merge_slots::SortMergeSlot;
 /// stall census state, which classifies the owned engine's awaited file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AwaitedSlotState {
-    /// No block is being decompressed for the slot (`in_flight == 0`).
+    /// Nothing read, stashed or in flight for the slot.
     Starved,
-    /// Blocks are being decompressed for the slot (`in_flight > 0`).
+    /// A read is in progress for the slot (`issued_bytes > 0`).
+    Issued,
+    /// Raw blocks are read and waiting to be claimed (`stash_len > 0`).
+    Stashed,
+    /// Claimed blocks are being decompressed for the slot.
     Decompressing,
 }
 
 impl AwaitedSlotState {
     /// The number of states (the stats' bucket count).
-    const COUNT: usize = 2;
+    const COUNT: usize = 4;
 }
 
 /// Outcome of the merge's pool-worker request, mirrored from pipeline-core's
@@ -170,8 +174,13 @@ pub struct MergeDemandSnapshot {
     pub parking_registrations: u64,
     /// Times a producer's delivery unparked the consumer.
     pub wakes_delivered: u64,
-    /// Stall episodes whose awaited slot had nothing being decompressed.
+    /// Stall episodes whose awaited slot had nothing read, stashed or in
+    /// flight.
     pub awaited_starved: u64,
+    /// Stall episodes whose awaited slot had a read in progress.
+    pub awaited_issued: u64,
+    /// Stall episodes whose awaited slot had read-but-unclaimed blocks.
+    pub awaited_stashed: u64,
     /// Stall episodes whose awaited slot had blocks being decompressed.
     pub awaited_decompressing: u64,
     /// Pool requests that woke a parked worker.
@@ -231,8 +240,11 @@ impl MergeDemandSnapshot {
                 self.registrations
             ),
             format!(
-                "Awaited slot at stall: starved {}% / decompressing {}%{}",
+                "Awaited slot at stall: starved {}% / issued {}% / stashed {}% / decompressing \
+                 {}%{}",
                 pct_int(self.awaited_starved, n),
+                pct_int(self.awaited_issued, n),
+                pct_int(self.awaited_stashed, n),
                 pct_int(self.awaited_decompressing, n),
                 if self.inline_decompress {
                     " (inline decompress: stalls are not classified, every one reports starved)"
@@ -426,6 +438,8 @@ impl MergeDemand {
             parking_registrations: ld(&s.parking_registrations),
             wakes_delivered: ld(&s.wakes_delivered),
             awaited_starved: ld(&s.awaited[AwaitedSlotState::Starved as usize]),
+            awaited_issued: ld(&s.awaited[AwaitedSlotState::Issued as usize]),
+            awaited_stashed: ld(&s.awaited[AwaitedSlotState::Stashed as usize]),
             awaited_decompressing: ld(&s.awaited[AwaitedSlotState::Decompressing as usize]),
             pool_woken: ld(&s.pool[MergePoolRequest::Woken as usize]),
             pool_all_awake: ld(&s.pool[MergePoolRequest::AllAwake as usize]),
@@ -527,11 +541,7 @@ mod tests {
     #[test]
     fn await_slot_rechecks_after_registering() {
         let d = MergeDemand::new();
-        let slot = SortMergeSlot::new(
-            4,
-            std::io::BufReader::new(tempfile::tempfile().unwrap()),
-            crate::codec::SpillCodec::Bgzf,
-        );
+        let slot = SortMergeSlot::for_test(4, crate::codec::SpillCodec::Bgzf);
         assert!(!d.await_slot(&slot), "empty, not EOF → park");
         assert_eq!(d.awaited(), Some(4));
         slot.decompressed.lock().unwrap().push_back(vec![1, 2, 3]);
@@ -584,9 +594,9 @@ mod tests {
     fn stall_buckets_and_log_lines() {
         let d = MergeDemand::new();
         d.stats().record_stall(AwaitedSlotState::Starved);
+        d.stats().record_stall(AwaitedSlotState::Issued);
+        d.stats().record_stall(AwaitedSlotState::Stashed);
         d.stats().record_stall(AwaitedSlotState::Decompressing);
-        d.stats().record_stall(AwaitedSlotState::Decompressing);
-        d.stats().record_stall(AwaitedSlotState::Starved);
         d.stats().record_stall_ns(2_000_000_000);
         d.stats().record_partial_flush();
         assert!(d.stats().record_pool_request(MergePoolRequest::Woken, 3));
@@ -597,7 +607,16 @@ mod tests {
         assert!(!d.stats().record_pool_request(MergePoolRequest::Unavailable, 0));
         d.stats().record_stall_with_sleeper_ns(500_000_000);
         let s = d.snapshot();
-        assert_eq!((s.stall_episodes, s.awaited_starved, s.awaited_decompressing), (4, 2, 2));
+        assert_eq!(
+            (
+                s.stall_episodes,
+                s.awaited_starved,
+                s.awaited_issued,
+                s.awaited_stashed,
+                s.awaited_decompressing
+            ),
+            (4, 1, 1, 1, 1)
+        );
         assert_eq!(
             (s.pool_woken, s.pool_all_awake, s.pool_pending, s.pool_unavailable),
             (2, 1, 0, 1)
@@ -605,7 +624,10 @@ mod tests {
         let lines = s.log_lines();
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].starts_with("Merge demand: 4 stall episodes (2.0 s exact)"), "{lines:?}");
-        assert_eq!(lines[1], "Awaited slot at stall: starved 50% / decompressing 50%");
+        assert_eq!(
+            lines[1],
+            "Awaited slot at stall: starved 25% / issued 25% / stashed 25% / decompressing 25%"
+        );
         assert_eq!(
             lines[2],
             "Pool at stall: requests woken 2 / all-awake 1 / pending 0 / unavailable 1; a \
@@ -616,7 +638,7 @@ mod tests {
         let lines = d.snapshot().log_lines();
         assert_eq!(
             lines[1],
-            "Awaited slot at stall: starved 50% / decompressing 50% \
+            "Awaited slot at stall: starved 25% / issued 25% / stashed 25% / decompressing 25% \
              (inline decompress: stalls are not classified, every one reports starved)"
         );
     }

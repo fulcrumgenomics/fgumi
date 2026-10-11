@@ -1013,6 +1013,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "crossbeam-utils",
+ "dhat",
  "fgumi-bam-io",
  "fgumi-bgzf",
  "fgumi-dna",

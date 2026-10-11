@@ -66,6 +66,8 @@ test-utils = []
 
 [dev-dependencies]
 fgumi-bam-io = { workspace = true }
+# Heap accounting for `tests/slot_alloc.rs` (a safe global allocator).
+dhat = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 fgumi-sam = { workspace = true }
 rstest = { workspace = true }

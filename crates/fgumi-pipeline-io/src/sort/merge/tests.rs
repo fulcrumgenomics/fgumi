@@ -31,11 +31,7 @@ fn mismatched_memory_lane_fails_closed() {
 /// regression. With no slots, the empty-input case is still accepted.
 #[test]
 fn empty_template_lane_with_spill_slots_fails_closed() {
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        std::io::BufReader::new(tempfile::tempfile().unwrap()),
-        fgumi_sort::SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
     // `Box<dyn MergeDriverDyn>` isn't `Debug`, so match rather than `expect_err`.
     match build_driver(SortOrder::TemplateCoordinate, vec![slot], MemoryChunksByKind::default(), 1)
     {
@@ -108,11 +104,7 @@ fn a_dispatch_that_absorbed_setup_input_is_progress() {
     use fgumi_pipeline_core::testing::StepProbe;
     let mut step = SortMerge::<RecordBatchOutput>::new(SortOrder::Coordinate, 1 << 20);
     let probe = StepProbe::new(&step);
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        std::io::BufReader::new(tempfile::tempfile().unwrap()),
-        fgumi_sort::SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
     probe.push_input(SortPhase2Event::SpillReady {
         slot,
         path: std::path::PathBuf::from("spill-0"),
@@ -167,11 +159,7 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
     let probe = StepProbe::new(&step);
     let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
         .map(|file_id| {
-            let slot = Arc::new(SortMergeSlot::new(
-                file_id,
-                std::io::BufReader::new(tempfile::tempfile().unwrap()),
-                fgumi_sort::SpillCodec::Bgzf,
-            ));
+            let slot = Arc::new(SortMergeSlot::for_test(file_id, fgumi_sort::SpillCodec::Bgzf));
             slot.decompressed.lock().unwrap().push_back(one_record_block(file_id as usize));
             slot
         })
@@ -211,4 +199,51 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
     // The edge is still full: this dispatch parks on the held batch.
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Contention);
     assert_eq!(demand.snapshot().parking_registrations, 0, "it parks on output, not a slot");
+}
+
+/// A stall books the awaited slot's state: a slot with a read in progress is
+/// `issued`, one whose read blocks wait unclaimed in the stash is `stashed`,
+/// and one with neither is `starved`.
+#[rstest::rstest]
+#[case::starved(0, 0, (1, 0, 0))]
+#[case::issued(4096, 0, (0, 1, 0))]
+#[case::stashed(0, 2, (0, 0, 1))]
+fn a_stall_books_the_awaited_slots_state(
+    #[case] issued: u64,
+    #[case] stashed: usize,
+    #[case] want: (u64, u64, u64),
+) {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let mut step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        1024,
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    let probe = StepProbe::new(&step);
+    // Slot 0 holds a record; slot 1 has nothing decompressed, so priming
+    // stalls on it.
+    let ready = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
+    ready.decompressed.lock().unwrap().push_back(one_record_block(0));
+    let awaited = Arc::new(SortMergeSlot::for_test(1, fgumi_sort::SpillCodec::Bgzf));
+    awaited.bp_note_issued(issued);
+    awaited.bp_stash_frames_for_test(vec![vec![0u8; 16]; stashed], false);
+    for slot in [&ready, &awaited] {
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::from("spill"),
+            records_ingested_so_far: 2,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    let _ = probe.try_run(&mut step).unwrap();
+    let s = demand.snapshot();
+    assert_eq!(s.stall_episodes, 1, "{s:?}");
+    assert_eq!((s.awaited_starved, s.awaited_issued, s.awaited_stashed), want);
+    assert_eq!(s.awaited_decompressing, 0);
 }

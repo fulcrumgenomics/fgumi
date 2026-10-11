@@ -312,6 +312,13 @@ impl BgzfSliceFramer {
         self.carry.len()
     }
 
+    /// Heap bytes the carried partial block holds: its allocation, which is
+    /// the block's full size once its header is known.
+    #[must_use]
+    pub fn carry_capacity(&self) -> usize {
+        self.carry.capacity()
+    }
+
     /// Cut every complete non-EOF-marker block from `carry ++ slice`: a
     /// [`SliceFrame::Carried`] for the block completing the carry, a
     /// [`SliceFrame::Within`] for each block wholly in `slice`; the partial

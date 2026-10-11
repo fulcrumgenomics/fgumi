@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn oversized_length_prefix_errors() {
         let bogus_len: u32 =
-            u32::try_from(crate::worker_pool::MAX_ZSTD_FRAME_BYTES).expect("fits") + 1;
+            u32::try_from(crate::spill_block_reader::MAX_ZSTD_FRAME_BYTES).expect("fits") + 1;
         let mut buf: Vec<u8> = ZSPILL_MAGIC.to_vec();
         buf.extend_from_slice(&bogus_len.to_le_bytes());
 
