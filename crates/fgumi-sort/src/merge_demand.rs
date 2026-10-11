@@ -49,9 +49,22 @@ pub enum AwaitedSlotState {
     Decompressing,
 }
 
+/// The stall buckets: `Starved`, `Issued`, and `Decompressing`, which a
+/// `Stashed` reading joins. The merge serves its awaited slot's stash before it
+/// books a stall, so a stash that is still non-empty then has its front
+/// claimed and in flight — the slot is being decompressed. A separate stashed
+/// bucket could only be filled by an ingest racing that window.
+const STALL_BUCKETS: usize = 3;
+
 impl AwaitedSlotState {
-    /// The number of states (the stats' bucket count).
-    const COUNT: usize = 4;
+    /// The stall bucket a reading of this state is booked to.
+    const fn bucket(self) -> usize {
+        match self {
+            Self::Starved => 0,
+            Self::Issued => 1,
+            Self::Stashed | Self::Decompressing => 2,
+        }
+    }
 }
 
 /// Outcome of the merge's pool-worker request, mirrored from pipeline-core's
@@ -89,20 +102,22 @@ pub struct MergeDemandStats {
     registrations: StdAtomicU64,
     parking_registrations: StdAtomicU64,
     wakes_delivered: StdAtomicU64,
-    /// Indexed by `AwaitedSlotState as usize`.
-    awaited: [StdAtomicU64; AwaitedSlotState::COUNT],
+    /// Indexed by [`AwaitedSlotState::bucket`].
+    awaited: [StdAtomicU64; STALL_BUCKETS],
     /// Indexed by `MergePoolRequest as usize`.
     pool: [StdAtomicU64; MergePoolRequest::COUNT],
     requests_with_sleeper: StdAtomicU64,
     stall_ns_with_sleeper: StdAtomicU64,
     partial_flushes: StdAtomicU64,
+    self_served_episodes: StdAtomicU64,
+    self_served_blocks: StdAtomicU64,
 }
 
 impl MergeDemandStats {
     /// One stall episode began with the awaited slot in `state`.
     pub fn record_stall(&self, state: AwaitedSlotState) {
         self.stall_episodes.fetch_add(1, Relaxed);
-        self.awaited[state as usize].fetch_add(1, Relaxed);
+        self.awaited[state.bucket()].fetch_add(1, Relaxed);
     }
 
     /// A stall episode ended after `ns` nanoseconds.
@@ -141,6 +156,19 @@ impl MergeDemandStats {
     pub fn record_partial_flush(&self) {
         self.partial_flushes.fetch_add(1, Relaxed);
     }
+
+    /// On a stall the consumer decompressed `blocks` already-read blocks
+    /// itself; `avoided_park` when that made the awaited slot ready, so the
+    /// merge carried on instead of parking (an episode counts only then).
+    pub fn record_self_serve(&self, blocks: u64, avoided_park: bool) {
+        if blocks == 0 {
+            return;
+        }
+        if avoided_park {
+            self.self_served_episodes.fetch_add(1, Relaxed);
+        }
+        self.self_served_blocks.fetch_add(blocks, Relaxed);
+    }
 }
 
 /// A point-in-time copy of [`MergeDemandStats`].
@@ -165,9 +193,8 @@ pub struct MergeDemandSnapshot {
     pub awaited_starved: u64,
     /// Stall episodes whose awaited slot had a read in progress.
     pub awaited_issued: u64,
-    /// Stall episodes whose awaited slot had read-but-unclaimed blocks.
-    pub awaited_stashed: u64,
-    /// Stall episodes whose awaited slot had blocks being decompressed.
+    /// Stall episodes whose awaited slot had blocks being decompressed (a
+    /// stash the merge could not serve at the stall has its front in flight).
     pub awaited_decompressing: u64,
     /// Pool requests that woke a parked worker.
     pub pool_woken: u64,
@@ -184,6 +211,11 @@ pub struct MergeDemandSnapshot {
     pub stall_ns_with_sleeper: u64,
     /// Partial output batches flushed on a stall.
     pub partial_flushes: u64,
+    /// Parks the consumer avoided by decompressing already-read blocks.
+    pub self_served_episodes: u64,
+    /// Blocks the consumer decompressed itself (including on stalls that
+    /// still parked).
+    pub self_served_blocks: u64,
 }
 
 /// `num / den` as a whole percentage, rounded to nearest; `0` when `den == 0`.
@@ -205,7 +237,7 @@ fn secs(ns: u64) -> f64 {
 
 impl MergeDemandSnapshot {
     /// The `--sort-stats` lines, in their fixed order: demand, awaited slot
-    /// state, pool requests at stalls, partial flushes. Line 2's percentages
+    /// state, pool requests at stalls, consumer self-serve, partial flushes. Line 2's percentages
     /// are of `stall_episodes`; line 3's sleeper share is of pool requests.
     #[must_use]
     pub fn log_lines(&self) -> Vec<String> {
@@ -223,10 +255,9 @@ impl MergeDemandSnapshot {
                 self.registrations
             ),
             format!(
-                "Awaited slot at stall: starved {}% / issued {}% / stashed {}% / decompressing {}%",
+                "Awaited slot at stall: starved {}% / issued {}% / decompressing {}%",
                 pct_int(self.awaited_starved, n),
                 pct_int(self.awaited_issued, n),
-                pct_int(self.awaited_stashed, n),
                 pct_int(self.awaited_decompressing, n)
             ),
             format!(
@@ -238,6 +269,11 @@ impl MergeDemandSnapshot {
                 self.pool_unavailable,
                 pct(self.requests_with_sleeper, requests),
                 secs(self.stall_ns_with_sleeper)
+            ),
+            format!(
+                "Consumer served itself: {} parks avoided by decompressing already-read blocks \
+                 inline ({} blocks decompressed by the merge)",
+                self.self_served_episodes, self.self_served_blocks
             ),
             format!("Merge output: {} partial flushes on stall", self.partial_flushes),
         ]
@@ -453,10 +489,9 @@ impl MergeDemand {
             registrations: ld(&s.registrations),
             parking_registrations: ld(&s.parking_registrations),
             wakes_delivered: ld(&s.wakes_delivered),
-            awaited_starved: ld(&s.awaited[AwaitedSlotState::Starved as usize]),
-            awaited_issued: ld(&s.awaited[AwaitedSlotState::Issued as usize]),
-            awaited_stashed: ld(&s.awaited[AwaitedSlotState::Stashed as usize]),
-            awaited_decompressing: ld(&s.awaited[AwaitedSlotState::Decompressing as usize]),
+            awaited_starved: ld(&s.awaited[AwaitedSlotState::Starved.bucket()]),
+            awaited_issued: ld(&s.awaited[AwaitedSlotState::Issued.bucket()]),
+            awaited_decompressing: ld(&s.awaited[AwaitedSlotState::Decompressing.bucket()]),
             pool_woken: ld(&s.pool[MergePoolRequest::Woken as usize]),
             pool_all_awake: ld(&s.pool[MergePoolRequest::AllAwake as usize]),
             pool_pending: ld(&s.pool[MergePoolRequest::Pending as usize]),
@@ -464,6 +499,8 @@ impl MergeDemand {
             requests_with_sleeper: ld(&s.requests_with_sleeper),
             stall_ns_with_sleeper: ld(&s.stall_ns_with_sleeper),
             partial_flushes: ld(&s.partial_flushes),
+            self_served_episodes: ld(&s.self_served_episodes),
+            self_served_blocks: ld(&s.self_served_blocks),
         }
     }
 
@@ -631,33 +668,36 @@ mod tests {
         assert!(d.stats().record_pool_request(MergePoolRequest::Woken, 0));
         assert!(!d.stats().record_pool_request(MergePoolRequest::Unavailable, 0));
         d.stats().record_stall_with_sleeper_ns(500_000_000);
+        d.stats().record_self_serve(3, true);
+        d.stats().record_self_serve(2, true);
+        // Served but still parked: blocks count, a park avoided does not.
+        d.stats().record_self_serve(4, false);
+        // Nothing served: nothing counts.
+        d.stats().record_self_serve(0, true);
         let s = d.snapshot();
         assert_eq!(
-            (
-                s.stall_episodes,
-                s.awaited_starved,
-                s.awaited_issued,
-                s.awaited_stashed,
-                s.awaited_decompressing
-            ),
-            (4, 1, 1, 1, 1)
+            (s.stall_episodes, s.awaited_starved, s.awaited_issued, s.awaited_decompressing),
+            (4, 1, 1, 2),
+            "a stashed reading is booked as decompressing"
         );
         assert_eq!(
             (s.pool_woken, s.pool_all_awake, s.pool_pending, s.pool_unavailable),
             (2, 1, 0, 1)
         );
         let lines = s.log_lines();
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert!(lines[0].starts_with("Merge demand: 4 stall episodes (2.0 s exact)"), "{lines:?}");
-        assert_eq!(
-            lines[1],
-            "Awaited slot at stall: starved 25% / issued 25% / stashed 25% / decompressing 25%"
-        );
+        assert_eq!(lines[1], "Awaited slot at stall: starved 25% / issued 25% / decompressing 50%");
         assert_eq!(
             lines[2],
             "Pool at stall: requests woken 2 / all-awake 1 / pending 0 / unavailable 1; a \
              worker was asleep at 50.0% of requests (0.5 s)"
         );
-        assert_eq!(lines[3], "Merge output: 1 partial flushes on stall");
+        assert_eq!(
+            lines[3],
+            "Consumer served itself: 2 parks avoided by decompressing already-read blocks inline \
+             (9 blocks decompressed by the merge)"
+        );
+        assert_eq!(lines[4], "Merge output: 1 partial flushes on stall");
     }
 }

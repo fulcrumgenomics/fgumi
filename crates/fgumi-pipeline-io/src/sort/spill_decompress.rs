@@ -34,6 +34,9 @@
 //! - The awaited slot is always claimable: the merge stalls only on an empty
 //!   FIFO, so the FIFO cap admits its head, and the head that is the reorder
 //!   front is admitted unconditionally (the escape in `bp_claim_raw`).
+//! - The merge serves itself: a stalled merge claims and decompresses its
+//!   awaited slot's stashed blocks on its own thread before it parks, so a
+//!   block that has been read never waits for a worker to be scheduled.
 //! - Backpressure composes without a queue cycle: claims stop at the FIFO cap,
 //!   the merge's pops make room, reads stop at the planner's allowance, and
 //!   claims drain the allowance.
@@ -64,6 +67,14 @@ use fgumi_pipeline_core::{
 /// bound*, so a resolved-to-zero budget is normalized to this cap rather than
 /// removing the only byte cap on decompressed stragglers.
 const DEFAULT_REORDER_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The per-slot reorder-window byte budget for claims from an
+/// `output_byte_limit` (zero is normalized to [`DEFAULT_REORDER_WINDOW_BYTES`]).
+/// Shared by the decompress step and the merge's self-serve, which claim from
+/// the same stashes under the same window.
+pub(crate) fn reorder_window_budget(output_byte_limit: u64) -> u64 {
+    if output_byte_limit == 0 { DEFAULT_REORDER_WINDOW_BYTES } else { output_byte_limit }
+}
 
 /// The slots seen so far (append-only), and their index by file id.
 #[derive(Default)]
@@ -98,8 +109,7 @@ impl SortSpillDecompress {
     /// with the read planner and the merge.
     #[must_use]
     pub fn new(output_byte_limit: u64, supply: &SpillSupply) -> Self {
-        let window_budget =
-            if output_byte_limit == 0 { DEFAULT_REORDER_WINDOW_BYTES } else { output_byte_limit };
+        let window_budget = reorder_window_budget(output_byte_limit);
         Self {
             registry: Arc::new(RwLock::new(Registry::default())),
             block_dec: SpillBlockDecompressor::new(),
