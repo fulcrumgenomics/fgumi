@@ -286,6 +286,36 @@ fn loom_two_blocks_batch1_three_workers_bounded() {
     check_model(2, || run_model(2, 1));
 }
 
+// ── merge wake: no lost wakeup between `await_slot` and a delivery ───────────
+
+/// The merge-wake lost-wakeup model over the REAL consumer sequence
+/// ([`fgumi_sort::MergeDemand::await_slot`], which `SortMerge` calls on every
+/// stall) and the REAL producer sequence
+/// ([`SortMergeSlot::bp_insert_drain_finalize`] then
+/// [`fgumi_sort::MergeDemand::notify_delivered`], as
+/// `SortSpillDecompress::try_fill_block_parallel_slot` does). The consumer
+/// parks only when `await_slot` says it may; if any interleaving lets it park
+/// with nobody left to unpark it, loom reports the deadlock. Swapping
+/// `await_slot`'s `set_awaited` and its re-check fails this model.
+#[test]
+fn loom_merge_wake_never_lost() {
+    check_model(3, || {
+        let slot = Arc::new(SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf));
+        let demand = Arc::new(fgumi_sort::MergeDemand::new());
+        slot.bp_commit_read(1, true); // reserve one block, as the reader would
+        let (s2, d2) = (Arc::clone(&slot), Arc::clone(&demand));
+        let producer = loom::thread::spawn(move || {
+            assert!(s2.bp_insert_drain_finalize(0, vec![0u64.to_le_bytes().to_vec()], 1));
+            d2.notify_delivered(0);
+        });
+        while !demand.await_slot(&slot) {
+            loom::thread::park();
+        }
+        producer.join().unwrap();
+        assert_eq!(slot.decompressed.lock().unwrap().len(), 1);
+    });
+}
+
 // ── decomp-error-beats-clean-EOF (#399) ──────────────────────────────────────
 
 /// The consumer that observes `queue_eof` under the `decompressed` mutex

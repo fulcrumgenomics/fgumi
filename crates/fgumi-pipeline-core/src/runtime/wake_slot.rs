@@ -83,6 +83,7 @@ impl Drop for SlotGuard {
 /// Called when a thread leaves its slot and after the fused loop.
 pub(crate) fn clear_thread_flags() {
     POPPED.with(|p| p.set(false));
+    EC_ARMED.with(|a| a.set(false));
     REJECTED.with(|r| r.set(false));
     FLUSHED.with(|f| f.set(false));
     CAP_REFUSED.with(|r| r.set(false));
@@ -173,6 +174,26 @@ pub(crate) fn take_flushed() -> bool {
 #[cfg(test)]
 pub(crate) fn flushed_pending() -> bool {
     FLUSHED.with(Cell::get)
+}
+
+thread_local! {
+    static EC_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This thread is (`true`) or no longer is (`false`) armed on the pool
+/// event-count: between its `prepare_wait` and the `cancel_wait`/`wait` that
+/// balances it. Set by the worker loop around the arm→re-poll→wait window.
+#[inline]
+pub(crate) fn set_ec_armed(armed: bool) {
+    EC_ARMED.with(|a| a.set(armed));
+}
+
+/// Whether this thread is armed on the pool event-count (see
+/// [`set_ec_armed`]): a `request_worker` made from a step in its re-poll must
+/// not count the requester itself as a parked worker to wake.
+#[inline]
+pub(crate) fn ec_armed() -> bool {
+    EC_ARMED.with(Cell::get)
 }
 
 thread_local! {
@@ -462,7 +483,7 @@ impl HolderSet {
     /// claimer cleared first is skipped. One `Relaxed` load per word when
     /// nothing is recorded. The caller fences (`SeqCst`) first.
     pub(crate) fn take_up_to(&self, n: usize, f: &mut dyn FnMut(usize)) -> usize {
-        claim_bits(&self.words, None, n, &mut |slot| {
+        claim_bits(&self.words, None, None, n, &mut |slot| {
             f(slot);
             true
         })
@@ -658,19 +679,31 @@ impl DirectParked {
     /// is all-zero) restricts the claim to its set bits; `None`: any armed
     /// worker. The caller has fenced after its publish.
     pub fn claim_one(&self, mask: Option<&[u64]>, unpark: &mut dyn FnMut(usize) -> bool) -> bool {
-        claim_bits(&self.words, mask, 1, unpark) == 1
+        claim_bits(&self.words, mask, None, 1, unpark) == 1
+    }
+
+    /// [`Self::claim_one`] over every armed worker, leaving worker `skip`'s bit
+    /// armed and unclaimed (the caller itself, which must not wake itself).
+    pub fn claim_one_except(
+        &self,
+        skip: Option<usize>,
+        unpark: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        claim_bits(&self.words, None, skip, 1, unpark) == 1
     }
 }
 
 /// The one claim loop of the wake bit sets: claim set bits in ascending order,
 /// clearing each with `fetch_and` (a bit another claimer cleared first is
-/// skipped), and call `f(bit)` on each claimed one; stop once `limit` calls
-/// returned `true`. Returns how many did. `eligible` (`None`: every bit)
-/// restricts the claim to its set bits. One `Relaxed` load per word when
-/// nothing is set. The caller fences (`SeqCst`) first.
+/// skipped; bit `skip`, if any, is left alone), and call `f(bit)` on each
+/// claimed one; stop once `limit` calls returned `true`. Returns how many did.
+/// `eligible` (`None`: every bit) restricts the claim to its set bits. One
+/// `Relaxed` load per word when nothing is set. The caller fences (`SeqCst`)
+/// first.
 fn claim_bits(
     words: &[Padded<HolderWord>],
     eligible: Option<&[u64]>,
+    skip: Option<usize>,
     limit: usize,
     f: &mut dyn FnMut(usize) -> bool,
 ) -> usize {
@@ -681,6 +714,9 @@ fn claim_bits(
     for (i, w) in words.iter().enumerate() {
         let allowed = eligible.map_or(u64::MAX, |m| m.get(i).copied().unwrap_or(0));
         let mut bits = w.0.load(Ordering::Relaxed) & allowed;
+        if let Some(s) = skip.filter(|&s| s / 64 == i) {
+            bits &= !(1u64 << (s % 64));
+        }
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
             let mask = 1u64 << b;

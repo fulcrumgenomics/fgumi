@@ -140,6 +140,11 @@ pub struct SortSpillDecompress {
     /// from `output_byte_limit` (one per-step byte budget per slot). Bounds the
     /// reorder buffer so a slow straggler can't balloon decompressed memory.
     window_budget: u64,
+    /// The sort's merge-wide demand. After every delivery, EOF finalize or
+    /// failure on a slot this step calls `notify_delivered(slot.file_id)`, which
+    /// unparks the merge iff it is waiting on that file. `None` when the step
+    /// runs without a merge to wake (unit tests that drive the step alone).
+    demand: Option<Arc<fgumi_sort::MergeDemand>>,
 }
 
 impl SortSpillDecompress {
@@ -180,7 +185,28 @@ impl SortSpillDecompress {
             cap: None,
             tuning,
             window_budget,
+            demand: None,
         }
+    }
+
+    /// Share the sort's [`fgumi_sort::MergeDemand`] (one per sort, built by the
+    /// chain builder's `add_sort`), so deliveries wake the merge awaiting them.
+    /// On the inline (file-granularity) path it also marks the demand's stalls
+    /// as unclassified (`MergeDemandStats::mark_inline_decompress`).
+    #[must_use]
+    pub fn with_merge_demand(mut self, demand: Arc<fgumi_sort::MergeDemand>) -> Self {
+        if self.tuning.file_granularity {
+            demand.stats().mark_inline_decompress();
+        }
+        self.demand = Some(demand);
+        self
+    }
+
+    /// The merge demand this step notifies (tests: a clone must carry it).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn merge_demand_for_test(&self) -> Option<&Arc<fgumi_sort::MergeDemand>> {
+        self.demand.as_ref()
     }
 
     /// One pass over the registry, under its lock and without cloning it:
@@ -334,7 +360,7 @@ impl SortSpillDecompress {
             // `SortMerge` surfaces the failure; swallowing it as a skip would
             // leave `queue_eof` unset and spin `Contention` forever (deadlock).
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                Self::mark_slot_failed(slot);
+                self.mark_slot_failed(slot);
                 return Err(io::Error::other(
                     "spill reader mutex poisoned: a decompress fill worker panicked",
                 ));
@@ -356,7 +382,7 @@ impl SortSpillDecompress {
                 Err(e) => {
                     // Centralized in `mark_slot_failed` so failure semantics stay
                     // in one place (see the block-parallel path's use of it).
-                    Self::mark_slot_failed(slot);
+                    self.mark_slot_failed(slot);
                     drop(reader_guard);
                     return Err(e);
                 }
@@ -370,6 +396,7 @@ impl SortSpillDecompress {
                 slot.queue_eof.store(true, Ordering::Release);
             }
             drop(reader_guard);
+            self.notify(slot);
             return Ok(true);
         }
 
@@ -383,6 +410,7 @@ impl SortSpillDecompress {
             }
         }
         drop(reader_guard);
+        self.notify(slot);
         Ok(true)
     }
 
@@ -408,7 +436,7 @@ impl SortSpillDecompress {
                 // Poisoned: a fill worker panicked mid-read. Fail closed so
                 // `SortMerge` surfaces it instead of spinning forever.
                 Err(std::sync::TryLockError::Poisoned(_)) => {
-                    Self::mark_slot_failed(slot);
+                    self.mark_slot_failed(slot);
                     return Err(io::Error::other(
                         "spill reader mutex poisoned: a decompress fill worker panicked",
                     ));
@@ -446,7 +474,7 @@ impl SortSpillDecompress {
                         ) {
                             Ok(r) => r,
                             Err(e) => {
-                                Self::mark_slot_failed(slot);
+                                self.mark_slot_failed(slot);
                                 drop(reader_guard);
                                 return Err(e);
                             }
@@ -473,12 +501,18 @@ impl SortSpillDecompress {
                             match self.block_dec.decompress_one(slot.codec, raw_block) {
                                 Ok(d) => blocks.push(d),
                                 Err(e) => {
-                                    Self::mark_slot_failed(slot);
+                                    self.mark_slot_failed(slot);
                                     return Err(e);
                                 }
                             }
                         }
-                        slot.bp_insert_drain_finalize(start_seq, blocks, got);
+                        // A batch that only filled the reorder window (its front
+                        // block is still another worker's) delivers nothing and
+                        // so wakes nobody; the worker that closes the gap
+                        // notifies.
+                        if slot.bp_insert_drain_finalize(start_seq, blocks, got) {
+                            self.notify(slot);
+                        }
                         return Ok(true);
                     }
                 }
@@ -488,17 +522,36 @@ impl SortSpillDecompress {
         // Phase B: drain-only. Flush any now-in-order blocks the FIFO can accept
         // (it may have freed up, or another worker delivered a straggler) and
         // finalize EOF if fully delivered.
-        Ok(slot.bp_drain_and_finalize())
+        let progressed = slot.bp_drain_and_finalize();
+        if progressed {
+            self.notify(slot);
+        }
+        Ok(progressed)
     }
 
     /// Mark a slot as failed (decompression / read error): set `decomp_error`
     /// and `queue_eof` under the `decompressed` mutex so the consumer surfaces
-    /// the error in preference to a clean EOF.
-    fn mark_slot_failed(slot: &Arc<SortMergeSlot>) {
+    /// the error in preference to a clean EOF, then wake the merge if it awaits
+    /// this slot.
+    fn mark_slot_failed(&self, slot: &Arc<SortMergeSlot>) {
         use std::sync::atomic::Ordering;
-        let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
-        slot.decomp_error.store(true, Ordering::Release);
-        slot.queue_eof.store(true, Ordering::Release);
+        {
+            let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
+            slot.decomp_error.store(true, Ordering::Release);
+            slot.queue_eof.store(true, Ordering::Release);
+        }
+        self.notify(slot);
+    }
+
+    /// Tell the merge that `slot` received a block, EOF or failure. Called
+    /// after the slot's `decompressed` mutex is released (the ordering the
+    /// wake protocol in `fgumi_sort::MergeDemand` relies on); unparks the merge
+    /// only when it awaits this slot.
+    #[inline]
+    fn notify(&self, slot: &SortMergeSlot) {
+        if let Some(d) = &self.demand {
+            d.notify_delivered(slot.file_id);
+        }
     }
 }
 
@@ -513,6 +566,8 @@ impl Clone for SortSpillDecompress {
             cap: self.cap.clone(),
             tuning: self.tuning,
             window_budget: self.window_budget,
+            // Every clone notifies the one demand the merge awaits on.
+            demand: self.demand.clone(),
         }
     }
 }

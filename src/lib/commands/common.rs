@@ -1207,9 +1207,13 @@ pub struct AllowUnmappedOptions {
 /// The chain engine normally chooses the pool's step-walk direction per chain:
 /// drain-bound shapes (terminal `group`/`dedup`, and a BAM `sort` source) run
 /// downstream-first (`DrainFirstScheduler`), everything else runs upstream-first
-/// (`ChainOrderScheduler`). This hidden override forces one choice regardless, so
-/// the tuning can be A/B-benchmarked on any command from a single binary without
-/// a rebuild. `Auto` is the default and changes nothing.
+/// (`ChainOrderScheduler`). A chain whose stages supply refill hints (a sort's
+/// merge, the in-process aligner) runs `RefillDrainScheduler` (`refill-drain`)
+/// instead: its own direction, with a starved stage's feeding steps walked first
+/// while the stage's hint is raised. This hidden override forces one pure
+/// direction regardless, hints ignored, so the tuning can be A/B-benchmarked on
+/// any command from a single binary without a rebuild. `Auto` is the default and
+/// changes nothing.
 ///
 /// The value names match the scheduler names surfaced in `--pipeline-stats`
 /// (`drain-first` / `chain-order`), so a benchmark can correlate the flag with

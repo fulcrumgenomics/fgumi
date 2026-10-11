@@ -6296,8 +6296,10 @@ pub enum MergeStep<'a> {
     Produced(&'a [u8]),
     /// A source's decompressed queue is momentarily empty (and not at EOF), or
     /// a source hasn't been primed yet. No record is available right now; the
-    /// caller should yield and retry on a later dispatch, by which point the
-    /// producer will have refilled the slot.
+    /// caller yields and retries on a later dispatch. The slot named by
+    /// [`MergeDriverDyn::stalled_slot`] is the one to await: its producer wakes
+    /// the merge when the awaited block, EOF or failure lands
+    /// ([`crate::MergeDemand`]).
     Stalled,
     /// The merge is exhausted.
     Done,
@@ -6326,6 +6328,10 @@ pub trait MergeDriverDyn: Send {
     fn try_step(&mut self) -> Result<MergeStep<'_>>;
     /// Total records emitted since the driver was constructed.
     fn records_merged(&self) -> u64;
+    /// The slot whose empty FIFO caused the last [`MergeStep::Stalled`], or
+    /// `None` after a `Produced` (a memory source never stalls). The merge
+    /// awaits this slot so the delivery that refills it can wake the merge.
+    fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>>;
 }
 
 /// Internal phase of the [`MergeDriver`] non-blocking state machine.
@@ -6358,6 +6364,9 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static> {
     phase: MergePhase<K>,
     records_merged: u64,
     progress: ProgressTracker,
+    /// `sources` index of the slot that caused the last `Stalled`; cleared on
+    /// `Produced`.
+    stalled_src: Option<usize>,
 }
 
 impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
@@ -6435,6 +6444,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriver<K> {
             },
             records_merged: 0,
             progress,
+            stalled_src: None,
         }
     }
 }
@@ -6454,6 +6464,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                         match self.sources[next].try_next_record(&mut rec)? {
                             TryRead::WouldBlock => {
                                 stalled = true;
+                                self.stalled_src = Some(next);
                                 break;
                             }
                             TryRead::Ready(Some(key)) => {
@@ -6490,6 +6501,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                         let src = self.source_map[winner];
                         match self.sources[src].try_next_record(&mut self.records[winner])? {
                             TryRead::WouldBlock => {
+                                self.stalled_src = Some(src);
                                 self.phase = MergePhase::Merging { tree, pending_refill: true };
                                 return Ok(MergeStep::Stalled);
                             }
@@ -6506,6 +6518,7 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
                     // Defer this winner's refill to the next call so the
                     // returned borrow stays valid until the caller copies it.
                     self.phase = MergePhase::Merging { tree, pending_refill: true };
+                    self.stalled_src = None;
                     return Ok(MergeStep::Produced(&self.records[winner]));
                 }
                 MergePhase::Done => return Ok(MergeStep::Done),
@@ -6515,6 +6528,13 @@ impl<K: RawSortKey + Default + Send + 'static> MergeDriverDyn for MergeDriver<K>
 
     fn records_merged(&self) -> u64 {
         self.records_merged
+    }
+
+    fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
+        match self.sources.get(self.stalled_src?)? {
+            SlotMergeSource::Slot { slot, .. } => Some(slot),
+            SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+        }
     }
 }
 
@@ -11388,6 +11408,43 @@ mod from_slots_merge_tests {
             vec![b"from-file-0".to_vec(), b"from-file-1".to_vec()],
             "equal-key ties must resolve by file_id, not by caller push order",
         );
+    }
+
+    /// `stalled_slot` names the slot whose empty FIFO stalled the merge, in
+    /// priming and in mid-merge refill, and is cleared by the next `Produced`.
+    #[test]
+    fn stalled_slot_names_the_awaited_slot() {
+        let slot_a = populated_slot(0, &[(TestKey(1), b"A-1".to_vec())], 1);
+        // Slot 1: empty, not EOF → priming stalls on it.
+        let slot_b = StdArc::new(SortMergeSlot::new(
+            1,
+            BufReader::new(tempfile::tempfile().unwrap()),
+            crate::codec::SpillCodec::Bgzf,
+        ));
+        let mut driver = MergeDriver::<TestKey>::from_slots(
+            vec![StdArc::clone(&slot_a), StdArc::clone(&slot_b)],
+            MemorySources::Shared(Vec::new()),
+            2,
+        );
+        assert!(matches!(driver.try_step().unwrap(), MergeStep::Stalled));
+        assert_eq!(driver.stalled_slot().map(|s| s.file_id), Some(1), "priming stall");
+        // Feed slot 1 one record, still open; the merge resumes.
+        slot_b
+            .decompressed
+            .lock()
+            .unwrap()
+            .push_back(serialize_records(&[(TestKey(2), b"B-2".to_vec())]));
+        assert!(matches!(driver.try_step().unwrap(), MergeStep::Produced(b) if b == b"A-1"));
+        assert_eq!(driver.stalled_slot().map(|s| s.file_id), None, "cleared by Produced");
+        assert!(matches!(driver.try_step().unwrap(), MergeStep::Produced(b) if b == b"B-2"));
+        // Refilling slot 1's winner finds its FIFO empty and the slot open.
+        assert!(matches!(driver.try_step().unwrap(), MergeStep::Stalled));
+        assert_eq!(driver.stalled_slot().map(|s| s.file_id), Some(1), "mid-merge refill stall");
+        {
+            let _g = slot_b.decompressed.lock().unwrap();
+            slot_b.queue_eof.store(true, std::sync::atomic::Ordering::Release);
+        }
+        assert!(matches!(driver.try_step().unwrap(), MergeStep::Done));
     }
 
     /// The core BUG #3 regression: a slot whose decompressed queue is empty

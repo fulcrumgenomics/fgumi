@@ -47,6 +47,7 @@ use crate::pipeline::core::builder::PipelineBuilder;
 #[cfg(feature = "consensus")]
 use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
+use crate::pipeline::refill::RefillHint;
 use crate::pipeline::steps::tuning::BamPipelineTuning;
 
 /// Nominal decompressed size of one BGZF block, used to turn the
@@ -559,7 +560,9 @@ pub struct ChainBuilder<'a> {
     /// Set for a chain whose drain-bound shape benefits from downstream-first
     /// dispatch. [`Self::build`] reads it to select the
     /// [`DrainFirstScheduler`](crate::pipeline::core::runtime::DrainFirstScheduler)
-    /// in place of the default upstream-first scheduler. Two shapes set it:
+    /// in place of the default upstream-first scheduler (or, when the chain
+    /// carries refill hints, as the `Reverse` base of the refill-drain
+    /// scheduler — see [`Self::refill_hints`]). Two shapes set it:
     ///
     /// - A BAM sort source wired through the parallel-inflate arena front
     ///   (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any sort
@@ -584,9 +587,14 @@ pub struct ChainBuilder<'a> {
     /// drain-first even though its group is Intermediate, because the flag is
     /// only ever set, never cleared.
     use_drain_first_scheduler: bool,
-    /// An align backend's input-refill hint: when drain-first is chosen
-    /// automatically, the chain uses `RefillDrainScheduler` on it instead.
-    align_refill: Option<crate::pipeline::steps::align::RefillHint>,
+    /// The chain's refill hints, one per stage that supplies one, tagged with
+    /// the stage that added it (see [`Self::add_refill_hint`]). Under
+    /// `--pool-scheduler auto`, [`Self::build`] installs
+    /// [`RefillDrainScheduler`](crate::pipeline::core::runtime::RefillDrainScheduler)
+    /// over the hints that apply (see [`choose_pool_scheduler`]): the in-process
+    /// aligner's input refill (only when drain-first was chosen) and the sort
+    /// merge's spill-starvation hint (under either base direction).
+    refill_hints: Vec<(RefillHint, &'static str)>,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
@@ -818,7 +826,7 @@ impl<'a> ChainBuilder<'a> {
             paired_tail: None,
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
-            align_refill: None,
+            refill_hints: Vec::new(),
             pending_header_handle: None,
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
@@ -2422,6 +2430,22 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    /// Add a stage's refill hint, tagged with the stage (`owner`) that adds it.
+    /// Several stages may each add one (an in-process aligner and a sort, in
+    /// one `runall` chain); their signals are not raised at the same time. The
+    /// same stage adding a second is a construction bug.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `owner` already added a hint.
+    fn add_refill_hint(&mut self, hint: RefillHint, owner: &'static str) -> Result<()> {
+        if self.refill_hints.iter().any(|(_, o)| *o == owner) {
+            bail!("the {owner} stage added a refill hint twice");
+        }
+        self.refill_hints.push((hint, owner));
+        Ok(())
+    }
+
     /// Build the final [`BuiltPipeline`] from the accumulated state.
     ///
     /// Prepends a chain-level [`StageTimingFinalizeHook`] whose `Instant` is
@@ -2470,28 +2494,25 @@ impl<'a> ChainBuilder<'a> {
         {
             log::warn!("{warning}");
         }
-        // An explicit `--pool-scheduler drain-first` keeps the pure policy for
-        // A/B runs; the automatic choice refines it with the backend's refill
-        // signal when there is one.
-        let choice = choose_pool_scheduler(
+        // An explicit `--pool-scheduler` keeps the pure policy for A/B runs;
+        // the automatic choice refines the chain's direction with the stages'
+        // refill hints when any apply.
+        config = match choose_pool_scheduler(
             pool_override,
             self.use_drain_first_scheduler,
-            self.align_refill.is_some(),
-        );
-        config = match (choice, self.align_refill.clone()) {
-            (PoolSchedulerChoice::RefillDrain, Some(hint)) => config.with_scheduler(
-                std::sync::Arc::new(crate::pipeline::core::runtime::RefillDrainScheduler::new(
-                    hint.signal,
-                    hint.feed.0,
-                    hint.feed.1,
-                    hint.cap_bytes,
-                )),
-            ),
-            (PoolSchedulerChoice::DrainFirst | PoolSchedulerChoice::RefillDrain, _) => config
-                .with_scheduler(std::sync::Arc::new(
-                    crate::pipeline::core::runtime::DrainFirstScheduler,
-                )),
-            (PoolSchedulerChoice::ChainOrder, _) => config,
+            &self.refill_hints,
+        ) {
+            PoolSchedulerChoice::RefillDrain { base, active } => {
+                let sources =
+                    active.iter().map(|&i| self.refill_hints[i].0.source.clone()).collect();
+                config.with_scheduler(Arc::new(
+                    crate::pipeline::core::runtime::RefillDrainScheduler::new(base, sources),
+                ))
+            }
+            PoolSchedulerChoice::DrainFirst => {
+                config.with_scheduler(Arc::new(crate::pipeline::core::runtime::DrainFirstScheduler))
+            }
+            PoolSchedulerChoice::ChainOrder => config,
         };
         // DIAGNOSTIC: the stats `Arc` already exists whenever the deadlock
         // monitor is on (default), so allow `FGUMI_PIPELINE_STATS=1` to dump the
@@ -3192,8 +3213,8 @@ impl<'a> ChainBuilder<'a> {
             &mut self.override_pipeline_threads,
             &mut self.use_drain_first_scheduler,
         );
-        if wired.refill.is_some() {
-            self.align_refill = wired.refill;
+        if let Some(hint) = wired.refill {
+            self.add_refill_hint(hint, "align")?;
         }
 
         let timer = OperationTimer::new("AlignAndMerge");
@@ -3590,11 +3611,16 @@ impl<'a> ChainBuilder<'a> {
                 file_granularity: sort.file_granularity,
                 block_batch: sort.block_batch,
             };
+            // One merge-wide demand per sort, shared by the supply
+            // (`notify_delivered` after each delivery) and the merge
+            // (`await_slot` on a stall; the thread the delivery unparks).
+            let merge_demand = Arc::new(fgumi_sort::MergeDemand::new());
             // Phase-2 cap (`--merge-threads`): bounds concurrent spill
             // decompression together with the terminal output compressor.
             let decompress =
                 SortSpillDecompress::new(self.tuning.per_step_byte_limit, decompress_tuning)
-                    .with_phase_cap(phase2_cap.clone());
+                    .with_phase_cap(phase2_cap.clone())
+                    .with_merge_demand(Arc::clone(&merge_demand));
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -3802,6 +3828,17 @@ impl<'a> ChainBuilder<'a> {
                 self.pipeline.append_step(write, tail)
             };
             let decompress_tail = self.pipeline.append_step(decompress, phase1_tail);
+            // While the merge is starved, pool workers walk the spill supply
+            // (`SortSpillDecompress` and the steps before it) before the steps
+            // after it, such as the output compressor — the merge parks on a
+            // block only decompression can deliver. `cap_bytes = MAX`: this
+            // step's output edge carries only setup events in the merge phase,
+            // so its depth says nothing about demand. Applies under either base
+            // walk direction, so a `SortBuffer`-fed sort (chain order) flips too.
+            self.add_refill_hint(
+                RefillHint::new(merge_demand.starved_signal(), decompress_tail, u64::MAX, false),
+                "sort",
+            )?;
 
             if position == StagePosition::Terminal {
                 // Terminal sort: `SortMerge<BlockOutput>` frames merged records
@@ -3829,6 +3866,7 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
+                merge = merge.with_merge_demand(Arc::clone(&merge_demand));
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -3882,7 +3920,9 @@ impl<'a> ChainBuilder<'a> {
                 // rather than serially on the detached thread. Bounded to the
                 // effective phase-2 count (`--merge-threads` within `--threads`).
                 .with_fast_path_threads(phases.phase2);
-                merge = merge.with_fast_path_cap(phase2_cap.clone());
+                merge = merge
+                    .with_fast_path_cap(phase2_cap.clone())
+                    .with_merge_demand(Arc::clone(&merge_demand));
                 let merge_tail = self.pipeline.append_step(merge, decompress_tail);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
@@ -6647,35 +6687,53 @@ fn resolve_use_drain_first(
 }
 
 /// The pool scheduler `build` installs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PoolSchedulerChoice {
     /// The runtime's default upstream-first dispatch.
     ChainOrder,
     /// Pure downstream-first dispatch (`DrainFirstScheduler`).
     DrainFirst,
-    /// Downstream-first dispatch refined by the align backend's refill signal
-    /// (`RefillDrainScheduler`).
-    RefillDrain,
+    /// The chain's own direction `base` (`Forward` or `Reverse`), refined by
+    /// the refill hints at indices `active` (`RefillDrainScheduler`).
+    RefillDrain { base: crate::pipeline::core::runtime::WalkDirection, active: Vec<usize> },
 }
 
 /// Select the pool scheduler from the `--pool-scheduler` override, the
-/// accumulated automatic drain-first choice, and whether an align backend
-/// supplied a refill hint. The refill-aware scheduler is used only when
-/// drain-first was chosen *automatically* (`Auto`); an explicit
-/// `--pool-scheduler drain-first` keeps the pure `DrainFirstScheduler` so A/B
-/// runs compare the plain policy. Pure so it can be unit tested.
+/// accumulated automatic drain-first choice, and the chain's refill hints.
+///
+/// An explicit `--pool-scheduler` (`drain-first` / `chain-order`) ignores the
+/// hints, so A/B runs compare the pure policies. Under `Auto` the hints that
+/// apply are those that do not require drain-first, plus — when drain-first was
+/// chosen — those that do; with none, the choice is plain `DrainFirst` /
+/// `ChainOrder` exactly as without hints, and with some it is `RefillDrain`
+/// over them with the chain's own direction (`Reverse` where drain-first was
+/// chosen, `Forward` otherwise) as the base. A chain with only the in-process
+/// aligner's hint is therefore `RefillDrain` over a `Reverse` base when
+/// drain-first was chosen and `ChainOrder` otherwise. Pure so it can be unit
+/// tested.
 fn choose_pool_scheduler(
     pool_override: crate::commands::common::PoolScheduler,
     auto_wants_drain_first: bool,
-    has_align_refill: bool,
+    hints: &[(RefillHint, &'static str)],
 ) -> PoolSchedulerChoice {
-    if !resolve_use_drain_first(pool_override, auto_wants_drain_first) {
-        PoolSchedulerChoice::ChainOrder
-    } else if has_align_refill && pool_override == crate::commands::common::PoolScheduler::Auto {
-        PoolSchedulerChoice::RefillDrain
-    } else {
-        PoolSchedulerChoice::DrainFirst
+    use crate::pipeline::core::runtime::WalkDirection;
+    let drain_first = resolve_use_drain_first(pool_override, auto_wants_drain_first);
+    let plain =
+        if drain_first { PoolSchedulerChoice::DrainFirst } else { PoolSchedulerChoice::ChainOrder };
+    if pool_override != crate::commands::common::PoolScheduler::Auto {
+        return plain;
     }
+    let active: Vec<usize> = hints
+        .iter()
+        .enumerate()
+        .filter(|(_, (hint, _))| !hint.requires_drain_first || drain_first)
+        .map(|(i, _)| i)
+        .collect();
+    if active.is_empty() {
+        return plain;
+    }
+    let base = if drain_first { WalkDirection::Reverse } else { WalkDirection::Forward };
+    PoolSchedulerChoice::RefillDrain { base, active }
 }
 
 /// The warning `build` should log when the hidden `--pool-scheduler` override
@@ -6724,6 +6782,7 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::commands::common::PoolScheduler;
+    use crate::pipeline::core::runtime::WalkDirection;
     use crate::pipeline::steps::align::subprocess::SubprocessBackend;
 
     /// A `ChainSpec` with the given stages and every other field at its
@@ -6775,7 +6834,7 @@ mod tests {
             paired_tail: None,
             override_pipeline_threads: None,
             use_drain_first_scheduler: false,
-            align_refill: None,
+            refill_hints: Vec::new(),
             pending_header_handle: None,
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
@@ -7146,58 +7205,252 @@ mod tests {
         );
     }
 
-    /// Pin `choose_pool_scheduler`: an align refill hint upgrades an
-    /// *automatic* drain-first choice to `RefillDrain`, while an explicit
-    /// `--pool-scheduler drain-first` keeps the pure `DrainFirst` policy, and a
-    /// hint never overrides an upstream-first (`ChainOrder`) resolution.
+    fn refill(base: WalkDirection, active: &[usize]) -> PoolSchedulerChoice {
+        PoolSchedulerChoice::RefillDrain { base, active: active.to_vec() }
+    }
+
+    fn hint(requires_drain_first: bool) -> RefillHint {
+        RefillHint::new(Arc::default(), (StepIdx(0), BranchIdx(0)), 1, requires_drain_first)
+    }
+
+    /// The installed scheduler's `Debug` names a refill source fed at the
+    /// built pipeline's `SortSpillDecompress` step.
+    fn assert_sort_refill_source_feeds_decompress(built: &BuiltPipeline) {
+        let debug = format!("{:?}", built.config.scheduler);
+        let names = built.pipeline.stats().snapshot().steps;
+        let feed = names
+            .iter()
+            .position(|(name, _)| *name == "SortSpillDecompress")
+            .expect("a sort chain has a SortSpillDecompress step");
+        assert!(debug.contains(&format!("refill_through: {:?}", StepIdx(feed))), "{debug}");
+    }
+
+    /// Pin `choose_pool_scheduler`. `requires_drain_first` lists the chain's
+    /// hints (`true` = the aligner's kind, `false` = the sort's kind). An
+    /// aligner hint applies only under an automatic drain-first choice; a sort
+    /// hint applies under either base, keeping the chain's own direction as the
+    /// base; an explicit `--pool-scheduler` ignores every hint.
     #[rstest::rstest]
-    #[case::auto_with_refill_picks_refill_drain(
-        PoolScheduler::Auto,
-        true,
-        true,
-        PoolSchedulerChoice::RefillDrain
-    )]
-    #[case::auto_without_refill_picks_drain_first(
-        PoolScheduler::Auto,
-        true,
-        false,
-        PoolSchedulerChoice::DrainFirst
-    )]
-    #[case::explicit_drain_first_ignores_refill(
-        PoolScheduler::DrainFirst,
-        true,
-        true,
-        PoolSchedulerChoice::DrainFirst
-    )]
-    #[case::explicit_drain_first_over_auto_off_ignores_refill(
-        PoolScheduler::DrainFirst,
-        false,
-        true,
-        PoolSchedulerChoice::DrainFirst
-    )]
-    #[case::auto_off_with_refill_stays_chain_order(
+    #[case::auto_no_hints_drain(PoolScheduler::Auto, true, vec![], PoolSchedulerChoice::DrainFirst)]
+    #[case::auto_no_hints_chain(PoolScheduler::Auto, false, vec![], PoolSchedulerChoice::ChainOrder)]
+    #[case::auto_align_hint_drain(PoolScheduler::Auto, true, vec![true], refill(WalkDirection::Reverse, &[0]))]
+    #[case::auto_align_hint_without_drain_is_dropped(
         PoolScheduler::Auto,
         false,
-        true,
+        vec![true],
         PoolSchedulerChoice::ChainOrder
     )]
-    #[case::explicit_chain_order_ignores_refill(
+    #[case::auto_sort_hint_drain(PoolScheduler::Auto, true, vec![false], refill(WalkDirection::Reverse, &[0]))]
+    #[case::auto_sort_hint_chain_order_base(
+        PoolScheduler::Auto,
+        false,
+        vec![false],
+        refill(WalkDirection::Forward, &[0])
+    )]
+    #[case::auto_align_and_sort_drain(
+        PoolScheduler::Auto,
+        true,
+        vec![true, false],
+        refill(WalkDirection::Reverse, &[0, 1])
+    )]
+    #[case::auto_align_and_sort_chain(
+        PoolScheduler::Auto,
+        false,
+        vec![true, false],
+        refill(WalkDirection::Forward, &[1])
+    )]
+    #[case::override_drain_first_ignores_align_hint(
+        PoolScheduler::DrainFirst,
+        true,
+        vec![true],
+        PoolSchedulerChoice::DrainFirst
+    )]
+    #[case::override_drain_first_ignores_hints(
+        PoolScheduler::DrainFirst,
+        false,
+        vec![false],
+        PoolSchedulerChoice::DrainFirst
+    )]
+    #[case::override_chain_order_ignores_hints(
         PoolScheduler::ChainOrder,
         true,
-        true,
+        vec![true, false],
         PoolSchedulerChoice::ChainOrder
     )]
     fn choose_pool_scheduler_matrix(
         #[case] pool_override: PoolScheduler,
         #[case] auto_wants_drain_first: bool,
-        #[case] has_align_refill: bool,
+        #[case] requires_drain_first: Vec<bool>,
         #[case] expected: PoolSchedulerChoice,
     ) {
+        let hints: Vec<(RefillHint, &'static str)> =
+            requires_drain_first.iter().map(|&r| (hint(r), "x")).collect();
         assert_eq!(
-            choose_pool_scheduler(pool_override, auto_wants_drain_first, has_align_refill),
+            choose_pool_scheduler(pool_override, auto_wants_drain_first, &hints),
             expected,
-            "{pool_override:?} over auto={auto_wants_drain_first}, refill={has_align_refill}"
+            "{pool_override:?} over auto={auto_wants_drain_first}, hints={requires_drain_first:?}"
         );
+    }
+
+    /// A header-only input with one reference, as BAM or as SAM, in `dir`
+    /// (building a chain reads only the header).
+    fn header_only_input(dir: &std::path::Path, sam: bool) -> std::path::PathBuf {
+        if sam {
+            let path = dir.join("in.sam");
+            std::fs::write(&path, "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n").unwrap();
+            return path;
+        }
+        let path = dir.join("in.bam");
+        let header = noodles::sam::Header::builder()
+            .add_reference_sequence(
+                bstr::BString::from("chr1"),
+                noodles::sam::header::record::value::Map::<
+                    noodles::sam::header::record::value::map::ReferenceSequence,
+                >::new(std::num::NonZeroUsize::new(1000).unwrap()),
+            )
+            .build();
+        fgumi_bam_io::create_raw_bam_writer(&path, &header, 1, 1).unwrap().finish().unwrap();
+        path
+    }
+
+    /// A template-coordinate sort chain over `stages` reading `input`, at
+    /// `--threads 4`.
+    fn sort_chain_spec(
+        dir: &std::path::Path,
+        input: std::path::PathBuf,
+        stages: Vec<Stage>,
+    ) -> ChainSpec {
+        use crate::commands::common::{MaxTempFiles, MemoryLimit, MemoryReserve};
+        use crate::commands::sort::{SortOptions, SortOrderArg};
+        let mut spec = empty_spec(stages);
+        spec.command_line = "fgumi <sort refill-hint test>".to_string();
+        spec.source = SourceSpec::Bam(input);
+        spec.sink = SinkSpec::Bam(dir.join("out.bam"));
+        spec.threading = crate::commands::common::ThreadingOptions { threads: Some(4) };
+        spec.stage_opts.sort = Some(SortOptions {
+            order: SortOrderArg::TemplateCoordinate,
+            key_types: None,
+            max_memory: MemoryLimit::Fixed(64 * 1024 * 1024),
+            memory_reserve: MemoryReserve::Auto,
+            memory_per_thread: true,
+            tmp_dirs: vec![dir.to_path_buf()],
+            sort_threads: None,
+            merge_threads: None,
+            temp_compression: 1,
+            temp_codec: fgumi_sort::SpillCodec::default(),
+            max_temp_files: MaxTempFiles::Auto,
+            block_batch: 4,
+            file_granularity: false,
+            sort_stats: false,
+        });
+        spec.stage_opts.group = Some(crate::commands::group::GroupOptions::default());
+        spec
+    }
+
+    /// The sort's refill hint reaches the installed scheduler on every sort
+    /// chain shape, fed at `SortSpillDecompress`, beside an aligner-kind hint
+    /// when the chain has
+    /// one (the in-process aligner is feature-gated, so a stand-in hint is
+    /// added before the stages, where `add_align` would add it). The base
+    /// direction is the chain's own: `Reverse` behind the BAM arena front
+    /// (drain-first), `Forward` behind `SortBuffer` (a SAM source), where the
+    /// aligner-kind hint does not apply.
+    #[rstest::rstest]
+    #[case::bam_arena_sort(false, vec![Stage::Sort], false, "Reverse", 1)]
+    #[case::bam_arena_sort_then_group(false, vec![Stage::Sort, Stage::Group], false, "Reverse", 1)]
+    #[case::bam_arena_sort_beside_an_aligner_hint(false, vec![Stage::Sort], true, "Reverse", 2)]
+    #[case::sort_buffer_sort(true, vec![Stage::Sort], false, "Forward", 1)]
+    #[case::sort_buffer_sort_beside_an_aligner_hint(true, vec![Stage::Sort], true, "Forward", 1)]
+    fn sort_chains_carry_the_sort_refill_hint(
+        #[case] sam: bool,
+        #[case] stages: Vec<Stage>,
+        #[case] aligner_hint: bool,
+        #[case] base: &str,
+        #[case] n_sources: usize,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), sam);
+        let spec = sort_chain_spec(tmp.path(), input, stages);
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        if aligner_hint {
+            chain.add_refill_hint(hint(true), "align").unwrap();
+        }
+        chain.add_source().unwrap();
+        let last = spec.stages.len() - 1;
+        for (i, &stage) in spec.stages.iter().enumerate() {
+            let position =
+                if i == last { StagePosition::Terminal } else { StagePosition::Intermediate };
+            chain.add_stage(stage, position).unwrap();
+        }
+        chain.add_sink().unwrap();
+        let built = chain.build().unwrap();
+
+        assert_eq!(built.config.scheduler.name(), "refill-drain");
+        let debug = format!("{:?}", built.config.scheduler);
+        assert!(debug.contains(&format!("base: {base}")), "{debug}");
+        assert_eq!(debug.matches("RefillSource {").count(), n_sources, "{debug}");
+        assert_sort_refill_source_feeds_decompress(&built);
+    }
+
+    /// A real runall `[Align(inproc), Sort]` chain: the in-process aligner's
+    /// `add_align` and the sort's `add_sort` each add their refill hint, and the
+    /// installed `refill-drain` carries both (the stand-in-hint case of
+    /// [`sort_chains_carry_the_sort_refill_hint`] built for real). Wiring the
+    /// in-process backend loads a bwa-mem3 index, so this needs a prebuilt one
+    /// at `FGUMI_BWA_MEM3_TEST_REF` (the FASTA, with its index files and
+    /// `.dict` beside it); it skips when that is unset, unless
+    /// `FGUMI_BWA_MEM3_REQUIRE_TOOLS` is set (the e2e-parity CI job).
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[test]
+    fn runall_sort_chains_carry_the_sort_refill_hint() {
+        let Ok(reference) = std::env::var("FGUMI_BWA_MEM3_TEST_REF") else {
+            assert!(
+                std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
+                "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but FGUMI_BWA_MEM3_TEST_REF (a bwa-mem3 \
+                 indexed reference) is not"
+            );
+            eprintln!("skipping: FGUMI_BWA_MEM3_TEST_REF not set");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // A header-only, queryname-sorted unmapped BAM (building reads only the
+        // header).
+        let input = tmp.path().join("unmapped.bam");
+        let header: noodles::sam::Header = "@HD\tVN:1.6\tSO:queryname\n".parse().unwrap();
+        fgumi_bam_io::create_raw_bam_writer(&input, &header, 1, 1).unwrap().finish().unwrap();
+        let mut spec = sort_chain_spec(tmp.path(), input, vec![Stage::Align, Stage::Sort]);
+        spec.stage_opts.aligner = Some(crate::pipeline::chains::options_bag::AlignOptions {
+            aligner: crate::aligner::AlignerOptions {
+                preset: Some(crate::aligner::AlignerPreset::BwaMem3InProc),
+                ..crate::aligner::AlignerOptions::default()
+            },
+            reference: std::path::PathBuf::from(reference),
+            aligner_bin: None,
+        });
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Align, StagePosition::Intermediate).unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        chain.add_sink().unwrap();
+        let built = chain.build().unwrap();
+
+        assert_eq!(built.config.scheduler.name(), "refill-drain");
+        let debug = format!("{:?}", built.config.scheduler);
+        assert_eq!(debug.matches("RefillSource {").count(), 2, "align + sort hints: {debug}");
+        assert_sort_refill_source_feeds_decompress(&built);
+    }
+
+    /// Two stages may each add a hint; the same stage adding twice is a bug.
+    #[test]
+    fn refill_hints_accumulate_and_reject_a_duplicate_owner() {
+        let spec = empty_spec(vec![Stage::Sort]);
+        let mut b = chain_builder_for_stages(&spec);
+        b.add_refill_hint(hint(true), "align").unwrap();
+        b.add_refill_hint(hint(false), "sort").unwrap();
+        assert_eq!(b.refill_hints.len(), 2);
+        let err = b.add_refill_hint(hint(false), "sort").unwrap_err().to_string();
+        assert!(err.contains("sort"), "{err}");
+        assert_eq!(b.refill_hints.len(), 2, "a rejected hint is not added");
     }
 
     /// Pin the override warning `build` logs: a warning is emitted only when the

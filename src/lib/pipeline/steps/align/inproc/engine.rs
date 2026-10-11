@@ -49,6 +49,7 @@ use bwa_mem3_rs::{
 };
 
 use super::gate::CohortLease;
+use crate::pipeline::core::runtime::elapsed_ns;
 
 // Re-exports for the rest of the `inproc` module tree: these are the only
 // `bwa_mem3_rs` names it references, and they go through here so `engine.rs`
@@ -265,13 +266,6 @@ pub(crate) struct BwaMem3Engine {
     infer_cohort_calls: AtomicU64,
     pair_emit_ns: AtomicU64,
     pair_emit_calls: AtomicU64,
-}
-
-/// Nanoseconds since `start`, saturating into a `u64` (a `u64` of ns is ~584
-/// years, so the cap is only a formality that avoids a `u128`-to-`u64` panic
-/// path on an absurd clock).
-fn elapsed_ns(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl BwaMem3Engine {
