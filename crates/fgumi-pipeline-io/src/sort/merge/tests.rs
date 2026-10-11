@@ -33,16 +33,27 @@ fn mismatched_memory_lane_fails_closed() {
 fn empty_template_lane_with_spill_slots_fails_closed() {
     let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
     // `Box<dyn MergeDriverDyn>` isn't `Debug`, so match rather than `expect_err`.
-    match build_driver(SortOrder::TemplateCoordinate, vec![slot], MemoryChunksByKind::default(), 1)
-    {
+    match build_driver(
+        SortOrder::TemplateCoordinate,
+        vec![slot],
+        MemoryChunksByKind::default(),
+        1,
+        None,
+    ) {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         Ok(_) => panic!("empty template lane with spill slots must fail closed"),
     }
 
     // No slots → empty input; any key width is safe (nothing to merge).
     assert!(
-        build_driver(SortOrder::TemplateCoordinate, Vec::new(), MemoryChunksByKind::default(), 0)
-            .is_ok(),
+        build_driver(
+            SortOrder::TemplateCoordinate,
+            Vec::new(),
+            MemoryChunksByKind::default(),
+            0,
+            None
+        )
+        .is_ok(),
         "empty template lane with no slots is valid",
     );
 }

@@ -140,6 +140,36 @@ impl ParkedConsumer {
     }
 }
 
+/// The scan visits the merge's demand slots first — awaited, predicted,
+/// frontier, deduplicated — then the rotation, and drops a demand slot that
+/// is already EOF.
+#[test]
+fn scan_order_puts_demand_slots_first_and_drops_eof() {
+    let slots: Vec<_> =
+        (0..5).map(|i| Arc::new(SortMergeSlot::for_test(i, SpillCodec::Bgzf))).collect();
+    for s in &slots[..4] {
+        s.bp_stash_frames_for_test(vec![vec![1, 2, 3]], false);
+    }
+    slots[4].bp_stash_frames_for_test(Vec::new(), true);
+    assert!(slots[4].queue_eof());
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let step = SortSpillDecompress::new(1 << 20, &supply_with(&demand));
+    for s in &slots {
+        step.register_for_test(s);
+    }
+    await_file(&demand, 3);
+    demand.set_predicted(Some(1));
+    demand.set_frontier(Some(4));
+    let (order, _) = step.scan_order();
+    assert_eq!(order[..2], [3, 1], "awaited, predicted; the EOF frontier dropped: {order:?}");
+    assert_eq!(order.len(), 4, "the rest once each, no EOF slot: {order:?}");
+    demand.set_frontier(Some(1));
+    demand.set_predicted(Some(0));
+    let (order, _) = step.scan_order();
+    assert_eq!(order[..3], [3, 0, 1], "{order:?}");
+    assert_eq!(order.len(), 4, "{order:?}");
+}
+
 /// Slices of one slot that land in reverse order are parsed in sequence: the
 /// delivered blocks equal those of the same file ingested as one slice.
 #[test]

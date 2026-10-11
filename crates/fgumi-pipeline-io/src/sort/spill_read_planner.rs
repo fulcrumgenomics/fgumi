@@ -202,6 +202,12 @@ impl SpillReadPlanner {
         self.outbox.drain(..).collect()
     }
 
+    /// The hot set's file ids, in order (test support).
+    #[cfg(test)]
+    pub(crate) fn hot_set_for_test(&self) -> Vec<u32> {
+        self.hot_set().into_iter().map(|i| self.slots[i].slot.file_id).collect()
+    }
+
     /// Handle one phase event (test support).
     #[cfg(test)]
     pub(crate) fn on_event_for_test(&mut self, e: SortPhase1Event) -> SortPhase2Event {
@@ -263,15 +269,16 @@ impl SpillReadPlanner {
         }
     }
 
-    /// The hot set: the merge's demand ([`MergeDemand::hot_ids`]), each slot
-    /// only while registered.
+    /// The hot set: the merge's demand ([`MergeDemand::hot_ids`]: awaited,
+    /// predicted and frontier slots, deduplicated), each only while registered
+    /// and not yet EOF (at most [`super::read_ahead_budget::HOT_SLOTS`]).
     fn hot_set(&self) -> Vec<usize> {
         self.demand
             .hot_ids()
             .as_slice()
             .iter()
-            .filter_map(|id| self.by_file_id.get(id))
-            .copied()
+            .filter_map(|id| self.by_file_id.get(id).copied())
+            .filter(|&i| !self.slots[i].slot.queue_eof())
             .collect()
     }
 

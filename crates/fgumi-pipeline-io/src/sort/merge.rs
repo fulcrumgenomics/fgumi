@@ -450,27 +450,33 @@ fn build_driver(
     slots: Vec<Arc<SortMergeSlot>>,
     chunks: MemoryChunksByKind,
     total_records: u64,
+    demand: Option<&Arc<fgumi_sort::MergeDemand>>,
 ) -> io::Result<Box<dyn MergeDriverDyn + Send>> {
     Ok(match sort_order {
-        SortOrder::Coordinate => Box::new(MergeDriver::<RawCoordinateKey>::from_slots(
-            slots,
-            MemorySources::Shared(chunks.coordinate),
-            total_records,
+        SortOrder::Coordinate => Box::new(attach(
+            MergeDriver::<RawCoordinateKey>::from_slots(
+                slots,
+                MemorySources::Shared(chunks.coordinate),
+                total_records,
+            ),
+            demand,
         )),
-        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-            Box::new(MergeDriver::<RawQuerynameLexKey>::from_slots(
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
+            MergeDriver::<RawQuerynameLexKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_lex),
                 total_records,
-            ))
-        }
-        SortOrder::Queryname(QuerynameComparator::Natural) => {
-            Box::new(MergeDriver::<RawQuerynameKey>::from_slots(
+            ),
+            demand,
+        )),
+        SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
+            MergeDriver::<RawQuerynameKey>::from_slots(
                 slots,
                 MemorySources::Shared(chunks.queryname_natural),
                 total_records,
-            ))
-        }
+            ),
+            demand,
+        )),
         SortOrder::TemplateCoordinate => match chunks.template_coordinate {
             // `Empty` means no residual chunk identified the `--key-types` lane.
             // For valid input this only happens with empty input (no spill files
@@ -491,34 +497,57 @@ fn build_driver(
                          Phase-1 seal-logic regression.",
                     ));
                 }
-                Box::new(MergeDriver::<TemplateKey>::from_slots(
-                    slots,
-                    MemorySources::Shared(Vec::new()),
-                    total_records,
+                Box::new(attach(
+                    MergeDriver::<TemplateKey>::from_slots(
+                        slots,
+                        MemorySources::Shared(Vec::new()),
+                        total_records,
+                    ),
+                    demand,
                 ))
             }
-            TemplateChunks::K24(v) => Box::new(MergeDriver::<TemplateKey24>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::K24(v) => Box::new(attach(
+                MergeDriver::<TemplateKey24>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
-            TemplateChunks::Cb32(v) => Box::new(MergeDriver::<CbKey32>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::Cb32(v) => Box::new(attach(
+                MergeDriver::<CbKey32>::from_slots(slots, MemorySources::Shared(v), total_records),
+                demand,
             )),
-            TemplateChunks::Tert32(v) => Box::new(MergeDriver::<TertKey32>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::Tert32(v) => Box::new(attach(
+                MergeDriver::<TertKey32>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
-            TemplateChunks::K40(v) => Box::new(MergeDriver::<TemplateKey>::from_slots(
-                slots,
-                MemorySources::Shared(v),
-                total_records,
+            TemplateChunks::K40(v) => Box::new(attach(
+                MergeDriver::<TemplateKey>::from_slots(
+                    slots,
+                    MemorySources::Shared(v),
+                    total_records,
+                ),
+                demand,
             )),
         },
     })
+}
+
+/// Hand the sort's merge demand to `driver`, which publishes its predictions
+/// and frontier through it.
+fn attach<K: fgumi_sort::RawSortKey + Default + Send + 'static>(
+    driver: MergeDriver<K>,
+    demand: Option<&Arc<fgumi_sort::MergeDemand>>,
+) -> MergeDriver<K> {
+    match demand {
+        Some(d) => driver.with_demand(Arc::clone(d)),
+        None => driver,
+    }
 }
 
 enum NextBatch<I> {
@@ -1834,7 +1863,13 @@ impl<O: MergeOutput> SortMerge<O> {
                 SortMergeState::FastPath { chunk, cursor: 0, total, builder, next_ordinal: 0 };
             return Ok(());
         }
-        let driver = build_driver(self.sort_order, slots, memory_chunks, total_records)?;
+        let driver = build_driver(
+            self.sort_order,
+            slots,
+            memory_chunks,
+            total_records,
+            self.demand.as_ref(),
+        )?;
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         // Seed the first buffer modestly; subsequent buffers are sized from the
         // prior batch's actual byte length (see `next_batch`).

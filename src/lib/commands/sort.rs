@@ -487,11 +487,13 @@ pub struct Sort {
     /// registered to be woken), contention (dispatches that produced nothing),
     /// and output-backpressure counts. When the merge reads spill files it is
     /// followed by the merge-demand lines ("Merge demand:", "Awaited slot at
-    /// stall:", "Pool at stall:", "Merge output:"): stall episodes and their
-    /// time, wakes the spill supply delivered to the parked merge, the awaited
-    /// spill file's state at each stall, the merge's requests for a pool worker,
-    /// and partial batches flushed on a stall (see the performance tuning
-    /// guide). Only when the sort
+    /// stall:", "Pool at stall:", "Merge prediction:", "Consumer served
+    /// itself:", "Merge output:"): stall episodes and their time, wakes the
+    /// spill supply delivered to the parked merge, the awaited spill file's
+    /// state at each stall, the merge's requests for a pool worker, how often
+    /// its next-file prediction was right, the stalls it served itself from
+    /// already-read blocks, and partial batches flushed on a stall (see the
+    /// performance tuning guide). Only when the sort
     /// spills nothing *and* fits in a single in-memory chunk is there no merge
     /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
     /// diag: ...") saying the single-chunk in-memory fast path was taken.

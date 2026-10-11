@@ -13,7 +13,8 @@
 //! 2. **Serve** one block: claim a stash head ([`SortMergeSlot::bp_claim_raw`]),
 //!    decompress it, publish it ([`SortMergeSlot::bp_insert_drain_finalize`]),
 //!    and wake the merge if it awaits the slot. Slots are scanned demand first
-//!    — the merge's awaited slot, then a rotation from a cursor the clones share —
+//!    — the merge's awaited, predicted and frontier slots, then a rotation from
+//!    a cursor the clones share —
 //!    using lock-free mirrors only, so a scan never takes a slot lock.
 //! 3. **Drain**: move a block waiting in a slot's reorder buffer into its FIFO
 //!    once the consumer has made room, and finalize `queue_eof` — the path that

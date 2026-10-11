@@ -406,6 +406,7 @@ fn sort_stats_gates_merge_demand_lines(
         "Merge demand:",
         "Awaited slot at stall:",
         "Pool at stall:",
+        "Merge prediction:",
         "Consumer served itself:",
         "Merge output:",
     ] {
@@ -488,6 +489,34 @@ fn sort_stats_reports_self_serve(
         .and_then(|(_, r)| r.split_whitespace().next()?.parse().ok())
         .unwrap();
     assert_eq!(consumer, blocks, "{order}: every merge-decompressed block is a consumer claim");
+}
+
+/// Parse `(predictions, hit_pct)` from the `Merge prediction:` line.
+fn merge_predictions(stderr: &str) -> Option<(u64, f64)> {
+    let body = stderr.lines().map(log_body).find(|l| l.starts_with("Merge prediction: "))?;
+    let rest = body.strip_prefix("Merge prediction: ")?;
+    let n: u64 = rest.split(' ').next()?.parse().ok()?;
+    let hit: f64 = rest.split("hit ").nth(1)?.split('%').next()?.parse().ok()?;
+    Some((n, hit))
+}
+
+/// On a sort that merges at least two sources, every source switch after the
+/// first scores the prediction the previous switch published, so a merge
+/// that switches at all reports predictions. The runner-up is the next
+/// winner exactly (a memory source predicted as "no file"), so every one
+/// hits. (The exact count is pinned by the unit test
+/// `predictions_skip_memory_sources_and_track_switches`.)
+#[rstest]
+fn sort_stats_reports_predictions_on_a_multi_source_merge(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+) {
+    let stderr = sort_spilling_with(order, &["--sort-stats"]);
+    let sources = merge_sources(&stderr).expect("Merge sources line");
+    assert!(sources >= 2, "{order}: at least 2 sources (got {sources}):\n{stderr}");
+    let (n, hit) =
+        merge_predictions(&stderr).unwrap_or_else(|| panic!("no prediction line:\n{stderr}"));
+    assert!(n > 0, "{order}: a multi-source merge switches sources ({n})");
+    assert!((hit - 100.0).abs() < f64::EPSILON, "{order}: every prediction hits ({hit}%)");
 }
 
 /// On a sort that fits entirely in memory (the single-chunk fast path, no

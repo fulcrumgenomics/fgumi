@@ -3,7 +3,7 @@
 //! SortSpillDecompress` over pre-written zstd spills, drained by a synthetic
 //! consumer that pops the slots' FIFOs in a loser-tree-like interleaving
 //! (runs of consecutive blocks per source with p50 = 1 and p99 = 1024) and
-//! publishes the awaited slot as the merge does.
+//! publishes the awaited and predicted slots as the merge does.
 //!
 //! Per `k ∈ {27, 256, 1024}` it reports blocks/s (criterion), and once per
 //! case on stderr: the consumer's wait for a block it stalled on (p50/p99),
@@ -138,8 +138,8 @@ struct ConsumerReport {
 }
 
 /// `Detached` consumer: registers the slots, then pops runs of consecutive
-/// blocks per source, publishing awaited (on an empty FIFO) through the merge
-/// demand.
+/// blocks per source, publishing awaited (on an empty FIFO) and predicted (the
+/// next source) through the merge demand.
 struct Consumer {
     demand: Arc<MergeDemand>,
     slots: Vec<Arc<SortMergeSlot>>,
@@ -164,6 +164,9 @@ impl Consumer {
         self.rng = mix(self.rng);
         self.current = self.live[usize::try_from(self.rng % self.live.len() as u64).unwrap()];
         self.run_left = self.run_length();
+        self.rng = mix(self.rng);
+        let predicted = self.live[usize::try_from(self.rng % self.live.len() as u64).unwrap()];
+        self.demand.set_predicted(Some(self.slots[predicted].file_id));
     }
 }
 
