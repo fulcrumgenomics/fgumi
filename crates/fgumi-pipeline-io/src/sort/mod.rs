@@ -38,5 +38,7 @@ pub use spill_decompress::{SortDecompressTuning, SortSpillDecompress};
 pub use spill_gather::SpillGather;
 pub use spill_write::{SpillRunStats, SpillWrite};
 
+#[cfg(all(test, feature = "stress-tests"))]
+mod slot_stash_soak;
 #[cfg(test)]
 pub mod tests;

@@ -270,7 +270,7 @@ pub use keys::{
 pub use merge_demand::{
     AwaitedSlotState, MergeDemand, MergeDemandSnapshot, MergeDemandStats, MergePoolRequest,
 };
-pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
+pub use merge_slots::{IngestOutcome, PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
@@ -287,7 +287,7 @@ pub use run_consolidate::{
 pub use segmented_buf::SegmentedBuf;
 pub use sort_pool::BoundedSortPool;
 pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
-pub use spill_block_reader::SpillBlockDecompressor;
+pub use spill_block_reader::{RawBlock, SpillBlockDecompressor, SpillFrameParser};
 pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
 pub use template_arena::{
     TemplateArenaAccumulator, TemplateArenaRefs, TemplateMemChunk, seal_template_refs,

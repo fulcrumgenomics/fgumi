@@ -5862,10 +5862,10 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
 /// Open `path` as a single [`SortMergeSlot`] with the given `file_id`.
 ///
 /// The spill codec is auto-detected from the file magic: for zstd (`ZSP1`) the
-/// 4-byte magic is consumed here, leaving the reader at the first `[len][frame]`
-/// record; for BGZF the `1f 8b` is part of the first block, so the reader is
-/// rewound to byte 0. `SortSpillDecompress` reads `slot.codec` to decompress
-/// accordingly.
+/// frames start after the 4-byte magic; for BGZF the `1f 8b` is part of the
+/// first block, so the frames start at byte 0. The slot carries the file as a
+/// positional handle with that body range and allocates no read buffer;
+/// `SortSpillDecompress` reads `slot.codec` to decompress accordingly.
 ///
 /// `file_id` is the slot's stable merge-order identifier — `SortMerge` orders
 /// sources by it so the `LoserTree` tie-break for equal sort keys matches the
@@ -5875,8 +5875,8 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened, its magic cannot be read, or
-/// (for BGZF) the rewind fails.
+/// Returns an error if the file cannot be opened, or its magic or length
+/// cannot be read.
 pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortMergeSlot>> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
@@ -5888,13 +5888,12 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
     } else {
         crate::codec::SpillCodec::Bgzf
     };
-    if matches!(codec, crate::codec::SpillCodec::Bgzf) {
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(0))
-            .with_context(|| format!("failed to rewind spill chunk {}", path.display()))?;
-    }
-    let reader = std::io::BufReader::new(file);
-    Ok(Arc::new(SortMergeSlot::new(file_id, reader, codec)))
+    let body_start = crate::spill_block::spill_magic(codec).len() as u64;
+    let len = file
+        .metadata()
+        .with_context(|| format!("failed to stat spill chunk {}", path.display()))?
+        .len();
+    Ok(Arc::new(SortMergeSlot::new(file_id, Arc::new(file), body_start, len, codec)))
 }
 
 // ============================================================================
@@ -6003,7 +6002,7 @@ fn slot_try_load_block(
     use std::sync::atomic::Ordering;
 
     let mut guard = slot.decompressed.lock().expect("slot.decompressed mutex poisoned");
-    if let Some(data) = guard.pop_front() {
+    if let Some(data) = slot.pop_locked(&mut guard) {
         drop(guard);
         parser.current_buf = data;
         parser.current_pos = 0;
@@ -11132,7 +11131,7 @@ mod from_slots_merge_tests {
     //! identical at this layer). These exercise the parser/state-machine paths
     //! that the end-to-end `three_step_chain_*` tests do not isolate.
     use super::*;
-    use std::io::{BufReader, Read, Write};
+    use std::io::{Read, Write};
     use std::sync::Arc as StdArc;
 
     #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -11182,11 +11181,7 @@ mod from_slots_merge_tests {
         assert!(n_blocks >= 1, "n_blocks must be >= 1");
         let bytes = serialize_records(records);
         let block_size = bytes.len().div_ceil(n_blocks);
-        let slot = StdArc::new(SortMergeSlot::new(
-            file_id,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(file_id, crate::codec::SpillCodec::Bgzf));
         {
             let mut dec = slot.decompressed.lock().unwrap();
             for chunk in bytes.chunks(block_size) {
@@ -11281,11 +11276,7 @@ mod from_slots_merge_tests {
 
     #[test]
     fn from_slots_empty_sources_drain_to_zero_records() {
-        let empty_slot = StdArc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let empty_slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
         // Mark drained without inserting any blocks.
         empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
         // Lazy priming: `from_slots` always yields a driver; the empty
@@ -11317,11 +11308,7 @@ mod from_slots_merge_tests {
         bytes.write_all(&bogus_len.to_le_bytes()).unwrap();
         bytes.write_all(b"only-a-few-body-bytes").unwrap();
 
-        let slot = StdArc::new(SortMergeSlot::new(
-            5,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(5, crate::codec::SpillCodec::Bgzf));
         slot.decompressed.lock().unwrap().push_back(bytes);
         slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
 
@@ -11374,11 +11361,7 @@ mod from_slots_merge_tests {
         let keep = keep.unwrap_or(serialized.len() - 5);
         assert!(keep < serialized.len(), "the case must actually truncate");
 
-        let slot = StdArc::new(SortMergeSlot::new(
-            3,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(3, crate::codec::SpillCodec::Bgzf));
         slot.decompressed.lock().unwrap().push_back(serialized[..keep].to_vec());
         slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
 
@@ -11416,11 +11399,7 @@ mod from_slots_merge_tests {
     fn stalled_slot_names_the_awaited_slot() {
         let slot_a = populated_slot(0, &[(TestKey(1), b"A-1".to_vec())], 1);
         // Slot 1: empty, not EOF → priming stalls on it.
-        let slot_b = StdArc::new(SortMergeSlot::new(
-            1,
-            BufReader::new(tempfile::tempfile().unwrap()),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot_b = StdArc::new(SortMergeSlot::for_test(1, crate::codec::SpillCodec::Bgzf));
         let mut driver = MergeDriver::<TestKey>::from_slots(
             vec![StdArc::clone(&slot_a), StdArc::clone(&slot_b)],
             MemorySources::Shared(Vec::new()),
@@ -11454,11 +11433,7 @@ mod from_slots_merge_tests {
     /// the slot and marks EOF, the merge resumes and drains to completion.
     #[test]
     fn from_slots_try_step_stalls_on_empty_non_eof_slot_then_resumes() {
-        let slot = StdArc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
         // Empty queue, NOT eof — the producer is "still feeding".
         let mut driver = MergeDriver::<TestKey>::from_slots(
             vec![StdArc::clone(&slot)],
@@ -11496,11 +11471,7 @@ mod from_slots_merge_tests {
     /// once the producer pushes the next block and marks EOF.
     #[test]
     fn from_slots_try_step_stalls_mid_merge_then_resumes() {
-        let slot = StdArc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
         // One record present, NOT eof (more "coming").
         {
             let bytes = serialize_records(&[(TestKey(1), b"rec-A".to_vec())]);
@@ -11550,11 +11521,7 @@ mod from_slots_merge_tests {
         let serialized = serialize_records(&[(TestKey(7), rec_body.clone())]);
         assert!(serialized.len() > 12, "must span the 8-byte key + 4-byte len header");
 
-        let slot = StdArc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
         slot.decompressed.lock().unwrap().push_back(vec![serialized[0]]);
 
         let mut driver = MergeDriver::<TestKey>::from_slots(
@@ -11598,11 +11565,7 @@ mod from_slots_merge_tests {
         assert!(split < serialized.len() && split > 4 + 8, "split mid-body, past the key");
         let (head, tail) = serialized.split_at(split);
 
-        let slot = StdArc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(0, crate::codec::SpillCodec::Bgzf));
         slot.decompressed.lock().unwrap().push_back(head.to_vec());
 
         let mut driver = MergeDriver::<TestEmbeddedKey>::from_slots(
@@ -11772,11 +11735,7 @@ mod from_slots_merge_tests {
     ) -> StdArc<SortMergeSlot> {
         let bytes = serialize_embedded(records);
         let block_size = bytes.len().div_ceil(n_blocks.max(1));
-        let slot = StdArc::new(SortMergeSlot::new(
-            file_id,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(file_id, crate::codec::SpillCodec::Bgzf));
         {
             let mut dec = slot.decompressed.lock().unwrap();
             for chunk in bytes.chunks(block_size) {
@@ -11836,11 +11795,7 @@ mod from_slots_merge_tests {
             (TestKey(3), b"three".to_vec()),
         ];
 
-        let empty_slot = StdArc::new(SortMergeSlot::new(
-            99,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let empty_slot = StdArc::new(SortMergeSlot::for_test(99, crate::codec::SpillCodec::Bgzf));
         empty_slot.queue_eof.store(true, std::sync::atomic::Ordering::Release);
         // Insert empty-slot first, then a populated slot. The driver should
         // skip the empty one during priming and only emit records from the
@@ -11860,11 +11815,7 @@ mod from_slots_merge_tests {
     /// dropped, exit status zero — with the whole suite green.
     #[test]
     fn decomp_error_surfaces_as_an_error_not_a_clean_eof() {
-        let slot = StdArc::new(SortMergeSlot::new(
-            7,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            crate::codec::SpillCodec::Bgzf,
-        ));
+        let slot = StdArc::new(SortMergeSlot::for_test(7, crate::codec::SpillCodec::Bgzf));
         // The shape a failed decompression leaves behind: queue drained, EOF
         // set, and the error flag raised. Ordering matters — both are set, so
         // only the check order decides the outcome.
@@ -11913,5 +11864,300 @@ mod from_slots_merge_tests {
             total,
             "records_merged must equal the emitted record count"
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_ingest_tests {
+    //! The slot's positional handle and slice ingest: `open_spill_slot`'s body
+    //! range, slice reorder, the raw stash, EOF finalize, and the FIFO mirror,
+    //! observed through the merge's own read path (`slot_try_load_block`).
+    use super::*;
+    use crate::codec::SpillCodec;
+    use crate::merge_slots::{IngestOutcome, SortMergeSlot};
+    use crate::spill_block::{SpillBlockCompressor, spill_magic, spill_trailer};
+    use crate::spill_block_reader::SpillBlockDecompressor;
+    use fgumi_bam_io::pread::{SliceBufferPool, SliceLease};
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    /// Write a spill file of `blocks` raw blocks (each `per_block` bytes of a
+    /// pattern) in `codec`; returns its dir, path and whole contents.
+    fn spill_file(
+        codec: SpillCodec,
+        blocks: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.spill");
+        let mut bytes = spill_magic(codec).to_vec();
+        let mut c = SpillBlockCompressor::new(codec, 1).unwrap();
+        for b in 0..blocks {
+            let raw: Vec<u8> =
+                (0..20_000).map(|i| u8::try_from((i * 31 + b * 7) % 251).unwrap()).collect();
+            bytes.extend_from_slice(&c.compress_block(&raw).unwrap());
+        }
+        bytes.extend_from_slice(spill_trailer(codec));
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        (dir, path, bytes)
+    }
+
+    fn lease_of(pool: &Arc<SliceBufferPool>, bytes: &[u8]) -> SliceLease {
+        pool.lease(bytes.to_vec())
+    }
+
+    /// Ingest as the read planner would: issued first, then the slice.
+    fn ingest(
+        slot: &SortMergeSlot,
+        seq: u32,
+        lease: SliceLease,
+        last: bool,
+    ) -> std::io::Result<IngestOutcome> {
+        slot.bp_note_issued(lease.len() as u64);
+        slot.bp_ingest_slice(seq, lease, last)
+    }
+
+    /// Claim every stashed frame and publish it, as decompress workers would.
+    fn serve_stash(slot: &SortMergeSlot) {
+        let mut dec = SpillBlockDecompressor::new();
+        while let Some(b) = slot.bp_claim_raw(0) {
+            let d = dec.decompress_one(slot.codec, &b.frame).unwrap();
+            slot.bp_insert_drain_finalize(b.seq, vec![d], 1);
+        }
+    }
+
+    /// Run `f` on another thread; fail if it does not finish within 5 s.
+    fn within_5s(f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("did not finish within 5 s");
+    }
+
+    #[rstest::rstest]
+    #[case::bgzf(SpillCodec::Bgzf, 0)]
+    #[case::zstd(SpillCodec::Zstd, 4)]
+    fn open_spill_slot_reads_codec_and_body_range(
+        #[case] codec: SpillCodec,
+        #[case] body_start: u64,
+    ) {
+        let (_dir, path, bytes) = spill_file(codec, 2);
+        let slot = open_spill_slot(&path, 3).unwrap();
+        assert_eq!(slot.codec, codec);
+        assert_eq!((slot.body_start(), slot.len()), (body_start, bytes.len() as u64));
+        let r = slot.reader.lock().unwrap();
+        assert!(r.slices.is_empty() && r.parser.carry_len() == 0 && r.pending.is_empty());
+    }
+
+    /// A last slice holding only the BGZF EOF marker, after
+    /// every earlier frame was claimed and drained, still finalizes the slot;
+    /// the merge's read path reaches `Eof` under a watchdog.
+    #[test]
+    fn eof_marker_only_slice_reaches_eof() {
+        let (_dir, path, bytes) = spill_file(SpillCodec::Bgzf, 2);
+        let slot = open_spill_slot(&path, 0).unwrap();
+        let pool = SliceBufferPool::new(4);
+        let body_end = bytes.len() - spill_trailer(SpillCodec::Bgzf).len();
+        let out = ingest(&slot, 0, lease_of(&pool, &bytes[..body_end]), false).unwrap();
+        assert_eq!((out.frames, out.hit_eof), (2, false));
+        serve_stash(&slot);
+        let out = ingest(&slot, 1, lease_of(&pool, &bytes[body_end..]), true).unwrap();
+        assert_eq!(out, IngestOutcome { frames: 0, stashed_bytes: 0, hit_eof: true });
+        let s2 = Arc::clone(&slot);
+        within_5s(move || {
+            let mut parser = SlotParserState::new();
+            loop {
+                match slot_try_load_block(&s2, &mut parser).unwrap() {
+                    BlockLoad::Eof => break,
+                    _ => std::thread::yield_now(),
+                }
+            }
+        });
+        assert!(slot.is_drained());
+    }
+
+    /// Slices that land out of order are parsed in file order: the stash's
+    /// sequence numbers are dense and its frames equal the sequential reader's.
+    #[rstest::rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn out_of_order_slices_are_reassembled_by_seq(#[case] codec: SpillCodec) {
+        let (_dir, path, bytes) = spill_file(codec, 5);
+        let slot = open_spill_slot(&path, 0).unwrap();
+        let body = &bytes[usize::try_from(slot.body_start()).unwrap()..];
+        let oracle = SpillBlockDecompressor::new().read_raw(&mut &body[..], codec, 64).unwrap();
+        let pool = SliceBufferPool::new(8);
+        let cut = body.len() / 3 + 7;
+        let parts = [&body[..cut], &body[cut..2 * cut], &body[2 * cut..]];
+        assert_eq!(ingest(&slot, 2, lease_of(&pool, parts[2]), true).unwrap().frames, 0);
+        assert_eq!(ingest(&slot, 1, lease_of(&pool, parts[1]), false).unwrap().frames, 0);
+        let out = ingest(&slot, 0, lease_of(&pool, parts[0]), false).unwrap();
+        assert_eq!((out.frames, out.hit_eof), (oracle.len(), true));
+        let stash = slot.raw_stash.lock().unwrap();
+        let seqs: Vec<u64> = stash.iter().map(|b| b.seq).collect();
+        assert_eq!(seqs, (0..oracle.len() as u64).collect::<Vec<_>>());
+        let frames: Vec<Vec<u8>> = stash.iter().map(|b| b.frame.to_vec()).collect();
+        assert_eq!(frames, oracle);
+        assert_eq!(slot.stash_len.load(Ordering::Relaxed) as usize, oracle.len());
+        assert_eq!(slot.issued_bytes.load(Ordering::Relaxed), 0, "every issued byte was parsed");
+    }
+
+    /// A last slice that ends mid-frame fails the slot.
+    #[test]
+    fn truncated_last_slice_marks_the_slot_failed() {
+        let (_dir, path, bytes) = spill_file(SpillCodec::Zstd, 2);
+        let slot = open_spill_slot(&path, 0).unwrap();
+        let pool = SliceBufferPool::new(2);
+        let err = ingest(&slot, 0, lease_of(&pool, &bytes[4..bytes.len() - 9]), true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(slot.has_error() && slot.queue_eof.load(Ordering::Acquire));
+    }
+
+    /// The front escape admits the last block while the FIFO
+    /// is full; it waits in `reorder`. Once the consumer frees room, the
+    /// drain-only path moves it and sets `queue_eof`. The oracle is the merge's
+    /// read path under a watchdog.
+    #[test]
+    fn last_block_inserted_into_full_fifo_still_reaches_eof() {
+        let cap = crate::merge_slots::PHASE2_DECOMP_CAP;
+        let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Bgzf));
+        slot.bp_stash_frames_for_test(
+            (0..=cap).map(|i| vec![u8::try_from(i % 251).unwrap()]).collect(),
+            true,
+        );
+        for _ in 0..cap {
+            let b = slot.bp_claim_raw(u64::MAX).unwrap();
+            slot.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+        }
+        assert_eq!(slot.fifo_len(), cap, "the FIFO is full");
+        let last = slot.bp_claim_raw(u64::MAX).expect("the front is admitted over a full FIFO");
+        slot.bp_insert_drain_finalize(last.seq, vec![last.frame.to_vec()], 1);
+        assert_eq!(slot.fifo_len(), cap, "the last block waits in reorder");
+        assert!(!slot.queue_eof.load(Ordering::Acquire));
+        let s2 = Arc::clone(&slot);
+        within_5s(move || {
+            let mut parser = SlotParserState::new();
+            loop {
+                // What a decompress pass / self-serve does when it finds no claim.
+                s2.bp_drain_and_finalize();
+                match slot_try_load_block(&s2, &mut parser).unwrap() {
+                    BlockLoad::Eof => break,
+                    _ => std::thread::yield_now(),
+                }
+            }
+        });
+    }
+
+    /// Borrowed frames claimed and decompressed by several threads deliver
+    /// every block in order, and every slice returns to its pool once its
+    /// frames are dropped (20 runs).
+    #[test]
+    fn stash_claims_with_borrowed_frames_release_every_slice() {
+        for _ in 0..20 {
+            let (_dir, path, bytes) = spill_file(SpillCodec::Zstd, 12);
+            let slot = open_spill_slot(&path, 0).unwrap();
+            let pool = SliceBufferPool::new(8);
+            let body = &bytes[4..];
+            let oracle: Vec<Vec<u8>> = {
+                let mut dec = SpillBlockDecompressor::new();
+                dec.read_raw(&mut &body[..], SpillCodec::Zstd, 64)
+                    .unwrap()
+                    .iter()
+                    .map(|f| dec.decompress_one(SpillCodec::Zstd, f).unwrap())
+                    .collect()
+            };
+            let cut = body.len() / 4 + 3;
+            let chunks: Vec<&[u8]> = body.chunks(cut).collect();
+            let n = chunks.len();
+            std::thread::scope(|sc| {
+                for _ in 0..4 {
+                    let slot = &slot;
+                    sc.spawn(move || {
+                        let mut dec = SpillBlockDecompressor::new();
+                        while !slot.queue_eof.load(Ordering::Acquire) {
+                            if let Some(b) = slot.bp_claim_raw(u64::MAX) {
+                                let d = dec.decompress_one(slot.codec, &b.frame).unwrap();
+                                let seq = b.seq;
+                                drop(b);
+                                slot.bp_insert_drain_finalize(seq, vec![d], 1);
+                            } else {
+                                slot.bp_drain_and_finalize();
+                                std::thread::yield_now();
+                            }
+                        }
+                    });
+                }
+                // Slices land in reverse order; the slot parses them in file order.
+                for i in (0..n).rev() {
+                    let seq = u32::try_from(i).unwrap();
+                    ingest(&slot, seq, lease_of(&pool, chunks[i]), i == n - 1).unwrap();
+                }
+                let mut parser = SlotParserState::new();
+                let mut got = Vec::new();
+                loop {
+                    match slot_try_load_block(&slot, &mut parser).unwrap() {
+                        BlockLoad::Loaded => got.push(std::mem::take(&mut parser.current_buf)),
+                        BlockLoad::Eof => break,
+                        BlockLoad::WouldBlock => std::thread::yield_now(),
+                    }
+                }
+                assert_eq!(got, oracle);
+            });
+            assert_eq!(pool.resident_bytes(), 0, "every slice returned to its pool");
+            assert_eq!(slot.stash_bytes.load(Ordering::Relaxed), 0, "every charge released");
+        }
+    }
+
+    /// The stash charges what it holds: a slice in full while any frame
+    /// borrowing it is stashed (not the frames' lengths), released with its
+    /// last stashed frame; plus the parser's carried partial frame. Every
+    /// charge is released once every frame is claimed.
+    #[rstest::rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn stash_charges_the_slices_its_frames_pin(#[case] codec: SpillCodec) {
+        let (_dir, path, bytes) = spill_file(codec, 6);
+        let slot = open_spill_slot(&path, 0).unwrap();
+        let pool = SliceBufferPool::new(8);
+        let body = &bytes[usize::try_from(slot.body_start()).unwrap()..];
+        let cut = body.len() / 2 + 5;
+        let charged = || slot.stash_bytes.load(Ordering::Relaxed);
+        let carry = || slot.reader.lock().unwrap().parser.carry_capacity() as u64;
+
+        let out = ingest(&slot, 0, lease_of(&pool, &body[..cut]), false).unwrap();
+        let carry0 = carry();
+        assert!(out.frames >= 2 && carry0 > 0, "a straddling frame and several within");
+        assert_eq!(charged(), cut as u64 + carry0, "the whole slice and the carry");
+        assert_eq!(out.stashed_bytes, i64::try_from(charged()).unwrap());
+        for _ in 1..out.frames {
+            drop(slot.bp_claim_raw(0).unwrap());
+            assert_eq!(charged(), cut as u64 + carry0, "the slice stays charged");
+        }
+        drop(slot.bp_claim_raw(0).unwrap());
+        assert_eq!(charged(), carry0, "the slice is released with its last frame");
+
+        let out = ingest(&slot, 1, lease_of(&pool, &body[cut..]), true).unwrap();
+        assert!(out.hit_eof);
+        assert_eq!(carry(), 0);
+        let stashed: u64 = slot.raw_stash.lock().unwrap().iter().map(|b| b.charge).sum();
+        assert_eq!(charged(), stashed, "the carry moved into the owned frame's charge");
+        while slot.bp_claim_raw(0).is_some() {}
+        assert_eq!(charged(), 0);
+    }
+
+    /// The lock-free FIFO-length mirror equals the FIFO's length after a push
+    /// (drain) and after the consumer's pop.
+    #[test]
+    fn fifo_len_mirror_tracks_push_and_pop() {
+        let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Bgzf));
+        slot.bp_commit_read(3, true);
+        slot.bp_insert_drain_finalize(0, vec![vec![1], vec![2], vec![3]], 3);
+        assert_eq!((slot.fifo_len_relaxed(), slot.fifo_len()), (3, 3));
+        let mut parser = SlotParserState::new();
+        assert!(matches!(slot_try_load_block(&slot, &mut parser).unwrap(), BlockLoad::Loaded));
+        assert_eq!((slot.fifo_len_relaxed(), slot.fifo_len()), (2, 2));
+        slot.fifo_cap.store(1, Ordering::Relaxed);
+        assert_eq!(slot.reorder_len_relaxed(), 0);
     }
 }

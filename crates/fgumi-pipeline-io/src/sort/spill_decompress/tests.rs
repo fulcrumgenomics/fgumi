@@ -1,5 +1,4 @@
 use super::*;
-use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -49,11 +48,7 @@ fn full_cap_refuses_the_fill_then_fills_after_release() {
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
         .with_phase_cap(Some(Arc::clone(&cap)));
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        BufReader::new(tempfile::tempfile().expect("tempfile")),
-        SpillCodec::Zstd,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Zstd));
     step.registry.lock().push(RegisteredSpill { slot: Arc::clone(&slot) });
     let probe = StepProbe::new(&step);
 
@@ -98,11 +93,7 @@ fn live_but_unfillable_slot_takes_no_permit() {
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default())
         .with_phase_cap(Some(Arc::clone(&cap)));
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        BufReader::new(tempfile::tempfile().expect("tempfile")),
-        SpillCodec::Zstd,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Zstd));
     for _ in 0..fgumi_sort::PHASE2_DECOMP_CAP {
         slot.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
     }
@@ -136,11 +127,7 @@ fn uncapped_poll_keeps_the_atomic_only_liveness_check() {
     use fgumi_pipeline_core::StepOutcome;
     use fgumi_pipeline_core::testing::StepProbe;
     let mut step = SortSpillDecompress::new(4 * 1024 * 1024, SortDecompressTuning::default());
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        BufReader::new(tempfile::tempfile().expect("tempfile")),
-        SpillCodec::Zstd,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Zstd));
     for _ in 0..fgumi_sort::PHASE2_DECOMP_CAP {
         slot.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
     }
@@ -190,11 +177,7 @@ fn input_events_are_forwarded_while_the_cap_is_full() {
 #[test]
 fn emptiest_first_order_sorts_by_fifo_len_ascending() {
     let mk = |file_id: u32, nblocks: usize| {
-        let s = Arc::new(SortMergeSlot::new(
-            file_id,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            SpillCodec::Bgzf,
-        ));
+        let s = Arc::new(SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
         for _ in 0..nblocks {
             s.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
         }
@@ -214,11 +197,7 @@ fn emptiest_first_order_sorts_by_fifo_len_ascending() {
 #[test]
 fn poisoned_reader_lock_fails_closed_rather_than_hanging() {
     let make_poisoned_slot = || {
-        let slot = Arc::new(SortMergeSlot::new(
-            0,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            SpillCodec::Bgzf,
-        ));
+        let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Bgzf));
         let holder = Arc::clone(&slot);
         // Panic while holding the reader lock; joining the panicked thread leaves
         // the mutex poisoned (mirrors a fill worker dying mid-read).
@@ -261,11 +240,7 @@ fn emptiest_first_order_skips_slots_that_reached_eof() {
     use std::sync::atomic::Ordering;
 
     let mk = |file_id: u32, nblocks: usize, eof: bool| {
-        let s = Arc::new(SortMergeSlot::new(
-            file_id,
-            BufReader::new(tempfile::tempfile().expect("tempfile")),
-            SpillCodec::Bgzf,
-        ));
+        let s = Arc::new(SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
         for _ in 0..nblocks {
             s.decompressed.lock().expect("decompressed lock").push_back(vec![0u8]);
         }
@@ -360,11 +335,7 @@ impl ParkedConsumer {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let stand_in = SortMergeSlot::new(
-                file_id,
-                std::io::BufReader::new(tempfile::tempfile().unwrap()),
-                SpillCodec::Bgzf,
-            );
+            let stand_in = SortMergeSlot::for_test(file_id, SpillCodec::Bgzf);
             assert!(!d.await_slot(&stand_in), "an empty, open slot never satisfies the re-check");
             ready_tx.send(()).unwrap();
             std::thread::park_timeout(std::time::Duration::from_secs(10));
@@ -459,18 +430,19 @@ fn delivery_to_the_awaited_slot_wakes_the_merge(#[case] file_granularity: bool) 
     assert_eq!(demand.awaited(), None);
 }
 
-/// The run ends exactly at a block boundary. The slot holds exactly
-/// `block_batch` blocks, so the first fill reads them all without seeing EOF;
-/// the merge drains them and awaits the slot; the second fill takes the
-/// EOF-with-no-block path (inline: `got == 0`; block-parallel:
-/// `bp_commit_read(0, true)` → an empty `bp_insert_drain_finalize`) — which must
-/// wake the merge.
+/// End of file with no block to deliver wakes the awaiting merge. The reads
+/// are positional, so EOF is known when the cursor reaches the end with
+/// nothing carried or pending — normally in the same read as the last blocks.
+/// A spill whose body holds no frame (only the BGZF EOF marker) is the case
+/// where the EOF-finalizing read delivers nothing (inline: `got == 0`;
+/// block-parallel: `bp_commit_read(0, true)` → an empty
+/// `bp_insert_drain_finalize`), and that path must still wake the merge.
 #[rstest::rstest]
 #[case::block_parallel(false)]
 #[case::inline(true)]
 fn eof_finalize_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
     let tmp = tempfile::tempdir().unwrap();
-    let slot = spill_slot(tmp.path(), 0, 4, 8);
+    let slot = spill_slot(tmp.path(), 0, 0, 8);
     let demand = Arc::new(fgumi_sort::MergeDemand::new());
     let mut step = SortSpillDecompress::new(
         1 << 20,
@@ -478,12 +450,6 @@ fn eof_finalize_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
     )
     .with_merge_demand(Arc::clone(&demand));
     register_slots(&mut step, std::slice::from_ref(&slot));
-    // First fill: all four blocks, no EOF yet.
-    while slot.fifo_len() < 4 {
-        assert!(step.try_fill_some_slot().unwrap());
-    }
-    assert!(!slot.queue_eof.load(Ordering::Acquire), "a full first read must not see EOF");
-    slot.decompressed.lock().unwrap().clear(); // the merge consumed them
     let consumer = ParkedConsumer::start(&demand, 0);
     while !slot.queue_eof.load(Ordering::Acquire) {
         step.try_fill_some_slot().unwrap();
@@ -492,17 +458,63 @@ fn eof_finalize_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
     assert_eq!(slot.fifo_len(), 0, "EOF with no block");
 }
 
+/// A run whose last read delivers its final blocks together with EOF: the
+/// first fill (four of eight blocks) must not see EOF — frames remain
+/// pending — and the second delivers the rest and finalizes.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn eof_is_reached_by_position_not_by_count(#[case] file_granularity: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = spill_slot(tmp.path(), 0, 8, 8);
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 4 },
+    );
+    register_slots(&mut step, std::slice::from_ref(&slot));
+    while slot.fifo_len() < 4 {
+        assert!(step.try_fill_some_slot().unwrap());
+    }
+    assert!(!slot.queue_eof.load(Ordering::Acquire), "frames are still pending");
+    slot.decompressed.lock().unwrap().clear();
+    while !slot.queue_eof.load(Ordering::Acquire) {
+        step.try_fill_some_slot().unwrap();
+    }
+    assert_eq!(slot.fifo_len(), 4, "the last four blocks arrive with EOF");
+}
+
+/// The window reader pins no read buffer between fills: after a fill that
+/// leaves frames pending, every window buffer is back in the pool (nothing
+/// leased), and the pending frames are owned copies. Both fill paths.
+#[rstest::rstest]
+#[case::block_parallel(false)]
+#[case::inline(true)]
+fn window_reader_pins_no_read_buffer_between_fills(#[case] file_granularity: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let slot = spill_slot(tmp.path(), 0, 8, 8);
+    let mut step = SortSpillDecompress::new(
+        1 << 20,
+        SortDecompressTuning { file_granularity, block_batch: 1 },
+    );
+    register_slots(&mut step, std::slice::from_ref(&slot));
+    assert!(step.try_fill_some_slot().unwrap());
+    let reader = slot.reader.lock().unwrap();
+    assert!(!reader.pending.is_empty(), "precondition: the window held more than one frame");
+    assert!(
+        reader.pending.iter().all(|f| matches!(f, RawFrame::Owned(_))),
+        "pending frames are owned"
+    );
+    drop(reader);
+    assert_eq!(step.slices.resident_bytes(), 0, "no window buffer is leased between fills");
+}
+
 /// A slot failure (poisoned reader) wakes the awaiting merge, so it surfaces
 /// the error instead of sleeping until its timer.
 #[rstest::rstest]
 #[case::block_parallel(false)]
 #[case::inline(true)]
 fn failed_slot_wakes_the_awaiting_merge(#[case] file_granularity: bool) {
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        BufReader::new(tempfile::tempfile().unwrap()),
-        SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Bgzf));
     let holder = Arc::clone(&slot);
     let _ = std::thread::spawn(move || {
         let _g = holder.reader.lock().unwrap();
@@ -541,11 +553,7 @@ fn worker_copies_share_the_merge_demand() {
 /// The test holds the reader lock so the fill cannot take Phase A.
 #[test]
 fn phase_b_drain_wakes_the_awaiting_merge() {
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        BufReader::new(tempfile::tempfile().unwrap()),
-        SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, SpillCodec::Bgzf));
     // A full FIFO, and one in-order block parked in the reorder buffer.
     {
         let mut dec = slot.decompressed.lock().unwrap();

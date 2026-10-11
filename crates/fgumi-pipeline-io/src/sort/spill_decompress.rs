@@ -42,7 +42,8 @@
 use std::io;
 use std::sync::Arc;
 
-use fgumi_sort::{SortMergeSlot, SpillBlockDecompressor};
+use fgumi_bam_io::pread::{RawFrame, SliceBufferPool, read_at_exact};
+use fgumi_sort::{SortMergeReader, SortMergeSlot, SpillBlockDecompressor};
 use parking_lot::Mutex;
 
 use crate::sort::protocol::{SortPhase1Event, SortPhase2Event};
@@ -63,6 +64,74 @@ use fgumi_pipeline_core::{
 /// byte cap on decompressed stragglers. Matches
 /// `fgumi_pipeline_core::reorder::DEFAULT_REORDER_OVERFLOW_BYTES` (256 MiB).
 const DEFAULT_REORDER_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bytes the positional window reader fetches per requested frame: a BGZF
+/// block is at most 64 KiB, so `want` frames fit in about `want × 64 KiB`.
+const WINDOW_BYTES_PER_FRAME: u64 = 64 * 1024;
+
+/// Test override of [`WINDOW_BYTES_PER_FRAME`] (`0` = none), so parity tests
+/// can force frames to straddle tiny windows. Each nextest test is its own
+/// process, so a process-wide override is scoped to the test that sets it.
+#[cfg(test)]
+pub(crate) static WINDOW_BYTES_PER_FRAME_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The window reader's bytes per requested frame.
+fn window_bytes_per_frame() -> u64 {
+    #[cfg(test)]
+    {
+        let o = WINDOW_BYTES_PER_FRAME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if o > 0 {
+            return o;
+        }
+    }
+    WINDOW_BYTES_PER_FRAME
+}
+
+/// Up to `want` raw frames of `slot`, read positionally under its reader lock
+/// (`reader`): frames parsed earlier but not yet handed out come first; then
+/// windows of about `want × 64 KiB` are read at the file cursor into buffers
+/// from `pool` and parsed until `want` frames are available or the file is
+/// exhausted. Returns the frames and whether the file is fully delivered — the
+/// cursor at the end, no partial frame carried, nothing pending — which is
+/// decided by position, never by a short count (a frame that straddles a
+/// window would otherwise read as end of file).
+///
+/// Every parsed frame is copied out of its window before the window's buffer
+/// returns to `pool`, so no slot pins a read buffer between fills: a slot
+/// holds only its own pending frames (at most one window's worth of
+/// compressed bytes, `want × 64 KiB`) and the parser's carry of one partial
+/// frame.
+fn read_window_frames(
+    slot: &SortMergeSlot,
+    reader: &mut SortMergeReader,
+    want: usize,
+    pool: &Arc<SliceBufferPool>,
+) -> io::Result<(Vec<RawFrame>, bool)> {
+    let len = slot.len();
+    while reader.pending.len() < want && reader.next_offset < len {
+        let window = (want as u64 * window_bytes_per_frame()).min(len - reader.next_offset);
+        let window = usize::try_from(window).expect("a read window fits usize");
+        let mut buf = pool.take(window);
+        read_at_exact(&**slot.source(), &mut buf, reader.next_offset)?;
+        reader.next_offset += window as u64;
+        let lease = pool.lease(buf);
+        let mut frames = Vec::new();
+        reader.parser.push(&lease, &mut frames)?;
+        reader.pending.extend(frames.into_iter().map(|f| match f {
+            RawFrame::Owned(v) => RawFrame::Owned(v),
+            borrowed @ RawFrame::Borrowed { .. } => RawFrame::Owned(borrowed.bytes().to_vec()),
+        }));
+        if reader.next_offset == len {
+            reader.parser.finish()?;
+        }
+    }
+    let take = want.min(reader.pending.len());
+    let frames: Vec<RawFrame> = reader.pending.drain(..take).collect();
+    let hit_eof =
+        reader.next_offset == len && reader.parser.carry_len() == 0 && reader.pending.is_empty();
+    Ok((frames, hit_eof))
+}
 
 /// Tuning for the Phase-2 spill decompression granularity.
 ///
@@ -145,6 +214,8 @@ pub struct SortSpillDecompress {
     /// unparks the merge iff it is waiting on that file. `None` when the step
     /// runs without a merge to wake (unit tests that drive the step alone).
     demand: Option<Arc<fgumi_sort::MergeDemand>>,
+    /// Read buffers for the positional window reader, shared by every clone.
+    slices: Arc<SliceBufferPool>,
 }
 
 impl SortSpillDecompress {
@@ -186,6 +257,7 @@ impl SortSpillDecompress {
             tuning,
             window_budget,
             demand: None,
+            slices: SliceBufferPool::new(64),
         }
     }
 
@@ -376,28 +448,41 @@ impl SortSpillDecompress {
         }
         let want = room.min(self.tuning.block_batch);
 
-        let decompressed_batch =
-            match self.block_dec.read_blocks(&mut reader_guard.inner, slot.codec, want) {
-                Ok(b) => b,
-                Err(e) => {
-                    // Centralized in `mark_slot_failed` so failure semantics stay
-                    // in one place (see the block-parallel path's use of it).
-                    self.mark_slot_failed(slot);
-                    drop(reader_guard);
-                    return Err(e);
+        // Reads a window positionally and parses it under the reader lock, then
+        // decompresses inline.
+        let read = read_window_frames(slot, &mut reader_guard, want, &self.slices).and_then(
+            |(frames, hit_eof)| {
+                let mut out = Vec::with_capacity(frames.len());
+                for frame in &frames {
+                    out.push(self.block_dec.decompress_one(slot.codec, frame)?);
                 }
-            };
+                Ok((out, hit_eof))
+            },
+        );
+        let (decompressed_batch, hit_eof) = match read {
+            Ok(r) => r,
+            Err(e) => {
+                // Centralized in `mark_slot_failed` so failure semantics stay
+                // in one place (see the block-parallel path's use of it).
+                self.mark_slot_failed(slot);
+                drop(reader_guard);
+                return Err(e);
+            }
+        };
         let got = decompressed_batch.len();
-        let hit_eof = got < want;
 
         if got == 0 {
             {
                 let _g = slot.decompressed.lock().expect("decompressed mutex poisoned");
-                slot.queue_eof.store(true, Ordering::Release);
+                if hit_eof {
+                    slot.queue_eof.store(true, Ordering::Release);
+                }
             }
             drop(reader_guard);
-            self.notify(slot);
-            return Ok(true);
+            if hit_eof {
+                self.notify(slot);
+            }
+            return Ok(hit_eof);
         }
 
         {
@@ -405,6 +490,8 @@ impl SortSpillDecompress {
             for b in decompressed_batch {
                 dec.push_back(b);
             }
+            slot.fifo_len_mirror
+                .store(u32::try_from(dec.len()).unwrap_or(u32::MAX), Ordering::Relaxed);
             if hit_eof {
                 slot.queue_eof.store(true, Ordering::Release);
             }
@@ -467,22 +554,19 @@ impl SortSpillDecompress {
                         // reorder window. `want >= 1` since `fifo_room > 0`.
                         let want = self.tuning.block_batch.min(fifo_room);
                         let start_seq = reader_guard.next_seq;
-                        let raw = match self.block_dec.read_raw(
-                            &mut reader_guard.inner,
-                            slot.codec,
-                            want,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                self.mark_slot_failed(slot);
-                                drop(reader_guard);
-                                return Err(e);
-                            }
-                        };
+                        // Reads a window positionally and parses it under the
+                        // reader lock; EOF is the cursor at the end with nothing
+                        // carried or pending, never a short count.
+                        let (raw, hit_eof) =
+                            match read_window_frames(slot, &mut reader_guard, want, &self.slices) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    self.mark_slot_failed(slot);
+                                    drop(reader_guard);
+                                    return Err(e);
+                                }
+                            };
                         let got = raw.len();
-                        // EOF only when the reader returned fewer than we asked
-                        // for (`want`); a FIFO-limited short read is not EOF.
-                        let hit_eof = got < want;
                         // Stamp the read range and account for it BEFORE releasing
                         // the lock, so a concurrent worker observing EOF cannot
                         // race ahead of this batch's in-flight accounting. The
@@ -568,6 +652,7 @@ impl Clone for SortSpillDecompress {
             window_budget: self.window_budget,
             // Every clone notifies the one demand the merge awaits on.
             demand: self.demand.clone(),
+            slices: Arc::clone(&self.slices),
         }
     }
 }

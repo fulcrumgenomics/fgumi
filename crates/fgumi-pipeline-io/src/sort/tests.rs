@@ -869,6 +869,35 @@ fn three_step_chain_granularity_matrix_matches_legacy(
     #[case] file_granularity: bool,
     #[case] block_batch: usize,
 ) {
+    granularity_matrix_case(file_granularity, block_batch, SpillCodec::Zstd);
+}
+
+/// The positional window reader with windows small enough that frames
+/// straddle them (7 bytes per requested frame) and at its production size:
+/// frames carried across windows, EOF decided by position — for both spill
+/// codecs (a BGZF block's 18-byte header straddles a 7-byte window).
+#[rstest]
+#[case::file_b1_w7(true, 1, 7, SpillCodec::Zstd)]
+#[case::file_b3_w7(true, 3, 7, SpillCodec::Zstd)]
+#[case::block_b1_w7(false, 1, 7, SpillCodec::Zstd)]
+#[case::block_b3_w7(false, 3, 7, SpillCodec::Zstd)]
+#[case::file_b3_w64k(true, 3, 64 * 1024, SpillCodec::Zstd)]
+#[case::block_b3_w64k(false, 3, 64 * 1024, SpillCodec::Zstd)]
+#[case::bgzf_block_b1_w7(false, 1, 7, SpillCodec::Bgzf)]
+#[case::bgzf_block_b3_w7(false, 3, 7, SpillCodec::Bgzf)]
+#[case::bgzf_block_b3_w64k(false, 3, 64 * 1024, SpillCodec::Bgzf)]
+fn three_step_chain_tiny_windows_match_legacy(
+    #[case] file_granularity: bool,
+    #[case] block_batch: usize,
+    #[case] window_per_frame: u64,
+    #[case] codec: SpillCodec,
+) {
+    crate::sort::spill_decompress::WINDOW_BYTES_PER_FRAME_OVERRIDE
+        .store(window_per_frame, std::sync::atomic::Ordering::Relaxed);
+    granularity_matrix_case(file_granularity, block_batch, codec);
+}
+
+fn granularity_matrix_case(file_granularity: bool, block_batch: usize, codec: SpillCodec) {
     let sort_order = SortOrder::Coordinate;
     let threads = 4;
     let (header, records) = synthesize_sized_records(30_000, 0x5EED_1234, 120);
@@ -879,7 +908,8 @@ fn three_step_chain_granularity_matrix_matches_legacy(
         .memory_limit(memory_limit)
         .threads(2)
         .output_compression(1)
-        .temp_compression(1);
+        .temp_compression(1)
+        .spill_codec(codec);
     let new_out = drive_sort_pipeline_tuned(
         sorter,
         &header,
@@ -888,7 +918,7 @@ fn three_step_chain_granularity_matrix_matches_legacy(
         threads,
         StepKind::Exclusive,
         SortDecompressTuning { file_granularity, block_batch },
-        SpillCodec::Zstd,
+        codec,
     )
     .expect("pipeline drives to completion");
 
@@ -1880,13 +1910,7 @@ fn gated_block(pos: usize) -> Vec<u8> {
 /// Two empty, open `SortMergeSlot`s over tempfiles (file ids 0 and 1).
 fn two_open_slots() -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
     (0..2u32)
-        .map(|file_id| {
-            Arc::new(fgumi_sort::SortMergeSlot::new(
-                file_id,
-                std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
-                SpillCodec::Bgzf,
-            ))
-        })
+        .map(|file_id| Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf)))
         .collect()
 }
 
@@ -2410,11 +2434,7 @@ fn stalled_after_one_record(
     .with_merge_demand(Arc::clone(demand));
     let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
     for file_id in 0..2u32 {
-        let slot = Arc::new(fgumi_sort::SortMergeSlot::new(
-            file_id,
-            std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
-            SpillCodec::Bgzf,
-        ));
+        let slot = Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
         slot.decompressed.lock().unwrap().push_back(gated_block(file_id as usize));
         probe.push_input(SortPhase2Event::SpillReady {
             slot,
