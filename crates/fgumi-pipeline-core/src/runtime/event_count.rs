@@ -57,7 +57,14 @@
 //! sharded liveness counter already does) so an idling worker's
 //! increment/decrement of `waiters` never false-shares with a producer's load.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+// The fence pair is loom's under `--cfg loom`, so `tests/loom_wake.rs` drives
+// the real `notify_one` as the producer half of the direct-park protocol. The
+// counters stay std atomics: the models never wait on the event-count.
+#[cfg(loom)]
+use loom::sync::atomic::fence;
+#[cfg(not(loom))]
+use std::sync::atomic::fence;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
@@ -73,8 +80,11 @@ const CACHE_LINE: usize = 128;
 /// A Vyukov event-count over a `parking_lot` `Mutex`/`Condvar`.
 ///
 /// Shared by all pool workers of one pipeline via `Arc`. Only present when
-/// `n_threads > 1`; the fused and scheduled single-thread paths pass `None` and
-/// keep their existing sleep-backoff idle.
+/// `n_threads > 1`. The scheduled single-thread path passes `None`: its lone
+/// worker idles on `park_timeout` (`BackoffPolicy::ParkedSleep`), where a
+/// Directed `WakePlan` unparks it as `Worker(0)`. The fused path builds no
+/// event-count and keeps its fixed sleep between idle passes: it is the run's
+/// only thread, so nothing else could wake it.
 pub struct PoolEventCount {
     /// Number of workers currently *armed or blocked* (between `prepare_wait`
     /// and the matching `wait`/`cancel_wait`). Read by `notify_one` on the hot
@@ -127,9 +137,27 @@ pub enum WaitOutcome {
     /// The generation had already moved by the time `wait` took the lock — work
     /// was published in the arm→wait window; the caller must re-poll, not sleep.
     Woken,
-    /// The condvar returned (a notify, a spurious wake, or the deadline). The
-    /// caller loops and re-polls regardless — spurious wakes are harmless.
-    Returned,
+    /// The condvar returned before the deadline (a notify or a spurious wake).
+    /// The caller re-polls regardless.
+    Notified,
+    /// The deadline elapsed with no notify — the self-heal timer fired. Counted
+    /// per worker as `ec_waits_timed_out`: a pool whose idle is mostly
+    /// timer-fed is the signature that the wakes it needs are not arriving.
+    TimedOut,
+}
+
+/// What a `notify_one` / `notify_all` did. Returned by value so the caller can
+/// count it when stats are on; the event-count itself keeps no counters (its
+/// hot path stays a fence + one load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// Nobody armed or parked: fence + load, no lock, no wake.
+    NoWaiters,
+    /// A waiter exists but the concurrency ceiling kept it parked
+    /// (`notify_one` only; `notify_all` is never gated).
+    Suppressed,
+    /// The generation was bumped under the lock and the condvar notified.
+    Woken,
 }
 
 impl PoolEventCount {
@@ -180,11 +208,11 @@ impl PoolEventCount {
     /// caller's publish (the successful queue push) and *before* the `waiters`
     /// load, so a worker that armed before the publish is seen here.
     #[inline]
-    pub fn notify_one(&self) {
+    pub fn notify_one(&self) -> NotifyOutcome {
         fence(Ordering::SeqCst);
         let waiters = self.waiters.0.load(Ordering::Relaxed);
         if waiters == 0 {
-            return;
+            return NotifyOutcome::NoWaiters;
         }
         // Ceiling gate: keep at most `ceiling` workers awake. `awake = n_pool −
         // waiters`; if we are already at/above the ceiling, do not wake another
@@ -195,11 +223,12 @@ impl PoolEventCount {
         // branch never suppresses a wake.
         let awake = self.n_pool.saturating_sub(waiters);
         if awake >= self.ceiling.0.load(Ordering::Relaxed) {
-            return;
+            return NotifyOutcome::Suppressed;
         }
         let _guard = self.lock.lock();
         self.generation.0.fetch_add(1, Ordering::Relaxed);
         self.cvar.notify_one();
+        NotifyOutcome::Woken
     }
 
     /// Producer side: wake *every* parked worker. Reserved for terminal /
@@ -207,14 +236,15 @@ impl PoolEventCount {
     /// one waiter may need to observe the transition. Same fence discipline as
     /// [`Self::notify_one`].
     #[inline]
-    pub fn notify_all(&self) {
+    pub fn notify_all(&self) -> NotifyOutcome {
         fence(Ordering::SeqCst);
         if self.waiters.0.load(Ordering::Relaxed) == 0 {
-            return;
+            return NotifyOutcome::NoWaiters;
         }
         let _guard = self.lock.lock();
         self.generation.0.fetch_add(1, Ordering::Relaxed);
         self.cvar.notify_all();
+        NotifyOutcome::Woken
     }
 
     /// Worker side, phase 1: register as a waiter and snapshot the generation.
@@ -251,8 +281,11 @@ impl PoolEventCount {
     ///
     /// Returns [`WaitOutcome::Woken`] if the generation had already advanced
     /// when the lock was taken (a notify raced into the arm→wait window — do not
-    /// block, re-poll immediately), else [`WaitOutcome::Returned`] after the
-    /// condvar wait (notify, spurious, or timeout — re-poll anyway).
+    /// block, re-poll immediately); otherwise blocks on the condvar and returns
+    /// [`WaitOutcome::Notified`] if it returned before the deadline (a notify
+    /// that signalled this waiter, or a spurious wake) or
+    /// [`WaitOutcome::TimedOut`] if the deadline elapsed without one.
+    /// The caller re-polls in every case.
     ///
     /// Consumes the `WaitKey` (see [`cancel_wait`](Self::cancel_wait) for why it
     /// is taken by value rather than by reference).
@@ -269,11 +302,16 @@ impl PoolEventCount {
             return WaitOutcome::Woken;
         }
         // `wait_for` may wake spuriously; the caller re-polls regardless, so a
-        // single wait (not a loop) is correct here.
-        let _ = self.cvar.wait_for(&mut guard, deadline);
+        // single wait (not a loop) is correct here. The timeout result is kept
+        // — it is the one bit that separates "a peer woke me" from "my timer
+        // fired", which the stats report per worker. `parking_lot` decides it
+        // under its bucket lock: a notify that signalled this waiter is never
+        // reported as a timeout. The shared generation cannot be used instead,
+        // since any notify moves it, whichever waiter it signalled.
+        let timed_out = self.cvar.wait_for(&mut guard, deadline).timed_out();
         drop(guard);
         self.waiters.0.fetch_sub(1, Ordering::Relaxed);
-        WaitOutcome::Returned
+        if timed_out { WaitOutcome::TimedOut } else { WaitOutcome::Notified }
     }
 }
 
@@ -334,14 +372,126 @@ mod tests {
 
     #[test]
     fn wait_times_out_when_no_notify() {
-        // With no notify, wait blocks until the deadline and returns Returned.
+        // With no notify, wait blocks until the deadline and returns TimedOut.
         let ec = PoolEventCount::new(32);
         let key = ec.prepare_wait();
         let start = std::time::Instant::now();
         let outcome = ec.wait(key, Duration::from_millis(30));
         assert!(start.elapsed() >= Duration::from_millis(25), "must block ~the deadline");
-        assert_eq!(outcome, WaitOutcome::Returned);
+        assert_eq!(outcome, WaitOutcome::TimedOut);
         assert_eq!(ec.waiters(), 0);
+    }
+
+    /// `wait` must distinguish a deadline expiry from a notify so the
+    /// driver can count `ec_waits_timed_out` vs `ec_waits_notified` — the
+    /// number that quantifies how much of the pool's idle is timer-fed.
+    #[test]
+    fn wait_reports_timed_out_without_a_notify() {
+        let ec = PoolEventCount::new(32);
+        let key = ec.prepare_wait();
+        assert_eq!(ec.wait(key, Duration::from_millis(20)), WaitOutcome::TimedOut);
+        assert_eq!(ec.waiters(), 0);
+    }
+
+    /// Two waiters blocked on short and long deadlines, one `notify_one`: the
+    /// signalled waiter reports `Notified`, and the other, which waits out its
+    /// own deadline, reports `TimedOut` although the shared generation moved
+    /// during its wait.
+    ///
+    /// No sleep decides the result. A waiter that took the lock before the
+    /// notify is inside `wait_for` when the notify runs (the notify bumps the
+    /// generation under that lock, so it cannot fall between the waiter's
+    /// generation check and its wait). One that had not reports `Woken`, a
+    /// path other tests cover, and the attempt is retried on a fresh count, as
+    /// is one where both deadlines ran out before the notify.
+    #[test]
+    fn one_notify_books_one_notified_and_one_timed_out() {
+        for _ in 0..100 {
+            let ec = Arc::new(PoolEventCount::new(4));
+            let waiter = |deadline_ms: u64| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ec = Arc::clone(&ec);
+                let h = thread::spawn(move || {
+                    let key = ec.prepare_wait();
+                    tx.send(()).unwrap();
+                    ec.wait(key, Duration::from_millis(deadline_ms))
+                });
+                rx.recv().unwrap();
+                h
+            };
+            let long = waiter(1_500);
+            let short = waiter(300);
+            // Only makes a `Woken` retry less likely; the outcome does not
+            // depend on it.
+            thread::yield_now();
+            let notified = ec.notify_one();
+            let mut outcomes = vec![long.join().unwrap(), short.join().unwrap()];
+            assert_eq!(ec.waiters(), 0);
+            if notified == NotifyOutcome::NoWaiters {
+                // Both deadlines ran out before the notify (a starved host):
+                // nobody was there to signal.
+                assert_eq!(outcomes, vec![WaitOutcome::TimedOut; 2]);
+                continue;
+            }
+            assert_eq!(notified, NotifyOutcome::Woken);
+            if outcomes.contains(&WaitOutcome::Woken) {
+                continue;
+            }
+            outcomes.sort_by_key(|o| *o == WaitOutcome::TimedOut);
+            assert_eq!(outcomes, vec![WaitOutcome::Notified, WaitOutcome::TimedOut]);
+            return;
+        }
+        panic!("no attempt had both waiters inside `wait_for` before the notify");
+    }
+
+    /// Arm a waiter on its own thread and return once it has called
+    /// `prepare_wait` (so `waiters() >= 1` holds by construction, not by elapsed
+    /// time). The waiter then blocks up to 30 s, so a lost wake still fails.
+    fn armed_waiter(ec: &Arc<PoolEventCount>) -> thread::JoinHandle<WaitOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let ec2 = Arc::clone(ec);
+        let h = thread::spawn(move || {
+            let key = ec2.prepare_wait();
+            tx.send(()).unwrap();
+            ec2.wait(key, Duration::from_secs(30))
+        });
+        rx.recv().unwrap();
+        h
+    }
+
+    /// A notify reaches an armed waiter. Whether the waiter was still between
+    /// `prepare_wait` and `wait` (→ `Woken`) or already inside the condvar
+    /// (→ `Notified`) is scheduling; both are "a peer woke me", and neither is
+    /// `TimedOut`. This cell exercises the `Notified` arm whenever the waiter
+    /// was already blocked; the deterministic half of the split is
+    /// `wait_reports_timed_out_without_a_notify`.
+    #[test]
+    fn notify_wakes_an_armed_waiter() {
+        let ec = Arc::new(PoolEventCount::new(32));
+        let h = armed_waiter(&ec);
+        assert_eq!(ec.notify_one(), NotifyOutcome::Woken, "an armed waiter must report Woken");
+        let o = h.join().expect("waiter joins");
+        assert!(matches!(o, WaitOutcome::Woken | WaitOutcome::Notified), "{o:?}");
+    }
+
+    /// The hot path stays a fence + load: with nobody parked the outcome is
+    /// `NoWaiters` and the lock is never taken (proved the same way as
+    /// `notify_one_with_no_waiters_is_a_noop_and_takes_no_lock`).
+    #[test]
+    fn notify_outcomes_name_the_three_paths() {
+        let ec = Arc::new(PoolEventCount::new(4));
+        let held = ec.lock.lock();
+        assert_eq!(ec.notify_one(), NotifyOutcome::NoWaiters);
+        assert_eq!(ec.notify_all(), NotifyOutcome::NoWaiters);
+        drop(held);
+
+        // One waiter armed, ceiling 1: awake = 3 >= 1 → Suppressed.
+        ec.set_ceiling(1);
+        let h = armed_waiter(&ec);
+        assert_eq!(ec.notify_one(), NotifyOutcome::Suppressed);
+        assert_eq!(ec.notify_all(), NotifyOutcome::Woken, "notify_all is never gated");
+        let o = h.join().expect("waiter joins");
+        assert!(matches!(o, WaitOutcome::Woken | WaitOutcome::Notified), "{o:?}");
     }
 
     #[test]
@@ -417,32 +567,27 @@ mod tests {
             });
 
             // Worker: arm, re-check the real condition, block only if no work.
-            let deadline = Duration::from_millis(500);
+            // The deadline only bounds a lost wakeup (which reports
+            // `TimedOut`); it is generous so a descheduled producer on a loaded
+            // host cannot fail a correct run.
+            let deadline = Duration::from_secs(5);
             let key = ec.prepare_wait();
             let outcome = if work.load(Ordering::SeqCst) == 1 {
                 ec.cancel_wait(key);
                 WaitOutcome::Woken
             } else {
-                // Blocked: a healthy notify (or spurious wake) frees us
-                // promptly; a *lost* wakeup would instead burn the full
-                // deadline and time out. `WaitOutcome::Returned` conflates
-                // notify and timeout, so it cannot tell them apart on its own —
-                // time the wait and assert it completed well within the
-                // deadline, which a timeout (lost wakeup) never does.
-                let start = std::time::Instant::now();
+                // Blocked: a healthy notify (or spurious wake) frees us; a
+                // *lost* wakeup burns the full deadline and reports `TimedOut`.
                 let outcome = ec.wait(key, deadline);
-                assert!(
-                    start.elapsed() < deadline / 2,
-                    "blocked wait must complete promptly on notify, not time out (lost wakeup)"
-                );
+                assert_ne!(outcome, WaitOutcome::TimedOut, "a lost wakeup burns the full deadline");
                 outcome
             };
             producer.join().expect("producer joins");
             // Either the re-check saw the work, or the blocked wait returned
-            // well within the deadline (asserted above). Confirm the published
+            // before the deadline (asserted above). Confirm the published
             // work is visible on the way out.
             assert_eq!(work.load(Ordering::SeqCst), 1);
-            let _ = outcome;
+            assert_ne!(outcome, WaitOutcome::TimedOut);
             assert_eq!(ec.waiters(), 0);
         }
     }

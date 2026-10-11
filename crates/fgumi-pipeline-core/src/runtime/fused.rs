@@ -20,7 +20,7 @@
 //!
 //! Non-linear chains (two-input `Step2` merges like zipper, multi-output splits
 //! like `correct --rejects`) and `--threads ≥ 2` are not eligible and fall back
-//! to the scheduled [`run_worker_loop`](super::driver::run_worker_loop).
+//! to the scheduled `run_worker_loop`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -210,7 +210,8 @@ pub fn run_fused_single_thread(
     // background reader thread returns it legitimately — so failing on the first
     // idle pass aborts a healthy run and truncates its output. Tolerate idling
     // until this wall-clock budget is exhausted, which is what the scheduled path
-    // does via `WorkerCore::sleep_backoff`. That path has no stall limit at all
+    // does via its timer park (`park_timeout` of `WorkerCore::backoff_deadline`).
+    // That path has no stall limit at all
     // because the deadlock monitor catches wedges for it; the fused path is not
     // monitored, so it needs its own bound rather than hanging forever.
     //
@@ -371,6 +372,10 @@ pub fn run_fused_single_thread(
             break 'drive;
         }
     }
+    // The fused path takes no per-thread wake hint (it has no wake plan), but a
+    // held retry inside it still sets one (`BranchOutputHandle::retry` notes a
+    // flush): clear them so none leaks into this thread's next pipeline loop.
+    crate::runtime::wake_slot::clear_thread_flags();
 
     // `steps` (re-bound as a local after `contexts` above) drops before `contexts`
     // here by reverse-declaration order, keeping the typed-handle cache invariant.

@@ -3171,8 +3171,8 @@ impl<'a> ChainBuilder<'a> {
         // so 4 framework workers are the floor for steady-state progress; the
         // in-process bwa-mem3 backend needs only 1, which is what keeps
         // `--threads 1` eligible for the fused/inline path —
-        // `crate::pipeline::core::runtime::fused::should_fuse_single_thread`'s
-        // `n_threads == 1` precondition) — and fold its scheduler preference
+        // the `n_threads == 1` precondition of fgumi-pipeline-core's
+        // `should_fuse_single_thread`) — and fold its scheduler preference
         // into the automatic decision. Only ever set the flag true (mirrors the
         // grouping stages); the subprocess backend leaves it false, preserving
         // today's behavior. See `fold_align_wired_scheduling`'s doc comment for
@@ -6599,8 +6599,8 @@ pub(crate) fn chain_worker_floor(
 /// itself does not need drain-first, matching `grouping_stage_wants_drain_first`.
 ///
 /// The subprocess backend's floor of 4 forces `n_threads >= 4` for any align
-/// chain, which forecloses `crate::pipeline::core::runtime::fused::
-/// should_fuse_single_thread`'s `n_threads == 1` precondition regardless of the
+/// chain, which forecloses the `n_threads == 1` precondition of
+/// `should_fuse_single_thread` (fgumi-pipeline-core) regardless of the
 /// user's `--threads` request. The in-process bwa-mem3 backend's floor of 1
 /// does not, which is what keeps `--threads 1` eligible for the fused/inline
 /// path (the chain still needs `is_fusible_chain` to hold over its concrete
@@ -7039,8 +7039,8 @@ mod tests {
     ///
     /// The `in_process_*` cases double as the `--threads 1` fusion smoke: a
     /// `min_workers` of 1 leaves the resolved floor at 1 (satisfying
-    /// `should_fuse_single_thread`'s `n_threads == 1` precondition,
-    /// `crate::pipeline::core::runtime::fused`), while `subprocess_*` shows its
+    /// the `n_threads == 1` precondition of fgumi-pipeline-core's
+    /// `should_fuse_single_thread`), while `subprocess_*` shows its
     /// floor of 4 always forecloses that path regardless of the requested thread
     /// count. Actually building the fused chain end-to-end needs a real backend
     /// (see above), so that is exercised by the env-gated real-index tests
