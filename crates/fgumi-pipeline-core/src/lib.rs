@@ -7,8 +7,9 @@
 //! drives them. Nothing here reads or writes sequencing data, so the dependency
 //! graph stays light (`ahash` / `crossbeam-queue` / `parking_lot` / `log`, plus
 //! `anyhow` for the one [`FinalizeHook::finalize`] return type and one
-//! `noodles::sam` type for the shared header handle) and the crate compiles
-//! fast in isolation.
+//! `noodles::sam` type for the shared header handle; `loom` only under
+//! `--cfg loom`, for the admission model check) and the crate compiles fast in
+//! isolation.
 //!
 //! The concrete steps that do the I/O and the computation live elsewhere and
 //! plug in by implementing [`Step`] (one input) or [`Step2`] (two inputs);
@@ -16,6 +17,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod admission;
 pub mod builder;
 pub mod erased;
 pub mod finalize;
@@ -25,16 +27,20 @@ pub mod held;
 pub mod item;
 pub mod liveness;
 pub mod outputs;
+mod padded;
 pub mod queues;
 pub mod reorder;
 pub mod runtime;
 pub mod signal;
 pub mod step;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing;
 pub mod topology;
 
 #[cfg(test)]
 mod tests;
 
+pub use admission::{CapPermit, PhaseCap, WholeCap, admit_input};
 pub use builder::{
     BuildError, Chain, DEFAULT_DEADLOCK_TIMEOUT_SECS, InstrumentationLevel, MultiChain2,
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,

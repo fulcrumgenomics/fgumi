@@ -17,6 +17,7 @@
 //! the downstream writer can emit them verbatim.
 
 use std::io;
+use std::sync::Arc;
 
 use fgumi_bgzf::InlineBgzfCompressor;
 
@@ -26,6 +27,7 @@ use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::{PhaseCap, admit_input};
 use crate::pipeline::steps::types::{
     BamIndexManifest, BgzfBlock, DecompressedBlock, RecordIndexEntry,
 };
@@ -53,6 +55,11 @@ pub struct BgzfCompress {
     /// When unset, the frame walk and per-physical-block length capture are
     /// skipped entirely (zero overhead on the non-indexed path).
     index_bam: bool,
+    /// Admission cap for the standalone sort's merge phase (`--merge-threads`).
+    /// `None` (uncapped) by default; `ChainBuilder::add_sink` sets it only on the
+    /// standalone-sort terminal, so every other chain's output compressor is
+    /// untouched.
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl BgzfCompress {
@@ -65,6 +72,92 @@ impl BgzfCompress {
             held: HeldSlot::new(),
             output_byte_limit,
             index_bam,
+            cap: None,
+        }
+    }
+
+    /// Share a phase admission cap with the other pool steps of that phase.
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// One `try_run` with the phase cap moved out of `self` (see `try_run`).
+    fn run_once(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        cap: Option<&PhaseCap>,
+    ) -> io::Result<StepOutcome> {
+        if let Some(unpushed) = self.held.take() {
+            match ctx.outputs.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held.put(again);
+                    return Ok(StepOutcome::Contention);
+                }
+            }
+        }
+
+        // Admission (see the pipeline-core `admission` module): a capped step
+        // takes its phase permit BEFORE popping (an empty poll takes none and
+        // is recorded as an empty pop), so a refused clone leaves the item for
+        // a clone that may run and reports `Capped`. Uncapped, this is a no-op
+        // and the pop below runs exactly as without a cap. The permit is held
+        // to the end of this call.
+        let _permit = match admit_input(ctx.input, cap) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        let Some(parent) = ctx.input.pop() else {
+            // No input this call. If upstream is drained, every item has been
+            // processed (held output was flushed by the Contention preamble
+            // above) and this step will never push again — report Finished.
+            // For a Parallel step only the last clone to finish closes the
+            // shared output (gated by the StepDrainCounter in the driver).
+            if ctx.input.is_drained() {
+                return Ok(StepOutcome::Finished);
+            }
+            return Ok(StepOutcome::NoProgress);
+        };
+        let DecompressedBlock { batch_serial, bytes: input_bytes } = parent;
+        let uncompressed_size = u32::try_from(input_bytes.len()).unwrap_or(u32::MAX);
+
+        // Compress and harvest physical BGZF blocks.
+        self.compressor.write_all(&input_bytes)?;
+        self.compressor.flush()?;
+
+        // Build the index manifest from the ORIGINAL uncompressed input
+        // bytes (the framed BAM records), before they are consumed below —
+        // never from the compressed output.
+        let (bytes, index) = if self.index_bam {
+            let records = build_record_entries(&input_bytes);
+            let (bytes, phys_comp_len) = self.assemble_output_bytes_with_lens();
+            debug_assert_eq!(
+                phys_comp_len.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                bytes.len() as u64,
+                "physical block lengths must sum to the total compressed byte count"
+            );
+            debug_assert_eq!(
+                phys_comp_len.len(),
+                (uncompressed_size as usize).div_ceil(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE),
+                "one physical block per BGZF_MAX_BLOCK_SIZE-sized chunk of uncompressed input"
+            );
+            let index =
+                (!bytes.is_empty()).then(|| Box::new(BamIndexManifest { phys_comp_len, records }));
+            (bytes, index)
+        } else {
+            (self.assemble_output_bytes(), None)
+        };
+
+        let out = BgzfBlock { batch_serial, bytes, uncompressed_size, index };
+        match ctx.outputs.push(out) {
+            Ok(()) => Ok(StepOutcome::Progress),
+            Err(unpushed) => {
+                self.held.put(unpushed);
+                Ok(StepOutcome::Progress)
+            }
         }
     }
 }
@@ -78,6 +171,7 @@ impl Clone for BgzfCompress {
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
             index_bam: self.index_bam,
+            cap: self.cap.clone(),
         }
     }
 }
@@ -196,75 +290,59 @@ impl Step for BgzfCompress {
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        if let Some(unpushed) = self.held.take() {
-            match ctx.outputs.retry(unpushed) {
-                Ok(()) => {}
-                Err(again) => {
-                    self.held.put(again);
-                    return Ok(StepOutcome::Contention);
-                }
-            }
-        }
-
-        let Some(parent) = ctx.input.pop() else {
-            // No input this call. If upstream is drained, every item has been
-            // processed (held output was flushed by the Contention preamble
-            // above) and this step will never push again — report Finished.
-            // For a Parallel step only the last clone to finish closes the
-            // shared output (gated by the StepDrainCounter in the driver).
-            if ctx.input.is_drained() {
-                return Ok(StepOutcome::Finished);
-            }
-            return Ok(StepOutcome::NoProgress);
-        };
-        let DecompressedBlock { batch_serial, bytes: input_bytes } = parent;
-        let uncompressed_size = u32::try_from(input_bytes.len()).unwrap_or(u32::MAX);
-
-        // Compress and harvest physical BGZF blocks.
-        self.compressor.write_all(&input_bytes)?;
-        self.compressor.flush()?;
-
-        // Build the index manifest from the ORIGINAL uncompressed input
-        // bytes (the framed BAM records), before they are consumed below —
-        // never from the compressed output.
-        let (bytes, index) = if self.index_bam {
-            let records = build_record_entries(&input_bytes);
-            let (bytes, phys_comp_len) = self.assemble_output_bytes_with_lens();
-            debug_assert_eq!(
-                phys_comp_len.iter().map(|&n| u64::from(n)).sum::<u64>(),
-                bytes.len() as u64,
-                "physical block lengths must sum to the total compressed byte count"
-            );
-            debug_assert_eq!(
-                phys_comp_len.len(),
-                (uncompressed_size as usize).div_ceil(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE),
-                "one physical block per BGZF_MAX_BLOCK_SIZE-sized chunk of uncompressed input"
-            );
-            let index =
-                (!bytes.is_empty()).then(|| Box::new(BamIndexManifest { phys_comp_len, records }));
-            (bytes, index)
-        } else {
-            (self.assemble_output_bytes(), None)
-        };
-
-        let out = BgzfBlock { batch_serial, bytes, uncompressed_size, index };
-        match ctx.outputs.push(out) {
-            Ok(()) => Ok(StepOutcome::Progress),
-            Err(unpushed) => {
-                self.held.put(unpushed);
-                Ok(StepOutcome::Progress)
-            }
-        }
+        // Moved out for the call: the permit borrows the cap while the block assembly
+        // needs `&mut self`. A move, so no reference-count traffic.
+        let cap = self.cap.take();
+        let outcome = self.run_once(ctx, cap.as_deref());
+        self.cap = cap;
+        outcome
     }
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The output compressor is phase-neutral: uncapped by default (every
+    /// non-sort chain's terminal shows no `cap=` token), capped only when the
+    /// builder hands it the standalone sort's phase-2 cap — and worker copies
+    /// share that same counter, not an equal-looking new one.
+    #[test]
+    fn phase_cap_is_none_by_default_and_shared_by_worker_copies() {
+        use crate::pipeline::core::{PhaseCap, Step};
+        let plain = BgzfCompress::new(1, 1 << 20, false);
+        assert!(plain.phase_cap().is_none(), "uncapped by default");
+
+        let cap = PhaseCap::new("sort-phase2", 2);
+        let capped = plain.with_phase_cap(Some(std::sync::Arc::clone(&cap)));
+        assert_eq!(capped.phase_cap().map(PhaseCap::describe).as_deref(), Some("sort-phase2(2)"));
+        let copy = capped.new_worker_copy();
+        let _p1 = cap.try_acquire().expect("1 of 2");
+        let _p2 = cap.try_acquire().expect("2 of 2");
+        assert!(
+            copy.phase_cap().expect("capped").try_acquire().is_none(),
+            "the worker copy shares the exhausted counter"
+        );
+    }
+
+    /// Output compression under `--merge-threads`: the phase-2 admission
+    /// contract.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        crate::pipeline::core::testing::assert_admission_contract(
+            "sort-phase2",
+            |cap| BgzfCompress::new(1, 1 << 20, false).with_phase_cap(cap),
+            DecompressedBlock { batch_serial: 0, bytes: b"ACGT".repeat(16) },
+        );
+    }
 
     #[test]
     fn profile_advertises_parallel_byordinal() {

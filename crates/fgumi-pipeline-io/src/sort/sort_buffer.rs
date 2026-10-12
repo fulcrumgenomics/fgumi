@@ -45,7 +45,7 @@ use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
 use crate::sort::{ArenaSortStrategy, CoordinateStrategy, QuerynameStrategy, TemplateStrategy};
 use crate::types::RecordBatch;
 use fgumi_pipeline_core::{
-    HeldRetry, Unpushed,
+    HeldRetry, PhaseCap, Unpushed,
     held::HeldSlot,
     outputs::Single,
     queues::QueueSpec,
@@ -76,6 +76,9 @@ struct ArenaAccum<S: ArenaSortStrategy> {
     memory_used: usize,
     total_records: u64,
     sort_threads: usize,
+    /// Phase-1 cap the per-run sort takes whole (`None` = uncapped);
+    /// see [`seal_under_cap`](crate::sort::arena_ingest::seal_under_cap).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl<S: ArenaSortStrategy> ArenaAccum<S> {
@@ -87,6 +90,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
             memory_used: 0,
             total_records: 0,
             sort_threads,
+            cap: None,
         }
     }
 
@@ -110,11 +114,21 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
     /// Seal the current run: wrap the filled arena in an `Arc`, sort + materialize
     /// via the strategy, and reset for the next run. Empty if nothing was pushed
     /// since the last seal.
-    fn take_sorted_chunk(&mut self) -> MemoryChunkErased {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Interrupted`] if the run was cancelled while the
+    /// seal waited for the phase cap; the run is then not sorted.
+    fn take_sorted_chunk(&mut self) -> io::Result<MemoryChunkErased> {
         let arena = std::mem::replace(&mut self.arena, SegmentedBuf::new());
         self.memory_used = 0;
         let arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
-        self.strategy.seal(arc, self.sort_threads)
+        crate::sort::arena_ingest::seal_under_cap(
+            &mut self.strategy,
+            self.cap.as_deref(),
+            arc,
+            self.sort_threads,
+        )
     }
 
     fn total_records(&self) -> u64 {
@@ -141,6 +155,14 @@ pub struct SortBufferConfig {
 
 impl SortBufferConfig {
     /// The subset of `sorter`'s configuration a [`SortBuffer`] reads.
+    ///
+    /// Takes the engine's own phase-1 count, which honours a `sort_threads`
+    /// override as-is (not capped by `threads`; see
+    /// [`RawExternalSorter::phase1_threads`]). No fgumi CLI path builds a
+    /// `SortBuffer` this way — the chain builder fills [`SortBufferConfig`]
+    /// directly from its `PhaseThreads` resolution (`min(--sort-threads,
+    /// pool)`) — so this engine-parity constructor is unaffected by that
+    /// contract and is used only by tests.
     #[must_use]
     pub fn from_sorter(sorter: &RawExternalSorter) -> Self {
         Self {
@@ -206,6 +228,18 @@ impl ChunkSorter {
         })
     }
 
+    /// Make every run that sorts in parallel take the whole of `cap` (see
+    /// [`seal_under_cap`](crate::sort::arena_ingest::seal_under_cap)).
+    fn set_phase_cap(&mut self, cap: Option<Arc<PhaseCap>>) {
+        let slot = match self {
+            Self::Coordinate(s) => &mut s.cap,
+            Self::Template(s) => &mut s.cap,
+            Self::QuerynameLex(s) => &mut s.cap,
+            Self::QuerynameNatural(s) => &mut s.cap,
+        };
+        *slot = cap;
+    }
+
     /// Push one record; `true` once the run hits the memory limit.
     fn push(&mut self, bam_bytes: &[u8]) -> Result<bool> {
         match self {
@@ -217,8 +251,10 @@ impl ChunkSorter {
     }
 
     /// Seal + materialize the current run into one erased chunk (empty if nothing
-    /// was pushed), resetting for the next run.
-    fn take_sorted_chunk(&mut self) -> MemoryChunkErased {
+    /// was pushed), resetting for the next run. Fails with
+    /// [`io::ErrorKind::Interrupted`] if the run was cancelled while waiting for
+    /// the phase cap.
+    fn take_sorted_chunk(&mut self) -> io::Result<MemoryChunkErased> {
         match self {
             Self::Coordinate(s) => s.take_sorted_chunk(),
             Self::Template(s) => s.take_sorted_chunk(),
@@ -241,8 +277,8 @@ impl ChunkSorter {
     /// narrow-key spills. Coordinate and queryname have a fixed key type, so their
     /// empty residual is dropped as before; with no spills there is nothing to
     /// disambiguate, so the fast path (single non-empty chunk) is preserved.
-    fn take_residual_chunks(&mut self, had_spills: bool) -> Vec<MemoryChunkErased> {
-        residual_chunks_for(self.take_sorted_chunk(), had_spills)
+    fn take_residual_chunks(&mut self, had_spills: bool) -> io::Result<Vec<MemoryChunkErased>> {
+        Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills))
     }
 
     fn total_records(&self) -> u64 {
@@ -290,13 +326,18 @@ fn ingest_batch_records(
     batch: &RecordBatch,
     pending: &mut VecDeque<SortChunkEvent>,
     next_seq: &mut u32,
-) -> (u64, Option<String>) {
+) -> (u64, Option<io::Error>) {
     let mut batch_records = 0u64;
     for record in batch.iter_record_bytes() {
         batch_records += 1;
         let buffer_full = match sorter.push(record) {
             Ok(full) => full,
-            Err(e) => return (batch_records, Some(format!("SortBuffer: push failed: {e:#}"))),
+            Err(e) => {
+                return (
+                    batch_records,
+                    Some(io::Error::other(format!("SortBuffer: push failed: {e:#}"))),
+                );
+            }
         };
         if buffer_full {
             // Seal the filled arena and stage it. We keep draining the rest
@@ -306,7 +347,12 @@ fn ingest_batch_records(
             // production a block-bounded `RecordBatch` is far below
             // `memory_limit`, so this fires at most once per batch (see the
             // module docs).
-            let chunk = sorter.take_sorted_chunk();
+            let chunk = match sorter.take_sorted_chunk() {
+                Ok(chunk) => chunk,
+                // Cancelled while the seal waited for the phase cap: the run
+                // was not sorted, so nothing is staged.
+                Err(e) => return (batch_records, Some(e)),
+            };
             if !chunk.is_empty() {
                 pending.push_back(SortChunkEvent::Spill {
                     seq: *next_seq,
@@ -345,6 +391,9 @@ pub struct SortBuffer {
     /// "Read records" tracker) so the ingest rate over time is visible under
     /// `RUST_LOG=info` — distinguishes a slow read path from a stalled one.
     ingest_progress: ProgressTracker,
+    /// Phase-1 cap the per-run sort takes whole, reported by
+    /// `phase_cap()` (`None` = uncapped).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl SortBuffer {
@@ -387,7 +436,20 @@ impl SortBuffer {
             output_byte_limit,
             affinity: Affinity::None,
             ingest_progress: ProgressTracker::new("Sort ingest records").with_interval(1_000_000),
+            cap: None,
         })
+    }
+
+    /// Make each run that sorts in parallel take the whole phase-1 cap the
+    /// pool steps share (see `seal_under_cap`), so sort + ingest stay within
+    /// `--sort-threads`. `None` leaves it uncapped.
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        if let Some(sorter) = self.sorter.as_mut() {
+            sorter.set_phase_cap(cap.clone());
+        }
+        self.cap = cap;
+        self
     }
 
     /// Override the affinity hint.
@@ -459,9 +521,9 @@ impl SortBuffer {
         // wall time is visible — a steady rate means the read path is the cost;
         // a bursty/stalling rate means downstream backpressure.
         self.ingest_progress.log_if_needed(batch_records);
-        if let Some(message) = push_error {
-            self.failed = Some(message.clone());
-            return Err(io::Error::other(message));
+        if let Some(error) = push_error {
+            self.failed = Some(error.to_string());
+            return Err(error);
         }
         Ok(true)
     }
@@ -473,14 +535,28 @@ impl SortBuffer {
     /// # Panics
     ///
     /// Panics if called twice (`self.sorter` already `None`).
-    fn finalize(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Interrupted`] if the run was cancelled while the
+    /// residual seal waited for the phase cap; nothing is published and the step
+    /// is poisoned.
+    fn finalize(&mut self) -> io::Result<()> {
         let mut sorter = self.sorter.take().expect("finalize called twice");
         let total_records = sorter.total_records();
         // `had_spills` keeps an EMPTY template-coordinate residual alive: it is
         // the only carrier of the `--key-types` narrowed-lane variant, without
         // which `SortMerge` falls back to the full 40-byte key and misreads the
         // spills. See `take_residual_chunks` for the authoritative rule.
-        let residual_chunks = sorter.take_residual_chunks(self.next_seq > 0);
+        let residual_chunks = match sorter.take_residual_chunks(self.next_seq > 0) {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                // Cancelled while the residual seal waited: nothing is
+                // published, and the step is poisoned so it cannot finalize.
+                self.failed = Some(e.to_string());
+                return Err(e);
+            }
+        };
         let memory_chunk_count =
             u32::try_from(residual_chunks.len()).expect("residual chunk count fits u32");
         for chunk in residual_chunks {
@@ -495,6 +571,7 @@ impl SortBuffer {
             total_records,
         });
         // `sorter` dropped here (releases the buffer + private rayon pool).
+        Ok(())
     }
 }
 
@@ -548,12 +625,16 @@ impl Step for SortBuffer {
                 return Ok(StepOutcome::NoProgress);
             }
             // Input fully drained — produce the residual + AllAnnounced.
-            self.finalize();
+            self.finalize()?;
             return Ok(self.emit_pending(ctx));
         }
 
         // Finalized and all events drained.
         Ok(StepOutcome::Finished)
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
@@ -645,12 +726,13 @@ mod tests {
         let (traversed, error) =
             ingest_batch_records(&mut sorter, &batch_of(&records), &mut pending, &mut next_seq);
 
-        let message = error.expect("a differing MI under --key-types none must be rejected");
+        let message =
+            error.expect("a differing MI under --key-types none must be rejected").to_string();
         assert!(message.starts_with("SortBuffer: push failed"), "unexpected message: {message}");
         assert_eq!(traversed, 2, "ingest stops at the offending record, not after the batch");
         assert_eq!(sorter.total_records(), 1, "only the accepted record reached the arena");
         // Borrowed, never moved out: the sorter is still usable afterwards.
-        assert_eq!(sorter.take_sorted_chunk().len(), 1);
+        assert_eq!(sorter.take_sorted_chunk().unwrap().len(), 1);
         assert!(pending.is_empty());
         assert_eq!(next_seq, 0);
     }

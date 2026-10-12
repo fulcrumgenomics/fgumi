@@ -29,7 +29,6 @@ use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
     TemplateRecordRef, TertKey32, parallel_radix_sort_template_refs, radix_sort_template_refs,
 };
-use crate::ref_sort::PARALLEL_SORT_THRESHOLD;
 use crate::run_bound::RunBound;
 use crate::{SpillCodec, frame_keyed_record_into, write_sorted_chunk_inmem};
 use fgumi_raw_bam::{RawRecordView, SamTag};
@@ -198,7 +197,7 @@ pub fn template_chunk_from_arena_refs<K: TemplateLaneKey>(
     mut refs: Vec<TemplateRecordRef<K>>,
     sort_threads: usize,
 ) -> InMemoryChunk<K> {
-    if sort_threads > 1 && refs.len() >= PARALLEL_SORT_THRESHOLD {
+    if crate::ref_sort::radix_sorts_in_parallel(refs.len(), sort_threads) {
         parallel_radix_sort_template_refs(&mut refs);
     } else {
         radix_sort_template_refs(&mut refs);
@@ -254,6 +253,10 @@ impl ArenaRefs {
 
     fn reserve(&mut self, n: usize) {
         with_arena_refs!(self, v => v.reserve(n));
+    }
+
+    fn len(&self) -> usize {
+        with_arena_refs!(self, v => v.len())
     }
 }
 
@@ -321,6 +324,12 @@ impl TemplateArenaAccumulator {
             pending_reserve: 0,
             sort_pool: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Refs accumulated for the current run (what the next seal sorts).
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.state.as_ref().map_or(0, |state| state.refs.len())
     }
 
     /// Reserve capacity for approximately `est_records` refs for the current run.

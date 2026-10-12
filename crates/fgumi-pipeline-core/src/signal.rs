@@ -109,6 +109,11 @@ pub struct PipelineSignal {
     /// alive past the run. Workers hold the strong `Arc` for the run's duration,
     /// so the upgrade always succeeds while a worker could be parked.
     event_count: OnceLock<std::sync::Weak<crate::runtime::event_count::PoolEventCount>>,
+    /// Phase caps of this run's steps, registered by `Pipeline::run`
+    /// (`PhaseCap::bind_signal`). A terminal transition wakes each live one so
+    /// a caller parked for a whole cap observes `is_done()` and gives up. Weak:
+    /// the signal must not keep a cap alive past the run.
+    caps: parking_lot::Mutex<Vec<std::sync::Weak<crate::admission::PhaseCap>>>,
 }
 
 impl PipelineSignal {
@@ -158,6 +163,18 @@ impl PipelineSignal {
         if let Some(ec) = self.event_count.get().and_then(std::sync::Weak::upgrade) {
             ec.notify_all();
         }
+        // Snapshot first: a cap's notify takes the cap's own lock, which must
+        // never be taken while holding the registry's.
+        let caps: Vec<_> = self.caps.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+        for cap in caps {
+            cap.notify_cancel();
+        }
+    }
+
+    /// Register a phase cap whose parked whole-cap caller a terminal
+    /// transition must wake (see `PhaseCap::bind_signal`).
+    pub(crate) fn register_cap(&self, cap: std::sync::Weak<crate::admission::PhaseCap>) {
+        self.caps.lock().push(cap);
     }
 
     /// First writer wins; later writers are silently dropped (the

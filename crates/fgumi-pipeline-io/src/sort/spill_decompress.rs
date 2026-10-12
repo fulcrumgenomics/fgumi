@@ -41,14 +41,13 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fgumi_sort::{SortMergeSlot, SpillBlockDecompressor};
 use parking_lot::Mutex;
 
 use crate::sort::protocol::{SortPhase1Event, SortPhase2Event};
 use fgumi_pipeline_core::{
-    Unpushed,
+    PhaseCap, Unpushed,
     held::HeldSlot,
     outputs::Single,
     queues::QueueSpec,
@@ -102,40 +101,23 @@ impl Default for SortDecompressTuning {
     }
 }
 
-/// CAS-acquire one decompress permit. `max == None` ⇒ unbounded (always succeeds).
-///
-/// Returns the [`DecompressPermit`] on success so ownership of the slot is
-/// encoded in the type: the count is released exactly once, when the returned
-/// permit drops, and acquisition cannot be separated from release. `None` ⇒ the
-/// cap is full and no slot was taken.
-#[must_use]
-fn try_acquire(active: &Arc<AtomicUsize>, max: Option<usize>) -> Option<DecompressPermit> {
-    let Some(max) = max else {
-        active.fetch_add(1, Ordering::AcqRel);
-        return Some(DecompressPermit { active: Arc::clone(active) });
-    };
-    let max = max.max(1);
-    let mut cur = active.load(Ordering::Acquire);
-    loop {
-        if cur >= max {
-            return None;
-        }
-        match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(DecompressPermit { active: Arc::clone(active) }),
-            Err(observed) => cur = observed,
-        }
-    }
+/// What [`SortSpillDecompress::scan_slots`] found.
+#[derive(Clone, Copy)]
+struct SlotScan {
+    /// Some registered slot has not reached its queue EOF.
+    alive: bool,
+    /// Some live slot has FIFO room, so a fill could do work.
+    fillable: bool,
 }
 
-/// RAII release of one decompress permit. Holds an OWNED `Arc` clone so it does
-/// not borrow `self` while `try_fill_some_slot(&mut self)` runs.
-struct DecompressPermit {
-    active: Arc<AtomicUsize>,
-}
-impl Drop for DecompressPermit {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
+/// What one admission-controlled fill attempt did.
+enum Fill {
+    /// A slot was filled.
+    Filled,
+    /// The phase cap refused this worker.
+    Refused,
+    /// Nothing to fill right now (or no slot is live).
+    Nothing,
 }
 
 struct RegisteredSpill {
@@ -150,12 +132,9 @@ pub struct SortSpillDecompress {
     block_dec: SpillBlockDecompressor,
     held: HeldSlot<Unpushed<SortPhase2Event>>,
     output_byte_limit: u64,
-    /// Shared admission counter: how many worker clones are currently inside the
-    /// decompress branch. Shared across all clones so the cap is global.
-    active: Arc<AtomicUsize>,
-    /// Maximum concurrent decompress workers. `None` ⇒ unbounded. Set from
-    /// `--merge-threads` (Phase-2 CPU control).
-    max_decompress: Option<usize>,
+    /// Phase-2 admission cap shared with the other merge-phase pool steps
+    /// (`None` = uncapped until the chain builder sets it).
+    cap: Option<Arc<PhaseCap>>,
     tuning: SortDecompressTuning,
     /// Per-slot reorder-window byte budget for the block-parallel path. Derived
     /// from `output_byte_limit` (one per-step byte budget per slot). Bounds the
@@ -198,18 +177,65 @@ impl SortSpillDecompress {
             block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_byte_limit,
-            active: Arc::new(AtomicUsize::new(0)),
-            max_decompress: None,
+            cap: None,
             tuning,
             window_budget,
         }
     }
 
-    /// Cap the number of concurrent spill-decompression workers (Phase-2 CPU
-    /// control via `--merge-threads`). `None` (default) leaves it unbounded.
+    /// One pass over the registry, under its lock and without cloning it:
+    /// whether any registered slot is still live (has not reached its queue
+    /// EOF), and whether any live slot has FIFO room — the only state in which
+    /// a fill (either path) can do work.
+    fn scan_slots(&self) -> SlotScan {
+        use std::sync::atomic::Ordering;
+        let mut scan = SlotScan { alive: false, fillable: false };
+        for entry in self.registry.lock().iter() {
+            let slot = &entry.slot;
+            if slot.queue_eof.load(Ordering::Acquire) {
+                continue;
+            }
+            scan.alive = true;
+            if slot.bp_fifo_room() > 0 {
+                scan.fillable = true;
+                break;
+            }
+        }
+        scan
+    }
+
+    /// Whether any registered slot has not reached its queue EOF — the
+    /// uncapped path's liveness check after a failed fill: one atomic load per
+    /// slot under the registry lock, no FIFO inspection.
+    fn any_slot_alive(&self) -> bool {
+        self.registry
+            .lock()
+            .iter()
+            .any(|entry| !entry.slot.queue_eof.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// One fill attempt under `cap` (moved out of `self` by the caller). A
+    /// poll with no fillable slot — none live, or every live slot's FIFO full —
+    /// takes no permit and is not a refusal, so idle clones never crowd the
+    /// output compressor sharing the phase-2 cap; otherwise the permit is held
+    /// across the fill. The uncapped path does not come here: it fills
+    /// directly and pays no scan.
+    fn fill_under_cap(&mut self, cap: &PhaseCap, scan: SlotScan) -> io::Result<Fill> {
+        if !scan.fillable {
+            return Ok(Fill::Nothing);
+        }
+        let Some(_permit) = cap.try_acquire() else {
+            return Ok(Fill::Refused);
+        };
+        Ok(if self.try_fill_some_slot()? { Fill::Filled } else { Fill::Nothing })
+    }
+
+    /// Share the phase-2 admission cap with the other merge-phase pool steps
+    /// (`--merge-threads`): at most `cap.max()` workers decompress spill
+    /// blocks / compress output at once.
     #[must_use]
-    pub fn with_max_concurrency(mut self, max: Option<usize>) -> Self {
-        self.max_decompress = max;
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
         self
     }
 
@@ -483,9 +509,8 @@ impl Clone for SortSpillDecompress {
             block_dec: SpillBlockDecompressor::new(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
-            // Share the SAME counter so the cap is global across all worker clones.
-            active: Arc::clone(&self.active),
-            max_decompress: self.max_decompress,
+            // Share the SAME cap so it is global across all worker clones.
+            cap: self.cap.clone(),
             tuning: self.tuning,
             window_budget: self.window_budget,
         }
@@ -530,24 +555,44 @@ impl Step for SortSpillDecompress {
             return Ok(StepOutcome::Progress);
         }
 
-        // 3. Greedy slot-fill, admission-controlled by --merge-threads.
-        // `_permit` stays live across the `try_fill_some_slot` call — let-chain
-        // bindings are in scope for the conditions that follow them — and drops at
-        // the end of this `if` whichever way the fill goes (and on the `?` early
-        // return), releasing the count.
-        if let Some(_permit) = try_acquire(&self.active, self.max_decompress)
-            && self.try_fill_some_slot()?
-        {
-            return Ok(StepOutcome::Progress);
+        // 3. Greedy slot-fill, admission-controlled by --merge-threads. The
+        // permit covers only the fill (spill read + decompress); the event
+        // forwarding above is bookkeeping and stays uncapped. Only a capped
+        // poll scans the registry (once per call, to decide whether to take a
+        // permit); the uncapped path fills directly, as before the cap existed.
+        //
+        // The cap is moved out for the fill: the permit borrows it while the
+        // fill needs `&mut self` (the decompressor), which a field borrow
+        // cannot split. A move, so no reference-count traffic.
+        let cap = self.cap.take();
+        let (fill, scan) = match cap.as_deref() {
+            None => {
+                let filled = self.try_fill_some_slot();
+                (filled.map(|f| if f { Fill::Filled } else { Fill::Nothing }), None)
+            }
+            Some(cap) => {
+                let scan = self.scan_slots();
+                (self.fill_under_cap(cap, scan), Some(scan))
+            }
+        };
+        self.cap = cap;
+        match fill? {
+            Fill::Filled => return Ok(StepOutcome::Progress),
+            Fill::Refused => return Ok(StepOutcome::Capped),
+            Fill::Nothing => {}
         }
 
-        // 4. No fill work.
-        let any_alive = self
-            .snapshot_registry()
-            .iter()
-            .any(|slot| !slot.queue_eof.load(std::sync::atomic::Ordering::Acquire));
-        if any_alive {
-            return Ok(StepOutcome::Contention);
+        // 4. No fill work. A capped poll that found every live slot full is
+        // idle, not contended; uncapped, a live slot is contention.
+        let outcome_if_alive = match scan {
+            Some(scan) if scan.alive => {
+                Some(if scan.fillable { StepOutcome::Contention } else { StepOutcome::NoProgress })
+            }
+            Some(_) => None,
+            None => self.any_slot_alive().then_some(StepOutcome::Contention),
+        };
+        if let Some(outcome) = outcome_if_alive {
+            return Ok(outcome);
         }
 
         if ctx.input.is_drained() {
@@ -558,6 +603,10 @@ impl Step for SortSpillDecompress {
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 

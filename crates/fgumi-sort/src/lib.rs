@@ -267,6 +267,7 @@ pub use reader::{
 };
 pub use ref_sort::{
     coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
+    radix_sorts_in_parallel,
 };
 pub use run_bound::{RunBound, format_run_formation};
 pub use run_consolidate::{

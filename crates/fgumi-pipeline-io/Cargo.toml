@@ -42,6 +42,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 # inherit, so a dev-dependency entry would be redundant.
 fgumi-raw-bam = { workspace = true, features = ["noodles", "test-utils"] }
 fgumi-sort = { workspace = true, features = ["test-utils"] }
+fgumi-pipeline-core = { workspace = true, features = ["test-utils"] }
 noodles = { workspace = true, features = ["bam", "sam"] }
 rstest = "0.26"
 proptest = "1.10"

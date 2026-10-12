@@ -62,14 +62,13 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::padded::Padded;
+
 /// Cache-line stride used to isolate the hot atomics from each other and from
 /// any neighbouring fields. 128 bytes covers the 64-byte line plus the
 /// adjacent-line prefetch pairing on aarch64 and x86-64 (matches the padding
 /// the sharded liveness counter uses).
 const CACHE_LINE: usize = 128;
-
-#[repr(align(128))]
-struct Padded<T>(T);
 
 /// A Vyukov event-count over a `parking_lot` `Mutex`/`Condvar`.
 ///

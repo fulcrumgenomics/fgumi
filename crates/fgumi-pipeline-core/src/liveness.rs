@@ -56,15 +56,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cache-line padding. 128 rather than 64 because Apple Silicon and some `x86_64`
-/// prefetchers pair adjacent 64-byte lines, so a 64-byte stride can still share
-/// a coherence unit.
-const CACHE_LINE_BYTES: usize = 128;
+use crate::padded::Padded;
 
-#[repr(align(128))]
-struct PaddedCounter(AtomicU64);
-
-const _: () = assert!(std::mem::size_of::<PaddedCounter>() == CACHE_LINE_BYTES);
+/// One slot per worker, each alone on its line (see [`Padded`]).
+type PaddedCounter = Padded<AtomicU64>;
 
 /// Per-worker progress counters, summed by the deadlock monitor.
 pub struct LivenessCounter {
@@ -88,7 +83,7 @@ impl LivenessCounter {
         // dividing. The slack is a few unused cache lines — irrelevant next to
         // removing a division from a per-dispatch path.
         let n = n_workers.max(1).next_power_of_two();
-        Self { slots: (0..n).map(|_| PaddedCounter(AtomicU64::new(0))).collect(), mask: n - 1 }
+        Self { slots: (0..n).map(|_| Padded(AtomicU64::new(0))).collect(), mask: n - 1 }
     }
 
     /// Record one unit of progress for `worker`.
@@ -203,7 +198,7 @@ mod tests {
         let b = std::ptr::from_ref(&counter.slots[1]) as usize;
         assert_eq!(
             b - a,
-            CACHE_LINE_BYTES,
+            128,
             "adjacent slots must be a full cache line apart or they false-share",
         );
     }

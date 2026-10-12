@@ -15,10 +15,29 @@ log = { workspace = true }
 noodles = { workspace = true, features = ["sam"] }
 parking_lot = { workspace = true }
 
+[features]
+# Test-only support (`testing::StepProbe`, `Pipeline::phase_caps`): never part
+# of a normal build. Enabled by dependents' dev-dependencies.
+test-utils = []
+
 [dev-dependencies]
 proptest = { workspace = true }
 rstest = { workspace = true }
 trybuild = { workspace = true }
 
+# loom is only compiled under `--cfg loom`. It is a *regular* (not dev)
+# dependency so `admission.rs` itself can swap its atomics and parking lock to
+# loom's under `#[cfg(loom)]` and have the REAL `PhaseCap` model-checked by
+# `tests/loom_admission.rs` (`#![cfg(loom)]` — empty under a normal build), as
+# `fgumi-sort` does for `merge_slots.rs`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
+
+[lints.rust]
+# `loom` is a config flag set only for the model-checking test targets (run via
+# `RUSTFLAGS="--cfg loom"`). Declare it so the unexpected-cfg lint stays quiet
+# under the normal `-D warnings` build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -3308,6 +3308,65 @@ fn help_lists_key_flags() {
     }
 }
 
+/// `--sort::sort-threads` above runall's `--threads` (unset ⇒ 1) warns once,
+/// naming the flag as typed, and is clamped — the same contract as standalone
+/// sort, from the runall arm. The clamped output is byte-identical (records;
+/// `@PG` aside) to an unclamped runall sort of the same input.
+#[test]
+fn runall_warns_when_sort_override_exceeds_threads() {
+    let tmp = TempDir::new().unwrap();
+    let input = unsorted_bam(tmp.path());
+    let run = |out: &Path, extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .env("RUST_LOG", "info")
+            .args([
+                "runall",
+                "--start-from",
+                "sort",
+                "--stop-after",
+                "sort",
+                "-i",
+                p(&input),
+                "-o",
+                p(out),
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "runall sort-only chain failed:\n{stderr}");
+        stderr
+    };
+    let reference = tmp.path().join("reference.bam");
+    let reference_stderr = run(&reference, &[]);
+    // Matched on the level and the flag name, not the wording, so a reworded
+    // warning cannot make the "no warning" checks pass vacuously.
+    let flag_warnings = |stderr: &str, flag: &str| {
+        stderr.lines().filter(|l| l.contains(" WARN ") && l.contains(flag)).count()
+    };
+    assert_eq!(
+        flag_warnings(&reference_stderr, "-threads"),
+        0,
+        "no override, no warning:\n{reference_stderr}"
+    );
+
+    let clamped = tmp.path().join("clamped.bam");
+    let stderr = run(&clamped, &["--sort::sort-threads", "8", "--sort::merge-threads", "1"]);
+    let sort_warnings =
+        stderr.lines().filter(|l| l.contains("--sort::sort-threads 8 exceeds --threads 1")).count();
+    assert_eq!(sort_warnings, 1, "exactly one clamp warning for --sort::sort-threads:\n{stderr}");
+    assert_eq!(
+        flag_warnings(&stderr, "merge-threads"),
+        0,
+        "an override within --threads must not warn:\n{stderr}"
+    );
+    assert_eq!(
+        decompressed_records_without_pg(&clamped),
+        decompressed_records_without_pg(&reference),
+        "clamped runall sort must be byte-identical to the unclamped one"
+    );
+}
+
 // ══════════════════════════════════ error paths ══════════════════════════════════
 
 #[test]

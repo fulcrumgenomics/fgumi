@@ -193,7 +193,9 @@ pub fn run_worker_loop(
                     // Nothing to do this call — yield out of the sticky loop
                     // back to round-robin. The step terminates via `Finished`,
                     // not a drain protocol.
-                    Ok(StepOutcome::NoProgress | StepOutcome::Contention) => break,
+                    Ok(StepOutcome::NoProgress | StepOutcome::Contention | StepOutcome::Capped) => {
+                        break;
+                    }
                     Err(io_err) => {
                         signal.record_error(PipelineError::Io { step: info.name, source: io_err });
                         break;
@@ -484,7 +486,7 @@ fn round_robin_dispatch(
             // Nothing to do this call. The step terminates by returning
             // `Finished` (handled below); `NoProgress`/`Contention` are idle
             // ticks — there is no separate drain protocol.
-            Ok(StepOutcome::NoProgress | StepOutcome::Contention) => {}
+            Ok(StepOutcome::NoProgress | StepOutcome::Contention | StepOutcome::Capped) => {}
             Ok(StepOutcome::Finished) => {
                 // Any step (source, mid, or sink) may report `Finished` once
                 // all its inputs are drained and it holds no buffered output.

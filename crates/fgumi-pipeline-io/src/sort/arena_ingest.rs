@@ -52,6 +52,7 @@ use fgumi_pipeline_core::step::{
     CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
 };
 use fgumi_pipeline_core::{HeldRetry, Unpushed};
+use fgumi_pipeline_core::{PhaseCap, admit_input};
 
 use crate::boundaries::bam_header_len;
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
@@ -765,6 +766,9 @@ pub struct InflateToArena {
     /// ISIZE / exact-fill checks always run; see
     /// [`fgumi_bgzf::decompress_into_slice_with_crc`].
     verify_crc: bool,
+    /// Admission cap shared with the other phase-1 pool steps (set by the
+    /// chain builder via `with_phase_cap`; `None` = uncapped).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl InflateToArena {
@@ -790,6 +794,69 @@ impl InflateToArena {
             held: HeldSlot::new(),
             output_byte_limit,
             verify_crc,
+            cap: None,
+        }
+    }
+
+    /// Share a phase admission cap with the other pool steps of this phase. At
+    /// most `cap.max()` workers are inside any of those steps at once. `None`
+    /// leaves the step uncapped.
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// One `try_run` with the phase cap moved out of `self` (see `try_run`).
+    fn run_once(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        cap: Option<&PhaseCap>,
+    ) -> io::Result<StepOutcome> {
+        // Retry any held output first (backpressure path — mirror BgzfDecompress).
+        if let Some(unpushed) = self.held.take() {
+            match ctx.outputs.retry(unpushed) {
+                Ok(()) => {}
+                Err(again) => {
+                    self.held.put(again);
+                    // `Contention` keeps the worker alive for retry — `NoProgress`
+                    // would let the framework silently drop the held item if input
+                    // is also drained.
+                    return Ok(StepOutcome::Contention);
+                }
+            }
+        }
+
+        // Admission (see the pipeline-core `admission` module): a capped step
+        // takes its phase permit BEFORE popping (an empty poll takes none and
+        // is recorded as an empty pop), so a refused clone leaves the item for
+        // a clone that may run and reports `Capped`. Uncapped, this is a no-op
+        // and the pop below runs exactly as without a cap. The permit is held
+        // to the end of this call.
+        let _permit = match admit_input(ctx.input, cap) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        let Some(block) = ctx.input.pop() else {
+            // No input this call.  If upstream is fully drained the held slot was
+            // already flushed by the Contention preamble above, so every item has
+            // been processed.  For a Parallel step only the last clone to finish
+            // closes the shared output (gated by StepDrainCounter in the driver).
+            if ctx.input.is_drained() {
+                return Ok(StepOutcome::Finished);
+            }
+            return Ok(StepOutcome::NoProgress);
+        };
+
+        let inflated = self.inflate_one(block)?;
+
+        match ctx.outputs.push(inflated) {
+            Ok(()) => Ok(StepOutcome::Progress),
+            Err(unpushed) => {
+                self.held.put(unpushed);
+                Ok(StepOutcome::Progress)
+            }
         }
     }
 
@@ -861,44 +928,23 @@ impl Step for InflateToArena {
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        // Retry any held output first (backpressure path — mirror BgzfDecompress).
-        if let Some(unpushed) = self.held.take() {
-            match ctx.outputs.retry(unpushed) {
-                Ok(()) => {}
-                Err(again) => {
-                    self.held.put(again);
-                    // `Contention` keeps the worker alive for retry — `NoProgress`
-                    // would let the framework silently drop the held item if input
-                    // is also drained.
-                    return Ok(StepOutcome::Contention);
-                }
-            }
-        }
-
-        let Some(block) = ctx.input.pop() else {
-            // No input this call.  If upstream is fully drained the held slot was
-            // already flushed by the Contention preamble above, so every item has
-            // been processed.  For a Parallel step only the last clone to finish
-            // closes the shared output (gated by StepDrainCounter in the driver).
-            if ctx.input.is_drained() {
-                return Ok(StepOutcome::Finished);
-            }
-            return Ok(StepOutcome::NoProgress);
-        };
-
-        let inflated = self.inflate_one(block)?;
-
-        match ctx.outputs.push(inflated) {
-            Ok(()) => Ok(StepOutcome::Progress),
-            Err(unpushed) => {
-                self.held.put(unpushed);
-                Ok(StepOutcome::Progress)
-            }
-        }
+        // Moved out for the call: the permit borrows the cap while `inflate_one`
+        // needs `&mut self`. A move, so no reference-count traffic.
+        let cap = self.cap.take();
+        let outcome = self.run_once(ctx, cap.as_deref());
+        self.cap = cap;
+        outcome
     }
 
     fn new_worker_copy(&self) -> Self {
-        Self::new_with_crc(self.output_byte_limit, self.verify_crc)
+        Self {
+            cap: self.cap.clone(),
+            ..Self::new_with_crc(self.output_byte_limit, self.verify_crc)
+        }
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.cap.as_deref()
     }
 }
 
@@ -931,9 +977,15 @@ pub trait ArenaSortStrategy: Send + 'static {
     /// template-coordinate dropped-lane violation). Coordinate never errors.
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()>;
 
-    /// Sort the refs accumulated for this run and wrap `arena` into the erased
-    /// chunk (zero record copies), resetting the accumulator for the next run.
+    /// Sort the refs accumulated for this run on `sort_threads` threads and wrap
+    /// `arena` into the erased chunk (zero record copies), resetting the
+    /// accumulator for the next run.
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased;
+
+    /// Whether sealing the refs accumulated so far would sort on more than one
+    /// thread at `sort_threads` — what decides whether the seal must take the
+    /// whole phase cap (see `seal_under_cap`).
+    fn sorts_in_parallel(&self, sort_threads: usize) -> bool;
 
     /// A fresh, empty strategy carrying the same configuration — used to build a
     /// worker copy of the step. `FindBoundariesAndSort` is `Serial`, so this only
@@ -942,6 +994,42 @@ pub trait ArenaSortStrategy: Send + 'static {
     fn fresh(&self) -> Self
     where
         Self: Sized;
+}
+
+/// Seal one run under the phase-1 cap.
+///
+/// Uncapped: the sort runs at its full `sort_threads` width. Capped (an
+/// explicit `--sort-threads`): when the run sorts in parallel, the per-run
+/// sort is phase-1 work on its own rayon threads beside the pool steps that
+/// share the cap, so it takes the whole cap ([`PhaseCap::acquire_whole`]) and
+/// sorts on exactly the cap's width — pool admission pauses until it is done,
+/// and sort threads + inflate + spill-compression workers never exceed the cap
+/// together. A run that sorts on one thread takes no permit: it is the serial
+/// coordination thread's own work, which the cap does not count.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::Interrupted`] without sorting when the run is
+/// cancelled (or failed) while the seal waits for the cap.
+pub(crate) fn seal_under_cap<S: ArenaSortStrategy>(
+    strategy: &mut S,
+    cap: Option<&PhaseCap>,
+    arena: Arc<PooledSegmentedBuf>,
+    sort_threads: usize,
+) -> io::Result<MemoryChunkErased> {
+    let sort_threads = sort_threads.max(1);
+    match cap {
+        Some(cap) if strategy.sorts_in_parallel(sort_threads) => {
+            let whole = cap.acquire_whole().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "sort cancelled while waiting for its phase cap",
+                )
+            })?;
+            Ok(strategy.seal(arena, whole.width()))
+        }
+        _ => Ok(strategy.seal(arena, sort_threads)),
+    }
 }
 
 /// Coordinate-order strategy: extracts the fixed `u64` coordinate key inline and
@@ -982,6 +1070,10 @@ impl ArenaSortStrategy for CoordinateStrategy {
         MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(arena, refs, sort_threads))
     }
 
+    fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
+        fgumi_sort::radix_sorts_in_parallel(self.refs.len(), sort_threads)
+    }
+
     fn fresh(&self) -> Self {
         Self::new(self.n_ref)
     }
@@ -1020,6 +1112,10 @@ impl ArenaSortStrategy for TemplateStrategy {
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
         MemoryChunkErased::TemplateCoordinate(self.acc.seal(arena, sort_threads))
+    }
+
+    fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
+        fgumi_sort::radix_sorts_in_parallel(self.acc.pending_len(), sort_threads)
     }
 
     fn fresh(&self) -> Self {
@@ -1093,6 +1189,12 @@ impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
         });
         let wrap = self.wrap;
         pool.install(move || wrap(queryname_chunk_from_arena_refs(arena, refs)))
+    }
+
+    /// The comparator sort always runs inside the per-sort rayon pool, so it is
+    /// parallel whenever that pool has more than one thread.
+    fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
+        sort_threads > 1
     }
 
     fn fresh(&self) -> Self {
@@ -1177,6 +1279,9 @@ pub struct FindBoundariesAndSort<S: ArenaSortStrategy> {
     total_records: u64,
     /// Number of runs that sealed to a disk spill (all runs except the final one).
     spilled_run_count: u32,
+    /// Phase-1 cap the per-run sort takes whole (`None` = uncapped);
+    /// see [`seal_under_cap`].
+    radix_cap: Option<Arc<PhaseCap>>,
 }
 
 impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
@@ -1212,7 +1317,17 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
             next_seq: 0,
             total_records: 0,
             spilled_run_count: 0,
+            radix_cap: None,
         }
+    }
+
+    /// Make a run that sorts in parallel take the whole phase-1 cap the pool
+    /// steps share, so sort + inflate + spill compression together stay within
+    /// `--sort-threads` (see `seal_under_cap`). `None` leaves it uncapped.
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.radix_cap = cap;
+        self
     }
 
     /// Ingest one `InflatedBlock`, extending the current run's contiguous arena span
@@ -1478,7 +1593,12 @@ impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
 
         // Sort the refs accumulated across this run's blocks and wrap the arena into
         // the erased chunk — no record copies (keys were extracted during the scan).
-        let chunk = self.strategy.seal(Arc::clone(&arena), self.sort_threads);
+        let chunk = seal_under_cap(
+            &mut self.strategy,
+            self.radix_cap.as_deref(),
+            Arc::clone(&arena),
+            self.sort_threads,
+        )?;
 
         // Verify ReadBlocks and FindBoundariesAndSort are in lockstep on run
         // sequencing.  A desync here indicates a bug in the pipeline wiring (e.g.
@@ -1697,7 +1817,14 @@ impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
     }
 
     fn new_worker_copy(&self) -> Self {
-        Self::new(self.strategy.fresh(), self.sort_threads, self.output_byte_limit)
+        Self {
+            radix_cap: self.radix_cap.clone(),
+            ..Self::new(self.strategy.fresh(), self.sort_threads, self.output_byte_limit)
+        }
+    }
+
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.radix_cap.as_deref()
     }
 }
 
@@ -1711,6 +1838,7 @@ mod tests {
     use fgumi_sort::{CoordinateChunkSorter, PooledSegmentedBuf, SegmentedBuf};
     use rstest::rstest;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // -----------------------------------------------------------------------
     // Test helpers shared across ReadBlocks and InflateToArena tests.
@@ -2652,8 +2780,9 @@ mod tests {
     /// Runtime proof that `--sort-threads` (Phase 1) controls the actual sort
     /// worker count, not just that it parses.
     ///
-    /// The chain builder resolves `--sort-threads` (falling back to `--threads`)
-    /// into `num_phase1_threads` and hands it to `FindBoundariesAndSort::new`,
+    /// The chain builder resolves `--sort-threads` (capped at, and defaulting
+    /// to, `--threads`) into the effective phase-1 count and hands it to
+    /// `FindBoundariesAndSort::new`,
     /// which forwards it to `strategy.seal(arena, self.sort_threads)`. The
     /// queryname strategy builds a bounded rayon pool sized to that value and runs
     /// the per-run comparator sort inside it — so the pool's thread count IS the
@@ -2809,5 +2938,158 @@ mod tests {
         let (item, _arena) =
             arena_block_for(with_flipped_crc(compress_one_block(&payload)), payload.len());
         assert_eq!(copy.inflate_one(item).is_ok(), !verify_crc);
+    }
+
+    /// What a probe strategy saw while it sorted.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SealSeen {
+        /// Threads the seal was asked to sort on.
+        threads: usize,
+        /// `cap.active()` during the sort.
+        active: usize,
+        /// Whether a pool step's `try_acquire` was refused during the sort.
+        pool_refused: bool,
+        /// Whether the pool holders had already dropped their permits.
+        pool_released: bool,
+    }
+
+    /// A strategy that records, at each seal, what [`SealSeen`] reports.
+    /// `parallel` is what it answers to `sorts_in_parallel`.
+    struct ActiveProbe {
+        cap: Arc<PhaseCap>,
+        parallel: bool,
+        released: Arc<AtomicBool>,
+        seen: Vec<SealSeen>,
+    }
+
+    impl ActiveProbe {
+        fn new(cap: &Arc<PhaseCap>, parallel: bool) -> Self {
+            Self {
+                cap: Arc::clone(cap),
+                parallel,
+                released: Arc::new(AtomicBool::new(true)),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl ArenaSortStrategy for ActiveProbe {
+        fn reserve_for_run(&mut self, _est_records: usize) {}
+        fn push_record(&mut self, _body: &[u8], _body_off: u64, _len: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn seal(
+            &mut self,
+            _arena: Arc<PooledSegmentedBuf>,
+            sort_threads: usize,
+        ) -> MemoryChunkErased {
+            let pool_released = self.released.load(Ordering::Acquire);
+            let active = self.cap.active();
+            let pool_refused = self.cap.try_acquire().is_none();
+            self.seen.push(SealSeen { threads: sort_threads, active, pool_refused, pool_released });
+            MemoryChunkErased::Coordinate(fgumi_sort::InMemoryChunk::default())
+        }
+        fn sorts_in_parallel(&self, _sort_threads: usize) -> bool {
+            self.parallel
+        }
+        fn fresh(&self) -> Self {
+            Self::new(&self.cap, self.parallel)
+        }
+    }
+
+    /// A capped parallel per-run sort holds the WHOLE phase-1 cap while it
+    /// sorts at the cap's width: it starts only after the pool holders dropped
+    /// their permits (the dropper sets `released` BEFORE releasing, so the
+    /// sort can only see `true` if it waited), sees every permit held, and a
+    /// pool step's `try_acquire` is refused while it sorts. Everything is
+    /// released afterwards.
+    #[test]
+    fn capped_parallel_seal_holds_the_whole_cap_while_it_sorts() {
+        let cap = PhaseCap::new("sort-phase1", 3);
+        // `Pipeline::run` binds every reported cap; this drives the seal directly.
+        let signal = fgumi_pipeline_core::signal::PipelineSignal::new();
+        cap.bind_signal_for_test(&signal);
+        let mut probe = ActiveProbe::new(&cap, true);
+        let whole =
+            |pool_released| SealSeen { threads: 3, active: 3, pool_refused: true, pool_released };
+
+        // An idle cap: the whole cap, at once.
+        seal_under_cap(&mut probe, Some(&cap), test_arena(), 3).unwrap();
+        assert_eq!(probe.seen.pop(), Some(whole(true)));
+        assert_eq!(cap.active(), 0, "released after the sort");
+
+        // Pool steps hold permits: the sort waits for both to be released,
+        // then holds all three.
+        probe.released.store(false, Ordering::Release);
+        let released = Arc::clone(&probe.released);
+        std::thread::scope(|scope| {
+            let held: Vec<_> = (0..2).map(|_| cap.try_acquire().expect("pool")).collect();
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                released.store(true, Ordering::Release);
+                drop(held);
+            });
+            seal_under_cap(&mut probe, Some(&cap), test_arena(), 3).unwrap();
+        });
+        assert_eq!(probe.seen.pop(), Some(whole(true)), "waited for the pool, then held all");
+        assert_eq!(cap.active(), 0);
+    }
+
+    /// A run that sorts on one thread does not take the whole cap — it would
+    /// stall every pool step for serial work — and neither does an uncapped
+    /// seal. Both sort at the configured width with no permit taken.
+    #[rstest]
+    #[case::capped_serial(true, false)]
+    #[case::uncapped_parallel(false, true)]
+    fn seal_takes_no_permit_when_serial_or_uncapped(#[case] capped: bool, #[case] parallel: bool) {
+        let cap = PhaseCap::new("sort-phase1", 3);
+        let mut probe = ActiveProbe::new(&cap, parallel);
+        let _pool = cap.try_acquire().expect("a pool step holds a permit");
+        seal_under_cap(&mut probe, capped.then_some(&*cap), test_arena(), 3).unwrap();
+        assert_eq!(
+            probe.seen.pop(),
+            Some(SealSeen { threads: 3, active: 1, pool_refused: false, pool_released: true }),
+            "did not wait for the pool holder, held nothing, did not block admission"
+        );
+    }
+
+    /// Cancel while a capped seal waits for the whole cap: the seal gives up
+    /// with `Interrupted` and the strategy never sorts.
+    #[test]
+    fn cancel_while_a_seal_waits_skips_the_sort() {
+        let cap = PhaseCap::new("sort-phase1", 2);
+        let signal = fgumi_pipeline_core::signal::PipelineSignal::new();
+        cap.bind_signal_for_test(&signal);
+        let held = cap.try_acquire().expect("a pool step holds a permit");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let seal_cap = Arc::clone(&cap);
+        let waiter = std::thread::spawn(move || {
+            let mut probe = ActiveProbe::new(&seal_cap, true);
+            let result = seal_under_cap(&mut probe, Some(&seal_cap), test_arena(), 2);
+            let _ = tx.send(result.map(|_| ()).map_err(|e| e.kind()));
+            probe.seen.len()
+        });
+        while cap.pending_reservations() == 0 {
+            std::thread::yield_now();
+        }
+        signal.cancel();
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("woken by cancel");
+        assert_eq!(result, Err(io::ErrorKind::Interrupted));
+        assert_eq!(waiter.join().unwrap(), 0, "no sort ran");
+        assert_eq!(cap.pending_reservations(), 0);
+        drop(held);
+    }
+
+    /// Inflate under `--sort-threads`: the phase-1 admission contract. The
+    /// arena backing the block stays alive for the whole check.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        let payload = b"CAPPED-INFLATE".repeat(20);
+        let (item, _arena) = arena_block_for(compress_one_block(&payload), payload.len());
+        fgumi_pipeline_core::testing::assert_admission_contract(
+            "sort-phase1",
+            |cap| InflateToArena::new(1 << 20).with_phase_cap(cap),
+            item,
+        );
     }
 }

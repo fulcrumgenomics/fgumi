@@ -8,8 +8,9 @@
 //!   edges (`mark_outputs_drained`) and drops it from the worklist.
 //! - `try_run` returns `Progress` when it pushed or held an item, `NoProgress`
 //!   when there's nothing useful to do this call (input empty but not drained,
-//!   no held items), and `Contention` when a Serial-step mutex is held by
-//!   another worker; the scheduler reroutes.
+//!   no held items), `Contention` when a Serial-step mutex is held by another
+//!   worker, and `Capped` when a `Parallel` step's shared [`PhaseCap`] refused
+//!   this worker; the scheduler reroutes either way.
 //!
 //! **Last-worker barrier for `Parallel` steps.** A `Parallel` step has N
 //! per-worker `Clone`s sharing one output queue and a single drained input
@@ -195,6 +196,11 @@ pub enum StepOutcome {
     NoProgress,
     /// Step's Serial-step mutex was contended; scheduler reroutes.
     Contention,
+    /// Work may exist, but the step's shared [`PhaseCap`] refused this worker
+    /// admission (see [`crate::admission`]). Scheduled exactly like
+    /// `Contention`; counted separately so a deliberately binding cap is not
+    /// reported as mutex thrash.
+    Capped,
     /// The step has drained all its input and holds no buffered output — it
     /// will never push again. The framework marks its output queues drained
     /// (counter-gated for `Parallel`) and drops it. See the `Finished`
@@ -219,6 +225,7 @@ use std::io;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
+use crate::admission::PhaseCap;
 // `StepCounters` is a leaf counter-handle (an `Option<Arc<[AtomicU64]>>` with no
 // runtime logic) that lives with its primary owner `ChainContexts` in
 // `runtime::contexts`; the ctx types below hold a `&StepCounters`. This one
@@ -267,6 +274,20 @@ pub trait InputHandle<T: Send + HeapSize + 'static>: Send + Sync {
     /// further items will arrive. Used by mid-steps and sinks to detect
     /// when to stop pulling.
     fn is_drained(&self) -> bool;
+
+    /// Returns `true` if no item is ready to pop right now. Non-blocking and
+    /// non-consuming: a capped step checks it before taking an admission
+    /// permit, so an idle poll never holds (or is refused) a permit. A `false`
+    /// is a hint, not a promise — another clone may pop the item first, so a
+    /// following `pop` can still return `None`.
+    fn is_empty(&self) -> bool;
+
+    /// Record that a step polled this input, found it empty and did not pop
+    /// (the capped-step admission preamble, which checks [`Self::is_empty`]
+    /// instead of popping). Counts toward the edge's empty-pop metric exactly
+    /// as an empty `pop` would, including skipping a reorder-blocked edge.
+    /// Default: no-op (an uninstrumented handle).
+    fn note_empty_poll(&self) {}
 }
 
 /// Handle to this step's output queues, shaped by `S::Outputs`.
@@ -372,6 +393,33 @@ pub trait Step: Send + Sized + 'static {
     /// slot layout, so keep it a stable `&'static` in a fixed order.
     fn counters(&self) -> &'static [CounterSpec] {
         &[]
+    }
+
+    /// The admission cap this step *instance* shares with the other steps of
+    /// its phase, if the chain builder gave it one; `None` means uncapped (the
+    /// default). Read by [`crate::Pipeline::dag`] (rendered as
+    /// `cap=<name>(<max>)`), so caps can be reviewed without running, and by
+    /// `Pipeline::run`, which binds the run's cancel signal to it. The builder,
+    /// not the step type, decides the phase: a `BgzfCompress` is capped on the
+    /// standalone-sort terminal and uncapped everywhere else.
+    ///
+    /// Two kinds of step report a cap, and each must take its permits from that
+    /// same cap, or the DAG would advertise a limit the step never applies:
+    ///
+    /// - **Pool steps** (the sort's ingest, inflate, spill compress and spill
+    ///   decompress steps, and the output compressor) take one permit per item
+    ///   through [`crate::admission::admit_input`] (or
+    ///   [`PhaseCap::try_acquire`](crate::admission::PhaseCap::try_acquire)
+    ///   around a narrower section).
+    /// - **Serial / Detached steps with off-pool parallel work** (`SortBuffer`
+    ///   and `FindBoundariesAndSort` for the per-run sort, `SortMerge` for the
+    ///   in-memory fast-path gather) take the whole cap for that work through
+    ///   [`PhaseCap::acquire_whole`](crate::admission::PhaseCap::acquire_whole),
+    ///   which may park the step until the cap's pool holders finish their
+    ///   current items. Their serial part (one worker or driver thread) is not
+    ///   counted against the cap.
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        None
     }
 
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns

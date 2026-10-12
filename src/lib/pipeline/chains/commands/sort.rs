@@ -47,11 +47,16 @@ pub(crate) struct SortSummaryFinalizeHook {
     pub(crate) spill_stats: Option<Arc<SpillRunStats>>,
     pub(crate) output_path: PathBuf,
     pub(crate) timer: OperationTimer,
+    /// The standalone sort's phase caps — one per explicit `--sort-threads` /
+    /// `--merge-threads` — reported as high-water marks. Empty when neither
+    /// flag was given (no cap exists).
+    pub(crate) phase_caps: Vec<Arc<fgumi_pipeline_core::PhaseCap>>,
 }
 
 impl FinalizeHook for SortSummaryFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let SortSummaryFinalizeHook { stats_slot, spill_stats, output_path, timer } = *self;
+        let SortSummaryFinalizeHook { stats_slot, spill_stats, output_path, timer, phase_caps } =
+            *self;
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
         info!("Records processed: {}", stats.total_records);
@@ -70,6 +75,28 @@ impl FinalizeHook for SortSummaryFinalizeHook {
                 );
             }
             info!("Merge sources: {}", spill.merge_sources());
+        }
+        if !phase_caps.is_empty() {
+            // `peak` = most workers inside the phase at once, against its
+            // limit; `deferred` = polls a worker made while the phase was full,
+            // retried later — normal (not an error) whenever the limit binds.
+            let described: Vec<String> = phase_caps
+                .iter()
+                .map(|cap| {
+                    format!(
+                        "{} peak {} of {}, deferred {}",
+                        cap.name(),
+                        cap.peak(),
+                        cap.max(),
+                        cap.refused()
+                    )
+                })
+                .collect();
+            info!(
+                "Phase caps (peak workers of the limit; deferred = polls that waited for a free \
+                 slot, normal when the limit binds): {}",
+                described.join("; ")
+            );
         }
         info!("Output: {}", output_path.display());
         timer.log_completion(stats.total_records);
@@ -296,6 +323,7 @@ mod tests {
             spill_stats: None,
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
+            phase_caps: Vec::new(),
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -332,6 +360,7 @@ mod tests {
             spill_stats: Some(spill),
             output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
+            phase_caps: Vec::new(),
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -342,6 +371,34 @@ mod tests {
                 "expected a '{expected}' log line; got: {logs:?}"
             );
         }
+    }
+
+    /// The summary names each phase cap's high-water mark so a run shows
+    /// whether `--sort-threads`/`--merge-threads` actually bound.
+    #[test]
+    fn sort_summary_reports_phase_cap_peaks() {
+        use fgumi_pipeline_core::PhaseCap;
+        let _session = capture_logs();
+        let phase1 = PhaseCap::new("sort-phase1", 4);
+        let phase2 = PhaseCap::new("sort-phase2", 16);
+        let held: Vec<_> = (0..3).map(|_| phase1.try_acquire().expect("permit")).collect();
+        drop(held);
+        let hook = SortSummaryFinalizeHook {
+            stats_slot: Arc::new(Mutex::new(Some(fgumi_sort::SortStats::default()))),
+            spill_stats: None,
+            output_path: PathBuf::from("out.bam"),
+            timer: OperationTimer::new("Sort"),
+            phase_caps: vec![phase1, phase2],
+        };
+        Box::new(hook).finalize().expect("finalize must succeed");
+        let logs = captured();
+        assert!(
+            logs.iter().any(|l| l
+                == "Phase caps (peak workers of the limit; deferred = polls that waited for a \
+                    free slot, normal when the limit binds): sort-phase1 peak 3 of 4, deferred \
+                    0; sort-phase2 peak 0 of 16, deferred 0"),
+            "got: {logs:?}"
+        );
     }
 
     // ── Sort phase timing (`=== Sort Phase Timing ===`) ──────────────────────
@@ -356,6 +413,7 @@ mod tests {
             progress_count: 0,
             no_progress_count: 0,
             contention_count: 0,
+            capped_count: 0,
             finished_count: 0,
             error_count: 0,
             total_run_ns,

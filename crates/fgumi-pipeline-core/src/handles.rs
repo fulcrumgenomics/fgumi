@@ -271,6 +271,13 @@ enum BranchInputInner<T: Send + HeapSize + 'static> {
 }
 
 impl<T: Send + HeapSize + 'static> BranchInputHandle<T> {
+    /// An uninstrumented input handle reading `queue` directly (no reorder
+    /// stage). Used by [`crate::testing::StepProbe`] to feed one step by hand.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn direct(queue: Arc<dyn ItemQueue<T>>) -> Self {
+        Self { inner: BranchInputInner::Direct(queue), metrics: None, record_item_bytes: false }
+    }
+
     /// Construct a zero-state input handle that is always empty and always
     /// drained, owning no backing queue. Used for source steps, whose input is
     /// implicitly drained from the start and never popped.
@@ -317,6 +324,30 @@ impl<T: Send + HeapSize + 'static> InputHandle<T> for BranchInputHandle<T> {
             BranchInputInner::Direct(q) => q.is_drained() && q.is_empty(),
             BranchInputInner::Ordered(stage) => stage.is_drained(),
             BranchInputInner::AlwaysDrained(_) => true,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        match &self.inner {
+            BranchInputInner::Direct(q) => q.is_empty(),
+            BranchInputInner::Ordered(stage) => stage.is_empty(),
+            BranchInputInner::AlwaysDrained(_) => true,
+        }
+    }
+
+    fn note_empty_poll(&self) {
+        // Free on an uninstrumented edge. On an instrumented ordered edge the
+        // reorder check below takes the stage's state lock once per idle
+        // capped poll — the same lock `pop`'s own empty path already takes, and
+        // only while `--pipeline-trace` metrics are on.
+        let Some(m) = &self.metrics else { return };
+        // Same exclusion as `pop`: an ordered edge whose next ordinal is
+        // missing while later ones are buffered is backlog, not starvation.
+        let reorder_blocked = match &self.inner {
+            BranchInputInner::Ordered(stage) => stage.has_buffered_items(),
+            BranchInputInner::Direct(_) | BranchInputInner::AlwaysDrained(_) => false,
+        };
+        if !reorder_blocked {
+            m.record_empty();
         }
     }
 }
@@ -1799,6 +1830,44 @@ mod handle_tests {
             1,
             "an empty pop with no buffered work is a true empty pop"
         );
+    }
+
+    /// A capped step's idle poll (`is_empty` instead of `pop`) still counts as
+    /// an empty pop on the edge, with the same reorder-blocked exclusion `pop`
+    /// applies — so starvation stats see capped steps' input edges.
+    #[test]
+    fn note_empty_poll_counts_like_an_empty_pop_except_when_reorder_blocked() {
+        use crate::runtime::metrics::EdgeMetrics;
+
+        let m = EdgeMetrics::new();
+        let direct = BranchInputHandle::<u32> {
+            inner: BranchInputInner::Direct(Arc::new(CountBoundedQueue::<u32>::new(4))),
+            metrics: Some(m.clone()),
+            record_item_bytes: false,
+        };
+        assert!(direct.is_empty());
+        direct.note_empty_poll();
+        assert_eq!(m.snapshot().pop_empties, 1, "an idle capped poll is an empty pop");
+
+        let transport: Arc<dyn ItemQueue<Sequenced<u32>>> =
+            Arc::new(CountBoundedQueue::<Sequenced<u32>>::new(8));
+        let stage = Arc::new(ReorderStage::new(transport));
+        let m = EdgeMetrics::new();
+        let ordered = BranchInputHandle {
+            inner: BranchInputInner::Ordered(stage.clone()),
+            metrics: Some(m.clone()),
+            record_item_bytes: false,
+        };
+        stage.try_push(1, 100).unwrap();
+        assert_eq!(ordered.pop(), None, "ordinal 0 missing; ordinal 1 now buffered");
+        assert!(ordered.is_empty(), "nothing poppable");
+        ordered.note_empty_poll();
+        assert_eq!(m.snapshot().pop_empties, 0, "reorder-blocked is backlog, not starvation");
+        stage.try_push(0, 50).unwrap();
+        assert_eq!(ordered.pop(), Some(50));
+        assert_eq!(ordered.pop(), Some(100));
+        ordered.note_empty_poll();
+        assert_eq!(m.snapshot().pop_empties, 1, "a genuinely empty ordered edge counts");
     }
 
     #[test]

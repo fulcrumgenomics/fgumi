@@ -240,7 +240,7 @@ aligner-bwa-mem3 = ["dep:bwa-mem3-rs", "mimalloc/override"]
 # removed in R6/C6; retained as the self dev-dependency's feature hook. Enabled
 # automatically for `cargo test` via the self dev-dependency below; never
 # enabled for a normal build.
-test-utils = []
+test-utils = ["fgumi-pipeline-core/test-utils"]
 
 [dev-dependencies]
 # Self dev-dependency: the only way to turn `test-utils` on for the integration
