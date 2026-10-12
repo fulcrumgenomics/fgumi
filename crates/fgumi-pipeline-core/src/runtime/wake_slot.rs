@@ -156,6 +156,31 @@ pub(crate) fn take_rejected() -> bool {
     REJECTED.with(|r| r.replace(false))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the reorder stash cap refused this thread's push and latched
+    /// it as a holder (`ItemQueue::note_rejected_holder`). Lets a test count the
+    /// parks of exactly the holders that latch made, apart from every other
+    /// holder and timer park.
+    static STASH_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test-only: mark the calling thread as latched by the reorder stash cap.
+#[cfg(test)]
+#[inline]
+pub(crate) fn note_stash_held() {
+    STASH_HELD.with(|r| r.set(true));
+}
+
+/// Test-only: whether the reorder stash cap latched this thread since the
+/// last call (the worker loop clears it at each pass and reads it at a timer
+/// park).
+#[cfg(test)]
+#[inline]
+pub(crate) fn take_stash_held() -> bool {
+    STASH_HELD.with(|r| r.replace(false))
+}
+
 /// Non-consuming peek at the flag [`take_rejected`] takes, for tests (same
 /// shape as [`cap_refused_pending`]).
 #[cfg(test)]

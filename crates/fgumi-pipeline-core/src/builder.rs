@@ -235,6 +235,11 @@ pub struct PipelineConfig {
     /// other's hook.
     #[cfg(test)]
     pub(crate) test_after_spawn: Option<AfterSpawnHook>,
+    /// Test support (this crate's tests only): this run's worker-loop hooks
+    /// and recorders (`runtime::driver::test_hooks`), handed to this run's
+    /// pool workers and drivers only. Per run, like `test_after_spawn`.
+    #[cfg(test)]
+    pub(crate) test_hooks: Option<Arc<crate::runtime::driver::test_hooks::TestHooks>>,
 }
 
 /// [`PipelineConfig::test_after_spawn`]'s callback.
@@ -302,6 +307,8 @@ impl Default for PipelineConfig {
             test_reorder_overflow_bytes: None,
             #[cfg(test)]
             test_after_spawn: None,
+            #[cfg(test)]
+            test_hooks: None,
         }
     }
 }
@@ -1392,6 +1399,10 @@ impl Pipeline {
         let n_threads = config.threads;
         #[cfg(test)]
         let after_spawn = config.test_after_spawn.clone();
+        #[cfg(test)]
+        let run_hooks: crate::runtime::driver::RunTestHooks = config.test_hooks.clone();
+        #[cfg(not(test))]
+        let run_hooks: crate::runtime::driver::RunTestHooks = ();
         let stats_arc = config.stats;
         let deadlock_timeout_secs = config.deadlock_timeout_secs;
         let scheduler = Arc::clone(&config.scheduler);
@@ -1922,6 +1933,9 @@ impl Pipeline {
                 let board_clone = worker_board.clone();
                 let wake_clone = Arc::clone(&wake);
                 let driver_override = idle_overrides.driver(driver_idx);
+                #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+                // `()` outside this crate's tests
+                let driver_hooks = run_hooks.clone();
                 let state_slot = n_threads + driver_idx;
                 let thread_name = crate::runtime::detached::driver_thread_name(
                     group.label(),
@@ -1958,6 +1972,7 @@ impl Pipeline {
                                     state_slot,
                                     &wake_clone,
                                     driver_override,
+                                    driver_hooks,
                                     crate::runtime::wake::DriverIdx(driver_idx),
                                 );
                             }))
@@ -1994,8 +2009,17 @@ impl Pipeline {
                 .expect("build_worker_storage with n_threads=1 returns one entry vec");
             debug_assert!(worker_entries.is_empty());
             let sticky_owner = sticky_owners[0];
-            let mut worker =
-                WorkerCore::new(0, sticky_owner).with_backoff_override(idle_overrides.worker(0));
+            // The lone worker owns every pinned step; with no event-count it
+            // idles on its timer, where a driver's directed wake unparks it.
+            let worker = WorkerCore::new(
+                0,
+                sticky_owner,
+                crate::runtime::worker_core::BackoffPolicy::ParkedSleep,
+            )
+            .with_backoff_override(idle_overrides.worker(0));
+            #[cfg(test)]
+            let worker = worker.with_test_hooks(run_hooks.clone());
+            let mut worker = worker;
             let mut entries_local = entries;
             // Defer a panic on the single-threaded fast path the same way the
             // multi-worker join loop does: capture the payload, signal
@@ -2021,7 +2045,6 @@ impl Pipeline {
                     worker_board.as_deref(),
                     0,
                     &wake,
-                    pinned_workers[0],
                 );
             })) {
                 signal_arc.cancel();
@@ -2046,6 +2069,9 @@ impl Pipeline {
                 let wake_clone = Arc::clone(&wake);
                 let pinned = pinned_workers[worker_id];
                 let override_us = idle_overrides.worker(worker_id);
+                #[allow(clippy::let_unit_value, clippy::clone_on_copy)]
+                // `()` outside this crate's tests
+                let worker_hooks = run_hooks.clone();
 
                 let handle = thread::Builder::new()
                     .name(format!("fgumi-worker-{worker_id}"))
@@ -2060,8 +2086,20 @@ impl Pipeline {
                             crate::runtime::wake_slot::current_thread(),
                         );
                         let _slot = crate::runtime::wake_slot::SlotGuard::enter(worker_id);
-                        let mut worker = WorkerCore::new(worker_id, sticky_owner)
+                        // Pinned workers idle on their timer and are
+                        // unparked directly; the rest wait on the event-count.
+                        let policy = if pinned {
+                            crate::runtime::worker_core::BackoffPolicy::ParkedSleep
+                        } else {
+                            crate::runtime::worker_core::BackoffPolicy::EventCount
+                        };
+                        let worker = WorkerCore::new(worker_id, sticky_owner, policy)
                             .with_backoff_override(override_us);
+                        #[cfg(test)]
+                        let worker = worker.with_test_hooks(worker_hooks);
+                        #[cfg(not(test))]
+                        let () = worker_hooks;
+                        let mut worker = worker;
                         let mut entries_local = entries;
                         // Catch a worker-loop panic so we can signal cancellation
                         // *before* unwinding. A peer parked in its retry loop on a
@@ -2087,7 +2125,6 @@ impl Pipeline {
                                     board_clone.as_deref(),
                                     worker_id,
                                     &wake_clone,
-                                    pinned,
                                 );
                             }))
                         {
@@ -2729,7 +2766,10 @@ fn wake_inputs(
 /// [`wake_inputs`] — the very pins `WakePlan::build` routes `Worker(w)` wakes
 /// by, which include every Exclusive owner) and every sticky owner. A pinned worker must not
 /// deep-park on the event-count: `notify_one` cannot target it, and the plan's
-/// direct `unpark` does not end an event-count wait.
+/// direct `unpark` does not end an event-count wait. In a multi-worker run,
+/// `Pipeline::run` builds these workers with `BackoffPolicy::ParkedSleep` and
+/// the rest with `BackoffPolicy::EventCount`; the lone worker of a one-worker
+/// run is always `ParkedSleep` (there is no event-count), pinned or not.
 fn timer_idle_workers(
     pinned_worker: &[Option<usize>],
     sticky_owners: &[Option<super::topology::StepIdx>],

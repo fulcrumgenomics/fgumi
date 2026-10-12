@@ -329,6 +329,8 @@ impl<T: Send + 'static> ItemQueue<T> for CountBoundedQueue<T> {
         if let Some(h) = self.holders.get() {
             h.record_current();
             note_held();
+            #[cfg(test)]
+            crate::runtime::wake_slot::note_stash_held();
         }
     }
 
@@ -833,6 +835,8 @@ impl<T: Send + HeapSize + 'static> ItemQueue<T> for ByteBoundedQueue<T> {
             if let Some(h) = &t.holders {
                 h.record_current();
                 note_held();
+                #[cfg(test)]
+                crate::runtime::wake_slot::note_stash_held();
             }
             if let Some(c) = &t.clock {
                 c.on_reject();
@@ -959,6 +963,8 @@ impl<T: Send + 'static> ItemQueue<T> for UnboundedQueue<T> {
         if let Some(h) = self.holders.get() {
             h.record_current();
             note_held();
+            #[cfg(test)]
+            crate::runtime::wake_slot::note_stash_held();
         }
     }
 }
