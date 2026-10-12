@@ -47,7 +47,7 @@ pub fn assign_exclusive_owners(
 ///   - `Serial sticky` + `Affinity::None` → no sticky owner (every worker
 ///     is eligible, so no single worker can drive sticky without starving
 ///     the others; we silently drop the sticky hint here).
-///   - `Parallel` steps are never sticky-driven (each worker has its own
+///   - `Parallel` steps are never sticky-driven (each host worker has its own
 ///     clone — sticky drive on one would not gate others).
 ///
 /// If two steps' sticky-ownership rules collide on the same worker, the first

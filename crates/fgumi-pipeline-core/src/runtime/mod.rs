@@ -9,6 +9,7 @@ pub mod event_count;
 pub(crate) mod fused;
 pub(crate) mod live;
 pub mod metrics;
+pub(crate) mod placement;
 pub(crate) mod pool;
 pub mod sampler;
 pub mod scheduler;

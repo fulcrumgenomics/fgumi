@@ -24,9 +24,10 @@
 //! 4. **Spill phase**: Compress and write sorted chunk to temp file
 //! 5. **Merge phase**: K-way merge of sorted temp files using a loser tree
 
-// Unsafe code is prohibited at the crate level. The sole approved exception is
-// `memory_probe::platform_ffi`, which is guarded by `#[allow(unsafe_code)]` on
-// that inner module. See CLAUDE.md "Approved non-stdlib FFI exceptions".
+// Unsafe code is prohibited at the crate level. Approved exceptions carry
+// #[allow(unsafe_code)] on the item: memory_probe::platform_ffi (CLAUDE.md
+// "Approved non-stdlib FFI exceptions") and the sort hot paths listed in CLAUDE.md
+// "Approved hot-path unsafe (sort engine)".
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -41,7 +42,7 @@ use tempfile::TempDir;
 
 // Sub-modules are crate-private except where a consumer needs to name the type
 // itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`,
-// `ref_sort`, `template_arena`).
+// `prefetch`, `ref_sort`, `sort_pool`, `template_arena`, `template_key`).
 // Everything else is re-exported at the crate root below.
 pub mod arena_pool;
 pub(crate) mod bgzf_io;
@@ -60,6 +61,7 @@ pub(crate) mod merge_trace;
 pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
+pub mod prefetch;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
@@ -71,7 +73,9 @@ pub(crate) mod run_bound;
 // via the re-export below.
 pub(crate) mod run_consolidate;
 pub mod segmented_buf;
+pub mod sort_pool;
 pub mod template_arena;
+pub mod template_key;
 // Block-granular spill compression kernel for the block-parallel spill steps
 // (`SpillGather`/`SpillCompress`/`SpillWrite`). Surfaced via the re-exports
 // below.
@@ -243,9 +247,9 @@ pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
 pub use external::MemorySources;
 pub use external::{
-    KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep, RawExternalSorter,
-    ReadStreams, cb_hasher, create_sort_temp_dirs, extract_template_key_inline,
-    format_thread_counts, open_spill_slot,
+    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep,
+    RawExternalSorter, ReadStreams, TemplateKeyVariant, cb_hasher, create_sort_temp_dirs,
+    extract_template_key_inline, format_thread_counts, open_spill_slot,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
@@ -261,6 +265,7 @@ pub use keys::{
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
 };
 pub use merge_slots::{PHASE2_DECOMP_CAP, SortMergeReader, SortMergeSlot};
+pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
@@ -274,12 +279,15 @@ pub use run_consolidate::{
     RunMergeProgress, RunMergeSpec, RunMergerDyn, SpillKeyKind, new_run_merger,
 };
 pub use segmented_buf::SegmentedBuf;
+pub use sort_pool::BoundedSortPool;
 pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
 pub use spill_block_reader::SpillBlockDecompressor;
 pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
 pub use template_arena::{
-    TemplateArenaAccumulator, TemplateMemChunk, template_chunk_from_arena_refs,
+    TemplateArenaAccumulator, TemplateArenaRefs, TemplateMemChunk, seal_template_refs,
+    template_chunk_from_arena_refs,
 };
+pub use template_key::{ExtractedRefs, KeyViolation, TemplateKeyContext, TemplateKeySeed};
 pub use tmp_dir_alloc::TmpDirAllocator;
 pub use verify::{VerifySummary, verify_sort_order};
 

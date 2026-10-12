@@ -1132,7 +1132,10 @@ impl Pipeline {
     /// embedded in error messages.
     ///
     /// A step with a `phase_cap()` renders `cap=<name>(<max>)` after its
-    /// branch count. Each step ends with a `wake:` line naming who its
+    /// branch count. A `Parallel` step with a non-default `pool_placement()`
+    /// renders `placement=<placement>` after that, and `host=driver(<label>)`
+    /// when, at this thread count, its single clone runs on its Detached
+    /// producer's driver. Each step ends with a `wake:` line naming who its
     /// `Progress` wakes. Wake targets are rendered for the default thread
     /// count; use [`Self::dag_at`] with the run's post-override
     /// `PipelineConfig::threads` for the routing a run will use.
@@ -1153,16 +1156,24 @@ impl Pipeline {
         let owners = super::runtime::assign_exclusive_owners(&self.steps, n_threads)
             .unwrap_or_else(|_| vec![None; self.steps.len()]);
         let (kinds, pinned) = wake_inputs(&self.steps, &owners, n_threads);
-        let driver_of = super::runtime::detached::driver_index_of(&self.steps);
-        let plan = super::runtime::wake::WakePlan::build(
+        let detached = super::runtime::detached::driver_index_of(&self.steps);
+        let hosts = super::runtime::placement::plan_parallel_hosts(
+            &self.steps,
+            &self.graph,
+            &detached,
+            n_threads,
+        );
+        super::runtime::placement::assert_excluded_workers_are_pinned(&hosts, &pinned, n_threads);
+        let plan = super::runtime::wake::WakePlan::build_with_hosts(
             &self.graph,
             &kinds,
             &pinned,
-            &driver_of,
+            &super::runtime::placement::wake_driver_of(&detached, &hosts),
             &[],
             super::runtime::wake::WakeEdges::NONE,
             None,
             n_threads,
+            &hosts,
         );
         let wake_lines = plan.dag_lines(&self.graph);
 
@@ -1199,6 +1210,23 @@ impl Pipeline {
             );
             if let Some(cap) = step.phase_cap() {
                 let _ = write!(s, " cap={}", cap.describe());
+            }
+            if step.kind() == super::step::StepKind::Parallel
+                && step.pool_placement() != super::step::PoolPlacement::AllWorkers
+            {
+                let _ = write!(s, " placement={:?}", step.pool_placement());
+                // Name the hosting driver by its label, as its thread is named:
+                // the driver's first step (chain order) is its primary.
+                if let Some(d) = hosts[idx].driver
+                    && let Some(primary) = detached.iter().position(|&x| x == Some(d))
+                {
+                    let primary = &self.steps[primary];
+                    let label = super::runtime::detached::driver_label(
+                        primary.detached_group(),
+                        primary.name(),
+                    );
+                    let _ = write!(s, " host=driver({label})");
+                }
             }
             if n_branches == 0 {
                 let _ = writeln!(s, " (sink)");
@@ -1261,7 +1289,6 @@ impl Pipeline {
             run_detached_driver, run_fused_single_thread, run_worker_loop,
             should_fuse_single_thread,
         };
-        use super::step::{DetachedGroup, StepKind};
         use super::topology::StepIdx;
 
         let Self { mut steps, graph, signal } = self;
@@ -1415,35 +1442,53 @@ impl Pipeline {
             apply_initial_queue_budget(&contexts.bounded_queues, total);
         }
 
-        // 3. Per-step drain counter — init N for Parallel, 1 otherwise.
-        let drain_counters: Vec<Arc<StepDrainCounter>> = steps
-            .iter()
-            .map(|step| {
-                let initial = match step.profile().kind {
-                    StepKind::Parallel => n_threads,
-                    // `Detached` runs on a single dedicated thread, so (like
-                    // `Serial`/`Exclusive`) exactly one finisher closes its
-                    // output edge.
-                    StepKind::Serial | StepKind::Exclusive | StepKind::Detached => 1,
-                };
-                StepDrainCounter::new(initial)
-            })
-            .collect();
-
-        // 3a. Extract `Detached` steps' real instances for their dedicated
+        // 3. Extract `Detached` steps' real instances for their dedicated
         // threads, leaving same-position placeholders so `build_worker_storage`
         // (which Skips Detached on every worker) and the `step_idx`-aligned
         // `ChainContexts` stay correct. The contexts were already built from
         // `&steps` above, so each extracted step's input/output handles live in
-        // `contexts[step_idx]`. Done before `build_worker_storage` consumes
-        // `steps`. Empty for every non-sort chain (nothing declares Detached).
-        // Each step's phase cap, read while every step is still in place (an
-        // extracted Detached step's placeholder reports none): the wake plan
-        // routes cap-parked wakes by the consumer's cap.
+        // `contexts[step_idx]`. Empty for every non-sort chain (nothing declares
+        // Detached). Each step's phase cap is read first, while every step is
+        // still in place (an extracted step's placeholder reports none): the
+        // wake plan routes cap-parked wakes by the consumer's cap, and every
+        // cap is bound below — including a hosted Parallel step's, whose real
+        // instance moves into its driver's group. Then plan where every
+        // Parallel step's clones run, and move hosted Parallel clones into their
+        // driver's group. Placement reads the driver map from `driver_index_of`
+        // — the numbering `extract_detached_steps` groups by, and the one
+        // `dag_at` uses — and the drain counters read placement, so they follow
+        // it. All of this precedes `build_worker_storage`, which consumes
+        // `steps`.
         let step_caps: Vec<Option<Arc<crate::PhaseCap>>> =
             steps.iter().map(|s| s.phase_cap().and_then(crate::PhaseCap::arc)).collect();
-        let detached_steps = extract_detached_steps(&mut steps);
+        let detached_driver_of = super::runtime::detached::driver_index_of(&steps);
+        let mut detached_steps = extract_detached_steps(&mut steps);
+        let hosts = crate::runtime::placement::plan_parallel_hosts(
+            &steps,
+            &graph,
+            &detached_driver_of,
+            n_threads,
+        );
+        crate::runtime::detached::extract_hosted_parallel_steps(
+            &mut steps,
+            &hosts,
+            &mut detached_steps,
+        );
+        crate::runtime::placement::assert_excluded_workers_are_pinned(
+            &hosts,
+            &pinned_worker,
+            n_threads,
+        );
         let n_detached = detached_steps.len();
+
+        // 3a. Per-step drain counter — `hosts[i].clone_count()` for Parallel, 1
+        // otherwise. Reads the cached `kind()` (a placeholder's `profile()`
+        // panics by design). INVARIANT (driver.rs): init == clone count.
+        let drain_counters: Vec<Arc<StepDrainCounter>> =
+            crate::runtime::placement::drain_counter_inits(&steps, &hosts)
+                .into_iter()
+                .map(StepDrainCounter::new)
+                .collect();
 
         let signal_arc = Arc::clone(&signal);
 
@@ -1465,23 +1510,22 @@ impl Pipeline {
         // (kinds and affinities come from the live steps; a Detached placeholder
         // still reports `Detached`). `Legacy` for every chain without a Detached
         // step. Bound to the signal so cancel unparks every registered thread.
+        // A hosted Parallel clone routes as its driver (`wake_driver_of`), and a
+        // `Pool` wake's direct-park and cap-parked fallbacks are limited to the
+        // consumer's host
+        // workers (`build_with_hosts`).
         let wake = {
-            use crate::runtime::wake::{DriverIdx, WakePlan};
-            let mut driver_of = vec![None; steps.len()];
-            for (d, g) in detached_steps.iter().enumerate() {
-                for idx in g.step_indices() {
-                    driver_of[idx.0] = Some(DriverIdx(d));
-                }
-            }
-            WakePlan::build(
+            use crate::runtime::wake::WakePlan;
+            WakePlan::build_with_hosts(
                 &graph,
                 &kinds,
                 &pinned_worker,
-                &driver_of,
+                &crate::runtime::placement::wake_driver_of(&detached_driver_of, &hosts),
                 &step_caps,
                 contexts.wake_edges(),
                 parker.clone(),
                 n_threads,
+                &hosts,
             )
         };
         signal_arc.bind_wake_plan(&wake);
@@ -1539,7 +1583,7 @@ impl Pipeline {
             });
 
         // 4. Build per-worker step storage (consumes `steps`).
-        let mut worker_entries = build_worker_storage(steps, &owners, n_threads);
+        let mut worker_entries = build_worker_storage(steps, &owners, n_threads, &hosts);
 
         // 4a. Optional deadlock-detection monitor. Spawns a watcher
         // thread that periodically samples the stats snapshot; if no
@@ -1778,12 +1822,10 @@ impl Pipeline {
                 let wake_clone = Arc::clone(&wake);
                 let driver_override = idle_overrides.driver(driver_idx);
                 let state_slot = n_threads + driver_idx;
-                let thread_name = match group.label() {
-                    DetachedGroup::Shared(label) => format!("fgumi-driver-{label}"),
-                    DetachedGroup::PerStep => {
-                        format!("fgumi-detached-{}", group.primary_name())
-                    }
-                };
+                let thread_name = crate::runtime::detached::driver_thread_name(
+                    group.label(),
+                    group.primary_name(),
+                );
                 thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
@@ -2553,9 +2595,10 @@ fn reorder_cap_for(per_queue: u64) -> u64 {
     per_queue.clamp(MIN_REORDER_OVERFLOW_BYTES, crate::reorder::DEFAULT_REORDER_OVERFLOW_BYTES)
 }
 
-/// Per-step inputs of [`crate::runtime::wake::WakePlan::build`] that come from
-/// the steps themselves: each step's kind, and the one pool worker that runs it
-/// (a `Serial` step's in-range affinity target, or an `Exclusive` step's owner).
+/// Per-step inputs of [`crate::runtime::wake::WakePlan::build_with_hosts`]
+/// that come from the steps themselves: each step's kind, and the one pool
+/// worker that runs it (a `Serial` step's in-range affinity target, or an
+/// `Exclusive` step's owner).
 /// Shared by `Pipeline::run` and `Pipeline::dag_at` so the two cannot disagree.
 fn wake_inputs(
     steps: &[Box<dyn ErasedStep>],
@@ -5901,5 +5944,761 @@ mod tests {
         assert_eq!(cfg.telemetry.as_ref().unwrap().stem, std::path::PathBuf::from("s"));
         let probe = cfg.rss_probe.expect("with_rss_probe sets the probe");
         assert_eq!(probe(), Some(123));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PoolPlacement: placement-aware storage, drain counters, hosting
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Serial source pinned to the reader worker (worker 0), emitting `1..=n`.
+    /// With `finish_after` set it reports `Finished` only once that counter
+    /// reaches `n`, so its `Finished` broadcast cannot stand in for a wake
+    /// under test.
+    struct ReaderSource {
+        next: u32,
+        n: u32,
+        finish_after: Option<Arc<AtomicU32>>,
+    }
+    impl ReaderSource {
+        fn new(n: u32) -> Self {
+            Self { next: 0, n, finish_after: None }
+        }
+    }
+    impl Step for ReaderSource {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ReaderSource",
+                kind: StepKind::Serial,
+                sticky: true,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn affinity(&self) -> crate::step::Affinity {
+            crate::step::Affinity::Reader
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            if self.next >= self.n {
+                if let Some(done) = &self.finish_after
+                    && done.load(AtomicOrd::Acquire) < self.n
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    return Ok(StepOutcome::NoProgress);
+                }
+                return Ok(StepOutcome::Finished);
+            }
+            match ctx.outputs.push(self.next + 1) {
+                Ok(()) => {
+                    self.next += 1;
+                    Ok(StepOutcome::Progress)
+                }
+                Err(_) => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// What the excluding step does at a given item.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Inject {
+        Nothing,
+        PanicAt(u32),
+        ErrAt(u32),
+    }
+
+    type Names = Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>;
+    type ThreadIds = Arc<parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>>;
+
+    /// Parallel pass-through that opts into `ExcludeReader` and records the name
+    /// (`None` names recorded as "<unnamed>") and the `ThreadId` of every thread
+    /// that ran it. The id tells unnamed threads apart; the name does not.
+    #[derive(Clone)]
+    struct ExcludingPassThrough {
+        threads: Names,
+        ids: ThreadIds,
+        held: Option<u32>,
+        inject: Inject,
+    }
+    impl ExcludingPassThrough {
+        fn new(threads: &Names, inject: Inject) -> Self {
+            Self { threads: Arc::clone(threads), ids: Arc::default(), held: None, inject }
+        }
+        fn with_ids(self, ids: &ThreadIds) -> Self {
+            Self { ids: Arc::clone(ids), ..self }
+        }
+    }
+    impl Step for ExcludingPassThrough {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ExcludingPassThrough",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn pool_placement(&self) -> crate::step::PoolPlacement {
+            crate::step::PoolPlacement::ExcludeReader
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            self.threads
+                .lock()
+                .insert(std::thread::current().name().unwrap_or("<unnamed>").to_owned());
+            self.ids.lock().insert(std::thread::current().id());
+            if let Some(v) = self.held.take() {
+                return match ctx.outputs.push(v) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                };
+            }
+            match ctx.input.pop() {
+                Some(v) => {
+                    match self.inject {
+                        Inject::PanicAt(at) if at == v => panic!("injected panic at item {v}"),
+                        Inject::ErrAt(at) if at == v => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("injected error at item {v}"),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    match ctx.outputs.push(v) {
+                        Ok(()) => Ok(StepOutcome::Progress),
+                        Err(u) => {
+                            self.held = Some(u.into_item());
+                            Ok(StepOutcome::Progress)
+                        }
+                    }
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { held: None, ..self.clone() }
+        }
+    }
+
+    /// Move one item from `input` to `outputs`, re-offering a held one first.
+    fn pass_one(
+        held: &mut Option<u32>,
+        input: &dyn crate::step::InputHandle<u32>,
+        outputs: &crate::step::OutputHandles<Single<u32>>,
+    ) -> StepOutcome {
+        if let Some(v) = held.take() {
+            return match outputs.push(v) {
+                Ok(()) => StepOutcome::Progress,
+                Err(u) => {
+                    *held = Some(u.into_item());
+                    StepOutcome::NoProgress
+                }
+            };
+        }
+        match input.pop() {
+            Some(v) => {
+                if let Err(u) = outputs.push(v) {
+                    *held = Some(u.into_item());
+                }
+                StepOutcome::Progress
+            }
+            None if input.is_drained() => StepOutcome::Finished,
+            None => StepOutcome::NoProgress,
+        }
+    }
+
+    /// Detached pass-through on a shared driver labelled "coordtest".
+    struct CoordPassThrough {
+        held: Option<u32>,
+    }
+    impl Step for CoordPassThrough {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CoordPassThrough",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn detached_group(&self) -> crate::step::DetachedGroup {
+            crate::step::DetachedGroup::Shared("coordtest")
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            Ok(pass_one(&mut self.held, ctx.input, ctx.outputs))
+        }
+    }
+
+    /// Detached pass-through on its own (`PerStep`) driver.
+    struct PerStepPassThrough {
+        held: Option<u32>,
+    }
+    impl Step for PerStepPassThrough {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "PerStepPass",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 16 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            Ok(pass_one(&mut self.held, ctx.input, ctx.outputs))
+        }
+    }
+
+    /// Detached sink on its own driver ("detsink") — keeps a chain off the fused
+    /// path without being anyone's producer.
+    struct DetachedCountingSink {
+        seen: Arc<parking_lot::Mutex<Vec<u32>>>,
+    }
+    impl Step for DetachedCountingSink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedSink",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn detached_group(&self) -> crate::step::DetachedGroup {
+            crate::step::DetachedGroup::Shared("detsink")
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(v) => {
+                    self.seen.lock().push(v);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    impl SharedCountingSourceByteBounded {
+        fn new(n: u32) -> Self {
+            Self { remaining: Arc::new(AtomicU32::new(n)), pending: None }
+        }
+    }
+
+    fn names(set: &Names) -> Vec<String> {
+        set.lock().iter().cloned().collect()
+    }
+
+    fn assert_every_ordinal_once(seen: &[u32], n: u32) {
+        let mut got = seen.to_vec();
+        got.sort_unstable();
+        assert_eq!(got, (1..=n).collect::<Vec<_>>(), "every ordinal 1..={n} exactly once");
+    }
+
+    /// The header line of step `name` in a `dag_at` rendering (not a branch
+    /// line that merely mentions it as a consumer).
+    fn dag_header<'a>(dag: &'a str, name: &str) -> &'a str {
+        let needle = format!("] {name} ");
+        dag.lines()
+            .find(|l| l.contains(&needle) && l.contains("branches="))
+            .unwrap_or_else(|| panic!("no header for {name}:\n{dag}"))
+    }
+
+    /// The `wake:` line that follows step `name`'s header.
+    fn dag_wake_line<'a>(dag: &'a str, name: &str) -> &'a str {
+        let header = dag_header(dag, name);
+        dag.lines()
+            .skip_while(|l| *l != header)
+            .find(|l| l.trim_start().starts_with("wake:"))
+            .expect("wake line")
+    }
+
+    /// At n = 3 the opted-in step never runs on worker 0 and
+    /// every item arrives exactly once. The deterministic half — which workers
+    /// hold a clone — is asserted from the plan the run uses.
+    #[test]
+    fn exclude_reader_skips_worker_zero_and_closes_output() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let sink2 = sink.clone();
+        crate::tests::run_with_deadlock_timeout("exclude_reader n=3", move || {
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(500))
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing))
+                .chain(sink2)
+                .into_sink_marker();
+            let p = b.build().unwrap();
+            let hosts = crate::runtime::placement::plan_parallel_hosts(
+                &p.steps,
+                &p.graph,
+                &vec![None; p.steps.len()],
+                3,
+            );
+            assert_eq!(hosts[1].workers, vec![1, 2]);
+            p.run(PipelineConfig { threads: 3, ..Default::default() }).unwrap();
+        });
+        assert_received_every_ordinal_once(&sink, 500);
+        let ran_on = names(&seen);
+        assert!(
+            !ran_on.is_empty()
+                && ran_on.iter().all(|n| n == "fgumi-worker-1" || n == "fgumi-worker-2"),
+            "ran on {ran_on:?}, not only on workers 1 and 2"
+        );
+    }
+
+    /// Without a Reader step the hint is a no-op.
+    #[test]
+    fn exclude_reader_is_a_no_op_without_a_reader_step() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let sink2 = sink.clone();
+        crate::tests::run_with_deadlock_timeout("exclude_reader without reader", move || {
+            let b = PipelineBuilder::new();
+            b.chain(SharedCountingSource { remaining: Arc::new(AtomicU32::new(500)) })
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing))
+                .chain(sink2)
+                .into_sink_marker();
+            let p = b.build().unwrap();
+            let hosts = crate::runtime::placement::plan_parallel_hosts(
+                &p.steps,
+                &p.graph,
+                &vec![None; p.steps.len()],
+                4,
+            );
+            assert_eq!(hosts[1].workers, vec![0, 1, 2, 3]);
+            p.run(PipelineConfig { threads: 4, ..Default::default() }).unwrap();
+        });
+        assert_received_every_ordinal_once(&sink, 500);
+    }
+
+    /// At n = 2 excluding the reader leaves one clone (worker 1): the drain
+    /// counter must be 1, not 2, or the output never closes.
+    #[test]
+    fn exclude_reader_at_two_workers_runs_one_clone_and_closes() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let sink2 = sink.clone();
+        crate::tests::run_with_deadlock_timeout("exclude_reader n=2", move || {
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(300))
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing))
+                .chain(sink2)
+                .into_sink_marker();
+            b.build().unwrap().run(PipelineConfig { threads: 2, ..Default::default() }).unwrap();
+        });
+        assert_received_every_ordinal_once(&sink, 300);
+        assert_eq!(names(&seen), vec!["fgumi-worker-1".to_owned()]);
+    }
+
+    /// At n = 1 with a Detached producer → the clone
+    /// runs on that producer's driver, never on the caller (worker 0's) thread.
+    #[test]
+    fn exclude_reader_at_one_worker_hosts_on_the_producer_driver() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let sink2 = sink.clone();
+        crate::tests::run_with_deadlock_timeout("exclude_reader n=1 hosted", move || {
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(400))
+                .chain(CoordPassThrough { held: None })
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing))
+                .chain(sink2)
+                .into_sink_marker();
+            b.build().unwrap().run(PipelineConfig { threads: 1, ..Default::default() }).unwrap();
+        });
+        assert_received_every_ordinal_once(&sink, 400);
+        assert_eq!(names(&seen), vec!["fgumi-driver-coordtest".to_owned()]);
+    }
+
+    /// At n = 1 with a pool Serial producer the clone runs on worker 0 (the
+    /// caller thread on the one-worker path). The Detached sink keeps the chain
+    /// off the fused path. Compared by `ThreadId`: the caller is unnamed, so a
+    /// name cannot tell it from any other unnamed thread.
+    #[test]
+    fn exclude_reader_at_one_worker_without_a_detached_producer_runs_on_worker_zero() {
+        let seen: Names = Arc::default();
+        let ids: ThreadIds = Arc::default();
+        let (s2, ids2) = (Arc::clone(&seen), Arc::clone(&ids));
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let caller = Arc::new(parking_lot::Mutex::new(None));
+        let caller2 = Arc::clone(&caller);
+        crate::tests::run_with_deadlock_timeout("exclude_reader n=1 pool producer", move || {
+            *caller2.lock() = Some(std::thread::current().id());
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(200))
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing).with_ids(&ids2))
+                .chain(DetachedCountingSink { seen: got2 })
+                .into_sink_marker();
+            b.build().unwrap().run(PipelineConfig { threads: 1, ..Default::default() }).unwrap();
+        });
+        assert_every_ordinal_once(&got.lock(), 200);
+        let caller = caller.lock().expect("the caller recorded its id");
+        assert_eq!(
+            ids.lock().iter().copied().collect::<Vec<_>>(),
+            vec![caller],
+            "the clone ran on the caller thread, and only there"
+        );
+    }
+
+    /// The drain-counter init equals the closed-form clone count for
+    /// every n × reader × producer kind, and the run closes. Rows without a
+    /// Detached producer carry a Detached sink so t1 is scheduled, not fused.
+    #[rstest]
+    fn drain_counter_init_matches_hosts(
+        #[values(1usize, 2, 4)] n: usize,
+        #[values(true, false)] with_reader: bool,
+        #[values(true, false)] detached_producer: bool,
+    ) {
+        let seen: Names = Arc::default();
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        crate::tests::run_with_deadlock_timeout("drain_counter_init_matches_hosts", move || {
+            let b = PipelineBuilder::new();
+            let mid = ExcludingPassThrough::new(&seen, Inject::Nothing);
+            let sink = DetachedCountingSink { seen: got2 };
+            match (with_reader, detached_producer) {
+                (true, true) => b
+                    .chain(ReaderSource::new(200))
+                    .chain(CoordPassThrough { held: None })
+                    .chain(mid)
+                    .chain(sink)
+                    .into_sink_marker(),
+                (true, false) => {
+                    b.chain(ReaderSource::new(200)).chain(mid).chain(sink).into_sink_marker();
+                }
+                (false, true) => b
+                    .chain(SharedCountingSourceByteBounded::new(200))
+                    .chain(CoordPassThrough { held: None })
+                    .chain(mid)
+                    .chain(sink)
+                    .into_sink_marker(),
+                (false, false) => b
+                    .chain(SharedCountingSourceByteBounded::new(200))
+                    .chain(mid)
+                    .chain(sink)
+                    .into_sink_marker(),
+            }
+            let mid_idx = if detached_producer { 2 } else { 1 };
+            let p = b.build().unwrap();
+            let driver_of = crate::runtime::detached::driver_index_of(&p.steps);
+            let hosts =
+                crate::runtime::placement::plan_parallel_hosts(&p.steps, &p.graph, &driver_of, n);
+            let inits = crate::runtime::placement::drain_counter_inits(&p.steps, &hosts);
+            let expected = match (with_reader, n) {
+                (true, 1) => 1,
+                (true, n) => n - 1,
+                (false, n) => n,
+            };
+            assert_eq!(
+                inits[mid_idx], expected,
+                "n={n} reader={with_reader} detached_producer={detached_producer}"
+            );
+            assert_eq!(
+                hosts[mid_idx].driver.is_some(),
+                with_reader && n == 1 && detached_producer,
+                "hosted exactly when excluding the reader leaves no worker and the producer \
+                 is Detached"
+            );
+            // A chain whose Parallel step is hosted must never fuse at t1.
+            if hosts[mid_idx].driver.is_some() {
+                assert!(!crate::runtime::fused::should_fuse_single_thread(
+                    1,
+                    InstrumentationLevel::Off,
+                    false,
+                    &p.steps,
+                    &p.graph,
+                ));
+            }
+            p.run(PipelineConfig { threads: n, ..Default::default() }).unwrap();
+        });
+        assert_every_ordinal_once(&got.lock(), 200);
+    }
+
+    /// A panic in the hosted clone cancels and re-raises.
+    #[test]
+    fn hosted_clone_panic_propagates_and_cancels() {
+        let seen: Names = Arc::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::tests::run_with_deadlock_timeout("hosted panic", {
+                let seen = Arc::clone(&seen);
+                move || {
+                    let b = PipelineBuilder::new();
+                    b.chain(ReaderSource::new(100))
+                        .chain(CoordPassThrough { held: None })
+                        .chain(ExcludingPassThrough::new(&seen, Inject::PanicAt(50)))
+                        .chain(ParallelCountingSink::new(&Arc::new(AtomicU32::new(0))))
+                        .into_sink_marker();
+                    let _ =
+                        b.build().unwrap().run(PipelineConfig { threads: 1, ..Default::default() });
+                }
+            });
+        }));
+        let payload = result.expect_err("the injected panic must propagate out of run()");
+        let msg = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("injected panic at item 50"), "{msg}");
+        assert_eq!(names(&seen), vec!["fgumi-driver-coordtest".to_owned()], "it ran hosted");
+    }
+
+    /// An `io::Error` from the hosted clone is returned by `run()` (the
+    /// error/cancel path).
+    #[test]
+    fn hosted_clone_error_is_returned_by_run() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let out = Arc::new(parking_lot::Mutex::new(None));
+        let out2 = Arc::clone(&out);
+        crate::tests::run_with_deadlock_timeout("hosted error", move || {
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(100))
+                .chain(CoordPassThrough { held: None })
+                .chain(ExcludingPassThrough::new(&s2, Inject::ErrAt(50)))
+                .chain(ParallelCountingSink::new(&Arc::new(AtomicU32::new(0))))
+                .into_sink_marker();
+            *out2.lock() =
+                Some(b.build().unwrap().run(PipelineConfig { threads: 1, ..Default::default() }));
+        });
+        let r = out.lock().take().unwrap();
+        match r.expect_err("the injected error must fail the run") {
+            PipelineError::Io { step, source } => {
+                assert_eq!(step, "ExcludingPassThrough", "attributed to the hosted step");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(source.to_string(), "injected error at item 50");
+            }
+            other => panic!("expected the hosted step's Io error, got {other:?}"),
+        }
+        assert_eq!(names(&seen), vec!["fgumi-driver-coordtest".to_owned()], "it ran hosted");
+    }
+
+    /// `dag_at` renders `placement=` for an opted-in step and `host=driver(..)`
+    /// only at the thread count that hosts it, on the exact header lines.
+    #[test]
+    fn dag_renders_placement_and_driver_host() {
+        let b = PipelineBuilder::new();
+        b.chain(ReaderSource::new(1))
+            .chain(CoordPassThrough { held: None })
+            .chain(ExcludingPassThrough::new(&Arc::default(), Inject::Nothing))
+            .chain(ParallelCountingSink::new(&Arc::new(AtomicU32::new(0))))
+            .into_sink_marker();
+        let p = b.build().unwrap();
+        let s1 = p.dag_at(1);
+        let h1 = dag_header(&s1, "ExcludingPassThrough");
+        assert!(h1.ends_with(" placement=ExcludeReader host=driver(coordtest)"), "{h1}");
+        let s4 = p.dag_at(4);
+        let h4 = dag_header(&s4, "ExcludingPassThrough");
+        assert!(h4.ends_with(" placement=ExcludeReader") && !h4.contains("host="), "{h4}");
+        let sink = dag_header(&s4, "ParallelSink");
+        assert!(!sink.contains("placement=") && !sink.contains("host="), "{sink}");
+    }
+
+    /// A `PerStep` Detached producer's driver is labelled by the producer's
+    /// name: `dag_at` renders `host=driver(PerStepPass)`, and the clone runs on
+    /// the thread that label names, `fgumi-detached-PerStepPass`.
+    #[test]
+    fn a_per_step_producer_hosts_the_clone_under_its_own_name() {
+        let seen: Names = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let sink2 = sink.clone();
+        crate::tests::run_with_deadlock_timeout("exclude_reader n=1 per-step", move || {
+            let b = PipelineBuilder::new();
+            b.chain(ReaderSource::new(300))
+                .chain(PerStepPassThrough { held: None })
+                .chain(ExcludingPassThrough::new(&s2, Inject::Nothing))
+                .chain(sink2)
+                .into_sink_marker();
+            let p = b.build().unwrap();
+            let h = dag_header(&p.dag_at(1), "ExcludingPassThrough").to_owned();
+            assert!(h.ends_with(" placement=ExcludeReader host=driver(PerStepPass)"), "{h}");
+            p.run(PipelineConfig { threads: 1, ..Default::default() }).unwrap();
+        });
+        assert_received_every_ordinal_once(&sink, 300);
+        assert_eq!(names(&seen), vec!["fgumi-detached-PerStepPass".to_owned()]);
+    }
+
+    /// At t1 the hosted clone shares the driver with its producer,
+    /// so the producer's edge into it needs no wake (`None`), and the hosted
+    /// step's own forward edge to the Parallel sink targets `Worker(0)`. Checked
+    /// on `dag_at` and on the overlay `run` builds (the same helper feeds both).
+    #[test]
+    fn wake_plan_sees_the_hosted_clone_on_its_driver() {
+        let b = PipelineBuilder::new();
+        b.chain(ReaderSource::new(1))
+            .chain(CoordPassThrough { held: None })
+            .chain(ExcludingPassThrough::new(&Arc::default(), Inject::Nothing))
+            .chain(ParallelCountingSink::new(&Arc::new(AtomicU32::new(0))))
+            .into_sink_marker();
+        let p = b.build().unwrap();
+        let s = p.dag_at(1);
+        assert_eq!(
+            dag_wake_line(&s, "CoordPassThrough").trim(),
+            "wake: .0 → ExcludingPassThrough None",
+            "{s}"
+        );
+        assert!(dag_wake_line(&s, "ExcludingPassThrough").contains(".0 → ParallelSink Worker(0)"));
+        // The run's own overlay: `wake_driver_of` is the one helper both sites use.
+        let detached = crate::runtime::detached::driver_index_of(&p.steps);
+        let hosts =
+            crate::runtime::placement::plan_parallel_hosts(&p.steps, &p.graph, &detached, 1);
+        let overlay = crate::runtime::placement::wake_driver_of(&detached, &hosts);
+        assert_eq!(overlay[2], detached[1], "the hosted step maps to its producer's driver");
+        assert_eq!(overlay[3], None, "the pool sink stays on the pool");
+    }
+
+    /// A Parallel step that takes one permit of `cap` per item (via
+    /// `admit_input`) and opts into `ExcludeReader`, counting what it passes.
+    #[derive(Clone)]
+    struct CappedExcluding {
+        cap: Arc<crate::PhaseCap>,
+        passed: Arc<AtomicU32>,
+    }
+    impl Step for CappedExcluding {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "CappedExcluding",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![QueueSpec::Unbounded],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn pool_placement(&self) -> crate::step::PoolPlacement {
+            crate::step::PoolPlacement::ExcludeReader
+        }
+        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
+            Some(&self.cap)
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            let _permit = match crate::admit_input(ctx.input, Some(&self.cap)) {
+                Ok(p) => p,
+                Err(outcome) => return Ok(outcome),
+            };
+            let Some(v) = ctx.input.pop() else {
+                return Ok(StepOutcome::NoProgress);
+            };
+            assert!(ctx.outputs.push(v).is_ok(), "unbounded output");
+            self.passed.fetch_add(1, AtomicOrd::Release);
+            Ok(StepOutcome::Progress)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Cap-release wakes reach a hosted clone: a hosted clone that its phase cap
+    /// refuses on the driver thread is woken by the release, not by its timer.
+    /// One worker, so the clone runs on the "coordtest" driver; only that
+    /// driver has a 10 s timer, and the run must finish under a 5 s watchdog.
+    /// A helper thread holds the cap's only permit until the driver's wake slot
+    /// (`threads + 0`) is recorded on the cap — the refusal the release must
+    /// answer — then releases it, so the run cannot finish by the driver simply
+    /// re-polling a free permit. The source finishes only after the clone has
+    /// passed the item, so no `Finished` broadcast can stand in for the release
+    /// wake, and the stats confirm a driver park ended by an unpark. The cap is
+    /// reported only by the hosted step, so its waker is bound only if `run`
+    /// binds it although the step's real instance moved to a driver group.
+    #[test]
+    fn hosted_clone_refused_by_cap_is_woken_by_release() {
+        use std::time::{Duration, Instant};
+
+        use crate::runtime::worker_core::{TestBackoff, TestBackoffTarget};
+
+        let cap = crate::PhaseCap::new("hosted-cap", 1);
+        let passed = Arc::new(AtomicU32::new(0));
+        let received = Arc::new(AtomicU32::new(0));
+        let sink = ParallelCountingSink::new(&received);
+        let build = {
+            let (cap, passed, sink) = (Arc::clone(&cap), Arc::clone(&passed), sink.clone());
+            move || {
+                let b = PipelineBuilder::new();
+                b.chain(ReaderSource { next: 0, n: 1, finish_after: Some(Arc::clone(&passed)) })
+                    .chain(CoordPassThrough { held: None })
+                    .chain(CappedExcluding { cap: Arc::clone(&cap), passed: Arc::clone(&passed) })
+                    .chain(sink.clone())
+                    .into_sink_marker();
+                b.build().unwrap()
+            }
+        };
+        let probe = build();
+        assert!(
+            dag_header(&probe.dag_at(1), "CappedExcluding").contains("host=driver(coordtest)"),
+            "precondition: the capped clone is hosted at one worker"
+        );
+        drop(probe);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let cap = Arc::clone(&cap);
+            std::thread::spawn(move || {
+                let permit = cap.try_acquire().expect("the cap starts empty");
+                held_tx.send(()).unwrap();
+                // The driver's wake slot: drivers follow the one pool worker.
+                let driver_slot = 1;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cap.is_recorded(driver_slot) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(cap.is_recorded(driver_slot), "the hosted clone's refusal was recorded");
+                drop(permit);
+            })
+        };
+        held_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let pipeline = build();
+        let stats = pipeline.stats();
+        let stats2 = Arc::clone(&stats);
+        let run = std::thread::spawn(move || {
+            pipeline
+                .run(PipelineConfig {
+                    threads: 1,
+                    test_backoff: vec![TestBackoff {
+                        target: TestBackoffTarget::Driver(0),
+                        us: 10_000_000,
+                    }],
+                    stats: Some(stats2),
+                    ..Default::default()
+                })
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) => run.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(run.join().expect_err("run thread panicked"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("WEDGED: the refused hosted clone waited out its driver's 10 s timer")
+            }
+        }
+        holder.join().unwrap();
+        assert!(cap.refused() >= 1, "the scenario needs a refusal");
+        assert_received_every_ordinal_once(&sink, 1);
+        let outcomes = stats.snapshot().detached_park_outcomes;
+        let (unparked, timed_out) =
+            outcomes.iter().fold((0, 0), |(u, t), &(_, du, dt)| (u + du, t + dt));
+        assert!(unparked >= 1 && timed_out == 0, "driver parks {outcomes:?}");
     }
 }

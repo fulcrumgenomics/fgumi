@@ -616,7 +616,10 @@ impl Step for ReportsFinishedBuffer {
 /// A panic inside `build_and_run` is re-raised as itself, so an assertion
 /// failure inside the run reports its own message rather than a spurious
 /// deadlock.
-fn run_with_deadlock_timeout(context: &str, build_and_run: impl FnOnce() + Send + 'static) {
+pub(crate) fn run_with_deadlock_timeout(
+    context: &str,
+    build_and_run: impl FnOnce() + Send + 'static,
+) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         build_and_run();
@@ -1095,6 +1098,7 @@ fn crate_root_reexports_the_step_author_surface() {
     let _: fn() -> api::StepOutcome = || api::StepOutcome::Progress;
     let _: fn() -> api::Affinity = || api::Affinity::None;
     let _: fn() -> api::DetachedGroup = || api::DetachedGroup::PerStep;
+    let _: fn() -> api::PoolPlacement = || api::PoolPlacement::ExcludeReader;
     let _: fn() -> api::QueueSpec = || api::QueueSpec::Unbounded;
     let _: fn() -> api::BranchOrdering = || api::BranchOrdering::None;
     // `StepOutputs::build_queues` names this in its public signature, so anyone

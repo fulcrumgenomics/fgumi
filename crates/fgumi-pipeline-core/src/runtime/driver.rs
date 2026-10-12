@@ -112,8 +112,9 @@ impl LoopDiag {
 /// `entries[step_idx] = WorkerStepEntry` — this worker's storage.
 /// `contexts` — shared per-step input/output handles.
 /// `drain_counters[step_idx]` — the per-step `StepDrainCounter` that gates the
-/// output close on `Finished` (init N for Parallel so only the last clone
-/// closes the shared output; init 1 for Serial/Exclusive).
+/// output close on `Finished` (init = the clone count for Parallel —
+/// `ParallelHosts::clone_count()` — so only the last clone closes the shared
+/// output; init 1 for Serial/Exclusive/Detached).
 /// `signal` — error/cancel broadcast.
 /// `board` — optional per-thread state board for scheduling telemetry; `None`
 /// keeps the loop's stamping a no-op (telemetry-off parity).
@@ -848,7 +849,8 @@ fn dispatch_one_step(
     // the lock for any post-dispatch inspection.
     //
     // `mark_outputs_drained` is gated behind `counter.observe_drain()` (the
-    // per-step `StepDrainCounter`): for a `Parallel` step (counter init N)
+    // per-step `StepDrainCounter`): for a `Parallel` step (counter init = its
+    // clone count)
     // every clone returns `Finished` independently when the shared input edge
     // is drained, but only the LAST clone to finish (the one that takes the
     // counter to 0) closes the shared output queue — otherwise a clone could
@@ -856,14 +858,16 @@ fn dispatch_one_step(
     // panic). For `Serial`/`Exclusive` (counter init 1) the single finisher
     // wins on its first call, unchanged.
     //
-    // INVARIANT: for a `Parallel` step, `counter` init == clone count == the
-    // worker count, and a clone leaves its worklist ONLY by returning
+    // INVARIANT: for a `Parallel` step, `counter` init == clone count ==
+    // `ParallelHosts::clone_count()` — the host workers, or the one driver
+    // hosting it — and a clone leaves its worklist ONLY by returning
     // `Finished`, so the counter reaches 0 exactly when every clone has
     // finished. Any future scheduler change that removes a Parallel clone for
     // another reason (work-stealing, per-worker early exit) — or makes a source
     // `Parallel` — would leave the counter stuck above 0 and never close the
-    // shared output, hanging the downstream consumer. Keep the init (builder.rs)
-    // and this gate in lockstep.
+    // shared output, hanging the downstream consumer. Storage, driver-group
+    // membership and the init (`placement::drain_counter_inits`) all read the
+    // one `plan_parallel_hosts` result; keep them and this gate in lockstep.
     if let Some(b) = board {
         b.stamp(state_slot, crate::runtime::worker_state::WorkerState::Running, Some(step_idx));
     }

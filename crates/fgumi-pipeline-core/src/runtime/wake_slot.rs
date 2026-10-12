@@ -462,7 +462,7 @@ impl HolderSet {
     /// claimer cleared first is skipped. One `Relaxed` load per word when
     /// nothing is recorded. The caller fences (`SeqCst`) first.
     pub(crate) fn take_up_to(&self, n: usize, f: &mut dyn FnMut(usize)) -> usize {
-        claim_bits(&self.words, n, &mut |slot| {
+        claim_bits(&self.words, None, n, &mut |slot| {
             f(slot);
             true
         })
@@ -613,6 +613,23 @@ impl DirectParked {
         true
     }
 
+    /// A claim mask for [`Self::claim_one`] with one bit set per worker in
+    /// `workers`, in the armed words' layout (bit `w % 64` of word `w / 64`)
+    /// for `n_workers` workers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a worker in `workers` is `>= n_workers`.
+    #[must_use]
+    pub fn mask_for(workers: &[usize], n_workers: usize) -> Box<[u64]> {
+        let mut mask = vec![0u64; n_workers.div_ceil(64)];
+        for &w in workers {
+            assert!(w < n_workers, "worker {w} out of range ({n_workers} workers)");
+            mask[w / 64] |= 1u64 << (w % 64);
+        }
+        mask.into_boxed_slice()
+    }
+
     /// Worker `w` is running again.
     pub fn disarm(&self, w: usize) {
         if let Some(word) = self.words.get(w / 64) {
@@ -637,19 +654,23 @@ impl DirectParked {
 
     /// Claim armed workers in ascending order, clearing each bit, until
     /// `unpark(w)` returns `true` for one (it reached a thread); `false` when
-    /// none did. The caller has fenced after its publish.
-    pub fn claim_one(&self, unpark: &mut dyn FnMut(usize) -> bool) -> bool {
-        claim_bits(&self.words, 1, unpark) == 1
+    /// none did. `mask` (one bit per worker, as the armed words; a missing word
+    /// is all-zero) restricts the claim to its set bits; `None`: any armed
+    /// worker. The caller has fenced after its publish.
+    pub fn claim_one(&self, mask: Option<&[u64]>, unpark: &mut dyn FnMut(usize) -> bool) -> bool {
+        claim_bits(&self.words, mask, 1, unpark) == 1
     }
 }
 
 /// The one claim loop of the wake bit sets: claim set bits in ascending order,
 /// clearing each with `fetch_and` (a bit another claimer cleared first is
 /// skipped), and call `f(bit)` on each claimed one; stop once `limit` calls
-/// returned `true`. Returns how many did. One `Relaxed` load per word when
+/// returned `true`. Returns how many did. `eligible` (`None`: every bit)
+/// restricts the claim to its set bits. One `Relaxed` load per word when
 /// nothing is set. The caller fences (`SeqCst`) first.
 fn claim_bits(
     words: &[Padded<HolderWord>],
+    eligible: Option<&[u64]>,
     limit: usize,
     f: &mut dyn FnMut(usize) -> bool,
 ) -> usize {
@@ -658,7 +679,8 @@ fn claim_bits(
         return 0;
     }
     for (i, w) in words.iter().enumerate() {
-        let mut bits = w.0.load(Ordering::Relaxed);
+        let allowed = eligible.map_or(u64::MAX, |m| m.get(i).copied().unwrap_or(0));
+        let mut bits = w.0.load(Ordering::Relaxed) & allowed;
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
             let mask = 1u64 << b;
@@ -842,12 +864,57 @@ mod tests {
         let parked = DirectParked::new(2);
         assert!(parked.arm(0) && parked.arm(1));
         let mut tried = Vec::new();
-        assert!(parked.claim_one(&mut |w| {
+        assert!(parked.claim_one(None, &mut |w| {
             tried.push(w);
             w == 1
         }));
         assert_eq!(tried, vec![0, 1], "worker 0 had no thread; worker 1 was woken");
-        assert!(!parked.claim_one(&mut |_| true), "both bits were claimed");
+        assert!(!parked.claim_one(None, &mut |_| true), "both bits were claimed");
+    }
+
+    /// `mask_for` sets exactly the named workers' bits, across words.
+    #[test]
+    fn mask_for_sets_one_bit_per_worker_across_words() {
+        let mask = DirectParked::mask_for(&[1, 64, 65, 129], 130);
+        assert_eq!(&*mask, &[1u64 << 1, 0b11, 1u64 << 1]);
+        assert_eq!(&*DirectParked::mask_for(&[], 130), &[0, 0, 0]);
+    }
+
+    /// A masked claim crosses words and claims only masked bits: with workers
+    /// 0, 63, 64 and 129 armed and the mask {63, 129}, the claims reach 63 then
+    /// 129, and 0 and 64 stay armed. A mask shorter than the armed words reads
+    /// its missing words as zero.
+    #[test]
+    fn a_masked_claim_spans_words_and_claims_only_masked_workers() {
+        let parked = DirectParked::new(130);
+        for w in [0, 63, 64, 129] {
+            assert!(parked.arm(w));
+        }
+        let mask = DirectParked::mask_for(&[63, 129], 130);
+        let mut woke = Vec::new();
+        assert!(parked.claim_one(Some(&mask), &mut |w| {
+            woke.push(w);
+            true
+        }));
+        assert!(parked.claim_one(Some(&mask), &mut |w| {
+            woke.push(w);
+            true
+        }));
+        assert!(!parked.claim_one(Some(&mask), &mut |_| true), "no masked worker is left");
+        assert_eq!(woke, vec![63, 129]);
+        assert!(parked.is_armed(0) && parked.is_armed(64), "unmasked workers stay armed");
+
+        // One word of mask over three armed words: only word 0 is eligible.
+        assert!(parked.arm(129));
+        let short = [1u64];
+        let mut woke = Vec::new();
+        assert!(parked.claim_one(Some(&short), &mut |w| {
+            woke.push(w);
+            true
+        }));
+        assert_eq!(woke, vec![0]);
+        assert!(!parked.claim_one(Some(&short), &mut |_| true), "word 2 is outside the mask");
+        assert!(parked.is_armed(64) && parked.is_armed(129));
     }
 
     /// Leaving a slot clears every per-thread hint, so none leaks into the

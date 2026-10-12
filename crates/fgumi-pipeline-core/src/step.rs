@@ -12,11 +12,12 @@
 //!   worker, and `Capped` when a `Parallel` step's shared [`PhaseCap`] refused
 //!   this worker; the scheduler reroutes either way.
 //!
-//! **Last-worker barrier for `Parallel` steps.** A `Parallel` step has N
-//! per-worker `Clone`s sharing one output queue and a single drained input
-//! edge. When the input drains, every clone returns `Finished`, but only the
-//! LAST clone to finish (the one that takes the per-step `StepDrainCounter` to
-//! 0) closes the shared output queue. Otherwise a clone could `mark_drained`
+//! **Last-worker barrier for `Parallel` steps.** A `Parallel` step has one
+//! `Clone` per host worker ([`PoolPlacement`]), or a single clone hosted on a
+//! driver, all sharing one output queue and a single drained input edge. When
+//! the input drains, every clone returns `Finished`, but only the LAST clone to
+//! finish (the one that takes the per-step `StepDrainCounter` to 0) closes the
+//! shared output queue. Otherwise a clone could `mark_drained`
 //! while a sibling is still pushing — a `try_push`-after-`mark_drained`
 //! violation, which `ItemQueue::try_push` rejects with a panic in every build.
 //! The gate lives in the driver's `dispatch_one_step`.
@@ -24,8 +25,10 @@
 /// Concurrency profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
-    /// Any number of workers may be inside `try_run` concurrently. Each
-    /// worker holds its own `Clone` of the step.
+    /// Any number of workers may be inside `try_run` concurrently. Each host
+    /// worker ([`PoolPlacement`]) holds its own `Clone` of the step; at one
+    /// worker, an `ExcludeReader` step may instead run as a single clone on its
+    /// Detached producer's driver.
     Parallel,
     /// At most one worker at a time. Framework holds a per-step mutex; any
     /// worker can acquire it; one instance shared.
@@ -149,6 +152,25 @@ pub enum DetachedGroup {
     /// Share one dedicated driver thread with every other detached step that
     /// declares the same label.
     Shared(&'static str),
+}
+
+/// Which pool workers a [`StepKind::Parallel`] step is cloned onto. Read once at
+/// run start. Ignored for every other kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolPlacement {
+    /// Every pool worker holds a clone (the default).
+    #[default]
+    AllWorkers,
+    /// Every worker except the one hosting an `Affinity::Reader` `Serial` step;
+    /// a no-op when the chain has no such step. If excluding it leaves no pool
+    /// worker (`n_workers == 1`), the single clone is hosted on the driver thread
+    /// of this step's upstream producer when that producer is `Detached`, else on
+    /// worker 0: the lone pool worker is the pipeline's whole compute capacity,
+    /// and a Detached producer's driver is the coordination thread of the N+2
+    /// model. For a multi-input step the upstream producer is its
+    /// lowest-indexed one (`ChainGraph::first_producer_into`); another Detached
+    /// producer does not host the clone.
+    ExcludeReader,
 }
 
 /// Static description of how a step is scheduled, plus per-output queue
@@ -371,11 +393,13 @@ impl<O: StepOutputs> OutputHandles<O> {
 ///
 /// # Per-worker copy patterns by step kind
 ///
-/// **`Parallel` steps** must override [`Step::new_worker_copy`]. Each worker
-/// thread calls it once during `build_worker_storage` to materialize its
-/// private instance. The typical impl forwards to a regular `Clone` impl
-/// (most parallel steps either `#[derive(Clone)]` or hand-roll a `Clone`
-/// that resets per-worker scratch state). For example:
+/// **`Parallel` steps** must override [`Step::new_worker_copy`].
+/// `build_worker_storage` calls it once per extra host worker (see
+/// [`PoolPlacement`]) to materialize each host's private instance; a clone
+/// hosted on a driver is the original instance, so no copy is made. The typical
+/// impl forwards to a regular `Clone` impl (most parallel steps either
+/// `#[derive(Clone)]` or hand-roll a `Clone` that resets per-worker scratch
+/// state). For example:
 ///
 /// ```ignore
 /// #[derive(Clone)]
@@ -421,6 +445,14 @@ pub trait Step: Send + Sized + 'static {
     /// non-`Detached` kinds.
     fn detached_group(&self) -> DetachedGroup {
         DetachedGroup::PerStep
+    }
+
+    /// Which pool workers hold a clone of this step. Only meaningful for
+    /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`]. A
+    /// method rather than a `StepProfile` field, like [`Self::affinity`], so a
+    /// step that keeps the default does not mention it.
+    fn pool_placement(&self) -> PoolPlacement {
+        PoolPlacement::AllWorkers
     }
 
     /// Domain counters this step declares, in slot order. Defaults to `&[]` (the
@@ -474,7 +506,8 @@ pub trait Step: Send + Sized + 'static {
 
     /// Construct a fresh per-worker copy of this step. Only `Parallel`
     /// steps need to override this — the framework calls it during
-    /// `build_worker_storage` to materialize one instance per worker.
+    /// `build_worker_storage` to materialize one instance per host worker
+    /// ([`PoolPlacement`]); none when the step is hosted on a driver.
     /// `Serial`/`Exclusive` steps inherit the default panic; the framework
     /// guarantees it is never invoked on them (one shared instance behind
     /// a `Mutex` for `Serial`, pinned to a single owner worker for
@@ -538,6 +571,12 @@ pub trait Step2: Send + Sized + 'static {
     /// [`DetachedGroup::PerStep`].
     fn detached_group(&self) -> DetachedGroup {
         DetachedGroup::PerStep
+    }
+
+    /// Which pool workers hold a clone of this step. Only meaningful for
+    /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
+    fn pool_placement(&self) -> PoolPlacement {
+        PoolPlacement::AllWorkers
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
@@ -632,6 +671,12 @@ pub trait StepK: Send + Sized + 'static {
     /// [`DetachedGroup::PerStep`] (ignored unless the step is `Detached`).
     fn detached_group(&self) -> DetachedGroup {
         DetachedGroup::PerStep
+    }
+
+    /// Which pool workers hold a clone of this step. Only meaningful for
+    /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
+    fn pool_placement(&self) -> PoolPlacement {
+        PoolPlacement::AllWorkers
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
