@@ -22,7 +22,13 @@
 //!   deadline elapses).
 //! - **Producer (just published work):** [`notify_one`](PoolEventCount::notify_one)
 //!   (`SeqCst` fence, then read the waiter count; if any, bump the generation
-//!   under the lock and wake one).
+//!   under the lock and wake one). The producer is the wake plan
+//!   (`runtime::wake`): in a chain without a `Detached` step it notifies on
+//!   every `Progress`. Otherwise a byte-bounded edge a pool step consumes
+//!   notifies only when the dispatch pushed to it, so a `Progress` that
+//!   published nothing on such an edge notifies nobody through it; a
+//!   count-bounded or unbounded edge, and a zero-output Parallel step's
+//!   self-cascade, still notify on every `Progress`.
 //!
 //! # Correctness — one rule
 //!

@@ -7769,6 +7769,65 @@ mod tests {
         assert_eq!(pread.max(), 4);
     }
 
+    /// The real template-coordinate sort chain (native input) at `--threads 16`
+    /// has the steps, kinds and branch counts in the table below, and gates
+    /// exactly the listed number of branches per step: every byte-bounded
+    /// output branch, whatever the producer's kind. pipeline-core's
+    /// `native_input_sort_topology` wake-plan fixture is written against the
+    /// same table; this test pins names, kinds, branch counts and per-branch
+    /// gating, not driver groups, pins or wiring.
+    #[test]
+    fn sort_chain_gating_matches_the_table() {
+        // (name, kind, output branches, gated branches)
+        const TABLE: [(&str, &str, usize, usize); 15] = [
+            ("PlanInputReads", "Serial", 1, 1),
+            ("PreadInputSlices", "Parallel", 1, 1),
+            ("FrameBgzfBlocks", "Serial", 1, 1),
+            ("ReadBlocks", "Detached", 1, 1),
+            ("InflateToArena", "Parallel", 1, 1),
+            ("FindBoundariesAndSort", "Detached", 1, 1),
+            ("SpillGather", "Detached", 1, 1),
+            ("SpillBlockCompress", "Parallel", 1, 1),
+            ("SpillWrite", "Detached", 1, 1),
+            ("SpillReadPlanner", "Serial", 2, 2),
+            ("PreadSpillSlices", "Parallel", 1, 1),
+            ("SortSpillDecompress", "Parallel", 0, 0),
+            ("SortMerge", "Detached", 1, 1),
+            ("BgzfCompress", "Parallel", 1, 1),
+            ("WriteBgzfFile", "Detached", 0, 0),
+        ];
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, None, fgumi_bam_io::ReadStreams::Auto);
+        let lines = built.pipeline.wake_lines_at(16);
+        let names: Vec<&str> = lines.iter().map(|(n, _)| *n).collect();
+        let want_names: Vec<&str> = TABLE.iter().map(|t| t.0).collect();
+        assert_eq!(names, want_names, "the chain's steps, in order");
+        // `[i] <name> <kind> sticky=… branches=N` header lines of the DAG.
+        let dag = built.pipeline.dag_at(16);
+        let headers: Vec<(String, usize)> = dag
+            .lines()
+            .filter(|l| l.trim_start().starts_with('['))
+            .map(|l| {
+                let mut words = l.split_whitespace().skip(2);
+                let kind = words.next().expect("kind").to_string();
+                let branches = l
+                    .split_whitespace()
+                    .find_map(|w| w.strip_prefix("branches="))
+                    .and_then(|n| n.parse().ok())
+                    .expect("branches=");
+                (kind, branches)
+            })
+            .collect();
+        assert_eq!(headers.len(), TABLE.len(), "{dag}");
+        for (((name, kind, branches, gated), (_, line)), (got_kind, got_branches)) in
+            TABLE.iter().zip(&lines).zip(&headers)
+        {
+            assert_eq!(got_kind, kind, "{name}: kind\n{dag}");
+            assert_eq!(got_branches, branches, "{name}: branches\n{dag}");
+            assert_eq!(line.matches("[gated]").count(), *gated, "{name}: {line}");
+        }
+    }
+
     /// No `--sort-threads` → no phase-1 cap anywhere, including the input pread
     /// (no `cap=` token on its dag line).
     #[test]

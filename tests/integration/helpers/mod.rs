@@ -10,6 +10,7 @@
 pub mod aligner;
 pub mod assertions;
 pub mod bam_generator;
+pub mod chain_spec;
 pub mod cli;
 pub mod copy_umi_fixtures;
 pub mod cutover;
@@ -104,4 +105,35 @@ pub fn read_bam_output(
     }
 
     (header, records)
+}
+
+/// Runs `f` on a detached thread and returns its result, or panics if `f`
+/// does not finish within `timeout`: a liveness watchdog for tests whose
+/// failure mode is a hang.
+///
+/// A panic inside `f` is re-raised as itself, not reported as a timeout. On a
+/// timeout the thread is left running (it cannot be cancelled); the test
+/// fails at the deadline rather than joining a hung run.
+///
+/// # Panics
+///
+/// On a timeout, or with `f`'s own panic.
+pub fn run_with_timeout<T: Send + 'static>(
+    context: &str,
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out,
+        Err(RecvTimeoutError::Disconnected) => match handle.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => panic!("{context}: the run exited without a result"),
+        },
+        Err(RecvTimeoutError::Timeout) => panic!("{context}: no result within {timeout:?}"),
+    }
 }

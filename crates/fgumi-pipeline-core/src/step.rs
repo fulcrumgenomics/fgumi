@@ -211,8 +211,9 @@ pub enum StepOutcome {
     ///
     /// The runtime wakes whoever can now run: in a chain without a `Detached`
     /// step, one parked pool worker; otherwise the thread that consumes what
-    /// was pushed, plus any thread holding an item this step's pops made room
-    /// for (see `runtime::wake`).
+    /// was pushed — on a byte-bounded edge only if this call actually pushed
+    /// to it (a new hold wakes nobody downstream) — plus any thread holding an
+    /// item this step's pops made room for (see `runtime::wake`).
     ///
     /// A dispatch that took an input item must report `Progress` even if it
     /// pushed nothing. The plan's reverse wake, which releases a producer

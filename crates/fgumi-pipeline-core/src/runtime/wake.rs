@@ -11,6 +11,12 @@
 //! `std::thread::Thread::unpark` — an atomic swap plus a futex wake only when
 //! the target is actually parked, so a wake is useful by construction.
 //!
+//! In a `Directed` plan a forward wake is push-gated: a producer's branch with
+//! a byte-bounded transport wakes its consumer only when the dispatch actually
+//! pushed to it (the transport's push counter advanced; an ordered branch's
+//! stash insert counts), so progress that only held, accumulated or retried
+//! wakes nobody.
+//!
 //! A held item wakes its holder: every bounded edge the plan tracks records
 //! the refusing thread's wake slot (`runtime::wake_slot`), and the pop (or, on
 //! a byte-bounded edge, a limit raise) that makes room unparks exactly those
@@ -86,8 +92,8 @@ pub enum WakeMode {
     /// No `Detached` step in the chain: every `Progress` → `notify_one`, every
     /// `Finished` → `notify_all`, no thread registered, no edge tracked.
     Legacy,
-    /// ≥ 1 `Detached` step: per-branch targets, push-gated Detached producers
-    /// (direct byte-bounded branches), holder-directed reverse wakes on every
+    /// ≥ 1 `Detached` step: per-branch targets, push-gated producers (every
+    /// byte-bounded branch), holder-directed reverse wakes on every
     /// tracked bounded edge (byte-bounded, count-bounded, and the unbounded
     /// transport behind a reorder stash), forward wakes for flushed held
     /// retries, drivers and workers unparked directly.
@@ -95,7 +101,7 @@ pub enum WakeMode {
 }
 
 /// Size of the per-step push-counter snapshot. A typed step has at most
-/// `outputs::MAX_ARITY` branches, so every branch of a Detached producer is gated.
+/// `outputs::MAX_ARITY` branches, so every gateable branch of a producer fits.
 pub const MAX_GATED_BRANCHES: usize = 4;
 const _: () = assert!(MAX_GATED_BRANCHES >= crate::outputs::MAX_ARITY);
 
@@ -105,7 +111,10 @@ pub struct PushSnapshot([u64; MAX_GATED_BRANCHES]);
 
 struct BranchWake {
     target: WakeTarget,
-    /// `Some` ⇒ wake only if `pushed_total()` advanced during the dispatch.
+    /// `Some` ⇒ wake only if `pushed_total()` advanced during the dispatch (a
+    /// reorder-stash insert counts). Set for every producer's byte-bounded
+    /// branch, whatever the producer's kind; `None` on a count-bounded or
+    /// unbounded transport, which has no push counter.
     gate: Option<Arc<dyn BoundedQueueHandle>>,
     /// The branch has a consumer and it runs on this step's thread (`target`
     /// is then `None`). Read only by `on_flushed`.
@@ -146,9 +155,8 @@ struct StepWake {
 /// The bounded edges a plan may track, by kind.
 #[derive(Clone, Copy, Default)]
 pub struct WakeEdges<'a> {
-    /// Gated (a Detached producer's direct branches; an ordered branch's
-    /// must-accept stash insert advances no push counter, so it is never gated)
-    /// and reverse-woken.
+    /// Gated (every producer's branch on one of these edges, ordered branches
+    /// included: a reorder-stash insert counts as a push) and reverse-woken.
     pub byte_bounded: &'a [RegisteredQueue],
     /// Reverse-woken only: there is no push counter to gate on.
     pub(crate) holder_only: &'a [RegisteredHolderOnlyQueue],
@@ -375,10 +383,13 @@ impl WakePlan {
     /// reports (a step past the end of a shorter slice, `&[]` included, is
     /// uncapped); `edges` the bounded transports, by kind.
     ///
-    /// Gates: a Detached producer's direct byte-bounded branch wakes its
-    /// consumer only if the dispatch pushed. An ordered branch is not gated
-    /// (its must-accept stash insert advances no push counter), and a
-    /// holder-only edge has no push counter at all. Reverse edges: every input
+    /// Gates: every producer's byte-bounded branch, whatever the producer's
+    /// kind, wakes its consumer only if the dispatch pushed; on an ordered
+    /// branch a reorder-stash insert counts as a push
+    /// (`ItemQueue::note_stash_accepted`). A holder-only (count-bounded) edge,
+    /// an unbounded edge and a zero-output Parallel step's self-cascade have no
+    /// push counter and stay ungated: they wake on every `Progress`. Reverse
+    /// edges: every input
     /// edge in either registry whose producer runs on another thread, whatever
     /// that producer's role.
     ///
@@ -496,15 +507,15 @@ impl WakePlan {
                             Some(_) if same => WakeTarget::None,
                             Some(c) => thread_of(c),
                         };
-                        let gate = (kinds[i] == StepKind::Detached)
-                            .then(|| queue_for(step, branch))
-                            .flatten()
-                            // An ordered branch's must-accept stash insert does
-                            // not advance `pushed_total`, so a gate could hide the
-                            // push of `next_serial`: ordered branches are not
-                            // gated.
-                            .filter(|q| q.reorder_cap.is_none())
-                            .map(|q| Arc::clone(&q.handle));
+                        // Gate every producer whose branch has a byte-bounded
+                        // transport. A `Progress` that pushed nothing (a held
+                        // retry, an accumulation step, a Parallel clone that lost
+                        // the race to pop) wakes nobody; a concurrent clone's push
+                        // can only turn "not pushed" into "pushed" — a spurious,
+                        // safe wake. An ordered branch's stash insert counts as a
+                        // push (`ItemQueue::note_stash_accepted`). Non-byte-bounded edges
+                        // have no counter and stay ungated.
+                        let gate = queue_for(step, branch).map(|q| Arc::clone(&q.handle));
                         if gate.is_some() {
                             tracked.push((step, branch));
                         }
@@ -675,6 +686,18 @@ impl WakePlan {
         self.steps.iter().all(|s| s.reverse.iter().all(|r| r.queue.is_tracked()))
     }
 
+    /// Whether every gated branch's queue has a holder set installed (the push
+    /// counter advances only then). A gate on an untracked queue would read a
+    /// frozen counter, hold every forward wake off and strand the consumer on
+    /// its timer; `Pipeline::run` asserts this right after it installs
+    /// tracking.
+    #[must_use]
+    pub fn gated_edges_are_tracked(&self) -> bool {
+        self.steps
+            .iter()
+            .all(|s| s.forward.iter().filter_map(|b| b.gate.as_ref()).all(|q| q.is_tracked(SEALED)))
+    }
+
     /// Register driver `d`'s OS thread. Called by the driver thread itself as
     /// its first statement, before its first pass. The registration's `SeqCst`
     /// fence pairs with the delivery fence in `on_progress`: a producer's push
@@ -703,8 +726,9 @@ impl WakePlan {
         self.workers.is_registered(w)
     }
 
-    /// Snapshot the gated branches' push counters before a dispatch. One
-    /// `Relaxed` load per gated branch; call only when `is_gated`.
+    /// Snapshot the gated branches' push counters before a dispatch (a counter
+    /// advances on every push and on every reorder-stash insert). One `Relaxed`
+    /// load per gated branch; call only when `is_gated`.
     #[inline]
     pub fn snapshot_pushes(&self, step: StepIdx, out: &mut PushSnapshot) {
         if let Some(s) = self.steps.get(step.0) {
@@ -933,6 +957,11 @@ impl WakePlan {
     /// Deliver one forward wake. `fallback_mask` restricts a `Pool` wake's
     /// direct-park and cap-parked fallbacks to the consumer's host workers
     /// (`None`: any worker).
+    ///
+    /// Only a `Pool` target goes through the event-count, whose concurrency
+    /// ceiling may suppress it; reverse wakes are unparks of the holder's slot
+    /// (`deliver_slot`), never `notify_one`, so the ceiling cannot suppress a
+    /// wake meant for a specific holder.
     #[inline]
     fn deliver(
         &self,
@@ -1274,10 +1303,14 @@ mod tests {
         Vec<RegisteredQueue>,
     );
 
-    /// The sort chain (template-coordinate, t16): 11 steps, two Shared driver
-    /// groups (coord = {1,3,4,8}, io = {6,10}), `ReadBgzfBlocks` pinned to w0.
-    /// Every edge is byte-bounded.
-    pub(super) fn sort_topology() -> Topology {
+    /// A synthetic 11-step topology shaped like an earlier sort chain
+    /// (template-coordinate, t16, `ReadBgzfBlocks` front, no merge-supply
+    /// planner): two Shared driver groups (coord = {1,3,4,8}, io = {6,10}),
+    /// `ReadBgzfBlocks` pinned to w0, every edge byte-bounded. It mirrors no
+    /// production chain today and nothing checks it against one; it is kept
+    /// as a mixed-kind fixture whose expectations are its own.
+    /// [`native_input_sort_topology`] models the current chain.
+    pub(super) fn synthetic_sort_topology() -> Topology {
         use StepKind::{Detached as D, Parallel as P, Serial as S};
         let names = [
             "ReadBgzfBlocks",
@@ -1432,7 +1465,7 @@ mod tests {
     #[test]
     fn wake_plan_targets_for_the_sort_topology() {
         use WakeTarget::{Driver, None as NoneT, Pool};
-        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
         let pool = Arc::new(PoolEventCount::new(16));
         let plan = WakePlan::build(
             &g,
@@ -1451,16 +1484,16 @@ mod tests {
         let io = Driver(DriverIdx(1));
         // (step, forward, gated, reverse producers)
         let expected: [(usize, WakeTarget, bool, &[usize]); 11] = [
-            (0, coord, false, &[]),
+            (0, coord, true, &[]),
             (1, Pool, true, &[0]),
-            (2, coord, false, &[1]),
+            (2, coord, true, &[1]),
             (3, NoneT, true, &[2]),
             (4, Pool, true, &[]), // from FBS: same thread → omitted
-            (5, io, false, &[4]),
+            (5, io, true, &[4]),
             (6, Pool, true, &[5]),
-            (7, coord, false, &[6]),
+            (7, coord, true, &[6]),
             (8, Pool, true, &[7]),
-            (9, io, false, &[8]),
+            (9, io, true, &[8]),
             (10, NoneT, false, &[9]), // sink: no forward branch
         ];
         for (i, fwd, gated, rev) in expected {
@@ -1475,8 +1508,9 @@ mod tests {
             let want: Vec<StepIdx> = rev.iter().map(|&p| StepIdx(p)).collect();
             assert_eq!(plan.reverse_producers(StepIdx(i)), want, "reverse of step {i}");
         }
-        // Every edge is tracked: the same-thread FBS → SpillGather edge has no
-        // reverse wake, but FBS is a gated Detached producer, so it is counted.
+        // Every edge is tracked: every producer with a byte-bounded output is
+        // gated, whatever its kind — the same-thread FBS → SpillGather edge has
+        // no reverse wake, but FBS is a gated producer, so it is counted.
         for (i, rq) in queues.iter().enumerate() {
             assert!(plan.tracks(rq), "tracking of edge {i}");
         }
@@ -1568,7 +1602,7 @@ mod tests {
 
     #[test]
     fn single_worker_resolves_pool_to_worker_zero() {
-        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
         let plan = WakePlan::build(
             &g,
             &kinds,
@@ -1892,7 +1926,7 @@ mod tests {
 
     #[test]
     fn registration_is_once_and_mode_gated() {
-        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
         let plan = WakePlan::build(
             &g,
             &kinds,
@@ -1916,7 +1950,7 @@ mod tests {
 
     #[test]
     fn dag_lines_render_one_line_per_step() {
-        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
         let plan = WakePlan::build(
             &g,
             &kinds,
@@ -1929,14 +1963,14 @@ mod tests {
         );
         let lines = plan.dag_lines(&g);
         assert_eq!(lines.len(), 11);
-        assert_eq!(lines[0], "      wake: .0 → ReadBlocks Driver(0)");
+        assert_eq!(lines[0], "      wake: .0 → ReadBlocks Driver(0) [gated]");
         assert_eq!(
             lines[1],
             "      wake: .0 → InflateToArena Pool [gated]; reverse: ReadBgzfBlocks (holder)"
         );
         assert_eq!(
             lines[2],
-            "      wake: .0 → FindBoundariesAndSort Driver(0); reverse: ReadBlocks (holder)"
+            "      wake: .0 → FindBoundariesAndSort Driver(0) [gated]; reverse: ReadBlocks (holder)"
         );
         assert_eq!(lines[10], "      wake: (sink); reverse: BgzfCompress (holder)");
         let legacy = WakePlan::legacy(None);
@@ -2008,7 +2042,7 @@ mod tests {
     /// unparks it and reports Woken; unregistered → Unavailable.
     #[test]
     fn request_worker_at_one_thread_unparks_worker_zero() {
-        let (g, kinds, pinned, driver_of, queues) = sort_topology();
+        let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
         let plan = WakePlan::build(
             &g,
             &kinds,
@@ -2191,7 +2225,7 @@ mod tests {
     #[test]
     fn stress_no_lost_unpark() {
         super::e2e::run_under_watchdog("stress unpark", 30, || {
-            let (g, kinds, pinned, driver_of, queues) = sort_topology();
+            let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
             for _ in 0..2_000 {
                 // Fresh plan per iteration: `OnceLock` registers once.
                 let plan = WakePlan::build(
@@ -2231,8 +2265,11 @@ mod tests {
                 // the registration and let the test pass without `on_progress`'s
                 // fence.
                 work.store(true, std::sync::atomic::Ordering::Relaxed);
-                // InflateToArena (2) → FindBoundariesAndSort on Driver(0).
-                let _ = plan.on_progress(StepIdx(2), &PushSnapshot::default());
+                // InflateToArena (2) → FindBoundariesAndSort on Driver(0). The
+                // branch is push-gated; a snapshot no counter can equal stands
+                // for a dispatch that pushed.
+                let pushed = PushSnapshot([u64::MAX; MAX_GATED_BRANCHES]);
+                let _ = plan.on_progress(StepIdx(2), &pushed);
                 registrar.join().unwrap();
                 target.join().unwrap();
             }
@@ -2458,15 +2495,16 @@ mod tests {
         }
     }
 
-    /// An ordered byte-bounded branch of a Detached producer is not
-    /// gated (its must-accept stash insert advances no push counter), while a
-    /// direct one is. The reverse edge and its tracking survive the filter.
+    /// An ordered byte-bounded branch of a Detached producer is gated like a
+    /// direct one: its must-accept stash insert counts as a push
+    /// (`ItemQueue::note_stash_accepted`), so the gate cannot hide it. The reverse edge
+    /// and its tracking are kept either way.
     /// `A(Exclusive w0)` and `B(Exclusive w0)` feed the two input slots of
     /// `M(Detached d0)`, then `M → C(Parallel)`, at t2.
     #[rstest]
     #[case::direct(false)]
     #[case::ordered(true)]
-    fn ordered_branch_of_a_detached_producer_is_not_gated(#[case] ordered: bool) {
+    fn ordered_branch_of_a_detached_producer_is_gated(#[case] ordered: bool) {
         use crate::reorder::{ReorderCapHandle, ReorderStage, Sequenced};
         let mut g = ChainGraph::new();
         let a = g.register_step("A", 1);
@@ -2498,8 +2536,8 @@ mod tests {
             Some(Arc::new(PoolEventCount::new(2))),
             2,
         );
-        assert_eq!(plan.is_gated(m), !ordered);
-        assert_eq!(plan.gated_branches(m), usize::from(!ordered));
+        assert!(plan.is_gated(m), "ordered: {ordered}");
+        assert_eq!(plan.gated_branches(m), 1);
         assert_eq!(plan.forward_target(m, BranchIdx(0)), WakeTarget::Pool);
         assert_eq!(plan.reverse_producers(c), vec![m]);
         assert!(plan.tracks(&rq), "the reverse edge keeps the edge tracked");
@@ -2514,6 +2552,8 @@ mod tests {
         Terminal,
         GatedPushed,
         GatedNotPushed,
+        GatedPoolPushed,
+        GatedPoolNotPushed,
     }
 
     /// `on_flushed` delivers the flushed push's forward wake to every target
@@ -2527,6 +2567,8 @@ mod tests {
     #[case::terminal(Fwd::Terminal, WakeCounts::default())]
     #[case::gated_pushed(Fwd::GatedPushed, WakeCounts { no_waiters: 1, ..WakeCounts::default() })]
     #[case::gated_not_pushed(Fwd::GatedNotPushed, WakeCounts { gated_off: 1, ..WakeCounts::default() })]
+    #[case::gated_pool_pushed(Fwd::GatedPoolPushed, WakeCounts { no_waiters: 1, ..WakeCounts::default() })]
+    #[case::gated_pool_not_pushed(Fwd::GatedPoolNotPushed, WakeCounts { gated_off: 1, ..WakeCounts::default() })]
     fn on_flushed_delivers_the_push_s_forward_wake(#[case] fwd: Fwd, #[case] expected: WakeCounts) {
         use StepKind::{Detached as D, Exclusive as E, Parallel as P, Serial as S};
         let mut g = ChainGraph::new();
@@ -2536,7 +2578,10 @@ mod tests {
             g.wire(p, BranchIdx(0), c);
         }
         let d0 = Some(DriverIdx(0));
-        let gated = matches!(fwd, Fwd::GatedPushed | Fwd::GatedNotPushed);
+        let gated = matches!(
+            fwd,
+            Fwd::GatedPushed | Fwd::GatedNotPushed | Fwd::GatedPoolPushed | Fwd::GatedPoolNotPushed
+        );
         // (kinds, pinned, driver_of) per case; a Detached tail makes the plan Directed.
         let (kinds, pinned, driver_of): (Vec<StepKind>, Vec<Option<usize>>, Vec<_>) = match fwd {
             Fwd::Pool => (vec![E, P, D], vec![Some(0), None, None], vec![None, None, d0]),
@@ -2545,6 +2590,10 @@ mod tests {
             Fwd::Terminal => (vec![E, D], vec![Some(0), None], vec![None, d0]),
             Fwd::GatedPushed | Fwd::GatedNotPushed => {
                 (vec![D, P], vec![None, None], vec![d0, None])
+            }
+            // A pool producer's byte-bounded branch is push-gated too.
+            Fwd::GatedPoolPushed | Fwd::GatedPoolNotPushed => {
+                (vec![P, P, D], vec![None, None, None], vec![None, None, d0])
             }
         };
         if kinds.len() == 3 {
@@ -2582,15 +2631,66 @@ mod tests {
             Fwd::Pool | Fwd::Terminal => plan.register_worker(0, me),
             Fwd::Driver => plan.register_driver(DriverIdx(0), me),
             Fwd::Worker => plan.register_worker(1, me),
-            Fwd::GatedPushed | Fwd::GatedNotPushed => {}
+            Fwd::GatedPushed
+            | Fwd::GatedNotPushed
+            | Fwd::GatedPoolPushed
+            | Fwd::GatedPoolNotPushed => {}
         }
         let mut snap = PushSnapshot::default();
         plan.snapshot_pushes(p, &mut snap);
-        if matches!(fwd, Fwd::GatedPushed) {
+        if matches!(fwd, Fwd::GatedPushed | Fwd::GatedPoolPushed) {
             typed.try_push(7).unwrap();
         }
         assert_eq!(plan.on_flushed(p, &snap), expected, "the flushed push's forward wake");
         std::thread::park_timeout(Duration::ZERO); // consume any token left on this thread
+    }
+
+    /// A flushed retry on a gated ordered branch whose item the reorder stage
+    /// stashed (the transport is full) is judged by the push counter like a
+    /// push: the stash insert advances it (`ItemQueue::note_stash_accepted`), so the
+    /// forward wake is delivered, not gated off. `P(Detached d0) → C(Parallel)`
+    /// at t2.
+    #[test]
+    fn on_flushed_counts_a_stash_insert_on_an_ordered_branch_as_a_push() {
+        use crate::reorder::{ReorderStage, Sequenced};
+        let mut g = ChainGraph::new();
+        let p = g.register_step("P", 1);
+        let c = g.register_step("C", 0);
+        g.wire(p, BranchIdx(0), c);
+        let transport = Arc::new(ByteBoundedQueue::<Sequenced<Sized8>>::new(8));
+        let stage = Arc::new(ReorderStage::new(Arc::clone(&transport) as _));
+        let rq = RegisteredQueue {
+            producer_step_name: "P",
+            producer_step: p,
+            branch: BranchIdx(0),
+            handle: Arc::clone(&transport) as _,
+            reorder_cap: Some(Arc::clone(&stage) as _),
+        };
+        let plan = WakePlan::build(
+            &g,
+            &[StepKind::Detached, StepKind::Parallel],
+            &[None, None],
+            &[Some(DriverIdx(0)), None],
+            &[],
+            WakeEdges::byte_bounded(std::slice::from_ref(&rq)),
+            Some(Arc::new(PoolEventCount::new(2))),
+            2,
+        );
+        assert!(plan.is_gated(p));
+        transport.enable_tracking(
+            EdgeTracking { clock: None, holders: Some(HolderSet::new(plan.n_slots())) },
+            crate::queues::SEALED,
+        );
+        stage.try_push(1, Sized8).unwrap(); // out of order: fills the transport
+        let mut snap = PushSnapshot::default();
+        plan.snapshot_pushes(p, &mut snap);
+        stage.try_push(0, Sized8).unwrap(); // next_serial, transport full → stashed
+        assert_eq!(
+            plan.on_flushed(p, &snap),
+            WakeCounts { no_waiters: 1, ..WakeCounts::default() },
+            "the stash insert is a push"
+        );
+        let _ = crate::runtime::wake_slot::take_rejected();
     }
 
     /// `on_flushed` takes no holders: an idle-outcome dispatch made no room.
@@ -3121,6 +3221,412 @@ mod tests {
         let r = plan.on_progress(StepIdx(0), &PushSnapshot::default());
         assert_eq!((r.no_waiters, r.fallback), (1, 1), "no waiter, so the armed worker: {r:?}");
         assert!(worker.join().unwrap() < Duration::from_secs(5), "worker 64 was unparked");
+    }
+
+    type ParIntoPar = (
+        ChainGraph,
+        Vec<StepKind>,
+        Vec<Option<usize>>,
+        Vec<Option<DriverIdx>>,
+        Arc<ByteBoundedQueue<Sized8>>,
+        Vec<RegisteredQueue>,
+    );
+
+    /// `Par(P) → Cons(P) → Tap(Detached, driver 0)`, n = 4. The Par→Cons edge is
+    /// a one-item tracked queue (`one_item_tracked`); Cons→Tap is an ordinary
+    /// `q`. Returns the plan inputs and the typed Par→Cons handle.
+    fn parallel_into_parallel() -> ParIntoPar {
+        let mut g = ChainGraph::new();
+        let par = g.register_step("Par", 1);
+        let cons = g.register_step("Cons", 1);
+        let tap = g.register_step("Tap", 0);
+        g.wire(par, BranchIdx(0), cons);
+        g.wire(cons, BranchIdx(0), tap);
+        let kinds = vec![StepKind::Parallel, StepKind::Parallel, StepKind::Detached];
+        let pinned = vec![None, None, None];
+        let driver_of = vec![None, None, Some(DriverIdx(0))];
+        // 4 workers + 1 driver + the anonymous slot.
+        let (rq0, typed) = one_item_tracked(0, 4 + 1 + 1);
+        let queues = vec![rq0, q(1, 0)];
+        (g, kinds, pinned, driver_of, typed, queues)
+    }
+
+    /// Every merge of `a` and `b` that preserves each sequence's own order.
+    fn interleavings<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Vec<&'a str>> {
+        if a.is_empty() {
+            return vec![b.to_vec()];
+        }
+        if b.is_empty() {
+            return vec![a.to_vec()];
+        }
+        let mut out = Vec::new();
+        for mut rest in interleavings(&a[1..], b) {
+            rest.insert(0, a[0]);
+            out.push(rest);
+        }
+        for mut rest in interleavings(a, &b[1..]) {
+            rest.insert(0, b[0]);
+            out.push(rest);
+        }
+        out
+    }
+
+    /// Asserted at the top of every gate test: a fixture that slipped back to
+    /// Legacy would make the gate tests pass for any implementation.
+    fn assert_directed_and_gated(plan: &WakePlan, step: StepIdx) {
+        assert_eq!(
+            plan.mode(),
+            WakeMode::Directed,
+            "fixture must be Directed (needs a Detached step)"
+        );
+        assert!(plan.is_gated(step), "fixture's producer must be gated");
+    }
+
+    /// Step names of [`native_input_sort_topology`], in `StepIdx` order.
+    const NATIVE_INPUT_SORT_NAMES: [&str; 15] = [
+        "PlanInputReads",
+        "PreadInputSlices",
+        "FrameBgzfBlocks",
+        "ReadBlocks",
+        "InflateToArena",
+        "FindBoundariesAndSort",
+        "SpillGather",
+        "SpillBlockCompress",
+        "SpillWrite",
+        "SpillReadPlanner",
+        "PreadSpillSlices",
+        "SortSpillDecompress",
+        "SortMerge",
+        "BgzfCompress",
+        "WriteBgzfFile",
+    ];
+
+    /// A hand-written model of `fgumi sort`'s template-coordinate chain with
+    /// native input, at t16: 15 steps, two driver groups (coord, io), the
+    /// planner and framer pinned to the reader worker, every edge
+    /// byte-bounded. Its step names, kinds, branch counts and per-branch
+    /// gating mirror the table fgumi's `sort_chain_gating_matches_the_table`
+    /// checks against the real chain (fgumi keeps its own copy, so this crate
+    /// exports nothing chain-specific); its driver groups, pins and wiring are
+    /// checked by nothing but the tests below.
+    pub(super) fn native_input_sort_topology() -> Topology {
+        use StepKind::{Detached as D, Parallel as P, Serial as S};
+        let kinds = vec![S, P, S, D, P, D, D, P, D, S, P, P, D, P, D];
+        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        let mut g = ChainGraph::new();
+        let idx: Vec<StepIdx> = NATIVE_INPUT_SORT_NAMES
+            .iter()
+            .zip(branches)
+            .map(|(n, b)| g.register_step(n, b))
+            .collect();
+        for i in 0..9 {
+            g.wire(idx[i], BranchIdx(0), idx[i + 1]);
+        }
+        g.wire(idx[9], BranchIdx(0), idx[10]);
+        g.wire(idx[10], BranchIdx(0), idx[11]);
+        g.wire(idx[9], BranchIdx(1), idx[12]);
+        g.wire(idx[12], BranchIdx(0), idx[13]);
+        g.wire(idx[13], BranchIdx(0), idx[14]);
+        let (coord, io) = (Some(DriverIdx(0)), Some(DriverIdx(1)));
+        let driver_of = vec![
+            None, None, None, coord, None, coord, coord, None, io, None, None, None, coord, None,
+            io,
+        ];
+        let pinned = vec![
+            Some(0),
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let queues = vec![
+            q(0, 0),
+            q(1, 0),
+            q(2, 0),
+            q(3, 0),
+            q(4, 0),
+            q(5, 0),
+            q(6, 0),
+            q(7, 0),
+            q(8, 0),
+            q(9, 0),
+            q(9, 1),
+            q(10, 0),
+            q(12, 0),
+            q(13, 0),
+        ];
+        (g, kinds, pinned, driver_of, queues)
+    }
+
+    /// Every producer with a byte-bounded output is gated, whatever its kind;
+    /// the zero-output Parallel sink keeps its implicit ungated cascade.
+    #[test]
+    fn every_producer_with_a_byte_bounded_output_is_gated() {
+        let (g, kinds, pinned, driver_of, queues) = native_input_sort_topology();
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            Some(Arc::new(PoolEventCount::new(16))),
+            16,
+        );
+        assert_eq!(plan.mode(), WakeMode::Directed);
+        // Every branch of a step with outputs is gated; `SortSpillDecompress`
+        // (a zero-output Parallel step) and the `WriteBgzfFile` sink have none.
+        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        for (i, want) in want.iter().enumerate() {
+            assert_eq!(
+                plan.gated_branches(StepIdx(i)),
+                *want,
+                "{} ({:?})",
+                NATIVE_INPUT_SORT_NAMES[i],
+                kinds[i]
+            );
+        }
+        assert_eq!(
+            plan.forward_branch_count_for_test(StepIdx(11)),
+            1,
+            "SortSpillDecompress: implicit cascade"
+        );
+        for rq in &queues {
+            assert!(plan.tracks(rq), "every gated edge is tracked");
+        }
+    }
+
+    /// Gate oracle at the boundary: an armed event-count key.
+    #[test]
+    fn gated_pool_producer_does_not_notify_without_a_push() {
+        let (g, kinds, pinned, driver_of, typed, queues) = parallel_into_parallel();
+        let pool = Arc::new(PoolEventCount::new(4));
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            Some(Arc::clone(&pool)),
+            4,
+        );
+        assert_directed_and_gated(&plan, StepIdx(0));
+        let mut snap = PushSnapshot::default();
+        plan.snapshot_pushes(StepIdx(0), &mut snap);
+        let key = pool.prepare_wait();
+        let r = plan.on_progress(StepIdx(0), &snap);
+        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::TimedOut, "no push → no notify");
+        assert_eq!(r.gated_off, 1);
+        typed.try_push(Sized8).unwrap();
+        let key = pool.prepare_wait();
+        let _ = plan.on_progress(StepIdx(0), &snap);
+        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken, "a push → one notify");
+    }
+
+    /// Two clones A (pushes) and B (does not) of one producer, and a consumer
+    /// that arms at every possible point, then re-polls and checks
+    /// `wait(key, 0)`. In every one of the 10 producer orders × 6 arm points,
+    /// the re-poll saw the item or the key reads `Woken`.
+    #[test]
+    fn concurrent_clone_orders_never_lose_a_wake() {
+        let orders = interleavings(&["A.snap", "A.push", "A.prog"], &["B.snap", "B.prog"]);
+        assert_eq!(orders.len(), 10);
+        for order in &orders {
+            for arm_at in 0..=order.len() {
+                let (g, kinds, pinned, driver_of, typed, queues) = parallel_into_parallel();
+                let pool = Arc::new(PoolEventCount::new(4));
+                let plan = WakePlan::build(
+                    &g,
+                    &kinds,
+                    &pinned,
+                    &driver_of,
+                    &[],
+                    WakeEdges::byte_bounded(&queues),
+                    Some(Arc::clone(&pool)),
+                    4,
+                );
+                assert_directed_and_gated(&plan, StepIdx(0));
+                let (mut a, mut b) = (PushSnapshot::default(), PushSnapshot::default());
+                let (mut key, mut saw_item) = (None, false);
+                for (i, ev) in order.iter().enumerate() {
+                    if i == arm_at {
+                        key = Some(pool.prepare_wait());
+                        saw_item = !typed.is_empty();
+                    }
+                    match *ev {
+                        "A.snap" => plan.snapshot_pushes(StepIdx(0), &mut a),
+                        "B.snap" => plan.snapshot_pushes(StepIdx(0), &mut b),
+                        "A.push" => typed.try_push(Sized8).unwrap(),
+                        "A.prog" => {
+                            let _ = plan.on_progress(StepIdx(0), &a);
+                        }
+                        "B.prog" => {
+                            let _ = plan.on_progress(StepIdx(0), &b);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                if key.is_none() {
+                    key = Some(pool.prepare_wait());
+                    saw_item = !typed.is_empty();
+                }
+                let woken = pool.wait(key.unwrap(), Duration::ZERO) == WaitOutcome::Woken;
+                assert!(
+                    saw_item || woken,
+                    "order {order:?}, consumer armed at {arm_at}: wake lost"
+                );
+            }
+        }
+    }
+
+    type DirectedCountBounded =
+        (ChainGraph, Vec<StepKind>, Vec<Option<usize>>, Vec<Option<DriverIdx>>, Vec<ParallelHosts>);
+
+    /// `Src(Exclusive w0) → Par(P) → Sink(Serial, None) → Tap(Detached)`; every
+    /// edge `CountBounded`, so no byte-bounded registry entry exists: Directed
+    /// with no gates.
+    fn directed_count_bounded_chain(n: usize, hosts_exclude_reader: bool) -> DirectedCountBounded {
+        let mut g = ChainGraph::new();
+        let src = g.register_step("Src", 1);
+        let par = g.register_step("Par", 1);
+        let sink = g.register_step("Sink", 1);
+        let tap = g.register_step("Tap", 0);
+        g.wire(src, BranchIdx(0), par);
+        g.wire(par, BranchIdx(0), sink);
+        g.wire(sink, BranchIdx(0), tap);
+        let kinds =
+            vec![StepKind::Exclusive, StepKind::Parallel, StepKind::Serial, StepKind::Detached];
+        let pinned = vec![Some(0), None, None, None];
+        let driver_of = vec![None, None, None, Some(DriverIdx(0))];
+        let workers: Vec<usize> =
+            if hosts_exclude_reader { (1..n).collect() } else { (0..n).collect() };
+        let hosts = vec![
+            ParallelHosts::default(),
+            ParallelHosts { workers, driver: None },
+            ParallelHosts::default(),
+            ParallelHosts::default(),
+        ];
+        (g, kinds, pinned, driver_of, hosts)
+    }
+
+    /// Under the widened gate (every producer kind), a count-bounded branch
+    /// stays ungated — it has no push counter — whatever the producer's role,
+    /// a Pool producer's `Progress` on it still wakes its consumer, and every
+    /// cross-thread producer gets a reverse wake on it (count-bounded holder
+    /// wakes).
+    #[test]
+    fn count_bounded_branch_stays_ungated_with_a_reverse_edge() {
+        let (g, kinds, pinned, driver_of, hosts) = directed_count_bounded_chain(4, false);
+        let holder_only: Vec<RegisteredHolderOnlyQueue> = (0..3).map(count_edge).collect();
+        let pool = Arc::new(PoolEventCount::new(4));
+        let plan = WakePlan::build_with_hosts(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges { byte_bounded: &[], holder_only: &holder_only },
+            Some(Arc::clone(&pool)),
+            4,
+            &hosts,
+        );
+        assert_eq!(plan.mode(), WakeMode::Directed);
+        for p in 0..3 {
+            assert!(!plan.is_gated(StepIdx(p)), "a count-bounded branch is never gated");
+        }
+        assert_eq!(plan.reverse_producers(StepIdx(1)), vec![StepIdx(0)]);
+        assert_eq!(plan.reverse_producers(StepIdx(2)), vec![StepIdx(1)]);
+        assert_eq!(plan.reverse_producers(StepIdx(3)), vec![StepIdx(2)]);
+        let key = pool.prepare_wait();
+        let _ = plan.on_progress(StepIdx(1), &PushSnapshot::default());
+        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken, "Par's ungated Pool wake");
+    }
+
+    /// The stashed `next_serial` reaches a consumer armed before the push: an
+    /// ordered branch is gated, and the gate sees the stash insert as a push.
+    #[test]
+    fn stashed_must_accept_push_wakes_the_consumer() {
+        use crate::reorder::{ReorderStage, Sequenced};
+
+        let mut g = ChainGraph::new();
+        let par = g.register_step("Par", 1);
+        let cons = g.register_step("Cons", 1);
+        let tap = g.register_step("Tap", 0);
+        g.wire(par, BranchIdx(0), cons);
+        g.wire(cons, BranchIdx(0), tap);
+        let transport = Arc::new(ByteBoundedQueue::<Sequenced<Sized8>>::new(8));
+        let stage = Arc::new(ReorderStage::new(Arc::clone(&transport) as _));
+        let rq = RegisteredQueue {
+            producer_step_name: "Par",
+            producer_step: par,
+            branch: BranchIdx(0),
+            handle: Arc::clone(&transport) as _,
+            reorder_cap: Some(Arc::clone(&stage) as _),
+        };
+        let pool = Arc::new(PoolEventCount::new(4));
+        let plan = WakePlan::build(
+            &g,
+            &[StepKind::Parallel, StepKind::Parallel, StepKind::Detached],
+            &[None, None, None],
+            &[None, None, Some(DriverIdx(0))],
+            &[],
+            WakeEdges::byte_bounded(&[rq, q(1, 0)]),
+            Some(Arc::clone(&pool)),
+            4,
+        );
+        assert_directed_and_gated(&plan, par);
+        transport.enable_tracking(
+            EdgeTracking { clock: None, holders: Some(HolderSet::new(plan.n_slots())) },
+            crate::queues::SEALED,
+        );
+        stage.try_push(1, Sized8).unwrap(); // fills the transport (out of order)
+        let mut snap = PushSnapshot::default();
+        plan.snapshot_pushes(par, &mut snap);
+        let key = pool.prepare_wait();
+        stage.try_push(0, Sized8).unwrap(); // next_serial → stashed
+        let _ = plan.on_progress(par, &snap);
+        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken, "stashed push gated off");
+    }
+
+    /// Chains without a Detached step keep the empty-table plan.
+    #[test]
+    fn legacy_chains_keep_the_empty_table_plan() {
+        let mut g = ChainGraph::new();
+        let src = g.register_step("Src", 1);
+        let par = g.register_step("Par", 1);
+        let sink = g.register_step("Sink", 0);
+        g.wire(src, BranchIdx(0), par);
+        g.wire(par, BranchIdx(0), sink);
+        let kinds = [StepKind::Serial, StepKind::Parallel, StepKind::Serial];
+        let (rq, _typed) = one_item_tracked(1, 6);
+        let queues = vec![q(0, 0), rq];
+        let pool = Arc::new(PoolEventCount::new(4));
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &[Some(0), None, Some(3)],
+            &[None; 3],
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            Some(Arc::clone(&pool)),
+            4,
+        );
+        assert_eq!(plan.mode(), WakeMode::Legacy);
+        assert!(queues.iter().all(|rq| !plan.tracks(rq)));
+        let key = pool.prepare_wait();
+        let _ = plan.on_progress(StepIdx(1), &PushSnapshot::default());
+        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken);
     }
 }
 
@@ -4787,5 +5293,232 @@ mod e2e {
                 "Legacy issues nothing else ({name})"
             );
         }
+    }
+
+    /// Records each Blob's value (in arrival order) and passes it on; a fixed
+    /// per-item delay makes the downstream edge fill.
+    #[derive(Clone)]
+    struct SlowRecordingPass {
+        seen: Arc<parking_lot::Mutex<Vec<u32>>>,
+        delay: Duration,
+        affinity: Affinity,
+        held: Option<Blob>,
+    }
+    impl SlowRecordingPass {
+        fn serial(seen: &Arc<parking_lot::Mutex<Vec<u32>>>, delay: Duration) -> Self {
+            Self { seen: Arc::clone(seen), delay, affinity: Affinity::None, held: None }
+        }
+    }
+    impl Step for SlowRecordingPass {
+        type Input = Blob;
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "SlowRecordingPass",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn affinity(&self) -> Affinity {
+            self.affinity
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(b) = self.held.take() {
+                return match ctx.outputs.push(b) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                };
+            }
+            match ctx.input.pop() {
+                Some(b) => {
+                    std::thread::sleep(self.delay);
+                    self.seen.lock().push(b.0);
+                    match ctx.outputs.push(b) {
+                        Ok(()) => Ok(StepOutcome::Progress),
+                        Err(u) => {
+                            self.held = Some(u.into_item());
+                            Ok(StepOutcome::Progress)
+                        }
+                    }
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { held: None, ..self.clone() }
+        }
+    }
+
+    /// `Source(Exclusive w0) → Holder(Parallel, one-item edge) →
+    /// SlowRecordingPass(Serial, w0, 1 ms) → Det(Detached) → Sink(Serial, w0)` at
+    /// t2, every worker and driver on a 10 s timer. Worker 1 runs only its
+    /// Holder clone, and no forward wake targets it once the source has pushed
+    /// everything (every consumer downstream of the holder is on worker 0 or a
+    /// driver). Its retries are push-gated, so when its clone holds an item the
+    /// slow pass's pop must unpark it through the edge's holder set. The source
+    /// finishes only after the sink has seen every item, so no `Finished`
+    /// broadcast can release a held item instead; the sink shares worker 0 with
+    /// the source, so the pass that counts the last item lets the source finish.
+    /// (Worker 0 also pays the source's 1 ms wait per pass, ~4.5 ms per item, so
+    /// 300 items keep the run well inside the watchdog.) Preconditions, from the
+    /// run's own stats: the Holder held items (299 of 300 when measured) and the
+    /// slow pass delivered reverse wakes, so the run went through the mechanism
+    /// the test is named for.
+    #[test]
+    fn directed_held_item_resolves_by_reverse_wake() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        let counted = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&counted);
+        run_under_watchdog("directed held item", 5, move || {
+            let mut holder = Pass::new("Holder", StepKind::Parallel);
+            holder.edge = ONE_BLOB;
+            let mut slow = SlowRecordingPass::serial(&s2, Duration::from_millis(1));
+            slow.affinity = Affinity::Worker(0);
+            let mut sink = Sink::new(StepKind::Serial, &c2);
+            sink.affinity = Affinity::Worker(0);
+            let stats = run(
+                2,
+                vec![
+                    TestBackoff { target: T::AllWorkers, us: TEN_S },
+                    TestBackoff { target: T::AllDrivers, us: TEN_S },
+                ],
+                |b| {
+                    b.chain(Source::exclusive_finishing_last(300, 0, &c2))
+                        .chain(holder)
+                        .chain(slow)
+                        .chain(Pass::new("Det", StepKind::Detached))
+                        .chain(sink)
+                        .into_sink_marker();
+                },
+            );
+            *sn2.lock() = Some(stats);
+        });
+        let mut got = seen.lock().clone();
+        got.sort_unstable();
+        assert_eq!(got, (0..300).collect::<Vec<u32>>());
+        assert_eq!(counted.load(AO::Relaxed), 300);
+        let snap = snap.lock().take().expect("snapshot");
+        let holds = row(&snap, "Holder").holds;
+        assert!(holds >= 100, "fixture must hold items on the one-item edge: holds={holds}");
+        let reverse = row(&snap, "SlowRecordingPass").reverse_wakes;
+        assert!(reverse > 0, "the slow pass's pops must deliver reverse wakes: {reverse}");
+    }
+
+    /// A Blob's value is its ordinal: `Source` emits `Blob(0..n)` densely, so a
+    /// `ByItemOrdinal` edge delivers in value order, and a refused item keeps its
+    /// ordinal on retry.
+    impl crate::item::Ordered for Blob {
+        fn ordinal(&self) -> u64 {
+            u64::from(self.0)
+        }
+    }
+
+    /// Ordered Parallel pass-through: `OrderedBytesSingle<Blob>` with
+    /// `ByItemOrdinal`. A refused item is held as `Unpushed` and re-sent with
+    /// `retry`.
+    struct OrderedPass {
+        name: &'static str,
+        edge: QueueSpec,
+        held: Option<crate::handles::Unpushed<Blob>>,
+    }
+    impl OrderedPass {
+        fn new(name: &'static str, edge: QueueSpec) -> Self {
+            Self { name, edge, held: None }
+        }
+    }
+    impl Step for OrderedPass {
+        type Input = Blob;
+        type Outputs = crate::outputs::OrderedBytesSingle<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![self.edge],
+                branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if let Some(u) = self.held.take() {
+                return match ctx.outputs.retry(u) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u);
+                        Ok(StepOutcome::NoProgress)
+                    }
+                };
+            }
+            match ctx.input.pop() {
+                Some(b) => match ctx.outputs.push(b) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u);
+                        Ok(StepOutcome::Progress)
+                    }
+                },
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self::new(self.name, self.edge)
+        }
+    }
+
+    /// `OrderedPass` behind a one-item transport and a 1-byte reorder-stash cap
+    /// into a slow Serial consumer, Detached tail; every thread on a 10 s timer.
+    /// With one item in the transport and the next stashed, every further push
+    /// is a cap rejection even when items arrive in order. Cap rejections latch
+    /// the holder; in-order pops unpark it. `holds >= 100` proves the fixture
+    /// reached the cap (precondition): with the cap applied ~496 of 500 pushes
+    /// hold, without it at most a handful of fast-path refusals do (0-1 when
+    /// measured). The oracle is the in-order values inside the watchdog.
+    #[test]
+    fn stash_cap_holder_is_woken_in_a_directed_chain() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        let counted = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&counted);
+        run_under_watchdog("stash-cap holder", 5, move || {
+            let builder = Pipeline::builder();
+            builder
+                .chain(Source::exclusive(500, 0))
+                .chain(OrderedPass::new("OrderedPass", ONE_BLOB))
+                .chain(SlowRecordingPass::serial(&s2, Duration::from_micros(200)))
+                .chain(Sink::new(StepKind::Detached, &c2))
+                .into_sink_marker();
+            let pipeline = builder.build().expect("build");
+            let stats = pipeline.stats();
+            pipeline
+                .run(
+                    PipelineConfig {
+                        threads: 3,
+                        test_backoff: vec![
+                            TestBackoff { target: T::AllWorkers, us: TEN_S },
+                            TestBackoff { target: T::AllDrivers, us: TEN_S },
+                        ],
+                        test_reorder_overflow_bytes: Some(1),
+                        ..Default::default()
+                    }
+                    .with_stats(Arc::clone(&stats)),
+                )
+                .expect("run");
+            *sn2.lock() = Some(stats.snapshot());
+        });
+        assert_eq!(*seen.lock(), (0..500).collect::<Vec<u32>>());
+        let s = snap.lock().take().unwrap();
+        let holds = row(&s, "OrderedPass").holds;
+        assert!(holds >= 100, "fixture never hit the stash cap: holds={holds}");
     }
 }

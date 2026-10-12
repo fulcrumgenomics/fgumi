@@ -796,6 +796,14 @@ struct DispatchInfo {
 /// `Finished` here rather than re-`try_lock`-ing and re-running an already-done
 /// step. The winning worker sets the latch under the dispatch guard before
 /// `mark_outputs_drained`, so a non-idempotent flusher can never be re-entered.
+///
+/// Wakes: a `Progress` calls `WakePlan::on_progress` with the push counters
+/// snapshotted before the dispatch, so in a `Directed` chain a consumer on a
+/// byte-bounded edge is woken only if this dispatch actually pushed to it
+/// (count-bounded and unbounded edges, and a zero-output Parallel step's
+/// self-cascade, are ungated and wake on every `Progress`), plus the reverse
+/// wakes of holders its pops made room for; a `Legacy` chain wakes one pool
+/// worker per `Progress`.
 #[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 fn dispatch_one_step(
     entry: &mut WorkerStepEntry,
@@ -837,8 +845,10 @@ fn dispatch_one_step(
     // Per-thread diagnostic state; updated after the outcome is known.
     diag: &mut LoopDiag,
 ) -> Option<DispatchInfo> {
-    // Gate snapshot: one Relaxed load per gated branch of a Detached producer,
-    // nothing for an ungated step (`is_gated` is a precomputed bool).
+    // Gate snapshot: one Relaxed load per push-gated branch (every byte-bounded
+    // output of a Directed chain), nothing for an ungated step (`is_gated` is a
+    // precomputed bool). `on_progress` compares against it to wake a consumer
+    // only when this dispatch pushed to its edge.
     let mut snap = PushSnapshot::default();
     if wake.is_gated(step_idx) {
         wake.snapshot_pushes(step_idx, &mut snap);
