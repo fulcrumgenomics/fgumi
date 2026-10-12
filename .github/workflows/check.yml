@@ -284,20 +284,20 @@ jobs:
 
   # `merge_slots.rs` (fgumi-sort) and `admission.rs` (fgumi-pipeline-core) swap
   # their sync primitives for loom's under `--cfg loom`, and
-  # `tests/loom_merge_slots.rs` and `tests/loom_admission.rs`, which drive those
-  # real types, are `#![cfg(loom)]`. None is built by any other
-  # job, so without this one a broken model — or a `cfg(loom)` build that stopped
-  # compiling — is invisible: the test target compiles to an empty binary under a
-  # normal build and reports success. That silence is the whole reason this job
+  # `tests/loom_merge_slots.rs`, `tests/loom_admission.rs` and
+  # `tests/loom_wake.rs` are `#![cfg(loom)]`. None is built by any other job, so
+  # without this one a broken model — or a `cfg(loom)` build that stopped
+  # compiling — is invisible: the test target compiles to an empty binary under
+  # a normal build and reports success. That silence is the whole reason this job
   # exists.
   #
   # Per-PR rather than on a schedule, unlike `miri.yml` and `stress.yml`. Those
   # two are scheduled because they are non-deterministic in ways unrelated to a
   # given change (a nightly-toolchain regression; timing sensitivity). Loom
-  # explores a bounded state space deterministically — every model in both
-  # files runs under a preemption bound (see `loom_merge_slots.rs`'s
-  # "Preemption-bounded exploration" note) — so the same input yields the same verdict with no flake, which is
-  # what lets it gate a PR, and a gate is what stops it rotting.
+  # explores a bounded state space deterministically — exhaustively for the
+  # small `loom_wake.rs` models, under a preemption bound for the others (see
+  # `loom_merge_slots.rs`'s "Preemption-bounded exploration" note) — so the same
+  # input yields the same verdict with no flake, which is what lets it gate a PR, and a gate is what stops it rotting.
   loom:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -310,14 +310,26 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install nextest
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: nextest
       # Release: the models explore enough interleavings that a debug build takes
-      # several times as long for the same verdict.
+      # several times as long for the same verdict. nextest fails on zero tests
+      # run, so a `cfg` mismatch that builds an empty test binary fails the step
+      # instead of passing silently; the `loom` profile gives each model a
+      # 10-minute budget, inside this job's 20-minute timeout for the three
+      # steps together (see `.config/nextest.toml`).
       - name: Loom model check (SortMergeSlot)
-        run: cargo test -p fgumi-sort --test loom_merge_slots --release
+        run: cargo nextest run --profile loom -p fgumi-sort --test loom_merge_slots --release
         env:
           RUSTFLAGS: --cfg loom
       - name: Loom model check (phase-cap whole-cap reservation)
-        run: cargo test -p fgumi-pipeline-core --test loom_admission --release
+        run: cargo nextest run --profile loom -p fgumi-pipeline-core --test loom_admission --release
+        env:
+          RUSTFLAGS: --cfg loom
+      - name: Loom model check (pipeline-core wake protocols)
+        run: cargo nextest run --profile loom -p fgumi-pipeline-core --test loom_wake --release
         env:
           RUSTFLAGS: --cfg loom
 

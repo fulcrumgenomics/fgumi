@@ -114,6 +114,13 @@ pub struct PipelineSignal {
     /// a caller parked for a whole cap observes `is_done()` and gives up. Weak:
     /// the signal must not keep a cap alive past the run.
     caps: parking_lot::Mutex<Vec<std::sync::Weak<crate::admission::PhaseCap>>>,
+    /// Late-bound handle to the chain's wake plan, set by `Pipeline::run`
+    /// before any thread spawns. On a terminal transition the signal unparks
+    /// every registered driver and worker through it, so a thread parked on its
+    /// timer (a driver, a pinned worker, the lone worker of a one-worker run)
+    /// observes `is_done()` promptly. Held as a `Weak` for the same reason as
+    /// `event_count`.
+    wake_plan: OnceLock<std::sync::Weak<crate::runtime::wake::WakePlan>>,
 }
 
 impl PipelineSignal {
@@ -161,7 +168,10 @@ impl PipelineSignal {
     /// dropped (all workers joined — nobody to wake).
     fn wake_parked_workers(&self) {
         if let Some(ec) = self.event_count.get().and_then(std::sync::Weak::upgrade) {
-            ec.notify_all();
+            let _ = ec.notify_all();
+        }
+        if let Some(p) = self.wake_plan.get().and_then(std::sync::Weak::upgrade) {
+            p.unpark_all();
         }
         // Snapshot first: a cap's notify takes the cap's own lock, which must
         // never be taken while holding the registry's.
@@ -175,6 +185,13 @@ impl PipelineSignal {
     /// transition must wake (see `PhaseCap::bind_signal`).
     pub(crate) fn register_cap(&self, cap: std::sync::Weak<crate::admission::PhaseCap>) {
         self.caps.lock().push(cap);
+    }
+
+    /// Bind the chain's wake plan so terminal transitions unpark every
+    /// registered thread. Called once by `Pipeline::run` before spawning any
+    /// thread; a second call is silently dropped. Stored as a `Weak`.
+    pub(crate) fn bind_wake_plan(&self, plan: &Arc<crate::runtime::wake::WakePlan>) {
+        let _ = self.wake_plan.set(Arc::downgrade(plan));
     }
 
     /// First writer wins; later writers are silently dropped (the
@@ -331,6 +348,27 @@ impl CancelHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cancel unparks a registered driver through the bound wake plan, even
+    /// with no event-count to notify.
+    #[test]
+    fn cancel_unparks_a_registered_driver() {
+        use crate::runtime::wake::DriverIdx;
+        let (plan, _g) = crate::runtime::wake::tests_support::directed_plan_with_workers(2);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let driver = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            std::thread::park_timeout(std::time::Duration::from_secs(10));
+            t.elapsed()
+        });
+        plan.register_driver(DriverIdx(0), driver.thread().clone());
+        let signal = PipelineSignal::new();
+        signal.bind_wake_plan(&plan);
+        rx.recv().unwrap();
+        signal.cancel();
+        assert!(driver.join().unwrap() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn fresh_signal_is_not_done() {

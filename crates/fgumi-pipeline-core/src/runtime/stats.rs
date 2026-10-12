@@ -45,6 +45,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::runtime::event_count::WaitOutcome;
 use crate::step::StepOutcome;
 use crate::topology::StepIdx;
 
@@ -75,6 +76,80 @@ pub struct StepStats {
     /// Progress dispatch. Updated on every Progress (monotonic max).
     /// `0` if the step never made progress.
     pub last_progress_ns: AtomicU64,
+    /// `notify_one` calls issued on this step's `Progress` or flushed retry
+    /// (any outcome). A flushed retry issues them only in a Directed plan.
+    pub notifies_issued: AtomicU64,
+    /// Of those, calls that found no armed or parked event-count waiter.
+    pub notifies_no_waiters: AtomicU64,
+    /// Of those, calls that found a waiter but left it parked: the concurrency
+    /// ceiling was reached (`NotifyOutcome::Suppressed`).
+    pub notifies_suppressed: AtomicU64,
+    /// `Thread::unpark` calls issued on this step's `Progress` or flushed retry
+    /// (driver / pinned-worker targets, or the step's own thread, for a
+    /// same-thread consumer of a flushed retry).
+    pub unparks_issued: AtomicU64,
+    /// Holders this step's pops woke: threads whose push into this step's input
+    /// was rejected, unparked directly when the pop made room.
+    pub reverse_wakes: AtomicU64,
+    /// `Pool` wakes that found no event-count waiter and unparked a worker that
+    /// was idling on its own timer instead: one armed for a timer park
+    /// (pinned, or holding an item), else one parked only because a phase cap
+    /// refused it (when the consumer's cap has a free permit).
+    pub direct_fallbacks: AtomicU64,
+    /// Gated output branches that pushed nothing on a `Progress` (or, in a
+    /// Directed plan, flushed-retry) dispatch, so their wake was skipped: one
+    /// per such branch, not per dispatch.
+    pub gated_off: AtomicU64,
+    /// Items this step held and later pushed: a push into one of its
+    /// byte-bounded output edges was refused back to the step, and a later
+    /// successful push into that edge (or a reorder stash insert that accepted
+    /// the item) released it. A refusal is either the transport's (budget
+    /// reached) or, on an ordered branch, the reorder stash cap's. A transport
+    /// refusal that the reorder stage turns into a stash insert is an accepted
+    /// push and is not a hold. Measured at the `ByteBoundedQueue` transport
+    /// while stats are on, so it counts every holding step — whatever slot type
+    /// it uses and whether its retry reports `NoProgress` or `Contention` — and
+    /// nothing that is not a refusal (an admission-cap refusal, a Serial lock)
+    /// is counted. A `Parallel` step's holds are timed per clone (its thread);
+    /// any other step's per step, so a `Serial` step's held item flushed by a
+    /// different worker ends its hold. Count-bounded and unbounded edges carry
+    /// no hold clock.
+    pub holds: AtomicU64,
+    /// Retries of a held item that were rejected again.
+    pub held_retries: AtomicU64,
+    /// Sum over holds of (first rejection → successful push) wall time.
+    pub held_wait_ns: AtomicU64,
+    /// The longest single hold.
+    pub held_wait_max_ns: AtomicU64,
+    /// Log2 histogram of hold waits in microseconds (bucket `i` = `[2^i, 2^(i+1))` µs,
+    /// bucket 0 also takes waits under 1 µs, the last bucket everything above).
+    /// The decision rules are stated as p99, which a sum and a max cannot give.
+    pub held_wait_hist: [AtomicU64; HELD_HIST_BUCKETS],
+}
+
+/// Buckets of the per-step hold-wait histogram.
+pub const HELD_HIST_BUCKETS: usize = 32;
+
+/// What one dispatch's wakes did, handed to [`PipelineStats::record_wake`].
+/// Small integers (a step has at most a handful of output branches per
+/// dispatch). Returned by value from the wake path; recorded only when stats
+/// are on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WakeCounts {
+    /// Event-count notifies that woke a waiter.
+    pub notified: u8,
+    /// Event-count notifies that found no waiter.
+    pub no_waiters: u8,
+    /// Event-count notifies the concurrency ceiling suppressed.
+    pub suppressed: u8,
+    /// Direct `Thread::unpark` forward wakes (driver or pinned worker).
+    pub unparked: u8,
+    /// Holders woken by this dispatch's pop.
+    pub reverse: u8,
+    /// `Pool` wakes delivered by unparking a timer-parked worker.
+    pub fallback: u8,
+    /// Gated branches that pushed nothing, so their wake was skipped.
+    pub gated_off: u8,
 }
 
 impl Default for StepStats {
@@ -90,6 +165,18 @@ impl Default for StepStats {
             total_run_ns: AtomicU64::new(0),
             first_progress_ns: AtomicU64::new(u64::MAX),
             last_progress_ns: AtomicU64::new(0),
+            notifies_issued: AtomicU64::new(0),
+            notifies_no_waiters: AtomicU64::new(0),
+            notifies_suppressed: AtomicU64::new(0),
+            unparks_issued: AtomicU64::new(0),
+            reverse_wakes: AtomicU64::new(0),
+            direct_fallbacks: AtomicU64::new(0),
+            gated_off: AtomicU64::new(0),
+            holds: AtomicU64::new(0),
+            held_retries: AtomicU64::new(0),
+            held_wait_ns: AtomicU64::new(0),
+            held_wait_max_ns: AtomicU64::new(0),
+            held_wait_hist: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -107,6 +194,18 @@ impl StepStats {
             total_run_ns: self.total_run_ns.load(Ordering::Relaxed),
             first_progress_ns: self.first_progress_ns.load(Ordering::Relaxed),
             last_progress_ns: self.last_progress_ns.load(Ordering::Relaxed),
+            notifies_issued: self.notifies_issued.load(Ordering::Relaxed),
+            notifies_no_waiters: self.notifies_no_waiters.load(Ordering::Relaxed),
+            notifies_suppressed: self.notifies_suppressed.load(Ordering::Relaxed),
+            unparks_issued: self.unparks_issued.load(Ordering::Relaxed),
+            reverse_wakes: self.reverse_wakes.load(Ordering::Relaxed),
+            direct_fallbacks: self.direct_fallbacks.load(Ordering::Relaxed),
+            gated_off: self.gated_off.load(Ordering::Relaxed),
+            holds: self.holds.load(Ordering::Relaxed),
+            held_retries: self.held_retries.load(Ordering::Relaxed),
+            held_wait_ns: self.held_wait_ns.load(Ordering::Relaxed),
+            held_wait_max_ns: self.held_wait_max_ns.load(Ordering::Relaxed),
+            held_wait_hist: std::array::from_fn(|i| self.held_wait_hist[i].load(Ordering::Relaxed)),
         }
     }
 }
@@ -146,6 +245,19 @@ pub struct PipelineStats {
     /// duration and the park-to-progress ratio — the signal for whether the
     /// backoff (vs a precise per-slot condvar) adds latency on the merge's path.
     detached_park_events: Box<[AtomicU64]>,
+    /// Per-worker event-count wait outcomes (`WaitOutcome::{Woken, Notified,
+    /// TimedOut}`), indexed by `thread_id`. A pool whose waits mostly time out
+    /// is being fed by its timer, not by wakes.
+    ec_waits_woken_fast: Box<[AtomicU64]>,
+    ec_waits_notified: Box<[AtomicU64]>,
+    ec_waits_timed_out: Box<[AtomicU64]>,
+    /// Per-worker timer parks (pinned workers, the lone worker of a one-worker
+    /// run, holders): returned early (unparked or spurious) vs ran to the deadline.
+    timer_parks_unparked: Box<[AtomicU64]>,
+    timer_parks_timed_out: Box<[AtomicU64]>,
+    /// Per-step driver park outcomes (attributed like `detached_park_events`).
+    detached_park_unparked: Box<[AtomicU64]>,
+    detached_park_timed_out: Box<[AtomicU64]>,
     /// Anchor for first/last-progress timestamps. Set at `PipelineStats`
     /// construction; all `first_progress_ns` / `last_progress_ns` values
     /// are wall-ns elapsed from this `Instant`.
@@ -166,7 +278,16 @@ impl PipelineStats {
         let detached_busy_ns = (0..n_steps).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         let detached_idle_ns = (0..n_steps).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         let detached_park_events = (0..n_steps).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
+        let per_worker = || (0..MAX_TRACKED_WORKERS).map(|_| AtomicU64::new(0)).collect();
+        let per_step = || (0..n_steps).map(|_| AtomicU64::new(0)).collect();
         Self {
+            ec_waits_woken_fast: per_worker(),
+            ec_waits_notified: per_worker(),
+            ec_waits_timed_out: per_worker(),
+            timer_parks_unparked: per_worker(),
+            timer_parks_timed_out: per_worker(),
+            detached_park_unparked: per_step(),
+            detached_park_timed_out: per_step(),
             steps: steps.into_boxed_slice(),
             step_names: step_names.into_boxed_slice(),
             worker_busy_ns: worker_busy_ns.into_boxed_slice(),
@@ -205,6 +326,79 @@ impl PipelineStats {
     #[inline]
     pub fn record_detached_park(&self, step: StepIdx) {
         if let Some(c) = self.detached_park_events.get(step.0) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Accumulate one dispatch's wake report for `step`. Stats-on only — the
+    /// driver calls this with the report the wake path returned by value.
+    #[inline]
+    pub(crate) fn record_wake(&self, step: StepIdx, r: WakeCounts) {
+        let Some(s) = self.steps.get(step.0) else { return };
+        s.notifies_issued.fetch_add(
+            u64::from(r.notified) + u64::from(r.no_waiters) + u64::from(r.suppressed),
+            Ordering::Relaxed,
+        );
+        s.notifies_no_waiters.fetch_add(u64::from(r.no_waiters), Ordering::Relaxed);
+        s.notifies_suppressed.fetch_add(u64::from(r.suppressed), Ordering::Relaxed);
+        s.unparks_issued.fetch_add(u64::from(r.unparked), Ordering::Relaxed);
+        s.reverse_wakes.fetch_add(u64::from(r.reverse), Ordering::Relaxed);
+        s.direct_fallbacks.fetch_add(u64::from(r.fallback), Ordering::Relaxed);
+        s.gated_off.fetch_add(u64::from(r.gated_off), Ordering::Relaxed);
+    }
+
+    /// One held item of `step` was released after `wait_ns`.
+    #[inline]
+    pub fn record_hold(&self, step: StepIdx, wait_ns: u64) {
+        let Some(s) = self.steps.get(step.0) else { return };
+        s.holds.fetch_add(1, Ordering::Relaxed);
+        s.held_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        s.held_wait_max_ns.fetch_max(wait_ns, Ordering::Relaxed);
+        let us = wait_ns / 1_000;
+        let bucket =
+            if us == 0 { 0 } else { (63 - us.leading_zeros()) as usize }.min(HELD_HIST_BUCKETS - 1);
+        s.held_wait_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A retry of a held item of `step` was rejected again.
+    #[inline]
+    pub fn record_held_retry(&self, step: StepIdx) {
+        if let Some(s) = self.steps.get(step.0) {
+            s.held_retries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One event-count wait on pool `worker` ended with `outcome`.
+    #[inline]
+    pub fn record_ec_wait(&self, worker: usize, outcome: WaitOutcome) {
+        let arr = match outcome {
+            WaitOutcome::Woken => &self.ec_waits_woken_fast,
+            WaitOutcome::Notified => &self.ec_waits_notified,
+            WaitOutcome::TimedOut => &self.ec_waits_timed_out,
+        };
+        if let Some(c) = arr.get(worker) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One timed park on pool `worker` (its timer, not the event-count):
+    /// `timed_out` when it ran to its deadline.
+    #[inline]
+    pub fn record_timer_park(&self, worker: usize, timed_out: bool) {
+        let arr = if timed_out { &self.timer_parks_timed_out } else { &self.timer_parks_unparked };
+        if let Some(c) = arr.get(worker) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One driver park attributed to `step`: `timed_out` when it ran to its deadline
+    /// (timer slack can misclassify a late unpark as a timeout — the conservative
+    /// direction, since a timeout is the signal that a wake is missing).
+    #[inline]
+    pub fn record_detached_park_outcome(&self, step: StepIdx, timed_out: bool) {
+        let arr =
+            if timed_out { &self.detached_park_timed_out } else { &self.detached_park_unparked };
+        if let Some(c) = arr.get(step.0) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -351,7 +545,34 @@ impl PipelineStats {
             })
             .filter(|(_, busy, idle)| *busy != 0 || *idle != 0)
             .collect();
-        StatsSnapshot { steps, workers, detached: self.detached_snapshot(), edges: Vec::new() }
+        let load = |a: &[AtomicU64], i: usize| a[i].load(Ordering::Relaxed);
+        let worker_waits = (0..MAX_TRACKED_WORKERS)
+            .map(|w| {
+                (
+                    w,
+                    load(&self.ec_waits_woken_fast, w),
+                    load(&self.ec_waits_notified, w),
+                    load(&self.ec_waits_timed_out, w),
+                    load(&self.timer_parks_unparked, w),
+                    load(&self.timer_parks_timed_out, w),
+                )
+            })
+            .filter(|&(_, a, b, c, d, e)| a | b | c | d | e != 0)
+            .collect();
+        let detached_park_outcomes = (0..self.steps.len())
+            .map(|s| {
+                (s, load(&self.detached_park_unparked, s), load(&self.detached_park_timed_out, s))
+            })
+            .filter(|&(_, u, t)| u | t != 0)
+            .collect();
+        StatsSnapshot {
+            steps,
+            workers,
+            detached: self.detached_snapshot(),
+            edges: Vec::new(),
+            worker_waits,
+            detached_park_outcomes,
+        }
     }
 
     /// Collect `(step, step_name, busy_ns, idle_ns, park_events)` for every step
@@ -405,7 +626,7 @@ impl PipelineStats {
 }
 
 /// Plain (non-atomic) snapshot of `PipelineStats` at a moment in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct StatsSnapshot {
     pub steps: Vec<(&'static str, StepStatsSnapshot)>,
     /// `(thread_id, busy_ns, idle_ns)` for each worker that did anything.
@@ -425,6 +646,13 @@ pub struct StatsSnapshot {
     /// Per-edge throughput / occupancy / latency. Empty unless the snapshot was
     /// built via [`PipelineStats::snapshot_with_edges`] (i.e. instrumentation on).
     pub edges: Vec<EdgeStatsSnapshot>,
+    /// `(worker, woken_fast, notified, timed_out, timer_unparked, timer_timed_out)`
+    /// for each pool worker that waited on the event-count or idled on its timer:
+    /// event-count wait outcomes, then timer-park outcomes. Filtered to non-zero.
+    pub worker_waits: Vec<(usize, u64, u64, u64, u64, u64)>,
+    /// `(step, unparked, timed_out)` driver-park outcomes per step (attributed
+    /// like `detached`'s park count). Filtered to non-zero.
+    pub detached_park_outcomes: Vec<(usize, u64, u64)>,
 }
 
 /// Occupancy classification refined from the histogram's [`RawOccupancy`](crate::runtime::metrics::RawOccupancy) plus
@@ -569,7 +797,7 @@ pub(crate) fn compute_edge_stats(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct StepStatsSnapshot {
     /// Total `try_run` dispatches (every outcome, including errors).
     pub try_run_total: u64,
@@ -593,9 +821,65 @@ pub struct StepStatsSnapshot {
     /// Wall ns (from pipeline start) of this step's last Progress
     /// dispatch end. `0` if no Progress was ever recorded.
     pub last_progress_ns: u64,
+    /// See [`StepStats::notifies_issued`].
+    pub notifies_issued: u64,
+    /// See [`StepStats::notifies_no_waiters`].
+    pub notifies_no_waiters: u64,
+    /// See [`StepStats::notifies_suppressed`].
+    pub notifies_suppressed: u64,
+    /// See [`StepStats::unparks_issued`].
+    pub unparks_issued: u64,
+    /// See [`StepStats::reverse_wakes`].
+    pub reverse_wakes: u64,
+    /// See [`StepStats::direct_fallbacks`].
+    pub direct_fallbacks: u64,
+    /// See [`StepStats::gated_off`].
+    pub gated_off: u64,
+    /// See [`StepStats::holds`].
+    pub holds: u64,
+    /// See [`StepStats::held_retries`].
+    pub held_retries: u64,
+    /// See [`StepStats::held_wait_ns`].
+    pub held_wait_ns: u64,
+    /// See [`StepStats::held_wait_max_ns`].
+    pub held_wait_max_ns: u64,
+    /// See [`StepStats::held_wait_hist`].
+    pub held_wait_hist: [u64; HELD_HIST_BUCKETS],
 }
 
 impl StepStatsSnapshot {
+    /// Upper edge (ns) of the histogram bucket holding quantile `q` (0..=1) of
+    /// this step's hold waits — an upper bound within 2× of the true value.
+    /// `0` when the histogram is empty.
+    ///
+    /// The rank is taken from the histogram's own total, not from
+    /// [`holds`](Self::holds): the two are separate relaxed counters
+    /// ([`PipelineStats::record_hold`] bumps `holds` first), so a mid-run
+    /// snapshot can see more holds than bucketed waits. Ranking against `holds`
+    /// would then walk past the last bucket.
+    #[must_use]
+    pub fn held_wait_quantile_ns(&self, q: f64) -> u64 {
+        let total: u64 = self.held_wait_hist.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let rank = ((total as f64) * q.clamp(0.0, 1.0)).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (i, &n) in self.held_wait_hist.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                return (1u64 << (i + 1)) * 1_000;
+            }
+        }
+        // Unreachable: `rank <= total`, so the running sum reaches it above.
+        (1u64 << HELD_HIST_BUCKETS) * 1_000
+    }
+
     #[must_use]
     pub fn avg_run_ns(&self) -> Option<u64> {
         if self.try_run_total == 0 { None } else { Some(self.total_run_ns / self.try_run_total) }
@@ -766,6 +1050,7 @@ impl fmt::Display for StatsSnapshot {
         // for the headroom line.
         let total_cpu_ns: u64 = self.steps.iter().map(|(_, s)| s.total_run_ns).sum();
         self.write_steps(f, total_cpu_ns)?;
+        self.write_wakes(f)?;
         self.write_utilization(f, total_cpu_ns)?;
         // Per-edge throughput / occupancy / latency + the bottleneck verdict
         // (both only when instrumented).
@@ -848,6 +1133,63 @@ impl StatsSnapshot {
         Ok(())
     }
 
+    /// Render the per-step wake/hold table. No-op when every counter is zero
+    /// (every single-thread fused run, and any run that never notified or held).
+    fn write_wakes(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let any = self.steps.iter().any(|(_, s)| {
+            s.notifies_issued
+                | s.unparks_issued
+                | s.reverse_wakes
+                | s.direct_fallbacks
+                | s.gated_off
+                | s.holds
+                | s.held_retries
+                != 0
+        });
+        if !any {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>12} {:>12} {:>12}",
+            "wake",
+            "notify",
+            "nowait",
+            "suppressed",
+            "unpark",
+            "reverse",
+            "fallback",
+            "gated_off",
+            "holds",
+            "retries",
+            "held_p50_ms",
+            "held_p99_ms",
+            "held_max_ms",
+        )?;
+        #[allow(clippy::cast_precision_loss)]
+        let ms = |ns: u64| (ns as f64) / 1_000_000.0;
+        for (name, s) in &self.steps {
+            writeln!(
+                f,
+                "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>12.3} {:>12.3} {:>12.3}",
+                name,
+                s.notifies_issued,
+                s.notifies_no_waiters,
+                s.notifies_suppressed,
+                s.unparks_issued,
+                s.reverse_wakes,
+                s.direct_fallbacks,
+                s.gated_off,
+                s.holds,
+                s.held_retries,
+                ms(s.held_wait_quantile_ns(0.50)),
+                ms(s.held_wait_quantile_ns(0.99)),
+                ms(s.held_wait_max_ns),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Render per-worker utilisation, the pool-level utilisation, and the
     /// squeeze-headroom synthesis. No-op when no worker recorded activity.
     ///
@@ -867,7 +1209,11 @@ impl StatsSnapshot {
         #[allow(clippy::cast_precision_loss)]
         let ms = |ns: u64| (ns as f64) / 1_000_000.0;
         let (mut sum_busy, mut sum_idle) = (0u64, 0u64);
-        writeln!(f, "  {:<8} {:>14} {:>14} {:>8}", "worker", "busy_ms", "idle_ms", "busy%")?;
+        writeln!(
+            f,
+            "  {:<8} {:>14} {:>14} {:>8} {:>10} {:>10} {:>11}",
+            "worker", "busy_ms", "idle_ms", "busy%", "waits", "notified%", "timed_out%"
+        )?;
         for &(id, busy, idle) in &self.workers {
             sum_busy += busy;
             sum_idle += idle;
@@ -878,7 +1224,30 @@ impl StatsSnapshot {
                 let p = busy as f64 / (busy + idle) as f64 * 100.0;
                 p
             };
-            writeln!(f, "  {id:<8} {:>14.3} {:>14.3} {pct:>7.1}%", ms(busy), ms(idle))?;
+            let (fast, notified, timed_out, timer_unparked, timer_timed_out) = self
+                .worker_waits
+                .iter()
+                .find(|w| w.0 == id)
+                .map_or((0, 0, 0, 0, 0), |w| (w.1, w.2, w.3, w.4, w.5));
+            let waits = fast + notified + timed_out;
+            #[allow(clippy::cast_precision_loss)]
+            let share = |n: u64| if waits == 0 { 0.0 } else { n as f64 / waits as f64 * 100.0 };
+            write!(
+                f,
+                "  {id:<8} {:>14.3} {:>14.3} {pct:>7.1}% {waits:>10} {:>9.1}% {:>10.1}%",
+                ms(busy),
+                ms(idle),
+                share(notified),
+                share(timed_out),
+            )?;
+            if timer_unparked + timer_timed_out > 0 {
+                write!(
+                    f,
+                    " timer_parks={} (unparked {timer_unparked}, timed_out {timer_timed_out})",
+                    timer_unparked + timer_timed_out
+                )?;
+            }
+            writeln!(f)?;
         }
         let pool_pct = if sum_busy + sum_idle == 0 {
             0.0
@@ -921,7 +1290,7 @@ impl StatsSnapshot {
         }
         #[allow(clippy::cast_precision_loss)]
         let ms = |ns: u64| (ns as f64) / 1_000_000.0;
-        for &(_step, name, busy, idle, parks) in &self.detached {
+        for &(step, name, busy, idle, parks) in &self.detached {
             let pct = if busy + idle == 0 {
                 0.0
             } else {
@@ -934,9 +1303,14 @@ impl StatsSnapshot {
             // signal (the deferred per-slot condvar would eliminate them).
             #[allow(clippy::cast_precision_loss)]
             let avg_park_us = if parks == 0 { 0.0 } else { (idle as f64 / parks as f64) / 1000.0 };
+            let (unparked, timed_out) = self
+                .detached_park_outcomes
+                .iter()
+                .find(|o| o.0 == step)
+                .map_or((0, 0), |o| (o.1, o.2));
             writeln!(
                 f,
-                "  detached `{name}`: {:.3} ms busy / {:.3} ms idle ({pct:.1}% busy, off pool); {parks} parks (avg {avg_park_us:.1}µs)",
+                "  detached `{name}`: {:.3} ms busy / {:.3} ms idle ({pct:.1}% busy, off pool); {parks} parks (unparked {unparked}, timed out {timed_out}, avg {avg_park_us:.1}µs)",
                 ms(busy),
                 ms(idle),
             )?;
@@ -1066,6 +1440,7 @@ mod tests {
             total_run_ns: 0,
             first_progress_ns: u64::MAX,
             last_progress_ns: 0,
+            ..Default::default()
         };
         assert_eq!(snap.avg_run_ns(), None);
 
@@ -1173,6 +1548,7 @@ mod tests {
                 total_run_ns,
                 first_progress_ns: 0,
                 last_progress_ns: total_run_ns,
+                ..Default::default()
             },
         )
     }
@@ -1215,6 +1591,7 @@ mod tests {
                 edge_stat("Up", Some("Slow"), 1, Some(0), OccupancyClass::Full, 0.0),
                 edge_stat("Slow", Some("Down"), 0, Some(1), OccupancyClass::Empty, 0.0),
             ],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         let primary: Vec<_> = v.iter().filter(|f| f.severity == Severity::Primary).collect();
@@ -1244,6 +1621,7 @@ mod tests {
                 edge_stat("B", Some("Merge"), 1, Some(2), OccupancyClass::Full, 0.0),
                 edge_stat("Merge", Some("Sink"), 2, Some(3), OccupancyClass::Empty, 0.0),
             ],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         let primary: Vec<_> = v.iter().filter(|f| f.severity == Severity::Primary).collect();
@@ -1268,6 +1646,7 @@ mod tests {
                 OccupancyClass::Starved,
                 0.7,
             )],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         assert!(
@@ -1292,6 +1671,7 @@ mod tests {
             workers: vec![],
             detached: vec![],
             edges: vec![],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         assert!(
@@ -1342,6 +1722,7 @@ mod tests {
             workers: vec![],
             detached: vec![(0, "SortMerge", 900_000_000, 100_000_000, 4_200)],
             edges: vec![],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         assert!(
@@ -1362,6 +1743,7 @@ mod tests {
             workers: vec![],
             detached: vec![(0, "SortMerge", 900_000_000, 100_000_000, 4_200)],
             edges: vec![],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         assert_eq!(
@@ -1379,6 +1761,7 @@ mod tests {
             workers: vec![],
             detached: vec![],
             edges: vec![edge_stat("A", Some("B"), 0, Some(1), OccupancyClass::Healthy, 0.0)],
+            ..Default::default()
         };
         let v = bottleneck_verdict(&snap);
         assert_eq!(v.len(), 1);
@@ -1404,6 +1787,7 @@ mod tests {
             workers: vec![(0, 800, 200)],
             detached: vec![],
             edges: vec![],
+            ..Default::default()
         };
         let out = format!("{snap}");
         assert!(out.contains("cpu%"), "per-step table has a cpu% column: {out}");
@@ -1423,6 +1807,7 @@ mod tests {
             workers: vec![],
             detached: vec![],
             edges: vec![],
+            ..Default::default()
         };
         let out = format!("{snap}");
         assert!(!out.contains("pool utilisation"), "no pool line without workers: {out}");
@@ -1483,5 +1868,144 @@ mod tests {
         let out = format!("{}", stats.snapshot());
         assert!(out.contains("detached `OnlyDetached`"), "Detached line present: {out}");
         assert!(!out.contains("pool utilisation"), "no pool line without workers: {out}");
+    }
+
+    #[test]
+    fn wake_counters_accumulate_per_step_and_render_only_when_nonzero() {
+        let stats = PipelineStats::new(vec!["A", "B"]);
+        // Nothing recorded → no wake table.
+        let text = format!("{}", stats.snapshot());
+        assert!(!text.contains("  wake "), "no wake table when every counter is zero:\n{text}");
+
+        stats.record_wake(
+            StepIdx(1),
+            WakeCounts {
+                notified: 2,
+                no_waiters: 1,
+                suppressed: 2,
+                unparked: 3,
+                reverse: 1,
+                fallback: 1,
+                gated_off: 4,
+            },
+        );
+        stats.record_wake(StepIdx(1), WakeCounts { notified: 1, ..WakeCounts::default() });
+        stats.record_hold(StepIdx(1), 1_500_000);
+        stats.record_hold(StepIdx(1), 500_000);
+        stats.record_held_retry(StepIdx(1));
+
+        let snap = stats.snapshot();
+        let b = snap.steps[1].1;
+        assert_eq!(b.notifies_issued, 6, "notified 2 + no_waiters 1 + suppressed 2 + notified 1");
+        assert_eq!(b.notifies_no_waiters, 1);
+        assert_eq!(b.notifies_suppressed, 2);
+        assert_eq!(b.unparks_issued, 3);
+        assert_eq!(b.reverse_wakes, 1);
+        assert_eq!(b.direct_fallbacks, 1);
+        assert_eq!(b.gated_off, 4);
+        assert_eq!((b.holds, b.held_retries), (2, 1));
+        assert_eq!(b.held_wait_ns, 2_000_000);
+        assert_eq!(b.held_wait_max_ns, 1_500_000);
+        let a = snap.steps[0].1;
+        assert_eq!(a.notifies_issued + a.unparks_issued + a.holds, 0, "A untouched");
+
+        let text = format!("{snap}");
+        let row = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("B ") && l.contains("1.500"))
+            .unwrap_or_else(|| panic!("wake row for B missing:\n{text}"));
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        // B notify nowait suppressed unpark reverse fallback gated_off holds retries p50 p99 max
+        assert_eq!(&cols[..10], &["B", "6", "1", "2", "3", "1", "1", "4", "2", "1"], "{row}");
+        assert_eq!(cols[12], "1.500", "max column: {row}");
+    }
+
+    /// The histogram's quantiles come from the bucket boundaries (an upper bound
+    /// within 2×), so they are checked against hand-placed waits.
+    #[test]
+    fn held_wait_quantiles_come_from_the_log2_histogram() {
+        let stats = PipelineStats::new(vec!["S"]);
+        for _ in 0..98 {
+            stats.record_hold(StepIdx(0), 3_000); // 3 µs → bucket 1 = [2, 4) µs
+        }
+        stats.record_hold(StepIdx(0), 5_000_000); // 5 ms → bucket 12 = [4096, 8192) µs
+        stats.record_hold(StepIdx(0), 5_000_000);
+        let s = stats.snapshot().steps[0].1;
+        assert_eq!(s.holds, 100);
+        assert_eq!(
+            s.held_wait_quantile_ns(0.50),
+            4_000,
+            "p50 lands in [2, 4) µs; reported as its upper edge"
+        );
+        assert_eq!(s.held_wait_quantile_ns(0.99), 8_192_000, "p99 lands in the 5 ms bucket");
+        assert_eq!(
+            PipelineStats::new(vec!["E"]).snapshot().steps[0].1.held_wait_quantile_ns(0.99),
+            0
+        );
+    }
+
+    /// A mid-run snapshot can see `holds` ahead of the histogram (`record_hold`
+    /// bumps `holds` first, and the counters are independent relaxed atomics).
+    /// The quantile must still be a bucket upper edge, not `held_wait_max_ns`.
+    #[test]
+    fn held_wait_quantile_ranks_against_the_histogram_not_holds() {
+        let stats = PipelineStats::new(vec!["S"]);
+        stats.record_hold(StepIdx(0), 3_000); // bucket 1 = [2, 4) µs
+        stats.record_hold(StepIdx(0), 5_000_000); // bucket 12 = [4096, 8192) µs
+        let mut s = stats.snapshot().steps[0].1;
+        s.holds += 3; // three holds counted, not yet bucketed
+        s.held_wait_max_ns = 7_777_777; // not a bucket edge
+        assert_eq!(s.held_wait_quantile_ns(0.99), 8_192_000, "p99 is the top bucket's edge");
+        assert_eq!(s.held_wait_quantile_ns(0.50), 4_000, "p50 is the bottom bucket's edge");
+        s.held_wait_hist = [0; HELD_HIST_BUCKETS];
+        assert_eq!(s.held_wait_quantile_ns(0.99), 0, "holds counted but none bucketed yet");
+    }
+
+    #[test]
+    fn worker_wait_outcomes_render_as_percentages() {
+        use crate::runtime::event_count::WaitOutcome;
+        let stats = PipelineStats::new(vec!["A"]);
+        stats.record_worker_busy(3, 1_000_000);
+        stats.record_ec_wait(3, WaitOutcome::TimedOut);
+        stats.record_ec_wait(3, WaitOutcome::TimedOut);
+        stats.record_ec_wait(3, WaitOutcome::Notified);
+        stats.record_ec_wait(3, WaitOutcome::Woken);
+        stats.record_timer_park(5, false);
+        stats.record_timer_park(5, true);
+        stats.record_worker_idle(5, 10);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.worker_waits, vec![(3, 1, 1, 2, 0, 0), (5, 0, 0, 0, 1, 1)]);
+        let text = format!("{snap}");
+        let header = text
+            .lines()
+            .find(|l| l.contains("worker") && l.contains("busy_ms"))
+            .expect("worker header");
+        assert!(
+            header.contains("waits")
+                && header.contains("notified%")
+                && header.contains("timed_out%"),
+            "{header}"
+        );
+        let w3 = text.lines().find(|l| l.trim_start().starts_with("3 ")).expect("worker 3 row");
+        assert!(w3.contains("25.0%") && w3.contains("50.0%"), "notified 1/4, timed out 2/4: {w3}");
+        let w5 = text.lines().find(|l| l.trim_start().starts_with("5 ")).expect("worker 5 row");
+        assert!(w5.contains("timer_parks=2 (unparked 1, timed_out 1)"), "{w5}");
+    }
+
+    #[test]
+    fn detached_line_appends_park_outcomes_after_the_park_count() {
+        let stats = PipelineStats::new(vec!["Det"]);
+        stats.record_detached_busy(StepIdx(0), 1_000_000);
+        stats.record_detached_idle(StepIdx(0), 3_000_000);
+        stats.record_detached_park(StepIdx(0));
+        stats.record_detached_park(StepIdx(0));
+        stats.record_detached_park(StepIdx(0));
+        stats.record_detached_park_outcome(StepIdx(0), false);
+        stats.record_detached_park_outcome(StepIdx(0), true);
+        stats.record_detached_park_outcome(StepIdx(0), true);
+        let text = format!("{}", stats.snapshot());
+        let line = text.lines().find(|l| l.contains("detached `Det`")).expect("detached line");
+        assert!(line.contains("; 3 parks (unparked 1, timed out 2, avg 1000.0µs)"), "{line}");
     }
 }
