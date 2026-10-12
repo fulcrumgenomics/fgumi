@@ -60,7 +60,7 @@ impl<B> WriteRawFile<B> {
     /// Opens through [`open_output_sink`], as `WriteBgzfFile` does through
     /// `open_output_writer`: `-` and `/dev/stdout` select a block-buffered
     /// duplicate of stdout whose close is checked, and any other path an
-    /// output file that is synced and closed with its errors checked.
+    /// output file that is closed with its errors checked.
     ///
     /// # Errors
     ///
@@ -117,7 +117,7 @@ impl<B: RawBytesBlock> Step for WriteRawFile<B> {
 }
 
 /// Clean end-of-stream: append `trailer` (e.g. the BGZF EOF marker) exactly
-/// once, then flush, sync and close the output (see [`OutputSink::close`]).
+/// once, then flush and close the output (see [`OutputSink::close`]).
 fn finish_stream(mut out: BufWriter<Box<dyn OutputSink>>, trailer: &[u8]) -> io::Result<()> {
     if !trailer.is_empty() {
         out.write_all(trailer)?;

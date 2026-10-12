@@ -474,7 +474,7 @@ impl Step for WriteBgzfFile {
 }
 
 impl WriteBgzfFile {
-    /// Terminate a drained stream: write the BGZF EOF marker, flush, sync and
+    /// Terminate a drained stream: write the BGZF EOF marker, flush and
     /// close the output (see [`OutputSink::close`]), then write the inline BAI
     /// sidecar, if any, so an index is only written for a BAM that closed
     /// cleanly.

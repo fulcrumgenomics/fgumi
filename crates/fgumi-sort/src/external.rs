@@ -383,20 +383,22 @@ impl MergeOutputTarget {
         }
     }
 
-    /// Atomically moves the finished temp onto its resolved destination (a no-op
-    /// for stdout), first stamping the resolved mode so the output is not left
+    /// Renames the finished temp onto its resolved destination (a no-op for
+    /// stdout), first stamping the resolved mode so the output is not left
     /// temp-private (`0600`). Consumes `self`, disarming the RAII auto-remove.
     ///
     /// The merge wrote the temp through its own descriptor, which its writer
-    /// already synced and closed with the result checked (`OutputFile`), so the
-    /// temp's handle here is closed, checked, without a second sync before the
-    /// rename.
+    /// already closed with the result checked (`OutputFile`); the temp's own
+    /// handle is closed here, also checked, before the rename. The rename is
+    /// atomic against a failure of this process, not a host crash: the data is
+    /// not synced first (see `fgumi_bam_io::persist_after_close`).
     fn persist(self) -> Result<()> {
-        self.persist_with(|file| fgumi_bam_io::OutputFile::unsynced(file).close())
+        self.persist_with(|file| fgumi_bam_io::OutputFile::from(file).close())
     }
 
-    /// [`persist`](Self::persist) with the temp handle's close supplied, so
-    /// tests can make it fail.
+    /// [`persist`](Self::persist) with the temp handle's close supplied.
+    /// Production always passes a checked `OutputFile` close; the parameter
+    /// exists so tests can make the close fail.
     fn persist_with<F>(self, close: F) -> Result<()>
     where
         F: FnOnce(std::fs::File) -> std::io::Result<()>,

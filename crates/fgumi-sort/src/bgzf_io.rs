@@ -205,7 +205,7 @@ fn write_block_in_order<W: Write>(
 /// number of in-flight compressed blocks to the pool capacity.
 /// Writes BGZF EOF marker and flushes when all blocks are received, then
 /// returns the writer so the caller decides how to close it: the sort's output
-/// is synced and its close checked (`fgumi_bam_io::close_buffered`), while a
+/// has its close checked (`fgumi_bam_io::close_buffered`), while a
 /// spill chunk, read back by this same process, is simply dropped.
 ///
 /// Generic over the sink rather than fixed to `File`: spill chunks are always

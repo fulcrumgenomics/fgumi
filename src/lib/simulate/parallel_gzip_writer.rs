@@ -111,7 +111,7 @@ impl ParallelGzipWriter {
     /// Create a new parallel gzip writer.
     ///
     /// Once every block is written, the I/O thread closes `writer` (see
-    /// [`OutputSink::close`]), so a sync or close failure is returned by
+    /// [`OutputSink::close`]), so a close failure is returned by
     /// [`Self::finish`].
     ///
     /// # Errors

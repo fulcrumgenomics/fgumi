@@ -14,8 +14,8 @@ pub(crate) mod test_support {
     pub(crate) const CLOSE_ERROR: &str = "input/output error at close";
 
     /// An in-memory [`OutputSink`] that records its bytes, counts closes, and
-    /// can fail its close, modelling write-back (or an NFS flush) failing only
-    /// when the file is closed. Clones share state.
+    /// can fail its close, modelling an error reported at close (such as an
+    /// NFS flush failing). Clones share state.
     #[derive(Clone, Default)]
     pub(crate) struct CloseProbe {
         written: Arc<Mutex<Vec<u8>>>,
