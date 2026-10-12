@@ -917,14 +917,13 @@ pub(crate) struct Phase2Reader {
 ///
 /// # Two Phase-2 merge implementations (production vs. the retained oracle)
 ///
-/// **In this tree THIS pool path is the production sort.** `fgumi sort` and
-/// `fgumi merge` both construct a `RawExternalSorter`, so every real sort runs
-/// through here. The source branch's note said the opposite — that the buffer
-/// chain over `merge_slots.rs` had taken over and this path was reduced to a
-/// library entry point and parity oracle — but that end state needs the
-/// typed-step `SortMerge` consumer, which lands with `fgumi-pipeline-io` in a
-/// later phase. Read the paragraph below as describing why the two Phase-2
-/// implementations differ, not as a claim about which one runs.
+/// `RawExternalSorter::sort_records` drives this pool path: `fgumi simulate`
+/// sorts through it, and so does the `#[cfg(test)]` parity oracle. `fgumi
+/// merge` does not (`merge_bams` merges its sorted inputs with
+/// `run_merge_loop`, with no spill files). `fgumi sort` and the
+/// `runall` sort run the chain sort, whose Phase-2 is `merge_slots.rs`
+/// (`SortSpillDecompress` / `SortMerge`). Read the paragraph below as describing
+/// why the two Phase-2 implementations differ.
 ///
 /// The two implementations differ deliberately, and that difference is
 /// load-bearing for the oracle. This path keeps the `raw_blocks` FIFO,

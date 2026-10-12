@@ -90,6 +90,8 @@ impl Step for VecSource {
 struct VecSink {
     received: Arc<Mutex<Vec<RecordBatch>>>,
     kind: StepKind,
+    /// Records received so far, for a test feeder that gates on sink progress.
+    progress: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Step for VecSink {
@@ -109,7 +111,11 @@ impl Step for VecSink {
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
         match ctx.input.pop() {
             Some(batch) => {
+                let n = batch.len();
                 self.received.lock().push(batch);
+                if let Some(p) = &self.progress {
+                    p.fetch_add(n, std::sync::atomic::Ordering::Release);
+                }
                 Ok(StepOutcome::Progress)
             }
             None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
@@ -236,7 +242,7 @@ fn drive_sort_buffer_pipeline(
     let decompress = SortSpillDecompress::new(output_byte_limit, decompress_tuning);
     let merge =
         SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256);
-    let sink = VecSink { received: Arc::clone(&received), kind: sink_kind };
+    let sink = VecSink { received: Arc::clone(&received), kind: sink_kind, progress: None };
 
     let builder = Pipeline::builder();
     builder
@@ -974,7 +980,7 @@ fn drive_spill_split_pipeline(
     let merge =
         SortMerge::<RecordBatchOutput>::with_target_batch_count(sort_order, output_byte_limit, 256)
             .with_stats_slot(Arc::clone(&stats_slot));
-    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None };
 
     let builder = Pipeline::builder();
     builder
@@ -1758,21 +1764,697 @@ fn collect_merge_batches(
     output_byte_limit: u64,
     target_batch_count: usize,
 ) -> Result<Vec<RecordBatch>> {
+    Ok(collect_merge_batches_with(
+        events,
+        output_byte_limit,
+        target_batch_count,
+        MergeRunOptions::default(),
+    )?
+    .batches)
+}
+
+/// How [`collect_merge_batches_with`] runs the merge: the merge demand handed
+/// to `SortMerge`, the pool size, per-thread test timers, a sink-side record
+/// counter a feeder can gate on, an optional pool-side supply between the
+/// source and the merge, and the sink's kind.
+#[derive(Default)]
+struct MergeRunOptions {
+    demand: Option<Arc<fgumi_sort::MergeDemand>>,
+    /// `0` means one thread.
+    threads: usize,
+    test_backoff: Vec<fgumi_pipeline_core::runtime::TestBackoff>,
+    progress: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// A pool step that delivers the slots' blocks (see [`FeedOnDemand`]).
+    feeder: Option<FeedOnDemand>,
+    /// Hold the setup's `AllAnnounced` back until a pool worker is parked
+    /// (see [`HoldUntilPoolParked`]), so the merge's first stall finds one.
+    hold_until_parked: bool,
+    /// `None` means `Serial` (a pool step).
+    sink_kind: Option<StepKind>,
+}
+
+/// What [`collect_merge_batches_with`] observed.
+struct MergeRun {
+    batches: Vec<RecordBatch>,
+    /// The run's per-step stats, by step name.
+    stats: fgumi_pipeline_core::runtime::StatsSnapshot,
+}
+
+impl MergeRun {
+    /// The `SortMerge` step's stats.
+    fn merge_stats(&self) -> &fgumi_pipeline_core::runtime::StepStatsSnapshot {
+        &self.stats.steps.iter().find(|(name, _)| *name == "SortMerge").expect("SortMerge").1
+    }
+
+    /// Positions of every merged record, in output order.
+    fn positions(&self) -> Vec<i32> {
+        self.batches
+            .iter()
+            .flat_map(|b| b.iter_record_bytes().map(fgumi_raw_bam::pos).collect::<Vec<_>>())
+            .collect()
+    }
+}
+
+/// [`collect_merge_batches`] with a merge demand, a pool size, per-thread test
+/// timers, a sink progress counter and an optional pool-side supply.
+fn collect_merge_batches_with(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    output_byte_limit: u64,
+    target_batch_count: usize,
+    opts: MergeRunOptions,
+) -> Result<MergeRun> {
     let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let source = Phase2EventSource::new(events, output_byte_limit);
-    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+    let mut merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
         SortOrder::Coordinate,
         output_byte_limit,
         target_batch_count,
     );
-    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+    if let Some(d) = opts.demand {
+        merge = merge.with_merge_demand(d);
+    }
+    let sink = VecSink {
+        received: Arc::clone(&received),
+        kind: opts.sink_kind.unwrap_or(StepKind::Serial),
+        progress: opts.progress,
+    };
 
     let builder = Pipeline::builder();
-    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let chain = builder.chain(source);
+    let chain = match opts.feeder {
+        Some(feeder) if opts.hold_until_parked => {
+            chain.chain(feeder).chain(HoldUntilPoolParked::new(output_byte_limit)).chain(merge)
+        }
+        Some(feeder) => chain.chain(feeder).chain(merge),
+        None => chain.chain(merge),
+    };
+    chain.chain(sink).into_sink_marker();
     let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads: 1, ..Default::default() })?;
+    let stats = pipeline.stats();
+    pipeline.run(PipelineConfig {
+        threads: opts.threads.max(1),
+        test_backoff: opts.test_backoff,
+        stats: Some(Arc::clone(&stats)),
+        ..Default::default()
+    })?;
 
-    Ok(std::mem::take(&mut *received.lock()))
+    Ok(MergeRun { batches: std::mem::take(&mut *received.lock()), stats: stats.snapshot() })
+}
+
+/// One record per block for the gated feeds: a coordinate-sortable BAM record
+/// at `pos` on reference 0, framed as a spill block (the coordinate key is
+/// embedded in the record, so the frame is `[u32 len][record]`).
+fn gated_block(pos: usize) -> Vec<u8> {
+    let pos = i32::try_from(pos).expect("small test positions");
+    let record = make_bam_bytes(0, pos, 0, format!("r{pos:04}").as_bytes(), &[], 4, -1, -1, &[]);
+    let mut block = Vec::new();
+    fgumi_sort::frame_keyed_record_into(
+        &mut block,
+        &fgumi_sort::RawCoordinateKey::default(),
+        &record,
+    )
+    .expect("frame record");
+    block
+}
+
+/// Two empty, open `SortMergeSlot`s over tempfiles (file ids 0 and 1).
+fn two_open_slots() -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
+    (0..2u32)
+        .map(|file_id| {
+            Arc::new(fgumi_sort::SortMergeSlot::new(
+                file_id,
+                std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
+                SpillCodec::Bgzf,
+            ))
+        })
+        .collect()
+}
+
+/// The phase-2 setup events announcing `slots` (no memory chunks) for a merge
+/// of `total` records.
+fn announce_slots(
+    slots: &[Arc<fgumi_sort::SortMergeSlot>],
+    total: usize,
+) -> Vec<crate::sort::protocol::SortPhase2Event> {
+    use crate::sort::protocol::SortPhase2Event;
+    let mut events: Vec<SortPhase2Event> = slots
+        .iter()
+        .map(|slot| SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::new(),
+            records_ingested_so_far: total as u64,
+        })
+        .collect();
+    events.push(SortPhase2Event::AllAnnounced {
+        slot_count: u32::try_from(slots.len()).expect("few slots"),
+        memory_chunk_count: 0,
+        total_records: total as u64,
+    });
+    events
+}
+
+/// Two `SortMergeSlot`s over tempfiles, announced through phase-2 events, and a
+/// feeder thread that pushes one single-record block at a time into alternating
+/// slots (record `j` at position `j` into slot `j % 2`, so the merge switches
+/// sources every record), then marks both slots EOF. Record `j` is pushed only
+/// once the sink holds `j - 1` records, and `delay` after that: the merge
+/// needs both slots' heads to emit, so every push lands while the merge is
+/// parked or about to park on the slot it needs. The EOFs land only once the
+/// sink holds every record but the last (and `delay` after that): the last
+/// record needs the other slot's EOF to win, so the run ends on a run-end EOF
+/// stall that only the EOF's notify can end. Each delivery is the producer half of the wake
+/// protocol without a `SortSpillDecompress`: push under `decompressed`,
+/// release, then `notify_delivered`.
+fn gated_two_slot_feed(
+    n_blocks_per_slot: usize,
+    demand: &Arc<fgumi_sort::MergeDemand>,
+    progress: &Arc<std::sync::atomic::AtomicUsize>,
+    delay: std::time::Duration,
+) -> (Vec<crate::sort::protocol::SortPhase2Event>, std::thread::JoinHandle<()>) {
+    use std::sync::atomic::Ordering;
+    let slots = two_open_slots();
+    let total = 2 * n_blocks_per_slot;
+    let events = announce_slots(&slots, total);
+    let demand = Arc::clone(demand);
+    let progress = Arc::clone(progress);
+    let feeder = std::thread::spawn(move || {
+        for j in 0..total {
+            while progress.load(Ordering::Acquire) < j.saturating_sub(1) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            std::thread::sleep(delay);
+            let slot = &slots[j % 2];
+            slot.decompressed.lock().unwrap().push_back(gated_block(j));
+            demand.notify_delivered(slot.file_id);
+        }
+        while progress.load(Ordering::Acquire) < total - 1 {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        std::thread::sleep(delay);
+        for slot in &slots {
+            {
+                let _g = slot.decompressed.lock().unwrap();
+                slot.queue_eof.store(true, Ordering::Release);
+            }
+            demand.notify_delivered(slot.file_id);
+        }
+    });
+    (events, feeder)
+}
+
+/// The state [`FeedOnDemand`]'s clones share: the two slots, the blocks still
+/// to deliver (record `j` to slot `j % 2`, in key order), and the merge demand.
+struct FeedShared {
+    slots: Vec<Arc<fgumi_sort::SortMergeSlot>>,
+    blocks: Mutex<std::collections::VecDeque<(usize, Vec<u8>)>>,
+    eof_sent: std::sync::atomic::AtomicBool,
+    demand: Arc<fgumi_sort::MergeDemand>,
+    starved: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FeedShared {
+    /// While the merge is starved, deliver the next block — or, once every
+    /// block is out, both slots' EOF — the producer half of the wake protocol.
+    /// `true` iff something was delivered.
+    fn feed_if_starved(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.starved.load(Ordering::Relaxed) || self.eof_sent.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut blocks = self.blocks.lock();
+        if let Some((slot_idx, block)) = blocks.pop_front() {
+            let slot = &self.slots[slot_idx];
+            slot.decompressed.lock().unwrap().push_back(block);
+            self.demand.notify_delivered(slot.file_id);
+            return true;
+        }
+        for slot in &self.slots {
+            {
+                let _g = slot.decompressed.lock().unwrap();
+                slot.queue_eof.store(true, Ordering::Release);
+            }
+            self.demand.notify_delivered(slot.file_id);
+        }
+        self.eof_sent.store(true, Ordering::Release);
+        true
+    }
+}
+
+/// A pool (Parallel) step standing in for the spill supply: it forwards the
+/// phase-2 setup events and, on a pass that finds the merge starved, delivers
+/// the next prepared block. It runs only when a pool worker passes over it, so
+/// a merge parked on an empty slot is fed only once a pool worker is awake.
+struct FeedOnDemand {
+    shared: Arc<FeedShared>,
+    held: HeldSlot<Unpushed<crate::sort::protocol::SortPhase2Event>>,
+    output_byte_limit: u64,
+}
+
+impl FeedOnDemand {
+    /// The setup events for two open slots holding `n_blocks_per_slot`
+    /// single-record blocks each, and the step that delivers them.
+    fn new(
+        n_blocks_per_slot: usize,
+        demand: &Arc<fgumi_sort::MergeDemand>,
+        output_byte_limit: u64,
+    ) -> (Vec<crate::sort::protocol::SortPhase2Event>, Self) {
+        let slots = two_open_slots();
+        let total = 2 * n_blocks_per_slot;
+        let events = announce_slots(&slots, total);
+        let blocks = (0..total).map(|j| (j % 2, gated_block(j))).collect();
+        let shared = Arc::new(FeedShared {
+            slots,
+            blocks: Mutex::new(blocks),
+            eof_sent: std::sync::atomic::AtomicBool::new(false),
+            demand: Arc::clone(demand),
+            starved: demand.starved_signal(),
+        });
+        (events, Self { shared, held: HeldSlot::new(), output_byte_limit })
+    }
+}
+
+impl Step for FeedOnDemand {
+    type Input = crate::sort::protocol::SortPhase2Event;
+    type Outputs = fgumi_pipeline_core::outputs::Single<crate::sort::protocol::SortPhase2Event>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "FeedOnDemand",
+            kind: StepKind::Parallel,
+            sticky: false,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(unpushed) = self.held.take()
+            && let Err(again) = ctx.outputs.retry(unpushed)
+        {
+            self.held.put(again);
+            return Ok(StepOutcome::Contention);
+        }
+        if let Some(event) = ctx.input.pop() {
+            if let Err(unpushed) = ctx.outputs.push(event) {
+                self.held.put(unpushed);
+            }
+            return Ok(StepOutcome::Progress);
+        }
+        if self.shared.feed_if_starved() {
+            return Ok(StepOutcome::Progress);
+        }
+        if ctx.input.is_drained() && self.shared.eof_sent.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(StepOutcome::Finished);
+        }
+        Ok(StepOutcome::NoProgress)
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            held: HeldSlot::new(),
+            output_byte_limit: self.output_byte_limit,
+        }
+    }
+}
+
+/// A Detached pass-through that holds the setup's `AllAnnounced` back until a
+/// pool worker is parked on the pool's event-count (bounded at 5 s), so the
+/// merge's first stall happens while every pool worker that could feed it is
+/// asleep — only the merge's `request_worker` can then wake one.
+struct HoldUntilPoolParked {
+    held: HeldSlot<Unpushed<crate::sort::protocol::SortPhase2Event>>,
+    output_byte_limit: u64,
+}
+
+impl HoldUntilPoolParked {
+    fn new(output_byte_limit: u64) -> Self {
+        Self { held: HeldSlot::new(), output_byte_limit }
+    }
+}
+
+impl Step for HoldUntilPoolParked {
+    type Input = crate::sort::protocol::SortPhase2Event;
+    type Outputs = fgumi_pipeline_core::outputs::Single<crate::sort::protocol::SortPhase2Event>;
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "HoldUntilPoolParked",
+            kind: StepKind::Detached,
+            sticky: false,
+            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
+            branch_ordering: vec![BranchOrdering::None],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        use crate::sort::protocol::SortPhase2Event;
+        if let Some(unpushed) = self.held.take()
+            && let Err(again) = ctx.outputs.retry(unpushed)
+        {
+            self.held.put(again);
+            return Ok(StepOutcome::Contention);
+        }
+        let Some(event) = ctx.input.pop() else {
+            return Ok(if ctx.input.is_drained() {
+                StepOutcome::Finished
+            } else {
+                StepOutcome::NoProgress
+            });
+        };
+        if matches!(event, SortPhase2Event::AllAnnounced { .. }) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ctx.pool.parked_workers() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        if let Err(unpushed) = ctx.outputs.push(event) {
+            self.held.put(unpushed);
+        }
+        Ok(StepOutcome::Progress)
+    }
+}
+
+/// A merge parked on an empty slot gets its block from pool work that reaches
+/// it off any queue edge: at threads 2, the merge's driver, the sink's driver
+/// and both pool workers all have 10 s park timers, and the only supply is
+/// [`FeedOnDemand`], which runs only when a pool worker passes over it. The
+/// sink is Detached, so no pool worker is woken by the merge's output either:
+/// after the merge stalls, nothing reaches a parked worker except the merge's
+/// `request_worker`. Finishing under the watchdog proves the request woke a
+/// worker; `pool_requests_woken` (recorded by pipeline-core's `PoolHandle`, not
+/// by the merge) confirms it, and the first stall is held until a worker is
+/// parked so at least one request must wake one.
+#[test]
+fn stalled_merge_requests_a_worker_that_feeds_it() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let (events, feeder) = FeedOnDemand::new(10, &demand, 1 << 20);
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        threads: 2,
+        test_backoff: vec![
+            TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 },
+            TestBackoff { target: TestBackoffTarget::AllWorkers, us: 10_000_000 },
+        ],
+        feeder: Some(feeder),
+        hold_until_parked: true,
+        sink_kind: Some(StepKind::Detached),
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 1, opts));
+    });
+    let run = done_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("WEDGED: the starved merge's pool-worker request woke nobody")
+        .unwrap();
+    assert_eq!(run.positions(), (0..20).collect::<Vec<i32>>(), "every record, in key order");
+    assert!(
+        run.merge_stats().pool_requests_woken > 0,
+        "a request must have woken a parked worker: {:?}",
+        run.merge_stats()
+    );
+    assert!(
+        !demand.starved_signal().load(std::sync::atomic::Ordering::Relaxed),
+        "starved is lowered when the merge finishes"
+    );
+}
+
+/// At one thread a sort chain is never fused (it has Detached steps), and the
+/// pool's lone worker 0 is the only thread that runs [`FeedOnDemand`]: with
+/// worker 0 and every driver on 10 s timers, the run finishes under the
+/// watchdog only if the merge's request unparks worker 0.
+#[test]
+fn request_worker_at_one_thread_unparks_worker_zero() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let (events, feeder) = FeedOnDemand::new(10, &demand, 1 << 20);
+    let shared = Arc::clone(&feeder.shared);
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        progress: Some(Arc::clone(&progress)),
+        threads: 1,
+        test_backoff: vec![
+            TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 },
+            TestBackoff { target: TestBackoffTarget::Worker(0), us: 10_000_000 },
+        ],
+        feeder: Some(feeder),
+        sink_kind: Some(StepKind::Detached),
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 1, opts));
+    });
+    let run = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|_| {
+            panic!(
+                "WEDGED: the merge's request did not unpark worker 0 (sink records {}, blocks \
+                 left {}, eof sent {}, starved {}, awaited {:?}, fifo {:?}, {:?})",
+                progress.load(std::sync::atomic::Ordering::Relaxed),
+                shared.blocks.lock().len(),
+                shared.eof_sent.load(std::sync::atomic::Ordering::Relaxed),
+                shared.starved.load(std::sync::atomic::Ordering::Relaxed),
+                demand.awaited(),
+                shared.slots.iter().map(|s| s.fifo_len()).collect::<Vec<_>>(),
+                demand.snapshot()
+            )
+        })
+        .unwrap();
+    assert_eq!(run.positions(), (0..20).collect::<Vec<i32>>(), "every record, in key order");
+    assert!(run.merge_stats().pool_requests_woken > 0, "{:?}", run.merge_stats());
+    // Worker 0 was asleep on its timer, which no event-count census sees: a
+    // request that woke it still found a sleeping worker.
+    let s = demand.snapshot();
+    assert!(s.pool_woken > 0 && s.requests_with_sleeper >= s.pool_woken, "{s:?}");
+}
+
+/// One pool request per stall episode, never per re-stall: the merge's driver
+/// wakes on a 1 ms timer while the gated feeder waits 20 ms before each push,
+/// so every episode re-stalls many times before its block lands. Requests
+/// (counted by pipeline-core for the `SortMerge` step) stay at or below the
+/// stall episodes (counted by the merge demand); a request per re-stall would
+/// exceed them many times over.
+#[test]
+fn stalled_merge_requests_once_per_episode() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (events, feeder) =
+        gated_two_slot_feed(10, &demand, &progress, std::time::Duration::from_millis(20));
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        threads: 1,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 1_000 }],
+        progress: Some(Arc::clone(&progress)),
+        ..Default::default()
+    };
+    let run = collect_merge_batches_with(events, 1 << 20, 1, opts).unwrap();
+    feeder.join().unwrap();
+    assert_eq!(run.positions(), (0..20).collect::<Vec<i32>>());
+    let m = run.merge_stats();
+    let requests = m.pool_requests_woken + m.pool_requests_all_awake + m.pool_requests_pending;
+    let episodes = demand.snapshot().stall_episodes;
+    assert!(episodes >= 2, "the fixture must stall more than once ({episodes})");
+    assert!(requests >= 1, "a parking stall must request a worker: {m:?}");
+    assert!(requests <= episodes, "at most one request per episode: {requests} > {episodes}");
+}
+
+/// The run-end stall: the merge has emitted every record and waits only on a
+/// slot's EOF. That EOF's notify must let it finish without another park —
+/// its driver parks for 10 s, so a merge that reached `Done` and then waited
+/// out its timer before reporting `Finished` fails the 5 s watchdog.
+#[test]
+fn run_end_eof_wake_finishes_the_merge_without_a_timer_park() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    use std::sync::atomic::Ordering;
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let slots = two_open_slots();
+    // Slot 0: record 0, then EOF. Slot 1: record 1, left open.
+    {
+        let mut d = slots[0].decompressed.lock().unwrap();
+        d.push_back(gated_block(0));
+        slots[0].queue_eof.store(true, Ordering::Release);
+    }
+    slots[1].decompressed.lock().unwrap().push_back(gated_block(1));
+    let events = announce_slots(&slots, 2);
+    let feeder = {
+        let (slot, demand, progress) =
+            (Arc::clone(&slots[1]), Arc::clone(&demand), Arc::clone(&progress));
+        std::thread::spawn(move || {
+            // Both records are out; the merge is stalled (or about to stall)
+            // refilling slot 1, with nothing left to emit.
+            while progress.load(Ordering::Acquire) < 2 {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            {
+                let _g = slot.decompressed.lock().unwrap();
+                slot.queue_eof.store(true, Ordering::Release);
+            }
+            demand.notify_delivered(slot.file_id);
+        })
+    };
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        threads: 1,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
+        progress: Some(Arc::clone(&progress)),
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 1, opts));
+    });
+    let run = done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("WEDGED: the merge parked on its timer after its last wake")
+        .unwrap();
+    feeder.join().unwrap();
+    assert_eq!(run.positions(), vec![0, 1]);
+}
+
+/// The merge's stalls end on the awaited delivery, not on the driver's timer:
+/// the merge's driver parks for 10 s, so each of the ~100 stalls ends in time
+/// only if the awaited delivery's `notify_delivered` unparks it — including the
+/// run-end stall, whose EOF must wake the merge and let it finish without
+/// another park. A missing wake fails the 10 s watchdog.
+#[test]
+fn stalled_merge_is_woken_by_the_awaited_delivery() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (events, feeder) = gated_two_slot_feed(50, &demand, &progress, std::time::Duration::ZERO);
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        threads: 1,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
+        progress: Some(Arc::clone(&progress)),
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 1, opts));
+    });
+    let out = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("WEDGED: a stall was not woken by its delivery")
+        .unwrap();
+    feeder.join().unwrap();
+    assert_eq!(out.positions(), (0..100).collect::<Vec<i32>>(), "every record, in key order");
+    let s = demand.snapshot();
+    assert!(s.stall_episodes > 0, "the gated feed must make the merge stall: {s:?}");
+}
+
+/// A stall that finds records already in the output builder flushes them as a
+/// partial batch, and the demand counts each such flush. With a 256-record
+/// target and one record per stall, every output batch is short: each was
+/// flushed by a stall, except possibly the last (flushed by `Done`). Each of
+/// those stalls withdraws its registration before the merge runs again, and the
+/// stall it re-stalls into parks: a missed wake would trip the 10 s timer.
+#[test]
+fn stalls_that_flush_a_partial_batch_are_counted() {
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (events, feeder) = gated_two_slot_feed(10, &demand, &progress, std::time::Duration::ZERO);
+    let opts = MergeRunOptions {
+        demand: Some(Arc::clone(&demand)),
+        threads: 1,
+        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
+        progress: Some(Arc::clone(&progress)),
+        ..Default::default()
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 256, opts));
+    });
+    let out = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("WEDGED: a stall was not woken by its delivery")
+        .unwrap()
+        .batches;
+    feeder.join().unwrap();
+    let records: usize = out.iter().map(|b| b.iter_record_bytes().count()).sum();
+    assert_eq!(records, 20);
+    assert!(out.iter().all(|b| b.iter_record_bytes().count() < 256), "every batch is short");
+    let s = demand.snapshot();
+    let batches = out.len() as u64;
+    assert!(s.partial_flushes > 0, "{s:?}");
+    assert!(
+        s.partial_flushes == batches || s.partial_flushes + 1 == batches,
+        "every short batch but a final `Done` flush is a partial flush on stall: \
+         {batches} batches, {s:?}"
+    );
+}
+
+/// Two hand-driven dispatches over two slots: slot 0 holds record 0 and slot 1
+/// record 1, both left open, so the merge emits record 0 and stalls on slot 0.
+fn stalled_after_one_record(
+    demand: &Arc<fgumi_sort::MergeDemand>,
+) -> (
+    SortMerge<RecordBatchOutput>,
+    fgumi_pipeline_core::testing::StepProbe<SortMerge<RecordBatchOutput>>,
+) {
+    use crate::sort::protocol::SortPhase2Event;
+    let step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        256,
+    )
+    .with_merge_demand(Arc::clone(demand));
+    let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
+    for file_id in 0..2u32 {
+        let slot = Arc::new(fgumi_sort::SortMergeSlot::new(
+            file_id,
+            std::io::BufReader::new(tempfile::tempfile().expect("tempfile")),
+            SpillCodec::Bgzf,
+        ));
+        slot.decompressed.lock().unwrap().push_back(gated_block(file_id as usize));
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot,
+            path: std::path::PathBuf::new(),
+            records_ingested_so_far: 2,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    (step, probe)
+}
+
+/// A registration counts as a parking registration only when the merge parks:
+/// a stall that flushed a partial batch runs again at once, so it withdraws
+/// its registration (a delivery must not unpark a merge that is not waiting);
+/// the stall after it delivers nothing, returns `Contention`, and stays
+/// registered.
+#[test]
+fn only_a_registration_the_merge_parks_on_counts_as_parking() {
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let (mut step, probe) = stalled_after_one_record(&demand);
+    assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Progress);
+    let s = demand.snapshot();
+    assert_eq!(
+        (s.registrations, s.parking_registrations, s.partial_flushes),
+        (1, 0, 1),
+        "record 0 was flushed on the stall, so the merge did not park: {s:?}"
+    );
+    assert_eq!(demand.awaited(), None, "the registration was withdrawn");
+    assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Contention);
+    let s = demand.snapshot();
+    assert_eq!(
+        (s.registrations, s.parking_registrations, s.partial_flushes),
+        (2, 1, 1),
+        "an empty builder: nothing delivered, so the merge parks: {s:?}"
+    );
+    assert_eq!(demand.awaited(), Some(0), "a parked merge stays registered on slot 0");
 }
 
 /// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`
@@ -2007,7 +2689,7 @@ fn collect_fastpath_batches(
     )
     .with_fast_path_threads(fast_path_threads)
     .with_fast_path_min_records(min_records);
-    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial };
+    let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None };
 
     let builder = Pipeline::builder();
     builder.chain(source).chain(merge).chain(sink).into_sink_marker();
@@ -2535,7 +3217,7 @@ fn drive_arena_split_pipeline(
         .chain(SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs))
         .chain(SortSpillDecompress::new(output_byte_limit, SortDecompressTuning::default()))
         .chain(merge)
-        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial })
+        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
         .into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads, ..Default::default() })?;
@@ -2601,7 +3283,7 @@ fn drive_arena_split_pipeline_capped(
                 .with_phase_cap(Some(Arc::clone(phase2_cap))),
         )
         .chain(merge)
-        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial })
+        .chain(VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None })
         .into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads, ..Default::default() })?;

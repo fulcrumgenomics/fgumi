@@ -475,8 +475,15 @@ pub struct Sort {
     /// Whenever the k-way merge runs -- any sort that spills, or that keeps
     /// more than one in-memory chunk -- prints the `SortMerge` merge-loop
     /// diagnostic ("Sort merge diag: ..."): stalls (merge-loop passes that were
-    /// input-starved waiting on decompress), contention (dispatches that
-    /// produced nothing), and output-backpressure counts. Only when the sort
+    /// input-starved waiting on decompress and found nothing when they
+    /// registered to be woken), contention (dispatches that produced nothing),
+    /// and output-backpressure counts. When the merge reads spill files it is
+    /// followed by the merge-demand lines ("Merge demand:", "Awaited slot at
+    /// stall:", "Pool at stall:", "Merge output:"): stall episodes and their
+    /// time, wakes the spill supply delivered to the parked merge, the awaited
+    /// spill file's state at each stall, the merge's requests for a pool worker,
+    /// and partial batches flushed on a stall (see the performance tuning
+    /// guide). Only when the sort
     /// spills nothing *and* fits in a single in-memory chunk is there no merge
     /// to diagnose -- there it instead prints a one-line note ("Sort fast-path
     /// diag: ...") saying the single-chunk in-memory fast path was taken.
@@ -1881,6 +1888,57 @@ mod tests {
         let bag_sort = spec.stage_opts.sort.as_ref().expect("sort options must be set");
         assert_eq!(bag_sort.block_batch, 16, "--block-batch must reach the chain spec");
         assert!(bag_sort.file_granularity, "--file-granularity must reach the chain spec");
+    }
+
+    /// The standalone-sort `ChainSpec` for a header-only BAM written into `dir`
+    /// (building the chain reads only the header), sorted to `order`, at
+    /// `--threads 4`.
+    fn sort_spec_for_test(dir: &Path, order: &str) -> crate::pipeline::chains::ChainSpec {
+        let input = dir.join("in.bam");
+        let output = dir.join("out.bam");
+        let header = noodles::sam::Header::builder()
+            .add_reference_sequence(
+                bstr::BString::from("chr1"),
+                noodles::sam::header::record::value::Map::<
+                    noodles::sam::header::record::value::map::ReferenceSequence,
+                >::new(std::num::NonZeroUsize::new(1000).unwrap()),
+            )
+            .build();
+        fgumi_bam_io::create_raw_bam_writer(&input, &header, 1, 1).unwrap().finish().unwrap();
+        let (input, output) = (input.to_str().unwrap(), output.to_str().unwrap());
+        let sort = Sort::try_parse_from([
+            "sort", "-i", input, "-o", output, "--order", order, "-m", "64MiB", "-@", "4",
+        ])
+        .expect("parse should succeed");
+        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
+        sort.build_sort_chain_spec(
+            Path::new(output),
+            vec![dir.to_path_buf()],
+            resolved_max_temp_files,
+            "fgumi sort (test)",
+        )
+    }
+
+    /// A standalone sort (BAM arena front, drain-first) installs `refill-drain`
+    /// over a `Reverse` base with one source, fed at `SortSpillDecompress`.
+    #[test]
+    fn standalone_sort_installs_refill_drain_on_the_decompress_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let built = crate::pipeline::chains::build_for(sort_spec_for_test(
+            tmp.path(),
+            "template-coordinate",
+        ))
+        .unwrap();
+        assert_eq!(built.config.scheduler.name(), "refill-drain");
+        let debug = format!("{:?}", built.config.scheduler);
+        assert!(debug.contains("base: Reverse"), "{debug}");
+        assert_eq!(debug.matches("RefillSource {").count(), 1, "{debug}");
+        let names = built.pipeline.stats().snapshot().steps;
+        let feed = names
+            .iter()
+            .position(|(name, _)| *name == "SortSpillDecompress")
+            .expect("a SortSpillDecompress step");
+        assert!(debug.contains(&format!("refill_through: StepIdx({feed})")), "{debug}");
     }
 
     /// The command resolves its phase counts through `PhaseThreads`, the same

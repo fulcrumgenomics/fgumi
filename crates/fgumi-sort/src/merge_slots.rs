@@ -16,8 +16,11 @@
 //! is also **non-blocking**: when the queue is empty but the slot is
 //! not yet `queue_eof` it reports `WouldBlock` (see
 //! `external.rs::slot_try_load_block`) and the cooperative `SortMerge`
-//! step yields, so the framework re-dispatches it after the producer
-//! has refilled the slot. No condvar, no parked thread.
+//! step yields: it declares the slot awaited
+//! ([`crate::MergeDemand::await_slot`]) and its driver thread parks until
+//! the producer's next delivery, EOF or failure on that slot unparks it
+//! ([`crate::MergeDemand::notify_delivered`]). No condvar: the producer
+//! never blocks, and only a delivery to the awaited slot wakes the merge.
 //!
 //! ## Why "queue has space OR consumer has a block OR slot EOF" is
 //! the full state space
@@ -73,31 +76,25 @@
 //! the inline path, while the block-parallel path additionally requires
 //! `in_flight == 0` and a drained `reorder` before `queue_eof` finalizes.
 //!
-//! ## Status in this tree, and the OTHER Phase-2 implementation
+//! ## Who drives it, and the OTHER Phase-2 implementation
 //!
-//! **`SortMergeSlot` has in-crate callers but no production caller.** The
-//! arena engine gave it two: `external.rs::open_spill_slot`, which opens a
-//! spill file as a slot, and `MergeDriver::from_slots`, which merges a set
-//! of them. Both are reachable only from tests in this tree — their
-//! production consumer is the typed-step `SortSpillDecompress` /
-//! `SortMerge` pair, which arrives with `fgumi-pipeline-io` in a later
-//! phase. Until then the crate's live Phase-2 is
-//! `worker_pool::Phase2FileState`, driven through `RawExternalSorter::sort`
-//! — which is what `fgumi sort` and `fgumi merge` actually call.
+//! `SortMergeSlot` is the Phase-2 of the chain sort — standalone `fgumi sort`
+//! and the fused `runall` sort. The spill writer opens each spill file as a
+//! slot (`external.rs::open_spill_slot`), `SortSpillDecompress` fills it (the
+//! `bp_*` methods on its block-parallel path), and `SortMerge` merges the set
+//! through `MergeDriver::from_slots`.
 //!
-//! That "no production driver yet" fact is now stated in three places — twice
-//! here and once on `worker_pool::Phase2FileState`. All three have to change
-//! together when the pipeline steps land, so keep them in sync (a stale count
-//! here is the characteristic failure mode).
-//!
-//! `worker_pool::Phase2FileState` keeps its own reorder buffer and
-//! in-flight counter because its single-reader/**multi-decompressor**
-//! topology needs them, and it retains the gap-filler this module
-//! dropped. Once the rewrite lands, this module becomes the production
-//! Phase-2 for both standalone `fgumi sort` and the fused `runall`
-//! sort, and `Phase2FileState` is retained as the
-//! `RawExternalSorter::sort` library path and the `#[cfg(test)]`
-//! parity oracle. (History: commit `9d6d7e9` / PR #395.)
+//! `worker_pool::Phase2FileState` is the other Phase-2: `RawExternalSorter`'s
+//! `sort_records` drives it (`fgumi simulate`, and the `#[cfg(test)]` parity
+//! oracle). `fgumi merge` uses neither: `RawExternalSorter::merge_bams` merges
+//! its sorted inputs with `run_merge_loop`, which has no spill files and no
+//! Phase-2 slots. `Phase2FileState` keeps
+//! its own reorder buffer and in-flight counter because its
+//! single-reader/**multi-decompressor** topology needs them, and it retains
+//! the gap-filler this module dropped. Which implementation each command runs
+//! is stated here, on [`PHASE2_DECOMP_CAP`], and on
+//! `worker_pool::Phase2FileState`; keep the three in sync. (History: commit
+//! `9d6d7e9` / PR #395.)
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -137,18 +134,17 @@ use crate::codec::SpillCodec;
 /// `try_run` after the consumer has drained. It stays a per-slot, independent
 /// bound (deadlock-safety is unchanged — see the module header).
 ///
-/// # Not the bound in force today
+/// # Not the only bound of that name
 ///
 /// `worker_pool.rs` declares a *different* constant of the same name
 /// (`pub(crate) const PHASE2_DECOMP_CAP: usize = 8`) for its own Phase-2, and
-/// that is the one governing this crate's live merge path: `fgumi sort` and
-/// `fgumi merge` run through `RawExternalSorter`, i.e. the pool. This module's
-/// callers (`open_spill_slot`, `MergeDriver::from_slots`) are reachable only
-/// from tests until the typed-step `SortMerge` consumer lands. So
-/// `fgumi_sort::PHASE2_DECOMP_CAP` resolves to 32 while the merge that actually
-/// runs is bounded at 8. The two are deliberately unequal (see this constant's
-/// history above); the confusable part is only which is in force, and that
-/// flips when the pipeline steps land.
+/// that is the one governing `RawExternalSorter::sort_records`' merge
+/// (`fgumi simulate`, and the test parity oracle). This constant bounds the
+/// chain sort's slots (`fgumi sort`, the `runall` sort). So
+/// `fgumi_sort::PHASE2_DECOMP_CAP` resolves to 32 while `fgumi simulate`'s
+/// sort runs bounded at 8 (`fgumi merge`'s `merge_bams` has no Phase-2 slots,
+/// so neither bounds it). The two are deliberately unequal (see this constant's history
+/// above); the confusable part is only which command each one bounds.
 pub const PHASE2_DECOMP_CAP: usize = 32;
 
 /// Disk reader state for a single spill file. Mutex'd separately
@@ -355,6 +351,38 @@ impl SortMergeSlot {
     #[must_use]
     pub fn fifo_len(&self) -> usize {
         self.decompressed.lock().expect("SortMergeSlot decompressed mutex poisoned").len()
+    }
+
+    /// The merge can make progress on this slot: a decompressed block is queued,
+    /// or the slot reached EOF (clean or failed). Read under `decompressed`, so
+    /// it orders against a producer's push (see `merge_demand`'s module doc).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `decompressed` mutex is poisoned.
+    #[must_use]
+    pub fn has_block_or_eof(&self) -> bool {
+        let d = self.decompressed.lock().expect("SortMergeSlot decompressed mutex poisoned");
+        !d.is_empty() || self.queue_eof.load(Ordering::Acquire)
+    }
+
+    /// What this slot is doing while the merge stalls on it, from lock-free
+    /// state only: the merge must not take the `reader` lock, which would make
+    /// a decompress worker skip the very slot the merge is waiting on. Only
+    /// the block-parallel path raises `in_flight`, so under
+    /// `--sort::file-granularity` (inline decompress) every stall reports
+    /// [`AwaitedSlotState::Starved`]; the `--sort-stats` awaited-slot line says
+    /// the buckets are not classified there
+    /// ([`crate::MergeDemandStats::mark_inline_decompress`]).
+    ///
+    /// [`AwaitedSlotState::Starved`]: crate::AwaitedSlotState::Starved
+    #[must_use]
+    pub fn awaited_state(&self) -> crate::AwaitedSlotState {
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            crate::AwaitedSlotState::Decompressing
+        } else {
+            crate::AwaitedSlotState::Starved
+        }
     }
 
     // ── Block-parallel decompression helpers (file_granularity == false) ─────
@@ -625,6 +653,33 @@ mod tests {
         slot.decompressed.lock().unwrap().push_back(vec![0u8; 10]);
         slot.decompressed.lock().unwrap().push_back(vec![0u8; 20]);
         assert_eq!(slot.fifo_len(), 2, "counts blocks, not bytes");
+    }
+
+    /// The merge's re-check must treat EOF as "can progress" — otherwise the
+    /// merge parks at a run end where no further delivery will wake it.
+    #[test]
+    fn has_block_or_eof_is_true_for_a_block_or_eof_only() {
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+        assert!(!slot.has_block_or_eof(), "fresh slot: no block, no EOF");
+        slot.decompressed.lock().unwrap().push_back(vec![1]);
+        assert!(slot.has_block_or_eof(), "a queued block");
+        let eof = SortMergeSlot::new(1, empty_reader(), SpillCodec::Bgzf);
+        eof.queue_eof.store(true, Ordering::Release);
+        assert!(eof.has_block_or_eof(), "EOF with an empty FIFO");
+    }
+
+    /// A stalled-on slot reports `Decompressing` while blocks are in flight
+    /// for it, else `Starved` (queued blocks or EOF never reach a stall).
+    #[rstest::rstest]
+    #[case::starved(0, crate::AwaitedSlotState::Starved)]
+    #[case::decompressing(2, crate::AwaitedSlotState::Decompressing)]
+    fn awaited_state_reads_in_flight(
+        #[case] in_flight: usize,
+        #[case] want: crate::AwaitedSlotState,
+    ) {
+        let slot = SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf);
+        slot.in_flight.store(in_flight, Ordering::Release);
+        assert_eq!(slot.awaited_state(), want);
     }
 
     #[test]

@@ -285,20 +285,12 @@ pub(crate) struct AlignWired {
     pub(crate) min_workers: usize,
     /// Whether the chain builder should prefer drain-first dispatch.
     pub(crate) prefers_drain_first: bool,
-    /// When set and drain-first is chosen automatically, the chain uses
+    /// The backend's input-refill hint, added to the chain's refill hints. It
+    /// requires drain-first dispatch: when the chain chose drain-first
+    /// automatically,
     /// [`RefillDrainScheduler`](crate::pipeline::core::runtime::RefillDrainScheduler)
-    /// on this hint.
-    pub(crate) refill: Option<RefillHint>,
-}
-
-/// A backend's input-refill hint: while `signal` is raised and the queue
-/// `feed` (a producer step and output branch) holds less than `cap_bytes`, the
-/// steps up to and including the producer should be walked upstream-first.
-#[derive(Clone)]
-pub(crate) struct RefillHint {
-    pub(crate) signal: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) feed: (StepIdx, BranchIdx),
-    pub(crate) cap_bytes: u64,
+    /// walks the backend's feed upstream-first while the hint is raised.
+    pub(crate) refill: Option<crate::pipeline::refill::RefillHint>,
 }
 
 /// A pluggable align backend: appends its steps after a queryname-grouped

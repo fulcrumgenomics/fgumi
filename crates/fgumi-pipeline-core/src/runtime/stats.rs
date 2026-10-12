@@ -100,6 +100,14 @@ pub struct StepStats {
     /// Directed plan, flushed-retry) dispatch, so their wake was skipped: one
     /// per such branch, not per dispatch.
     pub gated_off: AtomicU64,
+    /// `PoolHandle::request_worker` calls from this step that woke a parked pool worker.
+    pub pool_requests_woken: AtomicU64,
+    /// `PoolHandle::request_worker` calls from this step that found no other
+    /// worker to wake.
+    pub pool_requests_all_awake: AtomicU64,
+    /// `PoolHandle::request_worker` calls from this step suppressed because an
+    /// earlier event-count request was still unacknowledged.
+    pub pool_requests_pending: AtomicU64,
     /// Items this step held and later pushed: a push into one of its
     /// byte-bounded output edges was refused back to the step, and a later
     /// successful push into that edge (or a reorder stash insert that accepted
@@ -172,6 +180,9 @@ impl Default for StepStats {
             reverse_wakes: AtomicU64::new(0),
             direct_fallbacks: AtomicU64::new(0),
             gated_off: AtomicU64::new(0),
+            pool_requests_woken: AtomicU64::new(0),
+            pool_requests_all_awake: AtomicU64::new(0),
+            pool_requests_pending: AtomicU64::new(0),
             holds: AtomicU64::new(0),
             held_retries: AtomicU64::new(0),
             held_wait_ns: AtomicU64::new(0),
@@ -201,6 +212,9 @@ impl StepStats {
             reverse_wakes: self.reverse_wakes.load(Ordering::Relaxed),
             direct_fallbacks: self.direct_fallbacks.load(Ordering::Relaxed),
             gated_off: self.gated_off.load(Ordering::Relaxed),
+            pool_requests_woken: self.pool_requests_woken.load(Ordering::Relaxed),
+            pool_requests_all_awake: self.pool_requests_all_awake.load(Ordering::Relaxed),
+            pool_requests_pending: self.pool_requests_pending.load(Ordering::Relaxed),
             holds: self.holds.load(Ordering::Relaxed),
             held_retries: self.held_retries.load(Ordering::Relaxed),
             held_wait_ns: self.held_wait_ns.load(Ordering::Relaxed),
@@ -216,6 +230,14 @@ impl StepStats {
 /// `--threads`, so a fixed array avoids threading `num_workers` through every
 /// `PipelineStats::new` call site.
 const MAX_TRACKED_WORKERS: usize = 512;
+
+/// Nanoseconds since `start`, saturating into a `u64` (a `u64` of ns is ~584
+/// years, so the cap only avoids a `u128`-to-`u64` panic path on an absurd
+/// clock). For steps and stages that time their own work.
+#[must_use]
+pub fn elapsed_ns(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Per-step counter container. Sized to match the pipeline's chain length;
 /// callers obtain one via `Pipeline::stats()`.
@@ -347,6 +369,25 @@ impl PipelineStats {
         s.gated_off.fetch_add(u64::from(r.gated_off), Ordering::Relaxed);
     }
 
+    /// Count one `PoolHandle::request_worker` outcome for `step`
+    /// (`Unavailable` — no pool to ask — is not counted).
+    #[inline]
+    pub(crate) fn record_pool_request(
+        &self,
+        step: StepIdx,
+        outcome: crate::runtime::wake::PoolRequest,
+    ) {
+        use crate::runtime::wake::PoolRequest;
+        let Some(s) = self.steps.get(step.0) else { return };
+        let c = match outcome {
+            PoolRequest::Woken => &s.pool_requests_woken,
+            PoolRequest::AllAwake => &s.pool_requests_all_awake,
+            PoolRequest::Pending => &s.pool_requests_pending,
+            PoolRequest::Unavailable => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One held item of `step` was released after `wait_ns`.
     #[inline]
     pub fn record_hold(&self, step: StepIdx, wait_ns: u64) {
@@ -424,7 +465,7 @@ impl PipelineStats {
     /// per-step first/last progress timestamps.
     #[must_use]
     pub fn elapsed_ns(&self) -> u64 {
-        u64::try_from(self.pipeline_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        elapsed_ns(self.pipeline_start)
     }
 
     #[must_use]
@@ -835,6 +876,12 @@ pub struct StepStatsSnapshot {
     pub direct_fallbacks: u64,
     /// See [`StepStats::gated_off`].
     pub gated_off: u64,
+    /// See [`StepStats::pool_requests_woken`].
+    pub pool_requests_woken: u64,
+    /// See [`StepStats::pool_requests_all_awake`].
+    pub pool_requests_all_awake: u64,
+    /// See [`StepStats::pool_requests_pending`].
+    pub pool_requests_pending: u64,
     /// See [`StepStats::holds`].
     pub holds: u64,
     /// See [`StepStats::held_retries`].
@@ -1142,6 +1189,9 @@ impl StatsSnapshot {
                 | s.reverse_wakes
                 | s.direct_fallbacks
                 | s.gated_off
+                | s.pool_requests_woken
+                | s.pool_requests_all_awake
+                | s.pool_requests_pending
                 | s.holds
                 | s.held_retries
                 != 0
@@ -1151,7 +1201,7 @@ impl StatsSnapshot {
         }
         writeln!(
             f,
-            "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>12} {:>12} {:>12}",
+            "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12}",
             "wake",
             "notify",
             "nowait",
@@ -1160,6 +1210,9 @@ impl StatsSnapshot {
             "reverse",
             "fallback",
             "gated_off",
+            "req_woken",
+            "req_awake",
+            "req_pending",
             "holds",
             "retries",
             "held_p50_ms",
@@ -1171,7 +1224,7 @@ impl StatsSnapshot {
         for (name, s) in &self.steps {
             writeln!(
                 f,
-                "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>12.3} {:>12.3} {:>12.3}",
+                "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>8} {:>8} {:>12.3} {:>12.3} {:>12.3}",
                 name,
                 s.notifies_issued,
                 s.notifies_no_waiters,
@@ -1180,6 +1233,9 @@ impl StatsSnapshot {
                 s.reverse_wakes,
                 s.direct_fallbacks,
                 s.gated_off,
+                s.pool_requests_woken,
+                s.pool_requests_all_awake,
+                s.pool_requests_pending,
                 s.holds,
                 s.held_retries,
                 ms(s.held_wait_quantile_ns(0.50)),
@@ -1890,6 +1946,17 @@ mod tests {
             },
         );
         stats.record_wake(StepIdx(1), WakeCounts { notified: 1, ..WakeCounts::default() });
+        {
+            use crate::runtime::wake::PoolRequest;
+            for r in [
+                PoolRequest::Woken,
+                PoolRequest::AllAwake,
+                PoolRequest::Pending,
+                PoolRequest::Unavailable,
+            ] {
+                stats.record_pool_request(StepIdx(1), r);
+            }
+        }
         stats.record_hold(StepIdx(1), 1_500_000);
         stats.record_hold(StepIdx(1), 500_000);
         stats.record_held_retry(StepIdx(1));
@@ -1903,6 +1970,11 @@ mod tests {
         assert_eq!(b.reverse_wakes, 1);
         assert_eq!(b.direct_fallbacks, 1);
         assert_eq!(b.gated_off, 4);
+        assert_eq!(
+            (b.pool_requests_woken, b.pool_requests_all_awake, b.pool_requests_pending),
+            (1, 1, 1),
+            "one of each, and `Unavailable` is not counted"
+        );
         assert_eq!((b.holds, b.held_retries), (2, 1));
         assert_eq!(b.held_wait_ns, 2_000_000);
         assert_eq!(b.held_wait_max_ns, 1_500_000);
@@ -1915,9 +1987,14 @@ mod tests {
             .find(|l| l.trim_start().starts_with("B ") && l.contains("1.500"))
             .unwrap_or_else(|| panic!("wake row for B missing:\n{text}"));
         let cols: Vec<&str> = row.split_whitespace().collect();
-        // B notify nowait suppressed unpark reverse fallback gated_off holds retries p50 p99 max
-        assert_eq!(&cols[..10], &["B", "6", "1", "2", "3", "1", "1", "4", "2", "1"], "{row}");
-        assert_eq!(cols[12], "1.500", "max column: {row}");
+        // B notify nowait suppressed unpark reverse fallback gated_off req_woken req_awake
+        // req_pending holds retries p50 p99 max
+        assert_eq!(
+            &cols[..13],
+            &["B", "6", "1", "2", "3", "1", "1", "4", "1", "1", "1", "2", "1"],
+            "{row}"
+        );
+        assert_eq!(cols[15], "1.500", "max column: {row}");
     }
 
     /// The histogram's quantiles come from the bucket boundaries (an upper bound

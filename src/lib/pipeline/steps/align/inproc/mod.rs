@@ -44,9 +44,9 @@ use crate::pipeline::core::step::StepOutcome;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 
 use super::{
-    AlignBackend, AlignWired, AlignWiringCtx, RefillHint, merge_aligner_header,
-    validate_sq_consistency,
+    AlignBackend, AlignWired, AlignWiringCtx, merge_aligner_header, validate_sq_consistency,
 };
+use crate::pipeline::refill::RefillHint;
 use engine::BwaMem3Engine;
 use gate::cohort_bound_for_chunk_size;
 use header::{load_index_header_sidecar, synthesize_aligner_header};
@@ -225,10 +225,10 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // AlignPrepare keeps the next cohort out of seed/extend until the pool
         // drains the current cohort's pair/emit: running the two together costs
         // ~6% CPU at 8 threads.
-        let refill = refill_signal.map(|signal| RefillHint {
-            signal,
-            feed: input,
-            cap_bytes: cohort_bound_for_chunk_size(self.chunk_size),
+        // The hint applies only under drain-first dispatch, which this backend
+        // asks for (`prefers_drain_first`): its walk is a refinement of it.
+        let refill = refill_signal.map(|signal| {
+            RefillHint::new(signal, input, cohort_bound_for_chunk_size(self.chunk_size), true)
         });
 
         let seed_limit = seed_extend_output_byte_limit(ctx.per_step_byte_limit, ctx.num_threads);
