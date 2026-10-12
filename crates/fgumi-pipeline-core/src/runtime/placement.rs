@@ -49,7 +49,7 @@ pub fn reader_worker(steps: &[Box<dyn ErasedStep>], n_workers: usize) -> Option<
 /// `ExcludeReader` with a reader drops the reader's worker; if that leaves no
 /// worker, the single clone goes to `producer_driver` when the step's producer
 /// runs on a driver, else to worker 0. Every other combination is every worker.
-/// For a multi-input step, "the producer" is the one [`plan_parallel_hosts`]
+/// For a multi-input step, "the producer" is the one the pipeline's host planner
 /// passes: its lowest-indexed producer.
 #[must_use]
 pub fn parallel_hosts(

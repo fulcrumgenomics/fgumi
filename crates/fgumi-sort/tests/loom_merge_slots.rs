@@ -26,9 +26,11 @@
 //!
 //!   * **The "read" is simulated.** loom cannot model real file I/O, so a
 //!     worker computes `(start_seq, got, hit_eof)` from a test-held total under
-//!     the real `reader` lock instead of calling `read_raw`; "decompression"
-//!     yields the seq number as the payload. The slot's accounting/finalize
-//!     methods that run on the result are 100% production code.
+//!     the real `reader` lock (`SortMergeSlot::bp_read_batch_for_test`, which
+//!     publishes through the real `bp_commit_read`) instead of parsing a
+//!     slice; "decompression" yields the seq number as the payload. The slot's
+//!     accounting/finalize methods that run on the result are 100% production
+//!     code.
 //!   * **Blocking `reader.lock()` instead of production's `try_lock()`.** The
 //!     property under test depends only on reads being *serialized* (so
 //!     `reader_eof` can never become visible while an unreserved block still
@@ -39,9 +41,10 @@
 //!
 //! ## Modeling choices (documented for honesty)
 //!
-//!   * **Window/FIFO admission disabled.** `bp_reorder_admits` backpressure is a
-//!     *bounded-memory* property, separately covered by the `merge_slots` unit
-//!     test `bp_reorder_window_is_bounded_under_straggler`. Workers here always
+//!   * **Window/FIFO admission disabled.** The reorder-window backpressure
+//!     claims obey is a *bounded-memory* property, separately covered by the
+//!     `merge_slots` unit tests `bp_reorder_window_is_bounded_under_straggler`
+//!     and `claims_respect_the_reorder_window_under_a_straggler`. Workers here always
 //!     admit, keeping the model focused on the EOF/truncation invariants.
 //!   * **Tiny sizes (2-4 blocks, 2-3 workers).** loom's state space is
 //!     super-exponential; these sizes still exercise every out-of-order
@@ -98,18 +101,14 @@
 // usize; the casts below are between u64 model seqs and usize counts.
 #![allow(clippy::cast_possible_truncation)]
 
-use std::fs::File;
-use std::io::BufReader;
-
 use fgumi_sort::{SortMergeSlot, SpillCodec};
 use loom::sync::Arc;
-use loom::sync::atomic::Ordering;
 
-/// A throwaway reader for the slot. The block-parallel slot methods never touch
-/// `reader.inner`; the model serializes reads on the `reader` mutex and computes
-/// the read result arithmetically, so an empty file is all the struct needs.
-fn empty_reader() -> BufReader<File> {
-    BufReader::new(tempfile::tempfile().expect("create tempfile"))
+/// A slot over an empty file. The block-parallel slot methods never read the
+/// file; the model serializes reads on the `reader` mutex and computes the read
+/// result arithmetically, so an empty file is all the struct needs.
+fn empty_slot() -> SortMergeSlot {
+    SortMergeSlot::for_test(0, SpillCodec::Bgzf)
 }
 
 /// One worker's body: mirrors a single `try_run` of
@@ -121,26 +120,15 @@ fn empty_reader() -> BufReader<File> {
 /// A worker that finds the reader already at EOF falls through to the REAL
 /// Phase-B drain-only [`SortMergeSlot::bp_drain_and_finalize`].
 fn worker_one_pass(slot: &SortMergeSlot, block_batch: u64, total_blocks: u64) {
-    if slot.queue_eof.load(Ordering::Acquire) {
+    if slot.queue_eof() {
         return;
     }
     let mut did_phase_a = false;
-    if !slot.reader_eof.load(Ordering::Acquire) {
-        // Blocking lock (sound over-approximation of production's `try_lock`;
-        // see module docs) — serializes reads on the REAL reader mutex.
-        let mut reader = slot.reader.lock().unwrap();
-        // Re-check under the lock: another worker may have hit EOF.
-        if !slot.reader_eof.load(Ordering::Acquire) {
-            let start_seq = reader.next_seq;
-            let remaining = total_blocks - start_seq;
-            let got = block_batch.min(remaining);
-            let hit_eof = got < block_batch;
-            // Stamp the read range and commit the accounting BEFORE releasing
-            // the lock, via the real publish-order method.
-            reader.next_seq += got;
-            slot.bp_commit_read(got as usize, hit_eof);
-            drop(reader);
-
+    if !slot.reader_eof() {
+        // The REAL reader lock serializes the simulated read, which stamps the
+        // range and commits the accounting through the real publish order
+        // before releasing the lock (`None`: another worker hit EOF first).
+        if let Some((start_seq, got)) = slot.bp_read_batch_for_test(total_blocks, block_batch) {
             // "Decompress" outside the reader lock: the payload is the seq as
             // 8 little-endian bytes, so the drained FIFO can be checked for
             // in-order, no-loss delivery.
@@ -190,7 +178,7 @@ fn consume_until_drained(slot: &SortMergeSlot) -> Vec<u64> {
     let mut collected = Vec::new();
     loop {
         loop {
-            let popped = slot.decompressed.lock().unwrap().pop_front();
+            let popped = slot.pop_decompressed();
             match popped {
                 Some(b) => collected.push(seq_of(&b)),
                 None => break,
@@ -209,7 +197,7 @@ fn consume_until_drained(slot: &SortMergeSlot) -> Vec<u64> {
 /// and assert the no-loss / in-order / clean-EOF invariants for every
 /// interleaving against the REAL slot state.
 fn run_model(total_blocks: u64, block_batch: u64) {
-    let slot = Arc::new(SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf));
+    let slot = Arc::new(empty_slot());
     let n_workers = reads_needed(total_blocks, block_batch);
 
     let mut handles: Vec<_> = (0..n_workers)
@@ -231,11 +219,11 @@ fn run_model(total_blocks: u64, block_batch: u64) {
     // buffered, and the consumer collected every block exactly once, in read
     // order, BEFORE it observed the clean EOF (a premature `queue_eof` truncates
     // `delivered`).
-    assert!(slot.queue_eof.load(Ordering::Acquire), "slot never reached queue_eof");
+    assert!(slot.queue_eof(), "slot never reached queue_eof");
     assert!(!slot.has_error(), "spurious decomp_error");
-    assert_eq!(slot.in_flight.load(Ordering::Acquire), 0, "blocks left in flight at EOF");
-    assert!(slot.reorder.lock().unwrap().is_empty(), "reorder buffer not drained at EOF");
-    assert!(slot.decompressed.lock().unwrap().is_empty(), "FIFO not fully consumed at EOF");
+    assert_eq!(slot.in_flight(), 0, "blocks left in flight at EOF");
+    assert_eq!(slot.reorder_len_relaxed(), 0, "reorder buffer not drained at EOF");
+    assert_eq!(slot.fifo_len(), 0, "FIFO not fully consumed at EOF");
 
     let expected: Vec<u64> = (0..total_blocks).collect();
     assert_eq!(
@@ -300,7 +288,7 @@ fn loom_two_blocks_batch1_three_workers_bounded() {
 #[test]
 fn loom_merge_wake_never_lost() {
     check_model(3, || {
-        let slot = Arc::new(SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf));
+        let slot = Arc::new(empty_slot());
         let demand = Arc::new(fgumi_sort::MergeDemand::new());
         slot.bp_commit_read(1, true); // reserve one block, as the reader would
         let (s2, d2) = (Arc::clone(&slot), Arc::clone(&demand));
@@ -312,7 +300,7 @@ fn loom_merge_wake_never_lost() {
             loom::thread::park();
         }
         producer.join().unwrap();
-        assert_eq!(slot.decompressed.lock().unwrap().len(), 1);
+        assert_eq!(slot.fifo_len(), 1);
     });
 }
 
@@ -331,16 +319,14 @@ fn loom_merge_wake_never_lost() {
 #[test]
 fn loom_decomp_error_beats_clean_eof() {
     loom::model(|| {
-        let slot = Arc::new(SortMergeSlot::new(0, empty_reader(), SpillCodec::Bgzf));
+        let slot = Arc::new(empty_slot());
 
         // Producer: error path. Mirrors `mark_slot_failed` — set decomp_error
         // THEN queue_eof, both under the `decompressed` mutex.
         let producer = {
             let slot = Arc::clone(&slot);
             loom::thread::spawn(move || {
-                let _g = slot.decompressed.lock().unwrap();
-                slot.decomp_error.store(true, Ordering::Release);
-                slot.queue_eof.store(true, Ordering::Release);
+                slot.mark_failed();
             })
         };
 
@@ -384,5 +370,292 @@ fn loom_decomp_error_beats_clean_eof() {
         producer.join().unwrap();
         consumer.join().unwrap();
         consumer_reversed.join().unwrap();
+    });
+}
+
+// ── raw stash: claims, the front escape, EOF with stash outstanding ─────────
+
+/// The frame payload a model stashes for `seq`: the seq as 8 LE bytes, so the
+/// consumer can check in-order, exactly-once delivery with [`seq_of`].
+fn payload(seq: u64) -> Vec<u8> {
+    seq.to_le_bytes().to_vec()
+}
+
+/// One claimer pass (bounded, as every model producer is — see the module
+/// header): claim the stash head and publish it ("decompress" = copy), or run
+/// the drain-only pass when nothing is claimable.
+fn claim_once(slot: &SortMergeSlot) {
+    match slot.bp_claim_raw(u64::MAX) {
+        Some(b) => {
+            let d = b.frame.to_vec();
+            slot.bp_insert_drain_finalize(b.seq, vec![d], 1);
+        }
+        None => {
+            slot.bp_drain_and_finalize();
+        }
+    }
+}
+
+/// One consumer pass: pop everything queued, then look at the drain state. A
+/// premature `queue_eof` shows up as "drained" with blocks still missing.
+fn consume_once(slot: &SortMergeSlot, total: u64) -> Vec<u64> {
+    let mut got = Vec::new();
+    loop {
+        let popped = slot.pop_decompressed();
+        match popped {
+            Some(b) => got.push(seq_of(&b)),
+            None => break,
+        }
+    }
+    if slot.is_drained() {
+        assert_eq!(got, (0..total).collect::<Vec<_>>(), "clean EOF before every block landed");
+    }
+    got
+}
+
+/// Finish what the bounded passes left (claims, drains) single-threaded and
+/// collect the rest of the FIFO.
+fn finish(slot: &SortMergeSlot) -> Vec<u64> {
+    while let Some(b) = slot.bp_claim_raw(u64::MAX) {
+        slot.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+    }
+    slot.bp_drain_and_finalize();
+    let mut got = Vec::new();
+    while let Some(b) = slot.pop_decompressed() {
+        got.push(seq_of(&b));
+    }
+    got
+}
+
+/// One ingest of three frames (last) races two claimer passes and a consumer
+/// pass: every seq is delivered exactly once, in order, then `queue_eof` —
+/// never a clean EOF with a block missing.
+#[test]
+fn loom_stash_claims_deliver_each_seq_once() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        let s = Arc::clone(&slot);
+        let ingest = loom::thread::spawn(move || {
+            s.bp_stash_frames_for_test((0..3).map(payload).collect(), true)
+        });
+        let claimers: Vec<_> = (0..2)
+            .map(|_| {
+                let s = Arc::clone(&slot);
+                loom::thread::spawn(move || claim_once(&s))
+            })
+            .collect();
+        let s = Arc::clone(&slot);
+        let consumer = loom::thread::spawn(move || consume_once(&s, 3));
+        ingest.join().unwrap();
+        for c in claimers {
+            c.join().unwrap();
+        }
+        let mut delivered = consumer.join().unwrap();
+        delivered.extend(finish(&slot));
+        assert_eq!(delivered, vec![0, 1, 2], "lost, duplicated or reordered");
+        assert!(slot.queue_eof() && !slot.has_error());
+    });
+}
+
+/// The front escape. With the FIFO at its cap (1) and the window budget at 1
+/// byte, nothing but the escape admits a claim: the stash head that IS the
+/// reorder front must be claimable anyway (a claimer that loops on it
+/// terminates without the consumer popping), while a head that is not the
+/// front is refused until the front lands.
+#[test]
+fn loom_front_escape_unsticks_the_window() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        slot.set_fifo_cap(1);
+        slot.bp_stash_frames_for_test((0..3).map(payload).collect(), false);
+        let b0 = slot.bp_claim_raw(1).expect("the front");
+        slot.bp_insert_drain_finalize(b0.seq, vec![payload(0)], 1);
+        assert_eq!(slot.fifo_len(), 1, "the FIFO is at its cap");
+        let s = Arc::clone(&slot);
+        let claimer = loom::thread::spawn(move || {
+            loop {
+                if let Some(b) = s.bp_claim_raw(1) {
+                    return b.detach();
+                }
+                loom::thread::yield_now();
+            }
+        });
+        let b1 = claimer.join().unwrap();
+        assert_eq!(b1.seq, 1, "the front is admitted over a full FIFO and window");
+        assert!(slot.bp_claim_raw(1).is_none(), "seq 2 is not the front (1 is in flight)");
+        // The consumer pops seq 0, so seq 1 drains into the FIFO (refilling it
+        // to its cap) and seq 2 becomes the front; only the escape admits it.
+        assert_eq!(slot.pop_decompressed(), Some(payload(0)));
+        let s = Arc::clone(&slot);
+        let inserter = loom::thread::spawn(move || {
+            s.bp_insert_drain_finalize(b1.seq, vec![payload(1)], 1);
+        });
+        let s = Arc::clone(&slot);
+        let claimer = loom::thread::spawn(move || {
+            loop {
+                if let Some(b) = s.bp_claim_raw(1) {
+                    return b.seq;
+                }
+                loom::thread::yield_now();
+            }
+        });
+        inserter.join().unwrap();
+        assert_eq!(claimer.join().unwrap(), 2, "seq 2 is admitted once it is the front");
+    });
+}
+
+/// The last slice's EOF commit races a claim of an earlier block: `queue_eof`
+/// is set only after every block (including the one in flight) is inserted.
+#[test]
+fn loom_eof_slice_with_stash_outstanding() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        slot.bp_stash_frames_for_test(vec![payload(0)], false);
+        let s = Arc::clone(&slot);
+        let claimer = loom::thread::spawn(move || claim_once(&s));
+        let s = Arc::clone(&slot);
+        let last = loom::thread::spawn(move || s.bp_stash_frames_for_test(vec![payload(1)], true));
+        let s = Arc::clone(&slot);
+        let consumer = loom::thread::spawn(move || consume_once(&s, 2));
+        claimer.join().unwrap();
+        last.join().unwrap();
+        let mut delivered = consumer.join().unwrap();
+        delivered.extend(finish(&slot));
+        assert_eq!(delivered, vec![0, 1], "EOF finalized before a claimed block landed");
+        assert!(slot.queue_eof());
+    });
+}
+
+/// A self-serving consumer's decompress failure (`mark_failed`) while a worker
+/// claim is in flight: the slot is never reported as a clean drain, and once
+/// the consumer has failed its claimed block the slot is visibly failed —
+/// `queue_eof` set with `decomp_error` — so a merge waiting on it surfaces the
+/// error instead of waiting forever for a block that will never be inserted.
+#[test]
+fn loom_decomp_error_beats_clean_eof_with_self_serve() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        slot.bp_stash_frames_for_test((0..2).map(payload).collect(), true);
+        let s = Arc::clone(&slot);
+        let worker = loom::thread::spawn(move || {
+            if let Some(b) = s.bp_claim_raw(u64::MAX) {
+                s.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+            }
+        });
+        let s = Arc::clone(&slot);
+        let consumer = loom::thread::spawn(move || {
+            let claimed = s.bp_claim_raw(u64::MAX).is_some();
+            if claimed {
+                s.mark_failed();
+            }
+            claimed
+        });
+        let s = Arc::clone(&slot);
+        let observer = loom::thread::spawn(move || {
+            assert!(!s.is_drained(), "a slot that will fail reported a clean drain");
+        });
+        worker.join().unwrap();
+        let consumer_claimed = consumer.join().unwrap();
+        observer.join().unwrap();
+        assert!(!slot.is_drained());
+        if consumer_claimed {
+            assert!(
+                slot.has_error() && slot.queue_eof(),
+                "a failed self-serve must leave the slot failed and at EOF"
+            );
+        }
+    });
+}
+
+/// The front escape admits the last block while the FIFO is full; it waits in
+/// `reorder`. The consumer pops, then runs the drain-only pass, and reaches
+/// `queue_eof` in every interleaving with the worker's insert.
+#[test]
+fn loom_final_insert_into_full_fifo_drains() {
+    check_model(3, || {
+        let cap = fgumi_sort::PHASE2_DECOMP_CAP as u64;
+        let slot = Arc::new(empty_slot());
+        slot.bp_stash_frames_for_test((0..=cap).map(payload).collect(), true);
+        for _ in 0..cap {
+            let b = slot.bp_claim_raw(u64::MAX).unwrap();
+            slot.bp_insert_drain_finalize(b.seq, vec![b.frame.to_vec()], 1);
+        }
+        let last = slot.bp_claim_raw(u64::MAX).expect("the front over a full FIFO").detach();
+        let s = Arc::clone(&slot);
+        let worker = loom::thread::spawn(move || {
+            s.bp_insert_drain_finalize(last.seq, vec![last.frame.to_vec()], 1);
+        });
+        let s = Arc::clone(&slot);
+        let consumer = loom::thread::spawn(move || {
+            let mut got = Vec::new();
+            loop {
+                loop {
+                    let popped = s.pop_decompressed();
+                    match popped {
+                        Some(b) => got.push(seq_of(&b)),
+                        None => break,
+                    }
+                }
+                if s.is_drained() {
+                    return got;
+                }
+                s.bp_drain_and_finalize();
+                loom::thread::yield_now();
+            }
+        });
+        worker.join().unwrap();
+        let got = consumer.join().unwrap();
+        assert_eq!(got, (0..=cap).collect::<Vec<_>>());
+    });
+}
+
+/// An ingest racing the merge's stall classification: with no claim, a stall
+/// sampled at any point of the ingest reads the slot as stashed (or not yet
+/// stashed), never as decompressing — `stash_len` is stored before the
+/// in-flight reservation is raised, and `awaited_state` loads `in_flight`
+/// first.
+#[test]
+fn loom_awaited_state_never_reads_a_fresh_stash_as_decompressing() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        let s = Arc::clone(&slot);
+        let ingest = loom::thread::spawn(move || {
+            s.bp_stash_frames_for_test((0..2).map(payload).collect(), false);
+        });
+        let state = slot.awaited_state();
+        assert_ne!(state, fgumi_sort::AwaitedSlotState::Decompressing, "no block was claimed");
+        ingest.join().unwrap();
+        assert_eq!(slot.awaited_state(), fgumi_sort::AwaitedSlotState::Stashed);
+    });
+}
+
+/// The read planner bounds read-ahead by each slot's charge (`stash_bytes`),
+/// so the charge must balance however ingests, claims and the drops that
+/// release a claimed frame's charge interleave: a claimer races a second
+/// ingest, and once every frame is claimed and dropped the charge is zero —
+/// never underflowed, never left behind.
+#[test]
+fn loom_stash_charge_balances_across_claims_and_ingests() {
+    check_model(3, || {
+        let slot = Arc::new(empty_slot());
+        slot.bp_stash_frames_for_test(vec![payload(0)], false);
+        let s = Arc::clone(&slot);
+        let claimer = loom::thread::spawn(move || {
+            if let Some(b) = s.bp_claim_raw(u64::MAX) {
+                let charged = s.stash_bytes();
+                drop(b);
+                assert!(charged >= 8, "a claimed frame stays charged until dropped");
+            }
+        });
+        let s = Arc::clone(&slot);
+        let ingest = loom::thread::spawn(move || {
+            s.bp_stash_frames_for_test(vec![payload(1)], true);
+        });
+        claimer.join().unwrap();
+        ingest.join().unwrap();
+        while let Some(b) = slot.bp_claim_raw(u64::MAX) {
+            drop(b);
+        }
+        assert_eq!(slot.stash_bytes(), 0, "every charge released exactly once");
     });
 }

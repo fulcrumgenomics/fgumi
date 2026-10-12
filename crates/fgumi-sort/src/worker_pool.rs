@@ -112,7 +112,6 @@ pub(crate) fn read_raw_zstd_frames<R: std::io::Read + ?Sized>(
 pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<Option<usize>> {
-    use std::io::ErrorKind;
     let mut first = [0u8; 1];
     match reader.read(&mut first)? {
         0 => return Ok(None),
@@ -126,16 +125,7 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
     let mut rest = [0u8; 3];
     reader.read_exact(&mut rest)?;
     let len_buf = [first[0], rest[0], rest[1], rest[2]];
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    if frame_len > MAX_ZSTD_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "zstd spill frame length {frame_len} exceeds MAX_ZSTD_FRAME_BYTES ({MAX_ZSTD_FRAME_BYTES}): file likely corrupted",
-            ),
-        ));
-    }
-    Ok(Some(frame_len))
+    crate::spill_block_reader::checked_zstd_len(&len_buf).map(Some)
 }
 
 /// Cap on uncompressed size of a zstd spill frame. Production frames are
@@ -143,12 +133,6 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
 /// this leaves slack but stays small enough that per-frame allocations don't
 /// dominate the merge phase when there are many tens of thousands of frames.
 pub(crate) const ZSTD_FRAME_DECOMP_CAP: usize = 256 * 1024;
-
-/// Hard cap on the `u32 LE` length prefix of any zstd spill frame. Frames are
-/// produced one per ~64 KiB of input by `compress_job`; even
-/// pathological expansion can't reach this. Beyond it, we treat the value as
-/// corruption rather than allocate gigabytes.
-pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum zstd compression level recognized by the `zstd` crate.
 const ZSTD_MAX_CLEVEL: u32 = 22;
@@ -736,7 +720,7 @@ pub(crate) const PHASE2_STARVING_CAP_MULTIPLE: usize = 16;
 /// [`awaited_allowance_for`]'s `raw_cap` is sized to hold ~32 MiB *at the running
 /// mean compressed block size*, but it is an entry count, not a byte bound. A
 /// FIFO first measured from small frames earns a large entry cap, and a zstd
-/// frame is capped only at [`MAX_ZSTD_FRAME_BYTES`] (2 MiB), so once larger
+/// frame is capped only at [`MAX_ZSTD_FRAME_BYTES`](crate::spill_block_reader::MAX_ZSTD_FRAME_BYTES) (2 MiB), so once larger
 /// frames arrive the entry count alone would let the FIFO retain far more than
 /// the intended budget. `admitted_read_batch` therefore refuses a read once the
 /// FIFO already holds this many bytes, keeping the entry cap as a secondary
@@ -846,7 +830,7 @@ fn phase2_read_allowance(is_frontier: bool) -> (usize, usize) {
 /// Two caps bound the FIFO. `byte_budget` is the primary one: a deep FIFO's
 /// entry cap is derived from a running *mean* block size, so once frames larger
 /// than that mean arrive, the entry count no longer bounds the bytes held (a
-/// zstd frame is capped only at [`MAX_ZSTD_FRAME_BYTES`]). Refusing a read once
+/// zstd frame is capped only at [`MAX_ZSTD_FRAME_BYTES`](crate::spill_block_reader::MAX_ZSTD_FRAME_BYTES)). Refusing a read once
 /// the FIFO already holds `byte_budget` bytes bounds its memory regardless of
 /// how the entry cap was sized. The frontier and shallow paths pass
 /// `usize::MAX` here and rely on the entry cap alone, unchanged.
@@ -3608,6 +3592,7 @@ fn dispatch_reserved_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spill_block_reader::MAX_ZSTD_FRAME_BYTES;
     use std::time::Duration;
 
     /// Build `n` distinguishable placeholder blocks.

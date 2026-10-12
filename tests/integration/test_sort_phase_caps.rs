@@ -78,8 +78,6 @@ fn sort_options(sort_threads: Option<usize>, merge_threads: Option<usize>) -> So
         temp_compression: 1,
         temp_codec: fgumi_sort::SpillCodec::default(),
         max_temp_files: MaxTempFiles::Auto,
-        block_batch: 4,
-        file_granularity: false,
         sort_stats: false,
     }
 }

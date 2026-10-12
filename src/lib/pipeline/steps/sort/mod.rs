@@ -2,8 +2,9 @@
 //! crate (`fgumi_pipeline_io::sort`).
 pub use fgumi_pipeline_io::sort::{
     BlockOutput, CompressSpill, MergeBatchBuilder, MergeOutput, RecordBatchOutput,
-    SORT_COORD_GROUP, SORT_IO_GROUP, SortBuffer, SortDecompressTuning, SortMerge,
-    SortSpillDecompress, SpillBlockCompress, SpillGather, SpillRunStats, SpillWrite, protocol,
+    SORT_COORD_GROUP, SORT_IO_GROUP, SortBuffer, SortMerge, SortSpillDecompress,
+    SpillBlockCompress, SpillGather, SpillReadPlanner, SpillRunStats, SpillSupply, SpillWrite,
+    SupplyDiagnostics, SupplyLedger, protocol,
 };
 
 pub mod compress_spill {

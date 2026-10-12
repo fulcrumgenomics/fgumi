@@ -16,11 +16,209 @@
 
 use std::io::{self, Read};
 
+use fgumi_bam_io::pread::{RawFrame, SliceLease};
+use fgumi_bgzf::reader::{BgzfSliceFramer, SliceFrame};
 use libdeflater::Decompressor as BgzfDecompressor;
 use zstd::bulk::Decompressor as ZstdDecompressor;
 
 use crate::codec::SpillCodec;
 use crate::worker_pool::read_length_prefix;
+
+/// Hard cap on the `u32 LE` length prefix of any zstd spill frame, shared by
+/// every spill reader. Frames are produced one per ~64 KiB of input; even
+/// pathological expansion can't reach this. Beyond it, we treat the value as
+/// corruption rather than allocate gigabytes.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Size of a zstd spill frame's `u32 LE` length prefix.
+const ZSTD_LEN_PREFIX: usize = 4;
+
+/// One parsed, not yet decompressed spill frame and its per-slot sequence
+/// number (dense, in file order).
+#[derive(Debug)]
+pub struct RawBlock {
+    /// Per-slot sequence number of the frame.
+    pub seq: u64,
+    /// The frame's bytes: a BGZF block, or a zstd frame body without its
+    /// length prefix.
+    pub frame: RawFrame,
+    /// The resident bytes the slot's stash stops holding when this frame is
+    /// claimed: an owned frame's allocation; for a borrowed frame, its whole
+    /// read slice if it is the slice's last frame in the stash, else nothing
+    /// (a slice is resident while any of its frames is stashed).
+    pub charge: u64,
+}
+
+/// Incremental frame parser over a spill file's read slices.
+///
+/// Cuts every complete frame out of `carry ++ slice`: a frame wholly inside
+/// the slice is [`RawFrame::Borrowed`] from its lease (zero copy), the frame
+/// that completes the carry is [`RawFrame::Owned`], and the trailing partial
+/// frame is copied into the carry (at most one frame), so no slice is pinned
+/// by the next slice's frames. BGZF uses [`BgzfSliceFramer`] (EOF-marker
+/// blocks are skipped, as `read_raw` skips them); zstd parses
+/// `[u32 LE len][frame]` records, rejecting a length over
+/// `MAX_ZSTD_FRAME_BYTES` with the same error the sequential reader raises.
+#[derive(Debug)]
+pub struct SpillFrameParser {
+    codec: SpillCodec,
+    /// zstd: the length prefix of an incomplete `[len][frame]` record (the
+    /// first `prefix_len` bytes).
+    prefix: [u8; ZSTD_LEN_PREFIX],
+    /// zstd: bytes of `prefix` held.
+    prefix_len: usize,
+    /// zstd: the incomplete frame body, allocated at its full length once the
+    /// prefix is complete (it moves out as the emitted frame).
+    body: Vec<u8>,
+    /// zstd: the incomplete frame's body length (valid once `prefix_len` is 4).
+    body_len: usize,
+    /// BGZF: the framer (which keeps its own carry).
+    bgzf: BgzfSliceFramer,
+    /// BGZF: reused framer output.
+    frames: Vec<SliceFrame>,
+}
+
+impl SpillFrameParser {
+    /// A parser at the start of a spill body (after any file magic).
+    #[must_use]
+    pub fn new(codec: SpillCodec) -> Self {
+        Self {
+            codec,
+            prefix: [0; ZSTD_LEN_PREFIX],
+            prefix_len: 0,
+            body: Vec::new(),
+            body_len: 0,
+            bgzf: BgzfSliceFramer::new(),
+            frames: Vec::new(),
+        }
+    }
+
+    /// Bytes of an incomplete frame held from earlier slices.
+    #[must_use]
+    pub fn carry_len(&self) -> usize {
+        match self.codec {
+            SpillCodec::Bgzf => self.bgzf.carry_len(),
+            SpillCodec::Zstd => self.prefix_len + self.body.len(),
+        }
+    }
+
+    /// Heap bytes the carried partial frame holds (its allocation, which is
+    /// the frame's full size once that is known).
+    #[must_use]
+    pub fn carry_capacity(&self) -> usize {
+        match self.codec {
+            SpillCodec::Bgzf => self.bgzf.carry_capacity(),
+            SpillCodec::Zstd => self.body.capacity(),
+        }
+    }
+
+    /// Push every complete frame of `carry ++ slice` onto `out`; returns the
+    /// number pushed.
+    ///
+    /// # Errors
+    /// `InvalidData` for a malformed BGZF header or an oversized zstd length.
+    pub fn push(&mut self, slice: &SliceLease, out: &mut Vec<RawFrame>) -> io::Result<usize> {
+        match self.codec {
+            SpillCodec::Bgzf => self.push_bgzf(slice, out),
+            SpillCodec::Zstd => self.push_zstd(slice, out),
+        }
+    }
+
+    /// End of the spill body.
+    ///
+    /// # Errors
+    /// `UnexpectedEof` when a partial frame is still carried.
+    pub fn finish(&mut self) -> io::Result<()> {
+        match self.codec {
+            SpillCodec::Bgzf => self.bgzf.finish(),
+            SpillCodec::Zstd if self.carry_len() == 0 => Ok(()),
+            SpillCodec::Zstd => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated zstd spill frame: {} trailing bytes", self.carry_len()),
+            )),
+        }
+    }
+
+    fn push_bgzf(&mut self, slice: &SliceLease, out: &mut Vec<RawFrame>) -> io::Result<usize> {
+        self.frames.clear();
+        let n = self.bgzf.push(slice, &mut self.frames)?;
+        out.extend(self.frames.drain(..).map(|f| match f {
+            SliceFrame::Within(r) => RawFrame::borrowed(slice, r),
+            SliceFrame::Carried(v) => RawFrame::Owned(v),
+        }));
+        Ok(n)
+    }
+
+    fn push_zstd(&mut self, slice: &SliceLease, out: &mut Vec<RawFrame>) -> io::Result<usize> {
+        let before = out.len();
+        let mut pos = 0usize;
+        if self.prefix_len > 0 {
+            if self.prefix_len < ZSTD_LEN_PREFIX {
+                let take = (ZSTD_LEN_PREFIX - self.prefix_len).min(slice.len());
+                self.prefix[self.prefix_len..self.prefix_len + take]
+                    .copy_from_slice(&slice[..take]);
+                self.prefix_len += take;
+                pos = take;
+                if self.prefix_len < ZSTD_LEN_PREFIX {
+                    return Ok(0);
+                }
+                self.start_body(checked_zstd_len(&self.prefix)?);
+            }
+            let need = self.body_len - self.body.len();
+            if slice.len() - pos < need {
+                self.body.extend_from_slice(&slice[pos..]);
+                return Ok(0);
+            }
+            self.body.extend_from_slice(&slice[pos..pos + need]);
+            pos += need;
+            self.prefix_len = 0;
+            out.push(RawFrame::Owned(std::mem::take(&mut self.body)));
+        }
+        while slice.len() - pos >= ZSTD_LEN_PREFIX {
+            let len = checked_zstd_len(&slice[pos..pos + ZSTD_LEN_PREFIX])?;
+            let body = pos + ZSTD_LEN_PREFIX;
+            if slice.len() - body < len {
+                break;
+            }
+            out.push(RawFrame::borrowed(slice, body..body + len));
+            pos = body + len;
+        }
+        let tail = &slice[pos..];
+        if tail.len() < ZSTD_LEN_PREFIX {
+            self.prefix[..tail.len()].copy_from_slice(tail);
+            self.prefix_len = tail.len();
+        } else {
+            self.prefix.copy_from_slice(&tail[..ZSTD_LEN_PREFIX]);
+            self.prefix_len = ZSTD_LEN_PREFIX;
+            self.start_body(checked_zstd_len(&self.prefix)?);
+            self.body.extend_from_slice(&tail[ZSTD_LEN_PREFIX..]);
+        }
+        Ok(out.len() - before)
+    }
+
+    /// Begin carrying a frame body of `len` bytes, allocated once at that
+    /// size (it moves out as the emitted frame, so it cannot be reused).
+    fn start_body(&mut self, len: usize) {
+        self.body_len = len;
+        self.body = Vec::with_capacity(len);
+    }
+}
+
+/// A zstd frame's length from its `u32 LE` prefix, rejected over
+/// [`MAX_ZSTD_FRAME_BYTES`] (the one copy of that check and its message,
+/// shared with the sequential reader's `read_length_prefix`).
+pub(crate) fn checked_zstd_len(prefix: &[u8]) -> io::Result<usize> {
+    let len = u32::from_le_bytes(prefix.try_into().expect("a 4-byte prefix")) as usize;
+    if len > MAX_ZSTD_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "zstd spill frame length {len} exceeds MAX_ZSTD_FRAME_BYTES ({MAX_ZSTD_FRAME_BYTES}): file likely corrupted",
+            ),
+        ));
+    }
+    Ok(len)
+}
 
 /// Output staging-buffer capacity for a single decompressed block/frame. Mirrors
 /// the worker pool's `ZSTD_FRAME_DECOMP_CAP` / `BgzfDecompress` scratch sizing so
@@ -210,17 +408,9 @@ impl SpillBlockDecompressor {
     }
 
     /// Read up to `max` *raw* (still-compressed) blocks from `reader` using
-    /// `codec`, returning the compressed payloads **without** decompressing them.
-    ///
-    /// This is the read half of the block-parallel `SortSpillDecompress` path:
-    /// the caller acquires the per-slot reader lock, calls `read_raw` to pull a
-    /// batch of compressed blocks (which it sequence-tags), releases the lock,
-    /// and then decompresses each block via [`Self::decompress_one`] *outside*
-    /// the lock so multiple workers decompress one file's blocks concurrently.
-    /// The read and the decompression of a given block still happen within a
-    /// single `try_run` of a single worker — only the lock is released between
-    /// them — which preserves the read-and-decompress-together invariant that
-    /// the FIFO inline path also upholds.
+    /// `codec`, returning the compressed payloads **without** decompressing them
+    /// (test oracle: the sequential reader the slice parser,
+    /// [`SpillFrameParser`], is checked against).
     ///
     /// For BGZF each returned `Vec<u8>` is one complete raw block (header +
     /// compressed data + footer), exactly what [`Self::decompress_one`] expects;
@@ -232,6 +422,7 @@ impl SpillBlockDecompressor {
     ///
     /// Propagates I/O errors and truncation (a partial BGZF block, or a partial
     /// zstd length prefix / frame body at EOF).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn read_raw<R: Read + ?Sized>(
         &mut self,
         reader: &mut R,
@@ -274,7 +465,7 @@ impl SpillBlockDecompressor {
         }
     }
 
-    /// Decompress a single raw block/frame previously read by [`Self::read_raw`].
+    /// Decompress a single raw block/frame (one parsed from a spill slice).
     ///
     /// `raw` is one BGZF raw block (header + compressed data + footer) or one
     /// zstd frame body, per `codec`. Returns the decompressed bytes. Uses the
@@ -601,5 +792,174 @@ mod tests {
     #[test]
     fn read_raw_matches_read_blocks_zstd() {
         read_raw_matches_read_blocks(SpillCodec::Zstd);
+    }
+
+    // ---- SpillFrameParser ----
+
+    /// A spill file of `n` blocks of pseudo-random (poorly compressible)
+    /// records-sized payloads in `codec`: magic, blocks, trailer.
+    fn spill_stream(codec: SpillCodec, n: usize) -> Vec<u8> {
+        let mut c = crate::spill_block::SpillBlockCompressor::new(codec, 1).unwrap();
+        let mut out = crate::spill_block::spill_magic(codec).to_vec();
+        let mut state = 0x2545_f491_4f6c_dd1du64 ^ n as u64;
+        for i in 0..n {
+            let len = 1_000 + (i * 7_919) % 90_000;
+            let raw: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[2] & 0x3f
+                })
+                .collect();
+            out.extend_from_slice(&c.compress_block(&raw).unwrap());
+        }
+        out.extend_from_slice(crate::spill_block::spill_trailer(codec));
+        out
+    }
+
+    fn body_start(codec: SpillCodec) -> usize {
+        crate::spill_block::spill_magic(codec).len()
+    }
+
+    proptest::proptest! {
+        /// Both codecs: frames from random slice cuts (including
+        /// tiny ones that end inside a length prefix or a header) equal
+        /// `read_raw` over the whole stream; whole-in-slice frames are borrowed
+        /// within bounds; the carry never exceeds one frame; every slice returns
+        /// to its pool.
+        #[test]
+        fn parser_matches_read_raw_over_random_cuts(
+            zstd in proptest::bool::ANY,
+            n in 1usize..40,
+            cuts in proptest::collection::vec(1usize..300_000, 1..50),
+            tiny in proptest::bool::ANY,
+        ) {
+            use fgumi_bam_io::pread::SliceBufferPool;
+            let codec = if zstd { SpillCodec::Zstd } else { SpillCodec::Bgzf };
+            let stream = spill_stream(codec, n);
+            // `read_raw` pre-allocates `max`, so bound it by the stream length.
+            let oracle = SpillBlockDecompressor::new()
+                .read_raw(&mut &stream[body_start(codec)..], codec, stream.len())
+                .unwrap();
+            let pool = SliceBufferPool::new(64);
+            let mut p = SpillFrameParser::new(codec);
+            let mut got = Vec::new();
+            let mut pos = body_start(codec);
+            let mut i = 0;
+            while pos < stream.len() {
+                let cut = if tiny { 1 + cuts[i % cuts.len()] % 23 } else { cuts[i % cuts.len()] };
+                let len = cut.min(stream.len() - pos);
+                i += 1;
+                let lease = pool.lease(stream[pos..pos + len].to_vec());
+                let mut out = Vec::new();
+                p.push(&lease, &mut out).unwrap();
+                // Only the frame completing the carry may be owned: every frame
+                // wholly inside the slice is borrowed.
+                let owned = out.iter().filter(|f| matches!(f, RawFrame::Owned(_))).count();
+                proptest::prop_assert!(owned <= 1, "{owned} owned frames from one slice");
+                for f in out {
+                    if let RawFrame::Borrowed { range, .. } = &f {
+                        proptest::prop_assert!((range.end as usize) <= lease.len());
+                    }
+                    got.push(f.bytes().to_vec());
+                }
+                proptest::prop_assert!(p.carry_len() <= MAX_ZSTD_FRAME_BYTES + 18);
+                pos += len;
+            }
+            p.finish().unwrap();
+            proptest::prop_assert_eq!(got, oracle);
+            drop(p);
+            proptest::prop_assert_eq!(pool.resident_bytes(), 0);
+        }
+    }
+
+    /// A `[u32 len]` over the cap is `InvalidData` with the existing message.
+    #[test]
+    fn zstd_frame_length_over_cap_is_invalid_data() {
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+        let mut bytes = u32::try_from(MAX_ZSTD_FRAME_BYTES + 1).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        let mut p = SpillFrameParser::new(SpillCodec::Zstd);
+        let err = p.push(&pool.lease(bytes), &mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds MAX_ZSTD_FRAME_BYTES"), "{err}");
+    }
+
+    /// The same rejection when the length prefix is split across slices.
+    #[test]
+    fn zstd_frame_length_over_cap_split_across_slices_is_invalid_data() {
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(2);
+        let len = u32::try_from(MAX_ZSTD_FRAME_BYTES + 1).unwrap().to_le_bytes();
+        let mut p = SpillFrameParser::new(SpillCodec::Zstd);
+        assert_eq!(p.push(&pool.lease(len[..2].to_vec()), &mut Vec::new()).unwrap(), 0);
+        let err = p.push(&pool.lease(len[2..].to_vec()), &mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A slice holding only the BGZF EOF marker yields no frame and leaves no
+    /// carry.
+    #[test]
+    fn eof_marker_only_slice_yields_no_frame() {
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+        let mut p = SpillFrameParser::new(SpillCodec::Bgzf);
+        let mut out = Vec::new();
+        assert_eq!(p.push(&pool.lease(fgumi_bgzf::BGZF_EOF.to_vec()), &mut out).unwrap(), 0);
+        assert_eq!(p.carry_len(), 0);
+        p.finish().unwrap();
+    }
+
+    /// A frame carried across slices is allocated once at its full size —
+    /// whether the cut falls inside the zstd length prefix / BGZF header or
+    /// after it — and the carry reports that allocation while partial, so a
+    /// stash charging the carry charges exactly what the emitted frame holds.
+    #[rstest::rstest]
+    #[case::bgzf_after_header(SpillCodec::Bgzf, &[0.6])]
+    #[case::bgzf_inside_header(SpillCodec::Bgzf, &[0.001, 0.6])]
+    #[case::zstd_after_prefix(SpillCodec::Zstd, &[0.6])]
+    #[case::zstd_inside_prefix(SpillCodec::Zstd, &[0.0, 0.6])]
+    fn a_carried_frame_is_allocated_once_at_its_size(
+        #[case] codec: SpillCodec,
+        #[case] cuts: &[f64],
+    ) {
+        let stream = spill_stream(codec, 1);
+        let body = &stream[body_start(codec)..];
+        let frame = &SpillBlockDecompressor::new().read_raw(&mut &body[..], codec, 4).unwrap()[0];
+        let record = if codec == SpillCodec::Zstd { frame.len() + 4 } else { frame.len() };
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(4);
+        let mut p = SpillFrameParser::new(codec);
+        let mut out = Vec::new();
+        let mut from = 0;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "test cut points"
+        )]
+        for to in cuts.iter().map(|c| ((record as f64 * c) as usize).max(2)) {
+            p.push(&pool.lease(body[from..to].to_vec()), &mut out).unwrap();
+            assert!(out.is_empty());
+            if to >= 18 {
+                assert_eq!(p.carry_capacity(), frame.len(), "the carry holds the frame's size");
+            }
+            from = to;
+        }
+        p.push(&pool.lease(body[from..record].to_vec()), &mut out).unwrap();
+        let [RawFrame::Owned(v)] = &out[..] else { panic!("one carried frame: {out:?}") };
+        assert_eq!((v.len(), v.capacity()), (frame.len(), frame.len()));
+        assert_eq!(p.carry_capacity(), 0);
+    }
+
+    /// A stream that ends mid-frame fails `finish` with `UnexpectedEof`.
+    #[rstest::rstest]
+    #[case::bgzf(SpillCodec::Bgzf)]
+    #[case::zstd(SpillCodec::Zstd)]
+    fn truncated_stream_fails_finish(#[case] codec: SpillCodec) {
+        let stream = spill_stream(codec, 3);
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+        let mut p = SpillFrameParser::new(codec);
+        p.push(&pool.lease(stream[body_start(codec)..stream.len() - 40].to_vec()), &mut Vec::new())
+            .unwrap();
+        assert_eq!(p.finish().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }

@@ -32,7 +32,8 @@ use fgumi_lib::sam::SamTag;
 
 use crate::helpers::assertions::{assert_bam_sorted, string_tag};
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_umi_family, create_umi_family_at_pos, write_bam,
+    create_minimal_header, create_umi_family, create_umi_family_at_pos, shuffled_umi_families,
+    write_bam,
 };
 
 /// The stable substring pinning the `SortMerge` k-way-merge diagnostic line
@@ -206,34 +207,13 @@ fn log_body(line: &str) -> &str {
     line.split_once("] ").map_or(line, |(_, body)| body)
 }
 
-/// `SplitMix64`: a fixed, dependency-free mixer for seeded fixture shuffles.
-/// Deliberately not a `rand` generator: `StdRng`'s stream may change between
-/// `rand` releases, and the tests that need several merge sources or a
-/// parks/`gated_off` split must keep reading the same, reviewed input.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
 /// Writes a BAM of `families` three-read UMI families at seeded pseudo-random
 /// positions, in generation order, so the file is NOT coordinate-sorted. Every
 /// tenth family reuses the previous family's position, so equal coordinate keys
 /// exist across families. Names are hashed so name order is not index order either.
 fn write_shuffled_bam_fixture(path: &Path, families: usize, seed: u64) {
     let header = create_minimal_header("chr1", 100_000);
-    let mut pos = 1usize;
-    let records: Vec<_> = (0..families)
-        .flat_map(|i| {
-            let h = splitmix64(seed ^ (i as u64));
-            if i % 10 != 9 {
-                pos = 1 + usize::try_from(h % 90_000).expect("fits");
-            }
-            create_umi_family_at_pos("ACGT", 3, &format!("fam_{h:016x}"), "ACGTACGTAC", 35, pos)
-        })
-        .collect();
-    write_bam(path, &header, &records);
+    write_bam(path, &header, &shuffled_umi_families(families, seed));
 }
 
 /// Runs `fgumi sort --order <order>` on the shuffled fixture at info verbosity
@@ -422,9 +402,121 @@ fn sort_stats_gates_merge_demand_lines(
     let stderr = sort_spilling_with(order, extra);
     let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
     assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
-    for needle in ["Merge demand:", "Awaited slot at stall:", "Pool at stall:", "Merge output:"] {
+    for needle in [
+        "Merge demand:",
+        "Awaited slot at stall:",
+        "Pool at stall:",
+        "Merge prediction:",
+        "Consumer served itself:",
+        "Merge output:",
+    ] {
         assert_eq!(stderr.contains(needle), with_flag, "{order}: `{needle}` presence:\n{stderr}");
     }
+}
+
+/// `Byte fetch (input):` is gated on `--sort-stats` on the native input path
+/// (the fixture is a regular BGZF file at the default `--read-streams auto`),
+/// and its request histogram is populated, not merely rendered.
+#[rstest]
+fn sort_stats_gates_the_input_byte_fetch_line(#[values(false, true)] with_flag: bool) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with("coordinate", extra);
+    let line =
+        stderr.lines().map(log_body).find_map(|l| l.trim().strip_prefix("Byte fetch (input): "));
+    assert_eq!(line.is_some(), with_flag, "`Byte fetch (input):` presence:\n{stderr}");
+    if let Some(rest) = line {
+        let slices: u64 = rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap();
+        assert!(slices > 0, "the input histogram recorded no reads: {rest}");
+    }
+}
+
+/// The merge supply's lines — the read-ahead budget, the spill byte fetch,
+/// the measured spill block size, the disk reads, and the stash and claims —
+/// are gated on `--sort-stats`, on a sort that merges at least two sources, in
+/// every order.
+#[rstest]
+fn sort_stats_gates_spill_supply_lines(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
+    for prefix in [
+        "Spill supply: read-ahead budget R=",
+        "Byte fetch: ",
+        "Spill blocks: ",
+        "Spill disk read: ",
+        "Spill supply: frames ",
+    ] {
+        let present = bodies.iter().any(|b| b.starts_with(prefix));
+        assert_eq!(present, with_flag, "{order}: `{prefix}` presence:\n{stderr}");
+    }
+}
+
+/// On a multi-source merge, `--sort-stats` reports how often the merge served
+/// itself from a stalled slot's stash. Whether a stall finds stashed blocks is
+/// scheduling (the unit test `stalled_merge_self_serves_from_the_stash` forces
+/// it), but the line must agree with itself and with the supply line whatever
+/// the schedule: a park avoided served at least one block, and every block the
+/// merge decompressed is a claim booked to the consumer.
+#[rstest]
+fn sort_stats_reports_self_serve(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+) {
+    let stderr = sort_spilling_with(order, &["--sort-stats"]);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let body = |prefix: &str| -> &str {
+        stderr
+            .lines()
+            .map(log_body)
+            .find_map(|b| b.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("{order}: no `{prefix}` line:\n{stderr}"))
+    };
+    // "{E} parks avoided by decompressing already-read blocks inline ({B} blocks ..."
+    let line = body("Consumer served itself: ");
+    let episodes: u64 = line.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap();
+    let blocks: u64 =
+        line.split_once('(').and_then(|(_, r)| r.split_whitespace().next()?.parse().ok()).unwrap();
+    assert!(blocks >= episodes, "{order}: {line}");
+    // "... claims {W} by workers + {C} by the consumer; ..."
+    let supply = body("Spill supply: frames ");
+    let consumer: u64 = supply
+        .split_once(" by workers + ")
+        .and_then(|(_, r)| r.split_whitespace().next()?.parse().ok())
+        .unwrap();
+    assert_eq!(consumer, blocks, "{order}: every merge-decompressed block is a consumer claim");
+}
+
+/// Parse `(predictions, hit_pct)` from the `Merge prediction:` line.
+fn merge_predictions(stderr: &str) -> Option<(u64, f64)> {
+    let body = stderr.lines().map(log_body).find(|l| l.starts_with("Merge prediction: "))?;
+    let rest = body.strip_prefix("Merge prediction: ")?;
+    let n: u64 = rest.split(' ').next()?.parse().ok()?;
+    let hit: f64 = rest.split("hit ").nth(1)?.split('%').next()?.parse().ok()?;
+    Some((n, hit))
+}
+
+/// On a sort that merges at least two sources, every source switch after the
+/// first scores the prediction the previous switch published, so a merge
+/// that switches at all reports predictions. The runner-up is the next
+/// winner exactly (a memory source predicted as "no file"), so every one
+/// hits. (The exact count is pinned by the unit test
+/// `predictions_skip_memory_sources_and_track_switches`.)
+#[rstest]
+fn sort_stats_reports_predictions_on_a_multi_source_merge(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+) {
+    let stderr = sort_spilling_with(order, &["--sort-stats"]);
+    let sources = merge_sources(&stderr).expect("Merge sources line");
+    assert!(sources >= 2, "{order}: at least 2 sources (got {sources}):\n{stderr}");
+    let (n, hit) =
+        merge_predictions(&stderr).unwrap_or_else(|| panic!("no prediction line:\n{stderr}"));
+    assert!(n > 0, "{order}: a multi-source merge switches sources ({n})");
+    assert!((hit - 100.0).abs() < f64::EPSILON, "{order}: every prediction hits ({hit}%)");
 }
 
 /// On a sort that fits entirely in memory (the single-chunk fast path, no
@@ -597,8 +689,6 @@ fn fused_sort_then_group_chain_exercises_intermediate_add_sort_branch() {
         temp_compression: 1,
         temp_codec: fgumi_sort::SpillCodec::default(),
         max_temp_files: MaxTempFiles::Auto,
-        block_batch: 4,
-        file_granularity: false,
         // The point of this test: exercise `with_sort_stats(true)` on the
         // intermediate branch too, not just the flag being threaded through
         // without effect.

@@ -31,22 +31,29 @@ fn mismatched_memory_lane_fails_closed() {
 /// regression. With no slots, the empty-input case is still accepted.
 #[test]
 fn empty_template_lane_with_spill_slots_fails_closed() {
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        std::io::BufReader::new(tempfile::tempfile().unwrap()),
-        fgumi_sort::SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
     // `Box<dyn MergeDriverDyn>` isn't `Debug`, so match rather than `expect_err`.
-    match build_driver(SortOrder::TemplateCoordinate, vec![slot], MemoryChunksByKind::default(), 1)
-    {
+    match build_driver(
+        SortOrder::TemplateCoordinate,
+        vec![slot],
+        MemoryChunksByKind::default(),
+        1,
+        None,
+    ) {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         Ok(_) => panic!("empty template lane with spill slots must fail closed"),
     }
 
     // No slots → empty input; any key width is safe (nothing to merge).
     assert!(
-        build_driver(SortOrder::TemplateCoordinate, Vec::new(), MemoryChunksByKind::default(), 0)
-            .is_ok(),
+        build_driver(
+            SortOrder::TemplateCoordinate,
+            Vec::new(),
+            MemoryChunksByKind::default(),
+            0,
+            None
+        )
+        .is_ok(),
         "empty template lane with no slots is valid",
     );
 }
@@ -108,11 +115,7 @@ fn a_dispatch_that_absorbed_setup_input_is_progress() {
     use fgumi_pipeline_core::testing::StepProbe;
     let mut step = SortMerge::<RecordBatchOutput>::new(SortOrder::Coordinate, 1 << 20);
     let probe = StepProbe::new(&step);
-    let slot = Arc::new(SortMergeSlot::new(
-        0,
-        std::io::BufReader::new(tempfile::tempfile().unwrap()),
-        fgumi_sort::SpillCodec::Bgzf,
-    ));
+    let slot = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
     probe.push_input(SortPhase2Event::SpillReady {
         slot,
         path: std::path::PathBuf::from("spill-0"),
@@ -167,12 +170,8 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
     let probe = StepProbe::new(&step);
     let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
         .map(|file_id| {
-            let slot = Arc::new(SortMergeSlot::new(
-                file_id,
-                std::io::BufReader::new(tempfile::tempfile().unwrap()),
-                fgumi_sort::SpillCodec::Bgzf,
-            ));
-            slot.decompressed.lock().unwrap().push_back(one_record_block(file_id as usize));
+            let slot = Arc::new(SortMergeSlot::for_test(file_id, fgumi_sort::SpillCodec::Bgzf));
+            slot.push_decompressed_for_test(one_record_block(file_id as usize));
             slot
         })
         .collect();
@@ -200,7 +199,7 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
             break;
         }
         assert!(next < 1000, "the output edge never filled");
-        slots[next % 2].decompressed.lock().unwrap().push_back(one_record_block(next));
+        slots[next % 2].push_decompressed_for_test(one_record_block(next));
         next += 1;
     }
     assert!(
@@ -211,4 +210,90 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
     // The edge is still full: this dispatch parks on the held batch.
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Contention);
     assert_eq!(demand.snapshot().parking_registrations, 0, "it parks on output, not a slot");
+}
+
+/// A stall books the awaited slot's state: a slot with a read in progress is
+/// `issued`, and one with nothing read, stashed or in flight is `starved`. A
+/// slot whose read blocks wait in the stash is not a stall: the merge serves
+/// itself (`a_stashed_slot_is_served_not_parked_on`).
+#[rstest::rstest]
+#[case::starved(0, (1, 0, 0))]
+#[case::issued(4096, (0, 1, 0))]
+fn a_stall_books_the_awaited_slots_state(#[case] issued: u64, #[case] want: (u64, u64, u64)) {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let mut step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        1024,
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    let probe = StepProbe::new(&step);
+    // Slot 0 holds a record; slot 1 has nothing decompressed, so priming
+    // stalls on it.
+    let ready = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
+    ready.push_decompressed_for_test(one_record_block(0));
+    let awaited = Arc::new(SortMergeSlot::for_test(1, fgumi_sort::SpillCodec::Bgzf));
+    awaited.bp_note_issued(issued);
+    for slot in [&ready, &awaited] {
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::from("spill"),
+            records_ingested_so_far: 2,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    let _ = probe.try_run(&mut step).unwrap();
+    let s = demand.snapshot();
+    assert_eq!(s.stall_episodes, 1, "{s:?}");
+    assert_eq!((s.awaited_starved, s.awaited_issued, s.awaited_decompressing), want);
+}
+
+/// A stall on a slot whose read blocks wait in the stash is served by the
+/// merge itself, not booked as a stall at all: the only stall episode is
+/// the later one on an emptied slot (`starved`), and the self-served
+/// registration is not a parking one.
+#[test]
+fn a_stashed_slot_is_served_not_parked_on() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let mut step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        1024,
+    )
+    .with_merge_demand(Arc::clone(&demand));
+    let probe = StepProbe::new(&step);
+    let ready = Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
+    ready.push_decompressed_for_test(one_record_block(0));
+    let stashed = Arc::new(SortMergeSlot::for_test(1, fgumi_sort::SpillCodec::Bgzf));
+    let frame = fgumi_sort::SpillBlockCompressor::new(fgumi_sort::SpillCodec::Bgzf, 1)
+        .unwrap()
+        .compress_block(&one_record_block(1))
+        .unwrap();
+    stashed.bp_stash_frames_for_test(vec![frame], false);
+    for slot in [&ready, &stashed] {
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::from("spill"),
+            records_ingested_so_far: 2,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 2,
+    });
+    let _ = probe.try_run(&mut step).unwrap();
+    let s = demand.snapshot();
+    assert_eq!((s.self_served_episodes, s.self_served_blocks), (1, 1), "{s:?}");
+    assert_eq!(s.stall_episodes, s.awaited_starved, "a served stash is not a stall: {s:?}");
+    assert!(
+        s.parking_registrations < s.registrations,
+        "the self-served registration is not a parking one: {s:?}"
+    );
 }

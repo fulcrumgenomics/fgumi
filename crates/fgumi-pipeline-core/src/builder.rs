@@ -1122,6 +1122,29 @@ impl Pipeline {
             .collect()
     }
 
+    /// Each `Parallel` step's name and clone count at `n_threads`, from the
+    /// placement plan the runtime itself builds (the same
+    /// `plan_parallel_hosts`
+    /// result every consumer reads), in chain order. For callers that size
+    /// work by a step's clone count before the pipeline runs, to check their
+    /// prediction against the real plan.
+    #[must_use]
+    pub fn planned_clone_counts(&self, n_threads: usize) -> Vec<(&'static str, usize)> {
+        let detached = super::runtime::detached::driver_index_of(&self.steps);
+        let hosts = super::runtime::placement::plan_parallel_hosts(
+            &self.steps,
+            &self.graph,
+            &detached,
+            n_threads,
+        );
+        self.steps
+            .iter()
+            .zip(&hosts)
+            .filter(|(s, _)| s.kind() == super::step::StepKind::Parallel)
+            .map(|(s, h)| (s.profile().name, h.clone_count()))
+            .collect()
+    }
+
     /// Render the chain shape as a multi-line debug string. Lists each step
     /// in chain order with its profile (kind, sticky, branch count) and
     /// the consumer for each output branch. Used for diagnostics and for

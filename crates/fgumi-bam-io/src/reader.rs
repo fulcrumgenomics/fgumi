@@ -236,22 +236,23 @@ pub type BamReaderAuto = noodles::bam::io::Reader<BgzfReaderEnum>;
 /// Type alias for a raw BAM reader that supports both single and multi-threaded BGZF.
 pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 
-/// Read-stream policy for a seekable BAM/SAM source: how many concurrent
+/// Read-stream policy for a seekable BGZF source: how many concurrent
 /// positional reads to issue per fill window.
 ///
 /// Ports the semantics of fgumi v0.7.0's `fgumi sort --read-streams` flag. The
-/// mechanism (concurrent positional reads that raise the device's read queue
-/// depth) lives in [`crate::scatter_reader`]; on a slow, deep-queue device
-/// (e.g. EBS gp3) issuing several reads at once is markedly faster than the
-/// single outstanding read a plain reader issues.
+/// primitives (concurrent positional reads that raise the device's read queue
+/// depth) live in [`crate::pread`]; on a slow, deep-queue device (e.g. EBS
+/// gp3) several reads at once are markedly faster than the single outstanding
+/// read a plain reader issues. The resolved policy is
+/// [`crate::pread::ReadStreamsPolicy`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadStreams {
-    /// Measure the device's single-stream throughput once, then pick a stream
-    /// count from it. The default.
+    /// Start at one stream and double (up to eight) while the device starves
+    /// the input framer; never decrease. The default.
     #[default]
     Auto,
     /// Exactly this many concurrent streams; `1` is the plain sequential /
-    /// async-prefetch reader (no scatter).
+    /// async-prefetch reader.
     Fixed(usize),
 }
 
@@ -300,23 +301,11 @@ pub struct PipelineReaderOpts {
     /// and threaded through the chain builder in `fgumi_lib`). Defaults to `true`
     /// (verify) — the safe, pre-existing behavior.
     pub verify_crc: bool,
-    /// Concurrent positional-read policy for seekable regular-file inputs.
-    ///
-    /// `Fixed(1)` (the default) is the plain sequential / async-prefetch reader
-    /// that every command except `fgumi sort` uses — only `sort` sets this from
-    /// its own `--read-streams` flag. A higher count (or `Auto`) selects the
-    /// [`crate::scatter_reader::ScatterReader`] for seekable files; non-seekable
-    /// inputs (stdin, pipes) fall back to the sequential/async reader regardless.
-    pub read_streams: ReadStreams,
 }
 
 impl Default for PipelineReaderOpts {
     fn default() -> Self {
-        // NOTE: `Fixed(1)`, NOT `ReadStreams::default()` (which is `Auto`). Every
-        // non-sort command relies on `..Default::default()` keeping today's
-        // sequential/async behavior; defaulting to `Auto` here would silently
-        // turn on scatter-read probing for the whole codebase.
-        Self { async_reader: false, verify_crc: true, read_streams: ReadStreams::Fixed(1) }
+        Self { async_reader: false, verify_crc: true }
     }
 }
 
@@ -467,37 +456,29 @@ fn open_normalized_with_opts(
         // failure is logged and ignored. On non-Linux targets this is a no-op.
         crate::os_hints::advise_sequential(&file);
 
-        build_file_reader(file, path, &opts, label)?
+        build_file_reader(file, path, opts.async_reader, label)
     };
 
     crate::sam_input::normalize_to_bgzf(opened, path)
 }
 
-/// Choose the reader for an open regular file: the concurrent
-/// [`crate::scatter_reader::ScatterReader`] when `--read-streams` asks for more
-/// than one stream and the file is seekable (Unix only), otherwise the plain
-/// sequential / async-prefetch reader. The scatter-vs-fallback decision (and its
-/// "requested but unavailable" warning) is shared with `read_bam`'s entry point
-/// via [`crate::scatter_reader::decide_reader`] so the two cannot drift.
+/// Choose the reader for an open regular file: the plain sequential or
+/// async-prefetch reader. Concurrent positional reads are chain-native (the
+/// sort's `PlanInputReads → PreadSlices → FrameBgzfBlocks`, which decides for
+/// itself whether an input qualifies), so this opener never reads
+/// positionally.
 fn build_file_reader(
     file: File,
     path: &Path,
-    opts: &PipelineReaderOpts,
+    async_reader: bool,
     label: &str,
-) -> Result<Box<dyn Read + Send>> {
-    let file = match crate::scatter_reader::decide_reader(file, opts.read_streams, path, label)
-        .with_context(|| format!("open scatter reader for {}", path.display()))?
-    {
-        crate::scatter_reader::ScatterDecision::Scatter(scatter) => return Ok(scatter),
-        crate::scatter_reader::ScatterDecision::Fallback(file) => file,
-    };
-
-    Ok(if opts.async_reader {
+) -> Box<dyn Read + Send> {
+    if async_reader {
         log::info!("async {label} enabled: spawning fgumi-prefetch thread for {}", path.display());
         Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
     } else {
         Box::new(file)
-    })
+    }
 }
 
 /// Open `path` as a BGZF byte stream, transcoding it if it is uncompressed SAM.
@@ -919,16 +900,6 @@ mod tests {
     #[test]
     fn read_streams_default_is_auto() {
         assert_eq!(ReadStreams::default(), ReadStreams::Auto);
-    }
-
-    #[test]
-    fn pipeline_reader_opts_default_read_streams_is_fixed_one() {
-        // Load-bearing: the `PipelineReaderOpts` Default deliberately overrides
-        // the `ReadStreams` enum default (`Auto`) with `Fixed(1)`, because every
-        // non-sort command builds its opts via `..Default::default()`. A refactor
-        // that let this fall back to `Auto` would silently enable scatter-read
-        // probing across the whole codebase, so pin it.
-        assert_eq!(PipelineReaderOpts::default().read_streams, ReadStreams::Fixed(1));
     }
 
     fn create_test_header() -> Header {

@@ -750,8 +750,18 @@ mod tests {
         // first, so ordinal 0 is emitted before ordinal 1 for the `ByItemOrdinal`
         // reorder stage. The bytes are arbitrary non-EOF markers.
         let blocks = vec![
-            BgzfBlock { batch_serial: 1, bytes: vec![0xAB; 16], uncompressed_size: 0, index: None },
-            BgzfBlock { batch_serial: 0, bytes: vec![0xCD; 16], uncompressed_size: 0, index: None },
+            BgzfBlock {
+                batch_serial: 1,
+                bytes: vec![0xAB; 16].into(),
+                uncompressed_size: 0,
+                index: None,
+            },
+            BgzfBlock {
+                batch_serial: 0,
+                bytes: vec![0xCD; 16].into(),
+                uncompressed_size: 0,
+                index: None,
+            },
         ];
         let source = BlockSource { blocks, held: HeldSlot::new() };
 
@@ -910,7 +920,7 @@ mod tests {
         let mut blocks: Vec<BgzfBlock> = (0..N_BLOCKS as u64)
             .map(|i| BgzfBlock {
                 batch_serial: i,
-                bytes: vec![0xABu8; BLOCK_LEN],
+                bytes: vec![0xABu8; BLOCK_LEN].into(),
                 uncompressed_size: 0,
                 index: None,
             })
@@ -1052,7 +1062,7 @@ mod tests {
         // Block A (ordinal 0): one physical block, one record fully inside it.
         let block_a = BgzfBlock {
             batch_serial: 0,
-            bytes: vec![0xAA; 50],
+            bytes: vec![0xAA; 50].into(),
             uncompressed_size: 30,
             index: Some(Box::new(BamIndexManifest {
                 phys_comp_len: vec![50],
@@ -1065,7 +1075,7 @@ mod tests {
         let straddle_uoffset = u32::try_from(B - 10).unwrap();
         let block_b = BgzfBlock {
             batch_serial: 1,
-            bytes: vec![0xBB; 90],
+            bytes: vec![0xBB; 90].into(),
             uncompressed_size: u32::try_from(B).unwrap() + 20,
             index: Some(Box::new(BamIndexManifest {
                 phys_comp_len: vec![45, 45],

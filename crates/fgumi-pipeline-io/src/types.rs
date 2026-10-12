@@ -5,6 +5,7 @@
 //! [`Ordered`] (so `BranchOrdering::ByItemOrdinal` reorder stages preserve
 //! global ordering across multi-step Parallel transforms).
 
+use fgumi_bam_io::pread::RawFrame;
 use fgumi_pipeline_core::{HeapSize, Ordered};
 use fgumi_raw_bam::RawRecord;
 
@@ -69,15 +70,36 @@ pub struct BamIndexManifest {
 /// and `uncompressed_size = 0`.
 #[derive(Debug)]
 pub struct BgzfBlock {
-    /// Read-order serial. Set by `ReadBgzfBlocks` based on block read index.
+    /// Read-order serial. Set by the source based on block read index.
     pub batch_serial: u64,
-    pub bytes: Vec<u8>,
+    /// The block's bytes: borrowed from the read slice it was framed from on
+    /// the sort's chain-native input path (zero copy), owned everywhere else.
+    pub bytes: RawFrame,
     /// Decompressed size, parsed from the BGZF block header.
     pub uncompressed_size: u32,
     /// Sidecar index metadata for this block's records, populated only on the
     /// inline-BAI-indexed compress path (`None` for every other producer,
     /// including sentinel/EOF blocks).
     pub index: Option<Box<BamIndexManifest>>,
+}
+
+/// The queue charge of a raw frame: an owned frame its allocation, a borrowed
+/// frame its own range — not the whole slice, which every frame cut from it
+/// shares and the slice pool's gauges account once.
+///
+/// So a queue of borrowed frames under-charges by the unread remainder of the
+/// slices they pin. On the input path the frames on an edge are cut in file
+/// order and span consecutive slices, so that remainder is bounded by the two
+/// partly covered slices at the ends of the queued run plus one slice per
+/// consumer clone holding a frame it popped: a few input slices (each at most
+/// one 4 MiB fill), independent of the queue's byte limit. The slice pool's
+/// `peak_held_bytes` is the measured figure.
+#[must_use]
+pub fn raw_frame_heap_size(frame: &RawFrame) -> usize {
+    match frame {
+        RawFrame::Owned(v) => v.capacity(),
+        RawFrame::Borrowed { range, .. } => (range.end - range.start) as usize,
+    }
 }
 
 impl HeapSize for BgzfBlock {
@@ -89,7 +111,8 @@ impl HeapSize for BgzfBlock {
                 + m.phys_comp_len.capacity() * std::mem::size_of::<u32>()
                 + m.records.capacity() * std::mem::size_of::<RecordIndexEntry>()
         });
-        self.bytes.capacity() + manifest
+        let bytes = raw_frame_heap_size(&self.bytes);
+        bytes + manifest
     }
 }
 
@@ -290,7 +313,7 @@ mod tests {
     fn bgzf_block_heap_size_matches_bytes_capacity() {
         let b = BgzfBlock {
             batch_serial: 0,
-            bytes: vec![0u8; 1024],
+            bytes: vec![0u8; 1024].into(),
             uncompressed_size: 4096,
             index: None,
         };
@@ -300,10 +323,14 @@ mod tests {
 
     #[test]
     fn bgzf_block_index_defaults_none_and_heap_counts_manifest() {
-        let plain =
-            BgzfBlock { batch_serial: 0, bytes: vec![0u8; 100], uncompressed_size: 0, index: None };
+        let plain = BgzfBlock {
+            batch_serial: 0,
+            bytes: vec![0u8; 100].into(),
+            uncompressed_size: 0,
+            index: None,
+        };
         assert!(plain.index.is_none());
-        assert_eq!(plain.heap_size(), plain.bytes.capacity());
+        assert_eq!(plain.heap_size(), 100, "an owned block charges its buffer's capacity");
 
         let manifest = Box::new(BamIndexManifest {
             phys_comp_len: vec![10, 20],
@@ -311,19 +338,31 @@ mod tests {
         });
         let indexed = BgzfBlock {
             batch_serial: 1,
-            bytes: vec![0u8; 30],
+            bytes: vec![0u8; 30].into(),
             uncompressed_size: 0,
             index: Some(manifest),
         };
         let m = indexed.index.as_ref().expect("manifest present");
         assert_eq!(
             indexed.heap_size(),
-            indexed.bytes.capacity()
-                + std::mem::size_of::<BamIndexManifest>()
+            30 + std::mem::size_of::<BamIndexManifest>()
                 + m.phys_comp_len.capacity() * std::mem::size_of::<u32>()
                 + m.records.capacity() * std::mem::size_of::<RecordIndexEntry>(),
             "heap_size must account for the manifest allocation exactly"
         );
+    }
+
+    #[test]
+    fn heap_size_counts_the_frame_not_the_slice() {
+        let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+        let lease = pool.lease(vec![0u8; 1 << 20]);
+        let b = BgzfBlock {
+            batch_serial: 0,
+            bytes: RawFrame::Borrowed { lease, range: 0..1000 },
+            uncompressed_size: 0,
+            index: None,
+        };
+        assert_eq!(b.heap_size(), 1000);
     }
 
     #[test]
@@ -343,7 +382,8 @@ mod tests {
         assert!(bytes.capacity() >= 8192 && bytes.len() == 100);
         let cap = bytes.capacity();
 
-        let block = BgzfBlock { batch_serial: 0, bytes, uncompressed_size: 0, index: None };
+        let block =
+            BgzfBlock { batch_serial: 0, bytes: bytes.into(), uncompressed_size: 0, index: None };
         assert_eq!(block.heap_size(), cap);
 
         let mut backing = Vec::with_capacity(4096);
