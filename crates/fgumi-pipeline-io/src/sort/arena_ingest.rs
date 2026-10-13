@@ -1,11 +1,13 @@
 //! `ReadBlocks` serial arena-admit step, `InflateToArena` parallel step, and
-//! `FindBoundariesAndSort` serial step.
+//! the per-order [`ArenaSortStrategy`]s the record-input `SortBuffer` uses.
 //!
 //! `ReadBlocks`: serial step that consumes raw `BgzfBlock`s, uses an [`ArenaPool`]
 //! (capacity 1) to acquire/reuse arenas, reserves a fixed front region
 //! `[0, FRONT_REGION)` per run for the straddler carry (Task 2), reserves an
 //! uninit slot per block via `grow_uninit` at offsets `>= FRONT_REGION`, and
-//! seals a run when its cumulative uncompressed bytes reach `run_cap = memory_limit`.
+//! seals a run when its cumulative uncompressed bytes reach the run's charged cap
+//! ([`run_cap_for`]: `--max-memory` less room for the
+//! run's sort refs).
 //! Sealed mid-stream runs emit [`ArenaBlock`]s with `seals_to_spill = true`;
 //! the final residual run emits with `seals_to_spill = false`.
 //! This is the second `unsafe` site in `fgumi-pipeline-io`; see CLAUDE.md
@@ -19,46 +21,42 @@
 //! unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)" for the
 //! full justification and SAFETY invariant.
 //!
-//! `FindBoundariesAndSort`: serial step that scans a run's contiguous arena span
-//! directly (no copy), skips the BAM header via [`crate::boundaries::bam_header_len`],
-//! builds `(body_offset, block_size)` refs, sorts via
-//! [`fgumi_sort::coordinate_chunk_from_arena_refs`], and emits
-//! `SortChunkEvent::Residual` + `AllAnnounced`.  Single-run / no-spill scope;
-//! multi-run seal and straddler handling are 3b.4.
-//!
-//! Together these three steps form the BAM sort ingest front for the block-input
-//! path.  The chain builder's `add_sort` (`src/lib/pipeline/chains/builder.rs`)
-//! wires them as `ReadBlocks → InflateToArena → FindBoundariesAndSort` (feeding
-//! the Phase-1 spill/merge tail) when the sort source is raw BGZF blocks.
+//! Together `ReadBlocks` and `InflateToArena` form the head of the BAM sort's
+//! block-input front. The chain builder's `add_sort`
+//! (`src/lib/pipeline/chains/builder.rs`) follows them with the order's split
+//! front in [`arena_split`](super::arena_split) (boundaries → key extraction →
+//! run sort), feeding the Phase-1 spill/merge tail, when the sort source is raw
+//! BGZF blocks.
 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use fgumi_bam_io::pread::RawFrame;
 use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
-use fgumi_raw_bam::MIN_BAM_RECORD_LEN;
-use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
-    ArenaPool, BoundedSortPool, InMemoryChunk, PooledSegmentedBuf, RawSortKey, RecordRef,
-    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_arena_refs,
+    ArenaPool, BoundedSortPool, PooledSegmentedBuf, QN_CLASS_BATCH_RECORDS, QnBatchLcp,
+    QnComparator, QnRef, QnRefBuilder, QnSortState, RecordRef, coordinate_chunk_from_refs,
+    extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
 };
 
 use crate::types::BgzfBlock;
 
+use fgumi_pipeline_core::Unpushed;
 use fgumi_pipeline_core::held::HeldSlot;
 use fgumi_pipeline_core::item::{HeapSize, Ordered};
-use fgumi_pipeline_core::outputs::{OrderedBytesSingle, Single};
+use fgumi_pipeline_core::outputs::OrderedBytesSingle;
 use fgumi_pipeline_core::queues::QueueSpec;
 use fgumi_pipeline_core::reorder::BranchOrdering;
 use fgumi_pipeline_core::step::{
     CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
 };
-use fgumi_pipeline_core::{HeldRetry, Unpushed};
-use fgumi_pipeline_core::{PhaseCap, admit_input};
+use fgumi_pipeline_core::{PhaseCap, WholeCap, admit_input};
 
-use crate::boundaries::bam_header_len;
-use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
+use crate::sort::arena_split::QnChunkOrder;
+use crate::sort::protocol::MemoryChunkErased;
+use crate::sort::run_ledger::{RunLedger, run_cap_for};
 
 // ============================================================================
 // Constants
@@ -67,8 +65,8 @@ use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
 /// Reserved front region at the start of every run's arena, in bytes.
 ///
 /// Block 0 always lands at offset `FRONT_REGION`.  The region `[0, FRONT_REGION)`
-/// is left uninitialized by `ReadBlocks` and filled by `FindBoundariesAndSort`
-/// when it writes a carried straddler from the previous run (Task 2, 3b.4).
+/// is left uninitialized by `ReadBlocks` and filled by the split front's boundary
+/// step (`FindRecordBoundaries`) when it writes a carried straddler from the previous run (Task 2, 3b.4).
 /// Must be larger than any single BAM record; 8 MiB covers all realistic records.
 pub const FRONT_REGION: usize = 8 * 1024 * 1024;
 
@@ -100,9 +98,6 @@ const READ_BLOCKS_BLOCKS: usize = 0;
 /// `ReadBlocks` counter slot index: compressed bytes consumed from `ctx.input` this call.
 const READ_BLOCKS_BYTES_READ: usize = 1;
 
-/// `FindBoundariesAndSort` counter slot index: record boundaries found this call.
-const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
-
 // ============================================================================
 // ReadBlocks: serial arena-admit step
 // ============================================================================
@@ -112,8 +107,10 @@ const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
 /// once at acquire (so block slots can be sliced by inflate workers without
 /// further `&mut` growth), reserves a front region `[0, FRONT_REGION)` per run,
 /// assigns each block a slot at an arithmetic offset (`FRONT_REGION` + prefix-sum
-/// of ISIZE), seals a run when cumulative uncompressed bytes reach `memory_limit`,
-/// and emits one [`ArenaBlock`] per block.
+/// of ISIZE), seals a run when cumulative uncompressed bytes reach the run's
+/// charged cap — `memory_limit` less room for the run's sort refs, sized from
+/// the previous run's exact totals in the sort's [`RunLedger`] — and emits one
+/// [`ArenaBlock`] per block.
 ///
 /// **Eager (streaming) emission.** Blocks are emitted *as they are read*, not
 /// buffered until the run seals: the `Arc<PooledSegmentedBuf>` is created at
@@ -130,19 +127,20 @@ const FIND_BOUNDARIES_AND_SORT_RECORDS: usize = 0;
 ///
 /// Mid-stream seals set `seals_to_spill = true`; the final (residual) run sets
 /// `seals_to_spill = false`.  Only the LAST block of a run carries a meaningful
-/// `is_last_of_run`/`seals_to_spill`; downstream (`FindBoundariesAndSort`) reads
+/// `is_last_of_run`/`seals_to_spill`; downstream (`FindRecordBoundaries`) reads
 /// those fields only on the `is_last_of_run` block, so non-last blocks emit
 /// `is_last_of_run = false, seals_to_spill = false`.
 ///
 /// With pool capacity 1, the next run's arena cannot be acquired until the
-/// prior run's [`Arc<PooledSegmentedBuf>`] drops (i.e. after `CompressSpill`
-/// consumes and releases it).  If acquisition fails, `try_run` returns
+/// prior run's [`Arc<PooledSegmentedBuf>`] drops (i.e. after the spill steps
+/// and the merge release its chunk).  If acquisition fails, `try_run` returns
 /// `NoProgress` (backpressure) and retries on the next call.
 pub struct ReadBlocks {
     /// Bounded pool (capacity 1) that owns arena storage and reuses it across runs.
     pool: Arc<ArenaPool>,
-    /// Size of each arena segment (`FRONT_REGION + run_cap + MAX_BGZF_BLOCK`); the
-    /// whole segment is grown live once at acquire.
+    /// Size of each arena segment (`FRONT_REGION + memory_limit + MAX_BGZF_BLOCK`);
+    /// the whole segment is grown live once at acquire. It is reserved capacity:
+    /// pages past a run's cap are never touched.
     segment_size: usize,
     /// `Arc`-shared arena for the current run, grown to full capacity at acquire so
     /// blocks (and their inflate slots) can be handed out eagerly without further
@@ -172,8 +170,13 @@ pub struct ReadBlocks {
     run_seq: u32,
     /// Cumulative uncompressed bytes in the current run (resets on each seal).
     run_cumulative: usize,
-    /// Budget per run: seal when `run_cumulative >= run_cap`.
+    /// Budget per run: seal when `run_cumulative >= run_cap`. Recomputed when
+    /// each run's arena is acquired, from `memory_limit` and the ledger.
     run_cap: usize,
+    /// The sort's in-memory budget: a run's records plus its refs.
+    memory_limit: usize,
+    /// Per-run facts the run sort publishes; sizes each run's cap.
+    ledger: Arc<RunLedger>,
     /// Armed when the current run reached `run_cap`, but the seal is DEFERRED
     /// until the next block arrives.  Deferring by one block guarantees that a
     /// spill seal is only ever fired when at least one more block follows (so
@@ -189,39 +192,55 @@ pub struct ReadBlocks {
     finished: bool,
     /// Byte limit for the output queue.
     output_byte_limit: u64,
+    /// When the current wait for a free arena began (its first refusal);
+    /// `None` while not waiting.
+    wait_started: Option<Instant>,
+    /// Waits for a free arena that ended with an acquire.
+    arena_waits: u64,
+    /// Total time from each wait's first refusal to its acquire.
+    arena_wait_ns: u64,
+    /// Total time from the release that ended each wait to its acquire — the
+    /// wake latency, counted only for a release after the wait began.
+    arena_wake_ns: u64,
+    /// The level the arena-wait line is still to be logged at — `info` under
+    /// `--sort-stats`, `debug` otherwise; `None` once logged.
+    arena_line_level: Option<log::Level>,
+    /// Test hook run between the refused acquire and the waiter registration.
+    #[cfg(test)]
+    before_register: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ReadBlocks {
     /// Create a new `ReadBlocks` step.
     ///
-    /// - `memory_limit`: bytes of record data a run holds before sealing — the
-    ///   FULL in-memory budget (`--max-memory × threads`, via
-    ///   `resolve_memory_budget`).  This is the SAME spill trigger legacy uses:
-    ///   the front spills to disk ONLY when the data exceeds this budget.  For
-    ///   data that fits the budget the result is exactly ONE in-memory run, ZERO
-    ///   disk spills, and one radix sort over the full budget — legacy's
-    ///   in-memory algorithm and footprint, but with the no-copy arena ingest.
+    /// - `memory_limit`: the FULL in-memory budget (`--max-memory × threads`, via
+    ///   `resolve_memory_budget`) for a run's records **and** its sort refs. Each
+    ///   run seals when its record bytes reach
+    ///   [`run_cap_for`]`(memory_limit,
+    ///   ledger.snapshot())` = `memory_limit × m / (m + w)` — `m` the previous
+    ///   run's mean record bytes, `w` the ref width — so records plus refs fit
+    ///   the budget, as v0.7.0's in-memory buffer did. Data that fits leaves one
+    ///   in-memory run and no spills.
     /// - `output_byte_limit`: byte-bounds the output queue.
+    /// - `ledger`: the sort's [`RunLedger`], which its run sort publishes to.
     ///
     /// The arena segment is sized so one full run always fits within ONE segment
     /// (`FRONT_REGION` + the run budget + one deferred-seal tipping block), which
-    /// keeps the `FindBoundariesAndSort` contiguous-slice scan valid WITHOUT
+    /// keeps the boundary step's contiguous-slice scan valid WITHOUT
     /// capping the run below the budget.  (The earlier design fixed the segment at
     /// 256 MiB and capped `run_cap` to fit it, which forced the front to spill
     /// even when the data fit `--max-memory` — a wall-clock regression vs legacy.
     /// Sizing the segment to the budget instead removes that forced spill.)
     #[must_use]
-    pub fn new(memory_limit: usize, output_byte_limit: u64) -> Self {
-        // Seal a run only when its record data reaches the full budget (legacy's
-        // trigger); never cap below it.
-        let run_cap = memory_limit;
-        // One run = front region + up to `run_cap` of data + the single block that
+    pub fn new(memory_limit: usize, output_byte_limit: u64, ledger: Arc<RunLedger>) -> Self {
+        let run_cap = run_cap_for(memory_limit, ledger.snapshot());
+        // One run = front region + up to `memory_limit` of data + the single block that
         // tips `run_cumulative` over `run_cap` (the deferred seal holds the NEXT
         // block for the following run, so the current run overshoots by at most one
         // block).  Sizing the segment to that upper bound guarantees a run is
         // gap-free within one segment, so the scan's single `arena.slice(..)` over
         // `[scan_start, run_end)` never spans a segment boundary.
-        let segment_size = FRONT_REGION + run_cap + MAX_BGZF_BLOCK;
+        let segment_size = FRONT_REGION + memory_limit + MAX_BGZF_BLOCK;
         let pool = ArenaPool::new(1, segment_size);
         Self {
             pool,
@@ -236,9 +255,79 @@ impl ReadBlocks {
             run_seq: 0,
             run_cumulative: 0,
             run_cap,
+            memory_limit,
+            ledger,
             seal_pending: false,
             finished: false,
             output_byte_limit,
+            wait_started: None,
+            arena_waits: 0,
+            arena_wait_ns: 0,
+            arena_wake_ns: 0,
+            arena_line_level: Some(log::Level::Debug),
+            #[cfg(test)]
+            before_register: None,
+        }
+    }
+
+    /// Log the arena-wait line at `info` (`--sort-stats`) instead of `debug`.
+    #[must_use]
+    pub fn with_sort_stats(mut self, on: bool) -> Self {
+        self.arena_line_level = Some(if on { log::Level::Info } else { log::Level::Debug });
+        self
+    }
+
+    /// Acquire the next run's arena, registering as the pool's waiter when it
+    /// is exhausted so the release — on whichever thread drops the previous
+    /// run's last reference — unparks this step's driver. Accounts each wait
+    /// and its wake latency.
+    fn try_acquire_arena(&mut self) -> Option<PooledSegmentedBuf> {
+        let acquired = self.pool.try_acquire().or_else(|| {
+            #[cfg(test)]
+            if let Some(hook) = self.before_register.take() {
+                hook();
+            }
+            // Register, then retry: a release after the registration unparks
+            // us; one between the refused acquire and the registration is
+            // caught by the retry.
+            self.pool.register_waiter();
+            self.pool.try_acquire()
+        });
+        match acquired {
+            None => {
+                self.wait_started.get_or_insert_with(Instant::now);
+                None
+            }
+            Some(arena) => {
+                if let Some(started) = self.wait_started.take() {
+                    let now = Instant::now();
+                    self.arena_waits += 1;
+                    self.arena_wait_ns += nanos(now - started);
+                    if let Some(released) = self.pool.released_at().filter(|&r| r >= started) {
+                        self.arena_wake_ns += nanos(now.saturating_duration_since(released));
+                    }
+                }
+                Some(arena)
+            }
+        }
+    }
+
+    /// The arena-wait summary line.
+    fn arena_wait_line(&self) -> String {
+        #[allow(clippy::cast_precision_loss)] // display seconds
+        let wait_s = self.arena_wait_ns as f64 / 1e9;
+        format!(
+            "Phase 1: arena waits {} ({wait_s:.1} s waiting for a free arena; {} ms from return \
+             to reuse)",
+            self.arena_waits,
+            self.arena_wake_ns / 1_000_000
+        )
+    }
+
+    /// Log [`Self::arena_wait_line`] once.
+    fn log_arena_waits(&mut self) {
+        if let Some(level) = self.arena_line_level.take() {
+            log::log!(level, "{}", self.arena_wait_line());
         }
     }
 
@@ -264,7 +353,7 @@ impl ReadBlocks {
         if self.arena.is_some() {
             return true;
         }
-        let Some(mut arena) = self.pool.try_acquire() else {
+        let Some(mut arena) = self.try_acquire_arena() else {
             return false;
         };
         arena.reserve_full_capacity();
@@ -276,10 +365,11 @@ impl ReadBlocks {
         // capacity `reserve_full_capacity` just guaranteed, so `grow_uninit` performs
         // no realloc and the slot stays in one segment.  `u8` has no validity
         // invariant; every live byte is written exactly once — block slots by their
-        // inflate worker, the `[0, FRONT_REGION)` carry region by `FindBoundariesAndSort`
-        // — before any read.  Bytes never read (the unused tail past a run's end, and
-        // the front region when there is no straddler) are never observed: `FBS` only
-        // ever slices `[scan_start, run_end)`.
+        // inflate worker, the `[0, FRONT_REGION)` carry region by the boundary step
+        // (`FindRecordBoundaries`) — before any read.  Bytes never read (the unused
+        // tail past a run's end, and the front region when there is no straddler)
+        // are never observed: the boundary step only ever slices
+        // `[scan_start, run_end)`.
         #[allow(unsafe_code)]
         let _all = unsafe { arena.grow_uninit(self.segment_size) };
         // `ArenaPool::try_acquire` already returns the `PooledSegmentedBuf` wrapper
@@ -288,6 +378,10 @@ impl ReadBlocks {
         // is wrapped by construction here and only needs sharing.
         self.arena = Some(Arc::new(arena));
         self.run_offset = FRONT_REGION as u64;
+        // The previous run sealed (and published its totals) before its chunk
+        // released the arena this run just acquired, so the cap is a function of
+        // the input alone.
+        self.run_cap = run_cap_for(self.memory_limit, self.ledger.snapshot());
         true
     }
 
@@ -365,6 +459,32 @@ impl ReadBlocks {
         self.run_offset = 0;
     }
 
+    /// Test seam: acquire (or wait for) the run's arena.
+    #[cfg(test)]
+    pub(crate) fn ensure_arena_for_test(&mut self) -> bool {
+        self.ensure_arena()
+    }
+
+    /// Test seam: hand the current run's arena to the caller (as if the run
+    /// had sealed and its chunk were still downstream).
+    #[cfg(test)]
+    pub(crate) fn take_arena_for_test(&mut self) -> Option<Arc<PooledSegmentedBuf>> {
+        self.arena.take()
+    }
+
+    /// Test seam: run `hook` between the next refused acquire and the waiter
+    /// registration.
+    #[cfg(test)]
+    pub(crate) fn before_register_for_test(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.before_register = Some(hook);
+    }
+
+    /// Test seam: `(arena_waits, arena_wait_ns, arena_wake_ns)`.
+    #[cfg(test)]
+    pub(crate) fn arena_wait_stats(&self) -> (u64, u64, u64) {
+        (self.arena_waits, self.arena_wait_ns, self.arena_wake_ns)
+    }
+
     /// Test seam: admit blocks, then freeze the arena and drain all emitted
     /// [`ArenaBlock`]s into a `Vec` for direct inspection, bypassing the pipeline
     /// framework.  Uses `seals_to_spill = false` (residual) for the single flush.
@@ -373,6 +493,11 @@ impl ReadBlocks {
         self.seal_run(false);
         self.emit.drain(..).collect()
     }
+}
+
+/// A duration in whole nanoseconds, saturating.
+fn nanos(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Step for ReadBlocks {
@@ -412,6 +537,9 @@ impl Step for ReadBlocks {
         let outcome = self.try_run_inner(ctx, &mut admitted_blocks, &mut admitted_bytes);
         ctx.counters.add(READ_BLOCKS_BLOCKS, admitted_blocks);
         ctx.counters.add(READ_BLOCKS_BYTES_READ, admitted_bytes);
+        if matches!(outcome, Ok(StepOutcome::Finished)) {
+            self.log_arena_waits();
+        }
         outcome
     }
 
@@ -915,21 +1043,18 @@ impl Step for InflateToArena {
 // Arena sort strategy (per-order key extraction + seal)
 // ============================================================================
 
-/// Per-sort-order policy for the arena-front [`FindBoundariesAndSort`] scan.
+/// Per-sort-order policy for the record-input front (`SortBuffer`), which
+/// pushes records one at a time.
 ///
 /// The strategy owns the accumulated per-record refs and knows how to (a) extract
 /// a record's sort key from its arena-resident body and (b) at run seal, sort
 /// those refs and wrap the shared arena into the correctly-typed
-/// [`MemoryChunkErased`] — with zero record-body copies. `FindBoundariesAndSort`
-/// is generic over this trait and monomorphised per order, so the per-record
-/// [`push_record`](Self::push_record) call inlines into the boundary scan hot
-/// loop with no dynamic dispatch.
+/// [`MemoryChunkErased`] — with zero record-body copies. `SortBuffer` is generic
+/// over this trait and monomorphised per order, so the per-record
+/// [`push_record`](Self::push_record) call inlines with no dynamic dispatch. The
+/// block-input front extracts in batches instead
+/// ([`ArenaKeyExtractor`](super::arena_split::ArenaKeyExtractor)).
 pub trait ArenaSortStrategy: Send + 'static {
-    /// Reserve capacity for approximately `est_records` refs at the start of a
-    /// run, so the incremental per-record pushes do not reallocate a multi-GB ref
-    /// buffer mid-run.
-    fn reserve_for_run(&mut self, est_records: usize);
-
     /// Extract the sort key from `body` (the record's BAM body, `block_size`
     /// prefix excluded) and accumulate a ref pointing at `(body_off, len)` in the
     /// shared inflate arena. Called once per record on the boundary scan hot path.
@@ -945,18 +1070,52 @@ pub trait ArenaSortStrategy: Send + 'static {
     /// accumulator for the next run.
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased;
 
+    /// Seal the run as `pieces` pre-sorted chunks over contiguous input-order
+    /// ranges of its refs, sorted in parallel at `sort_threads` — the final run
+    /// of a sort that spilled. A run with no refs seals as [`Self::seal`] does.
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased>;
+
     /// Whether sealing the refs accumulated so far would sort on more than one
     /// thread at `sort_threads` — what decides whether the seal must take the
     /// whole phase cap (see `seal_under_cap`).
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool;
 
-    /// A fresh, empty strategy carrying the same configuration — used to build a
-    /// worker copy of the step. `FindBoundariesAndSort` is `Serial`, so this only
-    /// ever constructs its single working instance.
-    #[must_use]
-    fn fresh(&self) -> Self
-    where
-        Self: Sized;
+    /// Bytes one accumulated ref occupies. Constant per strategy except
+    /// template order, whose lanes the first record chooses: `None` until then.
+    fn ref_width(&self) -> Option<usize>;
+}
+
+/// Reserve the whole phase-1 cap for an off-pool run sort: the one reservation
+/// path of every run seal ([`seal_under_cap`] and the split front's `SortRun`).
+///
+/// Returns `Ok(None)` when there is no cap (an unset `--sort-threads`) or the
+/// sort runs on one thread — a serial sort is the coordination thread's own
+/// work, which the cap does not count. Otherwise registers a pending
+/// reservation (new pool admissions are refused while it waits), parks until
+/// every permit is held, and returns the guard; the sort runs while it is held.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::Interrupted`] when the run is cancelled (or failed)
+/// while waiting; the caller must not sort.
+pub(crate) fn reserve_for_run_sort(
+    cap: Option<&PhaseCap>,
+    sorts_in_parallel: bool,
+) -> io::Result<Option<WholeCap<'_>>> {
+    match cap {
+        Some(cap) if sorts_in_parallel => cap.acquire_whole().map(Some).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "sort cancelled while waiting for its phase cap",
+            )
+        }),
+        _ => Ok(None),
+    }
 }
 
 /// Seal one run under the phase-1 cap.
@@ -964,11 +1123,10 @@ pub trait ArenaSortStrategy: Send + 'static {
 /// Uncapped: the sort runs at its full `sort_threads` width. Capped (an
 /// explicit `--sort-threads`): when the run sorts in parallel, the per-run
 /// sort is phase-1 work on its own rayon threads beside the pool steps that
-/// share the cap, so it takes the whole cap ([`PhaseCap::acquire_whole`]) and
+/// share the cap, so it takes the whole cap ([`reserve_for_run_sort`]) and
 /// sorts on exactly the cap's width — pool admission pauses until it is done,
 /// and sort threads + inflate + spill-compression workers never exceed the cap
-/// together. A run that sorts on one thread takes no permit: it is the serial
-/// coordination thread's own work, which the cap does not count.
+/// together. A run that sorts on one thread takes no permit.
 ///
 /// # Errors
 ///
@@ -981,18 +1139,29 @@ pub(crate) fn seal_under_cap<S: ArenaSortStrategy>(
     sort_threads: usize,
 ) -> io::Result<MemoryChunkErased> {
     let sort_threads = sort_threads.max(1);
-    match cap {
-        Some(cap) if strategy.sorts_in_parallel(sort_threads) => {
-            let whole = cap.acquire_whole().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "sort cancelled while waiting for its phase cap",
-                )
-            })?;
-            Ok(strategy.seal(arena, whole.width()))
-        }
-        _ => Ok(strategy.seal(arena, sort_threads)),
-    }
+    let whole = reserve_for_run_sort(cap, strategy.sorts_in_parallel(sort_threads))?;
+    let width = whole.as_ref().map_or(sort_threads, WholeCap::width);
+    Ok(strategy.seal(arena, width))
+}
+
+/// [`seal_under_cap`] for the final run of a sort that spilled: the run seals
+/// as `pieces` chunks sorted in parallel, so with a cap it always holds the
+/// whole cap.
+///
+/// # Errors
+///
+/// As [`seal_under_cap`].
+pub(crate) fn seal_pieces_under_cap<S: ArenaSortStrategy>(
+    strategy: &mut S,
+    cap: Option<&PhaseCap>,
+    arena: Arc<PooledSegmentedBuf>,
+    sort_threads: usize,
+    pieces: usize,
+) -> io::Result<Vec<MemoryChunkErased>> {
+    let sort_threads = sort_threads.max(1);
+    let whole = reserve_for_run_sort(cap, sort_threads > 1)?;
+    let width = whole.as_ref().map_or(sort_threads, WholeCap::width);
+    Ok(strategy.seal_pieces(arena, width, pieces))
 }
 
 /// Coordinate-order strategy: extracts the fixed `u64` coordinate key inline and
@@ -1001,26 +1170,23 @@ pub(crate) fn seal_under_cap<S: ArenaSortStrategy>(
 pub struct CoordinateStrategy {
     /// BAM header reference-sequence count, used by [`extract_coordinate_key_inline`].
     n_ref: u32,
-    /// Coordinate-key refs accumulated across the current run's blocks. Filled
-    /// incrementally by the scan and consumed (via `mem::take`) at seal, leaving
-    /// an empty `Vec` for the next run.
+    /// Coordinate-key refs accumulated across the current run's blocks; the seal
+    /// clears them in place, keeping the buffer for the next run.
     refs: Vec<RecordRef>,
+    /// Bounded pool the final run's pieces sort on (the radix spawns its own
+    /// threads for a whole-run seal).
+    pieces_pool: BoundedSortPool,
 }
 
 impl CoordinateStrategy {
     /// Create a coordinate strategy for a header with `n_ref` reference sequences.
     #[must_use]
     pub fn new(n_ref: u32) -> Self {
-        Self { n_ref, refs: Vec::new() }
+        Self { n_ref, refs: Vec::new(), pieces_pool: BoundedSortPool::new("coord-sort") }
     }
 }
 
 impl ArenaSortStrategy for CoordinateStrategy {
-    #[inline]
-    fn reserve_for_run(&mut self, est_records: usize) {
-        self.refs.reserve(est_records);
-    }
-
     #[inline]
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()> {
         let sort_key = extract_coordinate_key_inline(body, self.n_ref);
@@ -1029,16 +1195,37 @@ impl ArenaSortStrategy for CoordinateStrategy {
     }
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
+        MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(
+            arena,
+            std::mem::take(&mut self.refs),
+            sort_threads,
+        ))
+    }
+
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        if self.refs.is_empty() {
+            return vec![self.seal(arena, sort_threads)];
+        }
         let refs = std::mem::take(&mut self.refs);
-        MemoryChunkErased::Coordinate(coordinate_chunk_from_refs(arena, refs, sort_threads))
+        self.pieces_pool
+            .bounded(sort_threads)
+            .install(|| fgumi_sort::coordinate_chunks_from_refs(&arena, refs, pieces))
+            .into_iter()
+            .map(MemoryChunkErased::Coordinate)
+            .collect()
     }
 
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
         fgumi_sort::radix_sorts_in_parallel(self.refs.len(), sort_threads)
     }
 
-    fn fresh(&self) -> Self {
-        Self::new(self.n_ref)
+    fn ref_width(&self) -> Option<usize> {
+        Some(size_of::<RecordRef>())
     }
 }
 
@@ -1047,6 +1234,9 @@ impl ArenaSortStrategy for CoordinateStrategy {
 /// machinery the template key needs; accumulates arena-pointing refs and seals to
 /// [`MemoryChunkErased::TemplateCoordinate`] (an arena-backed
 /// `InMemoryChunk<TemplateKey>`), byte-identical to the owned `TemplateChunkSorter`.
+///
+/// Its production user is `SortBuffer`, the record-input front; the block-input
+/// arena front sorts template order through [`super::arena_split`].
 pub struct TemplateStrategy {
     acc: fgumi_sort::TemplateArenaAccumulator,
 }
@@ -1062,11 +1252,6 @@ impl TemplateStrategy {
 
 impl ArenaSortStrategy for TemplateStrategy {
     #[inline]
-    fn reserve_for_run(&mut self, est_records: usize) {
-        self.acc.reserve(est_records);
-    }
-
-    #[inline]
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()> {
         self.acc
             .push(body, body_off, len)
@@ -1077,75 +1262,181 @@ impl ArenaSortStrategy for TemplateStrategy {
         MemoryChunkErased::TemplateCoordinate(self.acc.seal(arena, sort_threads))
     }
 
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        self.acc
+            .seal_pieces(&arena, sort_threads, pieces)
+            .into_iter()
+            .map(MemoryChunkErased::TemplateCoordinate)
+            .collect()
+    }
+
     fn sorts_in_parallel(&self, sort_threads: usize) -> bool {
         fgumi_sort::radix_sorts_in_parallel(self.acc.pending_len(), sort_threads)
     }
 
-    fn fresh(&self) -> Self {
-        Self { acc: self.acc.fresh() }
+    fn ref_width(&self) -> Option<usize> {
+        self.acc.ref_width()
     }
 }
 
-/// Queryname-order strategy (lexicographic or natural, selected by the key type
-/// `K` + `wrap`): extracts the embedded read-name key from each record and
-/// accumulates `(key, offset, len)` refs pointing into the shared arena; at seal
-/// it comparator-sorts the refs (variable-length names are not radix-able) into
-/// an arena-backed [`InMemoryChunk<K>`], wrapped into the matching erased variant.
+/// Queryname-order strategy: builds one 40-byte [`QnRef`] per record — a
+/// window of the read name behind a learned common prefix, the flag class and
+/// the record's arena position — and at seal sorts the refs with
+/// [`queryname_chunk_from_qn_refs`] into an arena-backed `InMemoryChunk<QnKey>`,
+/// wrapped into the matching erased variant. Nothing is copied or allocated
+/// per record.
 ///
-/// The record bodies stay in the arena (zero-copy); only the small name bytes are
-/// owned by each key, exactly as the legacy queryname sort. Queryname's
-/// tie order is unspecified (the integration parity gate is name-order, not
-/// byte-identity), so one globally-sorted chunk per run is correct.
-pub struct QuerynameStrategy<K: RawSortKey> {
-    /// `(key, body_offset, len)` refs accumulated across the current run's blocks.
-    refs: Vec<(K, u64, u32)>,
-    /// Bounded rayon pool (sized to `sort_threads`) the per-run comparator sort
-    /// installs into, so the parallel sort does not oversubscribe the pipeline's
-    /// worker pool on a spill. Built on the first seal, reused; unbuilt on a
-    /// fresh copy.
+/// The arena front's queryname orders run on the split front's
+/// [`QuerynameKeys`](super::arena_split::QuerynameKeys), which extracts through
+/// the same [`QnRefBuilder`]; this strategy is the record-input path.
+///
+/// The prefix is learned per batch of [`QN_CLASS_BATCH_RECORDS`] records. This
+/// front pushes records one at a time with no arena to read back until the
+/// seal, so a batch whose guessed prefix failed is recorded at the batch's
+/// close and re-windowed at seal, before the sort.
+///
+/// Equal keys keep input order (ties break by arena offset), so one sorted
+/// chunk per run is the stable sort of the run.
+pub struct QuerynameStrategy<C: QnComparator> {
+    /// Refs accumulated across the current run.
+    refs: Vec<QnRef>,
+    /// The sort's shared class table and counters.
+    keys: QnSortState,
+    /// Carries the class guess across batches.
+    builder: QnRefBuilder,
+    /// The common prefix of the open batch's names.
+    lcp: QnBatchLcp,
+    /// Index in `refs` where the open batch starts.
+    batch_start: usize,
+    /// Closed batches to re-window at seal: `(refs range, class)`.
+    pending: Vec<(std::ops::Range<usize>, u8)>,
+    /// Bounded rayon pool (sized to `sort_threads` on the first seal) the run's
+    /// comparator sort runs on, so it does not oversubscribe the pipeline's
+    /// workers.
     sort_pool: BoundedSortPool,
-    /// Erases the sorted `InMemoryChunk<K>` into the correct `MemoryChunkErased`
-    /// arm (`QuerynameLex` for the lex key, `QuerynameNatural` for the natural
-    /// key). A `fn` pointer so [`fresh`](ArenaSortStrategy::fresh) can copy it.
-    wrap: fn(InMemoryChunk<K>) -> MemoryChunkErased,
+    /// The comparator, which also picks the erased chunk variant
+    /// ([`QnChunkOrder::wrap`]).
+    _order: std::marker::PhantomData<C>,
 }
 
-impl<K: RawSortKey> QuerynameStrategy<K> {
-    /// Build a queryname strategy that erases its sealed chunk via `wrap`.
+impl<C: QnChunkOrder> QuerynameStrategy<C> {
+    /// A queryname strategy over the sort's shared key state `keys`; `C` picks
+    /// the sealed chunk's erased variant.
     #[must_use]
-    pub fn new(wrap: fn(InMemoryChunk<K>) -> MemoryChunkErased) -> Self {
-        Self { refs: Vec::new(), sort_pool: BoundedSortPool::new("qname-sort"), wrap }
+    pub fn new(keys: QnSortState) -> Self {
+        Self {
+            refs: Vec::new(),
+            keys,
+            builder: QnRefBuilder::default(),
+            lcp: QnBatchLcp::default(),
+            batch_start: 0,
+            pending: Vec::new(),
+            sort_pool: BoundedSortPool::new("qname-sort"),
+            _order: std::marker::PhantomData,
+        }
     }
 
-    /// Test-only observation of the bounded sort pool's thread count, so a test
-    /// can assert the Phase-1 `sort_threads` value actually SIZED the worker pool
-    /// (the runtime effect), not merely that it was plumbed. `None` until the
-    /// first [`seal`](ArenaSortStrategy::seal) builds the pool.
+    /// Replace the key state (before any record is pushed): the chain builder
+    /// shares one state across a sort's front and merge.
+    pub fn set_keys(&mut self, keys: QnSortState) {
+        debug_assert!(self.refs.is_empty(), "the key state is set before ingest");
+        self.keys = keys;
+    }
+
+    /// Test-only: the run's refs as the seal would sort them — the open batch
+    /// closed and every adopted batch re-windowed.
     #[cfg(test)]
-    pub(crate) fn sort_pool_threads(&self) -> Option<usize> {
-        self.sort_pool.built_threads()
+    pub(crate) fn refs_for_test(&mut self, arena: &PooledSegmentedBuf) -> Vec<QnRef> {
+        self.close_batch();
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, arena, &mut self.refs[range], class);
+        }
+        self.refs.clone()
+    }
+
+    /// Close the open batch: adopt a learned class if its guess failed (recorded
+    /// for re-windowing at seal) and count it.
+    fn close_batch(&mut self) {
+        let batch = &self.refs[self.batch_start..];
+        if batch.is_empty() {
+            return;
+        }
+        let adopted = self.builder.adopt_batch_class(&self.keys.table, batch, &self.lcp);
+        let class0 =
+            if adopted.is_some() { 0 } else { batch.iter().filter(|r| r.0.class == 0).count() };
+        self.keys.stats.note_batch(batch.len(), class0, adopted.is_some());
+        if let Some(class) = adopted {
+            self.pending.push((self.batch_start..self.refs.len(), class));
+        }
+        self.batch_start = self.refs.len();
+        self.lcp = QnBatchLcp::default();
     }
 }
 
-impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
-    #[inline]
-    fn reserve_for_run(&mut self, est_records: usize) {
-        self.refs.reserve(est_records);
-    }
-
+impl<C: QnChunkOrder> ArenaSortStrategy for QuerynameStrategy<C> {
     #[inline]
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()> {
-        // Queryname keys are EMBEDDED_IN_RECORD: the name lives in `body`, so the
-        // key is reconstructed straight from it (no SortContext needed).
-        self.refs.push((K::extract_from_record(body), body_off, len));
+        let r = self.builder.build(&self.keys.table, &mut self.lcp, body, body_off, len);
+        self.refs.push(r);
+        if self.refs.len() - self.batch_start == QN_CLASS_BATCH_RECORDS {
+            self.close_batch();
+        }
         Ok(())
     }
 
     fn seal(&mut self, arena: Arc<PooledSegmentedBuf>, sort_threads: usize) -> MemoryChunkErased {
+        self.close_batch();
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, &arena, &mut self.refs[range], class);
+        }
         let refs = std::mem::take(&mut self.refs);
-        let pool = self.sort_pool.bounded(sort_threads);
-        let wrap = self.wrap;
-        pool.install(move || wrap(queryname_chunk_from_arena_refs(arena, refs)))
+        self.batch_start = 0;
+        let keys = &self.keys;
+        self.sort_pool.bounded(sort_threads).install(move || {
+            C::wrap(queryname_chunk_from_qn_refs::<C>(
+                &keys.table,
+                arena,
+                refs,
+                keys.compare_stats(),
+            ))
+        })
+    }
+
+    fn seal_pieces(
+        &mut self,
+        arena: Arc<PooledSegmentedBuf>,
+        sort_threads: usize,
+        pieces: usize,
+    ) -> Vec<MemoryChunkErased> {
+        self.close_batch();
+        if self.refs.is_empty() {
+            return vec![self.seal(arena, sort_threads)];
+        }
+        for (range, class) in self.pending.drain(..) {
+            QnRefBuilder::rewindow(&self.keys.table, &arena, &mut self.refs[range], class);
+        }
+        let refs = std::mem::take(&mut self.refs);
+        self.batch_start = 0;
+        let keys = &self.keys;
+        self.sort_pool
+            .bounded(sort_threads)
+            .install(move || {
+                fgumi_sort::queryname_chunks_from_qn_refs::<C>(
+                    &keys.table,
+                    &arena,
+                    refs,
+                    keys.compare_stats(),
+                    pieces,
+                )
+            })
+            .into_iter()
+            .map(C::wrap)
+            .collect()
     }
 
     /// The comparator sort always runs inside the per-sort rayon pool, so it is
@@ -1154,646 +1445,8 @@ impl<K: RawSortKey + 'static> ArenaSortStrategy for QuerynameStrategy<K> {
         sort_threads > 1
     }
 
-    fn fresh(&self) -> Self {
-        Self::new(self.wrap)
-    }
-}
-
-// ============================================================================
-// FindBoundariesAndSort step
-// ============================================================================
-
-/// `Serial` step that scans each run's contiguous arena span directly (no copy),
-/// skips the BAM header on run 0 via [`bam_header_len`], accumulates one ref per
-/// record through the order's [`ArenaSortStrategy`], seals that into an arena-backed
-/// chunk (each strategy picks its own builder — see [`CoordinateStrategy::seal`]),
-/// and emits `SortChunkEvent::Spill` (for sealed mid-stream runs) or
-/// `SortChunkEvent::Residual` (for the final run), followed by
-/// `SortChunkEvent::AllAnnounced`.
-///
-/// **Straddler handling (3b.4 front-region carry):** A BAM record that spans the
-/// boundary between run k and run k+1 is handled as follows:
-/// - While scanning run k's span, the trailing partial record (a 4-byte
-///   `block_size` prefix whose body extends past the run's end) is detected when
-///   `cur + 4 <= span.len()` but `cur + 4 + bs > span.len()`.  Those partial bytes
-///   (`span[cur..]`) are copied into `self.carry`.
-/// - When the first block of run k+1 arrives (arena already frozen), the carry is
-///   written right-aligned into that arena's front region at
-///   `[FRONT_REGION - carry.len(), FRONT_REGION)` via `unsafe { arena.slice_mut(...) }`.
-///   The scan then starts at `FRONT_REGION - carry.len()` so that `carry ++ block-0-head`
-///   is physically contiguous, forming one complete record ref that is naturally
-///   record 0 after sorting.
-///
-/// **Parity invariant:** sealed mid-stream runs emit `Spill{seq: 0, 1, ...}`;
-/// exactly one final run emits `Residual`.  `AllAnnounced` carries
-/// `slot_count = spilled_run_count, memory_chunk_count = 1`.
-pub struct FindBoundariesAndSort<S: ArenaSortStrategy> {
-    /// Per-order key extraction + seal policy; owns the accumulated sort refs.
-    strategy: S,
-    /// Threads handed to the per-chunk coordinate sort (`coordinate_chunk_from_refs`);
-    /// `>1` enables the parallel radix on large chunks.  Matches the pipeline's
-    /// configured thread count.
-    sort_threads: usize,
-    output_byte_limit: u64,
-    /// Held slot for backpressure retry on emitting events.
-    held: HeldSlot<Unpushed<SortChunkEvent>>,
-    /// The shared arena that holds the current run's decompressed bytes (set on
-    /// the first block of each run, cleared after the run is scanned).
-    arena: Option<Arc<PooledSegmentedBuf>>,
-    /// Arena offset of the scan start for the current run.
-    ///
-    /// - Run 0 with empty carry: `FRONT_REGION + bam_header_len(...)`.
-    /// - Run k>0 with non-empty carry: `FRONT_REGION - carry.len()` (after
-    ///   writing carry into the front region).
-    /// - Run k>0 with empty carry (no straddler): `FRONT_REGION`.
-    scan_start: u64,
-    /// Arena offset one past the last byte of the current run span (updated with
-    /// each block).
-    run_end: u64,
-    /// Arena offset of the next un-parsed record's first byte within the current
-    /// run.  The incremental scan advances this as in-order blocks extend `run_end`,
-    /// parking it at the start of the first record that overruns the bytes inflated
-    /// so far; it resumes from here when the next block arrives.  At seal,
-    /// `[scan_cursor, run_end)` is exactly the trailing partial record (the straddler
-    /// carry for a spill, or empty for a clean residual).
-    scan_cursor: u64,
-    /// `true` once run 0's BAM header has been skipped.  Set `true` immediately for
-    /// runs `> 0` (no header).  Stays `false` on run 0 until enough blocks have been
-    /// inflated for [`bam_header_len`] to parse the full header — a many-reference
-    /// header can exceed a single 64 KiB block, so the skip may take several blocks.
-    header_skipped: bool,
-    /// Pending events staged after each run scan; drained in subsequent `try_run`
-    /// calls.  Holds `Spill`/`Residual` then `AllAnnounced` (only on the final run).
-    pending: VecDeque<SortChunkEvent>,
-    /// `true` once the final run has been scanned and `AllAnnounced` staged.
-    finalized: bool,
-    /// Trailing partial record bytes from the previous run (the carry buffer).
-    /// Non-empty when run k ended mid-record; written into run k+1's front region.
-    carry: Vec<u8>,
-    /// Sequence number for the next run's `Spill` event (monotonically increasing).
-    next_seq: u32,
-    /// Cumulative record count across all runs.
-    total_records: u64,
-    /// Number of runs that sealed to a disk spill (all runs except the final one).
-    spilled_run_count: u32,
-    /// Phase-1 cap the per-run sort takes whole (`None` = uncapped);
-    /// see [`seal_under_cap`].
-    radix_cap: Option<Arc<PhaseCap>>,
-}
-
-impl<S: ArenaSortStrategy> FindBoundariesAndSort<S> {
-    /// Test-only borrow of the per-order strategy, so a test can observe
-    /// strategy-owned state (e.g. the bounded sort pool built at seal) after
-    /// driving the step — confirming the `sort_threads` handed to [`new`](Self::new)
-    /// is forwarded into `strategy.seal`.
-    #[cfg(test)]
-    pub(crate) fn strategy(&self) -> &S {
-        &self.strategy
-    }
-
-    /// Create a new `FindBoundariesAndSort` step over the given per-order
-    /// `strategy` (e.g. [`CoordinateStrategy`], which carries the header's
-    /// reference-sequence count for key extraction). `sort_threads` is the thread
-    /// count handed to the per-chunk sort (the pipeline's configured threads).
-    /// `output_byte_limit` byte-bounds the output queue.
-    #[must_use]
-    pub fn new(strategy: S, sort_threads: usize, output_byte_limit: u64) -> Self {
-        Self {
-            strategy,
-            sort_threads,
-            output_byte_limit,
-            held: HeldSlot::new(),
-            arena: None,
-            scan_start: 0,
-            run_end: 0,
-            scan_cursor: 0,
-            header_skipped: false,
-            pending: VecDeque::new(),
-            finalized: false,
-            carry: Vec::new(),
-            next_seq: 0,
-            total_records: 0,
-            spilled_run_count: 0,
-            radix_cap: None,
-        }
-    }
-
-    /// Make a run that sorts in parallel take the whole phase-1 cap the pool
-    /// steps share, so sort + inflate + spill compression together stay within
-    /// `--sort-threads` (see `seal_under_cap`). `None` leaves it uncapped.
-    #[must_use]
-    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.radix_cap = cap;
-        self
-    }
-
-    /// Ingest one `InflatedBlock`, extending the current run's contiguous arena span
-    /// and then parsing every record made complete by it via
-    /// [`scan_available`](Self::scan_available) — so the scan overlaps the run's
-    /// still-inflating tail (Inflate‖Scan).  When the block is the last of a run
-    /// (`is_last_of_run`), the run is sealed: the trailing partial record (if any)
-    /// becomes the carry, the accumulated refs are sorted, and a `Spill` or
-    /// `Residual` event is staged in `self.pending`.  After the final run's
-    /// `Residual`, an `AllAnnounced` is also staged.
-    ///
-    /// On the first block of each run, the straddler carry from the previous run (if
-    /// any) is written right-aligned into the new arena's front region via an
-    /// `unsafe` `slice_mut` call (3rd `fgumi-pipeline-io` unsafe site — see
-    /// CLAUDE.md §"Approved hot-path unsafe (parallel-inflate sort ingest,
-    /// fgumi-pipeline-io)" for the full justification).
-    ///
-    /// Returns the number of record boundaries found by this call's scan (the
-    /// `FindBoundariesAndSort` `records` counter's batch total) — zero when the
-    /// scan found no new complete record this call (e.g. still waiting on more
-    /// of a straddling record).
-    ///
-    /// # Errors
-    ///
-    /// Returns an `io::Error` if:
-    /// - The carry to write into the front region is longer than `FRONT_REGION`.
-    /// - A `block_size` value in the record stream overflows `u32`.
-    /// - At seal: run 0's header never fully arrived, the carry exceeds `FRONT_REGION`,
-    ///   or the final residual run ends mid-record (truncated BAM).
-    pub(crate) fn ingest_block(&mut self, block: &InflatedBlock) -> io::Result<u64> {
-        let block_end = block.offset + u64::from(block.len);
-
-        if self.arena.is_none() {
-            // ----------------------------------------------------------------
-            // First block of this run.
-            // ----------------------------------------------------------------
-
-            // Straddler carry: write carry right-aligned into the front region.
-            let scan_start = if !self.carry.is_empty() {
-                let l = self.carry.len();
-                if l > FRONT_REGION {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "FindBoundariesAndSort: carry ({l} bytes) exceeds FRONT_REGION \
-                             ({FRONT_REGION}); record exceeds max straddler size — \
-                             raise --max-memory"
-                        ),
-                    ));
-                }
-                let write_offset = FRONT_REGION - l;
-                // SAFETY: `[FRONT_REGION - l, FRONT_REGION)` is the front region reserved
-                // by `ReadBlocks::ensure_arena` via `grow_uninit(FRONT_REGION)` before any
-                // block slot was allocated.  Soundness rests on DISJOINTNESS, not on
-                // ordering: this range lies strictly below `FRONT_REGION`, while every
-                // inflate block slot lies at or above `FRONT_REGION` (block 0 starts there
-                // by construction in ReadBlocks), so the `&mut [u8]` synthesized here
-                // aliases no slot an `InflateToArena` worker is concurrently writing — and
-                // run k+1's later blocks MAY still be inflating when this carry write runs
-                // (FBS is serial but does not wait for the whole run to inflate).  The
-                // arena's backing segment was frozen with `reserve_full_capacity` before
-                // being shared, so no `grow_uninit`/realloc can move these bytes underneath
-                // a live worker slice.  This write happens exactly once per straddler per
-                // run; `u8` has no validity invariant.
-                #[allow(unsafe_code)]
-                let dst = unsafe { block.arena.slice_mut(write_offset, l) };
-                dst.copy_from_slice(&self.carry);
-                self.carry.clear();
-                #[allow(clippy::cast_possible_truncation)]
-                let start = write_offset as u64;
-                start
-            } else if self.next_seq == 0 {
-                // Run 0: BAM header starts at block.offset (the first byte of the
-                // run's data).  In the real pipeline block.offset == FRONT_REGION
-                // (since ReadBlocks reserves the front region first), but in unit
-                // tests the arena may be laid out without the front region.
-                block.offset
-            } else {
-                // Non-first run, no carry: records start at FRONT_REGION.
-                #[allow(clippy::cast_possible_truncation)]
-                let start = FRONT_REGION as u64;
-                start
-            };
-
-            self.arena = Some(Arc::clone(&block.arena));
-            self.scan_start = scan_start;
-            self.scan_cursor = scan_start;
-            // Runs > 0 have no BAM header (it lives only at the very start of input);
-            // their first record is the straddler/`FRONT_REGION` data, so nothing to
-            // skip.  Run 0 must skip the header, which `scan_available` does once
-            // enough blocks have arrived.
-            self.header_skipped = self.next_seq != 0;
-            // Pre-size the ref buffer to the run's upper bound (the arena holds at
-            // most `segment_size` bytes of record data) so the incremental pushes do
-            // not trigger doubling reallocations of a multi-GB `Vec` mid-run.
-            let est = (block.arena.len() / 192).max(1024);
-            self.strategy.reserve_for_run(est);
-        } else {
-            debug_assert_eq!(
-                block.offset, self.run_end,
-                "FindBoundariesAndSort: non-contiguous arena block (expected offset {}, got {})",
-                self.run_end, block.offset
-            );
-        }
-        self.run_end = block_end;
-
-        // Parse every record made complete by the bytes inflated so far, overlapping
-        // the scan with the still-inflating tail of the run (Inflate‖Scan).
-        let run_records = self.scan_available(&block.arena)?;
-
-        if block.is_last_of_run {
-            self.seal_run(block.seals_to_spill, block.run_seq)?;
-        }
-
-        Ok(run_records)
-    }
-
-    /// Parse every record that is fully present in `[scan_cursor, run_end)`, pushing
-    /// a [`RecordRef`] (with its coordinate key extracted inline) for each, and park
-    /// `scan_cursor` at the first record that overruns the bytes inflated so far.
-    ///
-    /// Records are gap-free across block slots (the arena is one contiguous segment
-    /// with prefix-summed offsets), so the cursor walks straight through block
-    /// boundaries — a record that started in block k and continues into block k+1 is
-    /// simply parsed once k+1 has extended `run_end`.  A trailing partial record at
-    /// the *run* boundary is not handled here; it is left in `[scan_cursor, run_end)`
-    /// for `seal_run` to carry (spill) or reject (truncated residual).
-    ///
-    /// For run 0, the BAM header is skipped first; if the header is not yet fully
-    /// inflated (`bam_header_len` returns `None`), the scan returns and retries on the
-    /// next block.
-    ///
-    /// Returns the number of record boundaries found by this call (0 when the
-    /// scan made no progress, e.g. waiting on more of a straddling record or the
-    /// BAM header).
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidData` `io::Error` on a `block_size` value that
-    /// overflows `u32` or is shorter than a BAM record's 32 fixed bytes.
-    fn scan_available(&mut self, arena: &PooledSegmentedBuf) -> io::Result<u64> {
-        let scan_start = self.scan_start;
-        let scan_start_usize = usize::try_from(scan_start).expect("scan_start must fit in usize");
-        let run_end_usize = usize::try_from(self.run_end).expect("run_end must fit in usize");
-        let avail_len = run_end_usize.checked_sub(scan_start_usize).expect("run_end >= scan_start");
-
-        // Borrow the bytes inflated so far for this run directly from the arena — NO
-        // copy.  The whole run lives in one segment, so this single slice spans
-        // `[scan_start, run_end)` and is re-taken (cheaply) as `run_end` grows.
-        let span = arena.slice(scan_start_usize, avail_len);
-
-        // Run 0: skip the BAM header once it is fully present.  A many-reference
-        // header can exceed one BGZF block, so `None` means "wait for more blocks",
-        // NOT an error (the error is raised at seal if the header never completes).
-        if !self.header_skipped {
-            // `?` surfaces a wrong-magic stream as an error here; `Ok(None)` still
-            // means "header not fully inflated yet — wait for more blocks".
-            match bam_header_len(span)? {
-                Some(h) => {
-                    self.scan_cursor = scan_start + h as u64;
-                    self.header_skipped = true;
-                }
-                None => return Ok(0),
-            }
-        }
-
-        // Parse complete `[block_size(4)][body]` frames from the cursor, extracting
-        // the coordinate key inline (the body is already resident in `span`).
-        let mut cur = usize::try_from(self.scan_cursor - scan_start)
-            .expect("cursor offset within run fits in usize");
-        let mut run_records: u64 = 0;
-        loop {
-            if cur + 4 > span.len() {
-                // Not even a full 4-byte length prefix present yet — wait.
-                break;
-            }
-            let bs = u32::from_le_bytes([span[cur], span[cur + 1], span[cur + 2], span[cur + 3]])
-                as usize;
-            if cur + 4 + bs > span.len() {
-                // Record body not fully inflated yet — wait for the next block.
-                break;
-            }
-            // A frame shorter than the 32 fixed BAM bytes cannot be a record, and
-            // every strategy's key extractor indexes those fields.
-            if bs < MIN_BAM_RECORD_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "FindBoundariesAndSort: block_size {bs} is shorter than a BAM record \
-                         ({MIN_BAM_RECORD_LEN} bytes)"
-                    ),
-                ));
-            }
-            // Software-prefetch a few records ahead to hide the cold-arena miss
-            // latency of this forward scan.
-            let pf = cur + KEY_PREFETCH_DISTANCE;
-            if pf < span.len() {
-                prefetch_read_l1(&span[pf]);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let body_arena_off = scan_start + cur as u64 + 4;
-            let bs_u32 = u32::try_from(bs).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("FindBoundariesAndSort: block_size {bs} overflows u32"),
-                )
-            })?;
-            self.strategy.push_record(&span[cur + 4..cur + 4 + bs], body_arena_off, bs_u32)?;
-            cur += 4 + bs;
-            run_records += 1;
-        }
-        self.scan_cursor = scan_start + cur as u64;
-        self.total_records += run_records;
-        Ok(run_records)
-    }
-
-    /// Seal the current run: finalize the trailing carry, sort the refs accumulated
-    /// incrementally by [`scan_available`](Self::scan_available), and stage a `Spill`
-    /// or `Residual` event.
-    ///
-    /// By the time this is called, `scan_available` has already run for the run's last
-    /// block (in `ingest_block`), so every complete record is in `self.refs` and
-    /// `scan_cursor` is parked at the start of the trailing partial record (if any).
-    /// `[scan_cursor, run_end)` is therefore exactly that partial record:
-    /// - for a mid-stream (spill) seal it becomes the straddler carry for the next run;
-    /// - for the final (residual) seal it MUST be empty — a non-empty tail means the
-    ///   BAM ended mid-record (truncated/malformed), surfaced as a hard error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `io::Error` if run 0's header never fully arrived, on a truncated
-    /// final record, or if the carry exceeds `FRONT_REGION`.
-    fn seal_run(&mut self, seals_to_spill: bool, run_seq: u32) -> io::Result<()> {
-        let arena = self.arena.take().expect("seal_run called with no arena");
-
-        // Run 0's header must have been skipped by now; if `scan_available` never
-        // managed it, the input is too short to contain a valid BAM header.
-        if !self.header_skipped {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FindBoundariesAndSort: input too short to contain a valid BAM header",
-            ));
-        }
-
-        // The trailing partial record, if any, is `[scan_cursor, run_end)`.
-        let scan_cursor_usize =
-            usize::try_from(self.scan_cursor).expect("scan_cursor must fit in usize");
-        let run_end_usize = usize::try_from(self.run_end).expect("run_end must fit in usize");
-        let tail_len =
-            run_end_usize.checked_sub(scan_cursor_usize).expect("run_end >= scan_cursor");
-
-        if seals_to_spill {
-            // Mid-stream seal → the tail is the straddler carry for the next run.
-            if tail_len > 0 {
-                let tail = arena.slice(scan_cursor_usize, tail_len);
-                if tail_len > FRONT_REGION {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "FindBoundariesAndSort: carry ({tail_len} bytes) exceeds FRONT_REGION \
-                             ({FRONT_REGION}); record exceeds max straddler size — \
-                             raise --max-memory"
-                        ),
-                    ));
-                }
-                self.carry.extend_from_slice(tail);
-            }
-        } else if tail_len > 0 {
-            // Final (residual) run with a leftover tail → truncated/malformed BAM.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated BAM: final record incomplete at end of input",
-            ));
-        }
-
-        // Sort the refs accumulated across this run's blocks and wrap the arena into
-        // the erased chunk — no record copies (keys were extracted during the scan).
-        let chunk = seal_under_cap(
-            &mut self.strategy,
-            self.radix_cap.as_deref(),
-            Arc::clone(&arena),
-            self.sort_threads,
-        )?;
-
-        // Verify ReadBlocks and FindBoundariesAndSort are in lockstep on run
-        // sequencing.  A desync here indicates a bug in the pipeline wiring (e.g.
-        // ReadBlocks emitting the wrong seq on an is_last_of_run block).
-        debug_assert_eq!(
-            run_seq, self.next_seq,
-            "ReadBlocks run_seq desynced from FindBoundariesAndSort seq counter"
-        );
-
-        let seq = self.next_seq;
-        self.next_seq += 1;
-
-        if seals_to_spill {
-            // Mid-stream sealed run → disk spill.
-            debug_assert!(
-                !self.finalized,
-                "FindBoundariesAndSort: Spill emitted after finalization"
-            );
-            self.pending.push_back(SortChunkEvent::Spill {
-                seq,
-                chunk,
-                records_ingested_so_far: self.total_records,
-            });
-            self.spilled_run_count += 1;
-        } else {
-            // Final (residual) run.  A non-empty carry here means the BAM ends
-            // mid-record — the file is truncated or malformed.  We must surface
-            // this as a hard error in all build profiles: a debug_assert! would
-            // silently drop the partial record in release builds.
-            if !self.carry.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated BAM: final record incomplete at end of input",
-                ));
-            }
-            self.pending.push_back(SortChunkEvent::Residual {
-                chunk,
-                records_ingested_so_far: self.total_records,
-            });
-            self.pending.push_back(SortChunkEvent::AllAnnounced {
-                slot_count: self.spilled_run_count,
-                memory_chunk_count: 1,
-                total_records: self.total_records,
-            });
-            self.finalized = true;
-        }
-
-        // Reset per-run span tracking.  `self.refs` was emptied by `mem::take`; the
-        // next run's first block re-initializes `scan_cursor`/`header_skipped`.
-        self.scan_start = 0;
-        self.run_end = 0;
-        self.scan_cursor = 0;
-        self.header_skipped = false;
-
-        Ok(())
-    }
-
-    /// Called when input is fully drained and no `is_last_of_run` block was received
-    /// (empty pipeline — no arena was ingested at all).  Stages a well-formed
-    /// sentinel so downstream steps can complete.
-    ///
-    /// The "all runs sealed to spills, no residual" branch below is DEFENSIVE: the
-    /// `ReadBlocks` deferred-seal design guarantees the final run is always a
-    /// residual (it seals a spill only once a following block proves a next run
-    /// exists, and downgrades a pending seal to a residual at EOF), so for valid
-    /// input that branch is unreachable.  It is retained as a hard error on a
-    /// non-empty carry so a genuinely truncated BAM (or a future regression in the
-    /// seal logic) surfaces loudly instead of silently dropping a record.
-    ///
-    /// Returns `Some(first_event)` popped from `self.pending`, or `None` if no
-    /// arena was ingested.
-    pub(crate) fn finalize(&mut self) -> io::Result<Option<SortChunkEvent>> {
-        if self.finalized {
-            // Already handled by the last is_last_of_run block — nothing to do.
-            return Ok(self.pending.pop_front());
-        }
-        if self.arena.is_none() && self.next_seq == 0 {
-            // No arena was ever ingested (empty input).
-            return Ok(None);
-        }
-        if self.arena.is_none() && self.next_seq > 0 {
-            // DEFENSIVE / unreachable for valid input: the deferred-seal design
-            // always makes the final run a residual, so we should never finalize
-            // with spills-only-and-no-residual. If we somehow do, a non-empty carry
-            // means the BAM ends mid-record (truncated input or a seal-logic
-            // regression) — surface it as a hard error rather than drop a record.
-            if !self.carry.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated BAM: final record incomplete at end of input (no-residual path)",
-                ));
-            }
-            // Emit AllAnnounced with memory_chunk_count=0 so SortMerge completes.
-            self.pending.push_back(SortChunkEvent::AllAnnounced {
-                slot_count: self.spilled_run_count,
-                memory_chunk_count: 0,
-                total_records: self.total_records,
-            });
-            self.finalized = true;
-            return Ok(self.pending.pop_front());
-        }
-        // Edge case: arena present but no is_last_of_run seen — treat as residual.
-        if self.arena.is_some() {
-            self.seal_run(false, self.next_seq)?;
-        }
-        Ok(self.pending.pop_front())
-    }
-
-    fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
-        // `true` once the slot is clear (was empty, or the held event flushed);
-        // `false` while it's still held under backpressure. Uses the canonical
-        // re-hold helper so the put-back-on-reject invariant lives in one place.
-        !matches!(ctx.outputs.retry_held(&mut self.held), HeldRetry::StillHeld)
-    }
-
-    fn emit_pending(&mut self, ctx: &mut StepCtx<'_, Self>) -> StepOutcome {
-        let Some(event) = self.pending.pop_front() else {
-            return StepOutcome::NoProgress;
-        };
-        match ctx.outputs.push(event) {
-            Ok(()) => StepOutcome::Progress,
-            Err(unpushed) => {
-                self.held.put(unpushed);
-                StepOutcome::Progress
-            }
-        }
-    }
-}
-
-impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
-    type Input = InflatedBlock;
-    type Outputs = Single<SortChunkEvent>;
-
-    fn profile(&self) -> StepProfile {
-        StepProfile {
-            name: "FindBoundariesAndSort",
-            // Off-pool on the coordination driver (N+2): the serial boundary scan
-            // + radix sort + seal/spill framing runs on the dedicated coordination
-            // thread, keeping the pool on pure parallel inflate/compress.
-            kind: StepKind::Detached,
-            sticky: false,
-            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
-            branch_ordering: vec![BranchOrdering::None],
-        }
-    }
-
-    fn detached_group(&self) -> DetachedGroup {
-        DetachedGroup::Shared(crate::sort::SORT_COORD_GROUP)
-    }
-
-    fn counters(&self) -> &'static [CounterSpec] {
-        const SPECS: &[CounterSpec] = &[CounterSpec::new("records", "records")];
-        SPECS
-    }
-
-    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        // Retry any held output first (backpressure path).
-        if !self.flush_held(ctx) {
-            return Ok(StepOutcome::Contention);
-        }
-
-        // Drain any staged pending events before processing new input.
-        if !self.pending.is_empty() {
-            return Ok(self.emit_pending(ctx));
-        }
-
-        // If already finalized, drain pending or finish.
-        if self.finalized {
-            return Ok(StepOutcome::Finished);
-        }
-
-        // Try to pop and ingest one InflatedBlock.
-        if let Some(block) = ctx.input.pop() {
-            // Batch total for this call: one bump per `try_run`, from the scan's
-            // own record count rather than a per-record loop.
-            let n_records = self.ingest_block(&block)?;
-            ctx.counters.add(FIND_BOUNDARIES_AND_SORT_RECORDS, n_records);
-            // If ingest_block sealed a run it may have staged events; drain them.
-            if !self.pending.is_empty() {
-                return Ok(self.emit_pending(ctx));
-            }
-            return Ok(StepOutcome::Progress);
-        }
-
-        // No input available.
-        if !ctx.input.is_drained() {
-            return Ok(StepOutcome::NoProgress);
-        }
-
-        // Input fully drained: finalize (handles empty-input edge case).
-        if let Some(first_event) = self.finalize()? {
-            match ctx.outputs.push(first_event) {
-                Ok(()) => {
-                    // The push landed, so `held` is empty: it is safe to drain the
-                    // next staged event this call (e.g. `AllAnnounced` after
-                    // `Residual`).  `emit_pending` will itself hold on a full queue.
-                    if !self.pending.is_empty() {
-                        return Ok(self.emit_pending(ctx));
-                    }
-                }
-                Err(unpushed) => {
-                    // The output queue is full: hold `first_event` and retry it on
-                    // the next `try_run` via `flush_held`.  Do NOT drain `pending`
-                    // here — pushing a later event now would place it ahead of the
-                    // still-held one, and a subsequent hold would clobber the held
-                    // event (silent loss).  Keep the one-event-per-call invariant
-                    // exactly like the normal path above.
-                    self.held.put(unpushed);
-                }
-            }
-            return Ok(StepOutcome::Progress);
-        }
-
-        // No arena was ingested (empty input).
-        Ok(StepOutcome::Finished)
-    }
-
-    fn new_worker_copy(&self) -> Self {
-        Self {
-            radix_cap: self.radix_cap.clone(),
-            ..Self::new(self.strategy.fresh(), self.sort_threads, self.output_byte_limit)
-        }
-    }
-
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.radix_cap.as_deref()
+    fn ref_width(&self) -> Option<usize> {
+        Some(size_of::<QnRef>())
     }
 }
 
@@ -1804,7 +1457,7 @@ impl<S: ArenaSortStrategy> Step for FindBoundariesAndSort<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_sort::{CoordinateChunkSorter, PooledSegmentedBuf, SegmentedBuf};
+    use fgumi_sort::{PooledSegmentedBuf, SegmentedBuf};
     use rstest::rstest;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1893,7 +1546,7 @@ mod tests {
 
     #[test]
     fn read_blocks_runs_off_pool_on_the_coordination_driver() {
-        let step = ReadBlocks::new(1 << 20, 4096);
+        let step = ReadBlocks::new(1 << 20, 4096, RunLedger::new(Some(0)));
         let profile = step.profile();
         assert_eq!(profile.name, "ReadBlocks");
         // Detached keeps the serial arena-admit off a pool worker so it cannot
@@ -1932,7 +1585,6 @@ mod tests {
     #[test]
     fn coordinate_strategy_accumulates_refs_and_seal_drains_them() {
         let mut strategy = CoordinateStrategy::new(4);
-        strategy.reserve_for_run(8);
 
         // Two synthetic record bodies; only the leading tid/pos fields are read
         // by the inline key extractor, so a minimal fixed-size body suffices.
@@ -1944,18 +1596,6 @@ mod tests {
         let chunk = strategy.seal(test_arena(), 1);
         assert!(matches!(chunk, MemoryChunkErased::Coordinate(_)), "coordinate seal");
         assert!(strategy.refs.is_empty(), "seal must drain the accumulator for the next run");
-    }
-
-    #[test]
-    fn coordinate_strategy_fresh_keeps_config_and_drops_accumulated_state() {
-        let mut strategy = CoordinateStrategy::new(9);
-        let body = vec![0u8; 36];
-        strategy.push_record(&body, 0, 36).unwrap();
-        assert!(!strategy.refs.is_empty());
-
-        let next = strategy.fresh();
-        assert_eq!(next.n_ref, 9, "reference count is configuration and is carried over");
-        assert!(next.refs.is_empty(), "a fresh strategy starts a new run with no refs");
     }
 
     /// Read the BGZF footer ISIZE field (last 4 bytes of the block), which is
@@ -1992,7 +1632,7 @@ mod tests {
         let payload = b"deferred-block-payload";
         let bytes = make_test_bgzf_block(payload);
         let isz = u32::try_from(uncompressed_size_of(&bytes)).unwrap();
-        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024, RunLedger::new(Some(0)));
         let probe = StepProbe::new(&step);
         let stolen = step.pool.try_acquire().expect("the pool's one arena");
         probe.push_input(BgzfBlock {
@@ -2026,7 +1666,7 @@ mod tests {
         let isz1 = uncompressed_size_of(&blk1);
 
         // memory_limit larger than both blocks combined → single run
-        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(64 * 1024 * 1024, 64 * 1024 * 1024, RunLedger::new(Some(0)));
         assert!(
             step.admit_block(BgzfBlock {
                 batch_serial: 0,
@@ -2070,6 +1710,37 @@ mod tests {
         assert!(Arc::ptr_eq(&emitted[0].arena, &emitted[1].arena));
     }
 
+    /// Each run's arena cap leaves room for its refs: run 0 is charged at the
+    /// run-0 prior (258 B/record) and the configured width, run 1 at run 0's
+    /// exact mean record size. The expected caps are computed here from the
+    /// fixture, not by `run_cap_for`.
+    #[test]
+    fn read_blocks_seals_at_the_charged_cap() {
+        let memory_limit = 100_000usize;
+        let width = 40usize;
+        let ledger = crate::sort::RunLedger::new(Some(width));
+        let mut step = ReadBlocks::new(memory_limit, 64 * 1024 * 1024, Arc::clone(&ledger));
+        // Four 250-byte "records" per 1000-byte block.
+        let payload = vec![7u8; 1000];
+        let block = |serial| BgzfBlock {
+            batch_serial: serial,
+            bytes: make_test_bgzf_block(&payload).into(),
+            uncompressed_size: 1000,
+            index: None,
+        };
+        assert!(step.admit_block(block(0)).is_ok());
+        assert_eq!(step.run_cap, memory_limit * 258 / (258 + width), "run 0: the prior");
+        assert!(step.admit_block(block(1)).is_ok());
+        step.seal_run(true);
+        drop(step.emit.drain(..).collect::<Vec<_>>());
+        // The run sort publishes run 0's exact totals before its chunk frees the arena.
+        let (run0_bytes, run0_records) = (2000u64, 8u64);
+        ledger.publish_seal(run0_bytes, run0_records);
+        assert!(step.admit_block(block(2)).is_ok());
+        let m = usize::try_from(run0_bytes / run0_records).unwrap();
+        assert_eq!(step.run_cap, memory_limit * m / (m + width), "run 1: run 0's mean");
+    }
+
     /// Feed enough blocks to force TWO runs.
     ///
     /// Asserts:
@@ -2106,7 +1777,7 @@ mod tests {
         // budget (FRONT_REGION + run_cap + one block), so all tiny test blocks
         // still fit in one segment per run.
         let run_cap = isz0 + isz1;
-        let mut step = ReadBlocks::new(run_cap, 64 * 1024 * 1024);
+        let mut step = ReadBlocks::new(run_cap, 64 * 1024 * 1024, RunLedger::new(Some(0)));
 
         // Admit run 0 blocks.
         assert!(
@@ -2248,447 +1919,6 @@ mod tests {
         );
     }
 
-    /// Build a minimal valid BAM record body (no `block_size` prefix) with the given
-    /// ref\_id/pos and a one-character read name `name`.  Returns the body bytes.
-    ///
-    /// Copied verbatim from `crates/fgumi-sort/src/ref_sort.rs`'s test module
-    /// (the `(i32, i32, u8)` version) so tests in this crate can construct
-    /// identical records without a cross-crate dependency on a `#[cfg(test)]`
-    /// helper.
-    fn coord_body(ref_id: i32, pos: i32, name: u8) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&ref_id.to_le_bytes());
-        b.extend_from_slice(&pos.to_le_bytes());
-        b.push(2); // l_read_name (incl NUL): "<name>\0"
-        b.push(0); // mapq
-        b.extend_from_slice(&0u16.to_le_bytes()); // bin
-        b.extend_from_slice(&0u16.to_le_bytes()); // n_cigar_op
-        b.extend_from_slice(&0u16.to_le_bytes()); // flag (forward)
-        b.extend_from_slice(&0u32.to_le_bytes()); // l_seq
-        b.extend_from_slice(&(-1i32).to_le_bytes()); // next_refID
-        b.extend_from_slice(&(-1i32).to_le_bytes()); // next_pos
-        b.extend_from_slice(&0i32.to_le_bytes()); // tlen
-        b.push(name); // read_name char
-        b.push(0); // read_name NUL terminator
-        b
-    }
-
-    /// Build a minimal BAM binary header parseable by `bam_header_len`.
-    ///
-    /// Layout: `magic(4) + l_text=0(4) + n_ref(4)` followed by `n_ref` entries of
-    /// `l_name=2(4) + "r\0"(2) + l_ref=100(4)`.
-    fn minimal_bam_header(n_ref: u32) -> Vec<u8> {
-        let mut h = Vec::new();
-        h.extend_from_slice(b"BAM\x01"); // magic
-        h.extend_from_slice(&0u32.to_le_bytes()); // l_text = 0
-        h.extend_from_slice(&n_ref.to_le_bytes()); // n_ref
-        for _ in 0..n_ref {
-            h.extend_from_slice(&2u32.to_le_bytes()); // l_name = 2
-            h.push(b'r');
-            h.push(0); // name "r\0"
-            h.extend_from_slice(&100u32.to_le_bytes()); // l_ref = 100
-        }
-        h
-    }
-
-    /// Oracle test: `FindBoundariesAndSort` emitted chunk must be byte-identical to
-    /// the copy-based `CoordinateChunkSorter` over the same record bodies.
-    #[allow(unsafe_code)]
-    #[test]
-    fn find_boundaries_and_sort_single_run_matches_oracle() {
-        let n_ref = 4u32;
-        // Records deliberately out of coordinate order; distinct names witness stability.
-        let recs = vec![
-            coord_body(2, 100, b'a'),
-            coord_body(0, 50, b'b'),
-            coord_body(2, 10, b'c'),
-            coord_body(0, 50, b'd'), // coordinate tie with b'b' → stable sort keeps b before d
-            coord_body(1, 999, b'e'),
-        ];
-
-        // Build an arena: [BAM header][[block_size][body]...] as one contiguous run.
-        let header = minimal_bam_header(n_ref);
-        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-        arena.reserve_full_capacity();
-
-        // SAFETY: every slot fully written before any read.
-        let h_off = unsafe { arena.grow_uninit(header.len()) };
-        unsafe { arena.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
-        // h_off is usize; on 64-bit targets usize fits in u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let run_start = h_off as u64;
-
-        for r in &recs {
-            let bs = u32::try_from(r.len()).unwrap();
-            let po = unsafe { arena.grow_uninit(4) };
-            unsafe { arena.slice_mut(po, 4) }.copy_from_slice(&bs.to_le_bytes());
-            let bo = unsafe { arena.grow_uninit(r.len()) };
-            unsafe { arena.slice_mut(bo, r.len()) }.copy_from_slice(r);
-        }
-        // arena.len() is usize; usize fits in u64 on 64-bit targets.
-        #[allow(clippy::cast_possible_truncation)]
-        let run_len = arena.len() as u64 - run_start;
-        let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
-
-        // Drive ingest_block + finalize directly (the test seam).
-        let mut step =
-            FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, 64 * 1024 * 1024);
-        step.ingest_block(&InflatedBlock {
-            arena: Arc::clone(&arena),
-            ordinal: 0,
-            offset: run_start,
-            len: u32::try_from(run_len).unwrap(),
-            is_last_of_run: true,
-            run_seq: 0,
-            seals_to_spill: false,
-        })
-        .expect("ingest_block must succeed");
-        let ev = step.finalize().expect("finalize must succeed").expect("residual event");
-
-        let chunk_bytes: Vec<Vec<u8>> = match ev {
-            SortChunkEvent::Residual { chunk: MemoryChunkErased::Coordinate(c), .. } => {
-                (0..c.len()).map(|i| c.record_bytes(i).to_vec()).collect()
-            }
-            _ => panic!("expected Residual coordinate chunk, got something else"),
-        };
-
-        // Oracle: copy-based in-memory coordinate sort of the same record bodies.
-        let mut oracle = CoordinateChunkSorter::for_test(usize::MAX, n_ref);
-        for r in &recs {
-            let _ = oracle.push(r).unwrap();
-        }
-        let oc = oracle.take_sorted_chunk();
-        let oracle_bytes: Vec<Vec<u8>> =
-            (0..oc.len()).map(|i| oc.record_bytes(i).to_vec()).collect();
-
-        assert_eq!(
-            chunk_bytes, oracle_bytes,
-            "arena-scan single-run sort must be byte-identical to the copy-based sorter"
-        );
-    }
-
-    /// A frame whose `block_size` is below the 32 fixed BAM bytes cannot be a
-    /// record: the scan rejects it with `InvalidData` before any strategy's key
-    /// extractor indexes its fixed fields.
-    #[allow(unsafe_code)]
-    #[test]
-    fn scan_rejects_a_frame_shorter_than_a_bam_record() {
-        let header = minimal_bam_header(1);
-        let recs = [coord_body(0, 50, b'a'), vec![0u8; 12]];
-        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-        arena.reserve_full_capacity();
-        // SAFETY: every slot fully written before any read.
-        let h_off = unsafe { arena.grow_uninit(header.len()) };
-        unsafe { arena.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
-        #[allow(clippy::cast_possible_truncation)]
-        let run_start = h_off as u64;
-        for r in &recs {
-            let bs = u32::try_from(r.len()).unwrap();
-            let po = unsafe { arena.grow_uninit(4) };
-            unsafe { arena.slice_mut(po, 4) }.copy_from_slice(&bs.to_le_bytes());
-            let bo = unsafe { arena.grow_uninit(r.len()) };
-            unsafe { arena.slice_mut(bo, r.len()) }.copy_from_slice(r);
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let run_len = arena.len() as u64 - run_start;
-        let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
-        let mut step = FindBoundariesAndSort::new(CoordinateStrategy::new(1), 1, 64 * 1024 * 1024);
-        let err = step
-            .ingest_block(&InflatedBlock {
-                arena: Arc::clone(&arena),
-                ordinal: 0,
-                offset: run_start,
-                len: u32::try_from(run_len).unwrap(),
-                is_last_of_run: true,
-                run_seq: 0,
-                seals_to_spill: false,
-            })
-            .expect_err("a 12-byte frame must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("block_size 12 is shorter than a BAM record"), "{err}");
-    }
-
-    /// Two-run straddler test: a record that spans the boundary between run 0 and
-    /// run 1 must appear as record 0 of run 1's chunk with bytes equal to
-    /// `carry ++ head` (the full original record), and the merged union of both
-    /// runs (stable, lower-run first) must equal the oracle (`CoordinateChunkSorter`
-    /// over the same records in input order).
-    ///
-    /// Test layout:
-    /// - Run 0 arena (no `FRONT_REGION` prefix — built manually like the oracle test):
-    ///   `[header][rec0_prefix+body][rec1_prefix+body][straddler_prefix+partial_body]`
-    ///   The straddler record's `block_size` prefix PLUS the first few body bytes land
-    ///   in run 0; the rest of the body starts at `FRONT_REGION` in run 1's arena.
-    /// - Run 1 arena: `FRONT_REGION` uninit bytes reserved, then `straddler_tail +
-    ///   rec2_prefix + body`.
-    ///   `FindBoundariesAndSort` writes the carry into `[FRONT_REGION - L, FRONT_REGION)`,
-    ///   so `carry ++ straddler_tail` is contiguous and forms the complete record.
-    #[allow(unsafe_code)]
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn find_boundaries_and_sort_two_run_straddler() {
-        let n_ref = 2u32;
-        let seg_size = 256 * 1024 * 1024usize;
-
-        // Records: rec0 + rec1 go into run 0 (complete); straddler goes across
-        // the boundary; rec2 goes into run 1 (complete).
-        let rec0 = coord_body(0, 10, b'a');
-        let rec1 = coord_body(1, 20, b'b');
-        let straddler = coord_body(0, 5, b'c'); // will be straddled across runs
-        let rec2 = coord_body(1, 5, b'd');
-
-        let all_recs = vec![&rec0, &rec1, &straddler, &rec2];
-
-        // -----------------------------------------------------------------------
-        // Build run 0 arena: [header][rec0][rec1][straddler_prefix+partial_body]
-        // We use the same manual layout as the oracle test (no FRONT_REGION prefix).
-        // -----------------------------------------------------------------------
-        let header = minimal_bam_header(n_ref);
-
-        let mut arena0 = SegmentedBuf::with_capacity(0, seg_size);
-        arena0.reserve_full_capacity();
-
-        // Write header.
-        let h_off = unsafe { arena0.grow_uninit(header.len()) };
-        unsafe { arena0.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
-
-        // Write rec0 (prefix + body) — complete.
-        let bs0 = u32::try_from(rec0.len()).unwrap();
-        let po = unsafe { arena0.grow_uninit(4) };
-        unsafe { arena0.slice_mut(po, 4) }.copy_from_slice(&bs0.to_le_bytes());
-        let bo = unsafe { arena0.grow_uninit(rec0.len()) };
-        unsafe { arena0.slice_mut(bo, rec0.len()) }.copy_from_slice(&rec0);
-
-        // Write rec1 (prefix + body) — complete.
-        let bs1 = u32::try_from(rec1.len()).unwrap();
-        let po = unsafe { arena0.grow_uninit(4) };
-        unsafe { arena0.slice_mut(po, 4) }.copy_from_slice(&bs1.to_le_bytes());
-        let bo = unsafe { arena0.grow_uninit(rec1.len()) };
-        unsafe { arena0.slice_mut(bo, rec1.len()) }.copy_from_slice(&rec1);
-
-        // Write straddler prefix (4-byte block_size) + partial body.
-        // Split: put the 4-byte prefix + first 3 bytes of body in run 0.
-        let bs_str = u32::try_from(straddler.len()).unwrap();
-        let partial_len = 3usize; // bytes of straddler body in run 0
-        assert!(partial_len < straddler.len(), "partial_len must be < straddler body size");
-        let po = unsafe { arena0.grow_uninit(4) };
-        unsafe { arena0.slice_mut(po, 4) }.copy_from_slice(&bs_str.to_le_bytes());
-        let bp = unsafe { arena0.grow_uninit(partial_len) };
-        unsafe { arena0.slice_mut(bp, partial_len) }.copy_from_slice(&straddler[..partial_len]);
-
-        // run 0 span: from header offset (0) to end of arena.
-        let run0_start = h_off as u64;
-        let run0_end = arena0.len() as u64;
-        let run0_len = usize::try_from(run0_end - run0_start).unwrap();
-
-        let arena0 = Arc::new(PooledSegmentedBuf::unpooled(arena0));
-
-        // -----------------------------------------------------------------------
-        // Build run 1 arena: [FRONT_REGION uninit][straddler_tail][rec2 prefix+body]
-        // -----------------------------------------------------------------------
-        let mut arena1 = SegmentedBuf::with_capacity(0, seg_size);
-        arena1.reserve_full_capacity();
-
-        // Reserve the FRONT_REGION prefix (uninit — the carry will be written here
-        // by FindBoundariesAndSort).
-        let _front = unsafe { arena1.grow_uninit(FRONT_REGION) };
-        assert_eq!(arena1.len(), FRONT_REGION);
-
-        // Write straddler tail (remaining body bytes) at FRONT_REGION.
-        let tail_len = straddler.len() - partial_len;
-        let st_off = unsafe { arena1.grow_uninit(tail_len) };
-        assert_eq!(st_off, FRONT_REGION, "straddler tail must start at FRONT_REGION");
-        unsafe { arena1.slice_mut(st_off, tail_len) }.copy_from_slice(&straddler[partial_len..]);
-
-        // Write rec2 (prefix + body) — complete.
-        let bs2 = u32::try_from(rec2.len()).unwrap();
-        let po = unsafe { arena1.grow_uninit(4) };
-        unsafe { arena1.slice_mut(po, 4) }.copy_from_slice(&bs2.to_le_bytes());
-        let bo = unsafe { arena1.grow_uninit(rec2.len()) };
-        unsafe { arena1.slice_mut(bo, rec2.len()) }.copy_from_slice(&rec2);
-
-        // run 1 spans from FRONT_REGION (the inflate data, not the front region).
-        let run1_data_start = FRONT_REGION as u64;
-        let run1_data_end = arena1.len() as u64;
-        let run1_data_len = usize::try_from(run1_data_end - run1_data_start).unwrap();
-
-        let arena1 = Arc::new(PooledSegmentedBuf::unpooled(arena1));
-
-        // -----------------------------------------------------------------------
-        // Drive FindBoundariesAndSort across both runs.
-        // -----------------------------------------------------------------------
-        let mut fbs =
-            FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, 64 * 1024 * 1024);
-
-        // Run 0: one block, is_last_of_run = true, seals_to_spill = true.
-        fbs.ingest_block(&InflatedBlock {
-            arena: Arc::clone(&arena0),
-            ordinal: 0,
-            offset: run0_start,
-            len: u32::try_from(run0_len).unwrap(),
-            is_last_of_run: true,
-            run_seq: 0,
-            seals_to_spill: true,
-        })
-        .expect("run 0 ingest must succeed");
-
-        // After run 0's last block, a Spill event must be staged.
-        assert_eq!(fbs.pending.len(), 1, "run 0 must stage exactly one Spill event");
-        let ev0 = fbs.pending.pop_front().unwrap();
-        let run0_chunk = match ev0 {
-            SortChunkEvent::Spill { seq, chunk: MemoryChunkErased::Coordinate(c), .. } => {
-                assert_eq!(seq, 0, "first Spill must have seq=0");
-                c
-            }
-            _ => panic!("expected Spill(Coordinate) for run 0, got something else"),
-        };
-
-        // Assert run 0's carry: 4 bytes (prefix) + partial_len body bytes.
-        let expected_carry_len = 4 + partial_len;
-        assert_eq!(
-            fbs.carry.len(),
-            expected_carry_len,
-            "carry after run 0 must be {expected_carry_len} bytes (prefix + partial body)"
-        );
-
-        // Run 0 chunk must NOT contain the straddler — only rec0 and rec1.
-        assert_eq!(
-            run0_chunk.len(),
-            2,
-            "run 0 chunk must have exactly 2 complete records (rec0, rec1)"
-        );
-
-        // Run 1: one block, is_last_of_run = true, seals_to_spill = false.
-        fbs.ingest_block(&InflatedBlock {
-            arena: Arc::clone(&arena1),
-            ordinal: 1,
-            offset: run1_data_start,
-            len: u32::try_from(run1_data_len).unwrap(),
-            is_last_of_run: true,
-            run_seq: 1,
-            seals_to_spill: false,
-        })
-        .expect("run 1 ingest must succeed");
-
-        // After run 1's last block, pending has Residual + AllAnnounced.
-        assert_eq!(fbs.pending.len(), 2, "run 1 must stage Residual + AllAnnounced");
-        assert!(fbs.carry.is_empty(), "carry must be empty after the final run");
-
-        let ev_residual = fbs.pending.pop_front().unwrap();
-        let SortChunkEvent::Residual { chunk: MemoryChunkErased::Coordinate(run1_chunk), .. } =
-            ev_residual
-        else {
-            panic!("expected Residual(Coordinate) for run 1, got something else")
-        };
-
-        let ev_announced = fbs.pending.pop_front().unwrap();
-        match ev_announced {
-            SortChunkEvent::AllAnnounced { slot_count, memory_chunk_count, total_records } => {
-                assert_eq!(slot_count, 1, "AllAnnounced: slot_count must be 1 (one spill)");
-                assert_eq!(memory_chunk_count, 1, "AllAnnounced: memory_chunk_count must be 1");
-                assert_eq!(total_records, 4, "AllAnnounced: total_records must be 4");
-            }
-            _ => panic!("expected AllAnnounced, got something else"),
-        }
-
-        // Run 1 chunk: straddler (record 0) + rec2 (record 1) — 2 records.
-        assert_eq!(run1_chunk.len(), 2, "run 1 chunk must have 2 records (straddler + rec2)");
-
-        // Assert straddler is record 0 of run 1's sorted chunk.
-        // The straddler has key (ref_id=0, pos=5) and rec2 has (ref_id=1, pos=5);
-        // coordinate sort orders by ref_id first, so straddler (ref_id=0) comes before
-        // rec2 (ref_id=1).
-        let straddler_bytes = run1_chunk.record_bytes(0).to_vec();
-        assert_eq!(
-            straddler_bytes, straddler,
-            "run 1 record 0 must be the straddler (carry ++ head = full original record)"
-        );
-        let rec2_bytes = run1_chunk.record_bytes(1).to_vec();
-        assert_eq!(rec2_bytes, rec2, "run 1 record 1 must be rec2");
-
-        // -----------------------------------------------------------------------
-        // Oracle check: stable merge of run0 + run1 by coordinate key, lower
-        // source index first (run0 < run1) must equal the oracle over all 4 records.
-        //
-        // Oracle sort order: (ref_id=0,pos=5)=straddler, (ref_id=0,pos=10)=rec0,
-        //   (ref_id=1,pos=5)=rec2, (ref_id=1,pos=20)=rec1.
-        //
-        // Merge gives: run0 records sorted = [rec0(0,10), rec1(1,20)];
-        //              run1 records sorted = [straddler(0,5), rec2(1,5)].
-        // Interleaved lower-run-first stable merge:
-        //   Compare run0[0]=(0,10) vs run1[0]=(0,5): run1 wins → straddler
-        //   Compare run0[0]=(0,10) vs run1[1]=(1,5): run0 wins → rec0
-        //   Compare run0[1]=(1,20) vs run1[1]=(1,5): run1 wins → rec2
-        //   run1 exhausted → run0[1] = rec1
-        // Merge result: [straddler, rec0, rec2, rec1]
-        // -----------------------------------------------------------------------
-        let mut oracle = CoordinateChunkSorter::for_test(usize::MAX, n_ref);
-        for r in &all_recs {
-            let _ = oracle.push(r).unwrap();
-        }
-        let oracle_chunk = oracle.take_sorted_chunk();
-        let oracle_bytes: Vec<Vec<u8>> =
-            (0..oracle_chunk.len()).map(|i| oracle_chunk.record_bytes(i).to_vec()).collect();
-        // Expected oracle order: [(0,5)=straddler, (0,10)=rec0, (1,5)=rec2, (1,20)=rec1]
-        assert_eq!(oracle_bytes[0], straddler, "oracle[0] must be straddler");
-        assert_eq!(oracle_bytes[1], rec0, "oracle[1] must be rec0");
-        assert_eq!(oracle_bytes[2], rec2, "oracle[2] must be rec2");
-        assert_eq!(oracle_bytes[3], rec1, "oracle[3] must be rec1");
-
-        // Collect sorted bytes from both run chunks (run0 first, then run1) via a
-        // manual stable merge that mirrors the merge engine's lower-source-index-first
-        // tie-break.
-        //
-        // run0 sorted: [rec0(0,10), rec1(1,20)]
-        // run1 sorted: [straddler(0,5), rec2(1,5)]
-        let run0_sorted: Vec<Vec<u8>> =
-            (0..run0_chunk.len()).map(|i| run0_chunk.record_bytes(i).to_vec()).collect();
-        let run1_sorted: Vec<Vec<u8>> =
-            (0..run1_chunk.len()).map(|i| run1_chunk.record_bytes(i).to_vec()).collect();
-
-        // Build a merged sequence via coordinate key comparison.
-        // We use the oracle order as the expected merged order (they must match).
-        let mut merged: Vec<Vec<u8>> = Vec::with_capacity(4);
-        let mut i0 = 0usize;
-        let mut i1 = 0usize;
-        while i0 < run0_sorted.len() || i1 < run1_sorted.len() {
-            if i0 >= run0_sorted.len() {
-                merged.push(run1_sorted[i1].clone());
-                i1 += 1;
-            } else if i1 >= run1_sorted.len() {
-                merged.push(run0_sorted[i0].clone());
-                i0 += 1;
-            } else {
-                // Extract coordinate key: ref_id (first i32) and pos (second i32).
-                let key0 = {
-                    let b = &run0_sorted[i0];
-                    let r = i32::from_le_bytes(b[0..4].try_into().unwrap());
-                    let p = i32::from_le_bytes(b[4..8].try_into().unwrap());
-                    (r, p)
-                };
-                let key1 = {
-                    let b = &run1_sorted[i1];
-                    let r = i32::from_le_bytes(b[0..4].try_into().unwrap());
-                    let p = i32::from_le_bytes(b[4..8].try_into().unwrap());
-                    (r, p)
-                };
-                // Stable: on tie, run0 (lower source index) wins.
-                if key1 < key0 {
-                    merged.push(run1_sorted[i1].clone());
-                    i1 += 1;
-                } else {
-                    merged.push(run0_sorted[i0].clone());
-                    i0 += 1;
-                }
-            }
-        }
-
-        assert_eq!(
-            merged, oracle_bytes,
-            "stable merge of run0 + run1 chunks must equal the oracle over all 4 records"
-        );
-    }
-
     #[allow(unsafe_code)]
     #[test]
     fn inflate_writes_decompressed_bytes_into_the_slot() {
@@ -2733,184 +1963,113 @@ mod tests {
         );
     }
 
-    /// Regression coverage for the `FindBoundariesAndSort` `try_run`
-    /// finalize/drained-branch held-overwrite bug.
-    ///
-    /// The bug: on the drained path `try_run` did `push(first_event)` and then,
-    /// in the SAME call, unconditionally drained the rest of `pending` via
-    /// `emit_pending` WITHOUT re-checking `held`.  If the first push is rejected
-    /// (full output queue → `first_event` goes into `held`), the follow-on
-    /// `emit_pending` would push a LATER event (`AllAnnounced`) ahead of the
-    /// still-held `Residual` and then `held.put(...)` it — clobbering the held
-    /// `Residual` (`HeldSlot::put` asserts on a double-put, so it would panic /
-    /// lose the record).  The fix drains `pending` only when the first push
-    /// SUCCEEDED, preserving the one-event-per-call discipline of the normal path.
-    ///
-    /// This test pins the ordering contract `finalize()` hands `try_run`, which is
-    /// exactly what the one-event-per-call fix must emit in order: `Residual`
-    /// FIRST, then `AllAnnounced`, each staged exactly once.  If `finalize()`
-    /// staged them in the wrong order (or duplicated one), the held/retry path in
-    /// `try_run` could not emit a correct stream no matter how careful it is.
-    ///
-    /// Coverage limit: the held-overwrite lived inside `try_run`, which needs a
-    /// backpressuring `StepCtx` (an `OutputHandles<Single<_>>` whose queue rejects
-    /// the first push).  `OutputHandles::new` is `pub(crate)` to
-    /// `fgumi-pipeline-core`, so a rejecting output context cannot be built from
-    /// this crate without editing another crate; the full `try_run` held/retry path
-    /// is exercised end-to-end by the framework-driven tests in `sort/tests.rs`.
-    /// Here we assert the finalize-branch invariant as directly as the in-crate
-    /// seams (`finalize`, `pending`) allow.
-    #[allow(unsafe_code)]
+    /// Lost-wake guard: a release between the refused acquire and the waiter
+    /// registration is caught by the retry, deterministically — the step gets
+    /// its arena without ever waiting.
     #[test]
-    fn finalize_stages_residual_before_all_announced_each_once() {
-        let n_ref = 2u32;
-        // A complete run (header + two whole records, no trailing partial), so
-        // sealing it as a residual leaves an empty carry.
-        let recs = [coord_body(0, 10, b'a'), coord_body(1, 20, b'b')];
-        let header = minimal_bam_header(n_ref);
-        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-        arena.reserve_full_capacity();
-        // SAFETY: every slot fully written before any read.
-        let h_off = unsafe { arena.grow_uninit(header.len()) };
-        unsafe { arena.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
-        #[allow(clippy::cast_possible_truncation)]
-        let run_start = h_off as u64;
-        for r in &recs {
-            let bs = u32::try_from(r.len()).unwrap();
-            let po = unsafe { arena.grow_uninit(4) };
-            unsafe { arena.slice_mut(po, 4) }.copy_from_slice(&bs.to_le_bytes());
-            let bo = unsafe { arena.grow_uninit(r.len()) };
-            unsafe { arena.slice_mut(bo, r.len()) }.copy_from_slice(r);
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let run_len = arena.len() as u64 - run_start;
-        let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
-
-        let mut step =
-            FindBoundariesAndSort::new(CoordinateStrategy::new(n_ref), 1, 64 * 1024 * 1024);
-        // Ingest the run WITHOUT `is_last_of_run`, so `ingest_block` does NOT seal:
-        // the seal (and the `Residual` + `AllAnnounced` staging) then happens in
-        // `finalize()` — the path `try_run`'s drained branch drives.
-        step.ingest_block(&InflatedBlock {
-            arena: Arc::clone(&arena),
-            ordinal: 0,
-            offset: run_start,
-            len: u32::try_from(run_len).unwrap(),
-            is_last_of_run: false,
-            run_seq: 0,
-            seals_to_spill: false,
-        })
-        .expect("ingest_block must succeed");
-        assert!(step.pending.is_empty(), "no events staged before finalize");
-
-        // finalize() returns the FIRST event (Residual) and leaves the remainder
-        // staged in `pending`.  This is the one-event-at-a-time hand-off that
-        // `try_run`'s drained branch must respect: emit `first_event`, and only
-        // drain `pending` if that push landed.
-        let first = step.finalize().expect("finalize must succeed").expect("first event present");
+    fn register_then_retry_catches_a_release_in_between() {
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20, RunLedger::new(Some(0)));
+        assert!(step.ensure_arena_for_test(), "the pool's one arena");
+        let held = step.take_arena_for_test().expect("arena");
+        step.before_register_for_test(Box::new(move || drop(held)));
         assert!(
-            matches!(first, SortChunkEvent::Residual { .. }),
-            "finalize must return Residual as the first event"
+            step.ensure_arena_for_test(),
+            "the retry after registering finds the released arena"
         );
-        // Exactly one event remains staged, and it is AllAnnounced (never emitted
-        // ahead of the Residual).
-        assert_eq!(step.pending.len(), 1, "exactly one event remains staged after the Residual");
-        match step.pending.front().expect("AllAnnounced staged") {
-            SortChunkEvent::AllAnnounced { slot_count, memory_chunk_count, .. } => {
-                assert_eq!(*slot_count, 0, "no spills → slot_count 0");
-                assert_eq!(*memory_chunk_count, 1, "one in-memory residual chunk");
-            }
-            _ => panic!("second staged event must be AllAnnounced"),
-        }
-
-        // A subsequent finalize() (mirroring a later drained `try_run` after the
-        // Residual flushed) hands back AllAnnounced, then nothing — proving each
-        // event is produced exactly once and in order.
-        let second = step.finalize().expect("finalize must succeed").expect("AllAnnounced present");
-        assert!(
-            matches!(second, SortChunkEvent::AllAnnounced { .. }),
-            "second finalize must return AllAnnounced"
-        );
-        assert!(step.pending.is_empty(), "no further events staged");
-        assert!(
-            step.finalize().expect("finalize must succeed").is_none(),
-            "no more events after Residual + AllAnnounced"
-        );
+        assert_eq!(step.arena_wait_stats().0, 0, "no wait was recorded");
     }
 
-    /// Runtime proof that `--sort-threads` (Phase 1) controls the actual sort
-    /// worker count, not just that it parses.
-    ///
-    /// The chain builder resolves `--sort-threads` (capped at, and defaulting
-    /// to, `--threads`) into the effective phase-1 count and hands it to
-    /// `FindBoundariesAndSort::new`,
-    /// which forwards it to `strategy.seal(arena, self.sort_threads)`. The
-    /// queryname strategy builds a bounded rayon pool sized to that value and runs
-    /// the per-run comparator sort inside it — so the pool's thread count IS the
-    /// effective Phase-1 concurrency. (The D1.1 regression handed the strategy the
-    /// raw global `--threads` instead, silently ignoring `--sort-threads`.)
-    ///
-    /// `ThreadPool::current_num_threads()` is the fixed pool size, so this is
-    /// deterministic — unlike counting how many workers a given input happens to
-    /// keep busy. Sort output is byte-identical across thread counts, so this pool
-    /// observation is the only way to assert the flag's runtime effect.
-    #[allow(unsafe_code)]
+    /// Wait vs wake latency: the wait spans first refusal → acquire; the wake
+    /// latency spans release → acquire. Refuse, wait ≥ 100 ms, release, wait
+    /// ≥ 30 ms, then acquire.
     #[test]
-    fn phase1_sort_threads_sizes_the_queryname_worker_pool() {
-        use fgumi_sort::RawQuerynameLexKey;
+    fn read_blocks_separates_arena_wait_from_wake_latency() {
+        use std::time::Duration;
+        let mut step = ReadBlocks::new(1 << 16, 1 << 20, RunLedger::new(Some(0)));
+        assert!(step.ensure_arena_for_test());
+        let held = step.take_arena_for_test().expect("arena");
+        assert!(!step.ensure_arena_for_test(), "refused while the arena is held");
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(step.ensure_arena_for_test(), "acquired after the release");
+        let (waits, wait_ns, wake_ns) = step.arena_wait_stats();
+        assert_eq!(waits, 1);
+        assert!(wait_ns >= 130_000_000, "wait {wait_ns} ns");
+        assert!(wake_ns >= 30_000_000, "wake {wake_ns} ns");
+        assert!(wake_ns <= wait_ns - 100_000_000, "wake {wake_ns} ns within wait {wait_ns} ns");
+    }
 
-        for sort_threads in [1usize, 3] {
-            let n_ref = 2u32;
-            let recs = [coord_body(0, 10, b'a'), coord_body(1, 20, b'b')];
-            let header = minimal_bam_header(n_ref);
-            let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-            arena.reserve_full_capacity();
-            // SAFETY: every slot fully written before any read.
-            let h_off = unsafe { arena.grow_uninit(header.len()) };
-            unsafe { arena.slice_mut(h_off, header.len()) }.copy_from_slice(&header);
-            #[allow(clippy::cast_possible_truncation)]
-            let run_start = h_off as u64;
-            for r in &recs {
-                let bs = u32::try_from(r.len()).unwrap();
-                let po = unsafe { arena.grow_uninit(4) };
-                unsafe { arena.slice_mut(po, 4) }.copy_from_slice(&bs.to_le_bytes());
-                let bo = unsafe { arena.grow_uninit(r.len()) };
-                unsafe { arena.slice_mut(bo, r.len()) }.copy_from_slice(r);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let run_len = arena.len() as u64 - run_start;
-            let arena = Arc::new(PooledSegmentedBuf::unpooled(arena));
+    /// Each strategy reports the bytes one of its refs occupies: coordinate 24,
+    /// queryname 40, and template order the provisioned lanes' width — none
+    /// until its first record chooses them.
+    #[rstest]
+    #[case::k24(&[], 40)]
+    #[case::cb32(b"CBZAAAC\0", 48)]
+    #[case::tert32(b"MIZ7\0", 48)]
+    #[case::k40(b"CBZAAAC\0MIZ7\0", 56)]
+    fn strategies_report_their_ref_width(#[case] aux: &[u8], #[case] width: usize) {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        assert_eq!(CoordinateStrategy::new(1).ref_width(), Some(24));
+        let qn = QuerynameStrategy::<fgumi_sort::QnLex>::new(QnSortState::new(false));
+        assert_eq!(qn.ref_width(), Some(40));
+        let header = noodles::sam::Header::default();
+        let mut template =
+            TemplateStrategy::new(fgumi_sort::TemplateArenaAccumulator::from_header(
+                &header,
+                Some(fgumi_raw_bam::SamTag::CB),
+                fgumi_sort::KeyTypesSpec::Auto,
+            ));
+        assert_eq!(template.ref_width(), None, "lanes unknown before the first record");
+        let body = make_bam_bytes(0, 100, 0x63, b"rd_1", &[], 20, 0, 300, aux);
+        let len = u32::try_from(body.len()).unwrap();
+        template.push_record(&body, 0, len).unwrap();
+        assert_eq!(template.ref_width(), Some(width));
+    }
 
-            let mut step = FindBoundariesAndSort::new(
-                QuerynameStrategy::<RawQuerynameLexKey>::new(MemoryChunkErased::QuerynameLex),
-                sort_threads,
-                64 * 1024 * 1024,
-            );
-            assert_eq!(
-                step.strategy().sort_pool_threads(),
-                None,
-                "sort pool is not built until the first seal"
-            );
-            step.ingest_block(&InflatedBlock {
-                arena: Arc::clone(&arena),
-                ordinal: 0,
-                offset: run_start,
-                len: u32::try_from(run_len).unwrap(),
-                is_last_of_run: false,
-                run_seq: 0,
-                seals_to_spill: false,
+    /// The record-input front cannot re-window a batch when it closes (it has
+    /// no arena yet): a failed guess is recorded and applied at seal. The first
+    /// batch is built in class 0, learns `A00132:53:HFHJ:1:`, and comes out of
+    /// the seal in that class; the next batch is built in it directly.
+    #[test]
+    fn queryname_strategy_rewindows_pending_batches_at_seal() {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        use fgumi_sort::{QN_CLASS_BATCH_RECORDS, QnLex, RawQuerynameLexKey, RawSortKey};
+
+        let n = QN_CLASS_BATCH_RECORDS + 100;
+        let bodies: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                let name = format!("A00132:53:HFHJ:1:{}:{}", 1101 + (i * 7919) % 1000, i);
+                make_bam_bytes(0, 0, 0x41, name.as_bytes(), &[], 4, -1, -1, &[])
             })
-            .expect("ingest_block must succeed");
-            // finalize() seals the residual run, which builds + installs the
-            // bounded sort pool sized to `sort_threads`.
-            let _ = step.finalize().expect("finalize must succeed");
-            assert_eq!(
-                step.strategy().sort_pool_threads(),
-                Some(sort_threads),
-                "Phase-1 queryname sort pool must be sized to sort_threads={sort_threads} \
-                 (the value FindBoundariesAndSort was constructed with)"
-            );
+            .collect();
+        let mut arena = SegmentedBuf::new();
+        let keys = QnSortState::new(false);
+        let mut strategy = QuerynameStrategy::<QnLex>::new(keys.clone());
+        for b in &bodies {
+            let off = arena.extend_from_slice(b) as u64;
+            strategy.push_record(b, off, u32::try_from(b.len()).unwrap()).unwrap();
         }
+        let MemoryChunkErased::QuerynameLex(chunk) =
+            strategy.seal(Arc::new(PooledSegmentedBuf::unpooled(arena)), 2)
+        else {
+            panic!("a lex strategy seals a QuerynameLex chunk");
+        };
+        assert_eq!(keys.table.len(), 2, "the first batch learned one class");
+        assert_eq!(keys.table.ecp(1), b"A00132:53:HFHJ:1:");
+        assert!(
+            (0..chunk.len()).all(|i| chunk.key_at(i).class == 1),
+            "every ref, the first batch's included, is in the learned class"
+        );
+        let s = keys.stats.snapshot();
+        assert_eq!((s.batches, s.reclassified, s.class0_refs), (2, 1, 0));
+        let mut want = bodies.clone();
+        want.sort_by(|a, b| {
+            RawQuerynameLexKey::extract_from_record(a)
+                .cmp(&RawQuerynameLexKey::extract_from_record(b))
+        });
+        let got: Vec<Vec<u8>> = (0..chunk.len()).map(|i| chunk.record_bytes(i).to_vec()).collect();
+        assert!(got == want, "the sealed chunk is in owned-key order");
     }
 
     /// Build a one-block `ArenaBlock` over a fresh unpooled arena with its slot
@@ -3035,7 +2194,6 @@ mod tests {
     }
 
     impl ArenaSortStrategy for ActiveProbe {
-        fn reserve_for_run(&mut self, _est_records: usize) {}
         fn push_record(&mut self, _body: &[u8], _body_off: u64, _len: u32) -> io::Result<()> {
             Ok(())
         }
@@ -3050,11 +2208,19 @@ mod tests {
             self.seen.push(SealSeen { threads: sort_threads, active, pool_refused, pool_released });
             MemoryChunkErased::Coordinate(fgumi_sort::InMemoryChunk::default())
         }
+        fn seal_pieces(
+            &mut self,
+            arena: Arc<PooledSegmentedBuf>,
+            sort_threads: usize,
+            _pieces: usize,
+        ) -> Vec<MemoryChunkErased> {
+            vec![self.seal(arena, sort_threads)]
+        }
         fn sorts_in_parallel(&self, _sort_threads: usize) -> bool {
             self.parallel
         }
-        fn fresh(&self) -> Self {
-            Self::new(&self.cap, self.parallel)
+        fn ref_width(&self) -> Option<usize> {
+            Some(0)
         }
     }
 

@@ -179,62 +179,90 @@ pub fn natural_compare(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 #[allow(unsafe_code)]
 pub unsafe fn natural_compare_nul(a: *const u8, b: *const u8) -> Ordering {
-    let mut pa = a;
-    let mut pb = b;
+    // SAFETY: caller guarantees both pointers are null-terminated, and the walk
+    // reads index `i` of a side only after reading every byte before it as
+    // non-NUL (it advances a side solely past a byte it has just read as a
+    // digit or as a non-NUL byte equal to the other side's), so every read is
+    // at or before that side's terminator.
+    strnum_walk(|i| unsafe { *a.add(i) }, |i| unsafe { *b.add(i) }).0
+}
 
-    // SAFETY: caller guarantees both pointers are null-terminated, so every
-    // dereference below will hit a null byte before going out of bounds.
-    unsafe {
-        while *pa != 0 && *pb != 0 {
-            if !(*pa).is_ascii_digit() || !(*pb).is_ascii_digit() {
-                if *pa != *pb {
-                    return (*pa).cmp(&(*pb));
-                }
-                pa = pa.add(1);
-                pb = pb.add(1);
-            } else {
-                // Skip leading zeros.
-                while *pa == b'0' {
-                    pa = pa.add(1);
-                }
-                while *pb == b'0' {
-                    pb = pb.add(1);
-                }
-                // Skip matching significant digits.
-                while (*pa).is_ascii_digit() && *pa == *pb {
-                    pa = pa.add(1);
-                    pb = pb.add(1);
-                }
-                // Record first differing digit, then count remaining digits.
-                let a_digit = (*pa).is_ascii_digit();
-                let b_digit = (*pb).is_ascii_digit();
-                let diff = i16::from(*pa) - i16::from(*pb);
-                if a_digit && b_digit {
-                    pa = pa.add(1);
-                    pb = pb.add(1);
-                }
-                while (*pa).is_ascii_digit() && (*pb).is_ascii_digit() {
-                    pa = pa.add(1);
-                    pb = pb.add(1);
-                }
-                if (*pa).is_ascii_digit() {
-                    return Ordering::Greater;
-                } else if (*pb).is_ascii_digit() {
-                    return Ordering::Less;
-                } else if diff != 0 {
-                    return if diff > 0 { Ordering::Greater } else { Ordering::Less };
-                }
+/// [`natural_compare_nul`] over slices: the terminator of each side is its first
+/// NUL byte or, when it has none, the slice end. Returns the ordering and the
+/// index each side had reached when the walk decided it — the index of the last
+/// byte read, where `a.len()` (or `b.len()`) means the walk read that side's
+/// virtual terminator. The indices never exceed the slice lengths.
+///
+/// A caller comparing *prefixes* of longer strings uses the indices to tell a
+/// final answer from one that depends on bytes past a prefix: if the walk never
+/// reached a truncated side's end, every byte it read is a real byte of the full
+/// string and the full walk decides the same way.
+#[must_use]
+pub fn natural_cmp_bounded(a: &[u8], b: &[u8]) -> (Ordering, usize, usize) {
+    // The byte at `i`, or the terminator past the end.
+    strnum_walk(|i| a.get(i).copied().unwrap_or(0), |i| b.get(i).copied().unwrap_or(0))
+}
+
+/// samtools' `strnum_cmp` walk, shared by [`natural_compare_nul`] and
+/// [`natural_cmp_bounded`] so the run sort, the merge and the owned keys apply
+/// one state machine. `at_a(i)` / `at_b(i)` are each side's byte `i`, 0 at its
+/// terminator; the walk never asks for an index past a side's terminator.
+/// Returns the ordering and the index each side had reached.
+#[allow(clippy::inline_always)] // each comparator gets its own copy of the hot walk
+#[inline(always)]
+fn strnum_walk(at_a: impl Fn(usize) -> u8, at_b: impl Fn(usize) -> u8) -> (Ordering, usize, usize) {
+    let mut pa = 0;
+    let mut pb = 0;
+    while at_a(pa) != 0 && at_b(pb) != 0 {
+        let (ca, cb) = (at_a(pa), at_b(pb));
+        if !ca.is_ascii_digit() || !cb.is_ascii_digit() {
+            if ca != cb {
+                return (ca.cmp(&cb), pa, pb);
+            }
+            pa += 1;
+            pb += 1;
+        } else {
+            // Skip leading zeros.
+            while at_a(pa) == b'0' {
+                pa += 1;
+            }
+            while at_b(pb) == b'0' {
+                pb += 1;
+            }
+            // Skip matching significant digits.
+            while at_a(pa).is_ascii_digit() && at_a(pa) == at_b(pb) {
+                pa += 1;
+                pb += 1;
+            }
+            // Record the first differing digit, then count the remaining digits.
+            let a_digit = at_a(pa).is_ascii_digit();
+            let b_digit = at_b(pb).is_ascii_digit();
+            let diff = i16::from(at_a(pa)) - i16::from(at_b(pb));
+            if a_digit && b_digit {
+                pa += 1;
+                pb += 1;
+            }
+            while at_a(pa).is_ascii_digit() && at_b(pb).is_ascii_digit() {
+                pa += 1;
+                pb += 1;
+            }
+            if at_a(pa).is_ascii_digit() {
+                return (Ordering::Greater, pa, pb);
+            } else if at_b(pb).is_ascii_digit() {
+                return (Ordering::Less, pa, pb);
+            } else if diff != 0 {
+                return (if diff > 0 { Ordering::Greater } else { Ordering::Less }, pa, pb);
             }
         }
-
-        if *pa != 0 {
-            Ordering::Greater
-        } else if *pb != 0 {
-            Ordering::Less
-        } else {
-            Ordering::Equal
-        }
     }
+    let ord = if at_a(pa) != 0 {
+        Ordering::Greater
+    } else if at_b(pb) != 0 {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    };
+    (ord, pa, pb)
 }
 
 #[cfg(test)]
@@ -288,6 +316,66 @@ mod tests {
     #[case(b"SRR1.9", b"SRR1.10", Ordering::Less)]
     fn test_natural_compare_nul(#[case] a: &[u8], #[case] b: &[u8], #[case] expected: Ordering) {
         assert_eq!(compare_nul(a, b), expected);
+    }
+
+    // ========================================================================
+    // natural_cmp_bounded tests
+    // ========================================================================
+
+    #[rstest]
+    #[case(b"read1", b"read2", Ordering::Less)]
+    #[case(b"read2", b"read10", Ordering::Less)]
+    #[case(b"01", b"1", Ordering::Equal)]
+    #[case(b"001", b"01", Ordering::Equal)]
+    #[case(b"a", b"b", Ordering::Less)]
+    #[case(b"", b"", Ordering::Equal)]
+    #[case(b"", b"a", Ordering::Less)]
+    #[case(b"9", b"a", Ordering::Less)]
+    #[case(b"a0b", b"a00b", Ordering::Equal)]
+    #[case(b"SRR1.9", b"SRR1.10", Ordering::Less)]
+    #[case(b"ab\0zz", b"ab\0aa", Ordering::Equal)] // the first NUL terminates
+    #[case(b"pab\0", b"pab", Ordering::Equal)]
+    fn test_natural_cmp_bounded(#[case] a: &[u8], #[case] b: &[u8], #[case] expected: Ordering) {
+        assert_eq!(natural_cmp_bounded(a, b).0, expected);
+        assert_eq!(natural_cmp_bounded(b, a).0, expected.reverse());
+    }
+
+    /// The indices name the last byte read: a digit run decided at the window
+    /// edge reads the virtual terminator of the shorter side.
+    #[rstest]
+    #[case(b"x:12", b"x:13", (Ordering::Less, 4, 4))]
+    #[case(b"x:3333", b"x:3334", (Ordering::Less, 6, 6))]
+    #[case(b"pab", b"pac", (Ordering::Less, 2, 2))]
+    #[case(b"pab", b"pab", (Ordering::Equal, 3, 3))]
+    #[case(b"pab", b"pabc", (Ordering::Less, 3, 3))]
+    fn natural_cmp_bounded_reports_the_indices_it_read(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: (Ordering, usize, usize),
+    ) {
+        assert_eq!(natural_cmp_bounded(a, b), expected);
+    }
+
+    proptest::proptest! {
+        /// Equal to `natural_compare_nul` over NUL-appended copies, for arbitrary
+        /// bytes including embedded NULs; the indices stay within the slices.
+        #[test]
+        fn natural_cmp_bounded_agrees_with_natural_compare_nul(
+            a in proptest::collection::vec(proptest::prop_oneof![
+                8 => proptest::sample::select(b"0123456789".to_vec()),
+                4 => proptest::sample::select(b"ab:._".to_vec()),
+                1 => proptest::prelude::any::<u8>(),
+            ], 0..30),
+            b in proptest::collection::vec(proptest::prop_oneof![
+                8 => proptest::sample::select(b"0123456789".to_vec()),
+                4 => proptest::sample::select(b"ab:._".to_vec()),
+                1 => proptest::prelude::any::<u8>(),
+            ], 0..30),
+        ) {
+            let (ord, ia, ib) = natural_cmp_bounded(&a, &b);
+            proptest::prop_assert_eq!(ord, compare_nul(&a, &b));
+            proptest::prop_assert!(ia <= a.len() && ib <= b.len());
+        }
     }
 
     // ========================================================================

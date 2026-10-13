@@ -81,7 +81,7 @@ fn thread_flag_warnings(stderr: &str) -> Vec<&str> {
 }
 
 /// Standalone sort: with an explicit `--sort-threads`, every phase-1 step —
-/// the pool steps and the per-run sort (`FindBoundariesAndSort`) — shares
+/// the pool steps and the per-run sort (`SortCoordinateRun`) — shares
 /// `sort-phase1(min(sort,threads))`; with an explicit `--merge-threads`, every
 /// phase-2 step — the pool steps and the fast-path gather (`SortMerge`) —
 /// shares `sort-phase2(min(merge,threads))`. An unset flag caps nothing in its
@@ -118,7 +118,9 @@ fn standalone_sort_caps_every_step_of_an_explicit_phase(
     .expect("standalone sort chain builds");
     let dag = built.pipeline.dag();
 
-    for step in ["InflateToArena", "FindBoundariesAndSort", "SpillBlockCompress"] {
+    for step in
+        ["InflateToArena", "ExtractCoordinateKeys", "SortCoordinateRun", "SpillBlockCompress"]
+    {
         assert_eq!(cap_of(&dag, step).as_deref(), phase1, "{step}:\n{dag}");
     }
     for step in ["SortSpillDecompress", "SortMerge", "BgzfCompress"] {
@@ -130,7 +132,7 @@ fn standalone_sort_caps_every_step_of_an_explicit_phase(
 }
 
 /// The cap belongs to the phase, not the step: in a built standalone sort every
-/// phase-1 step — including the per-run sort, `FindBoundariesAndSort` — holds
+/// phase-1 step — including the per-run sort, `SortCoordinateRun` — holds
 /// the SAME counter, as does every phase-2 step including the fast-path gather
 /// in `SortMerge`, and the phases' counters are distinct. Identity is checked
 /// by address and by behaviour — exhausting the counter through one step's cap
@@ -157,8 +159,12 @@ fn standalone_sort_steps_of_one_phase_share_one_counter() {
     assert!(std::ptr::eq(inflate, spill), "phase-1 steps must share one counter");
     assert!(std::ptr::eq(decompress, output_compress), "phase-2 steps must share one counter");
     assert!(
-        std::ptr::eq(cap("FindBoundariesAndSort"), inflate),
+        std::ptr::eq(cap("SortCoordinateRun"), inflate),
         "the per-run sort must hold the phase-1 pool steps' counter"
+    );
+    assert!(
+        std::ptr::eq(cap("ExtractCoordinateKeys"), inflate),
+        "key extraction must hold the phase-1 pool steps' counter"
     );
     assert!(
         std::ptr::eq(cap("SortMerge"), decompress),

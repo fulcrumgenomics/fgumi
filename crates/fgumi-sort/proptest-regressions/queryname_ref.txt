@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4da591a4d1d65df97b3ad9fe5031562df7674d301887e2feefaaa563786b8bdf # shrinks to names = [[97], [], [48]], ecp = [0], prefix_p = 0.3662990956765917, guess = 1
+cc ba05215da3977fa93a193ebf0fa91fdafd342db521afe2950af47431658292fc # shrinks to names = [[], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [48], [], [], [], [], [], [], [], [], [], [], [], [], [48], [0]], ecp = [48, 48, 48, 48, 48, 48, 48, 48, 48, 97, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48], prefix_p = 0.8537066136441849, guess = 0
+cc f927380cd321c5ba1d05920cf643fd9afce65d504fbd79fede85b17937e85c2f # shrinks to names = [[97], [0]], ecp = [0], prefix_p = 0.619582513519422, guess = 0

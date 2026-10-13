@@ -12,7 +12,7 @@ use crate::arena_pool::PooledSegmentedBuf;
 use crate::inline::{
     InMemoryChunk, RecordRef, extract_coordinate_key_inline, radix_sort_record_refs,
 };
-use crate::keys::{RawCoordinateKey, RawSortKey};
+use crate::keys::RawCoordinateKey;
 
 /// Arrays smaller than this sort faster single-threaded (the parallel radix's
 /// partition + thread-coordination overhead exceeds its benefit on small inputs;
@@ -153,12 +153,17 @@ pub fn coordinate_chunk_from_arena_refs(
 
 /// Build a sorted coordinate chunk from already-extracted `RecordRef`s (each
 /// carries its coordinate `sort_key` and the `(offset, len)` of its body in
-/// `arena`).  Radix-sorts the refs and wraps `arena` into the returned chunk —
-/// NO walk of the arena and NO record-byte copies.
+/// `arena`).  Radix-sorts the refs in place and wraps `arena` into the returned
+/// chunk — NO walk of the arena and NO record-byte copies.
 ///
-/// This is the fused entry point: the caller (`FindBoundariesAndSort`) extracts
-/// the key during its single boundary scan and hands the refs here, so the arena
-/// is walked exactly once for the whole run (the previous two-step
+/// The refs' allocation becomes the chunk's record tuples: a `RecordRef` and a
+/// `(RawCoordinateKey, u64, u32)` have the same size and alignment, so the
+/// conversion runs in place. A run therefore holds one run-sized ref buffer,
+/// never a second one beside the chunk while the chunk spills.
+///
+/// This is the fused entry point: the split front extracts the key in
+/// `ExtractCoordinateKeys` (and the record-input front as it pushes each record)
+/// and hands the refs here, so the arena is walked once for the keys (the previous two-step
 /// [`coordinate_chunk_from_arena_refs`] re-walked it to re-derive each key).
 #[must_use]
 pub fn coordinate_chunk_from_refs(
@@ -166,41 +171,50 @@ pub fn coordinate_chunk_from_refs(
     mut refs: Vec<RecordRef>,
     sort_threads: usize,
 ) -> InMemoryChunk<RawCoordinateKey> {
+    const {
+        assert!(size_of::<RecordRef>() == size_of::<(RawCoordinateKey, u64, u32)>());
+        assert!(align_of::<RecordRef>() == align_of::<(RawCoordinateKey, u64, u32)>());
+    }
     sort_coordinate_refs(&mut refs, sort_threads);
-    let records: Vec<(RawCoordinateKey, u64, u32)> =
-        refs.iter().map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len)).collect();
+    let records: Vec<(RawCoordinateKey, u64, u32)> = refs
+        .into_iter()
+        .map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len))
+        .collect();
     InMemoryChunk::from_parts(arena, records)
 }
 
-/// Build a sorted queryname chunk from already-extracted `(key, offset, len)`
-/// refs pointing into `arena`. Unlike the coordinate/template builders, the
-/// queryname key is a variable-length read name (not radix-able), so this sorts
-/// by the key comparator with `par_sort_unstable_by` — matching the legacy
-/// queryname path's unstable comparator sort. No record bytes are copied: the
-/// returned chunk references its bodies in `arena`.
-///
-/// **Threading contract (differs from the coordinate/template radix builders on
-/// purpose).** Those take an explicit `sort_threads` and gate the parallel radix
-/// on both `sort_threads > 1` and `PARALLEL_SORT_THRESHOLD`. This builder takes
-/// no `sort_threads`: the caller (`QuerynameStrategy::seal`, in `fgumi-pipeline-io`)
-/// runs it inside a rayon pool already sized to `sort_threads`, so parallelism is
-/// bounded there,
-/// and `rayon::par_sort_unstable_by` has its own internal sequential cutoff for
-/// small slices — so a tiny run does not pay a partition/coordination cost even
-/// without an explicit size threshold here.
+/// The final run of a spilled sort as `pieces` pre-sorted chunks: `refs` split
+/// into contiguous input-order ranges (`piece_len`), each radix-sorted
+/// (serially, the ranges in parallel on the current rayon pool) into its own
+/// exactly-sized chunk over `arena`. `refs` is freed before returning, so the
+/// pieces hold the run's only ref bytes. An empty `refs` yields no chunks.
 #[must_use]
-pub fn queryname_chunk_from_arena_refs<K: RawSortKey>(
-    arena: Arc<PooledSegmentedBuf>,
-    mut records: Vec<(K, u64, u32)>,
-) -> InMemoryChunk<K> {
+pub fn coordinate_chunks_from_refs(
+    arena: &Arc<PooledSegmentedBuf>,
+    mut refs: Vec<RecordRef>,
+    pieces: usize,
+) -> Vec<InMemoryChunk<RawCoordinateKey>> {
     use rayon::prelude::*;
-    // `par_sort_unstable_by` gives no order guarantee for records whose keys
-    // compare equal (exact name+flag-class ties). samtools resolves those
-    // remaining ties by input order; the arena assigns offsets in ingest order,
-    // so break exact ties by ascending offset to preserve that (and keep output
-    // byte-identical run to run).
-    records.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    InMemoryChunk::from_parts(arena, records)
+    let size = piece_len(refs.len(), pieces);
+    refs.par_chunks_mut(size)
+        .map(|range| {
+            sort_coordinate_refs(range, 1);
+            let records = range
+                .iter()
+                .map(|r| (RawCoordinateKey { sort_key: r.sort_key }, r.offset, r.len))
+                .collect();
+            InMemoryChunk::from_parts(Arc::clone(arena), records)
+        })
+        .collect()
+}
+
+/// The length of each of a run's `pieces` contiguous input-order ranges (the
+/// last may be shorter): `⌈len / pieces⌉`, at least 1. Every order's
+/// final-run split uses it, so the split is a function of `len` and the
+/// configured width alone.
+#[must_use]
+pub(crate) fn piece_len(len: usize, pieces: usize) -> usize {
+    len.div_ceil(pieces.max(1)).max(1)
 }
 
 #[cfg(test)]
@@ -322,6 +336,37 @@ mod tests {
         );
     }
 
+    /// A coordinate seal converts the refs into the chunk's tuples in place
+    /// (serial and parallel radix alike): the chunk's tuples live in the refs'
+    /// allocation, so a sealed run holds one run-sized ref buffer.
+    #[rstest::rstest]
+    fn seal_reuses_the_refs_allocation(#[values(1, 4)] sort_threads: usize) {
+        let n = PARALLEL_SORT_THRESHOLD + 3;
+        let refs: Vec<RecordRef> = (0..n as u64)
+            .map(|i| RecordRef::new(i.wrapping_mul(2_654_435_761) % 997, i, 1))
+            .collect();
+        let at = refs.as_ptr().cast::<u8>();
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default()));
+        let chunk = coordinate_chunk_from_refs(arena, refs, sort_threads);
+        assert_eq!(chunk.len(), n);
+        assert!(std::ptr::eq(chunk.records_ptr().cast::<u8>(), at), "the tuples reuse the refs");
+        assert!((1..n).all(|i| chunk.key_at(i - 1).sort_key <= chunk.key_at(i).sort_key), "sorted");
+    }
+
+    /// The final run's pieces are exactly sized: the original allocation (here
+    /// twice the refs) is freed, not kept beside them.
+    #[test]
+    fn pieces_hold_the_refs_once() {
+        let mut refs: Vec<RecordRef> = Vec::with_capacity(2_006);
+        refs.extend((0..1_003u64).map(|i| RecordRef::new(1_003 - i, i, 1)));
+        let arena = Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default()));
+        let chunks = coordinate_chunks_from_refs(&arena, refs, 4);
+        assert_eq!(chunks.iter().map(InMemoryChunk::len).collect::<Vec<_>>(), [251, 251, 251, 250]);
+        for chunk in &chunks {
+            assert_eq!(chunk.records_capacity(), chunk.len(), "a piece holds no spare capacity");
+        }
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -371,54 +416,6 @@ mod tests {
                 (0..ref_chunk.len()).map(|i| ref_chunk.record_bytes(i).to_vec()).collect();
 
             prop_assert_eq!(ref_bytes, oracle_bytes);
-        }
-    }
-
-    /// Exact queryname ties (identical name + flag class) must emerge in ingest
-    /// order — samtools' final tie-break — which the arena encodes as ascending
-    /// offset. `par_sort_unstable_by` on the key alone gives no such guarantee,
-    /// so feed equal-key refs in scrambled order and assert the sort restores
-    /// ascending-offset (== ingest) order.
-    #[test]
-    #[allow(unsafe_code)]
-    fn queryname_arena_sort_breaks_exact_ties_by_offset() {
-        use crate::keys::RawQuerynameKey;
-
-        let n = 2_000usize;
-        let key = RawQuerynameKey::new(b"dup/name".to_vec(), 0); // one shared key → all ties
-
-        // Each body encodes its ingest index; offsets ascend with the index, so a
-        // correct sort must decode 0,1,2,… in order.
-        let mut arena = SegmentedBuf::with_capacity(0, 1 << 20);
-        arena.reserve_full_capacity();
-        let mut by_index: Vec<(u64, u32)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let body = (i as u64).to_le_bytes();
-            // SAFETY: each slot is fully written (copy_from_slice) before any read.
-            let off = unsafe { arena.grow_uninit(body.len()) };
-            unsafe { arena.slice_mut(off, body.len()) }.copy_from_slice(&body);
-            by_index.push((off as u64, u32::try_from(body.len()).unwrap()));
-        }
-
-        // Feed refs in a scrambled order (odds then evens) so an unstable sort with
-        // no offset tie-break would not reliably yield ascending offsets.
-        let mut refs: Vec<(RawQuerynameKey, u64, u32)> = Vec::with_capacity(n);
-        for i in (0..n).filter(|i| i % 2 == 1).chain((0..n).filter(|i| i % 2 == 0)) {
-            let (off, len) = by_index[i];
-            refs.push((key.clone(), off, len));
-        }
-
-        let arena_arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
-        let chunk = queryname_chunk_from_arena_refs(arena_arc, refs);
-        assert_eq!(chunk.len(), n);
-
-        let mut prev: Option<u64> = None;
-        for i in 0..chunk.len() {
-            let v = u64::from_le_bytes(chunk.record_bytes(i).try_into().unwrap());
-            if let Some(p) = prev {
-                assert!(v > p, "exact-tie records not in ascending ingest order: {p} then {v}");
-            }
-            prev = Some(v);
         }
     }
 }

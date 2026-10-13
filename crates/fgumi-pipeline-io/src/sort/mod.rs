@@ -1,8 +1,10 @@
 //! Sort typed-steps for the declarative chain.
 
 /// `DetachedGroup::Shared` label for the sort's **coordination** driver thread:
-/// the serial phase-1 coordination steps (`ReadBlocks` admit, `FindBoundariesAndSort`
-/// sort/seal, `SpillGather` framing) plus the phase-2 `SortMerge`. One dedicated
+/// the serial phase-1 coordination steps (`ReadBlocks` admit, the split front's
+/// boundary scan and run sort — `Find*Boundaries` / `Sort*Run`, with key
+/// extraction on the pool between them — and `SpillGather` range planning — the pool frames and
+/// compresses the ranges) plus the phase-2 `SortMerge`. One dedicated
 /// thread runs all of them off the pool — the true N+2 model (mirrors main's
 /// single main thread). Phase 1 and phase 2 are temporally disjoint, so the
 /// coordination steps finish and leave the driver's live set before the merge
@@ -16,10 +18,11 @@ pub const SORT_COORD_GROUP: &str = "sort-coord";
 pub const SORT_IO_GROUP: &str = "sort-io";
 
 pub mod arena_ingest;
-pub mod compress_spill;
+pub mod arena_split;
 pub mod merge;
 pub mod protocol;
 pub(crate) mod read_ahead_budget;
+pub mod run_ledger;
 pub(crate) mod run_stack;
 pub mod sort_buffer;
 pub mod spill_block_compress;
@@ -30,13 +33,20 @@ pub mod spill_write;
 pub mod supply_ledger;
 
 pub use arena_ingest::{
-    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
-    InflatedBlock, QuerynameStrategy, ReadBlocks, TemplateStrategy,
+    ArenaBlock, ArenaSortStrategy, CoordinateStrategy, InflateToArena, InflatedBlock,
+    QuerynameStrategy, ReadBlocks, TemplateStrategy,
 };
-pub use compress_spill::CompressSpill;
+pub use arena_split::{
+    ArenaKeyExtractor, CoordinateCtx, CoordinateKeys, ExtractCoordinateKeys, ExtractKeys,
+    ExtractQuerynameKeys, ExtractTemplateKeys, FindCoordinateBoundaries, FindQuerynameBoundaries,
+    FindRecordBoundaries, FindTemplateBoundaries, KEY_BATCH_RECORDS, KeyBatch, KeyOverlapCensus,
+    QnChunkOrder, QuerynameKeys, RefBatch, RunEnd, SortCoordinateRun, SortQuerynameRun, SortRun,
+    SortTemplateRun, TemplateKeyBatch, TemplateKeys, TemplateRefBatch,
+};
 pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
+pub use run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, RunPrior, run_cap_for};
 pub use sort_buffer::{SortBuffer, SortBufferConfig};
-pub use spill_block_compress::SpillBlockCompress;
+pub use spill_block_compress::{SpillBlockCompress, SpillBufPool};
 pub use spill_decompress::SortSpillDecompress;
 pub use spill_gather::SpillGather;
 pub use spill_read_planner::SpillReadPlanner;

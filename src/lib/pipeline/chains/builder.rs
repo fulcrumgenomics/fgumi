@@ -259,9 +259,9 @@ pub(crate) enum ChainTailKind {
     /// decompressed), with an arena-backed front waiting for the parallel-inflate
     /// sort ingest steps. Set by `add_source` when the first stage is a sort over
     /// a BAM source (all four orders): `ReadBgzfBlocks` is emitted but
-    /// `BgzfDecompress` is NOT — the new front (`ReadBlocks` → `InflateToArena`
-    /// → `FindBoundariesAndSort`) handles decompression + boundary-find + sort
-    /// inline.
+    /// `BgzfDecompress` is NOT — the arena front (`ReadBlocks` → `InflateToArena`
+    /// → the order's split front) handles decompression, boundary-find, key
+    /// extraction and sort inline.
     ///
     /// `add_sort` consumes this tail for every BAM sort order.
     BgzfBlockArena,
@@ -590,7 +590,7 @@ pub struct ChainBuilder<'a> {
     /// scheduler — see [`Self::refill_hints`]). Two shapes set it:
     ///
     /// - A BAM sort source wired through the parallel-inflate arena front
-    ///   (`ReadBlocks → InflateToArena → FindBoundariesAndSort`), for any sort
+    ///   (`ReadBlocks → InflateToArena →` the split front), for any sort
     ///   order — set in [`Self::add_sort`]. This opts the ENTIRE sort-first
     ///   pipeline (including fused `Sort → Group/Simplex/Duplex/Codec` chains)
     ///   in, so the sort's serial boundary/key scan overlaps the parallel inflate
@@ -620,6 +620,10 @@ pub struct ChainBuilder<'a> {
     /// aligner's input refill (only when drain-first was chosen) and the sort
     /// merge's spill-starvation hint (under either base direction).
     refill_hints: Vec<(RefillHint, &'static str)>,
+    /// Per sort stage, the sort's queryname class table and the one its
+    /// `SortMerge` holds (test support).
+    #[cfg(test)]
+    merge_class_tables: Vec<(Arc<fgumi_sort::QnClassTable>, Option<Arc<fgumi_sort::QnClassTable>>)>,
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
@@ -870,6 +874,8 @@ impl<'a> ChainBuilder<'a> {
             spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
+            #[cfg(test)]
+            merge_class_tables: Vec::new(),
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -1312,8 +1318,8 @@ impl<'a> ChainBuilder<'a> {
         // only one). When it is over a BAM source, the preamble stops at the
         // raw `ReadBgzfBlocks` step (tail = `ChainTailKind::BgzfBlockArena`)
         // instead of `DecodeRecords → DecodedRecordBatch`, so `add_sort`'s
-        // parallel-inflate arena front (`ReadBlocks → InflateToArena →
-        // FindBoundariesAndSort`) can consume it directly without an extra
+        // parallel-inflate arena front (`ReadBlocks → InflateToArena →` the
+        // split front) can consume it directly without an extra
         // round-trip. SAM sort-first is supported too (see the `Sam` arm
         // below): it decodes through the same `ParseSamChunk` preamble as
         // every other SAM ingest, and `add_sort` bridges the resulting
@@ -1343,8 +1349,7 @@ impl<'a> ChainBuilder<'a> {
                             // All four sort orders use the arena-backed
                             // parallel-inflate front (raw BGZF blocks only — no
                             // BgzfDecompress); ReadBlocks → InflateToArena →
-                            // FindBoundariesAndSort (with the per-order strategy)
-                            // are wired in add_sort. Leave the BgzfBlock tail for
+                            // the order's split front are wired in add_sort. Leave the BgzfBlock tail for
                             // that front. SAM / fused inputs still use SortBuffer.
                             if let Some(native) = self.native_input.clone() {
                                 // The header is parsed; the raw stream is re-read
@@ -2775,6 +2780,8 @@ impl<'a> ChainBuilder<'a> {
             config,
             finalize: self.finalize,
             finalize_on_success: self.finalize_on_success,
+            #[cfg(test)]
+            merge_class_tables: self.merge_class_tables,
         })
     }
 
@@ -3592,7 +3599,8 @@ impl<'a> ChainBuilder<'a> {
     /// RecordBatch (SAM) │ BgzfBlockArena (BAM)
     ///     ↓ arena sort ingest:
     ///        SAM → SortBuffer (Serial)
-    ///        BAM → ReadBlocks → InflateToArena → FindBoundariesAndSort
+    ///        BAM → ReadBlocks → InflateToArena → Find*Boundaries →
+    ///              Extract*Keys (Parallel) → Sort*Run
     ///     ↓ SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite (Serial)
     /// SortPhase1Event
     ///     ↓ SortSpillDecompress (Parallel)
@@ -3642,7 +3650,7 @@ impl<'a> ChainBuilder<'a> {
             //          DecodedRecordBatchToRecordBatch if DecodedRecordBatch — SAM source)
             //   RecordBatch (SAM, or fused non-Align/Correct upstream) │ BgzfBlockArena (BAM)
             //       ↓ arena sort ingest (SortBuffer, or ReadBlocks →
-            //         InflateToArena → FindBoundariesAndSort for BAM)
+            //         InflateToArena → the split front for BAM)
             //       ↓
             //   SpillGather (Serial) → SpillBlockCompress (Parallel) → SpillWrite
             //       (Serial) → SortPhase1Event
@@ -3787,10 +3795,11 @@ impl<'a> ChainBuilder<'a> {
             // in-memory capacity (768 MiB/thread) for standalone `--max-memory
             // auto`, relying on the old `RawExternalSorter`'s lazy buffer growth.
             // That knob does not carry over to the arena front used below
-            // (`ReadBlocks`): it sizes its arena segment to the FULL budget
-            // (`run_cap = memory_limit`) so a run that fits `--max-memory` sorts
-            // in memory with zero spills (see `ReadBlocks::new`). Capping the
-            // segment would cap `run_cap` and force premature spills — the exact
+            // (`ReadBlocks`): it sizes its arena segment to the FULL budget, and
+            // each run's cap leaves room in that budget for the run's sort refs
+            // (`run_cap_for`), so a run whose records and refs fit `--max-memory`
+            // sorts in memory with zero spills (see `ReadBlocks::new`). Capping the
+            // segment would cap the run and force premature spills — the exact
             // wall-clock regression that doc warns against — so there is no
             // separate initial-capacity clamp here.
 
@@ -3933,6 +3942,15 @@ impl<'a> ChainBuilder<'a> {
             // keeping `SortBuffer` Serial (no N² rayon oversubscription). The head
             // emits `SortPhase1Event`, so `SortSpillDecompress`/`SortMerge` are
             // identical downstream regardless of order.
+            //
+            // A queryname sort shares one class table and one set of key
+            // counters across its front and its summary.
+            let qn_keys = fgumi_sort::QnSortState::new(sort.sort_stats);
+            // A sort leaves mimalloc's purge delay alone, as v0.7.0 did: on a
+            // production-sized sort, align's retained 60 s delay cost 3–5 GiB of
+            // peak RSS for no speed gain. Report it, since an align stage in the same
+            // process may have raised it.
+            log::debug!("sort: mimalloc purge delay {} ms", fgumi_sort::mi_purge_delay_ms());
             let phase1_tail = {
                 let (temp_dirs, alloc) = fgumi_sort::create_sort_temp_dirs(&sort.tmp_dirs)
                     .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;
@@ -3943,25 +3961,48 @@ impl<'a> ChainBuilder<'a> {
                 let byte_limit = self.tuning.per_step_byte_limit;
                 // Sort head: two cases depending on the source tail kind.
                 // BgzfBlockArena (BAM): use the parallel-inflate front
-                // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
+                // (ReadBlocks → InflateToArena → the order's arena steps).
                 // Else (RecordBatch from SAM or upstream stage): use SortBuffer.
                 let head_tail = if self.chain_tail_kind == ChainTailKind::BgzfBlockArena {
                     // BAM sort through the parallel-inflate arena front
-                    // (ReadBlocks → InflateToArena → FindBoundariesAndSort).
-                    // Each order selects its per-order strategy.
-                    use fgumi_pipeline_io::sort::protocol::MemoryChunkErased;
+                    // (ReadBlocks → InflateToArena → …). Every order runs on the
+                    // split front (boundaries → key extraction → run sort).
                     use fgumi_pipeline_io::sort::{
-                        CoordinateStrategy, FindBoundariesAndSort, InflateToArena,
-                        QuerynameStrategy, ReadBlocks, TemplateStrategy,
+                        ArenaKeyExtractor, CoordinateKeys, InflateToArena, QuerynameKeys,
+                        ReadBlocks, RunLedger, TemplateKeys,
                     };
-                    use fgumi_sort::{QuerynameComparator, RawQuerynameKey, RawQuerynameLexKey};
+                    use fgumi_sort::QuerynameComparator;
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
                     // `total_memory` is the full in-memory budget (--max-memory ×
                     // the effective sort-phase thread count). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
-                    let read_blocks = ReadBlocks::new(total_memory, byte_limit);
+                    //
+                    // That budget holds a run's records AND its sort refs: one
+                    // ledger per sort sizes each run's arena cap from the previous
+                    // run's exact totals (`run_cap_for`). The ref width is known up
+                    // front except for template order under `--key-types auto`,
+                    // whose boundary step publishes it once the first record
+                    // chooses the lanes.
+                    let template_seed = fgumi_sort::TemplateKeySeed::from_header(
+                        &self.header,
+                        cell_tag,
+                        sort.key_types.unwrap_or_default(),
+                    );
+                    let known_width = match sort_order {
+                        SortOrder::Coordinate => CoordinateKeys::known_ref_width(&n_ref),
+                        SortOrder::Queryname(_) => {
+                            QuerynameKeys::<fgumi_sort::QnLex>::known_ref_width(&qn_keys)
+                        }
+                        SortOrder::TemplateCoordinate => {
+                            TemplateKeys::known_ref_width(&template_seed)
+                        }
+                    };
+                    let ledger = RunLedger::new(known_width);
+                    let read_blocks =
+                        ReadBlocks::new(total_memory, byte_limit, Arc::clone(&ledger))
+                            .with_sort_stats(sort.sort_stats);
                     // The arena front is the only decode path standalone sort
                     // takes, so the chain's CRC policy has to reach it here --
                     // `BgzfDecompress` (which also honors `spec.verify_crc`) is
@@ -3972,79 +4013,68 @@ impl<'a> ChainBuilder<'a> {
                     // pools (`bounded_sort_pool`, `qname-sort`,
                     // `sort_coordinate_refs`).
                     let sort_threads = phases.phase1;
+                    // Diagnostic knob for the reader-exclusion measurement: let key
+                    // extraction run on the reader worker too. Read once, here.
+                    let extract_placement = extract_placement_from_env(
+                        std::env::var("FGUMI_SORT_EXTRACT_ALL_WORKERS").ok().as_deref(),
+                    );
+                    let split_front = || SplitFront {
+                        sort_threads,
+                        byte_limit,
+                        sort_stats: sort.sort_stats,
+                        cap: phase1_cap.clone(),
+                        placement: extract_placement,
+                        ledger: Arc::clone(&ledger),
+                        memory_limit: total_memory,
+                    };
                     let t = self.pipeline.append_step(read_blocks, tail);
                     let t = self.pipeline.append_step(inflate, t);
                     let out = match sort_order {
                         SortOrder::TemplateCoordinate => {
-                            // Template-coordinate: the accumulator carries the
-                            // library / cell-barcode / MI and `--key-types`
-                            // narrowed-lane machinery the template key needs, built
-                            // from the header exactly as the legacy
-                            // TemplateChunkSorter.
-                            let key_types = sort.key_types.unwrap_or_default();
-                            let acc = fgumi_sort::TemplateArenaAccumulator::from_header(
-                                &self.header,
-                                cell_tag,
-                                key_types,
-                            );
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    TemplateStrategy::new(acc),
-                                    sort_threads,
-                                    byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
+                            // Template-coordinate: the split front. The seed carries
+                            // the library / cell-barcode / `--key-types` machinery;
+                            // the sort's first record chooses the key lanes.
+                            append_split::<TemplateKeys>(
+                                &self.pipeline,
                                 t,
+                                template_seed,
+                                split_front(),
                             )
                         }
                         SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-                            // Queryname (lexicographic): the read name IS the key,
-                            // embedded in the record; the strategy comparator-sorts
-                            // arena refs into an InMemoryChunk<RawQuerynameLexKey>.
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<RawQuerynameLexKey>::new(
-                                        MemoryChunkErased::QuerynameLex,
-                                    ),
-                                    sort_threads,
-                                    byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
+                            // Queryname: the read name IS the key, embedded in the
+                            // record; runs sort 40-byte arena refs. The key state
+                            // (class table, counters) is shared with the merge.
+                            append_split::<fgumi_pipeline_io::sort::QuerynameKeys<fgumi_sort::QnLex>>(
+                                &self.pipeline,
                                 t,
+                                qn_keys.clone(),
+                                split_front(),
                             )
                         }
                         SortOrder::Queryname(QuerynameComparator::Natural) => {
-                            self.pipeline.append_step(
-                                FindBoundariesAndSort::new(
-                                    QuerynameStrategy::<RawQuerynameKey>::new(
-                                        MemoryChunkErased::QuerynameNatural,
-                                    ),
-                                    sort_threads,
-                                    byte_limit,
-                                )
-                                .with_phase_cap(phase1_cap.clone()),
-                                t,
+                            append_split::<
+                                fgumi_pipeline_io::sort::QuerynameKeys<fgumi_sort::QnNatural>,
+                            >(
+                                &self.pipeline, t, qn_keys.clone(), split_front()
                             )
                         }
-                        SortOrder::Coordinate => self.pipeline.append_step(
-                            FindBoundariesAndSort::new(
-                                CoordinateStrategy::new(n_ref),
-                                sort_threads,
-                                byte_limit,
-                            )
-                            .with_phase_cap(phase1_cap.clone()),
-                            t,
+                        SortOrder::Coordinate => append_split::<
+                            fgumi_pipeline_io::sort::CoordinateKeys,
+                        >(
+                            &self.pipeline, t, n_ref, split_front()
                         ),
                     };
-                    // Opt this chain into downstream-first dispatch: the serial
-                    // FindBoundariesAndSort scan then overlaps the 8-way parallel
-                    // InflateToArena instead of starving behind it on the pool.
+                    // The serial `sort-coord` driver (boundary scan, run sort, range
+                    // planning) is the phase-1 bottleneck; dispatch downstream-first
+                    // so its outputs drain.
                     self.use_drain_first_scheduler = true;
                     out
                 } else {
                     let mut sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
-                        .with_affinity(affinity);
+                        .with_affinity(affinity)
+                        .with_queryname_keys(qn_keys.clone());
                     sort_buffer = sort_buffer.with_phase_cap(phase1_cap.clone());
                     self.pipeline.append_step(sort_buffer, tail)
                 };
@@ -4053,8 +4083,12 @@ impl<'a> ChainBuilder<'a> {
                 // head, so it never contends a pool worker — the driver frames the
                 // just-sorted chunk into blocks while the pool inflates/compresses.
                 let serialize = SpillGather::new(byte_limit);
+                // Compressed spill-block buffers circulate compress -> write ->
+                // compress instead of being allocated per block.
+                let spill_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();
                 let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit)
-                    .with_phase_cap(phase1_cap.clone());
+                    .with_phase_cap(phase1_cap.clone())
+                    .with_buf_pool(Arc::clone(&spill_bufs));
                 // `--max-temp-files` bounds the live spill runs: `SpillWrite`
                 // consolidates runs (at the spill compression level) whenever the
                 // limit would be exceeded, so the merge never opens more files than
@@ -4065,7 +4099,8 @@ impl<'a> ChainBuilder<'a> {
                 }
                 let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs)
                     .with_max_temp_files(resolved_max_temp_files, temp_compression)
-                    .with_stats(spill_stats);
+                    .with_stats(spill_stats)
+                    .with_buf_pool(spill_bufs);
                 // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
                 // detach the spill writer onto its own dedicated thread as well,
                 // so the single serial spill-write stream stops occupying a pool
@@ -4124,8 +4159,13 @@ impl<'a> ChainBuilder<'a> {
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
-                merge =
-                    merge.with_spill_supply(&supply).with_supply_diagnostics(supply_diagnostics);
+                merge = merge
+                    .with_spill_supply(&supply)
+                    .with_supply_diagnostics(supply_diagnostics)
+                    .with_class_table(Arc::clone(&qn_keys.table));
+                #[cfg(test)]
+                self.merge_class_tables
+                    .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
@@ -4164,6 +4204,9 @@ impl<'a> ChainBuilder<'a> {
                                         policy,
                                     }
                                 }),
+                            queryname_keys: matches!(sort_order, SortOrder::Queryname(_))
+                                .then(|| qn_keys.clone()),
+                            sort_stats: sort.sort_stats,
                         },
                     ));
                 }
@@ -4192,7 +4235,11 @@ impl<'a> ChainBuilder<'a> {
                 merge = merge
                     .with_fast_path_cap(phase2_cap.clone())
                     .with_spill_supply(&supply)
-                    .with_supply_diagnostics(supply_diagnostics);
+                    .with_supply_diagnostics(supply_diagnostics)
+                    .with_class_table(Arc::clone(&qn_keys.table));
+                #[cfg(test)]
+                self.merge_class_tables
+                    .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
@@ -7059,6 +7106,67 @@ fn dict_not_found_error(reference: &std::path::Path) -> anyhow::Error {
     )
 }
 
+/// Where the split front's key extraction runs, from the diagnostic
+/// `FGUMI_SORT_EXTRACT_ALL_WORKERS` value: `"1"` lets it run on the reader
+/// worker too (logged); anything else keeps it off the reader worker.
+fn extract_placement_from_env(value: Option<&str>) -> fgumi_pipeline_core::PoolPlacement {
+    if value == Some("1") {
+        log::info!("FGUMI_SORT_EXTRACT_ALL_WORKERS=1: key extraction may run on the reader worker");
+        fgumi_pipeline_core::PoolPlacement::AllWorkers
+    } else {
+        fgumi_pipeline_core::PoolPlacement::ExcludeReader
+    }
+}
+
+/// The configuration of a split arena front (see [`append_split`]).
+struct SplitFront {
+    /// The resolved phase-1 width (`PhaseThreads::phase1`): sizes the run sort.
+    sort_threads: usize,
+    /// Byte bound of each step's output queue.
+    byte_limit: u64,
+    /// `--sort-stats`: the overlap census at `info`.
+    sort_stats: bool,
+    /// The phase-1 cap — present only for an explicit `--sort-threads`. Key
+    /// extraction is admitted by it; the run sort reserves all of it.
+    cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    /// Where key extraction runs.
+    placement: fgumi_pipeline_core::PoolPlacement,
+    /// The sort's run ledger, shared with `ReadBlocks`: the boundary step
+    /// publishes the ref width, the run sort each run's totals.
+    ledger: Arc<fgumi_pipeline_io::sort::RunLedger>,
+    /// The in-memory budget a run's records and refs share.
+    memory_limit: usize,
+}
+
+/// Append the split arena front for the order `X` after `InflateToArena`:
+/// `FindRecordBoundaries<X>` → `ExtractKeys<X>` → `SortRun<X>`. Returns the run
+/// sort's output tail.
+fn append_split<X: fgumi_pipeline_io::sort::ArenaKeyExtractor>(
+    pipeline: &PipelineBuilder,
+    tail: (StepIdx, BranchIdx),
+    seed: X::Seed,
+    front: SplitFront,
+) -> (StepIdx, BranchIdx) {
+    use fgumi_pipeline_io::sort::{ExtractKeys, FindRecordBoundaries, SortRun};
+    let SplitFront { sort_threads, byte_limit, sort_stats, cap, placement, ledger, memory_limit } =
+        front;
+    let t = pipeline.append_step(
+        FindRecordBoundaries::<X>::new(seed, byte_limit).with_run_ledger(Arc::clone(&ledger)),
+        tail,
+    );
+    let t = pipeline.append_step(
+        ExtractKeys::<X>::new(byte_limit).with_phase_cap(cap.clone()).with_placement(placement),
+        t,
+    );
+    pipeline.append_step(
+        SortRun::<X>::new(sort_threads, byte_limit)
+            .with_phase_cap(cap)
+            .with_sort_stats(sort_stats)
+            .with_run_ledger(ledger, memory_limit),
+        t,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7123,6 +7231,8 @@ mod tests {
             spill_eligible_clones: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
+            #[cfg(test)]
+            merge_class_tables: Vec::new(),
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -7727,11 +7837,65 @@ mod tests {
         assert_sort_refill_source_feeds_decompress(&built);
     }
 
+    /// The merge of a queryname sort compares through the sort's own class
+    /// table — the one phase 1 windowed every key against — in every order.
+    #[rstest::rstest]
+    fn sort_merge_shares_the_sort_class_table(
+        #[values(
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural
+        )]
+        order: crate::commands::sort::SortOrderArg,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let (sort, merge) = &built.merge_class_tables[0];
+        let merge = merge.as_ref().expect("SortMerge carries a class table");
+        assert!(Arc::ptr_eq(sort, merge), "{order:?}: one table for the sort and its merge");
+    }
+
+    /// The step names strictly between `InflateToArena` and `SpillGather` in a
+    /// rendered sort DAG: the order's in-memory sort front.
+    fn front_steps(dag: &str) -> Vec<String> {
+        let names: Vec<&str> = dag
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix('[')?.split_once("] "))
+            .filter_map(|(_, rest)| rest.split_whitespace().next())
+            .collect();
+        let at = |name: &str| names.iter().position(|n| *n == name).expect(name);
+        names[at("InflateToArena") + 1..at("SpillGather")]
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect()
+    }
+
     /// Build a sort chain over a header-only BGZF BAM at `threads`, with an
     /// optional `--sort-threads` and the given `--read-streams`; returns the
     /// `PreadInputSlices` clone count `add_source` sized the native path for
     /// and the built pipeline.
     fn build_native_sort(
+        stages: Vec<Stage>,
+        threads: usize,
+        sort_threads: Option<usize>,
+        read_streams: fgumi_bam_io::ReadStreams,
+    ) -> (Option<usize>, crate::pipeline::chains::finalize::BuiltPipeline, tempfile::TempDir) {
+        build_native_sort_in_order(
+            crate::commands::sort::SortOrderArg::TemplateCoordinate,
+            stages,
+            threads,
+            sort_threads,
+            read_streams,
+        )
+    }
+
+    /// [`build_native_sort`] in `order`.
+    fn build_native_sort_in_order(
+        order: crate::commands::sort::SortOrderArg,
         stages: Vec<Stage>,
         threads: usize,
         sort_threads: Option<usize>,
@@ -7743,6 +7907,7 @@ mod tests {
         spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
         spec.read_streams = read_streams;
         spec.stage_opts.sort.as_mut().unwrap().sort_threads = sort_threads;
+        spec.stage_opts.sort.as_mut().unwrap().order = order;
         let mut chain = ChainBuilder::new(&spec).unwrap();
         chain.add_source().unwrap();
         let last = spec.stages.len() - 1;
@@ -7779,13 +7944,15 @@ mod tests {
     #[test]
     fn sort_chain_gating_matches_the_table() {
         // (name, kind, output branches, gated branches)
-        const TABLE: [(&str, &str, usize, usize); 15] = [
+        const TABLE: [(&str, &str, usize, usize); 17] = [
             ("PlanInputReads", "Serial", 1, 1),
             ("PreadInputSlices", "Parallel", 1, 1),
             ("FrameBgzfBlocks", "Serial", 1, 1),
             ("ReadBlocks", "Detached", 1, 1),
             ("InflateToArena", "Parallel", 1, 1),
-            ("FindBoundariesAndSort", "Detached", 1, 1),
+            ("FindTemplateBoundaries", "Detached", 1, 1),
+            ("ExtractTemplateKeys", "Parallel", 1, 1),
+            ("SortTemplateRun", "Detached", 1, 1),
             ("SpillGather", "Detached", 1, 1),
             ("SpillBlockCompress", "Parallel", 1, 1),
             ("SpillWrite", "Detached", 1, 1),
@@ -7946,6 +8113,209 @@ mod tests {
             .map(|&(_, c)| c)
             .expect("the spill reads");
         assert_eq!(eligible, clones.min(merge_threads.unwrap_or(clones)), "{planned:?}");
+    }
+
+    /// A BAM template-coordinate sort runs on the split arena front at every
+    /// thread count: exactly the three split steps sit between `InflateToArena`
+    /// and `SpillGather`.
+    #[rstest::rstest]
+    fn template_sort_dag_has_the_split_front(#[values(1usize, 16)] threads: usize) {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], threads, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(threads);
+        assert_eq!(
+            front_steps(&dag),
+            ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"],
+            "t{threads}:\n{dag}"
+        );
+    }
+
+    /// Every order's BAM sort runs on the split arena front: exactly three
+    /// steps — boundaries, key extraction, run sort — between `InflateToArena`
+    /// and `SpillGather`, with no single-step front.
+    #[rstest::rstest]
+    fn every_order_builds_the_split_front(
+        #[values(
+            crate::commands::sort::SortOrderArg::Coordinate,
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural,
+            crate::commands::sort::SortOrderArg::TemplateCoordinate
+        )]
+        order: crate::commands::sort::SortOrderArg,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(4);
+        let front = front_steps(&dag);
+        assert_eq!(front.len(), 3, "{order:?}:\n{dag}");
+        assert!(front[0].starts_with("Find") && front[0].ends_with("Boundaries"), "{front:?}");
+        assert!(front[1].starts_with("Extract") && front[1].ends_with("Keys"), "{front:?}");
+        assert!(front[2].starts_with("Sort") && front[2].ends_with("Run"), "{front:?}");
+    }
+
+    /// The coordinate split front's three steps.
+    #[test]
+    fn coordinate_sort_dag_has_the_split_front() {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            crate::commands::sort::SortOrderArg::Coordinate,
+            vec![Stage::Sort],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(4);
+        assert_eq!(
+            front_steps(&dag),
+            ["FindCoordinateBoundaries", "ExtractCoordinateKeys", "SortCoordinateRun"],
+            "{dag}"
+        );
+    }
+
+    /// A BAM queryname sort, lexicographic or natural, runs on the split arena
+    /// front: exactly the three queryname split steps.
+    /// Under an explicit `--sort-threads` the extraction carries the phase-1 cap.
+    #[rstest::rstest]
+    fn queryname_sort_dag_has_the_split_front(
+        #[values(
+            crate::commands::sort::SortOrderArg::Queryname,
+            crate::commands::sort::SortOrderArg::QuerynameNatural
+        )]
+        order: crate::commands::sort::SortOrderArg,
+        #[values(1usize, 16)] threads: usize,
+    ) {
+        let (_, built, _tmp) = build_native_sort_in_order(
+            order,
+            vec![Stage::Sort],
+            threads,
+            Some(threads.min(4)),
+            fgumi_bam_io::ReadStreams::Auto,
+        );
+        let dag = built.pipeline.dag_at(threads);
+        assert_eq!(
+            front_steps(&dag),
+            ["FindQuerynameBoundaries", "ExtractQuerynameKeys", "SortQuerynameRun"],
+            "{order:?} t{threads}:\n{dag}"
+        );
+        let line = dag.lines().find(|l| l.contains("] ExtractQuerynameKeys")).expect("split");
+        let cap = format!("cap=sort-phase1({})", threads.min(4));
+        assert!(line.contains(&cap), "{line}");
+    }
+
+    /// The extraction step carries the phase-1 cap only for an explicit
+    /// `--sort-threads` (clamped to `--threads`), and no `cap=` token otherwise.
+    #[rstest::rstest]
+    #[case::explicit(Some(4), Some("cap=sort-phase1(4)"))]
+    #[case::clamped(Some(32), Some("cap=sort-phase1(16)"))]
+    #[case::unset(None, None)]
+    fn extract_keys_carries_the_explicit_phase1_cap(
+        #[case] sort_threads: Option<usize>,
+        #[case] token: Option<&str>,
+    ) {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, sort_threads, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag();
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        match token {
+            Some(t) => assert!(line.contains(t), "{line}"),
+            None => assert!(!line.contains("cap="), "{line}"),
+        }
+    }
+
+    /// At one thread the reader worker is the only pool worker, so the
+    /// extraction clone is hosted on its producer's driver, `sort-coord`.
+    #[test]
+    fn t1_extraction_is_hosted_on_the_coord_driver() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 1, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(1);
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        assert!(line.ends_with(" placement=ExcludeReader host=driver(sort-coord)"), "{line}");
+    }
+
+    /// With `--sort-threads 4`, inflate, key extraction, spill compression and
+    /// the run sort all hold the one phase-1 cap.
+    #[test]
+    fn the_split_front_shares_the_phase1_cap() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 16, Some(4), fgumi_bam_io::ReadStreams::Auto);
+        let caps = built.pipeline.phase_caps();
+        let cap_of = |name: &str| caps.iter().find(|(n, _)| *n == name).expect(name).1;
+        let inflate = cap_of("InflateToArena");
+        for name in ["ExtractTemplateKeys", "SpillBlockCompress", "SortTemplateRun"] {
+            assert!(std::ptr::eq(cap_of(name), inflate), "{name} shares the phase-1 cap");
+        }
+    }
+
+    /// Unset `--sort-threads`: no phase cap on any step, so the run sort
+    /// reserves nothing.
+    #[test]
+    fn unset_sort_threads_means_no_cap_and_no_reservation() {
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 8, None, fgumi_bam_io::ReadStreams::Auto);
+        assert!(built.pipeline.phase_caps().is_empty(), "no caps without an explicit flag");
+        assert!(!built.pipeline.dag().contains("cap="), "no cap tokens");
+    }
+
+    /// A BAM sort chain keeps downstream-first dispatch with the sort's refill
+    /// hint: the refill-drain scheduler under the automatic choice.
+    #[test]
+    fn bam_sort_chain_uses_the_refill_drain_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let spec = sort_chain_spec(tmp.path(), input, vec![Stage::Sort]);
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        assert!(chain.use_drain_first_scheduler, "the arena front opts into drain-first");
+        assert!(
+            matches!(
+                choose_pool_scheduler(
+                    crate::commands::common::PoolScheduler::Auto,
+                    chain.use_drain_first_scheduler,
+                    &chain.refill_hints,
+                ),
+                PoolSchedulerChoice::RefillDrain { .. }
+            ),
+            "the refill-drain scheduler"
+        );
+    }
+
+    /// A runall chain whose first stage sorts a BAM uses the split front too.
+    #[test]
+    fn runall_sort_first_bam_uses_the_split_front() {
+        let (_, built, _tmp) = build_native_sort(
+            vec![Stage::Sort, Stage::Group],
+            4,
+            None,
+            fgumi_bam_io::ReadStreams::Fixed(1),
+        );
+        let dag = built.pipeline.dag();
+        assert_eq!(
+            front_steps(&dag),
+            ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"],
+            "{dag}"
+        );
+    }
+
+    /// `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` puts key extraction on every worker,
+    /// the reader's included; any other value, or none, keeps it off the reader
+    /// worker — which is what the default chain shows.
+    #[test]
+    fn extract_placement_override_is_honoured() {
+        use fgumi_pipeline_core::PoolPlacement;
+        assert_eq!(extract_placement_from_env(Some("1")), PoolPlacement::AllWorkers);
+        assert_eq!(extract_placement_from_env(Some("0")), PoolPlacement::ExcludeReader);
+        assert_eq!(extract_placement_from_env(None), PoolPlacement::ExcludeReader);
+        let (_, built, _tmp) =
+            build_native_sort(vec![Stage::Sort], 4, None, fgumi_bam_io::ReadStreams::Auto);
+        let dag = built.pipeline.dag_at(4);
+        let line = dag.lines().find(|l| l.contains("] ExtractTemplateKeys")).expect("split front");
+        assert!(line.contains("placement=ExcludeReader"), "{line}");
     }
 
     /// The native input path is taken exactly when `--read-streams` asks for

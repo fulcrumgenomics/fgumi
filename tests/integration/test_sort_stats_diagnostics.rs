@@ -256,6 +256,41 @@ fn sort_spilling_with(order: &str, extra: &[&str]) -> String {
     sort_shuffled(order, 20_000, "1M", extra, false)
 }
 
+/// A sort does not set mimalloc's purge delay, as v0.7.0 did not: the delay
+/// stays at the bundled mimalloc's 1000 ms default, or at what the user set.
+#[rstest]
+#[case::default(None, "sort: mimalloc purge delay 1000 ms")]
+#[case::user_set(Some("250"), "sort: mimalloc purge delay 250 ms")]
+fn sort_does_not_set_the_mimalloc_purge_delay(
+    #[case] purge_delay: Option<&str>,
+    #[case] expected: &str,
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let input: PathBuf = tmp.path().join("unsorted.bam");
+    write_shuffled_bam_fixture(&input, 200, 0x5EED);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
+    cmd.env("RUST_LOG", "debug")
+        .env_remove("MIMALLOC_PURGE_DELAY")
+        .env_remove("MIMALLOC_RESET_DELAY");
+    if let Some(ms) = purge_delay {
+        cmd.env("MIMALLOC_PURGE_DELAY", ms);
+    }
+    let result = cmd
+        .args(["sort", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(tmp.path().join("sorted.bam"))
+        .args(["--order", "coordinate"])
+        .output()
+        .expect("run fgumi sort");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
+    assert!(
+        stderr.lines().map(log_body).any(|l| l == expected),
+        "expected `{expected}`:\n{stderr}"
+    );
+}
+
 /// `N` from the standalone-sort summary line `Merge sources: N`.
 fn merge_sources(stderr: &str) -> Option<u64> {
     stderr
@@ -283,7 +318,7 @@ fn detached_parks(stderr: &str, step: &str) -> Option<(u64, u64, u64)> {
 /// booked to the step that last made progress on it, not to the first step of
 /// its group (`ReadBlocks`). Before the attribution fix every park of the
 /// shared `sort-coord` driver showed up under `ReadBlocks` and its other steps
-/// (`FindBoundariesAndSort`, `SpillGather`, `SortMerge`) all printed `0 parks`.
+/// (the run sort, `SpillGather`, `SortMerge`) all printed `0 parks`.
 /// Which of them parks depends on scheduling (the merge may never wait on a
 /// loaded host), so the check is on the group, not on one step.
 #[test]
@@ -297,7 +332,9 @@ fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
             .unwrap_or_else(|| panic!("no `detached \\`{step}\\`` line:\n{stderr}"))
     };
     // Every park ended one of two ways, so each line's split must add up.
-    for step in ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"] {
+    for step in
+        ["ReadBlocks", "FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+    {
         let (n, unparked, timed_out) = parks(step);
         assert_eq!(
             unparked + timed_out,
@@ -306,7 +343,10 @@ fn sort_stats_attribute_coord_driver_parks_to_the_progressing_step() {
         );
     }
     let booked_past_the_primary: u64 =
-        ["FindBoundariesAndSort", "SpillGather", "SortMerge"].iter().map(|s| parks(s).0).sum();
+        ["FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+            .iter()
+            .map(|s| parks(s).0)
+            .sum();
     assert!(
         booked_past_the_primary > 0,
         "coord-driver parks must be booked to the step that last progressed, not all to \
@@ -360,10 +400,11 @@ fn sort_stats_render_the_wake_table_under_pipeline_stats() {
     let (parks, unparked, timed_out) =
         detached_parks(&stderr, "SortMerge").expect("SortMerge park split");
     assert_eq!(unparked + timed_out, parks, "every SortMerge park ended one way:\n{stderr}");
-    let group_parks: u64 = ["ReadBlocks", "FindBoundariesAndSort", "SpillGather", "SortMerge"]
-        .iter()
-        .map(|s| detached_parks(&stderr, s).map_or(0, |p| p.0))
-        .sum();
+    let group_parks: u64 =
+        ["ReadBlocks", "FindCoordinateBoundaries", "SortCoordinateRun", "SpillGather", "SortMerge"]
+            .iter()
+            .map(|s| detached_parks(&stderr, s).map_or(0, |p| p.0))
+            .sum();
     assert!(group_parks > 0, "the coordination driver parked at least once:\n{stderr}");
 }
 
@@ -451,16 +492,18 @@ fn records_merged(stderr: &str) -> Option<u64> {
 }
 
 /// An in-memory sort never builds a merge driver, so under `--sort-stats` it
-/// prints no `Merge output:` line.
-#[test]
-fn fast_path_sort_prints_no_merge_output_line() {
-    let stderr = sort_and_capture_logs(4, "768M", &["--sort-stats"]);
+/// prints no `Merge output:` line — at any thread count: only a sort that
+/// spilled splits its final run into pieces, so the fast path survives.
+#[rstest]
+fn fast_path_sort_prints_no_merge_output_line(#[values("1", "4")] threads: &str) {
+    let stderr = sort_and_capture_logs(4, "768M", &["--sort-stats", "--threads", threads]);
     assert!(
         !stderr.contains("Spill runs:"),
         "fixture unexpectedly spilled; this case must exercise the fast path:\n{stderr}"
     );
     assert!(stderr.contains(FAST_PATH_DIAG_SUBSTRING), "the fast path must run:\n{stderr}");
     assert!(!stderr.contains("Merge output:"), "no merge driver ran:\n{stderr}");
+    assert!(!stderr.contains(MERGE_DIAG_SUBSTRING), "no k-way merge ran:\n{stderr}");
 }
 
 /// `Byte fetch (input):` is gated on `--sort-stats` on the native input path
@@ -502,6 +545,24 @@ fn sort_stats_gates_spill_supply_lines(
     ] {
         let present = bodies.iter().any(|b| b.starts_with(prefix));
         assert_eq!(present, with_flag, "{order}: `{prefix}` presence:\n{stderr}");
+    }
+}
+
+/// The split front's key-overlap census is logged at info only under
+/// `--sort-stats`, on a sort that spills, in every order on the split front.
+#[rstest]
+fn sort_stats_gates_key_overlap_census(
+    #[values("coordinate", "template-coordinate", "queryname", "queryname::natural")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let bodies: Vec<&str> = stderr.lines().map(log_body).collect();
+    for prefix in ["Deferred key extraction: ", "  tail wait (exact): "] {
+        let present = bodies.iter().any(|b| b.starts_with(prefix));
+        assert_eq!(present, with_flag, "`{prefix}` presence:\n{stderr}");
     }
 }
 
@@ -822,4 +883,59 @@ fn fused_sort_then_group_chain_exercises_intermediate_add_sort_branch() {
         counts.values().all(|&n| n == 3),
         "expected each molecule group to have all 3 of its family's reads, got {counts:?}"
     );
+}
+
+/// A queryname sort reports its key classes and compares in one `Queryname
+/// keys:` line under `--sort-stats` (and never without it), on a sort that
+/// merges at least two sources, for both comparators. With the flag the line
+/// carries the compare shares; at least one class beyond the empty one is
+/// learned from the fixture's shared `fam_` name prefix.
+#[rstest]
+fn sort_stats_gates_the_queryname_keys_line(
+    #[values("queryname", "queryname::natural")] order: &str,
+    #[values(false, true)] with_flag: bool,
+) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with(order, extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "{order}: the fixture must merge at least 2 sources (got {n}):\n{stderr}");
+    let line = stderr.lines().map(log_body).find(|l| l.starts_with("Queryname keys: "));
+    assert_eq!(line.is_some(), with_flag, "{order}: `Queryname keys:` presence:\n{stderr}");
+    if let Some(line) = line {
+        let classes: usize = line
+            .strip_prefix("Queryname keys: ")
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("{order}: unparseable classes: {line}"));
+        assert!(classes >= 2, "{order}: the `fam_` prefix is learned: {line}");
+        assert!(line.contains("arena fallbacks"), "{order}: compares are counted: {line}");
+        // `R of B batches re-windowed; C of N refs in class 0`: every extracted
+        // batch is counted, and the batch that learned `fam_` was re-windowed.
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after = |w: &str| -> u64 {
+            let i = words.iter().position(|x| x.trim_end_matches(';') == w).expect(w);
+            words[i - 1].parse().unwrap_or_else(|_| panic!("{order}: count before `{w}`: {line}"))
+        };
+        let (rewindowed, batches) = (
+            words[words.iter().position(|w| *w == "of").unwrap() - 1].parse::<u64>().unwrap(),
+            after("batches"),
+        );
+        assert!(batches > 0 && rewindowed >= 1, "{order}: batches are counted: {line}");
+        assert!(after("refs") >= batches, "{order}: refs are counted: {line}");
+    }
+}
+
+/// The arena-wait line — waits for a free arena and the latency from each
+/// release to its reuse — is logged under `--sort-stats` and not without it.
+#[rstest]
+fn read_blocks_logs_the_arena_line_only_with_sort_stats(#[values(false, true)] with_flag: bool) {
+    let extra: &[&str] = if with_flag { &["--sort-stats"] } else { &[] };
+    let stderr = sort_spilling_with("coordinate", extra);
+    let n = merge_sources(&stderr).unwrap_or_else(|| panic!("no `Merge sources:` line:\n{stderr}"));
+    assert!(n >= 2, "the fixture must spill several runs (got {n}):\n{stderr}");
+    let line = stderr.lines().map(log_body).find(|l| l.starts_with("Phase 1: arena waits "));
+    assert_eq!(line.is_some(), with_flag, "`Phase 1: arena waits` presence:\n{stderr}");
+    if let Some(line) = line {
+        assert!(line.contains("from return to reuse"), "{line}");
+    }
 }

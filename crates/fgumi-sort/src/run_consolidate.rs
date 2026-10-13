@@ -73,6 +73,21 @@ pub enum SpillKeyKind {
     TemplateK40,
 }
 
+impl SpillKeyKind {
+    /// Bytes of key a spilled record of this kind carries ahead of its length
+    /// prefix: 0 for the orders whose key is embedded in the record
+    /// (coordinate, queryname), the lane width for template-coordinate.
+    #[must_use]
+    pub const fn serialized_key_bytes(self) -> usize {
+        match self {
+            Self::Coordinate | Self::QuerynameLex | Self::QuerynameNatural => 0,
+            Self::TemplateK24 => 24,
+            Self::TemplateCb32 | Self::TemplateTert32 => 32,
+            Self::TemplateK40 => 40,
+        }
+    }
+}
+
 /// Outcome of one bounded [`RunMergerDyn::step`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunMergeProgress {
@@ -275,9 +290,17 @@ fn key_prefix_size<K: RawSortKey>() -> io::Result<usize> {
 }
 
 /// Recover a record's sort key exactly as the final merge's slot parser does.
+///
+/// Consolidation merges the canonical owned keys, whose merge context and hint
+/// are `()`: a default per record costs nothing.
 fn parse_key<K: RawSortKey + Default + 'static>(key_bytes: &[u8], body: &[u8]) -> io::Result<K> {
-    crate::external::slot_parse_key::<K>(key_bytes, body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))
+    crate::external::slot_parse_key::<K>(
+        &K::MergeCtx::default(),
+        &mut K::MergeHint::default(),
+        key_bytes,
+        body,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))
 }
 
 // ============================================================================

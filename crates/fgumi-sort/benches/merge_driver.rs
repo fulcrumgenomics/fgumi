@@ -81,6 +81,7 @@ fn merge(slots: Vec<Arc<SortMergeSlot>>, out: &mut Vec<u8>) -> u64 {
         slots,
         MemorySources::Shared(Vec::new()),
         RECORDS as u64,
+        (),
     );
     loop {
         match driver.try_step().expect("merge step") {

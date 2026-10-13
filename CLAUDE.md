@@ -164,9 +164,12 @@ The following external FFI calls are approved because they back core infrastruct
   mimalloc synchronizes these calls internally, so they are safe to invoke
   concurrently. `retain_freed_memory` sets mimalloc's purge delay to
   `RETAINED_PURGE_DELAY_MS` (60 s); both align backends call it at wiring (via
-  `retain_freed_memory_unless_user_set`) unless `MIMALLOC_PURGE_DELAY` is set,
-  because their per-batch buffer churn otherwise costs millions of page faults at
-  mimalloc's 1 s default. The setting is process-wide and never restored. It is
+  `crate::aligner::retain_freed_memory_unless_user_set`) unless
+  `MIMALLOC_PURGE_DELAY` is set, because their per-batch buffer churn otherwise
+  costs millions of page faults at mimalloc's 1 s default. Sort chains do not
+  call it: v0.7.0 never set the delay, and on a production-sized sort (EC2,
+  HG00096) the 60 s delay cost 3–5 GiB of peak RSS with no speed benefit, so a
+  standalone sort keeps mimalloc's default. The setting is process-wide and never restored. It is
   deliberately bounded, not -1 (never purge): under -1 every page a later stage
   frees stays resident (mimalloc does not even mark it purgeable, so
   `force_mi_collect()` cannot release it), and a fused sort's freed spill memory
@@ -293,14 +296,15 @@ of records) and a safe rewrite measurably regresses sort throughput.
 
 ### Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)
 
-The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`)
-inflates BGZF blocks in parallel straight into one shared arena segment and scans
-the records in place. It calls the two approved `SegmentedBuf` methods above
-(`grow_uninit`, `slice_mut`) at three production `#[allow(unsafe_code)]` sites,
-under their documented contracts. Approved for the same reason as those methods:
-the ingest runs once per BGZF block over millions of blocks, and the safe
-alternatives (zero-filling the segment, or inflating into an owned buffer and
-copying it into the arena) add a full extra pass over every inflated byte.
+The sort's block-input front (`crates/fgumi-pipeline-io/src/sort/arena_ingest.rs`
+and `sort/arena_split.rs`) inflates BGZF blocks in parallel straight into one
+shared arena segment and scans the records in place. It calls the two approved
+`SegmentedBuf` methods above (`grow_uninit`, `slice_mut`) at three production
+`#[allow(unsafe_code)]` sites, under their documented contracts. Approved for
+the same reason as those methods: the ingest runs once per BGZF block over
+millions of blocks, and the safe alternatives (zero-filling the segment, or
+inflating into an owned buffer and copying it into the arena) add a full extra
+pass over every inflated byte.
 
 - `ReadBlocks::ensure_arena` — one `grow_uninit(segment_size)` that grows the
   whole segment once, on the serial admit path, before the arena is wrapped in an
@@ -313,14 +317,24 @@ copying it into the arena) add a full extra pass over every inflated byte.
   slot. SAFETY: the slot was grown before the block was enqueued; the ISIZE
   prefix sum partitions the arena into disjoint slots, so no two workers' `&mut`
   overlap; `decompress_into_slice_with_crc` fills every byte before any read.
-- `FindBoundariesAndSort::ingest_block` — one `slice_mut` writing the previous
-  run's straddler carry right-aligned into `[FRONT_REGION - l, FRONT_REGION)`.
-  SAFETY: that range lies strictly below `FRONT_REGION`, where no inflate slot
-  ever lies, so it aliases no slot a worker is writing; the segment was frozen by
-  `reserve_full_capacity` before sharing, so no grow can move it.
+- `FindRecordBoundaries::ingest_block` (`arena_split.rs`) — one `slice_mut`
+  writing the previous run's straddler carry right-aligned into
+  `[FRONT_REGION - l, FRONT_REGION)`. SAFETY: that range lies strictly below
+  `FRONT_REGION`, where no inflate slot ever lies, so it aliases no slot a worker
+  is writing; the segment was frozen by `reserve_full_capacity` before sharing,
+  so no grow can move it.
 
 The prefetch hint this front also uses is `fgumi-sort`'s `prefetch_read_l1`
 (listed above); `fgumi-pipeline-io` has no intrinsic of its own.
+
+Concurrent reads (safe code, but the invariant the sites above must keep): on
+the split front, `ExtractKeys` workers read a key batch's
+`[byte_start, byte_end)` while inflate workers write later slots of the same
+run. Every byte of a batch lies below the boundary scan's cursor, which only
+advances over slots whose `InflatedBlock` token arrived (the inflate write
+happens-before the token's push, the scan's pop, the batch's push and the
+extractor's pop); the carry is written before any batch of its run is cut; and
+nothing below the cursor is written again during the run.
 
 ### Approved natural-order comparator (fgumi-raw-bam)
 
@@ -337,10 +351,11 @@ regresses `samtools sort -n`–style throughput.
   - `natural_compare` — `get_unchecked` over `&[u8]` in the digit-run
     hot loop. SAFETY: indices are bounded by the loop invariants `pa < alen` /
     `pb < blen`, asserted in `debug_assert!` for the `at` helper.
-  - `natural_compare_nul` — raw `*const u8` walk that mirrors
-    samtools' `strnum_cmp`. SAFETY: caller guarantees both pointers are
-    null-terminated; `RawQuerynameKey::new` enforces this for every production
-    call site.
+  - `natural_compare_nul` — raw `*const u8` reads feeding `strnum_walk`, the
+    samtools `strnum_cmp` state machine it shares with the safe
+    `natural_cmp_bounded`. SAFETY: caller guarantees both pointers are
+    null-terminated, and the walk never reads past a side's terminator;
+    `RawQuerynameKey::new` enforces termination for every production call site.
   - `compare_nul` test helper and the `proptest` agreement test — push an
     explicit NUL into a `Vec<u8>` then take `as_ptr()`.
     SAFETY: the buffers are `to_vec()` + push, so the pointer is valid and
@@ -447,11 +462,11 @@ storing a reference whose real lifetime the struct cannot name.
 The counts above are **production** sites. Tests carry their own
 `#[allow(unsafe_code)]` where they exercise an already-approved `unsafe` API
 directly. In `fgumi-sort` those are `segmented_buf.rs` (8), `ref_sort.rs` (3),
-and `chunk_sorter.rs` (2), all of them driving `SegmentedBuf::grow_uninit` /
+and `chunk_sorter.rs` (1), all of them driving `SegmentedBuf::grow_uninit` /
 `slice_mut` to check a reserve-then-write round-trip, or that a sorted chunk
 matches its oracle. In `fgumi-raw-bam` they are the `compare_nul` helper and the
 `proptest` agreement test in `src/sort.rs`, both already named above. In
-`fgumi-pipeline-io` they are the eight test functions in `sort/arena_ingest.rs`
+`fgumi-pipeline-io` they are the three test functions in `sort/arena_ingest.rs`
 that build an arena by hand with `grow_uninit` / `slice_mut`. They add no new
 `unsafe` *surface*: each calls a function already justified above, under that
 function's documented contract.
@@ -595,6 +610,88 @@ and macOS only):
   above the buffer is at most `k x (cold + one carried frame) + P + decoded`.
   `--sort-stats` logs that bound (`Spill supply:`), the spill byte fetch, disk
   reads, and stash/claim counts.
+
+### Spill framing
+
+`SpillGather` (on the `sort-coord` driver) does not frame spill records: it
+plans each sorted chunk into record ranges of at most one BGZF block of framed
+bytes, from the chunk's length index alone (`plan_next_block`, the cut rule of
+`frame_one_block`), and sends them as `SpillBlockEvent::Range`.
+`SpillBlockCompress` frames each range into a per-worker scratch buffer and
+compresses it on the pool. Only a run's final block is framed by the gather,
+serially, and withheld until the next chunk shows whether the run extends —
+which is what lets the gather drop the chunk, so its arena returns as soon as
+the last range is compressed. Spill files are byte-identical to serial framing.
+
+### Queryname sort refs
+
+A queryname run sorts 40-byte refs, not owned name keys
+(`crates/fgumi-sort/src/queryname_ref.rs`). A `QnKey` holds a 24-byte window of
+the read name after an elided common prefix — the `instrument:run:flowcell:lane:`
+part every read of a lane shares — plus the flag class, the tail length and the
+prefix's class id in a per-sort `QnClassTable` (at most 256 classes, lock-free
+reads). Prefixes are learned per 4096-record batch (`QnRefBuilder`). The
+comparator (`cmp_qn_refs`) decides from the windows, concatenates two classes'
+prefixes on the stack, and reads the names from the arena only when a truncated
+window was read to its end; then flags, then arena offset. That is exactly the
+owned keys' order, so the output is unchanged. A prefix holds no NUL and does
+not end on a digit (`trim_to_class_rule`), so a natural digit run is never split
+between prefix and window. `--sort-stats` logs a `Queryname keys:` line with the
+classes, re-windowed batches and the compare shares (`arena fallbacks` is the
+share that read the arena). The spill format is unchanged: queryname keys are
+embedded in the record, and the merge rebuilds them from the body as
+`QnMergeKey<C>` — the same window against the sort's class table
+(`RawSortKey::MergeCtx`), trying the source's last class first
+(`RawSortKey::MergeHint`), with the full name kept for the fallback — so the
+merge compares through the windows as the run sort does. Residual chunks keep
+their phase-1 classes; a slot and a residual key in different classes compare
+by full name. Every other key's `MergeCtx`/`MergeHint` is `()`.
+
+### Split arena front (every sort order)
+
+A BAM sort's phase 1 runs as three steps generic over an
+`ArenaKeyExtractor` (`crates/fgumi-pipeline-io/src/sort/arena_split.rs`). For
+template order: `FindTemplateBoundaries` (serial, `sort-coord`) cuts 4096-record key batches
+and run ends, `ExtractTemplateKeys` (parallel, excluded from the reader's
+worker) extracts refs under the phase-1 cap, and `SortTemplateRun` (serial,
+`sort-coord`) sorts each run behind the ordinal reorder, reserving the whole
+phase-1 cap for a parallel sort. Every run's chunk is identical to the one the
+single-step front produced. `--sort-stats` logs a `Deferred key extraction:`
+census (records keyed before the scan reached their run's end, and the tail
+wait). `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` lets extraction run on the reader's
+worker too — a diagnostic knob for measuring the reader exclusion, not a tuning
+option.
+
+Queryname (`FindQuerynameBoundaries` → `ExtractQuerynameKeys` →
+`SortQuerynameRun`) extracts each batch's `QnRef`s with the extraction clone's
+own `QnRefBuilder` and classifies (and, on a learned prefix, re-windows) the
+batch before it leaves the extractor, so the run sort only sorts.
+
+**What `--max-memory` bounds.** The record budget (`--max-memory` × the phase-1
+thread count) covers each run's records **and** their sort refs (24 B
+coordinate, 40 B queryname, 40–56 B template). `ReadBlocks` seals a run at
+`run_cap_for(memory_limit, ledger.snapshot())` = `memory_limit × m / (m + w)`:
+`w` the ref width, `m` the previous run's exact mean record size from the
+sort's `RunLedger` (run 0: `RUN0_MEAN_RECORD_BYTES` = 258, and the widest
+56-byte template ref under `--key-types auto` until the first record chooses
+the lanes). The run sort publishes each run's totals before its chunk can free
+the arena, so boundaries are a function of the input alone. The charge is an
+estimate: a run of much shorter records than the previous one holds more refs
+than `w × cap / m`. The published `run_bytes` span complete records only (no
+BAM header, no carried tail), so `m` is exact. Every seal moves the run's refs
+into its chunk (in place for coordinate and serial template sorts; the parallel
+template merge and the final run's pieces copy once and free the refs), so a
+run's refs are resident once, never beside a retained buffer while the chunk
+spills or through the merge. `SortBuffer` charges each record its strategy's
+exact ref width. Queue memory and the merge's spill read-ahead are separate
+budgets.
+
+Coordinate (`FindCoordinateBoundaries` → `ExtractCoordinateKeys` →
+`SortCoordinateRun`) extracts 24-byte `RecordRef`s and radix-sorts each run;
+the radix spawns its own `sort_threads` threads, so a whole-run seal leaves the
+bounded pool the trait hands it unused; the final run's pieces after a spill
+(`seal_pieces`) sort on it. The single-step front these replace is gone; SAM and fused
+inputs still sort through `SortBuffer` and its per-order `ArenaSortStrategy`.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

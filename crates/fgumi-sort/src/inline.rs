@@ -108,10 +108,25 @@ impl<K> InMemoryChunk<K> {
         Self { data: Arc::new(PooledSegmentedBuf::unpooled(data)), records }
     }
 
+    /// Records the chunk's tuple Vec holds without reallocating (tests that
+    /// assert a seal leaves no spare ref capacity resident).
+    #[cfg(test)]
+    pub(crate) fn records_capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
     /// Number of records in the chunk.
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Test-only: where the chunk's record tuples live, to observe that a
+    /// seal moved its refs into the chunk rather than copying them.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn records_ptr(&self) -> *const (K, u64, u32) {
+        self.records.as_ptr()
     }
 
     /// Whether the chunk is empty.
@@ -165,14 +180,33 @@ impl<K> InMemoryChunk<K> {
         &self.records[i].0
     }
 
-    /// Move out the `i`th record's key (replaces it with
-    /// `K::default()`). Used by the merge loop after the
-    /// loser-tree consumes the key.
+    /// Moves the key out of slot `i` (replacing it with `K::default()`). Sole
+    /// user: the in-process merge's `ChunkSource::Memory` (`external.rs`), which
+    /// keeps owned-key chunks; the slot-backed merge reads a chunk's keys
+    /// through [`ChunkRef`] instead.
     pub(crate) fn take_key(&mut self, i: usize) -> K
     where
         K: Default,
     {
         std::mem::take(&mut self.records[i].0)
+    }
+}
+
+/// How a sorted chunk's stored per-record ref yields the merge key of that
+/// record. Keys that are their own ref (coordinate and the template lanes)
+/// return themselves; a queryname chunk's [`QnKey`](crate::queryname_ref::QnKey)
+/// rebuilds the owned key from the record body, exactly as a spilled record's
+/// key is rebuilt.
+pub trait ChunkRef<K>: Copy + Send + Sync + 'static {
+    /// The merge key of the record whose stored ref is `self` and whose body is
+    /// `body`.
+    fn merge_key(&self, body: &[u8]) -> K;
+}
+
+impl<K: RawSortKey + Copy + Send + Sync + 'static> ChunkRef<K> for K {
+    #[inline]
+    fn merge_key(&self, _body: &[u8]) -> K {
+        *self
     }
 }
 
@@ -922,6 +956,10 @@ impl TemplateKey {
 pub type TemplateKey40 = TemplateKey;
 
 impl RawSortKey for TemplateKey {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(40);
 
     /// # Panics
@@ -1138,6 +1176,10 @@ impl Ord for TemplateKey32 {
 }
 
 impl RawSortKey for TemplateKey24 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(24);
 
     /// # Panics
@@ -1166,6 +1208,10 @@ impl RawSortKey for TemplateKey24 {
 }
 
 impl RawSortKey for TemplateKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics
@@ -1347,6 +1393,10 @@ impl TemplateLaneKey for TertKey32 {
 }
 
 impl RawSortKey for CbKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics
@@ -1374,6 +1424,10 @@ impl RawSortKey for CbKey32 {
 }
 
 impl RawSortKey for TertKey32 {
+    type MergeCtx = ();
+
+    type MergeHint = ();
+
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     /// # Panics
@@ -2287,19 +2341,94 @@ pub fn parallel_radix_sort_template_refs<K: TemplateLaneKey>(refs: &mut [Templat
         });
 
         // K-way merge the sorted chunks
-        let chunk_boundaries: Vec<_> = refs
-            .chunks(chunk_size)
-            .scan(0, |pos, chunk| {
-                let start = *pos;
-                *pos += chunk.len();
-                Some(start..*pos)
-            })
-            .collect();
-
-        merge_sorted_template_chunks(refs, &chunk_boundaries);
+        merge_sorted_template_chunks(refs, &chunk_ranges(n, chunk_size));
     } else {
         radix_sort_template_refs(refs);
     }
+}
+
+/// Sort `refs` stably by key — the parallel radix (sorted per-thread chunks,
+/// then a heap k-way merge) when [`radix_sorts_in_parallel`] and the current
+/// rayon pool has more than one thread, else the serial radix — and return the
+/// chunk's `(key, offset, len)` tuples. The merge writes the tuples directly:
+/// no intermediate sorted-refs buffer, no copy back.
+///
+/// `refs` is consumed. On the serial path its allocation becomes the tuples (a
+/// `TemplateRecordRef<K>` and a `(K, u64, u32)` have the same size and
+/// alignment, so the conversion runs in place); on the parallel path the merge
+/// needs the refs as its source, so they are freed once the tuples are
+/// written. Either way a sealed run holds one run-sized ref buffer, not two.
+///
+/// [`radix_sorts_in_parallel`]: crate::radix_sorts_in_parallel
+#[must_use]
+pub fn sort_template_refs_into_records<K: TemplateLaneKey>(
+    mut refs: Vec<TemplateRecordRef<K>>,
+    sort_threads: usize,
+) -> Vec<(K, u64, u32)> {
+    use rayon::prelude::*;
+    const {
+        assert!(size_of::<TemplateRecordRef<K>>() == size_of::<(K, u64, u32)>());
+        assert!(align_of::<TemplateRecordRef<K>>() == align_of::<(K, u64, u32)>());
+    }
+
+    let n = refs.len();
+    let n_threads = rayon::current_num_threads();
+    if crate::ref_sort::radix_sorts_in_parallel(n, sort_threads)
+        && n >= RADIX_THRESHOLD * 2
+        && n_threads > 1
+        && n > 10_000
+    {
+        let chunk_size = n.div_ceil(n_threads);
+        refs.par_chunks_mut(chunk_size).for_each(radix_sort_template_refs);
+        let ranges = chunk_ranges(n, chunk_size);
+        let mut records = Vec::with_capacity(n);
+        merge_sorted_template_runs(&refs, &ranges, |r| records.push((r.key, r.offset, r.len)));
+        records
+    } else {
+        radix_sort_template_refs(&mut refs);
+        refs.into_iter().map(|r| (r.key, r.offset, r.len)).collect()
+    }
+}
+
+/// Split `refs` into `pieces` contiguous input-order ranges and sort each
+/// stably by key (the serial radix per range, the ranges in parallel on the
+/// current rayon pool), returning each range's exactly-sized `(key, offset,
+/// len)` tuples in input order of the ranges. `refs` is freed before
+/// returning, so the pieces hold the run's only ref bytes. An empty `refs`
+/// yields no pieces.
+#[must_use]
+pub(crate) fn sort_template_refs_into_pieces<K: TemplateLaneKey>(
+    mut refs: Vec<TemplateRecordRef<K>>,
+    pieces: usize,
+) -> Vec<Vec<(K, u64, u32)>> {
+    use rayon::prelude::*;
+    let size = crate::ref_sort::piece_len(refs.len(), pieces);
+    refs.par_chunks_mut(size)
+        .map(|range| {
+            radix_sort_template_refs(range);
+            range.iter().map(|r| (r.key, r.offset, r.len)).collect()
+        })
+        .collect()
+}
+
+/// The pre-fusion seal (sort the refs, then collect the tuples), kept as the
+/// fused seal's test oracle.
+#[cfg(test)]
+pub(crate) fn sort_template_refs_then_collect_for_test<K: TemplateLaneKey>(
+    mut refs: Vec<TemplateRecordRef<K>>,
+    sort_threads: usize,
+) -> Vec<(K, u64, u32)> {
+    if crate::ref_sort::radix_sorts_in_parallel(refs.len(), sort_threads) {
+        parallel_radix_sort_template_refs(&mut refs);
+    } else {
+        radix_sort_template_refs(&mut refs);
+    }
+    refs.into_iter().map(|r| (r.key, r.offset, r.len)).collect()
+}
+
+/// `0..n` cut into consecutive ranges of `chunk_size` (the last may be short).
+fn chunk_ranges(n: usize, chunk_size: usize) -> Vec<std::ops::Range<usize>> {
+    (0..n).step_by(chunk_size.max(1)).map(|start| start..(start + chunk_size).min(n)).collect()
 }
 
 /// Merge k sorted chunks of `TemplateRecordRef` in place.
@@ -2309,6 +2438,22 @@ fn merge_sorted_template_chunks<K: TemplateLaneKey>(
     refs: &mut [TemplateRecordRef<K>],
     chunk_ranges: &[std::ops::Range<usize>],
 ) {
+    if chunk_ranges.len() <= 1 {
+        return;
+    }
+    let mut result: Vec<TemplateRecordRef<K>> = Vec::with_capacity(refs.len());
+    merge_sorted_template_runs(refs, chunk_ranges, |r| result.push(*r));
+    refs.copy_from_slice(&result);
+}
+
+/// Heap k-way merge of the sorted `chunk_ranges` of `refs`, calling `emit` for
+/// each ref in merged order. Ties break by chunk index, so equal keys keep
+/// input order.
+fn merge_sorted_template_runs<K: TemplateLaneKey>(
+    refs: &[TemplateRecordRef<K>],
+    chunk_ranges: &[std::ops::Range<usize>],
+    mut emit: impl FnMut(&TemplateRecordRef<K>),
+) {
     use crate::radix::{heap_make, heap_sift_down};
 
     struct HeapEntry<K> {
@@ -2317,22 +2462,11 @@ fn merge_sorted_template_chunks<K: TemplateLaneKey>(
         pos: usize,
     }
 
-    if chunk_ranges.len() <= 1 {
-        return;
-    }
-
-    let n = refs.len();
-    let mut result: Vec<TemplateRecordRef<K>> = Vec::with_capacity(n);
-
     let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(chunk_ranges.len());
     for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
         if !range.is_empty() {
             heap.push(HeapEntry { key: refs[range.start].key, chunk_idx, pos: range.start });
         }
-    }
-
-    if heap.is_empty() {
-        return;
     }
 
     // Min-heap with chunk_idx tie-breaker for stability
@@ -2349,7 +2483,7 @@ fn merge_sorted_template_chunks<K: TemplateLaneKey>(
 
     while heap_size > 0 {
         let entry = &heap[0];
-        result.push(refs[entry.pos]);
+        emit(&refs[entry.pos]);
 
         let chunk_idx = entry.chunk_idx;
         let next_pos = entry.pos + 1;
@@ -2366,8 +2500,6 @@ fn merge_sorted_template_chunks<K: TemplateLaneKey>(
             }
         }
     }
-
-    refs.copy_from_slice(&result);
 }
 
 /// Binary insertion sort for small arrays of `TemplateRecordRef`.
@@ -3930,6 +4062,95 @@ mod tests {
                         i, refs[i].key, expected[i].key
                     );
                 }
+            }
+        }
+    }
+
+    mod sort_into_records {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// `n` refs over a tiny key space (heavy ties), unique offsets.
+        fn refs(n: usize, seed: u64) -> Vec<TemplateRecordRef<TemplateKey24>> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|i| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let key = TemplateKey24 {
+                        primary: x % 8,
+                        secondary: (x >> 8) % 4,
+                        name_hash_upper: (x >> 16) % 4,
+                    };
+                    TemplateRecordRef {
+                        key,
+                        offset: i as u64 * 16,
+                        len: u32::try_from(i % 97).unwrap(),
+                        padding: 0,
+                    }
+                })
+                .collect()
+        }
+
+        fn records(refs: &[TemplateRecordRef<TemplateKey24>]) -> Vec<(TemplateKey24, u64, u32)> {
+            refs.iter().map(|r| (r.key, r.offset, r.len)).collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(12))]
+            /// The fused seal (radix, then a heap merge straight into tuples) is a
+            /// stable sort by key — against std's stable sort (ties by offset,
+            /// which is input order) and against the pre-fusion path — on both
+            /// sides of the parallel threshold, at one and four sort threads in a
+            /// four-thread pool.
+            #[test]
+            fn sort_template_refs_into_records_equals_a_stable_sort(
+                n in prop_oneof![
+                    0usize..2_000,
+                    (crate::ref_sort::PARALLEL_SORT_THRESHOLD - 64)
+                        ..(crate::ref_sort::PARALLEL_SORT_THRESHOLD + 64),
+                ],
+                seed in any::<u64>(),
+                sort_threads in prop_oneof![Just(1usize), Just(4usize)],
+            ) {
+                let input = refs(n, seed);
+                let mut std_sorted = input.clone();
+                std_sorted.sort_by_key(|r| (r.key, r.offset));
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+                let got =
+                    pool.install(|| sort_template_refs_into_records(input.clone(), sort_threads));
+                let old = pool.install(|| {
+                    sort_template_refs_then_collect_for_test(input.clone(), sort_threads)
+                });
+                prop_assert!(got == records(&std_sorted), "fused seal is not std's stable sort");
+                prop_assert!(got == old, "fused seal differs from the pre-fusion path");
+            }
+        }
+
+        /// A serial seal converts the refs into the chunk's tuples in place:
+        /// the tuples live in the refs' allocation, so a sealed run holds no
+        /// second run-sized buffer.
+        #[test]
+        fn serial_seal_reuses_the_refs_allocation() {
+            let input = refs(1_000, 7);
+            assert!(!crate::ref_sort::radix_sorts_in_parallel(input.len(), 1));
+            let at = input.as_ptr().cast::<u8>();
+            let got = sort_template_refs_into_records(input, 1);
+            assert_eq!(got.len(), 1_000);
+            assert!(std::ptr::eq(got.as_ptr().cast::<u8>(), at), "the tuples reuse the refs");
+        }
+
+        /// Pieces are exactly sized: together they hold the run's refs once.
+        #[test]
+        fn pieces_are_exactly_sized() {
+            let input = refs(1_003, 11);
+            let mut big = Vec::with_capacity(4 * input.len());
+            big.extend_from_slice(&input);
+            let pieces = sort_template_refs_into_pieces(big, 4);
+            assert_eq!(pieces.iter().map(Vec::len).collect::<Vec<_>>(), [251, 251, 251, 250]);
+            for piece in &pieces {
+                assert_eq!(piece.capacity(), piece.len(), "a piece holds no spare capacity");
             }
         }
     }

@@ -65,6 +65,7 @@ pub(crate) mod pipeline;
 pub(crate) mod pooled_bam_writer;
 pub(crate) mod pooled_chunk_writer;
 pub mod prefetch;
+pub mod queryname_ref;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
@@ -84,8 +85,9 @@ pub mod template_key;
 // below.
 pub(crate) mod spill_block;
 pub(crate) mod spill_block_reader;
-// Synchronous inline spill compress for the P6 `CompressSpill` step (retires the
-// `SortWorkerPool` compress path). Surfaced via `write_sorted_chunk` below.
+// Streaming single-chunk spill writer: the reference the block-parallel spill
+// compressor is tested against, and nothing else.
+#[cfg(test)]
 pub(crate) mod sync_spill_writer;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
@@ -259,10 +261,13 @@ pub use fd_limit::{
     temp_file_limit_from_nofile,
 };
 pub use inline::{
-    CbKey32, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef, SORT_SEGMENT_SIZE,
-    TemplateKey, TemplateKey24, TertKey32, extract_coordinate_key_inline, radix_sort_record_refs,
-    radix_sort_record_refs_with_max,
+    CbKey32, ChunkRef, InMemoryChunk, PackedCoordinateKey, RecordBuffer, RecordRef,
+    SORT_SEGMENT_SIZE, TemplateKey, TemplateKey24, TemplateLaneKey, TemplateRecordRef, TertKey32,
+    extract_coordinate_key_inline, radix_sort_record_refs, radix_sort_record_refs_with_max,
 };
+/// The template run sort's kernels, for the `seal_allocations` test.
+#[cfg(feature = "test-utils")]
+pub use inline::{radix_sort_template_refs, sort_template_refs_into_records};
 pub use keys::{
     QuerynameComparator, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
     SortContext, SortOrder, natural_compare, natural_compare_nul, normalize_natural_key,
@@ -273,12 +278,17 @@ pub use merge_demand::{
 };
 pub use merge_slots::{ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot};
 pub use prefetch::KEY_PREFETCH_DISTANCE;
+pub use queryname_ref::{
+    QN_CLASS_BATCH_RECORDS, QN_MAX_CLASSES, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
+    QnKey, QnLex, QnMergeKey, QnNatural, QnRef, QnRefBuilder, QnSortState, cmp_qn_refs,
+    queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs,
+};
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
 };
 pub use ref_sort::{
-    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, queryname_chunk_from_arena_refs,
+    coordinate_chunk_from_arena_refs, coordinate_chunk_from_refs, coordinate_chunks_from_refs,
     radix_sorts_in_parallel,
 };
 pub use run_bound::{RunBound, format_run_formation};
@@ -287,12 +297,14 @@ pub use run_consolidate::{
 };
 pub use segmented_buf::SegmentedBuf;
 pub use sort_pool::BoundedSortPool;
-pub use spill_block::{SpillBlockCompressor, frame_keyed_record_into, spill_magic, spill_trailer};
+pub use spill_block::{
+    SpillBlockCompressor, frame_embedded_record_into, frame_keyed_record_into, spill_magic,
+    spill_trailer,
+};
 pub use spill_block_reader::{RawBlock, SpillBlockDecompressor};
-pub use sync_spill_writer::{write_sorted_chunk, write_sorted_chunk_inmem};
 pub use template_arena::{
     TemplateArenaAccumulator, TemplateArenaRefs, TemplateMemChunk, seal_template_refs,
-    template_chunk_from_arena_refs,
+    seal_template_refs_pieces, template_chunk_from_arena_refs,
 };
 pub use template_key::{ExtractedRefs, KeyViolation, TemplateKeyContext, TemplateKeySeed};
 pub use tmp_dir_alloc::TmpDirAllocator;

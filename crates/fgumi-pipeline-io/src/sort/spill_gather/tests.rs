@@ -26,14 +26,18 @@ fn coord_chunk_keyed(keys: &[u64]) -> MemoryChunkErased {
     MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(recs))
 }
 
-/// The `(file_id, is_last_in_file)` of every `Block` event, in order. Panics if a
-/// non-`Block` event is present, so callers separate spills from passthroughs.
+/// The `(file_id, is_last_in_file)` of every spill block — a planned `Range` or
+/// the run-final raw `Block` — in order. Panics on a passthrough event, so
+/// callers separate spills from passthroughs.
 fn block_files(events: &[SpillBlockEvent]) -> Vec<(u32, bool)> {
     events
         .iter()
         .map(|e| match e {
-            SpillBlockEvent::Block { file_id, is_last_in_file, .. } => (*file_id, *is_last_in_file),
-            _ => panic!("expected only Block events (a non-Block event was present)"),
+            SpillBlockEvent::Range { file_id, is_last_in_file, .. }
+            | SpillBlockEvent::Block { file_id, is_last_in_file, .. } => {
+                (*file_id, *is_last_in_file)
+            }
+            _ => panic!("expected only Range/Block events (a passthrough event was present)"),
         })
         .collect()
 }
@@ -59,7 +63,7 @@ fn drive(step: &mut SpillGather, events: Vec<SortChunkEvent>) -> Vec<SpillBlockE
         step.stage_event(event);
         // Frame the active chunk to completion, collecting blocks as we go.
         while step.active.is_some() {
-            step.produce_blocks().unwrap();
+            step.plan_ranges().unwrap();
             while let Some(ev) = step.pending.pop_front() {
                 out.push(ev);
             }
@@ -163,31 +167,45 @@ fn stage_spill_mints_dense_ordinals_and_marks_last_block() {
     for (i, ev) in events.iter().enumerate() {
         assert_eq!(ev.ordinal(), i as u64, "ordinal not dense at index {i}");
     }
-    // Exactly the final block is flagged is_last_in_file; all carry file_id=3.
+    // Every block but the last is a planned range; the last is the raw
+    // run-final block, and only it is flagged is_last_in_file; all carry
+    // file_id=3.
+    let last = events.len() - 1;
     for (i, ev) in events.iter().enumerate() {
-        let SpillBlockEvent::Block { file_id, is_last_in_file, records_ingested_so_far, .. } = ev
-        else {
-            panic!("expected Block event");
+        let (file_id, is_last_in_file, records_ingested_so_far) = match ev {
+            SpillBlockEvent::Range {
+                file_id, is_last_in_file, records_ingested_so_far, ..
+            } => {
+                assert!(i < last, "the run-final block must be a raw Block, not a Range");
+                (file_id, is_last_in_file, records_ingested_so_far)
+            }
+            SpillBlockEvent::Block {
+                file_id, is_last_in_file, records_ingested_so_far, ..
+            } => {
+                assert_eq!(i, last, "only the run-final block is framed by the gather");
+                (file_id, is_last_in_file, records_ingested_so_far)
+            }
+            _ => panic!("expected spill blocks"),
         };
         assert_eq!(*file_id, 3);
         assert_eq!(*records_ingested_so_far, 10);
-        assert_eq!(*is_last_in_file, i == events.len() - 1, "is_last wrong at {i}");
+        assert_eq!(*is_last_in_file, i == last, "is_last wrong at {i}");
     }
     // The chunk was freed once fully framed.
     assert!(step.active.is_none(), "active chunk must be cleared after framing");
 }
 
 #[test]
-fn produce_blocks_keeps_pending_bounded() {
-    // With many small records and a tiny block size, a single produce_blocks call
+fn plan_ranges_keeps_pending_bounded() {
+    // With many small records and a tiny block size, a single plan_ranges call
     // must not materialize the whole chunk — it tops up at most
     // MAX_EVENTS_PER_LOCK blocks.
     let mut step = SpillGather::new(1 << 20);
     step.block_size = 120; // ~1 record/block over 104-byte records
     let chunk = coord_chunk((0u8..100).map(|i| vec![i; 100]).collect());
     step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 100 });
-    step.produce_blocks().unwrap();
-    assert_eq!(step.pending.len(), 8, "one produce call tops up to MAX_EVENTS_PER_LOCK blocks");
+    step.plan_ranges().unwrap();
+    assert_eq!(step.pending.len(), 8, "one plan call tops up to MAX_EVENTS_PER_LOCK ranges");
     assert!(step.active.is_some(), "chunk still mid-framing (not fully drained in one call)");
 }
 
@@ -269,15 +287,7 @@ fn ordinals_are_dense_and_monotonic_across_event_kinds() {
         records_ingested_so_far: 2,
     });
 
-    let ordinals: Vec<u64> = step
-        .pending
-        .iter()
-        .map(|e| match e {
-            SpillBlockEvent::Block { ordinal, .. }
-            | SpillBlockEvent::Residual { ordinal, .. }
-            | SpillBlockEvent::AllAnnounced { ordinal, .. } => *ordinal,
-        })
-        .collect();
+    let ordinals: Vec<u64> = step.pending.iter().map(SpillBlockEvent::ordinal).collect();
     assert_eq!(ordinals, vec![0, 1, 2], "ordinals must be dense across variants");
     assert_eq!(step.next_ordinal, 3);
 }
@@ -593,7 +603,7 @@ fn the_run_final_block_is_withheld_until_the_run_is_closed() {
         chunk: coord_chunk_keyed(&[10, 20]),
         records_ingested_so_far: 2,
     });
-    step.produce_blocks().unwrap();
+    step.plan_ranges().unwrap();
     assert!(step.active.is_none(), "the one-block chunk is fully framed");
     assert!(step.pending.is_empty(), "the sole (run-final) block is withheld, not emitted");
     assert!(
@@ -629,7 +639,7 @@ fn a_non_empty_spill_chunk_becomes_active_without_emitting_yet() {
     let active = step.active.as_ref().expect("chunk must be parked for incremental framing");
     assert_eq!(active.file_id, 7, "file_id comes from the spill seq, not write order");
     assert_eq!(active.next_idx, 0);
-    assert!(step.pending.is_empty(), "framing happens in produce_blocks, not stage_event");
+    assert!(step.pending.is_empty(), "planning happens in plan_ranges, not stage_event");
 }
 
 /// The `TemplateCoordinate` variant is framed by a *different* function than the
@@ -670,4 +680,321 @@ fn template_coordinate_chunks_frame_through_their_own_path() {
             "record {i}'s body must survive template framing"
         );
     }
+}
+
+// ── Range planning (the cut rule, run-final framing, arena lifetime) ─────────
+
+/// A chunk of `kind` whose records have the given body lengths (bodies are
+/// opaque to framing: only the template lanes write a key, which defaults).
+fn chunk_of_kind(kind: SpillKeyKind, lens: &[usize]) -> MemoryChunkErased {
+    use fgumi_sort::{CbKey32, QnKey, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32};
+    fn records<K: Default>(lens: &[usize]) -> Vec<(K, Vec<u8>)> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, &n)| (K::default(), vec![u8::try_from(i % 251).unwrap(); n]))
+            .collect()
+    }
+    match kind {
+        SpillKeyKind::Coordinate => {
+            MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(records::<
+                RawCoordinateKey,
+            >(lens)))
+        }
+        SpillKeyKind::QuerynameLex => MemoryChunkErased::QuerynameLex(
+            InMemoryChunk::from_owned_records(records::<QnKey>(lens)),
+        ),
+        SpillKeyKind::QuerynameNatural => MemoryChunkErased::QuerynameNatural(
+            InMemoryChunk::from_owned_records(records::<QnKey>(lens)),
+        ),
+        SpillKeyKind::TemplateK24 => MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K24(
+            InMemoryChunk::from_owned_records(records::<TemplateKey24>(lens)),
+        )),
+        SpillKeyKind::TemplateCb32 => MemoryChunkErased::TemplateCoordinate(
+            TemplateMemChunk::Cb32(InMemoryChunk::from_owned_records(records::<CbKey32>(lens))),
+        ),
+        SpillKeyKind::TemplateTert32 => MemoryChunkErased::TemplateCoordinate(
+            TemplateMemChunk::Tert32(InMemoryChunk::from_owned_records(records::<TertKey32>(lens))),
+        ),
+        SpillKeyKind::TemplateK40 => MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K40(
+            InMemoryChunk::from_owned_records(records::<TemplateKey>(lens)),
+        )),
+    }
+}
+
+/// The planner's cut rule reproduces `frame_one_block`'s blocks exactly — the
+/// same `[start, end)` and the same framed size — for every spill key kind
+/// (all four template lanes included), block
+/// size and an oversized record, so a planned range frames to the block the
+/// serial framer would have produced.
+#[rstest::rstest]
+fn plan_next_block_matches_frame_one_block(
+    #[values(
+        SpillKeyKind::Coordinate,
+        SpillKeyKind::QuerynameLex,
+        SpillKeyKind::QuerynameNatural,
+        SpillKeyKind::TemplateK24,
+        SpillKeyKind::TemplateCb32,
+        SpillKeyKind::TemplateTert32,
+        SpillKeyKind::TemplateK40
+    )]
+    kind: SpillKeyKind,
+    #[values(1usize, 100, 64 * 1024)] block_size: usize,
+) {
+    let mut lens: Vec<usize> = (0..300).map(|i| 1 + (i * 37) % 300).collect();
+    lens.insert(120, 70_000); // larger than every block size
+    lens.insert(7, 0);
+    let chunk = chunk_of_kind(kind, &lens);
+    let mut start = 0;
+    while start < chunk.len() {
+        let (end, framed) = plan_next_block(&chunk, start, block_size);
+        let mut out = Vec::new();
+        let framed_end = frame_one_block(&chunk, start, block_size, &mut out).unwrap();
+        assert_eq!((end, framed as usize), (framed_end, out.len()), "{kind:?} block at {start}");
+        assert!(end > start, "every block holds at least one record");
+        start = end;
+    }
+}
+
+/// A run-final block framed differently from the planner's cut fails the
+/// sort, naming both ranges, rather than dropping the skipped records.
+#[test]
+fn a_run_final_framing_disagreement_is_an_error() {
+    assert!(super::check_run_final_block(5, (9, 400), (9, 400)).is_ok());
+    for framed in [(8, 300), (9, 399), (10, 500)] {
+        let err = super::check_run_final_block(5, (9, 400), framed).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "SpillGather: the run-final block framed records [5, {}) ({} bytes) but the \
+                 planner cut [5, 9) (400 bytes); refusing to drop records",
+                framed.0, framed.1
+            )
+        );
+    }
+}
+
+/// A run smaller than one block has only its final block: it is framed
+/// serially and withheld, and no range is planned.
+#[test]
+fn single_block_run_is_framed_serially() {
+    let mut step = SpillGather::new(1 << 20);
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk: coord_chunk(vec![vec![1u8; 30], vec![2u8; 40]]),
+        records_ingested_so_far: 2,
+    });
+    step.plan_ranges().unwrap();
+    assert!(step.pending.is_empty(), "no range is planned for a one-block run");
+    assert!(step.active.is_none(), "the step released the chunk");
+    let held = step.held_last_block.take().expect("the run-final block is withheld");
+    assert_eq!(
+        held.bytes,
+        concat(
+            &frame_chunk_into_blocks(
+                &coord_chunk(vec![vec![1u8; 30], vec![2u8; 40]]),
+                BGZF_MAX_BLOCK_SIZE
+            )
+            .unwrap()
+        )
+    );
+}
+
+/// With a capacity-1 arena pool, run k's arena comes back only once every
+/// range planned from it has been compressed — and does come back then, so
+/// run k+1 can never wait on a chunk the planner still holds.
+#[test]
+fn arena_returns_only_after_the_last_range_is_compressed() {
+    use fgumi_sort::{ArenaPool, RecordRef, SpillCodec};
+
+    let pool = ArenaPool::new(1, 1 << 20);
+    let mut arena = pool.try_acquire().expect("the pool's one arena");
+    let refs: Vec<RecordRef> = (0..60u64)
+        .map(|i| {
+            let off = arena.extend_from_slice(&[u8::try_from(i).unwrap(); 100]) as u64;
+            RecordRef::new(i, off, 100)
+        })
+        .collect();
+    let chunk = MemoryChunkErased::Coordinate(fgumi_sort::coordinate_chunk_from_refs(
+        Arc::new(arena),
+        refs,
+        1,
+    ));
+    let mut step = SpillGather::new(1 << 20);
+    step.block_size = 250; // two records per block → many ranges
+    step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 60 });
+    let mut ranges = Vec::new();
+    while step.active.is_some() {
+        step.plan_ranges().unwrap();
+        ranges.extend(step.pending.drain(..));
+    }
+    assert!(ranges.len() > 1, "the chunk was planned into several ranges");
+    assert!(step.held_last_block.is_held(), "the run-final block was framed and withheld");
+    let mut compress = crate::sort::SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20);
+    let last = ranges.pop().expect("ranges");
+    for range in ranges {
+        compress.compress_event(range).unwrap();
+        assert!(pool.try_acquire().is_none(), "a range still pending holds the arena");
+    }
+    compress.compress_event(last).unwrap();
+    assert!(pool.try_acquire().is_some(), "the last compressed range returns the arena");
+}
+
+/// Every spill file the planned path writes (`SpillGather` ranges framed and
+/// compressed by `SpillBlockCompress`, written by `SpillWrite`) is
+/// byte-identical to the file the serial framing writes (the same chunks cut
+/// by `frame_chunk_into_blocks`, compressed, written), for both codecs and a
+/// run extended across two chunks.
+#[rstest::rstest]
+fn spill_files_are_byte_identical_to_serial_framing(
+    #[values(fgumi_sort::SpillCodec::Zstd, fgumi_sort::SpillCodec::Bgzf)]
+    codec: fgumi_sort::SpillCodec,
+) {
+    use crate::sort::{SpillBlockCompress, SpillWrite};
+    use fgumi_sort::TmpDirAllocator;
+
+    const BLOCK: usize = 700;
+    let run = |keys: std::ops::Range<u64>| {
+        let recs = keys
+            .map(|k| {
+                (
+                    RawCoordinateKey { sort_key: k },
+                    vec![
+                        u8::try_from(k % 251).unwrap();
+                        37 + usize::try_from(k * 13 % 90).unwrap()
+                    ],
+                )
+            })
+            .collect();
+        MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(recs))
+    };
+    // Run 0 is two contiguous chunks (one file); run 1 starts lower (a new file).
+    let chunks = || vec![run(0..40), run(40..90), run(5..30)];
+    let write = |events: Vec<SpillBlockEvent>| -> (tempfile::TempDir, Vec<Vec<u8>>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alloc = TmpDirAllocator::new(vec![dir.path().to_path_buf()]).unwrap();
+        let mut writer = SpillWrite::new(
+            Arc::new(parking_lot::Mutex::new(alloc)),
+            codec,
+            1 << 20,
+            Arc::new(Vec::new()),
+        );
+        let mut compress = SpillBlockCompress::new(codec, 1, 1 << 20);
+        for event in events {
+            writer.process_event(compress.compress_event(event).unwrap()).unwrap();
+        }
+        let mut names: Vec<_> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        let files = names.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        (dir, files)
+    };
+
+    // Planned: through SpillGather.
+    let mut step = SpillGather::new(1 << 20);
+    step.block_size = BLOCK;
+    let mut input: Vec<SortChunkEvent> = chunks()
+        .into_iter()
+        .enumerate()
+        .map(|(seq, chunk)| SortChunkEvent::Spill {
+            seq: u32::try_from(seq).unwrap(),
+            chunk,
+            records_ingested_so_far: 0,
+        })
+        .collect();
+    input.push(SortChunkEvent::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    let planned = drive(&mut step, input);
+    assert!(
+        planned.iter().any(|e| matches!(e, SpillBlockEvent::Range { .. })),
+        "ranges were planned"
+    );
+    assert!(
+        planned.iter().any(
+            |e| matches!(e, SpillBlockEvent::Range { framed_bytes, .. } if *framed_bytes as usize > BLOCK)
+        ),
+        "some range spans several frames"
+    );
+    let (_d1, planned_files) = write(planned);
+
+    // Serial: the same runs framed whole, as raw blocks.
+    let mut serial = Vec::new();
+    let file_of_chunk = [0u32, 0, 2];
+    let mut ordinal = 0;
+    let all = chunks();
+    for (c, chunk) in all.iter().enumerate() {
+        let blocks = frame_chunk_into_blocks(chunk, BLOCK).unwrap();
+        let n = blocks.len();
+        for (b, bytes) in blocks.into_iter().enumerate() {
+            let last_of_file =
+                b + 1 == n && (c + 1 == all.len() || file_of_chunk[c + 1] != file_of_chunk[c]);
+            serial.push(SpillBlockEvent::Block {
+                ordinal,
+                file_id: file_of_chunk[c],
+                key_kind: SpillKeyKind::Coordinate,
+                is_last_in_file: last_of_file,
+                records_ingested_so_far: 0,
+                bytes,
+            });
+            ordinal += 1;
+        }
+    }
+    serial.push(SpillBlockEvent::AllAnnounced {
+        ordinal,
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    let (_d2, serial_files) = write(serial);
+
+    assert_eq!(planned_files.len(), 2, "two runs, two files");
+    assert!(
+        planned_files == serial_files,
+        "spill files differ from the serial framing ({codec:?})"
+    );
+}
+
+/// Each planned range spans up to `FRAMES_PER_RANGE` frames, never the
+/// run-final one, and carries the frame size `SpillBlockCompress` re-cuts it
+/// at: the ranges' frames, then the withheld final block, are exactly the
+/// frames the planner cuts one at a time.
+#[test]
+fn ranges_span_up_to_frames_per_range_frames() {
+    const BLOCK: usize = 250;
+    let chunk = coord_chunk((0..70u8).map(|i| vec![i; 100]).collect());
+    let mut frames = vec![0usize];
+    while *frames.last().unwrap() < chunk.len() {
+        frames.push(plan_next_block(&chunk, *frames.last().unwrap(), BLOCK).0);
+    }
+    let n_frames = frames.len() - 1;
+    let mut step = SpillGather::new(1 << 20);
+    step.block_size = BLOCK;
+    step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 70 });
+    let mut ranges = Vec::new();
+    while step.active.is_some() {
+        step.plan_ranges().unwrap();
+        ranges.extend(step.pending.drain(..));
+    }
+    let mut at = 0usize;
+    let mut spans = Vec::new();
+    for range in &ranges {
+        let SpillBlockEvent::Range { start, end, frame_bytes, .. } = range else {
+            panic!("only ranges are planned before the run closes");
+        };
+        assert_eq!(*frame_bytes as usize, BLOCK);
+        assert_eq!(usize::try_from(*start).unwrap(), frames[at], "ranges are contiguous");
+        let span = frames[at..]
+            .iter()
+            .position(|&f| f == usize::try_from(*end).unwrap())
+            .expect("ends on a frame");
+        spans.push(span);
+        at += span;
+    }
+    assert_eq!(at, n_frames - 1, "every frame but the final one is in a range");
+    assert!(step.held_last_block.is_held(), "the run-final frame is withheld");
+    let full = n_frames.saturating_sub(1) / FRAMES_PER_RANGE;
+    assert!(spans[..full].iter().all(|&s| s == FRAMES_PER_RANGE), "{spans:?}");
+    assert!(spans.iter().all(|&s| (1..=FRAMES_PER_RANGE).contains(&s)), "{spans:?}");
 }

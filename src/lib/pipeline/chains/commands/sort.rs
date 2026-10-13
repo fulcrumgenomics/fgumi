@@ -55,6 +55,12 @@ pub(crate) struct SortSummaryFinalizeHook {
     /// reported as the `Byte fetch (input):` line; `Some` only under
     /// `--sort-stats` on that path.
     pub(crate) input_fetch: Option<InputFetchReport>,
+    /// A queryname sort's shared key state, reported as the `Queryname keys:`
+    /// line; `None` for the other orders.
+    pub(crate) queryname_keys: Option<fgumi_sort::QnSortState>,
+    /// Whether `--sort-stats` was given: the `Queryname keys:` line is logged
+    /// at `info` with it and at `debug` without it.
+    pub(crate) sort_stats: bool,
 }
 
 /// What the `Byte fetch (input):` line reports.
@@ -87,6 +93,8 @@ impl FinalizeHook for SortSummaryFinalizeHook {
             timer,
             phase_caps,
             input_fetch,
+            queryname_keys,
+            sort_stats,
         } = *self;
         let stats = stats_slot.lock().take().unwrap_or_default();
         info!("=== Summary ===");
@@ -109,6 +117,14 @@ impl FinalizeHook for SortSummaryFinalizeHook {
         }
         if let Some(fetch) = &input_fetch {
             info!("{}", fetch.line());
+        }
+        if let Some(keys) = &queryname_keys {
+            let line = keys.stats.summary_line(&keys.table);
+            if sort_stats {
+                info!("{line}");
+            } else {
+                log::debug!("{line}");
+            }
         }
         if !phase_caps.is_empty() {
             // `peak` = most workers inside the phase at once, against its
@@ -144,7 +160,8 @@ impl FinalizeHook for SortSummaryFinalizeHook {
 // `=== Sort Phase Timing ===` per-phase wall-time breakdown at `info!` on every
 // sort. Standalone `fgumi sort` now runs through the declarative chain, whose
 // sort phases are modeled as discrete pipeline steps
-// (`ReadBlocks`/`InflateToArena` → `FindBoundariesAndSort`/`SortBuffer` →
+// (`ReadBlocks`/`InflateToArena` → the split front (`Find*Boundaries` /
+// `Extract*Keys` / `Sort*Run`) or `SortBuffer` →
 // `SpillGather`/`SpillBlockCompress`/`SpillWrite` → `SortSpillDecompress` →
 // `SortMerge` → `BgzfCompress`/`WriteBgzfFile`). The pipeline already records
 // each step's cumulative `try_run` busy time
@@ -221,14 +238,17 @@ impl SortPhase {
             // FrameBgzfBlocks`) are the read half of this phase.
             "PlanInputReads" | "PreadInputSlices" | "FrameBgzfBlocks" | "ReadBlocks"
             | "InflateToArena" => Some(SortPhase::ReadDecompress),
-            "FindBoundariesAndSort" | "SortBuffer" => Some(SortPhase::InMemorySort),
-            // `CompressSpill` is the fused compress-and-write spill variant
-            // (`SortBuffer → CompressSpill → …`); `add_sort` currently wires the
-            // `SpillGather`/`SpillBlockCompress`/`SpillWrite` split instead, but
-            // classify it so the roll-up stays correct if that wiring changes.
-            "SpillGather" | "SpillBlockCompress" | "SpillWrite" | "CompressSpill" => {
-                Some(SortPhase::SpillWrite)
-            }
+            "SortBuffer"
+            | "FindCoordinateBoundaries"
+            | "ExtractCoordinateKeys"
+            | "SortCoordinateRun"
+            | "FindTemplateBoundaries"
+            | "ExtractTemplateKeys"
+            | "SortTemplateRun"
+            | "FindQuerynameBoundaries"
+            | "ExtractQuerynameKeys"
+            | "SortQuerynameRun" => Some(SortPhase::InMemorySort),
+            "SpillGather" | "SpillBlockCompress" | "SpillWrite" => Some(SortPhase::SpillWrite),
             // The merge supply (`SpillReadPlanner → PreadSpillSlices →
             // SortSpillDecompress`) is Phase-2 read-ahead of the final merge's
             // sources, not consolidation; consolidation runs inside `SpillWrite`
@@ -410,6 +430,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -448,6 +470,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
 
@@ -477,6 +501,8 @@ mod tests {
             timer: OperationTimer::new("Sort"),
             phase_caps: vec![phase1, phase2],
             input_fetch: None,
+            queryname_keys: None,
+            sort_stats: false,
         };
         Box::new(hook).finalize().expect("finalize must succeed");
         let logs = captured();
@@ -527,8 +553,8 @@ mod tests {
     fn summarize_sort_phases_buckets_every_step_into_its_phase() {
         let snap = snapshot_with_steps(vec![
             ("ReadBlocks", 100),
-            ("InflateToArena", 200),        // read + decompress = 300
-            ("FindBoundariesAndSort", 400), // in-memory sort = 400
+            ("InflateToArena", 200),    // read + decompress = 300
+            ("SortCoordinateRun", 400), // in-memory sort = 400
             ("SpillGather", 10),
             ("SpillBlockCompress", 20),
             ("SpillWrite", 30),          // spill write = 60, less consolidation
@@ -558,8 +584,8 @@ mod tests {
     }
 
     /// The `SortBuffer` ingest step (the SAM/RecordBatch arena front) buckets
-    /// into in-memory sort, exercising the branch the BAM path's
-    /// `FindBoundariesAndSort` does not.
+    /// into in-memory sort, exercising the branch the BAM path's split front
+    /// does not.
     #[test]
     fn summarize_maps_sort_buffer_ingest_to_in_memory_sort() {
         let phase_ns = summarize_sort_phases(&snapshot_with_steps(vec![("SortBuffer", 42)]), 0);
@@ -620,12 +646,19 @@ mod tests {
     #[case::frame_bgzf_blocks("FrameBgzfBlocks", SortPhase::ReadDecompress)]
     #[case::read_blocks("ReadBlocks", SortPhase::ReadDecompress)]
     #[case::inflate("InflateToArena", SortPhase::ReadDecompress)]
-    #[case::find_and_sort("FindBoundariesAndSort", SortPhase::InMemorySort)]
     #[case::sort_buffer("SortBuffer", SortPhase::InMemorySort)]
+    #[case::find_template_boundaries("FindTemplateBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_template_keys("ExtractTemplateKeys", SortPhase::InMemorySort)]
+    #[case::sort_template_run("SortTemplateRun", SortPhase::InMemorySort)]
+    #[case::find_coordinate_boundaries("FindCoordinateBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_coordinate_keys("ExtractCoordinateKeys", SortPhase::InMemorySort)]
+    #[case::sort_coordinate_run("SortCoordinateRun", SortPhase::InMemorySort)]
+    #[case::find_queryname_boundaries("FindQuerynameBoundaries", SortPhase::InMemorySort)]
+    #[case::extract_queryname_keys("ExtractQuerynameKeys", SortPhase::InMemorySort)]
+    #[case::sort_queryname_run("SortQuerynameRun", SortPhase::InMemorySort)]
     #[case::spill_gather("SpillGather", SortPhase::SpillWrite)]
     #[case::spill_block_compress("SpillBlockCompress", SortPhase::SpillWrite)]
     #[case::spill_write("SpillWrite", SortPhase::SpillWrite)]
-    #[case::compress_spill("CompressSpill", SortPhase::SpillWrite)]
     #[case::spill_read_planner("SpillReadPlanner", SortPhase::KWayMerge)]
     #[case::pread_spill_slices("PreadSpillSlices", SortPhase::KWayMerge)]
     #[case::spill_decompress("SortSpillDecompress", SortPhase::KWayMerge)]

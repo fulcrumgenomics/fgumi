@@ -485,7 +485,7 @@ pub trait Step: Send + Sized + 'static {
     ///   [`PhaseCap::try_acquire`](crate::admission::PhaseCap::try_acquire)
     ///   around a narrower section).
     /// - **Serial / Detached steps with off-pool parallel work** (`SortBuffer`
-    ///   and `FindBoundariesAndSort` for the per-run sort, `SortMerge` for the
+    ///   and the split front's `Sort*Run` for the per-run sort, `SortMerge` for the
     ///   in-memory fast-path gather) take the whole cap for that work through
     ///   [`PhaseCap::acquire_whole`](crate::admission::PhaseCap::acquire_whole),
     ///   which may park the step until the cap's pool holders finish their

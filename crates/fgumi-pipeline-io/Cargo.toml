@@ -59,3 +59,9 @@ harness = false
 [[bench]]
 name = "spill_merge_supply"
 harness = false
+
+[[bench]]
+name = "spill_gather"
+harness = false
+# The planner and framer it times are `test-utils` seams.
+required-features = ["test-utils"]

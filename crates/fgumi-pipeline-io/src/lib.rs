@@ -8,8 +8,9 @@
 //!   * [`source`] — BAM ingest steps ([`ReadBgzfBlocks`] and the
 //!     `read_bam*` helpers) that turn a reader into decompressed blocks.
 //!   * [`sink`] — BAM output steps ([`WriteBgzfFile`]).
-//!   * [`sort`] — in-pipeline sort steps ([`SortBuffer`], [`CompressSpill`],
-//!     [`SortSpillDecompress`], [`SortMerge`]).
+//!   * [`sort`] — in-pipeline sort steps ([`SortBuffer`],
+//!     [`SortSpillDecompress`], [`SortMerge`], and the spill and arena steps in
+//!     the module).
 //!   * [`types`] — the record-batch / decompressed-block buffers
 //!     ([`RecordBatch`], [`DecompressedBlock`], [`BgzfBlock`], …) exchanged
 //!     between steps.
@@ -25,7 +26,7 @@ pub mod types;
 
 pub use fgumi_pipeline_core::HeaderHandle;
 pub use sink::write_bgzf::{DeferredOpen, WriteBgzfFile};
-pub use sort::{CompressSpill, SortBuffer, SortMerge, SortSpillDecompress};
+pub use sort::{SortBuffer, SortMerge, SortSpillDecompress};
 pub use source::read_bam::{
     DEFAULT_BLOCKS_PER_BATCH, ReadBgzfBlocks, read_bam, read_bam_auto, read_bam_from_reader,
     read_bam_stdin,

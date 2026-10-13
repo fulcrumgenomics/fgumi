@@ -1,15 +1,12 @@
 //! Re-export shim. The sort typed-steps now live in the `fgumi-pipeline-io`
 //! crate (`fgumi_pipeline_io::sort`).
 pub use fgumi_pipeline_io::sort::{
-    BlockOutput, CompressSpill, MergeBatchBuilder, MergeOutput, RecordBatchOutput,
-    SORT_COORD_GROUP, SORT_IO_GROUP, SortBuffer, SortMerge, SortSpillDecompress,
-    SpillBlockCompress, SpillGather, SpillReadPlanner, SpillRunStats, SpillSupply, SpillWrite,
-    SupplyDiagnostics, SupplyLedger, protocol,
+    BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SORT_COORD_GROUP,
+    SORT_IO_GROUP, SortBuffer, SortMerge, SortSpillDecompress, SpillBlockCompress, SpillGather,
+    SpillReadPlanner, SpillRunStats, SpillSupply, SpillWrite, SupplyDiagnostics, SupplyLedger,
+    protocol,
 };
 
-pub mod compress_spill {
-    pub use fgumi_pipeline_io::sort::compress_spill::*;
-}
 pub mod sort_buffer {
     pub use fgumi_pipeline_io::sort::sort_buffer::*;
 }

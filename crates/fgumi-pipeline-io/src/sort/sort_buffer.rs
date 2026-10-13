@@ -1,15 +1,13 @@
-//! `SortBuffer` — first step of the P6 Phase-1 split (`SortBuffer` →
-//! `CompressSpill` → `SortSpillDecompress` → `SortMerge`).
+//! `SortBuffer` — the record-input phase-1 front (`SortBuffer` → `SpillGather`
+//! → `SpillBlockCompress` → `SpillWrite` → merge supply → `SortMerge`).
 //!
 //! `SortBuffer` (`Serial`) ingests `RecordBatch`es into an in-memory arena via
 //! the order-erased `ChunkSorter` (each variant drives the same per-order
-//! [`ArenaSortStrategy`] as the block-input `FindBoundariesAndSort` front),
+//! [`ArenaSortStrategy`] the record-input front was built around),
 //! sorts each filled arena, and emits the sorted records as a [`SortChunkEvent`]
 //! — **without touching disk**. Mid-stream spill
 //! chunks (`Spill { seq, .. }`) and the final residual (`Residual`) flow to the
-//! `Parallel` `CompressSpill` step, which compresses + writes spills and passes
-//! the residual through. This replaces the monolithic `SortAndSpill`, which
-//! drove a private `SortWorkerPool` to compress inline.
+//! spill steps, which compress + write spills and pass the residual through.
 //!
 //! Spill chunks are emitted **as the buffer fills** (not accumulated to the
 //! end), and `try_run` drains the staged-events queue before popping the next
@@ -36,8 +34,8 @@ use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::SamTag;
 use fgumi_sort::{
-    KeyTypesSpec, PooledSegmentedBuf, QuerynameComparator, RawExternalSorter, RawQuerynameKey,
-    RawQuerynameLexKey, SegmentedBuf, SortOrder, TemplateArenaAccumulator,
+    KeyTypesSpec, PooledSegmentedBuf, QnLex, QnNatural, QnSortState, QuerynameComparator,
+    SegmentedBuf, SortOrder, TemplateArenaAccumulator,
 };
 use noodles::sam::Header;
 
@@ -56,17 +54,10 @@ use fgumi_pipeline_core::{
 /// Max staged events flushed to the output per `try_run` invocation.
 const MAX_EVENTS_PER_LOCK: usize = 8;
 
-/// Per-record memory overhead added to the arena byte count so the seal
-/// threshold accounts for the strategy's `(key, offset, len)` ref alongside the
-/// record body. Conservative; the exact value only shifts spill boundaries, not
-/// the merged output (coordinate/template are globally stable; queryname's tie
-/// order is unspecified).
-const PER_RECORD_REF_OVERHEAD: usize = 64;
-
 /// Record-input arena accumulator: copies each pushed record into a growing
 /// [`SegmentedBuf`] and drives an [`ArenaSortStrategy`] over the arena refs, so
-/// the record-input (SAM / fused) path uses the SAME per-order sort engine as the
-/// block-input arena front ([`FindBoundariesAndSort`](crate::sort::FindBoundariesAndSort)).
+/// the record-input (SAM / fused) path seals the same arena-backed chunks as the
+/// block-input arena front (the split front in [`arena_split`](crate::sort::arena_split)).
 /// At seal the filled arena is wrapped in an `Arc` and handed to the strategy (no
 /// further record copies), and a fresh arena starts the next run.
 struct ArenaAccum<S: ArenaSortStrategy> {
@@ -106,7 +97,15 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
         // `(key, offset, len)`; it does not retain `body`, so the arena may grow
         // (and this slice's borrow end) freely afterwards.
         self.strategy.push_record(body, offset, len).map_err(|e| anyhow!("{e:#}"))?;
-        self.memory_used += bam_bytes.len() + PER_RECORD_REF_OVERHEAD;
+        // Each record is charged its bytes plus its sort ref, so a run's records
+        // and refs together fit the budget; template order charges the widest
+        // ref until its first record chooses the lanes. Boundaries only, never
+        // output: every order's sort is stable.
+        let ref_width = self
+            .strategy
+            .ref_width()
+            .unwrap_or_else(|| fgumi_sort::TemplateKeyVariant::WIDEST.ref_width());
+        self.memory_used += bam_bytes.len() + ref_width;
         self.total_records += 1;
         Ok(self.memory_used >= self.memory_limit)
     }
@@ -131,14 +130,32 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
         )
     }
 
+    /// Seal the final run of a sort that spilled as `pieces` pre-sorted chunks
+    /// (see [`ArenaSortStrategy::seal_pieces`]), under the whole phase cap.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::take_sorted_chunk`].
+    fn take_sorted_pieces(&mut self, pieces: usize) -> io::Result<Vec<MemoryChunkErased>> {
+        let arena = std::mem::replace(&mut self.arena, SegmentedBuf::new());
+        self.memory_used = 0;
+        let arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
+        crate::sort::arena_ingest::seal_pieces_under_cap(
+            &mut self.strategy,
+            self.cap.as_deref(),
+            arc,
+            self.sort_threads,
+            pieces,
+        )
+    }
+
     fn total_records(&self) -> u64 {
         self.total_records
     }
 }
 
 /// Everything a [`SortBuffer`] reads to provision its arena sorter — and
-/// nothing else, so a caller cannot set a knob here that the buffer ignores
-/// (the failure mode of configuring it through a whole [`RawExternalSorter`]).
+/// nothing else, so a caller cannot set a knob here that the buffer ignores.
 #[derive(Debug, Clone, Copy)]
 pub struct SortBufferConfig {
     /// The order to sort into.
@@ -153,38 +170,14 @@ pub struct SortBufferConfig {
     pub key_types: KeyTypesSpec,
 }
 
-impl SortBufferConfig {
-    /// The subset of `sorter`'s configuration a [`SortBuffer`] reads.
-    ///
-    /// Takes the engine's own phase-1 count, which honours a `sort_threads`
-    /// override as-is (not capped by `threads`; see
-    /// [`RawExternalSorter::phase1_threads`]). No fgumi CLI path builds a
-    /// `SortBuffer` this way — the chain builder fills [`SortBufferConfig`]
-    /// directly from its `PhaseThreads` resolution (`min(--sort-threads,
-    /// pool)`) — so this engine-parity constructor is unaffected by that
-    /// contract and is used only by tests.
-    #[must_use]
-    pub fn from_sorter(sorter: &RawExternalSorter) -> Self {
-        Self {
-            sort_order: sorter.sort_order(),
-            memory_limit: sorter.memory_limit_bytes(),
-            // Phase-1 count honors the `--sort-threads` override (falls back to
-            // `--threads`); `num_threads()` would drop the override silently.
-            sort_threads: sorter.phase1_threads(),
-            cell_tag: sorter.cell_tag_value(),
-            key_types: sorter.key_types_spec(),
-        }
-    }
-}
-
 /// Order-erased record-input arena sorter. Each variant pairs an [`ArenaAccum`]
-/// with the concrete [`ArenaSortStrategy`] for its order, so `SortBuffer` drives
-/// the same per-order sort engine as the block-input `FindBoundariesAndSort`.
+/// with the concrete [`ArenaSortStrategy`] for its order; each seals the same
+/// chunk type, through the same sort, as the block-input split front.
 enum ChunkSorter {
     Coordinate(ArenaAccum<CoordinateStrategy>),
     Template(ArenaAccum<TemplateStrategy>),
-    QuerynameLex(ArenaAccum<QuerynameStrategy<RawQuerynameLexKey>>),
-    QuerynameNatural(ArenaAccum<QuerynameStrategy<RawQuerynameKey>>),
+    QuerynameLex(ArenaAccum<QuerynameStrategy<QnLex>>),
+    QuerynameNatural(ArenaAccum<QuerynameStrategy<QnNatural>>),
 }
 
 impl ChunkSorter {
@@ -213,19 +206,28 @@ impl ChunkSorter {
             }
             SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
                 Self::QuerynameLex(ArenaAccum::new(
-                    QuerynameStrategy::new(MemoryChunkErased::QuerynameLex),
+                    QuerynameStrategy::new(QnSortState::new(false)),
                     memory_limit,
                     sort_threads,
                 ))
             }
             SortOrder::Queryname(QuerynameComparator::Natural) => {
                 Self::QuerynameNatural(ArenaAccum::new(
-                    QuerynameStrategy::new(MemoryChunkErased::QuerynameNatural),
+                    QuerynameStrategy::new(QnSortState::new(false)),
                     memory_limit,
                     sort_threads,
                 ))
             }
         })
+    }
+
+    /// Share the sort's queryname key state (a no-op for the other orders).
+    fn set_queryname_keys(&mut self, keys: QnSortState) {
+        match self {
+            Self::QuerynameLex(s) => s.strategy.set_keys(keys),
+            Self::QuerynameNatural(s) => s.strategy.set_keys(keys),
+            Self::Coordinate(_) | Self::Template(_) => {}
+        }
     }
 
     /// Make every run that sorts in parallel take the whole of `cap` (see
@@ -263,10 +265,13 @@ impl ChunkSorter {
         }
     }
 
-    /// Take the final residual as zero-or-one erased chunk. Every order seals one
-    /// globally-sorted chunk per run (coordinate/template are stable; queryname's
-    /// tie order is unspecified), so the residual is at most one chunk — the
-    /// legacy multi-chunk `par_chunks_mut` split is no longer needed.
+    /// Take the final residual. Without spills it is zero or one chunk (one
+    /// globally-sorted chunk keeps the merge's single-chunk fast path). After a
+    /// spill, at more than one sort thread, the run seals as `sort_threads`
+    /// pre-sorted pieces over contiguous input ranges: the k-way merge that
+    /// follows anyway does the final interleave, and the pieces sort in
+    /// parallel. Ties stay stable: the merge orders memory pieces after the
+    /// spills and in push order.
     ///
     /// An empty residual is normally dropped. The one EXCEPTION is
     /// template-coordinate when there were prior spills: the empty chunk still
@@ -278,7 +283,31 @@ impl ChunkSorter {
     /// empty residual is dropped as before; with no spills there is nothing to
     /// disambiguate, so the fast path (single non-empty chunk) is preserved.
     fn take_residual_chunks(&mut self, had_spills: bool) -> io::Result<Vec<MemoryChunkErased>> {
-        Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills))
+        let pieces = self.sort_threads();
+        if !had_spills || pieces <= 1 {
+            return Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills));
+        }
+        let mut chunks = match self {
+            Self::Coordinate(s) => s.take_sorted_pieces(pieces),
+            Self::Template(s) => s.take_sorted_pieces(pieces),
+            Self::QuerynameLex(s) => s.take_sorted_pieces(pieces),
+            Self::QuerynameNatural(s) => s.take_sorted_pieces(pieces),
+        }?;
+        if chunks.len() == 1 {
+            let chunk = chunks.pop().expect("one chunk");
+            return Ok(residual_chunks_for(chunk, had_spills));
+        }
+        Ok(chunks)
+    }
+
+    /// The phase-1 width the sorter seals at.
+    fn sort_threads(&self) -> usize {
+        match self {
+            Self::Coordinate(s) => s.sort_threads,
+            Self::Template(s) => s.sort_threads,
+            Self::QuerynameLex(s) => s.sort_threads,
+            Self::QuerynameNatural(s) => s.sort_threads,
+        }
     }
 
     fn total_records(&self) -> u64 {
@@ -366,7 +395,7 @@ fn ingest_batch_records(
     (batch_records, None)
 }
 
-/// `Serial` step that buffers, sorts, and emits sorted chunks for `CompressSpill`.
+/// `Serial` step that buffers, sorts, and emits sorted chunks for the spill steps.
 pub struct SortBuffer {
     /// In-memory buffering sorter. `Some` while ingesting; `None` after the
     /// residual has been taken (finalized).
@@ -376,7 +405,7 @@ pub struct SortBuffer {
     pending: VecDeque<SortChunkEvent>,
     /// Monotonic spill index. Each `Spill` event's `seq` (= the eventual slot
     /// `file_id`) makes the merge tie-break order independent of which
-    /// `CompressSpill` worker writes the file. Also the final `slot_count`.
+    /// worker compresses which block. Also the final `slot_count`.
     next_seq: u32,
     /// First ingest failure, if any. Once set the step is poisoned and every
     /// later `try_run` re-raises instead of ingesting or finalizing — a step
@@ -397,34 +426,14 @@ pub struct SortBuffer {
 }
 
 impl SortBuffer {
-    /// Build a `SortBuffer` from a configured `RawExternalSorter` (any of the
-    /// four sort orders) and the output `Header`.
-    ///
-    /// `output_byte_limit` byte-bounds the output event queue (its chunk-bearing
-    /// variants retain sorted records, so the queue budgets on bytes, not count).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the header's reference-sequence count does not fit in
-    /// a `u32` (the coordinate key's reference field). That conversion is the
-    /// only fallible step: the template path's `TemplateArenaAccumulator::from_header`
-    /// is infallible here.
-    #[allow(clippy::needless_pass_by_value)] // by-value keeps the caller's move-in; only read here
-    pub fn from_sorter(
-        sorter: RawExternalSorter,
-        header: &Header,
-        output_byte_limit: u64,
-    ) -> Result<Self> {
-        Self::new(SortBufferConfig::from_sorter(&sorter), header, output_byte_limit)
-    }
-
     /// Build a `SortBuffer` from exactly the configuration it reads (see
     /// [`SortBufferConfig`]), writing sorted chunks bounded by
     /// `output_byte_limit` bytes.
     ///
     /// # Errors
     ///
-    /// As [`Self::from_sorter`].
+    /// Returns an error if the header's reference-sequence count does not fit in
+    /// a `u32` (the coordinate key's reference field).
     pub fn new(config: SortBufferConfig, header: &Header, output_byte_limit: u64) -> Result<Self> {
         let chunk_sorter = ChunkSorter::new(config, header)?;
         Ok(Self {
@@ -449,6 +458,17 @@ impl SortBuffer {
             sorter.set_phase_cap(cap.clone());
         }
         self.cap = cap;
+        self
+    }
+
+    /// Share the sort's queryname key state — its class table and counters —
+    /// with this front, so the merge and the stats line see the same table. A
+    /// no-op for the other orders. Call before the step runs.
+    #[must_use]
+    pub fn with_queryname_keys(mut self, keys: QnSortState) -> Self {
+        if let Some(sorter) = self.sorter.as_mut() {
+            sorter.set_queryname_keys(keys);
+        }
         self
     }
 
@@ -683,6 +703,91 @@ mod tests {
         assert_eq!(residual_chunks_for(chunk, had_spills).len(), expected_len);
     }
 
+    /// A coordinate run is charged each record's bytes plus its 24-byte ref:
+    /// with fixed-size records it seals after `memory_limit / (len + 24)`
+    /// records, ± 1.
+    #[test]
+    fn sort_buffer_charges_the_strategy_ref_width() {
+        let body =
+            fgumi_raw_bam::testutil::make_bam_bytes(0, 100, 0, b"rd_1", &[], 20, -1, -1, &[]);
+        let memory_limit = 1000 * (body.len() + 24);
+        let mut acc = ArenaAccum::new(crate::sort::CoordinateStrategy::new(1), memory_limit, 1);
+        let mut pushed = 0usize;
+        while !acc.push(&body).unwrap() {
+            pushed += 1;
+            assert!(pushed < 10_000, "the run never sealed");
+        }
+        let want = memory_limit / (body.len() + 24);
+        assert!(
+            (pushed + 1).abs_diff(want) <= 1,
+            "sealed after {} records, want {want}",
+            pushed + 1
+        );
+    }
+
+    /// After a spill, the record-input front seals its final run as
+    /// `sort_threads` pieces; without one it keeps a single chunk (the merge's
+    /// fast path), and at one sort thread it never splits.
+    #[rstest]
+    #[case::spilled_t4(4, true, 4)]
+    #[case::unspilled_t4(4, false, 1)]
+    #[case::spilled_t1(1, true, 1)]
+    fn residual_pieces_follow_the_spill_rule(
+        #[case] sort_threads: usize,
+        #[case] had_spills: bool,
+        #[case] pieces: usize,
+    ) {
+        let config = SortBufferConfig {
+            sort_order: SortOrder::Coordinate,
+            memory_limit: 1 << 30,
+            sort_threads,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let mut sorter = ChunkSorter::new(config, &Header::default()).unwrap();
+        for i in 0..1000 {
+            let body = fgumi_raw_bam::testutil::make_bam_bytes(
+                0,
+                1000 - i,
+                0,
+                format!("rd_{i}").as_bytes(),
+                &[],
+                20,
+                -1,
+                -1,
+                &[],
+            );
+            sorter.push(&body).unwrap();
+        }
+        let chunks = sorter.take_residual_chunks(had_spills).unwrap();
+        assert_eq!(chunks.len(), pieces);
+        assert_eq!(chunks.iter().map(MemoryChunkErased::len).sum::<usize>(), 1000);
+    }
+
+    /// An empty template residual after a spill is still announced — one empty
+    /// chunk carrying the narrowed-lane variant — even at several sort threads.
+    #[test]
+    fn empty_template_residual_still_carries_the_variant() {
+        let config = SortBufferConfig {
+            sort_order: SortOrder::TemplateCoordinate,
+            memory_limit: 1 << 20,
+            sort_threads: 4,
+            cell_tag: None,
+            key_types: KeyTypesSpec::None,
+        };
+        let mut sorter = ChunkSorter::new(config, &Header::default()).unwrap();
+        sorter.push(&record_with_mi(10, b"rd_1", 1)).unwrap();
+        let spilled = sorter.take_sorted_chunk().unwrap();
+        assert_eq!(spilled.len(), 1);
+        let residual = sorter.take_residual_chunks(true).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(residual[0].is_empty());
+        assert!(matches!(
+            residual[0],
+            MemoryChunkErased::TemplateCoordinate(TemplateMemChunk::K24(_))
+        ));
+    }
+
     // ── Ingest failure handling ─────────────────────────────────────────────
 
     fn batch_of(records: &[Vec<u8>]) -> RecordBatch {
@@ -699,12 +804,14 @@ mod tests {
     /// any later record whose MI differs is rejected — the one reachable
     /// `ChunkSorter::push` failure.
     fn template_sorter_dropping_mi(memory_limit: usize) -> ChunkSorter {
-        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(memory_limit)
-            .threads(1)
-            .key_types(KeyTypesSpec::None);
-        ChunkSorter::new(SortBufferConfig::from_sorter(&sorter), &Header::default())
-            .expect("build template chunk sorter")
+        let config = SortBufferConfig {
+            sort_order: SortOrder::TemplateCoordinate,
+            memory_limit,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::None,
+        };
+        ChunkSorter::new(config, &Header::default()).expect("build template chunk sorter")
     }
 
     /// A push failure must stop ingest at the offending record and leave the
@@ -770,12 +877,15 @@ mod tests {
         #[case] failed: Option<&str>,
         #[case] expected_message: Option<&str>,
     ) {
-        let mut step = SortBuffer::from_sorter(
-            RawExternalSorter::new(SortOrder::Coordinate).memory_limit(1 << 20).threads(1),
-            &Header::default(),
-            1 << 20,
-        )
-        .expect("build SortBuffer");
+        let config = SortBufferConfig {
+            sort_order: SortOrder::Coordinate,
+            memory_limit: 1 << 20,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let mut step =
+            SortBuffer::new(config, &Header::default(), 1 << 20).expect("build SortBuffer");
         step.failed = failed.map(str::to_string);
 
         match expected_message {

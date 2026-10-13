@@ -11,8 +11,8 @@
 //!
 //! Exists specifically so a standalone (or sort-first-intermediate) chain over
 //! a SAM source can reach the sort stage: SAM has no BGZF framing for the
-//! parallel-inflate arena front (`ReadBlocks → InflateToArena →
-//! FindBoundariesAndSort`), so it always decodes through `ParseSamChunk`
+//! parallel-inflate arena front (`ReadBlocks → InflateToArena →` the split
+//! front), so it always decodes through `ParseSamChunk`
 //! first, same as every other stage's SAM ingest.
 //!
 //! `Parallel + ByItemOrdinal` — the conversion is per-batch stateless, so the

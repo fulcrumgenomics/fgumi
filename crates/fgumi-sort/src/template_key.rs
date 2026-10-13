@@ -127,6 +127,14 @@ impl TemplateKeySeed {
         Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types, header_library_varies }
     }
 
+    /// The lanes `--key-types` fixes before any record is seen; `None` under
+    /// `auto`, where the first record chooses them.
+    #[must_use]
+    pub fn known_variant(&self) -> Option<TemplateKeyVariant> {
+        (self.key_types != KeyTypesSpec::Auto)
+            .then(|| select_template_variant(None, self.key_types, self.header_library_varies))
+    }
+
     /// Extract the sort's FIRST record's full key, choose the lane variant from
     /// it (`select_template_variant`, the same choice the owned sorter makes on
     /// its first push), and freeze both into a shared context. Called once per

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    InMemoryChunk, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RunBound, SortMergeSlot,
-    SpillKeyKind, TemplateMemChunk,
+    InMemoryChunk, QnKey, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
+    RunBound, SortMergeSlot, SpillKeyKind, TemplateMemChunk,
 };
 
 use fgumi_pipeline_core::item::HeapSize;
@@ -24,18 +24,23 @@ use fgumi_pipeline_core::item::HeapSize;
 const PER_MEMORY_RECORD_OVERHEAD: usize = 354;
 
 /// In-memory sorted residual chunk produced by the Phase-1 sort head
-/// (`SortBuffer` or `FindBoundariesAndSort`), type-erased over the sort-key
+/// (`SortBuffer` or the split front's `Sort*Run`), type-erased over the sort-key
 /// variant `K`.
 pub enum MemoryChunkErased {
     /// Coordinate-sort residual. `K = RawCoordinateKey`. Zero-copy arena-backed
     /// chunk (shares the sort buffer's `Arc<SegmentedBuf>`).
     Coordinate(InMemoryChunk<RawCoordinateKey>),
-    /// Queryname-sort residual, lexicographic comparator. `K = RawQuerynameLexKey`.
-    /// Arena-backed like [`Coordinate`](Self::Coordinate): the record bodies live
-    /// in the chunk's shared buffer; the key owns its (small) name bytes.
-    QuerynameLex(InMemoryChunk<RawQuerynameLexKey>),
-    /// Queryname-sort residual, natural comparator. `K = RawQuerynameKey`.
-    QuerynameNatural(InMemoryChunk<RawQuerynameKey>),
+    /// Queryname-sort residual, lexicographic comparator. Arena-backed like
+    /// [`Coordinate`](Self::Coordinate); each record's ref is a [`QnKey`] that
+    /// borrows its name from the record body. The merge key is
+    /// `QnMergeKey<QnLex>`, rebuilt against the sort's class table; a residual
+    /// record keeps the class phase 1 gave it. The run bounds
+    /// ([`Self::min_bound`]) use the owned `RawQuerynameLexKey`.
+    QuerynameLex(InMemoryChunk<QnKey>),
+    /// Queryname-sort residual, natural comparator; refs as
+    /// [`QuerynameLex`](Self::QuerynameLex). The merge key is
+    /// `QnMergeKey<QnNatural>`; the run bounds use the owned `RawQuerynameKey`.
+    QuerynameNatural(InMemoryChunk<QnKey>),
     /// Template-coordinate-sort residual, carried as a variant-tagged
     /// [`TemplateMemChunk`] so the chosen `--key-types` narrow lane rides through
     /// merge and spill like every other order's `K`. Zero-copy arena-backed chunk
@@ -64,8 +69,7 @@ impl MemoryChunkErased {
     pub fn len(&self) -> usize {
         match self {
             Self::Coordinate(v) => v.len(),
-            Self::QuerynameLex(v) => v.len(),
-            Self::QuerynameNatural(v) => v.len(),
+            Self::QuerynameLex(v) | Self::QuerynameNatural(v) => v.len(),
             Self::TemplateCoordinate(v) => v.len(),
         }
     }
@@ -90,8 +94,7 @@ impl MemoryChunkErased {
     pub fn record_bytes(&self, i: usize) -> &[u8] {
         match self {
             Self::Coordinate(v) => v.record_bytes(i),
-            Self::QuerynameLex(v) => v.record_bytes(i),
-            Self::QuerynameNatural(v) => v.record_bytes(i),
+            Self::QuerynameLex(v) | Self::QuerynameNatural(v) => v.record_bytes(i),
             Self::TemplateCoordinate(v) => v.record_bytes(i),
         }
     }
@@ -111,32 +114,67 @@ impl MemoryChunkErased {
     pub fn record_len(&self, i: usize) -> u32 {
         match self {
             Self::Coordinate(v) => v.record_len(i),
-            Self::QuerynameLex(v) => v.record_len(i),
-            Self::QuerynameNatural(v) => v.record_len(i),
+            Self::QuerynameLex(v) | Self::QuerynameNatural(v) => v.record_len(i),
             Self::TemplateCoordinate(v) => v.record_len(i),
         }
     }
 
-    /// The chunk's minimum sort key (`key_at(0)`) as an owned [`RunBound`], or
-    /// `None` if the chunk is empty. Records are pre-sorted at seal, so this is
+    /// The framed size of record `i` in a spill block — `[key][u32 len][body]`,
+    /// the key present only for template lanes — from the length index alone,
+    /// without touching the record body.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    #[inline]
+    #[must_use]
+    pub fn framed_len(&self, i: usize) -> usize {
+        self.key_kind().serialized_key_bytes() + 4 + self.record_len(i) as usize
+    }
+
+    /// Append record `i` to `out` in the spill framing `[key][u32 len][body]`
+    /// (exactly [`Self::framed_len`] bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record is too long for its `u32` length prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.len()`.
+    pub fn frame_record_into(&self, i: usize, out: &mut Vec<u8>) -> std::io::Result<()> {
+        match self {
+            Self::Coordinate(c) => {
+                fgumi_sort::frame_keyed_record_into(out, c.key_at(i), c.record_bytes(i))
+            }
+            // Queryname keys are embedded in the record: no key bytes are framed.
+            Self::QuerynameLex(c) | Self::QuerynameNatural(c) => {
+                fgumi_sort::frame_embedded_record_into(out, c.record_bytes(i))
+            }
+            Self::TemplateCoordinate(c) => c.frame_record_into(i, out),
+        }
+    }
+
+    /// The chunk's minimum sort key (its first record's) as an owned
+    /// [`RunBound`], or `None` if the chunk is empty. Records are pre-sorted at seal, so this is
     /// `O(1)`. Used by the arena spill run-former to decide whether this chunk
     /// extends the open run.
     #[must_use]
     pub fn min_bound(&self) -> Option<RunBound> {
         match self {
             Self::Coordinate(v) => (!v.is_empty()).then(|| RunBound::Coordinate(*v.key_at(0))),
-            Self::QuerynameLex(v) => {
-                (!v.is_empty()).then(|| RunBound::QuerynameLex(v.key_at(0).clone()))
-            }
-            Self::QuerynameNatural(v) => {
-                (!v.is_empty()).then(|| RunBound::QuerynameNatural(v.key_at(0).clone()))
-            }
+            Self::QuerynameLex(v) => (!v.is_empty()).then(|| {
+                RunBound::QuerynameLex(RawQuerynameLexKey::extract_from_record(v.record_bytes(0)))
+            }),
+            Self::QuerynameNatural(v) => (!v.is_empty()).then(|| {
+                RunBound::QuerynameNatural(RawQuerynameKey::extract_from_record(v.record_bytes(0)))
+            }),
             Self::TemplateCoordinate(v) => v.min_bound(),
         }
     }
 
-    /// The chunk's maximum sort key (`key_at(len - 1)`) as an owned [`RunBound`],
-    /// or `None` if the chunk is empty. Records are pre-sorted at seal, so this
+    /// The chunk's maximum sort key (its last record's) as an owned
+    /// [`RunBound`], or `None` if the chunk is empty. Records are pre-sorted at seal, so this
     /// is `O(1)`. Used by the arena spill run-former to advance the open run's
     /// upper bound after appending this chunk.
     #[must_use]
@@ -145,12 +183,12 @@ impl MemoryChunkErased {
             Self::Coordinate(v) => {
                 v.len().checked_sub(1).map(|i| RunBound::Coordinate(*v.key_at(i)))
             }
-            Self::QuerynameLex(v) => {
-                v.len().checked_sub(1).map(|i| RunBound::QuerynameLex(v.key_at(i).clone()))
-            }
-            Self::QuerynameNatural(v) => {
-                v.len().checked_sub(1).map(|i| RunBound::QuerynameNatural(v.key_at(i).clone()))
-            }
+            Self::QuerynameLex(v) => v.len().checked_sub(1).map(|i| {
+                RunBound::QuerynameLex(RawQuerynameLexKey::extract_from_record(v.record_bytes(i)))
+            }),
+            Self::QuerynameNatural(v) => v.len().checked_sub(1).map(|i| {
+                RunBound::QuerynameNatural(RawQuerynameKey::extract_from_record(v.record_bytes(i)))
+            }),
             Self::TemplateCoordinate(v) => v.max_bound(),
         }
     }
@@ -160,35 +198,40 @@ impl MemoryChunkErased {
     pub fn approx_heap_bytes(&self) -> usize {
         let (count, payload): (usize, usize) = match self {
             Self::Coordinate(v) => (v.len(), v.payload_bytes()),
-            Self::QuerynameLex(v) => (v.len(), v.payload_bytes()),
-            Self::QuerynameNatural(v) => (v.len(), v.payload_bytes()),
+            Self::QuerynameLex(v) | Self::QuerynameNatural(v) => (v.len(), v.payload_bytes()),
             Self::TemplateCoordinate(v) => (v.len(), v.payload_bytes()),
         };
         count * PER_MEMORY_RECORD_OVERHEAD + payload
     }
 }
 
-/// Events from `SortBuffer` → `CompressSpill` (the P6 Phase-1 split).
+/// Events from a phase-1 front (`SortBuffer`, or the arena front's run sort)
+/// → `SpillGather`.
 ///
-/// `SortBuffer` (Serial) sorts each filled buffer and emits the sorted records
-/// as a chunk; `CompressSpill` (Parallel) then compresses spill chunks to disk
-/// or passes the in-memory residual through. The seam carries already-sorted
+/// The front sorts each filled run and emits it as a chunk; `SpillGather` plans
+/// a spill chunk into blocks for compression and writing, or passes the
+/// in-memory residual through. The seam carries already-sorted
 /// `MemoryChunkErased`s, so it is byte-bounded by [`HeapSize`] just like the
 /// downstream `SortPhase1Event` queue.
 pub enum SortChunkEvent {
-    /// A sorted chunk to be compressed and written to disk by `CompressSpill`.
+    /// A sorted chunk to be spilled to disk.
     ///
-    /// `seq` is the chunk's logical spill index, assigned monotonically by
-    /// `SortBuffer`. `CompressSpill` uses it as the opened slot's `file_id` so
-    /// the merge tie-break order matches the legacy spill order regardless of
-    /// which Parallel worker writes the file.
+    /// `seq` is the chunk's logical spill index, assigned monotonically by the
+    /// front. The spill split names the slot's `file_id` from it, so the merge
+    /// tie-break order is the run order regardless of which worker compresses
+    /// which block.
     Spill { seq: u32, chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// A sorted in-memory residual chunk to pass straight through as a
-    /// `SortPhase1Event::MemoryChunk` — no disk round-trip (the fast path).
+    /// `SortPhase1Event::MemoryChunk` — no disk round-trip. A sort that never
+    /// spilled seals its one run as one residual (the merge's single-chunk fast
+    /// path); a sort that spilled seals its final run as one residual per
+    /// pre-sorted piece (contiguous input ranges, emitted in input order, so
+    /// the merge keeps ties stable).
     Residual { chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// Terminal sentinel carrying the final counts (number of `Spill` chunks =
-    /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`).
-    /// `CompressSpill` forwards it verbatim as `SortPhase1Event::AllAnnounced`.
+    /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`: one
+    /// without spills, the final run's piece count with them).
+    /// Forwarded verbatim to `SortPhase1Event::AllAnnounced`.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
@@ -220,8 +263,7 @@ impl SortChunkEvent {
 }
 
 /// Events from `SpillGather` → `SpillBlockCompress` → `SpillWrite` (the
-/// block-parallel spill-write split that replaces the monolithic single-worker
-/// `CompressSpill`).
+/// block-parallel spill-write split).
 ///
 /// `SpillGather` (Serial) fans each `SortChunkEvent::Spill` chunk into
 /// record-aligned raw [`Block`](Self::Block)s and forwards `Residual` /
@@ -238,6 +280,30 @@ impl SortChunkEvent {
 /// **contiguous** in the ordinal stream — so `SpillWrite` only ever has one
 /// spill file open at a time.
 pub enum SpillBlockEvent {
+    /// A planned raw block: records `[start, end)` of `chunk`, framed
+    /// `[key][u32 len][body]` and compressed by `SpillBlockCompress` in one
+    /// `try_run`, which turns it into a compressed [`Block`](Self::Block).
+    /// `framed_bytes` is the exact raw size the planner's cut rule computed.
+    /// Never the last block of its file: `SpillGather` frames a run's final
+    /// block itself and sends it as a raw `Block`.
+    ///
+    /// A range may span several spill frames: when `frame_bytes` is non-zero,
+    /// `SpillBlockCompress` re-cuts `[start, end)` with the planner's cut rule at
+    /// `frame_bytes` and compresses each frame independently, concatenating them
+    /// into one `Block`. The bytes on disk are identical to one range per frame;
+    /// only the number of pipeline items changes. `0` means one frame.
+    Range {
+        ordinal: u64,
+        file_id: u32,
+        key_kind: SpillKeyKind,
+        is_last_in_file: bool,
+        records_ingested_so_far: u64,
+        chunk: Arc<MemoryChunkErased>,
+        start: u64,
+        end: u64,
+        framed_bytes: u32,
+        frame_bytes: u32,
+    },
     /// One raw (pre-compression) or compressed (post-`SpillBlockCompress`) block of a
     /// spill file. `file_id` is the spill `seq` (the eventual slot `file_id`),
     /// `is_last_in_file` marks the final block so `SpillWrite` can finalize the
@@ -266,7 +332,8 @@ impl SpillBlockEvent {
     #[must_use]
     pub fn ordinal(&self) -> u64 {
         match self {
-            Self::Block { ordinal, .. }
+            Self::Range { ordinal, .. }
+            | Self::Block { ordinal, .. }
             | Self::Residual { ordinal, .. }
             | Self::AllAnnounced { ordinal, .. } => *ordinal,
         }
@@ -280,6 +347,9 @@ impl HeapSize for SpillBlockEvent {
         // payload: a block's bytes, or a residual chunk's records.
         let base = std::mem::size_of::<Self>();
         match self {
+            // The bytes a range commits a worker to materialise; its chunk's
+            // records are the arena, already charged.
+            Self::Range { framed_bytes, .. } => base + *framed_bytes as usize,
             Self::Block { bytes, .. } => base + bytes.capacity(),
             Self::Residual { chunk, .. } => base + chunk.approx_heap_bytes(),
             Self::AllAnnounced { .. } => base,
@@ -293,16 +363,16 @@ impl fgumi_pipeline_core::item::Ordered for SpillBlockEvent {
     }
 }
 
-/// Events from the Phase-1 producers (`CompressSpill` / `SpillWrite`) →
+/// Events from the phase-1 producer (`SpillWrite`) →
 /// `SortSpillDecompress`.
 pub enum SortPhase1Event {
     /// A spill chunk file has been closed and is ready for Phase 2 decompression.
     SpillReady { slot: Arc<SortMergeSlot>, path: PathBuf, records_ingested_so_far: u64 },
     /// A par-sorted residual in-memory chunk passed through by the Phase-1
-    /// producer (`CompressSpill` / `SpillWrite`) on its drained-completion path.
+    /// producer (`SpillWrite`) on its drained-completion path.
     MemoryChunk { chunk: Arc<MemoryChunkErased>, records_ingested_so_far: u64 },
     /// Sentinel emitted as the LAST event by the Phase-1 producer
-    /// (`CompressSpill` / `SpillWrite`) on its drained-completion path.
+    /// (`SpillWrite`) on its drained-completion path.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
 
@@ -369,7 +439,7 @@ mod tests {
     /// size, so a swapped arm would decode silently wrong rather than fail.
     #[test]
     fn key_kind_names_the_key_type_of_every_chunk_variant() {
-        fn one<K: fgumi_sort::RawSortKey + Default>() -> InMemoryChunk<K> {
+        fn one<K: Default>() -> InMemoryChunk<K> {
             InMemoryChunk::from_owned_records(vec![(K::default(), vec![0u8; 8])])
         }
         let cases = [
@@ -441,21 +511,47 @@ mod tests {
         assert_eq!(chunk.max_bound(), None);
     }
 
-    #[test]
-    fn queryname_chunk_bounds_clone_the_owned_keys() {
-        let chunk = MemoryChunkErased::QuerynameLex(InMemoryChunk::from_owned_records(vec![
-            (RawQuerynameLexKey::new(b"aaa".to_vec(), 0), vec![0u8; 4]),
-            (RawQuerynameLexKey::new(b"zzz".to_vec(), 0), vec![0u8; 4]),
-        ]));
-        let min = chunk.min_bound().unwrap();
-        let max = chunk.max_bound().unwrap();
-        assert_eq!(min, RunBound::QuerynameLex(RawQuerynameLexKey::new(b"aaa".to_vec(), 0)));
-        assert_eq!(max, RunBound::QuerynameLex(RawQuerynameLexKey::new(b"zzz".to_vec(), 0)));
-        // A contiguous next chunk starting at "zzz" or later extends the run.
-        assert!(max.precedes_or_equal(&RunBound::QuerynameLex(RawQuerynameLexKey::new(
-            b"zzz".to_vec(),
-            0
-        ))));
+    /// A `QnKey` chunk's run bounds are the owned keys of its first and last
+    /// records, rebuilt from their bodies — the keys the run-former compares.
+    #[rstest::rstest]
+    fn run_bound_from_a_qn_chunk_equals_the_owned_key(#[values(false, true)] natural: bool) {
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+        let bodies: Vec<Vec<u8>> = [b"aaa".as_slice(), b"mmm", b"zzz"]
+            .iter()
+            .map(|n| make_bam_bytes(0, 0, 0x41, n, &[], 4, -1, -1, &[]))
+            .collect();
+        let chunk = InMemoryChunk::<QnKey>::from_owned_records(
+            bodies.iter().map(|b| (QnKey::default(), b.clone())).collect(),
+        );
+        let chunk = if natural {
+            MemoryChunkErased::QuerynameNatural(chunk)
+        } else {
+            MemoryChunkErased::QuerynameLex(chunk)
+        };
+        let (min, max) = (chunk.min_bound().unwrap(), chunk.max_bound().unwrap());
+        if natural {
+            assert_eq!(
+                min,
+                RunBound::QuerynameNatural(RawQuerynameKey::extract_from_record(&bodies[0]))
+            );
+            assert_eq!(
+                max,
+                RunBound::QuerynameNatural(RawQuerynameKey::extract_from_record(&bodies[2]))
+            );
+        } else {
+            assert_eq!(
+                min,
+                RunBound::QuerynameLex(RawQuerynameLexKey::extract_from_record(&bodies[0]))
+            );
+            assert_eq!(
+                max,
+                RunBound::QuerynameLex(RawQuerynameLexKey::extract_from_record(&bodies[2]))
+            );
+            // A contiguous next chunk starting at "zzz" or later extends the run.
+            assert!(max.precedes_or_equal(&RunBound::QuerynameLex(
+                RawQuerynameLexKey::extract_from_record(&bodies[2])
+            )));
+        }
     }
 
     #[test]
