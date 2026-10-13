@@ -1,21 +1,21 @@
-//! Directed wake routing (`WakePlan`).
+//! Directed wake routing (`WakePlan`): every scheduled chain's wakes.
 //!
-//! Without a plan every `Progress` wakes one parked pool worker (`notify_one`)
-//! whether or not the consumer of what was produced is a pool step — and
-//! nothing unparks a dedicated driver thread, which then idles on its timer.
+//! A blanket wake — every `Progress` notifying one parked pool worker
+//! (`notify_one`) whatever consumes what was produced — wakes the wrong
+//! thread when the consumer is not a pool step, and never reaches a dedicated
+//! driver thread. So every scheduled chain routes its wakes through a plan.
 //!
 //! A `WakePlan` is a per-chain table, built once in `Pipeline::run`, that says
 //! for each `(step, output branch)` *who* consumes it and therefore who to
 //! wake: nobody (same thread), the pool event-count, a driver thread, or one
 //! pinned pool worker. Drivers and workers are woken with
-//! `std::thread::Thread::unpark` — an atomic swap plus a futex wake only when
-//! the target is actually parked, so a wake is useful by construction.
+//! `std::thread::Thread::unpark`, and only when armed for their timer park
+//! (the parking bit, below).
 //!
-//! In a `Directed` plan a forward wake is push-gated: a producer's branch with
-//! a byte-bounded transport wakes its consumer only when the dispatch actually
-//! pushed to it (the transport's push counter advanced; an ordered branch's
-//! stash insert counts), so progress that only held, accumulated or retried
-//! wakes nobody.
+//! A forward wake is push-gated: a producer's branch with a byte-bounded
+//! transport wakes its consumer only when the dispatch actually pushed to it
+//! (the transport's push counter advanced; an ordered branch's stash insert
+//! counts), so progress that only held, accumulated or retried wakes nobody.
 //!
 //! A held item wakes its holder: every bounded edge the plan tracks records
 //! the refusing thread's wake slot (`runtime::wake_slot`), and the pop (or, on
@@ -24,19 +24,33 @@
 //! stage's fast path re-checks `next_serial_buffered` after the latch; an
 //! unbounded edge refuses only at an ordered branch's stash cap.
 //!
-//! In a Directed plan a flushed held retry (`BranchOutputHandle::retry`
-//! succeeded) gets the same forward wake as a `Progress`, whatever the dispatch
-//! then reports, and a same-thread consumer gets a re-poll (`on_flushed`). A
-//! Legacy plan delivers nothing for it.
+//! A flushed held retry (`BranchOutputHandle::retry` succeeded) gets the same
+//! forward wake as a `Progress`, whatever the dispatch then reports, and a
+//! same-thread consumer gets a re-poll (`on_flushed`).
 //!
-//! Two modes, chosen at build: `Legacy` for any chain without a `Detached`
-//! step (one `notify_one` per `Progress`, one `notify_all` per `Finished`, no
-//! thread registered) and `Directed` otherwise.
+//! Every scheduled chain gets a plan, with or without a `Detached` step: every
+//! pool worker and driver registers itself, and a `Pool` wake that finds no
+//! event-count waiter reaches an armed direct-parked worker, so a chain whose
+//! workers are all pinned still runs on wakes. The fused single-thread path
+//! uses [`WakePlan::standalone`], which routes nothing.
+//!
+//! A directed wake (a `Worker`/`Driver` forward target, a holder or
+//! cap-release wake) unparks only a thread armed for its timer park — one bit
+//! per wake slot (`parking`). A running thread costs the deliverer a load, not
+//! an `unpark`: every timer park first sets its bit, fences and re-polls, so a
+//! wake that finds the bit clear is seen by that re-poll. A holder wake reads
+//! the bit behind a second fence, after its claim (`WakePlan::deliver_holder`).
+//! A plan with one thread neither arms nor gates: its lone thread is unparked
+//! by every directed wake, since the queue-memory rebalancer, outside the
+//! plan, still delivers there.
 //!
 //! Lost-wakeup arguments, in short: the pool path is the event-count's own
 //! fence pair; the unpark path is closed by the std park token (`unpark` before
-//! `park` makes the park return at once) plus a `SeqCst` fence pair between
-//! registration and delivery (`ThreadSlots`); the reverse path is a Dekker
+//! `park` makes the park return at once) plus two `SeqCst` fence pairs with the
+//! delivery — registration's (`ThreadSlots`) and the park arm's (`parking`:
+//! the thread sets its bit, fences and re-polls; the deliverer fences and
+//! reads the bit; a holder take fences once more between its claim and that
+//! read); the reverse path is a Dekker
 //! pair — the producer latches its slot, fences and re-checks for room
 //! (`HolderSet::latch_and_recheck`, one implementation for every transport);
 //! the consumer pops, fences and takes the latches; the direct-park fallback is
@@ -61,7 +75,7 @@ use crate::runtime::event_count::{NotifyOutcome, PoolEventCount};
 use crate::runtime::placement::ParallelHosts;
 use crate::runtime::stats::WakeCounts;
 use crate::runtime::wake_slot::{
-    DirectParked, ParkThread, ThreadSlots, current_slot, delivery_fence, set_cap_owed,
+    DirectParked, ParkThread, ThreadSlots, arm_fence, current_slot, delivery_fence, set_cap_owed,
     take_cap_owed, take_cap_recorded,
 };
 use crate::step::StepKind;
@@ -76,28 +90,15 @@ pub enum WakeTarget {
     /// branch has no consumer. (A step's `Finished` is still broadcast.)
     None,
     /// The pool event-count (`notify_one`), falling back to one direct-parked
-    /// worker when no event-count waiter exists.
+    /// worker when no event-count waiter exists. A pinned worker is never an
+    /// event-count waiter, but it arms the fallback before its timer park, so a
+    /// chain whose workers are all pinned still receives `Pool` work.
     Pool,
     /// `Thread::unpark` the driver hosting a `Detached` consumer.
     Driver(DriverIdx),
     /// `Thread::unpark` pool worker `w`: the consumer is pinned to `w`, or
     /// `n_threads == 1` (the lone pool worker is `Worker(0)`).
     Worker(usize),
-}
-
-/// Whether the chain routes wakes (`Directed`) or behaves as without a plan
-/// (`Legacy`). Nothing outside this module and `Pipeline::run` branches on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WakeMode {
-    /// No `Detached` step in the chain: every `Progress` → `notify_one`, every
-    /// `Finished` → `notify_all`, no thread registered, no edge tracked.
-    Legacy,
-    /// ≥ 1 `Detached` step: per-branch targets, push-gated producers (every
-    /// byte-bounded branch), holder-directed reverse wakes on every
-    /// tracked bounded edge (byte-bounded, count-bounded, and the unbounded
-    /// transport behind a reorder stash), forward wakes for flushed held
-    /// retries, drivers and workers unparked directly.
-    Directed,
 }
 
 /// Size of the per-step push-counter snapshot. A typed step has at most
@@ -204,7 +205,7 @@ pub enum PoolRequest {
     /// A parked pool worker other than the requester was woken: an
     /// event-count waiter (ungated by the ceiling), else a worker that armed
     /// for a timer park, else one parked only because a phase cap refused it,
-    /// or — Directed mode at one thread — worker 0 was unparked. A cap-parked
+    /// or — at one thread — worker 0 was unparked. A cap-parked
     /// worker is woken whatever its caps' occupancy (a request names no
     /// step), so if the requested work sits behind a full cap that wake is
     /// wasted: the worker is refused again and re-records on that cap.
@@ -212,7 +213,7 @@ pub enum PoolRequest {
     /// No other worker to wake: besides the requester itself, no event-count
     /// waiter, no worker armed for a timer park, and no worker parked only
     /// because a phase cap refused it. A worker idling on its timer without
-    /// arming (a Legacy chain's, or a pinned one between arms) is not reachable
+    /// arming (a pinned one between arms) is not reachable
     /// here; it finds the work on its next pass.
     AllAwake,
     /// An earlier request woke an event-count waiter, and no worker has left
@@ -221,8 +222,8 @@ pub enum PoolRequest {
     /// each request claims (and so clears) one armed worker's bit, so it cannot
     /// wake the same worker twice.
     Pending,
-    /// No pool event-count and no registered worker 0 (the fused path, or
-    /// Legacy mode at one thread).
+    /// No pool event-count and no registered worker 0 (the fused path's
+    /// standalone plan).
     Unavailable,
 }
 
@@ -287,12 +288,11 @@ impl<'a> PoolHandle<'a> {
 
 /// The per-chain wake routing table. See the module docs.
 pub struct WakePlan {
-    mode: WakeMode,
-    /// By `StepIdx`; empty in `Legacy`.
+    /// By `StepIdx`; empty in the standalone plan.
     steps: Box<[StepWake]>,
     /// By `DriverIdx`.
     drivers: ThreadSlots,
-    /// By worker id; every worker is registered in Directed mode.
+    /// By worker id; every worker registers itself before its first pass.
     workers: ThreadSlots,
     /// The pool workers armed for a timer park.
     direct_parked: DirectParked,
@@ -300,14 +300,33 @@ pub struct WakePlan {
     /// refused them: claimed after `direct_parked`, and only for a `Pool` wake
     /// whose consumer is uncapped or capped by a cap with a free permit.
     cap_parked: DirectParked,
-    /// By `StepIdx`: the phase cap the step reports, if any. Empty in `Legacy`.
+    /// One bit per wake slot (workers `0..n`, then drivers): the threads
+    /// armed for a timer park. A directed wake (a `Worker`/`Driver` forward
+    /// target, a holder or cap-release wake through [`Self::deliver_slot`])
+    /// unparks only a thread whose bit is set; a running thread costs the
+    /// deliverer one shared load instead of an `unpark`. Sound because every
+    /// timer park arms first: set the bit, fence, re-poll ([`Self::arm_direct`],
+    /// [`Self::arm_cap_parked`], [`Self::arm_driver`]), and every deliverer
+    /// fences after its publish and before it reads the bit, so a delivery
+    /// either finds the bit or the re-poll finds the work. Cleared by the owner
+    /// after it wakes. Not used in a plan with one thread ([`Self::gates`]).
+    parking: DirectParked,
+    /// Whether directed wakes are gated on `parking`: the plan has more than
+    /// one thread (workers plus drivers). A plan with one thread never arms —
+    /// its own steps deliver nothing across threads — and delivers every
+    /// directed wake unconditionally instead, because threads outside the plan
+    /// still deliver there: the queue-memory rebalancer's holder wakes
+    /// ([`Self::wake_holders`]) reach the lone worker of a one-thread run.
+    gates: bool,
+    /// By `StepIdx`: the phase cap the step reports, if any. Empty in the
+    /// standalone plan.
     caps: Box<[Option<Arc<PhaseCap>>]>,
     /// Each cap in `caps` once, in a fixed order: a cap's position here is its
     /// run index (`PhaseCap::set_plan_index`), the bit a worker's
     /// thread-local record masks use for it, which is what lets a pass start
     /// tell which wakes the thread owes ([`Self::start_pass`]). The dedup is
     /// what makes the index well defined for a cap several steps share.
-    /// Empty in `Legacy`.
+    /// Empty in the standalone plan.
     distinct_caps: Box<[Arc<PhaseCap>]>,
     /// `None` when `n_threads == 1` (no event-count exists).
     pool: Option<Arc<PoolEventCount>>,
@@ -357,20 +376,23 @@ fn host_mask(hosts: &[ParallelHosts], consumer: StepIdx, n_threads: usize) -> Op
 }
 
 impl WakePlan {
-    /// A plan that behaves exactly like having no plan: `on_progress` is one
-    /// `notify_one`, `on_finished` one `notify_all`, nobody is registered.
+    /// The fused single-thread path's plan: no pool, no drivers, no workers.
+    /// Every forward target is `None`, `on_progress` delivers nothing,
+    /// registration is a no-op and `request_pool_worker` is `Unavailable`.
+    /// A fresh `Arc` per run; it holds nothing.
     #[must_use]
-    pub fn legacy(pool: Option<Arc<PoolEventCount>>) -> Arc<Self> {
+    pub fn standalone() -> Arc<Self> {
         Arc::new(Self {
-            mode: WakeMode::Legacy,
             steps: Box::new([]),
             drivers: ThreadSlots::new(0),
             workers: ThreadSlots::new(0),
             direct_parked: DirectParked::new(0),
             cap_parked: DirectParked::new(0),
+            parking: DirectParked::new(0),
+            gates: false,
             caps: Box::new([]),
             distinct_caps: Box::new([]),
-            pool,
+            pool: None,
             tracked: Box::new([]),
             request_pending: Padded(AtomicBool::new(false)),
         })
@@ -457,9 +479,6 @@ impl WakePlan {
             kinds.len() == n && pinned_worker.len() == n && driver_of.len() == n,
             "WakePlan::build: per-step inputs must be {n} long"
         );
-        if !driver_of.iter().any(Option::is_some) {
-            return Self::legacy(pool);
-        }
         let n_drivers = driver_of.iter().flatten().map(|d| d.0 + 1).max().unwrap_or(0);
 
         // Who to wake so that `step` runs. `Pool` resolves to `Worker(0)` at one
@@ -552,12 +571,13 @@ impl WakePlan {
         let distinct_caps = index_caps(&caps);
 
         Arc::new(Self {
-            mode: WakeMode::Directed,
             steps,
             drivers: ThreadSlots::new(n_drivers),
             workers: ThreadSlots::new(n_threads),
             direct_parked: DirectParked::new(n_threads),
             cap_parked: DirectParked::new(n_threads),
+            parking: DirectParked::new(n_threads + n_drivers),
+            gates: n_threads + n_drivers > 1,
             caps,
             distinct_caps,
             pool,
@@ -582,12 +602,6 @@ impl WakePlan {
             consumer: Some(step),
             fallback_mask,
         }
-    }
-
-    /// Whether this plan routes wakes or behaves as without a plan.
-    #[must_use]
-    pub fn mode(&self) -> WakeMode {
-        self.mode
     }
 
     /// The pool event-count (`None` at one thread).
@@ -617,14 +631,15 @@ impl WakePlan {
         self.steps.get(step.0).map_or(0, |s| s.forward.len())
     }
 
-    /// The forward target of `(step, branch)`; `Pool` for every branch in Legacy.
+    /// The forward target of `(step, branch)`; `None` for a step or branch the
+    /// plan does not know (e.g. any step of the standalone plan).
     #[cfg(test)]
     #[must_use]
     pub fn forward_target(&self, step: StepIdx, branch: BranchIdx) -> WakeTarget {
         self.steps
             .get(step.0)
             .and_then(|s| s.forward.get(branch.0))
-            .map_or(WakeTarget::Pool, |b| b.target)
+            .map_or(WakeTarget::None, |b| b.target)
     }
 
     /// Every pool worker some forward branch wakes with a direct `unpark`
@@ -709,13 +724,15 @@ impl WakePlan {
     }
 
     /// Register pool worker `w`'s OS thread — called by that thread itself before
-    /// its first pass, for the reason given on [`Self::register_driver`].
-    /// Ignored in Legacy mode (nothing may unpark a worker there) and for
-    /// out-of-range `w`.
+    /// its first pass, for the reason given on [`Self::register_driver`]; the
+    /// one-worker path registers the caller thread, which runs worker 0. Every
+    /// worker of every chain registers, pinned or not: a holder idles on its
+    /// timer and must be unparkable. Ignored for an out-of-range `w` (and so on
+    /// the standalone plan). A registered thread can receive an `unpark` it
+    /// does not need; the std park token then makes a later `park_timeout`
+    /// return early, which every park site tolerates by re-checking its
+    /// condition.
     pub fn register_worker(&self, w: usize, t: ParkThread) {
-        if self.mode == WakeMode::Legacy {
-            return;
-        }
         self.workers.register(w, t);
     }
 
@@ -748,15 +765,14 @@ impl WakePlan {
     pub(crate) fn on_progress(&self, step: StepIdx, before: &PushSnapshot) -> WakeCounts {
         let mut r = WakeCounts::default();
         let Some(s) = self.steps.get(step.0) else {
-            // Legacy: exactly one notify.
-            if let Some(p) = &self.pool {
-                Self::count_notify(p.notify_one(), &mut r);
-            }
+            // A step the plan does not know (the standalone plan): nothing to wake.
             return r;
         };
         let _ = self.forward(s, before, &mut r);
         for rev in &s.reverse {
-            let n = rev.queue.take_holders(&mut |slot| self.deliver_slot(slot));
+            let n = rev.queue.take_holders(&mut |slot| {
+                let _ = self.deliver_holder(slot);
+            });
             r.reverse = r.reverse.saturating_add(u8::try_from(n).unwrap_or(u8::MAX));
         }
         r
@@ -780,17 +796,26 @@ impl WakePlan {
     /// thread that can host a same-thread consumer (a driver, a pinned worker,
     /// the lone worker) idles only through `park_timeout`. No reverse take: a
     /// dispatch that popped reports `Progress` (the `StepOutcome::Progress`
-    /// contract), so this one made no room. Legacy: an empty report, nothing
-    /// delivered.
+    /// contract), so this one made no room. A step the plan does not know (the
+    /// standalone plan): an empty report, nothing delivered.
     #[inline]
     #[must_use]
     pub(crate) fn on_flushed(&self, step: StepIdx, before: &PushSnapshot) -> WakeCounts {
         let mut r = WakeCounts::default();
         let Some(s) = self.steps.get(step.0) else {
-            return r; // Legacy: no per-step table, and Legacy is unchanged.
+            return r; // the standalone plan: no per-step table
         };
         if self.forward(s, before, &mut r) {
-            self.deliver(s.own, None, None, &mut r); // `Driver`/`Worker`: an unpark of this very thread
+            // `Driver`/`Worker`: an unpark of this very thread, which is
+            // running, so its parking bit is clear — unconditional.
+            let woke = match s.own {
+                WakeTarget::Worker(w) => self.workers.unpark(w),
+                WakeTarget::Driver(d) => self.drivers.unpark(d.0),
+                WakeTarget::None | WakeTarget::Pool => false,
+            };
+            if woke {
+                r.unparked = r.unparked.saturating_add(1);
+            }
         }
         r
     }
@@ -822,10 +847,18 @@ impl WakePlan {
     }
 
     /// A capacity release that is not a pop (the queue-memory rebalancer raised
-    /// `q`'s limit): wake `q`'s recorded holders. Fences first.
+    /// `q`'s limit): claim `q`'s recorded holders and deliver each through
+    /// [`Self::deliver_holder`] (an `unpark` only for one armed for its timer
+    /// park, or the lone thread of a one-thread plan; a running holder
+    /// re-polls on its own). Fences first. Returns the records claimed.
     pub fn wake_holders(&self, q: &dyn BoundedQueueHandle) -> usize {
         delivery_fence();
-        q.take_holders(&mut |slot| self.deliver_slot(slot), SEALED)
+        q.take_holders(
+            &mut |slot| {
+                let _ = self.deliver_holder(slot);
+            },
+            SEALED,
+        )
     }
 
     /// A `Finished` closed an edge: broadcast to the pool and unpark every
@@ -845,19 +878,87 @@ impl WakePlan {
         self.workers.unpark_all();
     }
 
-    /// Worker `w` is about to park on its timer: make it reachable by a `Pool`
-    /// wake that finds no event-count waiter. Returns `true` when armed — the
-    /// caller must then re-poll once before parking (the arm's fence orders it
-    /// before that re-poll). `false` in Legacy mode and when no event-count
-    /// exists (one worker): nothing to arm, no extra pass.
+    /// Worker `w` is about to park on its timer: set its parking bit, so a
+    /// directed wake reaches it, and — when an event-count exists — its
+    /// direct-parked bit, so a `Pool` wake that finds no event-count waiter
+    /// does too; then fence once. Returns `true` when armed: the caller must
+    /// then re-poll once before parking (the fence orders the arm before that
+    /// re-poll), and that one re-poll serves both bits. `false` in a plan with
+    /// one thread and no event-count (the lone worker of a run with no driver,
+    /// or the standalone plan): such a plan does not gate its directed wakes
+    /// (they unpark the lone worker unconditionally), so there is nothing to
+    /// arm and no extra pass.
     #[must_use]
     pub fn arm_direct(&self, w: usize) -> bool {
-        self.pool.is_some() && self.direct_parked.arm(w)
+        let parking = self.mark_parking(w);
+        let direct = self.pool.is_some() && self.direct_parked.mark(w);
+        Self::fence_arm(parking || direct)
     }
 
     /// Worker `w` is running again.
     pub fn disarm_direct(&self, w: usize) {
         self.direct_parked.disarm(w);
+        self.parking.disarm(w);
+    }
+
+    /// Driver `d` is about to park on its timer: set its parking bit and
+    /// fence. Same protocol as [`Self::arm_direct`]: `true` means armed, and
+    /// the caller re-polls once before parking. `false` only in a plan with
+    /// one thread (the standalone plan of a test driving a driver loop by
+    /// hand), which gates nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the plan gates its wakes and has no driver `d`: such a driver would
+    /// park with no bit of its own, so every directed wake would skip it.
+    #[must_use]
+    pub fn arm_driver(&self, d: DriverIdx) -> bool {
+        if !self.gates {
+            return false;
+        }
+        assert!(
+            d.0 < self.drivers.len(),
+            "arm_driver: driver {} is not in this plan ({} drivers)",
+            d.0,
+            self.drivers.len()
+        );
+        let parking = self.mark_parking(self.workers.len() + d.0);
+        Self::fence_arm(parking)
+    }
+
+    /// Driver `d` is running again.
+    pub fn disarm_driver(&self, d: DriverIdx) {
+        self.parking.disarm(self.workers.len() + d.0);
+    }
+
+    /// Set wake slot `slot`'s parking bit, unless the plan has one thread
+    /// (which does not gate on the bit).
+    #[inline]
+    fn mark_parking(&self, slot: usize) -> bool {
+        self.gates && self.parking.mark(slot)
+    }
+
+    /// The one fence of a park arm, when it set any bit; returns `armed`.
+    #[inline]
+    fn fence_arm(armed: bool) -> bool {
+        if armed {
+            arm_fence();
+        }
+        armed
+    }
+
+    /// Whether wake slot `slot` is armed for a timer park (tests).
+    #[cfg(test)]
+    pub(crate) fn is_parking(&self, slot: usize) -> bool {
+        self.parking.is_set(slot)
+    }
+
+    /// [`Self::arm_direct`]'s parking bit without its fence: the negative
+    /// control of the loom parking model, which must lose a wake.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn mark_parking_unfenced(&self, w: usize) {
+        let _ = self.mark_parking(w);
     }
 
     /// Worker `w`, refused by a phase cap and holding nothing, is about to park
@@ -868,10 +969,12 @@ impl WakePlan {
     /// caller re-polls once before parking.
     #[must_use]
     pub fn arm_cap_parked(&self, w: usize) -> bool {
-        self.pool.is_some() && self.cap_parked.arm(w)
+        let parking = self.mark_parking(w);
+        let cap = self.pool.is_some() && self.cap_parked.mark(w);
+        Self::fence_arm(parking || cap)
     }
 
-    /// The phase cap `step` reports, if any (`None` in Legacy).
+    /// The phase cap `step` reports, if any (`None` in the standalone plan).
     #[inline]
     fn cap_of(&self, step: StepIdx) -> Option<&PhaseCap> {
         self.caps.get(step.0).and_then(Option::as_deref)
@@ -890,7 +993,7 @@ impl WakePlan {
     /// refusal would be (`PhaseCap::record_skip`: record, fence, re-check), so
     /// the release that frees a permit wakes this thread; a re-check that sees
     /// a free permit polls the step instead. `false` for an uncapped step and
-    /// in Legacy.
+    /// in the standalone plan.
     #[inline]
     #[must_use]
     pub(crate) fn skip_full_cap(&self, step: StepIdx) -> bool {
@@ -900,8 +1003,7 @@ impl WakePlan {
     /// The calling thread starts a dispatch pass: clear its own refusal
     /// record on every cap, so a record covers only the pass that made it
     /// (`PhaseCap::try_acquire`). Per cap one `Relaxed` load, plus a
-    /// `fetch_and` only when the bit is set; nothing in Legacy or without
-    /// caps.
+    /// `fetch_and` only when the bit is set; nothing without caps.
     ///
     /// A cap the thread recorded on since its last pass start, whose bit is
     /// now clear, had the record claimed by a release: the thread was handed
@@ -952,6 +1054,7 @@ impl WakePlan {
     /// Worker `w` is running again.
     pub fn disarm_cap_parked(&self, w: usize) {
         self.cap_parked.disarm(w);
+        self.parking.disarm(w);
     }
 
     /// Deliver one forward wake. `fallback_mask` restricts a `Pool` wake's
@@ -993,31 +1096,72 @@ impl WakePlan {
                     }
                 }
             }
-            WakeTarget::Driver(d) => {
-                if self.drivers.unpark(d.0) {
-                    r.unparked = r.unparked.saturating_add(1);
-                }
-            }
-            WakeTarget::Worker(w) => {
-                if self.workers.unpark(w) {
+            WakeTarget::Driver(_) | WakeTarget::Worker(_) => {
+                if self.unpark_if_parking(target) {
                     r.unparked = r.unparked.saturating_add(1);
                 }
             }
         }
     }
 
-    /// Unpark the holder in wake slot `slot` (worker, driver, or — for a thread
-    /// without a slot — everyone).
+    /// Unpark `target` (a `Driver` or `Worker`) only if it is armed for a
+    /// timer park (`parking`); `false` when it is running or unregistered.
+    /// The caller has fenced after its publish: a thread whose bit is clear
+    /// here sets it, fences and re-polls before it parks, and that re-poll
+    /// sees the publish. A plan with one thread does not gate
+    /// ([`Self::gates`]): its lone thread is unparked whenever registered.
     #[inline]
-    pub(crate) fn deliver_slot(&self, slot: usize) {
+    fn unpark_if_parking(&self, target: WakeTarget) -> bool {
+        let armed = |slot: usize| !self.gates || self.parking.is_set(slot);
+        match target {
+            WakeTarget::Worker(w) => armed(w) && self.workers.unpark(w),
+            WakeTarget::Driver(d) => armed(self.workers.len() + d.0) && self.drivers.unpark(d.0),
+            WakeTarget::None | WakeTarget::Pool => false,
+        }
+    }
+
+    /// Unpark the holder in wake slot `slot` (worker, driver, or — for a thread
+    /// without a slot — everyone). A worker or driver is unparked only if it
+    /// is armed for a timer park (in a plan with one thread, whenever it is
+    /// registered): a running holder's next pass, or the re-poll it runs
+    /// before it parks, retries on its own. The caller has fenced. Returns
+    /// whether an `unpark` was issued (`true` for the broadcast).
+    #[inline]
+    pub fn deliver_slot(&self, slot: usize) -> bool {
         let nw = self.workers.len();
         if slot < nw {
-            self.workers.unpark(slot);
+            self.unpark_if_parking(WakeTarget::Worker(slot))
         } else if slot - nw < self.drivers.len() {
-            self.drivers.unpark(slot - nw);
+            self.unpark_if_parking(WakeTarget::Driver(DriverIdx(slot - nw)))
         } else {
             self.deliver_anonymous();
+            true
         }
+    }
+
+    /// Deliver a holder wake for `slot`, whose record the caller has just
+    /// claimed from an edge's holder set (after its own fence): fence again,
+    /// then [`Self::deliver_slot`].
+    ///
+    /// The second fence is what makes the parking gate sound for holder
+    /// claims. A claim need not come with room for the holder (an in-order pop
+    /// that leaves the next ordinal buffered, a pop that frees too little), and
+    /// it can claim a record the holder wrote after the caller's first fence —
+    /// one its re-poll made after it armed. Reading the parking bit unfenced
+    /// there can miss that arm: the holder is skipped, its record is gone, and
+    /// its re-check saw no room, so it parks with nothing left to wake it.
+    /// With the fence, either the claimed record was written after the
+    /// holder's arm (the arm's fence then orders the bit before this read, and
+    /// the holder is unparked) or every record its re-poll writes after the
+    /// arm lands after this claim and stands for the next take. A cap release
+    /// needs no such fence: it always frees a permit, and a thread whose
+    /// claimed cap record went unwoken owes that wake and forwards it
+    /// (`WakePlan::start_pass`). `tests/loom_wake.rs`'s ordered fast-path
+    /// model loses the wake without it.
+    #[inline]
+    pub fn deliver_holder(&self, slot: usize) -> bool {
+        delivery_fence();
+        self.deliver_slot(slot)
     }
 
     /// Wake a holder whose slot is unknown: every thread, pool waiters
@@ -1062,9 +1206,10 @@ impl WakePlan {
     pub(crate) fn request_pool_worker(&self) -> PoolRequest {
         let caller = crate::runtime::wake_slot::current_slot();
         let Some(pool) = &self.pool else {
-            // One-thread Directed run: the lone worker is `Worker(0)`, and a
-            // request from worker 0 itself has no one else to wake.
-            if self.mode == WakeMode::Directed && caller == Some(0) {
+            // One-thread run: the lone worker is `Worker(0)`, and a request
+            // from worker 0 itself has no one else to wake. The standalone plan
+            // has no worker at all: `Unavailable`.
+            if caller == Some(0) && self.workers.len() > 0 {
                 return PoolRequest::AllAwake;
             }
             return if self.workers.unpark(0) {
@@ -1135,9 +1280,6 @@ impl WakePlan {
     #[must_use]
     pub fn dag_lines(&self, graph: &ChainGraph) -> Vec<String> {
         let n = graph.n_steps();
-        if self.mode == WakeMode::Legacy {
-            return vec!["      wake: Legacy (no Detached step)".to_string(); n];
-        }
         let fmt_target = |t: WakeTarget| match t {
             WakeTarget::None => "None".to_string(),
             WakeTarget::Pool => "Pool".to_string(),
@@ -1421,50 +1563,6 @@ mod tests {
     }
 
     #[test]
-    fn wake_plan_is_legacy_without_detached_steps() {
-        // Src(Exclusive w0) → Par → Serial(w1) → Sink(Exclusive w1)
-        let mut g = ChainGraph::new();
-        let src = g.register_step("Src", 1);
-        let par = g.register_step("Par", 1);
-        let ser = g.register_step("Ser", 1);
-        let sink = g.register_step("Sink", 0);
-        g.wire(src, BranchIdx(0), par);
-        g.wire(par, BranchIdx(0), ser);
-        g.wire(ser, BranchIdx(0), sink);
-        let kinds =
-            [StepKind::Exclusive, StepKind::Parallel, StepKind::Serial, StepKind::Exclusive];
-        let pinned = [Some(0), None, Some(1), Some(1)];
-        let driver_of = [None; 4];
-        let queues: Vec<RegisteredQueue> = (0..3).map(|i| q(i, 0)).collect();
-        let pool = Arc::new(PoolEventCount::new(2));
-        let plan = WakePlan::build(
-            &g,
-            &kinds,
-            &pinned,
-            &driver_of,
-            &[],
-            WakeEdges::byte_bounded(&queues),
-            Some(Arc::clone(&pool)),
-            2,
-        );
-        assert_eq!(plan.mode(), WakeMode::Legacy);
-        for (i, rq) in queues.iter().enumerate() {
-            assert_eq!(plan.forward_target(StepIdx(i), BranchIdx(0)), WakeTarget::Pool, "step {i}");
-            assert!(!plan.is_gated(StepIdx(i)));
-            assert!(plan.reverse_producers(StepIdx(i)).is_empty());
-            assert!(!plan.tracks(rq), "Legacy tracks no edge");
-        }
-        // Legacy never registers a worker, so nothing can unpark it.
-        plan.register_worker(1, std::thread::current());
-        assert!(!plan.is_worker_registered(1));
-        // on_progress is exactly one notify_one, observed by an armed key.
-        let key = pool.prepare_wait();
-        let r = plan.on_progress(StepIdx(1), &PushSnapshot::default());
-        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken);
-        assert_eq!(r, WakeCounts { notified: 1, ..WakeCounts::default() });
-    }
-
-    #[test]
     fn wake_plan_targets_for_the_sort_topology() {
         use WakeTarget::{Driver, None as NoneT, Pool};
         let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
@@ -1479,7 +1577,6 @@ mod tests {
             Some(pool),
             16,
         );
-        assert_eq!(plan.mode(), WakeMode::Directed);
         assert_eq!(plan.n_drivers(), 2);
         assert_eq!(plan.n_slots(), 18);
         let coord = Driver(DriverIdx(0));
@@ -1615,7 +1712,6 @@ mod tests {
             None,
             1,
         );
-        assert_eq!(plan.mode(), WakeMode::Directed);
         assert_eq!(plan.forward_target(StepIdx(1), BranchIdx(0)), WakeTarget::Worker(0));
         // ReadBgzfBlocks (w0) → ReadBlocks (driver) still crosses threads at t1.
         assert_eq!(plan.reverse_producers(StepIdx(1)), vec![StepIdx(0)]);
@@ -1712,9 +1808,11 @@ mod tests {
         edge.queue.try_push(Sized8).unwrap(); // full
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let queue_h = Arc::clone(&edge.queue);
+        let plan_h = Arc::clone(&plan);
         let holder = std::thread::spawn(move || {
             let _slot = SlotGuard::enter(1); // worker 1 holds
             assert!(queue_h.try_push(Sized8).is_err(), "rejected → latched as slot 1");
+            assert!(plan_h.arm_direct(1), "armed for its timer park");
             ready_tx.send(()).unwrap();
             let t = std::time::Instant::now();
             std::thread::park_timeout(Duration::from_secs(10));
@@ -1950,6 +2048,146 @@ mod tests {
         assert!(!plan.is_worker_registered(99));
     }
 
+    /// `Par(Parallel) → Ser(Serial, pinned to worker 1)` at two workers, plus
+    /// `Feed(Parallel) → Det(Detached, driver 0) → Par2(Parallel)` so the plan
+    /// has a driver: `Par`'s branch targets `Worker(1)` and `Feed`'s targets
+    /// `Driver(0)`.
+    fn worker_and_driver_plan() -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let par = g.register_step("Par", 1);
+        let ser = g.register_step("Ser", 0);
+        let feed = g.register_step("Feed", 1);
+        let det = g.register_step("Det", 1);
+        let par2 = g.register_step("Par2", 0);
+        g.wire(par, BranchIdx(0), ser);
+        g.wire(feed, BranchIdx(0), det);
+        g.wire(det, BranchIdx(0), par2);
+        WakePlan::build(
+            &g,
+            &[
+                StepKind::Parallel,
+                StepKind::Serial,
+                StepKind::Parallel,
+                StepKind::Detached,
+                StepKind::Parallel,
+            ],
+            &[None, Some(1), None, None, None],
+            &[None, None, None, Some(DriverIdx(0)), None],
+            &[],
+            WakeEdges::NONE,
+            Some(Arc::new(PoolEventCount::new(2))),
+            2,
+        )
+    }
+
+    /// Drain this thread's park token, so the next check starts clean.
+    fn drain_token() {
+        std::thread::park_timeout(Duration::ZERO);
+    }
+
+    /// A park of this thread ended before its 10 s timeout: an unpark reached it.
+    fn was_unparked() -> bool {
+        let t = std::time::Instant::now();
+        std::thread::park_timeout(Duration::from_secs(10));
+        t.elapsed() < Duration::from_secs(5)
+    }
+
+    /// A directed wake unparks only a thread armed for its timer park. While
+    /// worker 1 runs (its parking bit clear) a `Worker(1)` forward wake and a
+    /// holder wake through `deliver_slot` issue no unpark; once it arms they
+    /// do; disarming clears the bit again. The same for driver 0, whose bit is
+    /// its wake slot `n_workers + 0`, through a `Driver(0)` forward wake and
+    /// `deliver_slot(2)`. The skips are asserted through the returned counts,
+    /// not through a park's timing.
+    #[test]
+    fn a_directed_wake_unparks_only_an_armed_thread() {
+        let plan = worker_and_driver_plan();
+        assert_eq!(plan.forward_target(StepIdx(0), BranchIdx(0)), WakeTarget::Worker(1));
+        assert_eq!(plan.forward_target(StepIdx(2), BranchIdx(0)), WakeTarget::Driver(DriverIdx(0)));
+        plan.register_worker(1, std::thread::current());
+        plan.register_driver(DriverIdx(0), std::thread::current());
+        drain_token();
+
+        // Worker 1.
+        assert!(!plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(0), &PushSnapshot::default()).unparked, 0);
+        assert!(!plan.deliver_slot(1), "a running worker was unparked");
+        assert!(plan.arm_direct(1));
+        assert!(plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(0), &PushSnapshot::default()).unparked, 1);
+        assert!(was_unparked(), "the armed worker was not unparked");
+        assert!(plan.deliver_slot(1), "deliver_slot skipped an armed worker");
+        drain_token();
+        plan.disarm_direct(1);
+        assert!(!plan.is_parking(1));
+        assert!(!plan.deliver_slot(1), "a disarmed worker was unparked");
+
+        assert!(plan.arm_cap_parked(1));
+        assert!(plan.is_parking(1), "a cap-parked worker is armed for directed wakes too");
+        assert!(plan.deliver_slot(1), "a cap-release wake skipped a cap-parked worker");
+        drain_token();
+        plan.disarm_cap_parked(1);
+        assert!(!plan.is_parking(1));
+
+        // Driver 0, wake slot 2.
+        assert!(!plan.is_parking(2));
+        assert_eq!(plan.on_progress(StepIdx(2), &PushSnapshot::default()).unparked, 0);
+        assert!(!plan.deliver_slot(2), "a running driver was unparked");
+        assert!(plan.arm_driver(DriverIdx(0)));
+        assert!(plan.is_parking(2), "driver 0 is wake slot n_workers + 0");
+        assert!(!plan.is_parking(0) && !plan.is_parking(1));
+        assert_eq!(plan.on_progress(StepIdx(2), &PushSnapshot::default()).unparked, 1);
+        assert!(was_unparked(), "the armed driver was not unparked");
+        assert!(plan.deliver_slot(2), "deliver_slot skipped an armed driver");
+        drain_token();
+        plan.disarm_driver(DriverIdx(0));
+        assert!(!plan.is_parking(2));
+        assert!(!plan.deliver_slot(2), "a disarmed driver was unparked");
+    }
+
+    /// A driver index the plan does not have is loud: a driver parked with no
+    /// bit of its own would be skipped by every directed wake, silently.
+    #[test]
+    #[should_panic(expected = "arm_driver: driver 1 is not in this plan (1 drivers)")]
+    fn arming_a_driver_the_plan_lacks_panics() {
+        let _ = worker_and_driver_plan().arm_driver(DriverIdx(1));
+    }
+
+    /// A plan with one thread arms nothing (the arm and its re-poll would be
+    /// pure cost) and gates nothing: a directed wake to its lone worker is an
+    /// unconditional unpark, since a thread outside the plan (the queue-memory
+    /// rebalancer) still delivers there. One driver beside the lone worker
+    /// makes the arm, and the gate, real. The standalone plan arms nothing.
+    #[test]
+    fn a_one_thread_plan_arms_nothing_and_gates_nothing() {
+        let one_step = |driver: bool| {
+            let mut g = ChainGraph::new();
+            let a = g.register_step("A", 1);
+            let b = g.register_step("B", 0);
+            g.wire(a, BranchIdx(0), b);
+            let kinds =
+                [if driver { StepKind::Detached } else { StepKind::Serial }, StepKind::Serial];
+            let driver_of = [driver.then_some(DriverIdx(0)), None];
+            WakePlan::build(&g, &kinds, &[None, None], &driver_of, &[], WakeEdges::NONE, None, 1)
+        };
+        let lone = one_step(false);
+        assert!(!lone.arm_direct(0) && !lone.arm_cap_parked(0));
+        assert!(!lone.is_parking(0));
+        lone.register_worker(0, std::thread::current());
+        drain_token();
+        assert!(lone.deliver_slot(0), "the unarmed lone worker is still unparked");
+        assert!(was_unparked());
+
+        let with_driver = one_step(true);
+        with_driver.register_worker(0, std::thread::current());
+        assert!(!with_driver.deliver_slot(0), "a plan with two threads gates the lone worker");
+        assert!(with_driver.arm_direct(0) && with_driver.is_parking(0));
+        assert!(with_driver.deliver_slot(0));
+        drain_token();
+        assert!(with_driver.arm_driver(DriverIdx(0)) && with_driver.is_parking(1));
+        assert!(!WakePlan::standalone().arm_direct(0));
+    }
+
     #[test]
     fn dag_lines_render_one_line_per_step() {
         let (g, kinds, pinned, driver_of, queues) = synthetic_sort_topology();
@@ -1975,8 +2213,6 @@ mod tests {
             "      wake: .0 → ArenaSort Driver(0) [gated]; reverse: ReadBlocks (holder)"
         );
         assert_eq!(lines[10], "      wake: (sink); reverse: BgzfCompress (holder)");
-        let legacy = WakePlan::legacy(None);
-        assert_eq!(legacy.dag_lines(&g), vec!["      wake: Legacy (no Detached step)"; 11]);
     }
 
     /// Arm a pool waiter on its own thread; returns once `prepare_wait` ran.
@@ -1996,16 +2232,16 @@ mod tests {
     #[test]
     fn request_worker_semantics() {
         use crate::runtime::event_count::NotifyOutcome;
-        // No pool, Legacy: Unavailable.
-        let legacy = WakePlan::legacy(None);
+        // No pool, no worker (the standalone plan): Unavailable.
+        let standalone = WakePlan::standalone();
         assert_eq!(
-            PoolHandle::new(&legacy, None, StepIdx(0)).request_worker(),
+            PoolHandle::new(&standalone, None, StepIdx(0)).request_worker(),
             PoolRequest::Unavailable
         );
 
         // Pool with nobody armed: AllAwake, and the generation does not move.
         let pool = Arc::new(PoolEventCount::new(2));
-        let plan = WakePlan::legacy(Some(Arc::clone(&pool)));
+        let plan = super::tests_support::plan_with_pool(Arc::clone(&pool), 2);
         let h = PoolHandle::new(&plan, None, StepIdx(0));
         assert_eq!(h.parked_workers(), 0);
         assert_eq!(h.request_worker(), PoolRequest::AllAwake);
@@ -2040,7 +2276,7 @@ mod tests {
         assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
     }
 
-    /// Directed mode at one worker: no pool, worker 0 registered → the request
+    /// One worker: no pool, worker 0 registered → the request
     /// unparks it and reports Woken; unregistered → Unavailable.
     #[test]
     fn request_worker_at_one_thread_unparks_worker_zero() {
@@ -2139,11 +2375,11 @@ mod tests {
     #[test]
     fn request_worker_records_per_step_outcomes() {
         let stats = crate::runtime::stats::PipelineStats::new(vec!["A", "B"]);
-        let legacy = WakePlan::legacy(None);
-        let h = PoolHandle::new(&legacy, Some(&stats), StepIdx(1));
+        let standalone = WakePlan::standalone();
+        let h = PoolHandle::new(&standalone, Some(&stats), StepIdx(1));
         assert_eq!(h.request_worker(), PoolRequest::Unavailable);
         let pool = Arc::new(PoolEventCount::new(2));
-        let plan = WakePlan::legacy(Some(Arc::clone(&pool)));
+        let plan = super::tests_support::plan_with_pool(Arc::clone(&pool), 2);
         let h = PoolHandle::new(&plan, Some(&stats), StepIdx(1));
         assert_eq!(h.request_worker(), PoolRequest::AllAwake);
         // An armed waiter: the first request wakes it, a second one before any
@@ -2243,8 +2479,11 @@ mod tests {
                 let work = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
                 let work_t = Arc::clone(&work);
+                let plan_t = Arc::clone(&plan);
                 let target = std::thread::spawn(move || {
                     registered_rx.recv().unwrap(); // first pass after registration
+                    // The driver arms for its timer park before that pass.
+                    assert!(plan_t.arm_driver(DriverIdx(0)));
                     // `Relaxed`, as a queue publish is: only the registration
                     // and delivery fences may order this load against the store.
                     if !work_t.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2379,6 +2618,7 @@ mod tests {
 
         let (ready_tx, ready_rx) = channel::<()>();
         let stage_h = Arc::clone(&stage);
+        let plan_h = Arc::clone(&plan);
         let holder = std::thread::spawn(move || {
             let _slot = SlotGuard::enter(1);
             let _ = crate::runtime::wake_slot::take_rejected();
@@ -2395,6 +2635,7 @@ mod tests {
             assert!(!rejected_pending(), "the stash inserts mark nothing");
             assert!(stage_h.try_push(4, Sized8).is_err(), "stash at its cap: ordinal 4 is held");
             assert!(rejected_pending(), "a stash-cap hold marks the thread");
+            assert!(plan_h.arm_direct(1), "armed for its timer park");
             ready_tx.send(()).unwrap();
             let t = std::time::Instant::now();
             std::thread::park_timeout(Duration::from_secs(10));
@@ -2461,40 +2702,6 @@ mod tests {
         assert!(plan.dag_lines(&g)[par.0].ends_with("; reverse: Src (holder)"));
         assert!(plan.steps[sink.0].needs_fence, "Sink's only reason is its holder-only input");
         assert!(plan.steps[det.0].needs_fence, "Det's forward target is None (same driver)");
-    }
-
-    /// The same graph with no Detached step builds a Legacy plan: no reverse
-    /// edges, nothing tracked.
-    #[test]
-    fn legacy_plan_routes_no_holder_only_edge() {
-        let mut g = ChainGraph::new();
-        let ids: Vec<StepIdx> =
-            ["Src", "Par", "Det", "Det2", "Sink"].iter().map(|n| g.register_step(n, 1)).collect();
-        for w in ids.windows(2) {
-            g.wire(w[0], BranchIdx(0), w[1]);
-        }
-        let holder_only: Vec<RegisteredHolderOnlyQueue> = (0..4).map(count_edge).collect();
-        let plan = WakePlan::build(
-            &g,
-            &[
-                StepKind::Exclusive,
-                StepKind::Parallel,
-                StepKind::Parallel,
-                StepKind::Parallel,
-                StepKind::Serial,
-            ],
-            &[Some(0), None, None, None, None],
-            &[None; 5],
-            &[],
-            WakeEdges { byte_bounded: &[], holder_only: &holder_only },
-            Some(Arc::new(PoolEventCount::new(2))),
-            2,
-        );
-        assert_eq!(plan.mode(), WakeMode::Legacy);
-        for (i, q) in holder_only.iter().enumerate() {
-            assert!(plan.reverse_producers(StepIdx(i + 1)).is_empty());
-            assert!(!plan.tracks_holder_only(q), "Legacy tracks no edge");
-        }
     }
 
     /// An ordered byte-bounded branch of a Detached producer is gated like a
@@ -2584,7 +2791,7 @@ mod tests {
             fwd,
             Fwd::GatedPushed | Fwd::GatedNotPushed | Fwd::GatedPoolPushed | Fwd::GatedPoolNotPushed
         );
-        // (kinds, pinned, driver_of) per case; a Detached tail makes the plan Directed.
+        // (kinds, pinned, driver_of) per case.
         let (kinds, pinned, driver_of): (Vec<StepKind>, Vec<Option<usize>>, Vec<_>) = match fwd {
             Fwd::Pool => (vec![E, P, D], vec![Some(0), None, None], vec![None, None, d0]),
             Fwd::Driver => (vec![P, D], vec![None, None], vec![None, d0]),
@@ -2629,10 +2836,18 @@ mod tests {
             );
         }
         let me = std::thread::current();
+        // The consumer's thread is registered and, for a directed target,
+        // armed for its timer park (a running target is not unparked).
         match fwd {
             Fwd::Pool | Fwd::Terminal => plan.register_worker(0, me),
-            Fwd::Driver => plan.register_driver(DriverIdx(0), me),
-            Fwd::Worker => plan.register_worker(1, me),
+            Fwd::Driver => {
+                plan.register_driver(DriverIdx(0), me);
+                assert!(plan.arm_driver(DriverIdx(0)));
+            }
+            Fwd::Worker => {
+                plan.register_worker(1, me);
+                assert!(plan.arm_direct(1));
+            }
             Fwd::GatedPushed
             | Fwd::GatedNotPushed
             | Fwd::GatedPoolPushed
@@ -2824,7 +3039,7 @@ mod tests {
     fn a_ceiling_suppressed_notify_is_counted_apart() {
         let ec = Arc::new(PoolEventCount::new(2));
         ec.set_ceiling(1);
-        let plan = WakePlan::legacy(Some(Arc::clone(&ec)));
+        let plan = super::tests_support::plan_with_pool(Arc::clone(&ec), 2);
         let key = ec.prepare_wait(); // one waiter: awake 1 >= ceiling 1
         let r = plan.on_progress(StepIdx(0), &PushSnapshot::default());
         ec.cancel_wait(key);
@@ -3032,7 +3247,7 @@ mod tests {
         assert_eq!(*woken.lock(), vec![Some(2)], "slot 3 is not woken by a forward");
     }
 
-    /// A Directed plan over a Detached source and `n_caps` steps, each capped
+    /// A plan over a Detached source and `n_caps` steps, each capped
     /// by its own cap; returns the caps in step order.
     fn plan_with_own_caps(n_caps: usize) -> Vec<Arc<crate::PhaseCap>> {
         let n = n_caps + 1;
@@ -3077,17 +3292,15 @@ mod tests {
         let _ = plan_with_own_caps(crate::MAX_PHASE_CAPS + 1);
     }
 
-    /// A cap has one run index at a time: a Directed plan's build sets it, a
-    /// Legacy run's binding clears it, and a later Directed plan sets its own.
+    /// A cap has one run index at a time: a plan's build sets it, and a later
+    /// plan sets its own.
     #[test]
     fn a_reused_cap_takes_each_run_s_index() {
         let cap = crate::PhaseCap::new("c", 1);
         let other = crate::PhaseCap::new("o", 1);
         let _first = plan_with_capped_consumer(Some(Arc::clone(&cap)));
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
-        assert_eq!(cap.plan_bit(), Some(0), "the first Directed run");
-        cap.bind_waker(None);
-        assert_eq!(cap.plan_bit(), None, "a Legacy run");
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
+        assert_eq!(cap.plan_bit(), Some(0), "the first run");
         let mut g = ChainGraph::new();
         let d = g.register_step("Det", 1);
         let a = g.register_step("A", 1);
@@ -3104,8 +3317,8 @@ mod tests {
             Some(Arc::new(PoolEventCount::new(2))),
             2,
         );
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
-        assert_eq!(cap.plan_bit(), Some(1), "the second Directed run");
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
+        assert_eq!(cap.plan_bit(), Some(1), "the second run");
     }
 
     /// A pass start clears the thread's own refusal record on every cap the
@@ -3115,7 +3328,7 @@ mod tests {
     fn a_pass_start_clears_only_the_thread_s_own_records() {
         let tracked = |name| {
             let c = crate::PhaseCap::new(name, 1);
-            c.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
+            c.bind_waker(Arc::new(|_: Option<usize>| {}));
             c
         };
         let (cap_a, cap_b, other) = (tracked("a"), tracked("b"), tracked("other"));
@@ -3149,21 +3362,6 @@ mod tests {
             [(true, false), (true, false), (true, true)]
         );
         drop(held);
-    }
-
-    /// A Legacy plan ignores a flush: no notify (observed through the
-    /// event-count), an empty report. `on_progress` on the same plan does move
-    /// the generation.
-    #[test]
-    fn legacy_plan_ignores_a_flush() {
-        let ec = Arc::new(PoolEventCount::new(2));
-        let plan = WakePlan::legacy(Some(Arc::clone(&ec)));
-        let k = ec.prepare_wait();
-        assert_eq!(plan.on_flushed(StepIdx(0), &PushSnapshot::default()), WakeCounts::default());
-        assert_eq!(ec.wait(k, Duration::ZERO), WaitOutcome::TimedOut);
-        let k2 = ec.prepare_wait();
-        let _ = plan.on_progress(StepIdx(0), &PushSnapshot::default());
-        assert_eq!(ec.wait(k2, Duration::ZERO), WaitOutcome::Woken);
     }
 
     /// Park `who` on its own thread for up to 10 s; returns once it has
@@ -3200,7 +3398,7 @@ mod tests {
         };
         let ec = plan.pool().expect("two workers: an event-count");
         let k = ec.prepare_wait();
-        plan.deliver_slot(plan.n_slots()); // the anonymous bit
+        assert!(plan.deliver_slot(plan.n_slots())); // the anonymous bit
         assert_eq!(ec.wait(k, Duration::ZERO), WaitOutcome::Woken, "the event-count is notified");
         for (who, h) in [("driver", driver), ("worker", worker)] {
             assert!(h.join().unwrap() < Duration::from_secs(5), "the {who} was unparked");
@@ -3273,14 +3471,9 @@ mod tests {
         out
     }
 
-    /// Asserted at the top of every gate test: a fixture that slipped back to
-    /// Legacy would make the gate tests pass for any implementation.
-    fn assert_directed_and_gated(plan: &WakePlan, step: StepIdx) {
-        assert_eq!(
-            plan.mode(),
-            WakeMode::Directed,
-            "fixture must be Directed (needs a Detached step)"
-        );
+    /// Asserted at the top of every gate test: a fixture whose producer is not
+    /// gated would make the gate tests pass for any implementation.
+    fn assert_gated(plan: &WakePlan, step: StepIdx) {
         assert!(plan.is_gated(step), "fixture's producer must be gated");
     }
 
@@ -3359,7 +3552,6 @@ mod tests {
             Some(Arc::new(PoolEventCount::new(16))),
             16,
         );
-        assert_eq!(plan.mode(), WakeMode::Directed);
         // Every branch of a step with outputs is gated; `SortSpillDecompress`
         // (a zero-output Parallel step) and the `WriteBgzfFile` sink have none.
         let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
@@ -3397,7 +3589,7 @@ mod tests {
             Some(Arc::clone(&pool)),
             4,
         );
-        assert_directed_and_gated(&plan, StepIdx(0));
+        assert_gated(&plan, StepIdx(0));
         let mut snap = PushSnapshot::default();
         plan.snapshot_pushes(StepIdx(0), &mut snap);
         let key = pool.prepare_wait();
@@ -3432,7 +3624,7 @@ mod tests {
                     Some(Arc::clone(&pool)),
                     4,
                 );
-                assert_directed_and_gated(&plan, StepIdx(0));
+                assert_gated(&plan, StepIdx(0));
                 let (mut a, mut b) = (PushSnapshot::default(), PushSnapshot::default());
                 let (mut key, mut saw_item) = (None, false);
                 for (i, ev) in order.iter().enumerate() {
@@ -3470,8 +3662,8 @@ mod tests {
         (ChainGraph, Vec<StepKind>, Vec<Option<usize>>, Vec<Option<DriverIdx>>, Vec<ParallelHosts>);
 
     /// `Src(Exclusive w0) → Par(P) → Sink(Serial, None) → Tap(Detached)`; every
-    /// edge `CountBounded`, so no byte-bounded registry entry exists: Directed
-    /// with no gates.
+    /// edge `CountBounded`, so no byte-bounded registry entry exists: a routed
+    /// plan with no gates.
     fn directed_count_bounded_chain(n: usize, hosts_exclude_reader: bool) -> DirectedCountBounded {
         let mut g = ChainGraph::new();
         let src = g.register_step("Src", 1);
@@ -3517,7 +3709,6 @@ mod tests {
             4,
             &hosts,
         );
-        assert_eq!(plan.mode(), WakeMode::Directed);
         for p in 0..3 {
             assert!(!plan.is_gated(StepIdx(p)), "a count-bounded branch is never gated");
         }
@@ -3561,7 +3752,7 @@ mod tests {
             Some(Arc::clone(&pool)),
             4,
         );
-        assert_directed_and_gated(&plan, par);
+        assert_gated(&plan, par);
         transport.enable_tracking(
             EdgeTracking { clock: None, holders: Some(HolderSet::new(plan.n_slots())) },
             crate::queues::SEALED,
@@ -3575,34 +3766,153 @@ mod tests {
         assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken, "stashed push gated off");
     }
 
-    /// Chains without a Detached step keep the empty-table plan.
-    #[test]
-    fn legacy_chains_keep_the_empty_table_plan() {
+    type PlainChain = (
+        ChainGraph,
+        Vec<StepKind>,
+        Vec<Option<usize>>,
+        Vec<Option<DriverIdx>>,
+        Vec<Arc<ByteBoundedQueue<Sized8>>>,
+        Vec<RegisteredQueue>,
+    );
+
+    /// `Src(Serial, Reader w0) → Par(P) → Grouper(Serial, Worker(1)) → Par2(P)
+    /// → Sink(Serial, Writer w3)`, n = 4, no Detached step. Every edge is a
+    /// one-item `Sized8` queue; returns the typed handles (index = producer step).
+    fn plain_chain_with_grouper() -> PlainChain {
         let mut g = ChainGraph::new();
-        let src = g.register_step("Src", 1);
-        let par = g.register_step("Par", 1);
-        let sink = g.register_step("Sink", 0);
-        g.wire(src, BranchIdx(0), par);
-        g.wire(par, BranchIdx(0), sink);
-        let kinds = [StepKind::Serial, StepKind::Parallel, StepKind::Serial];
-        let (rq, _typed) = one_item_tracked(1, 6);
-        let queues = vec![q(0, 0), rq];
-        let pool = Arc::new(PoolEventCount::new(4));
+        let names = ["Src", "Par", "Grouper", "Par2", "Sink"];
+        let idx: Vec<StepIdx> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| g.register_step(n, usize::from(i != 4)))
+            .collect();
+        for i in 0..4 {
+            g.wire(idx[i], BranchIdx(0), idx[i + 1]);
+        }
+        let kinds = vec![
+            StepKind::Serial,
+            StepKind::Parallel,
+            StepKind::Serial,
+            StepKind::Parallel,
+            StepKind::Serial,
+        ];
+        let pinned = vec![Some(0), None, Some(1), None, Some(3)];
+        let driver_of = vec![None; 5];
+        let mut typed = Vec::new();
+        let mut queues = Vec::new();
+        for (p, name) in names.iter().take(4).enumerate() {
+            let t = Arc::new(ByteBoundedQueue::<Sized8>::new(1));
+            queues.push(RegisteredQueue {
+                producer_step_name: name,
+                producer_step: StepIdx(p),
+                branch: BranchIdx(0),
+                handle: Arc::clone(&t) as _,
+                reorder_cap: None,
+            });
+            typed.push(t);
+        }
+        (g, kinds, pinned, driver_of, typed, queues)
+    }
+
+    /// Every chain gets tables: the plain-chain shape (no Detached step) routes
+    /// pinned consumers to their worker and unpinned ones to the pool, and
+    /// tracks every byte-bounded edge. A rendering check of `build`'s rules;
+    /// delivery is `plain_chain_progress_unparks_the_pinned_consumer`.
+    #[test]
+    fn plain_chain_builds_tables() {
+        let (g, kinds, pinned, driver_of, _typed, queues) = plain_chain_with_grouper();
         let plan = WakePlan::build(
             &g,
             &kinds,
-            &[Some(0), None, Some(3)],
-            &[None; 3],
+            &pinned,
+            &driver_of,
             &[],
             WakeEdges::byte_bounded(&queues),
-            Some(Arc::clone(&pool)),
+            Some(Arc::new(PoolEventCount::new(4))),
             4,
         );
-        assert_eq!(plan.mode(), WakeMode::Legacy);
-        assert!(queues.iter().all(|rq| !plan.tracks(rq)));
-        let key = pool.prepare_wait();
-        let _ = plan.on_progress(StepIdx(1), &PushSnapshot::default());
-        assert_eq!(pool.wait(key, Duration::ZERO), WaitOutcome::Woken);
+        assert_eq!(plan.forward_target(StepIdx(0), BranchIdx(0)), WakeTarget::Pool);
+        assert_eq!(plan.forward_target(StepIdx(1), BranchIdx(0)), WakeTarget::Worker(1));
+        assert_eq!(plan.forward_target(StepIdx(3), BranchIdx(0)), WakeTarget::Worker(3));
+        assert!(
+            queues.iter().all(|rq| plan.tracks(rq)),
+            "every byte-bounded edge is tracked (S2 gate + holder sets)"
+        );
+        assert!(
+            plan.dag_lines(&g).iter().all(|l| !l.contains("Legacy")),
+            "{:?}",
+            plan.dag_lines(&g)
+        );
+    }
+
+    /// The fused path's plan: no tables, no pool, nothing to request.
+    #[test]
+    fn standalone_plan_has_no_tables_and_requests_are_unavailable() {
+        let plan = WakePlan::standalone();
+        assert_eq!(plan.forward_target(StepIdx(0), BranchIdx(0)), WakeTarget::None);
+        assert_eq!(plan.gated_branches(StepIdx(0)), 0);
+        assert!(plan.reverse_producers(StepIdx(0)).is_empty());
+        assert_eq!(plan.n_slots(), 0);
+        assert_eq!(
+            PoolHandle::new(&plan, None, StepIdx(0)).request_worker(),
+            PoolRequest::Unavailable
+        );
+        let _slot = SlotGuard::enter(0);
+        assert_eq!(
+            PoolHandle::new(&plan, None, StepIdx(0)).request_worker(),
+            PoolRequest::Unavailable,
+            "even from slot 0: the standalone plan has no worker"
+        );
+    }
+
+    /// A delivery to a pinned consumer of a plain chain reaches a real parked
+    /// thread: the helper registers as worker 1 from its own thread, parks on a
+    /// 10 s timer, and must return under a 5 s watchdog once the Par step's
+    /// progress (one push onto `Par → Grouper`) is delivered.
+    #[test]
+    fn plain_chain_progress_unparks_the_pinned_consumer() {
+        let (g, kinds, pinned, driver_of, typed, queues) = plain_chain_with_grouper();
+        let plan = WakePlan::build(
+            &g,
+            &kinds,
+            &pinned,
+            &driver_of,
+            &[],
+            WakeEdges::byte_bounded(&queues),
+            Some(Arc::new(PoolEventCount::new(4))),
+            4,
+        );
+        // Mirror `Pipeline::run`: a holder set on every edge the plan tracks.
+        for rq in &queues {
+            if plan.tracks(rq) {
+                rq.handle.enable_tracking(
+                    EdgeTracking { clock: None, holders: Some(HolderSet::new(plan.n_slots())) },
+                    crate::queues::SEALED,
+                );
+            }
+        }
+        assert!(plan.is_gated(StepIdx(1)), "fixture: Par → Grouper(Worker(1)) must be gated");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = Arc::clone(&plan);
+        std::thread::spawn(move || {
+            p.register_worker(1, std::thread::current());
+            assert!(p.arm_direct(1), "armed for its timer park");
+            ready_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            std::thread::park_timeout(Duration::from_secs(10));
+            done_tx.send(t0.elapsed()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        // Let it park; an earlier unpark is still caught (the token persists).
+        std::thread::sleep(Duration::from_millis(20));
+        let mut snap = PushSnapshot::default();
+        plan.snapshot_pushes(StepIdx(1), &mut snap);
+        typed[1].try_push(Sized8).unwrap();
+        let r = plan.on_progress(StepIdx(1), &snap);
+        assert_eq!(r.unparked, 1, "{r:?}");
+        let woke = done_rx.recv_timeout(Duration::from_secs(5)).expect("worker 1 not unparked");
+        assert!(woke < Duration::from_secs(5));
     }
 }
 
@@ -3616,18 +3926,60 @@ pub(crate) mod tests_support {
     use crate::step::StepKind;
     use crate::topology::{BranchIdx, ChainGraph};
 
-    /// A pool handle over a process-wide Legacy plan with no pool, for tests
+    /// A pool handle over a process-wide standalone plan (no pool), for tests
     /// that build an `ErasedStepCtx` by hand.
-    pub(crate) fn legacy_pool_handle() -> super::PoolHandle<'static> {
+    pub(crate) fn standalone_pool_handle() -> super::PoolHandle<'static> {
         static PLAN: std::sync::OnceLock<Arc<WakePlan>> = std::sync::OnceLock::new();
         super::PoolHandle::new(
-            PLAN.get_or_init(|| WakePlan::legacy(None)),
+            PLAN.get_or_init(WakePlan::standalone),
             None,
             crate::topology::StepIdx(0),
         )
     }
 
-    /// A Directed plan for `Det (driver 0) → Par` with `n` pool workers and a
+    /// A real two-step plan over `pool` (built for `n` workers) for tests
+    /// that dispatch step 0 by hand: `Par(Parallel) → Par2(Parallel)`, no edge
+    /// registered, so step 0's one branch targets `Pool`, is ungated and has
+    /// no reverse edge — every `on_progress(StepIdx(0), ..)` is exactly one
+    /// `notify_one`.
+    pub(crate) fn plan_with_pool(pool: Arc<PoolEventCount>, n: usize) -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let a = g.register_step("Par", 1);
+        let b = g.register_step("Par2", 0);
+        g.wire(a, BranchIdx(0), b);
+        WakePlan::build(
+            &g,
+            &[StepKind::Parallel, StepKind::Parallel],
+            &[None, None],
+            &[None, None],
+            &[],
+            WakeEdges::NONE,
+            Some(pool),
+            n,
+        )
+    }
+
+    /// The plan of a plain chain (no Detached step) at `n` threads:
+    /// `A(Serial) → B(Serial)`, a pool event-count only when `n > 1`. At one
+    /// thread it is the lone worker's plan, with nothing else in it.
+    pub(crate) fn plain_plan(n: usize) -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let a = g.register_step("A", 1);
+        let b = g.register_step("B", 0);
+        g.wire(a, BranchIdx(0), b);
+        WakePlan::build(
+            &g,
+            &[StepKind::Serial, StepKind::Serial],
+            &[None, None],
+            &[None, None],
+            &[],
+            WakeEdges::NONE,
+            (n > 1).then(|| Arc::new(PoolEventCount::new(n))),
+            n,
+        )
+    }
+
+    /// A plan for `Det (driver 0) → Par` with `n` pool workers and a
     /// pool event-count.
     pub(crate) fn directed_plan_with_workers(n: usize) -> (Arc<WakePlan>, ChainGraph) {
         let mut g = ChainGraph::new();
@@ -3716,6 +4068,7 @@ mod e2e {
         started: Option<Instant>,
         kind: StepKind,
         group: DetachedGroup,
+        affinity: Affinity,
         held: Option<Blob>,
         /// When set, `Finished` waits until the sink has seen every item, so a
         /// `Finished` broadcast cannot stand in for the wakes under test.
@@ -3734,6 +4087,7 @@ mod e2e {
                 started: None,
                 kind: StepKind::Exclusive,
                 group: DetachedGroup::PerStep,
+                affinity: Affinity::None,
                 held: None,
                 finish_after_sink: None,
                 edge: EDGE,
@@ -3751,6 +4105,10 @@ mod e2e {
                 Some(c) => c.count(Result::is_err, || ctx.outputs.push(b)),
                 None => ctx.outputs.push(b),
             }
+        }
+        /// A Serial source pinned by `affinity` (`Reader` → worker 0).
+        fn serial_with_affinity(n: u32, delay_ms: u64, affinity: Affinity) -> Self {
+            Self { kind: StepKind::Serial, affinity, ..Self::exclusive(n, delay_ms) }
         }
         /// Like [`Self::exclusive`], but `Finished` only once `seen` reaches `n`.
         fn exclusive_finishing_last(n: u32, delay_ms: u64, seen: &Arc<AtomicU64>) -> Self {
@@ -3775,6 +4133,9 @@ mod e2e {
                 output_queues: vec![self.edge],
                 branch_ordering: vec![BranchOrdering::None],
             }
+        }
+        fn affinity(&self) -> Affinity {
+            self.affinity
         }
         fn detached_group(&self) -> DetachedGroup {
             self.group
@@ -4078,9 +4439,9 @@ mod e2e {
         assert_eq!(seen.load(AO::Relaxed), 1_000);
     }
 
-    /// Parallel → `Serial` (`Affinity::Worker(1)`) with a Detached sink forcing
-    /// Directed mode; only worker 1 has the 10 s timer. Worker 0 is the Source's
-    /// owner, so both workers are pinned: Par's work reaches them through the
+    /// Parallel → `Serial` (`Affinity::Worker(1)`) → a Serial sink, no Detached
+    /// step; only worker 1 has the 10 s timer. Worker 0 is the Source's owner,
+    /// so both workers are pinned: Par's work reaches them through the
     /// direct-park fallback and Ser's through `Worker(1)` unparks. The source
     /// finishes only after the sink has seen every item, so no `Finished`
     /// broadcast can deliver them instead.
@@ -4095,7 +4456,7 @@ mod e2e {
                 b.chain(Source::exclusive_finishing_last(1_000, 100, &s2))
                     .chain(Pass::new("Par", StepKind::Parallel))
                     .chain(ser)
-                    .chain(Sink::new(StepKind::Detached, &s2))
+                    .chain(Sink::new(StepKind::Serial, &s2))
                     .into_sink_marker();
             });
         });
@@ -4453,6 +4814,105 @@ mod e2e {
         assert!(cap.refused() >= 1, "the scenario needs a refusal");
     }
 
+    /// A Detached step that takes a permit of `cap` for every item
+    /// ([`crate::admit_input`]) and passes it on. Before its first try at its
+    /// second item it waits (bounded) until another thread holds the cap, so
+    /// that admission is refused.
+    struct DetachedAdmitted {
+        cap: Arc<crate::PhaseCap>,
+        admitted: u32,
+        waited: bool,
+    }
+    impl Step for DetachedAdmitted {
+        type Input = Blob;
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "DetachedAdmitted",
+                kind: StepKind::Detached,
+                sticky: false,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if self.admitted == 1 && !self.waited && !ctx.input.is_empty() {
+                self.waited = true;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while self.cap.active() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let _permit = match crate::admit_input(ctx.input, Some(&self.cap)) {
+                Ok(p) => p,
+                Err(outcome) => return Ok(outcome),
+            };
+            match ctx.input.pop() {
+                Some(b) => {
+                    self.admitted += 1;
+                    assert!(ctx.outputs.push(b).is_ok(), "the output edge holds every item");
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
+            Some(&self.cap)
+        }
+    }
+
+    /// A cap release wakes a refused driver: the driver arms its parking bit
+    /// for a cap-only park (`arm_driver`), and the release's
+    /// `deliver_slot(n_workers + 0)` finds it. A cap of 1 shared by a Detached
+    /// step (driver 0, 10 s timer) and the Parallel step after it. The driver
+    /// passes item 1 on and, before item 2, waits until the pool step holds
+    /// the cap, so its admission is refused and it parks. The pool step waits
+    /// for that refusal, lets the driver park, and releases. Nothing else
+    /// reaches the driver: the source pushed both items before, finishes only
+    /// after the sink has seen them (no `Finished` broadcast), and the pool
+    /// step's own wakes go to the sink. A driver that parked unarmed would be
+    /// skipped by the release and sleep its 10 s timer.
+    #[test]
+    fn cap_release_wakes_a_refused_driver() {
+        let cap = crate::PhaseCap::new("test-cap", 1);
+        let done = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(AtomicU64::new(0));
+        let (cap2, done2, seen2) = (Arc::clone(&cap), Arc::clone(&done), Arc::clone(&seen));
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let snap2 = Arc::clone(&snap);
+        run_under_watchdog("cap-release driver", 5, move || {
+            let capped = CappedStep {
+                cap: Arc::clone(&cap2),
+                work: Duration::ZERO,
+                settle: Duration::from_millis(20),
+                first: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                done: done2,
+                total: 2,
+            };
+            *snap2.lock() = Some(run(2, slow(T::Driver(0)), |b| {
+                b.chain(Source::exclusive_finishing_last(2, 0, &seen2))
+                    .chain(DetachedAdmitted { cap: cap2, admitted: 0, waited: false })
+                    .chain(capped)
+                    .chain(Sink::new(StepKind::Serial, &seen2))
+                    .into_sink_marker();
+            }));
+        });
+        assert_eq!(done.load(AO::Relaxed), 2);
+        assert_eq!(seen.load(AO::Relaxed), 2);
+        assert!(cap.refused() >= 1, "the scenario needs the driver refused");
+        let snap = snap.lock().take().expect("snapshot");
+        assert!(row(&snap, "DetachedAdmitted").capped_count >= 1, "the driver was refused");
+        assert!(
+            snap.detached_park_outcomes
+                .iter()
+                .any(|&(step, unparked, _)| step == 1 && unparked > 0),
+            "the refused driver parked and was unparked: {:?}",
+            snap.detached_park_outcomes
+        );
+    }
+
     /// A Detached step that consumes every item and pushes nothing: its
     /// `Progress` is push-gated, so it wakes no pool worker.
     struct Swallow;
@@ -4577,7 +5037,7 @@ mod e2e {
                 .into_sink_marker();
         });
         assert_eq!(seen.load(AO::Relaxed), 3);
-        assert!(cap.is_tracking(), "the Directed run bound a waker to the Detached step's cap");
+        assert!(cap.is_tracking(), "the run bound a waker to the Detached step's cap");
     }
 
     /// Emits one item, then a second 300 ms later (once every pool worker is
@@ -4850,33 +5310,54 @@ mod e2e {
         assert!(row(&snap, consumer).reverse_wakes > 0, "the consumer's pops woke the holder");
     }
 
-    /// The same shape in a Legacy chain (no Detached step): count-bounded
-    /// refusals record and mark nothing, and nothing reverse-wakes. Default
-    /// timers; Legacy releases holders through its per-`Progress` notify.
-    #[test]
-    fn legacy_count_bounded_refusal_latches_nothing() {
+    /// Who holds an item on the one-slot count-bounded edge of a plain chain.
+    #[derive(Clone, Copy, Debug)]
+    enum PlainHolder {
+        ExclusivePinned,
+        ParallelPool,
+    }
+
+    /// The plain-chain twin of `count_bounded_holder_is_woken_by_the_pop`: no
+    /// Detached step anywhere, the consumer a Serial sink pinned to worker 1.
+    /// A producer refused by the full one-slot count-bounded edge — the
+    /// Exclusive source on worker 0, or `ProcessShaped` clones on the pool —
+    /// is woken by the sink's pop through the edge's holder set. Every worker
+    /// has a 10 s timer and the sink takes 200 µs per item, so holds keep
+    /// happening, and only the pop's reverse wake can release them under the
+    /// watchdog. Every refusal must mark its thread.
+    #[rstest]
+    #[case::exclusive_pinned_holder(PlainHolder::ExclusivePinned)]
+    #[case::parallel_pool_holder(PlainHolder::ParallelPool)]
+    fn plain_count_bounded_holder_is_woken_by_the_pop(#[case] holder: PlainHolder) {
+        const N: u32 = 200;
+        let work = Duration::from_micros(200);
         let seen = Arc::new(AtomicU64::new(0));
         let counts = RefusalCounts::default();
         let out = Arc::new(parking_lot::Mutex::new(None));
         let (s2, c2, out2) = (Arc::clone(&seen), counts.clone(), Arc::clone(&out));
-        run_under_watchdog("legacy count-bounded", 10, move || {
+        run_under_watchdog("plain count-bounded holder", 5, move || {
             let sink =
-                Sink { work: Duration::from_micros(200), ..Sink::new(StepKind::Serial, &s2) };
-            let snap = run(2, vec![], |b| {
-                b.chain(Source::exclusive(200, 0))
-                    .chain(ProcessShaped { counts: c2, held: crate::held::HeldSlot::new() })
-                    .chain(sink)
-                    .into_sink_marker();
-            });
+                Sink { work, affinity: Affinity::Worker(1), ..Sink::new(StepKind::Serial, &s2) };
+            let snap = match holder {
+                PlainHolder::ExclusivePinned => run(2, all_slow(), |b| {
+                    b.chain(Source::exclusive(N, 0).with_edge(ONE_COUNT).with_counts(&c2))
+                        .chain(sink)
+                        .into_sink_marker();
+                }),
+                PlainHolder::ParallelPool => run(3, all_slow(), |b| {
+                    b.chain(Source::exclusive(N, 0))
+                        .chain(ProcessShaped { counts: c2, held: crate::held::HeldSlot::new() })
+                        .chain(sink)
+                        .into_sink_marker();
+                }),
+            };
             *out2.lock() = Some(snap);
         });
         let snap = out.lock().take().expect("snapshot");
-        assert_eq!(seen.load(AO::Relaxed), 200);
-        assert!(counts.refusals() > 0, "the one-slot edge must refuse");
-        assert_eq!(counts.latched(), 0, "a Legacy refusal marks nothing");
-        for (name, s) in &snap.steps {
-            assert_eq!(s.reverse_wakes, 0, "Legacy reverse-wakes nothing ({name})");
-        }
+        assert_eq!(seen.load(AO::Relaxed), u64::from(N));
+        assert!(counts.refusals() > 0, "the one-slot edge must refuse, or the test proves nothing");
+        assert_eq!(counts.latched(), counts.refusals(), "every refusal marks its thread");
+        assert!(row(&snap, "Sink").reverse_wakes > 0, "the sink's pops woke the holder");
     }
 
     /// Emits `rounds` inputs, one per round: input k only once the sink has
@@ -4983,6 +5464,7 @@ mod e2e {
     /// (the feeder is waiting), and the dispatch returns `after_flush`.
     struct FanOutTwo {
         kind: StepKind,
+        affinity: Affinity,
         group: DetachedGroup,
         edge: QueueSpec,
         gate: RetryGate,
@@ -5005,6 +5487,7 @@ mod e2e {
         ) -> Self {
             Self {
                 kind,
+                affinity: Affinity::None,
                 group: DetachedGroup::PerStep,
                 edge,
                 gate,
@@ -5032,6 +5515,9 @@ mod e2e {
         }
         fn detached_group(&self) -> DetachedGroup {
             self.group
+        }
+        fn affinity(&self) -> Affinity {
+            self.affinity
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             let mut flushed = false;
@@ -5094,6 +5580,7 @@ mod e2e {
             // The configuration and the shared counters, with a fresh hold.
             Self {
                 group: self.group,
+                affinity: self.affinity,
                 ..Self::new(
                     self.kind,
                     self.edge,
@@ -5170,15 +5657,72 @@ mod e2e {
         let vacuous = counts.vacuous.load(AO::Relaxed);
         assert!(flushed_idle >= 1, "at least one round must exercise the flushed path");
         assert_eq!(flushed_idle + vacuous, 8, "every round is flushed or vacuous");
+        // At most one unpark of the sink's driver per Progress and per flushed
+        // idle dispatch. Not exactly one: a delivery that finds the sink
+        // running (its parking bit clear) is skipped and not counted, and
+        // whether the sink has armed by then is scheduling. That every round's
+        // flushed wake reached it is the watchdog's to show: the sink's only
+        // other way out of its park is the 10 s timer.
         let f = row(&snap, "FanOutTwo");
-        assert_eq!(
+        assert!(
+            f.unparks_issued <= f.progress_count + flushed_idle,
+            "more unparks than deliveries: {} > {} + {flushed_idle}",
             f.unparks_issued,
-            f.progress_count + flushed_idle,
-            "one unpark of the sink's driver per Progress and per flushed idle dispatch"
+            f.progress_count
         );
         if matches!(case, FlushCase::DetachedProducerGated) {
             assert_eq!(f.gated_off, 0, "a flushed push counts as a push for the gate");
         }
+    }
+
+    /// The plain-chain twin of `flushed_retry_wakes_a_parked_detached_consumer`'s
+    /// Pool cases: no Detached step, the sink a Serial step pinned to worker 1,
+    /// which alone has the 10 s timer. The producer is a Serial step pinned to
+    /// worker 0 (beside the Exclusive feeder, also on worker 0), so its held y
+    /// is never on the sink's slow worker. After the sink pops x it polls empty
+    /// and parks; the flush of y happens ≥ 50 ms later on worker 0 and the
+    /// dispatch reports `NoProgress`; the feeder waits for the sink, so nothing
+    /// else reports `Progress`. Every round therefore needs the flushed push's
+    /// forward wake (a `Worker(1)` unpark).
+    #[rstest]
+    #[case::one_blob(ONE_BLOB)]
+    #[case::one_count(ONE_COUNT)]
+    fn plain_flushed_retry_wakes_its_consumer(#[case] edge: QueueSpec) {
+        let seen = Arc::new(AtomicU64::new(0));
+        let counts = FlushCounts::default();
+        let out = Arc::new(parking_lot::Mutex::new(None));
+        let (s2, c2, out2) = (Arc::clone(&seen), counts.clone(), Arc::clone(&out));
+        run_under_watchdog("plain flushed retry wake", 5, move || {
+            let gate = RetryGate::After(Duration::from_millis(50));
+            let producer = FanOutTwo {
+                affinity: Affinity::Worker(0),
+                ..FanOutTwo::new(StepKind::Serial, edge, gate, StepOutcome::NoProgress, &s2, &c2)
+            };
+            let sink = Sink { affinity: Affinity::Worker(1), ..Sink::new(StepKind::Serial, &s2) };
+            let snap = run(2, slow(T::Worker(1)), |b| {
+                b.chain(Feeder::new(&s2)).chain(producer).chain(sink).into_sink_marker();
+            });
+            *out2.lock() = Some(snap);
+        });
+        let snap = out.lock().take().expect("snapshot");
+        assert_eq!(seen.load(AO::Relaxed), 16);
+        let flushed_idle = counts.flushed_idle.load(AO::Relaxed);
+        let vacuous = counts.vacuous.load(AO::Relaxed);
+        assert!(flushed_idle >= 1, "at least one round must exercise the flushed path");
+        assert_eq!(flushed_idle + vacuous, 8, "every round is flushed or vacuous");
+        // At most one unpark of the sink's worker per Progress and per flushed
+        // idle dispatch. Not exactly one: a delivery that finds the sink
+        // running (its parking bit clear) is skipped and not counted, and
+        // whether the sink has armed by then is scheduling. That every round's
+        // flushed wake reached it is the watchdog's to show: the sink's only
+        // other way out of its park is the 10 s timer.
+        let f = row(&snap, "FanOutTwo");
+        assert!(
+            f.unparks_issued <= f.progress_count + flushed_idle,
+            "more unparks than deliveries: {} > {} + {flushed_idle}",
+            f.unparks_issued,
+            f.progress_count
+        );
     }
 
     /// The reverse-walk flush-first hole: producer and consumer share one
@@ -5230,45 +5774,6 @@ mod e2e {
             8,
             "the self-unparks; a same-thread Progress delivers nothing"
         );
-    }
-
-    /// Legacy is unchanged by a flush, wake counts included: every step's
-    /// notifies equal its `Progress` count, and nothing else is issued. The
-    /// sink recovers on its event-count deadline, as before.
-    #[test]
-    fn legacy_flushed_retry_changes_no_wake_count() {
-        let seen = Arc::new(AtomicU64::new(0));
-        let counts = FlushCounts::default();
-        let out = Arc::new(parking_lot::Mutex::new(None));
-        let (s2, c2, out2) = (Arc::clone(&seen), counts.clone(), Arc::clone(&out));
-        run_under_watchdog("legacy flushed retry", 10, move || {
-            let producer = FanOutTwo::new(
-                StepKind::Parallel,
-                ONE_BLOB,
-                RetryGate::After(Duration::from_millis(20)),
-                StepOutcome::NoProgress,
-                &s2,
-                &c2,
-            );
-            let snap = run(2, vec![], |b| {
-                b.chain(Feeder::new(&s2))
-                    .chain(producer)
-                    .chain(Sink::new(StepKind::Serial, &s2))
-                    .into_sink_marker();
-            });
-            *out2.lock() = Some(snap);
-        });
-        let snap = out.lock().take().expect("snapshot");
-        assert_eq!(seen.load(AO::Relaxed), 16);
-        assert!(counts.flushed_idle.load(AO::Relaxed) >= 1, "the flushed path ran");
-        for (name, s) in &snap.steps {
-            assert_eq!(s.notifies_issued, s.progress_count, "one notify per Progress ({name})");
-            assert_eq!(
-                (s.unparks_issued, s.reverse_wakes, s.direct_fallbacks, s.gated_off),
-                (0, 0, 0, 0),
-                "Legacy issues nothing else ({name})"
-            );
-        }
     }
 
     /// Records each Blob's value (in arrival order) and passes it on; a fixed
@@ -5496,5 +6001,288 @@ mod e2e {
         let s = snap.lock().take().unwrap();
         let holds = row(&s, "OrderedPass").holds;
         assert!(holds >= 100, "fixture never hit the stash cap: holds={holds}");
+    }
+
+    // ───── Plain chains (no Detached step) ─────
+
+    /// A Serial sink of configurable affinity that records each value in
+    /// arrival order (chains must end in a zero-output step).
+    struct RecordingSink {
+        seen: Arc<parking_lot::Mutex<Vec<u32>>>,
+        affinity: Affinity,
+        delay: Duration,
+    }
+    impl Step for RecordingSink {
+        type Input = Blob;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "RecordingSink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn affinity(&self) -> Affinity {
+            self.affinity
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(b) => {
+                    if !self.delay.is_zero() {
+                        std::thread::sleep(self.delay);
+                    }
+                    self.seen.lock().push(b.0);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+    }
+
+    /// A Parallel pass-through that works only on wake slot `w`: other clones
+    /// return `NoProgress` while input exists and `Finished` once it is
+    /// drained, so the Parallel drain counter still reaches zero.
+    #[derive(Clone)]
+    struct OnlyOnWorker {
+        name: &'static str,
+        w: usize,
+        edge: QueueSpec,
+        held: Option<Blob>,
+    }
+    impl Step for OnlyOnWorker {
+        type Input = Blob;
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: self.name,
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![self.edge],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            if crate::runtime::wake_slot::current_slot() != Some(self.w) {
+                return Ok(if ctx.input.is_drained() {
+                    StepOutcome::Finished
+                } else {
+                    StepOutcome::NoProgress
+                });
+            }
+            if let Some(b) = self.held.take() {
+                return match ctx.outputs.push(b) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                };
+            }
+            match ctx.input.pop() {
+                Some(b) => match ctx.outputs.push(b) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::Progress)
+                    }
+                },
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { held: None, ..self.clone() }
+        }
+    }
+
+    /// A Serial source pinned to the reader that never produces.
+    struct NeverSource;
+    impl Step for NeverSource {
+        type Input = ();
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "NeverSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn affinity(&self) -> Affinity {
+            Affinity::Reader
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// `Reader → Par(ordered) → Writer` at t2 with no Detached step: both
+    /// workers are pinned, so no event-count waiter exists. Forward `Pool`
+    /// wakes must reach an armed direct-parked worker, and a Par clone holding
+    /// on the full one-item writer edge must be unparked by the writer's pop.
+    /// The edge is ordered by item (`OrderedPass`, `ByItemOrdinal`), so a held
+    /// item also blocks the writer's in-order pop — the worst case — and value
+    /// order is delivery order, so the order assertion is exact. A 1-byte
+    /// reorder-stash cap makes the ordered edge refuse (an unbounded stash
+    /// would take every out-of-order push, and nothing would hold); `holds`
+    /// and the writer's `reverse_wakes` confirm it did. Every worker is on a
+    /// 10 s timer.
+    #[test]
+    fn parallel_middle_at_t2_runs_on_unparks_not_timers() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        run_under_watchdog("reader → par → writer at t2", 5, move || {
+            let builder = Pipeline::builder();
+            builder
+                .chain(Source::serial_with_affinity(500, 0, Affinity::Reader))
+                .chain(OrderedPass::new("Par", ONE_BLOB))
+                .chain(RecordingSink {
+                    seen: s2,
+                    affinity: Affinity::Writer,
+                    delay: Duration::ZERO,
+                })
+                .into_sink_marker();
+            let pipeline = builder.build().expect("build");
+            let stats = pipeline.stats();
+            pipeline
+                .run(
+                    PipelineConfig {
+                        threads: 2,
+                        test_backoff: slow(T::AllWorkers),
+                        test_reorder_overflow_bytes: Some(1),
+                        ..Default::default()
+                    }
+                    .with_stats(Arc::clone(&stats)),
+                )
+                .expect("run");
+            *sn2.lock() = Some(stats.snapshot());
+        });
+        assert_eq!(*seen.lock(), (0..500).collect::<Vec<u32>>(), "values in order, none lost");
+        let snap = snap.lock().take().expect("snapshot");
+        // The mechanism the test is named for ran (measured: ~475 holds and
+        // ~760 reverse claims of 500 items).
+        let (holds, reverse) = (row(&snap, "Par").holds, row(&snap, "RecordingSink").reverse_wakes);
+        assert!(holds >= 100, "the Par clones must hold on the one-item edge: holds={holds}");
+        assert!(reverse >= 100, "the writer's pops must claim the holders: reverse={reverse}");
+    }
+
+    /// At t4 only worker 0's Par clone (the reader's worker) produces, and it
+    /// holds on the full one-item writer edge; only an unpark of w0 itself can
+    /// make progress — a reverse wake sent to the pool would reach a clone that
+    /// does nothing. One producing clone ⇒ arrival order is exact.
+    #[test]
+    fn held_clone_on_the_reader_worker_is_unparked_by_the_pop() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        run_under_watchdog("held clone on w0", 5, move || {
+            let par = OnlyOnWorker { name: "ParW0", w: 0, edge: ONE_BLOB, held: None };
+            *sn2.lock() = Some(run(4, slow(T::AllWorkers), |b| {
+                b.chain(Source::serial_with_affinity(300, 0, Affinity::Reader))
+                    .chain(par)
+                    .chain(RecordingSink {
+                        seen: s2,
+                        affinity: Affinity::Writer,
+                        delay: Duration::from_millis(1),
+                    })
+                    .into_sink_marker();
+            }));
+        });
+        assert_eq!(*seen.lock(), (0..300).collect::<Vec<u32>>());
+        let snap = snap.lock().take().expect("snapshot");
+        // The mechanism the test is named for ran (measured: ~298 holds and
+        // ~299 reverse claims of 300 items).
+        let (holds, reverse) =
+            (row(&snap, "ParW0").holds, row(&snap, "RecordingSink").reverse_wakes);
+        assert!(holds >= 100, "w0's clone must hold on the one-item edge: holds={holds}");
+        assert!(reverse >= 100, "the writer's pops must claim the holder: reverse={reverse}");
+    }
+
+    /// `directed_held_item_resolves_by_reverse_wake`'s twin for a plain chain
+    /// (no Detached step) at t3: a Parallel holder on a one-item edge into a
+    /// slow Serial sink, every worker on a 10 s timer. As in the twin, `holds`
+    /// and the sink's `reverse_wakes` confirm the run went through the
+    /// mechanism; the source's one early `Finished` broadcast cannot stand in
+    /// for the ~1,000 holds after it.
+    #[test]
+    fn plain_held_item_resolves_by_reverse_wake() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        run_under_watchdog("plain held item", 5, move || {
+            let mut holder = Pass::new("Holder", StepKind::Parallel);
+            holder.edge = ONE_BLOB;
+            *sn2.lock() = Some(run(3, slow(T::AllWorkers), |b| {
+                b.chain(Source::exclusive(1_000, 0))
+                    .chain(holder)
+                    .chain(RecordingSink {
+                        seen: s2,
+                        affinity: Affinity::None,
+                        delay: Duration::from_millis(1),
+                    })
+                    .into_sink_marker();
+            }));
+        });
+        let mut got = seen.lock().clone();
+        got.sort_unstable(); // one Parallel stage, unordered edge
+        assert_eq!(got, (0..1_000).collect::<Vec<u32>>());
+        let snap = snap.lock().take().expect("snapshot");
+        // The mechanism the test is named for ran (measured: ~998 holds and
+        // ~2,990 reverse claims of 1,000 items).
+        let (holds, reverse) =
+            (row(&snap, "Holder").holds, row(&snap, "RecordingSink").reverse_wakes);
+        assert!(holds >= 100, "the Holder clones must hold on the one-item edge: holds={holds}");
+        assert!(reverse >= 100, "the sink's pops must claim the holders: reverse={reverse}");
+    }
+
+    /// Cancel unparks a pinned worker parked on its 10 s timer in a plain
+    /// chain, on the scheduled path. At t1 `Summary` instrumentation declines
+    /// fusion, and non-fusion is observed afterwards: per-worker stats rows
+    /// exist only on the scheduled path.
+    #[rstest]
+    #[case::t1_scheduled(1)]
+    #[case::t2(2)]
+    fn cancel_unparks_parked_pinned_workers_in_plain_chains(#[case] threads: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let builder = Pipeline::builder();
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            builder
+                .chain(NeverSource)
+                .chain(RecordingSink { seen, affinity: Affinity::Writer, delay: Duration::ZERO })
+                .into_sink_marker();
+            let pipeline = builder.build().expect("build");
+            let stats = pipeline.stats();
+            let cancel = pipeline.cancel_handle();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.cancel();
+            });
+            let t0 = Instant::now();
+            let res = pipeline.run(
+                PipelineConfig {
+                    threads,
+                    instrumentation: crate::builder::InstrumentationLevel::Summary,
+                    test_backoff: slow(T::AllWorkers),
+                    ..Default::default()
+                }
+                .with_stats(Arc::clone(&stats)),
+            );
+            let _ = tx.send((res, t0.elapsed(), stats.snapshot()));
+        });
+        let (res, elapsed, snap) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("WEDGED: cancel did not unpark the pinned worker");
+        assert!(matches!(res, Err(crate::signal::PipelineError::Cancelled)), "{res:?}");
+        assert!(elapsed < Duration::from_secs(1), "cancel took {elapsed:?}");
+        assert!(!snap.workers.is_empty(), "the run must be scheduled (per-worker rows), not fused");
     }
 }

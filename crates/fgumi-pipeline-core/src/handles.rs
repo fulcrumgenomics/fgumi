@@ -193,8 +193,8 @@ impl<T: Send + HeapSize + 'static> BranchOutputHandle<T> {
     /// A successful retry marks the current dispatch as flushed: a held item
     /// left this producer, so its consumer must be woken even if the step goes
     /// on to report `NoProgress`, `Contention` or `Capped` (the flush-first
-    /// preamble finding an empty input). The dispatcher delivers that wake in a
-    /// chain with a `Detached` step (Directed wakes). Every output shape and
+    /// preamble finding an empty input). The dispatcher delivers that wake.
+    /// Every output shape and
     /// arity retries through here, so this is the one place the mark is set. A
     /// fresh `push` does not set it: it is covered by the `Progress` contract.
     ///

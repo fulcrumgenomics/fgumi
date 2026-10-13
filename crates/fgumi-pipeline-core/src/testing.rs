@@ -54,7 +54,7 @@ impl<S: Step> StepProbe<S> {
             outputs: OutputHandles::new(view),
             output_queues,
             counters: StepCounters::disabled(),
-            wake: WakePlan::legacy(None),
+            wake: WakePlan::standalone(),
         }
     }
 

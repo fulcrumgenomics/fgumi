@@ -12,7 +12,14 @@
 //! It also drives the cap-release wake of a refused pool worker: the refusal
 //! records the worker's wake slot, fences and re-checks; the release fences
 //! and claims the slot, and the bound waker unparks it (`loom::thread::park`
-//! stands in for the worker's timer park, with no timeout).
+//! stands in for the worker's timer park, with no timeout). The waker here
+//! unparks unconditionally: these models check the cap's own record, claim and
+//! forward protocol against an ideal delivery. `Pipeline::run` binds
+//! `WakePlan::deliver_slot`, which unparks only a thread armed for its timer
+//! park; that composition — the worker's arm and re-poll pass against a
+//! release, and a skipped wake's forward — is model-checked in
+//! `tests/loom_wake.rs` (`cap_release_gated_model`,
+//! `forwarded_cap_wake_gated_model`).
 //!
 //! And the owner side of the per-pass record: the pass-start clear
 //! (`PhaseCap::clear_own_record`) raced against a release; the forward of a
@@ -198,7 +205,7 @@ fn a_release_wakes_the_refused_worker() {
     builder.check(|| {
         let cap = PhaseCap::new("loom", 1);
         let (handle, waker) = slot0_waker();
-        cap.bind_waker_for_test(Some(waker));
+        cap.bind_waker_for_test(waker);
         let held = cap.try_acquire_as(1).expect("an idle cap admits the holder");
         let worker = refused_worker(&cap, &handle);
         drop(held);
@@ -234,7 +241,7 @@ fn a_whole_cap_release_wakes_a_worker_refused_during_the_reservation() {
                 waker(slot);
             })
         };
-        cap.bind_waker_for_test(Some(counted));
+        cap.bind_waker_for_test(counted);
         let held = cap.try_acquire_as(1).expect("an idle cap admits the holder");
         let whole = {
             let cap = std::sync::Arc::clone(&cap);
@@ -296,7 +303,7 @@ fn a_pass_start_clear_racing_a_release_loses_no_wake() {
     builder.check(|| {
         let cap = PhaseCap::new("loom", 1);
         let (handles, waker) = slots_waker();
-        cap.bind_waker_for_test(Some(waker));
+        cap.bind_waker_for_test(waker);
         let held = cap.try_acquire_as(9).expect("an idle cap admits the holder");
         assert!(cap.try_acquire_as(0).is_none(), "slot 0's record from an earlier pass");
         let worker = |slot: usize, new_pass: bool| {
@@ -340,7 +347,7 @@ fn an_unspent_wake_is_forwarded_to_the_refused_worker() {
     builder.check(|| {
         let cap = PhaseCap::new("loom", 1);
         let (handles, waker) = slots_waker();
-        cap.bind_waker_for_test(Some(waker));
+        cap.bind_waker_for_test(waker);
         let held = cap.try_acquire_as(9).expect("an idle cap admits the holder");
         assert!(cap.try_acquire_as(0).is_none(), "slot 0's record from an earlier pass");
         let zero = {
@@ -384,7 +391,7 @@ fn a_full_cap_skip_racing_a_release_loses_no_wake() {
     builder.check(|| {
         let cap = PhaseCap::new("loom", 1);
         let (handles, waker) = slots_waker();
-        cap.bind_waker_for_test(Some(waker));
+        cap.bind_waker_for_test(waker);
         let held = cap.try_acquire_as(9).expect("an idle cap admits the holder");
         let worker = {
             let cap = std::sync::Arc::clone(&cap);
@@ -423,7 +430,7 @@ fn a_skip_whose_fresh_record_a_release_claims_forwards_the_wake() {
     builder.check(|| {
         let cap = PhaseCap::new("loom", 1);
         let (handles, waker) = slots_waker();
-        cap.bind_waker_for_test(Some(waker));
+        cap.bind_waker_for_test(waker);
         let held = cap.try_acquire_as(9).expect("an idle cap admits the holder");
         assert!(cap.try_acquire_as(1).is_none(), "slot 1 is refused");
         let zero = {

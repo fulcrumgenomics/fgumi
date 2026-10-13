@@ -22,14 +22,14 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use fgumi_pipeline_core::Unpushed;
-use fgumi_pipeline_core::builder::{Pipeline, PipelineConfig};
+use fgumi_pipeline_core::builder::{InstrumentationLevel, Pipeline, PipelineConfig};
 use fgumi_pipeline_core::held::HeldSlot;
 use fgumi_pipeline_core::item::{HeapSize, Ordered};
 use fgumi_pipeline_core::outputs::{OrderedBytesSingle, Single};
 use fgumi_pipeline_core::queues::QueueSpec;
 use fgumi_pipeline_core::reorder::BranchOrdering;
 use fgumi_pipeline_core::runtime::stats::{PipelineStats, StepStatsSnapshot};
-use fgumi_pipeline_core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use fgumi_pipeline_core::step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
 /// Per-edge byte budget. Large enough that the queues never bind — this
 /// benchmark measures dispatch cost, and backpressure stalls would swamp it
@@ -63,15 +63,28 @@ impl Ordered for Item {
     }
 }
 
-/// Emits `n` items and finishes. `Exclusive` so it owns its cursor.
+/// Emits `n` items and finishes. `Exclusive` so it owns its cursor, or — for
+/// the plain held-item shape — `Serial` pinned to the reader worker, as every
+/// BAM command's reader is.
 struct CountingSource {
     remaining: VecDeque<Item>,
     held: HeldSlot<Unpushed<Item>>,
+    kind: StepKind,
+    affinity: Affinity,
 }
 
 impl CountingSource {
     fn new(n: u64) -> Self {
-        Self { remaining: (0..n).map(|ordinal| Item { ordinal }).collect(), held: HeldSlot::new() }
+        Self {
+            remaining: (0..n).map(|ordinal| Item { ordinal }).collect(),
+            held: HeldSlot::new(),
+            kind: StepKind::Exclusive,
+            affinity: Affinity::None,
+        }
+    }
+
+    fn reader(n: u64) -> Self {
+        Self { kind: StepKind::Serial, affinity: Affinity::Reader, ..Self::new(n) }
     }
 }
 
@@ -82,11 +95,15 @@ impl Step for CountingSource {
     fn profile(&self) -> StepProfile {
         StepProfile {
             name: "BenchSource",
-            kind: StepKind::Exclusive,
+            kind: self.kind,
             sticky: false,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: EDGE_LIMIT_BYTES }],
             branch_ordering: vec![BranchOrdering::ByItemOrdinal],
         }
+    }
+
+    fn affinity(&self) -> Affinity {
+        self.affinity
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
@@ -274,11 +291,57 @@ impl Step for CountingSink {
     }
 }
 
+/// `Serial` sink pinned to the writer worker (`n − 1`), busy-looping `work_us`
+/// per item: the writer every BAM command ends in.
+struct SlowWriterSink {
+    seen: Arc<AtomicU64>,
+    work_us: u64,
+}
+
+impl Step for SlowWriterSink {
+    type Input = Item;
+    type Outputs = ();
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "BenchWriter",
+            kind: StepKind::Serial,
+            sticky: false,
+            output_queues: vec![],
+            branch_ordering: vec![],
+        }
+    }
+
+    fn affinity(&self) -> Affinity {
+        Affinity::Writer
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        match ctx.input.pop() {
+            Some(item) => {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_micros(self.work_us) {
+                    std::hint::spin_loop();
+                }
+                black_box(item);
+                self.seen.fetch_add(1, Ordering::Relaxed);
+                Ok(StepOutcome::Progress)
+            }
+            None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+            None => Ok(StepOutcome::NoProgress),
+        }
+    }
+}
+
 /// Which chain shape a group runs.
 #[derive(Clone, Copy)]
 enum Shape {
     /// Source → Parallel → Sink: the no-op regression check for the hot path.
     Plain,
+    /// `Plain` with a `Serial` sink, so one worker can run the chain on the
+    /// scheduled path (two `Exclusive` steps need two owners): the shape of
+    /// the instrumented one-thread group.
+    PlainSerialSink,
     /// Source → Parallel → Detached → Parallel → Sink: the sort's two-sided
     /// shape, where the middle step runs on its own driver thread and every
     /// push into / out of it is a directed wake.
@@ -289,9 +352,16 @@ enum Shape {
     /// `Progress` that only held, and the reverse wake that releases a holder
     /// on every slow pop.
     HeldMid,
+    /// Reader (Serial, worker 0) → Holder (Parallel, unordered) → one-item
+    /// edge → Writer (Serial, worker `n − 1`, 20 µs): the same held-item path
+    /// in a chain with no Detached step, the shape of every BAM command. The
+    /// writer is fed by unparks of its pinned worker, and a holder by the
+    /// writer's pops.
+    PlainHeldMid,
 }
 
-/// Per-item work of `Shape::HeldMid`'s slow Serial consumer.
+/// Per-item work of the slow Serial consumer in `Shape::HeldMid` and
+/// `Shape::PlainHeldMid`.
 const HELD_MID_SLOW_US: u64 = 20;
 
 /// Build the chain; the returned counter is the sink's.
@@ -303,6 +373,11 @@ fn build_chain(shape: Shape, work_us: u64, n_items: u64) -> (Pipeline, Arc<Atomi
             .chain(CountingSource::new(n_items))
             .chain(PassThrough::new(StepKind::Parallel, work_us))
             .chain(CountingSink { seen: Arc::clone(&seen), kind: StepKind::Exclusive })
+            .into_sink_marker(),
+        Shape::PlainSerialSink => builder
+            .chain(CountingSource::new(n_items))
+            .chain(PassThrough::new(StepKind::Parallel, work_us))
+            .chain(CountingSink { seen: Arc::clone(&seen), kind: StepKind::Serial })
             .into_sink_marker(),
         Shape::DetachedMid => builder
             .chain(CountingSource::new(n_items))
@@ -316,6 +391,11 @@ fn build_chain(shape: Shape, work_us: u64, n_items: u64) -> (Pipeline, Arc<Atomi
             .chain(UnorderedPass::new(StepKind::Parallel, work_us, 64))
             .chain(UnorderedPass::new(StepKind::Serial, HELD_MID_SLOW_US, EDGE_LIMIT_BYTES))
             .chain(CountingSink { seen: Arc::clone(&seen), kind: StepKind::Detached })
+            .into_sink_marker(),
+        Shape::PlainHeldMid => builder
+            .chain(CountingSource::reader(n_items))
+            .chain(UnorderedPass::new(StepKind::Parallel, work_us, 64))
+            .chain(SlowWriterSink { seen: Arc::clone(&seen), work_us: HELD_MID_SLOW_US })
             .into_sink_marker(),
     }
     (builder.build().expect("bench chain builds"), seen)
@@ -334,7 +414,19 @@ fn run_built(
     threads: usize,
     stats: Option<Arc<PipelineStats>>,
 ) {
-    let mut config = PipelineConfig { threads, ..Default::default() };
+    run_built_with(pipeline, seen, n_items, threads, InstrumentationLevel::Off, stats);
+}
+
+/// [`run_built`] at an explicit instrumentation level.
+fn run_built_with(
+    pipeline: Pipeline,
+    seen: &AtomicU64,
+    n_items: u64,
+    threads: usize,
+    instrumentation: InstrumentationLevel,
+    stats: Option<Arc<PipelineStats>>,
+) {
+    let mut config = PipelineConfig { threads, instrumentation, ..Default::default() };
     if let Some(s) = stats {
         config = config.with_stats(s);
     }
@@ -398,6 +490,32 @@ fn print_counters() {
             sum(|s| s.direct_fallbacks),
         );
     }
+    for threads in [2usize, 4, 8] {
+        let n = N_ITEMS_WORK;
+        let (pipeline, seen) = build_chain(Shape::PlainHeldMid, 0, n);
+        let stats = pipeline.stats();
+        let start = Instant::now();
+        run_built(pipeline, &seen, n, threads, Some(Arc::clone(&stats)));
+        let wall = start.elapsed();
+        let snap = stats.snapshot();
+        let sum =
+            |f: fn(&StepStatsSnapshot) -> u64| snap.steps.iter().map(|(_, s)| f(s)).sum::<u64>();
+        // The writer is pinned to worker `threads − 1`; its timer parks are the
+        // pinned parks: unparked (a wake ended it) or timed out (the timer did).
+        let writer = threads - 1;
+        let (unparked, timed_out) =
+            snap.worker_waits.iter().find(|w| w.0 == writer).map_or((0, 0), |w| (w.4, w.5));
+        eprintln!(
+            "counters plain_held_mid threads={threads}: wall_ms={:.1} \
+             writer_pinned_parks_unparked={unparked} writer_pinned_parks_timed_out={timed_out} \
+             holds={} unparks_issued={} reverse_wakes={} direct_fallbacks={}",
+            wall.as_secs_f64() * 1e3,
+            sum(|s| s.holds),
+            sum(|s| s.unparks_issued),
+            sum(|s| s.reverse_wakes),
+            sum(|s| s.direct_fallbacks),
+        );
+    }
 }
 
 fn bench_dispatch(c: &mut Criterion) {
@@ -405,6 +523,9 @@ fn bench_dispatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_dispatch");
     group.throughput(criterion::Throughput::Elements(N_ITEMS));
     // The no-op groups are the regression check for the hot path.
+    // `threads_1` fuses (`should_fuse_single_thread`) and never touches the wake
+    // plan: a control. `threads_1_instrumented` is the scheduled one-worker path
+    // that `--pipeline-stats` takes.
     for threads in [1usize, 4, 8] {
         group.bench_function(format!("threads_{threads}"), |b| {
             b.iter(|| {
@@ -413,6 +534,12 @@ fn bench_dispatch(c: &mut Criterion) {
             });
         });
     }
+    group.bench_function("threads_1_instrumented", |b| {
+        b.iter(|| {
+            let (p, seen) = build_chain(Shape::PlainSerialSink, 0, N_ITEMS);
+            run_built_with(p, &seen, N_ITEMS, 1, InstrumentationLevel::Summary, None);
+        });
+    });
     group.finish();
     let mut group = c.benchmark_group("pipeline_dispatch_detached");
     group.sample_size(10);
@@ -435,6 +562,18 @@ fn bench_dispatch(c: &mut Criterion) {
         group.bench_function(format!("held_mid/threads_{threads}"), |b| {
             b.iter(|| {
                 let (p, seen) = build_chain(Shape::HeldMid, 0, N_ITEMS_WORK);
+                run_built(p, &seen, N_ITEMS_WORK, threads, None);
+            });
+        });
+    }
+    group.finish();
+    let mut group = c.benchmark_group("pipeline_dispatch_plain_held");
+    group.sample_size(10);
+    group.throughput(criterion::Throughput::Elements(N_ITEMS_WORK));
+    for threads in [2usize, 4, 8] {
+        group.bench_function(format!("plain_held_mid/threads_{threads}"), |b| {
+            b.iter(|| {
+                let (p, seen) = build_chain(Shape::PlainHeldMid, 0, N_ITEMS_WORK);
                 run_built(p, &seen, N_ITEMS_WORK, threads, None);
             });
         });

@@ -500,11 +500,13 @@ pub(crate) fn run_detached_driver(
     // A test override of this driver's idle-backoff bounds
     // (`PipelineConfig::test_backoff`); `None` in every real run.
     backoff_override: Option<u64>,
+    // This driver's index in `wake` (its wake slot is `n_workers + driver`).
+    driver: crate::runtime::placement::DriverIdx,
 ) {
     let primary = group.primary_step();
     debug_assert_eq!(drain_counters.len(), contexts.inputs.len(), "one counter per step");
     let mut row = build_driver_storage(group.into_steps(), drain_counters);
-    let mut worker = WorkerCore::driver(primary).with_backoff_override(backoff_override);
+    let mut worker = WorkerCore::driver(primary, driver).with_backoff_override(backoff_override);
     run_worker_loop(
         &mut worker,
         &mut row,
@@ -666,8 +668,9 @@ mod tests {
             &crate::liveness::LivenessCounter::new(1),
             None,
             0,
-            &crate::runtime::wake::WakePlan::legacy(None),
+            &crate::runtime::wake::WakePlan::standalone(),
             None,
+            crate::runtime::placement::DriverIdx(0),
         );
     }
 

@@ -145,8 +145,9 @@ pub(crate) fn run_worker_loop(
     // event-count: `notify_one` cannot target a specific worker, so a push meant
     // to wake *this* worker's pinned step could wake a peer that `Skip`s it,
     // leaving the pinned step's owner asleep to its timeout. Pinned workers idle
-    // on their timer with `park_timeout`; in a Directed chain the wake plan
-    // unparks them directly. Its step is also often driven by out-of-engine
+    // with `park_timeout`, where the wake plan unparks them directly (and a
+    // `Pool` wake with no event-count waiter reaches them through the
+    // direct-park fallback); the timer is only the self-heal. Its step is also often driven by out-of-engine
     // events (a reader's prefetch thread, the affinity-pinned grouper) that no
     // push notifies anyway. The plan still routes a pinned worker's own
     // `Progress` wakes.
@@ -366,7 +367,7 @@ pub(crate) fn run_worker_loop(
             // holding an item. Its wake is a direct `unpark` from whoever makes
             // room, which the event-count cannot deliver — so it idles on its
             // timer, like a pinned worker. Always `false` on edges without a
-            // holder set (every Legacy chain), so Legacy idle is unchanged.
+            // holder set (a producer and consumer on one thread).
             let mut holding = crate::runtime::wake_slot::take_rejected();
             // A phase cap refused this thread and recorded it: the release that
             // frees a permit `unpark`s it directly, so it too idles on its timer.
@@ -482,7 +483,7 @@ pub(crate) fn run_worker_loop(
                         stats.record_ec_wait(worker.thread_id, outcome);
                         match worker.role() {
                             WorkerRole::Pool => stats.record_worker_idle(worker.thread_id, ns),
-                            WorkerRole::Driver { primary_step } => {
+                            WorkerRole::Driver { primary_step, .. } => {
                                 let step = diag.attributed(primary_step, &live);
                                 stats.record_detached_idle(step, ns);
                                 stats.record_detached_park(step);
@@ -493,9 +494,15 @@ pub(crate) fn run_worker_loop(
                 }
             }
 
-            // Timer park: pinned workers, holders, the lone worker, drivers. A
-            // Directed pool worker arms and re-polls first, so a `Pool` wake
-            // that finds no event-count waiter can reach it.
+            // Timer park: pinned workers, holders, the lone worker, drivers.
+            // Every one arms and re-polls first: its parking bit is what lets a
+            // directed wake (a forward unpark, a holder or cap-release wake)
+            // reach it — a deliverer skips a thread whose bit is clear — and a
+            // pool worker's direct-parked bit lets a `Pool` wake that finds no
+            // event-count waiter reach it. One fence and one re-poll serve both
+            // bits. The one exception is the lone worker of a one-thread run
+            // with no driver: its plan gates nothing (every directed wake
+            // unparks it), so it arms nothing and parks with no extra pass.
             //
             // A worker parked only because a cap refused it arms the separate
             // cap-parked set instead: a `Pool` wake claims it only after every
@@ -503,16 +510,20 @@ pub(crate) fn run_worker_loop(
             // (uncapped, or a free permit). A wake for a step whose cap is full
             // would only see it refused again; the release that frees a permit
             // on that cap wakes it, through the record its refusal or its
-            // re-poll's skip left.
+            // re-poll's skip left. (A driver has no cap-parked set: it arms
+            // its parking bit only.)
             let cap_only = cap_refused && !holding;
-            let armed = matches!(worker.role(), WorkerRole::Pool)
-                && if cap_only {
-                    wake.arm_cap_parked(worker.thread_id)
-                } else {
-                    wake.arm_direct(worker.thread_id)
-                };
-            let disarm = |wake: &WakePlan, w: usize| {
-                if cap_only { wake.disarm_cap_parked(w) } else { wake.disarm_direct(w) }
+            let cap_parked = cap_only && !is_driver;
+            let role = worker.role();
+            let armed = match role {
+                WorkerRole::Pool if cap_parked => wake.arm_cap_parked(worker.thread_id),
+                WorkerRole::Pool => wake.arm_direct(worker.thread_id),
+                WorkerRole::Driver { driver, .. } => wake.arm_driver(driver),
+            };
+            let disarm = |wake: &WakePlan, w: usize| match role {
+                WorkerRole::Driver { driver, .. } => wake.disarm_driver(driver),
+                WorkerRole::Pool if cap_parked => wake.disarm_cap_parked(w),
+                WorkerRole::Pool => wake.disarm_direct(w),
             };
             if armed {
                 // A new pass: it re-records on every cap it is refused by or
@@ -539,7 +550,7 @@ pub(crate) fn run_worker_loop(
                     state_slot,
                     wake,
                     &mut diag,
-                    cap_only,
+                    cap_parked,
                 );
                 wake.end_pass();
                 if recheck.removed_sticky_owner {
@@ -558,7 +569,7 @@ pub(crate) fn run_worker_loop(
                 // the normal path (the event-count, or direct-parked), where
                 // every `Pool` wake reaches it. No idle is recorded for this
                 // round.
-                if cap_only && !crate::runtime::wake_slot::cap_recorded_pending() {
+                if cap_parked && !crate::runtime::wake_slot::cap_recorded_pending() {
                     disarm(wake, worker.thread_id);
                     continue;
                 }
@@ -588,7 +599,7 @@ pub(crate) fn run_worker_loop(
                         stats.record_worker_idle(worker.thread_id, ns);
                         stats.record_timer_park(worker.thread_id, timed_out);
                     }
-                    WorkerRole::Driver { primary_step } => {
+                    WorkerRole::Driver { primary_step, .. } => {
                         let step = diag.attributed(primary_step, &live);
                         stats.record_detached_idle(step, ns);
                         stats.record_detached_park(step);
@@ -798,12 +809,11 @@ struct DispatchInfo {
 /// `mark_outputs_drained`, so a non-idempotent flusher can never be re-entered.
 ///
 /// Wakes: a `Progress` calls `WakePlan::on_progress` with the push counters
-/// snapshotted before the dispatch, so in a `Directed` chain a consumer on a
-/// byte-bounded edge is woken only if this dispatch actually pushed to it
-/// (count-bounded and unbounded edges, and a zero-output Parallel step's
-/// self-cascade, are ungated and wake on every `Progress`), plus the reverse
-/// wakes of holders its pops made room for; a `Legacy` chain wakes one pool
-/// worker per `Progress`.
+/// snapshotted before the dispatch, so a consumer on a byte-bounded edge is
+/// woken only if this dispatch actually pushed to it (count-bounded and
+/// unbounded edges, and a zero-output Parallel step's self-cascade, are
+/// ungated and wake on every `Progress`), plus the reverse wakes of holders
+/// its pops made room for.
 #[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 fn dispatch_one_step(
     entry: &mut WorkerStepEntry,
@@ -846,7 +856,7 @@ fn dispatch_one_step(
     diag: &mut LoopDiag,
 ) -> Option<DispatchInfo> {
     // Gate snapshot: one Relaxed load per push-gated branch (every byte-bounded
-    // output of a Directed chain), nothing for an ungated step (`is_gated` is a
+    // output), nothing for an ungated step (`is_gated` is a
     // precomputed bool). `on_progress` compares against it to wake a consumer
     // only when this dispatch pushed to its edge.
     let mut snap = PushSnapshot::default();
@@ -989,8 +999,7 @@ fn dispatch_one_step(
         // Wake seam: a productive dispatch may have given a parked thread new
         // work. `Progress` = "took, pushed or newly held an item" (incl. a reorder
         // must-accept stash that unblocks an ordinal waiter) → the plan wakes
-        // the consumer's thread (a Legacy plan: one parked pool worker, which
-        // cascades) and any holder this step's pops made room for. `Finished`
+        // the consumer's thread and any holder this step's pops made room for. `Finished`
         // closed an output edge (a parked consumer must observe end-of-stream,
         // and a sink's `Finished` closes no edge but its peers may be waiting on
         // the drain latch) → wake everyone. When nobody is parked, each wake is
@@ -1052,7 +1061,8 @@ fn upgrade_a_popping_dispatch(info: &mut Option<DispatchInfo>) {
 /// branch. `Progress` and `Finished` already deliver it in
 /// [`dispatch_one_step`], and `Err` ends the run (the signal's terminal path
 /// unparks everyone). Liveness is not bumped: the consumer's pop of the item
-/// will. A Legacy plan returns an empty report and delivers nothing.
+/// will. A step the plan does not know (the standalone plan) gets an empty
+/// report and nothing is delivered.
 #[inline]
 fn deliver_flushed_wake(
     wake: &WakePlan,
@@ -1145,7 +1155,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
         // If we reach this line, the loop exited cleanly.
@@ -1188,7 +1198,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             Some(&board),
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
         assert_eq!(board.read(0).0, WorkerState::Parked);
@@ -1380,8 +1390,9 @@ mod tests {
 
     /// The framework enforces "a dispatch that took input reports `Progress`":
     /// a step that pops and returns `NoProgress` is recorded as `Progress`,
-    /// bumps liveness, and runs the plan's `Progress` wake (here a Legacy
-    /// plan's `notify_one`, observed on the event-count), so the wake for the
+    /// bumps liveness, and runs the plan's `Progress` wake (here the ungated
+    /// `Pool` wake from `Finish` to `Sink`, a `notify_one` observed on the
+    /// event-count), so the wake for the
     /// room its pop made is not lost. A dispatch that popped nothing keeps its
     /// `NoProgress`: no liveness, no wake.
     #[test]
@@ -1397,7 +1408,16 @@ mod tests {
         assert!(producer.push(7).is_ok());
         let stats = Arc::new(PipelineStats::new(vec!["Src", "Finish", "Sink"]));
         let ec = Arc::new(PoolEventCount::new(2));
-        let plan = WakePlan::legacy(Some(Arc::clone(&ec)));
+        let plan = WakePlan::build(
+            &graph,
+            &[StepKind::Parallel; 3],
+            &[None; 3],
+            &[None; 3],
+            &[],
+            crate::runtime::wake::WakeEdges::NONE,
+            Some(Arc::clone(&ec)),
+            2,
+        );
         let liveness = LivenessCounter::new(1);
         let mut entry = WorkerStepEntry::Owned { step: Box::new(TypedStep::new(PopsThenIdle)) };
         let _ = crate::runtime::wake_slot::take_popped();
@@ -1473,7 +1493,7 @@ mod tests {
                 false,
                 None,
                 0,
-                &WakePlan::legacy(None),
+                &WakePlan::standalone(),
                 &mut LoopDiag::new(false),
             )
             .unwrap();
@@ -1519,7 +1539,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         )
         .unwrap();
@@ -1542,7 +1562,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         )
         .unwrap();
@@ -1601,7 +1621,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         )
         .unwrap();
@@ -1664,7 +1684,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
     }
@@ -1731,7 +1751,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
 
@@ -1866,7 +1886,7 @@ mod tests {
         // Forward walk (ChainOrderScheduler) tries `wedged` (idx 0) first: it
         // yields NoProgress, and the loop MUST proceed to `opener` in the same
         // pass, flip the gate, then finish `wedged` on the next pass.
-        let mut worker = WorkerCore::driver(wedged);
+        let mut worker = WorkerCore::driver(wedged, crate::runtime::placement::DriverIdx(0));
         run_worker_loop(
             &mut worker,
             &mut entries,
@@ -1878,7 +1898,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
         done.store(true, Ordering::SeqCst);
@@ -2043,7 +2063,7 @@ mod tests {
             &crate::runtime::scheduler::ChainOrderScheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
         done.store(true, Ordering::SeqCst);
@@ -2189,7 +2209,7 @@ mod tests {
             &scheduler,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             false,
         );
         done.store(true, Ordering::SeqCst);
@@ -2262,7 +2282,7 @@ mod tests {
             true,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         );
         let snap = stats.snapshot();
@@ -2293,7 +2313,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         );
         assert!(
@@ -2626,7 +2646,7 @@ mod tests {
         use crate::admission::PhaseCap;
         use crate::runtime::wake::{DriverIdx, WakeEdges};
         let cap: &'static Arc<PhaseCap> = Box::leak(Box::new(PhaseCap::new("t", 2)));
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
         let held: Vec<_> = (0..2).map(|i| cap.try_acquire_as(10 + i).expect("room")).collect();
         // Records left by an earlier pass: slot 1's, and slot 0's (lower, so a
         // release claims it first).
@@ -2725,7 +2745,7 @@ mod tests {
         use crate::admission::PhaseCap;
         use crate::runtime::wake::{DriverIdx, WakeEdges};
         let cap: &'static Arc<PhaseCap> = Box::leak(Box::new(PhaseCap::new("t", 1)));
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
         let held = cap.try_acquire_as(10).expect("room");
         let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
         let contexts = Arc::new(build_chain_contexts(
@@ -2819,7 +2839,7 @@ mod tests {
         use crate::admission::PhaseCap;
         use crate::runtime::wake::{DriverIdx, WakeEdges};
         let cap: &'static Arc<PhaseCap> = Box::leak(Box::new(PhaseCap::new("t", 1)));
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
         let held = cap.try_acquire_as(10).expect("room");
         let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
         let contexts = Arc::new(build_chain_contexts(
@@ -2938,13 +2958,15 @@ mod tests {
         use crate::step::OutputHandles;
         let cap: &'static Arc<PhaseCap> = Box::leak(Box::new(PhaseCap::new("t", 1)));
         let (contexts, plan) = capped_middle_plan(cap, 2);
-        cap.bind_waker(Some({
+        cap.bind_waker({
             let plan = Arc::clone(&plan);
             Arc::new(move |slot: Option<usize>| match slot {
-                Some(s) => plan.deliver_slot(s),
+                Some(s) => {
+                    let _ = plan.deliver_slot(s);
+                }
                 None => plan.deliver_anonymous(),
             })
-        }));
+        });
         let producer = |c: &ChainContexts| {
             assert!(
                 c.outputs[0].downcast_ref::<OutputHandles<Single<u32>>>().unwrap().push(7).is_ok()
@@ -3004,7 +3026,7 @@ mod tests {
         assert_eq!(plan.pool().map(PoolEventCount::waiters), Some(0));
     }
 
-    /// A three-step chain's contexts and a Directed plan for it at `n_threads`
+    /// A three-step chain's contexts and a wake plan for it at `n_threads`
     /// pool workers, the middle (`Parallel`) step capped by `cap`.
     fn capped_middle_plan(
         cap: &Arc<crate::admission::PhaseCap>,
@@ -3108,7 +3130,7 @@ mod tests {
         let slot = REFUSED_SLOTS + 45;
         let cap: &'static Arc<PhaseCap> = Box::leak(Box::new(PhaseCap::new("t", 1)));
         let (contexts, plan) = capped_middle_plan(cap, slot + 1);
-        cap.bind_waker(Some(Arc::new(|_: Option<usize>| {})));
+        cap.bind_waker(Arc::new(|_: Option<usize>| {}));
         let producer = contexts.outputs[0].downcast_ref::<OutputHandles<Single<u32>>>().unwrap();
         assert!(producer.push(7).is_ok());
         let held = cap.try_acquire_as(9).expect("room");
@@ -3295,7 +3317,7 @@ mod tests {
             let stats = Arc::clone(&stats);
             let drain_counters = drain_counters.clone();
             std::thread::spawn(move || {
-                let mut worker = WorkerCore::driver(a);
+                let mut worker = WorkerCore::driver(a, crate::runtime::placement::DriverIdx(0));
                 run_worker_loop(
                     &mut worker,
                     &mut row,
@@ -3307,7 +3329,7 @@ mod tests {
                     &crate::runtime::scheduler::DrainFirstScheduler,
                     None,
                     0,
-                    &WakePlan::legacy(None),
+                    &WakePlan::standalone(),
                     true,
                 );
             })
@@ -3408,12 +3430,12 @@ mod tests {
         }
     }
 
-    /// Every `Progress` issues exactly one `notify_one` and every `Finished` one
-    /// `notify_all`. Observed through the event-count itself (an armed key
-    /// reports `Woken` iff the generation moved), not through the stats the
-    /// same branch records.
+    /// Over a plan whose step 0 has one ungated `Pool` branch, every `Progress`
+    /// issues exactly one `notify_one` and every `Finished` one `notify_all`.
+    /// Observed through the event-count itself (an armed key reports `Woken`
+    /// iff the generation moved), not through the stats the same branch records.
     #[test]
-    fn legacy_mode_notifies_exactly_as_before() {
+    fn pool_target_notifies_once_per_progress() {
         use std::time::Duration;
 
         use crate::runtime::event_count::WaitOutcome;
@@ -3444,7 +3466,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(Some(Arc::clone(&ec))),
+            &crate::runtime::wake::tests_support::plan_with_pool(Arc::clone(&ec), 2),
             &mut LoopDiag::new(false),
         )
         .unwrap();
@@ -3467,7 +3489,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(Some(Arc::clone(&ec))),
+            &crate::runtime::wake::tests_support::plan_with_pool(Arc::clone(&ec), 2),
             &mut LoopDiag::new(false),
         )
         .unwrap();
@@ -3850,6 +3872,9 @@ mod tests {
             2,
         );
         plan.register_driver(DriverIdx(0), std::thread::current());
+        // The driver (this thread) is armed for its timer park, so a delivered
+        // forward wake unparks it rather than finding it running.
+        assert!(plan.arm_driver(DriverIdx(0)));
         let stats = Arc::new(PipelineStats::new(vec!["Src", "Finish", "Sink"]));
         clear_dispatch_flags();
         let mut entry = if let Some(flush) = flush {
@@ -3899,51 +3924,6 @@ mod tests {
         clear_dispatch_flags();
     }
 
-    /// A Legacy plan ignores a flush, exactly as before: no notify (observed
-    /// through the event-count itself) and nothing recorded, for every idle
-    /// outcome.
-    #[rstest::rstest]
-    #[case::no_progress(StepOutcome::NoProgress)]
-    #[case::contention(StepOutcome::Contention)]
-    #[case::capped(StepOutcome::Capped)]
-    fn legacy_flushed_dispatch_notifies_nothing(#[case] result: StepOutcome) {
-        use std::time::Duration;
-
-        use crate::runtime::event_count::WaitOutcome;
-        let (steps, graph, _runs) = three_step_chain(StepKind::Parallel);
-        let contexts =
-            build_chain_contexts(&steps, &graph, crate::builder::InstrumentationLevel::Off, false);
-        let stats = Arc::new(PipelineStats::new(vec!["Src", "Finish", "Sink"]));
-        let ec = Arc::new(PoolEventCount::new(2));
-        clear_dispatch_flags();
-        let mut entry = WorkerStepEntry::Owned {
-            step: Box::new(TypedStep::new(FlushThen {
-                flush: true,
-                cap_refused: false,
-                result: Some(result),
-            })),
-        };
-        let key = ec.prepare_wait();
-        let _ = dispatch_one_step(
-            &mut entry,
-            StepIdx(0),
-            &contexts,
-            &StepDrainCounter::new(2),
-            &PipelineSignal::new(),
-            Some(&stats),
-            &LivenessCounter::new(1),
-            0,
-            false,
-            None,
-            0,
-            &WakePlan::legacy(Some(Arc::clone(&ec))),
-            &mut LoopDiag::new(false),
-        );
-        assert_eq!(ec.wait(key, Duration::ZERO), WaitOutcome::TimedOut, "no notify");
-        assert_eq!(stats.snapshot().steps[0].1.notifies_issued, 0);
-        clear_dispatch_flags();
-    }
-
     #[test]
     fn dispatch_stamps_running_step_when_board_present() {
         // A dispatch of step idx 3 with a board present must leave the board's
@@ -3979,7 +3959,7 @@ mod tests {
             false,
             Some(&board),
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         );
         assert_eq!(board.read(0), (WorkerState::Running, Some(StepIdx(0))));
@@ -4016,7 +3996,7 @@ mod tests {
             false,
             None,
             0,
-            &WakePlan::legacy(None),
+            &WakePlan::standalone(),
             &mut LoopDiag::new(false),
         )
         .unwrap();

@@ -87,8 +87,8 @@ const CACHE_LINE: usize = 128;
 ///
 /// Shared by all pool workers of one pipeline via `Arc`. Only present when
 /// `n_threads > 1`. The scheduled single-thread path passes `None`: its lone
-/// worker idles on `park_timeout` (`BackoffPolicy::ParkedSleep`), where a
-/// Directed `WakePlan` unparks it as `Worker(0)`. The fused path builds no
+/// worker idles on `park_timeout` (`BackoffPolicy::ParkedSleep`), where the
+/// `WakePlan` unparks it as `Worker(0)`. The fused path builds no
 /// event-count and keeps its fixed sleep between idle passes: it is the run's
 /// only thread, so nothing else could wake it.
 pub struct PoolEventCount {

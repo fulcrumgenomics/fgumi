@@ -2,14 +2,15 @@
 
 use std::time::Duration;
 
+use crate::runtime::placement::DriverIdx;
 use crate::topology::StepIdx;
 
 // Timer-idle bounds for pool workers that do not wait on the event-count: a
 // pinned worker (Exclusive owner, sticky owner, or the affinity target of a
 // Serial step), the lone worker of a one-worker run, and a worker holding an
-// item. Under Directed wakes (`runtime::wake`) a producer can `unpark` it
-// early; in Legacy mode nothing holds its handle and the timer is the whole
-// policy.
+// item. Its producers (and, for a holder, the consumer whose pop makes room)
+// `unpark` it through the wake plan (`runtime::wake`), so the timer is only the
+// self-heal for a wake nobody delivers.
 //
 // The initial (also the post-progress reset floor) is 20µs, NOT 1µs. A surplus
 // worker in an oversubscribed pool makes the occasional lucky pop, which resets
@@ -20,7 +21,7 @@ const SLEEP_INITIAL_US: u64 = 20;
 const SLEEP_MAX_US: u64 = 50_000; // 50 milliseconds
 
 // Dedicated-driver idle bounds. A driver drives a small step subset off the
-// pool; under Directed wakes every producer of its live steps unparks it, so
+// pool; every producer of its live steps unparks it, so
 // the deadline is the self-heal bound for a wake nobody thought of, not the
 // wake mechanism. 2 ms bounds the latency of a wake nobody delivers while keeping
 // idle timer expiries rare; `timed out` on the detached line of
@@ -128,8 +129,10 @@ pub enum WorkerRole {
     Pool,
     /// Dedicated driver thread. Per-step busy is recorded by each step's own
     /// index in `dispatch_one_step`; thread-level idle/park is keyed to
-    /// `primary_step` (the group's representative).
-    Driver { primary_step: StepIdx },
+    /// `primary_step` (the group's representative). `driver` is its index in
+    /// the run's wake plan: the parking bit its timer park arms
+    /// (`WakePlan::arm_driver`), without which no directed wake reaches it.
+    Driver { primary_step: StepIdx, driver: DriverIdx },
 }
 
 pub struct WorkerCore {
@@ -164,10 +167,10 @@ impl WorkerCore {
     /// `Park` backoff. Drives a set of `Owned` steps off the pool; its
     /// aggregate busy/idle is attributed on the off-pool detached line.
     /// `thread_id` is unused for drivers; it never owns Exclusive or sticky
-    /// steps.
+    /// steps. `driver` is the thread's index in the run's wake plan.
     #[must_use]
-    pub fn driver(primary_step: StepIdx) -> Self {
-        Self::with_role(0, None, WorkerRole::Driver { primary_step })
+    pub fn driver(primary_step: StepIdx, driver: DriverIdx) -> Self {
+        Self::with_role(0, None, WorkerRole::Driver { primary_step, driver })
     }
 
     fn with_role(thread_id: usize, sticky_owner: Option<StepIdx>, role: WorkerRole) -> Self {
@@ -269,7 +272,12 @@ mod tests {
         SLEEP_MAX_US,
         BackoffPolicy::ParkedSleep
     )]
-    #[case::park(WorkerCore::driver(StepIdx(0)), PARK_INITIAL_US, PARK_MAX_US, BackoffPolicy::Park)]
+    #[case::park(
+        WorkerCore::driver(StepIdx(0), DriverIdx(0)),
+        PARK_INITIAL_US,
+        PARK_MAX_US,
+        BackoffPolicy::Park
+    )]
     fn backoff_doubles_then_caps(
         #[case] mut w: WorkerCore,
         #[case] initial: u64,
@@ -293,8 +301,9 @@ mod tests {
     /// keeps the normal ramp (no process-global state).
     #[test]
     fn backoff_override_is_per_core() {
-        let mut slow = WorkerCore::driver(StepIdx(0)).with_backoff_override(Some(10_000_000));
-        let normal = WorkerCore::driver(StepIdx(0));
+        let mut slow =
+            WorkerCore::driver(StepIdx(0), DriverIdx(0)).with_backoff_override(Some(10_000_000));
+        let normal = WorkerCore::driver(StepIdx(0), DriverIdx(0));
         assert_eq!(slow.current_backoff_us(), 10_000_000);
         slow.increase_backoff();
         assert_eq!(slow.current_backoff_us(), 10_000_000);
@@ -302,7 +311,9 @@ mod tests {
         assert_eq!(slow.current_backoff_us(), 10_000_000);
         assert_eq!(normal.current_backoff_us(), PARK_INITIAL_US);
         assert_eq!(
-            WorkerCore::driver(StepIdx(0)).with_backoff_override(None).current_backoff_us(),
+            WorkerCore::driver(StepIdx(0), DriverIdx(0))
+                .with_backoff_override(None)
+                .current_backoff_us(),
             PARK_INITIAL_US
         );
     }
