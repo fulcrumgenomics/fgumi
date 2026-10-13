@@ -38,13 +38,11 @@ use std::sync::Arc;
 /// allocations and reads record bytes directly out of the shared
 /// segments at merge time.
 ///
-/// The merge consumer still copies record bytes into its own scratch
-/// `Vec<u8>` via `extend_from_slice` — the original `mem::swap`
-/// zero-copy bridge no longer applies because the bytes are now
-/// borrowed from the shared `SegmentedBuf`, not owned per record.
-/// In exchange, materialization is allocation-free and the peak
-/// memory of the sort drops by ~1× (the materialization no longer
-/// transiently doubles the buffer).
+/// The merge emits each record straight out of the shared `SegmentedBuf`
+/// (by index), so a residual record is never copied before it reaches
+/// the output. Materialization is allocation-free and the peak memory
+/// of the sort drops by ~1× (the materialization no longer transiently
+/// doubles the buffer).
 pub struct InMemoryChunk<K> {
     /// Shared backing store for record bytes (the original sort
     /// buffer's `SegmentedBuf`). All sibling chunks from one

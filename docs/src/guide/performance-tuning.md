@@ -314,7 +314,8 @@ When the merge reads spill files, the diag line is followed by the merge-demand 
 - `Pool at stall:` the merge asks the pool for one sleeping worker once per stall episode, before it parks; the outcomes of those requests (`woken`, `all-awake`: no worker was asleep where a request reaches it, `pending`: an earlier request was still unanswered, `unavailable`: no pool to ask), the share of requests that found a sleeping worker (parked on the pool's shared wait, or idling on its own timer), and the stall time of the episodes whose request did. The same outcomes, per step, are the `req_*` columns of the `--pipeline-stats` wake table.
 - `Merge prediction:` how often the merge's prediction of the spill file it would need next (published on each source switch, so the supply can read that file ahead) named the file it actually switched to.
 - `Consumer served itself:` how many stalls the merge resolved by decompressing the awaited spill file's already-read blocks on its own thread instead of parking, and how many blocks it decompressed that way (including on stalls that still parked).
-- `Merge output:` how many output batches the merge flushed early, short of their target size, because it stalled with records already merged.
+
+Every k-way merge then prints `Merge output: records borrowed B / assembled A`, whether or not it read spill files (a no-spill sort with several in-memory chunks prints it too; the single-chunk fast path, which runs no merge, does not): how many merged records the merge emitted in place, by reference to a decompressed spill block or a shared in-memory chunk (`borrowed`), and how many it first copied into its scratch buffer, such as a record that spans two spill blocks (`assembled`). The two sum to the `Sort merge complete:` total.
 
 The spill supply then reports, in this order (the budget line is logged when the merge starts, the rest when it ends):
 

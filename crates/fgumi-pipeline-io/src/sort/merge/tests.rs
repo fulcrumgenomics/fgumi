@@ -152,20 +152,21 @@ fn one_record_block(pos: usize) -> Vec<u8> {
     block
 }
 
-/// A stall whose partial batch is refused by a full output edge leaves the
-/// merge blocked on its output, not on the spill supply: it lowers `starved`
-/// (so the pool's refill walk stops putting the supply ahead of the steps that
-/// drain that edge), withdraws its registration, and the dispatch that then
-/// parks on the held batch is not a parking registration.
+/// A full batch refused by a full output edge leaves the merge blocked on its
+/// output, not on the spill supply: `starved` is low (the record that closed
+/// the batch ended the stall episode, so the pool's refill walk does not put
+/// the supply ahead of the steps that drain that edge), the last stall's
+/// registration was withdrawn, and the dispatch that then parks on the held
+/// batch is not a parking registration.
 #[test]
-fn a_partial_batch_held_on_a_full_output_lowers_starved() {
+fn a_batch_held_on_a_full_output_leaves_starved_low() {
     use fgumi_pipeline_core::testing::StepProbe;
     let demand = Arc::new(fgumi_sort::MergeDemand::new());
-    // A 256-byte edge: a few one-record batches (their buffers are sized up to
-    // the 256-byte cap) fill it, and one record never fills a batch, so each
-    // stall flushes a partial batch.
+    // A 256-byte edge and one-record batches: every produced record closes a
+    // full batch (its buffer sized up to the 256-byte cap), so a few of them
+    // fill the edge, and the `Batch` arm's refused push is what holds one.
     let mut step =
-        SortMerge::<RecordBatchOutput>::with_target_batch_count(SortOrder::Coordinate, 256, 1024)
+        SortMerge::<RecordBatchOutput>::with_target_batch_count(SortOrder::Coordinate, 256, 1)
             .with_merge_demand(Arc::clone(&demand));
     let probe = StepProbe::new(&step);
     let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
@@ -188,10 +189,10 @@ fn a_partial_batch_held_on_a_full_output_lowers_starved() {
         total_records: 1000,
     });
     let starved = demand.starved_signal();
-    // Each dispatch merges one record and runs dry on that record's slot,
-    // flushing it as a partial batch; feeding the slot's next record first
-    // keeps every dispatch a stall with one record merged. Nothing drains the
-    // edge, so a partial batch is eventually refused and held.
+    // Each dispatch merges one record, delivers it as a full batch and runs
+    // dry on that record's slot; feeding the slot's next record first keeps
+    // every dispatch one record then a stall. Nothing drains the edge, so a
+    // full batch is eventually refused and held.
     let mut next = 2;
     loop {
         assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Progress);

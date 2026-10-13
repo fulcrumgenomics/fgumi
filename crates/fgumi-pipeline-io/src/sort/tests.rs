@@ -2368,50 +2368,9 @@ fn stalled_merge_is_woken_by_the_awaited_delivery() {
     assert!(s.stall_episodes > 0, "the gated feed must make the merge stall: {s:?}");
 }
 
-/// A stall that finds records already in the output builder flushes them as a
-/// partial batch, and the demand counts each such flush. With a 256-record
-/// target and one record per stall, every output batch is short: each was
-/// flushed by a stall, except possibly the last (flushed by `Done`). Each of
-/// those stalls withdraws its registration before the merge runs again, and the
-/// stall it re-stalls into parks: a missed wake would trip the 10 s timer.
-#[test]
-fn stalls_that_flush_a_partial_batch_are_counted() {
-    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
-    let demand = Arc::new(fgumi_sort::MergeDemand::new());
-    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (events, feeder) = gated_two_slot_feed(10, &demand, &progress, std::time::Duration::ZERO);
-    let opts = MergeRunOptions {
-        demand: Some(Arc::clone(&demand)),
-        threads: 1,
-        test_backoff: vec![TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 }],
-        progress: Some(Arc::clone(&progress)),
-        ..Default::default()
-    };
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(collect_merge_batches_with(events, 1 << 20, 256, opts));
-    });
-    let out = done_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("WEDGED: a stall was not woken by its delivery")
-        .unwrap()
-        .batches;
-    feeder.join().unwrap();
-    let records: usize = out.iter().map(|b| b.iter_record_bytes().count()).sum();
-    assert_eq!(records, 20);
-    assert!(out.iter().all(|b| b.iter_record_bytes().count() < 256), "every batch is short");
-    let s = demand.snapshot();
-    let batches = out.len() as u64;
-    assert!(s.partial_flushes > 0, "{s:?}");
-    assert!(
-        s.partial_flushes == batches || s.partial_flushes + 1 == batches,
-        "every short batch but a final `Done` flush is a partial flush on stall: \
-         {batches} batches, {s:?}"
-    );
-}
-
 /// Two hand-driven dispatches over two slots: slot 0 holds record 0 and slot 1
 /// record 1, both left open, so the merge emits record 0 and stalls on slot 0.
+/// One-record batches, so record 0 closes a full batch before the stall.
 fn stalled_after_one_record(
     demand: &Arc<fgumi_sort::MergeDemand>,
 ) -> (
@@ -2419,12 +2378,9 @@ fn stalled_after_one_record(
     fgumi_pipeline_core::testing::StepProbe<SortMerge<RecordBatchOutput>>,
 ) {
     use crate::sort::protocol::SortPhase2Event;
-    let step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
-        SortOrder::Coordinate,
-        1 << 20,
-        256,
-    )
-    .with_merge_demand(Arc::clone(demand));
+    let step =
+        SortMerge::<RecordBatchOutput>::with_target_batch_count(SortOrder::Coordinate, 1 << 20, 1)
+            .with_merge_demand(Arc::clone(demand));
     let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
     for file_id in 0..2u32 {
         let slot = Arc::new(fgumi_sort::SortMergeSlot::for_test(file_id, SpillCodec::Bgzf));
@@ -2490,10 +2446,10 @@ fn a_merge_that_ends_short_of_the_ingested_records_fails(#[case] announced: u64,
 }
 
 /// A registration counts as a parking registration only when the merge parks:
-/// a stall that flushed a partial batch runs again at once, so it withdraws
-/// its registration (a delivery must not unpark a merge that is not waiting);
-/// the stall after it delivers nothing, returns `Contention`, and stays
-/// registered.
+/// a stall in a dispatch that delivered a batch runs again at once, so it
+/// withdraws its registration (a delivery must not unpark a merge that is not
+/// waiting); the stall after it delivers nothing, returns `Contention`, and
+/// stays registered.
 #[test]
 fn only_a_registration_the_merge_parks_on_counts_as_parking() {
     let demand = Arc::new(fgumi_sort::MergeDemand::new());
@@ -2501,16 +2457,16 @@ fn only_a_registration_the_merge_parks_on_counts_as_parking() {
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Progress);
     let s = demand.snapshot();
     assert_eq!(
-        (s.registrations, s.parking_registrations, s.partial_flushes),
-        (1, 0, 1),
-        "record 0 was flushed on the stall, so the merge did not park: {s:?}"
+        (s.registrations, s.parking_registrations),
+        (1, 0),
+        "record 0 went out as a full batch before the stall, so the merge did not park: {s:?}"
     );
     assert_eq!(demand.awaited(), None, "the registration was withdrawn");
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Contention);
     let s = demand.snapshot();
     assert_eq!(
-        (s.registrations, s.parking_registrations, s.partial_flushes),
-        (2, 1, 1),
+        (s.registrations, s.parking_registrations),
+        (2, 1),
         "an empty builder: nothing delivered, so the merge parks: {s:?}"
     );
     assert_eq!(demand.awaited(), Some(0), "a parked merge stays registered on slot 0");
@@ -3988,4 +3944,551 @@ fn planner_tops_up_after_input_drains_with_long_timers() {
         .flat_map(|b| b.iter_record_bytes().map(fgumi_raw_bam::pos).collect::<Vec<_>>())
         .collect();
     assert_eq!(positions, (0..i32::try_from(total).unwrap()).collect::<Vec<_>>());
+}
+
+// ── Output batching: a stall never closes a batch ───────────────────────────
+
+/// [`collect_merge_batches_with`] for the terminal `SortMerge<BlockOutput>`:
+/// each emitted block's `(batch_serial, bytes)`, the bytes being the
+/// `[u32 len][record]` framing the merge writes before `BgzfCompress`.
+///
+/// It honors only `demand`, `threads`, `test_backoff` and `sink_kind`.
+///
+/// # Panics
+///
+/// Panics if `opts` sets a supply ledger, a sink progress counter, a feeder
+/// or `hold_until_parked`, rather than silently dropping them.
+fn collect_merge_blocks_with(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    output_byte_limit: u64,
+    target_batch_count: usize,
+    opts: MergeRunOptions,
+) -> Result<Vec<(u64, Vec<u8>)>> {
+    let MergeRunOptions {
+        demand,
+        ledger,
+        threads,
+        test_backoff,
+        progress,
+        feeder,
+        hold_until_parked,
+        sink_kind,
+    } = opts;
+    assert!(
+        ledger.is_none() && progress.is_none() && feeder.is_none() && !hold_until_parked,
+        "collect_merge_blocks_with supports only demand, threads, test_backoff and sink_kind"
+    );
+    let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let source = Phase2EventSource::new(events, output_byte_limit);
+    let mut merge = SortMerge::<BlockOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        target_batch_count,
+    );
+    if let Some(d) = demand {
+        merge = merge.with_merge_demand(d);
+    }
+    let sink =
+        BlockSink { received: Arc::clone(&received), kind: sink_kind.unwrap_or(StepKind::Serial) };
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build()?;
+    pipeline.run(PipelineConfig { threads: threads.max(1), test_backoff, ..Default::default() })?;
+    let blocks = std::mem::take(&mut *received.lock());
+    Ok(blocks.into_iter().map(|b| (b.batch_serial, b.bytes)).collect())
+}
+
+/// A valid BAM record body of exactly `len` bytes at (tid 0, `pos`), read name
+/// `{tag}{i:07}`, so a test can tell the run from byte 32 of the body (the
+/// first byte of the name).
+fn test_record_body(tag: u8, i: usize, pos: i32, len: usize) -> Vec<u8> {
+    let name = format!("{}{i:07}", tag as char);
+    let fixed = 32 + name.len() + 1;
+    assert!(len >= fixed + 4, "len too small");
+    // Pad with one Z tag so the body is exactly `len`.
+    let aux_len = len - fixed;
+    let mut aux = b"XZZ".to_vec();
+    aux.extend(std::iter::repeat_n(b'x', aux_len - 4));
+    aux.push(0);
+    let body = make_bam_bytes(0, pos, 0, name.as_bytes(), &[], 0, -1, -1, &aux);
+    assert_eq!(body.len(), len);
+    body
+}
+
+/// The run a [`test_record_body`] record came from (the name's first byte).
+fn run_tag(body: &[u8]) -> u8 {
+    body[32]
+}
+
+/// Two coordinate-sorted runs whose positions interleave with cross-run ties:
+/// run A at 0,1,2,2,3,4,4,…; run B at 0,1,1,2,3,3,4,5,5,…. Bodies carry their
+/// run in the name's first byte.
+fn interleaved_runs(n_per_run: usize, body_len: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let a = (0..n_per_run)
+        .map(|i| test_record_body(b'A', i, i32::try_from(i - i / 3).unwrap(), body_len))
+        .collect();
+    let b = (0..n_per_run)
+        .map(|i| test_record_body(b'B', i, i32::try_from(i - (i + 1) / 3).unwrap(), body_len))
+        .collect();
+    (a, b)
+}
+
+/// Oracle: a stable merge by `RawCoordinateKey` (A before B on ties, then
+/// position within the run) — `a` then `b`, stable-sorted by key, computed
+/// without `MergeDriver`.
+fn oracle_merge(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use fgumi_sort::{RawCoordinateKey, RawSortKey};
+    let mut all: Vec<&Vec<u8>> = a.iter().chain(b).collect();
+    all.sort_by_cached_key(|r| RawCoordinateKey::extract_from_record(r));
+    all.into_iter().cloned().collect()
+}
+
+/// The `(records, bytes)` of every batch a merge with no stall flush must
+/// produce, from the record sequence alone: after pushing a record the batch
+/// closes when it holds `count` records or `byte_limit` bytes (as `measure`d);
+/// the end of input closes the final partial.
+fn expected_batches(
+    records: &[Vec<u8>],
+    count: usize,
+    byte_limit: u64,
+    measure: impl Fn(&[u8]) -> usize,
+) -> Vec<(usize, usize)> {
+    let (mut out, mut n, mut bytes) = (Vec::new(), 0usize, 0usize);
+    for r in records {
+        n += 1;
+        bytes += measure(r);
+        if n >= count || bytes as u64 >= byte_limit {
+            out.push((n, bytes));
+            (n, bytes) = (0, 0);
+        }
+    }
+    if n > 0 {
+        out.push((n, bytes));
+    }
+    out
+}
+
+/// One emitted batch, from either output type.
+#[derive(Debug)]
+struct BatchView {
+    ordinal: u64,
+    records: usize,
+    bytes: usize,
+    record_bytes: Vec<Vec<u8>>,
+}
+
+/// Embedded-key spill framing for coordinate slots: `[u32 len][body]` each.
+fn frame_block(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in records {
+        fgumi_sort::frame_keyed_record_into(&mut out, &fgumi_sort::RawCoordinateKey::default(), r)
+            .expect("frame record");
+    }
+    out
+}
+
+/// Run the merge over `events` and view every emitted batch, from the terminal
+/// `BlockOutput` (`terminal`) or the intermediate `RecordBatchOutput`.
+fn merge_batch_views(
+    events: Vec<crate::sort::protocol::SortPhase2Event>,
+    byte_limit: u64,
+    count: usize,
+    opts: MergeRunOptions,
+    terminal: bool,
+) -> Result<Vec<BatchView>> {
+    use fgumi_pipeline_core::Ordered as _;
+    if terminal {
+        collect_merge_blocks_with(events, byte_limit, count, opts).map(|v| {
+            v.into_iter()
+                .map(|(ordinal, framed)| {
+                    let recs = unframe_block_records(&framed);
+                    BatchView {
+                        ordinal,
+                        records: recs.len(),
+                        bytes: framed.len(),
+                        record_bytes: recs,
+                    }
+                })
+                .collect()
+        })
+    } else {
+        collect_merge_batches_with(events, byte_limit, count, opts).map(|run| {
+            run.batches
+                .iter()
+                .map(|b| {
+                    let recs: Vec<Vec<u8>> = b.iter_record_bytes().map(<[u8]>::to_vec).collect();
+                    BatchView {
+                        ordinal: b.ordinal(),
+                        records: recs.len(),
+                        bytes: recs.iter().map(Vec::len).sum(),
+                        record_bytes: recs,
+                    }
+                })
+                .collect()
+        })
+    }
+}
+
+/// What [`merge_with_a_stall_per_block`] observed.
+struct StallRun {
+    batches: Vec<BatchView>,
+    records: Vec<Vec<u8>>,
+    demand: Arc<fgumi_sort::MergeDemand>,
+}
+
+/// Feed two runs through two slots, one block (`block_records` records) per
+/// stall. The feeder loop:
+///   1. wait (≤ 30 s) until `demand.awaited() == Some(id)` for a slot that
+///      still has blocks;
+///   2. push that slot's next block through the slot's own API
+///      (`bp_commit_read` + `bp_insert_drain_finalize`);
+///   3. `demand.notify_delivered(id)` — the only call that clears `awaited`;
+///   4. count one feed.
+///
+/// Before the very last block it sleeps `hold_last` (the merge is stalled on
+/// it, holding its partial batch). An empty run is finalized at EOF up front.
+/// The merge runs on a spawned thread under a 30 s watchdog; a merge that
+/// stops stalling makes step 1 time out, so the fixture cannot silently stop
+/// stalling, and a merge that fails or finishes early is reported from step 1
+/// at once, with its result.
+fn merge_with_a_stall_per_block(
+    runs: (&[Vec<u8>], &[Vec<u8>]),
+    block_records: usize,
+    terminal: bool,
+    byte_limit: u64,
+    count: usize,
+    hold_last: std::time::Duration,
+) -> StallRun {
+    use crate::sort::protocol::SortPhase2Event;
+    use std::time::{Duration, Instant};
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let slots = two_open_slots();
+    let blocks: [Vec<Vec<u8>>; 2] = [
+        runs.0.chunks(block_records).map(frame_block).collect(),
+        runs.1.chunks(block_records).map(frame_block).collect(),
+    ];
+    for i in 0..2 {
+        if blocks[i].is_empty() {
+            slots[i].bp_commit_read(0, true);
+            slots[i].bp_drain_and_finalize();
+        }
+    }
+    let total = (runs.0.len() + runs.1.len()) as u64;
+    let events = vec![
+        SortPhase2Event::SpillReady {
+            slot: Arc::clone(&slots[0]),
+            path: std::path::PathBuf::new(),
+            records_ingested_so_far: runs.0.len() as u64,
+        },
+        SortPhase2Event::SpillReady {
+            slot: Arc::clone(&slots[1]),
+            path: std::path::PathBuf::new(),
+            records_ingested_so_far: total,
+        },
+        SortPhase2Event::AllAnnounced {
+            slot_count: 2,
+            memory_chunk_count: 0,
+            total_records: total,
+        },
+    ];
+    let opts =
+        MergeRunOptions { demand: Some(Arc::clone(&demand)), threads: 1, ..Default::default() };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(merge_batch_views(events, byte_limit, count, opts, terminal));
+    });
+    let (mut next, mut seq) = ([0usize; 2], [0u64; 2]);
+    let last_total = blocks[0].len() + blocks[1].len();
+    let mut fed = 0usize;
+    while fed < last_total {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let id = loop {
+            if let Some(id) = demand.awaited()
+                && next[id as usize] < blocks[id as usize].len()
+            {
+                break id as usize;
+            }
+            if let Ok(result) = rx.try_recv() {
+                panic!(
+                    "the merge ended with {fed} of {last_total} blocks fed: {:?}",
+                    result.map(|views| views.len())
+                );
+            }
+            assert!(Instant::now() < deadline, "the merge stopped stalling per block");
+            std::thread::yield_now();
+        };
+        let last = next[id] + 1 == blocks[id].len();
+        if fed + 1 == last_total && !hold_last.is_zero() {
+            std::thread::sleep(hold_last);
+        }
+        slots[id].bp_commit_read(1, last);
+        slots[id].bp_insert_drain_finalize(seq[id], vec![blocks[id][next[id]].clone()], 1);
+        seq[id] += 1;
+        next[id] += 1;
+        fed += 1;
+        demand.notify_delivered(u32::try_from(id).unwrap());
+    }
+    let views = rx.recv_timeout(Duration::from_secs(30)).expect("merge wedged").unwrap();
+    let records = views.iter().flat_map(|v| v.record_bytes.clone()).collect();
+    // Not an equality: one stall episode can span two feeds (priming stalls on
+    // slot 0 then slot 1 with no record produced between them), and the
+    // merge's re-check after declaring a slot awaited can find a block the
+    // feeder pushed just after `awaited` flipped (a feed with no episode). The
+    // feeder only feeds on `awaited() == Some(id)` and times out otherwise, so
+    // it is itself the proof of a stall per block; the episode count must
+    // merely be non-zero and never exceed it.
+    let s = demand.snapshot();
+    let episodes = usize::try_from(s.stall_episodes).unwrap();
+    assert!(episodes > 0 && episodes <= fed, "stall episodes {episodes} vs feeds {fed}");
+    // The merge's own count of the same thing: each feed waited for
+    // `awaited() == Some(id)`, which only the merge's registration sets, and
+    // the feed's `notify_delivered` cleared it, so every feed consumed a
+    // registration of its own.
+    let registrations = usize::try_from(s.registrations).unwrap();
+    assert!(registrations >= fed, "{registrations} registrations for {fed} feeds");
+    StallRun { batches: views, records, demand }
+}
+
+/// With a stall forced after every block, the emitted batches are exactly the
+/// full batches plus one final partial — the boundaries computed from the
+/// record sequence alone — so no stall produced a batch. Records equal the
+/// oracle; ordinals are dense; the merge switched sources and, as the fixture
+/// checks, really stalled once per block.
+#[rstest]
+#[case::terminal_block_output(true)]
+#[case::intermediate_record_batches(false)]
+fn stalls_never_close_a_batch(#[case] terminal: bool) {
+    let (a, b) = interleaved_runs(10_000, 300);
+    let count = 1024;
+    // The count cap binds: 1024 × 304 B ≈ 304 KiB.
+    let byte_limit = 4 << 20;
+    let run = merge_with_a_stall_per_block(
+        (&a, &b),
+        40,
+        terminal,
+        byte_limit,
+        count,
+        std::time::Duration::ZERO,
+    );
+    let want = oracle_merge(&a, &b);
+    assert!(run.records == want, "records differ from the oracle");
+    let switches = run.records.windows(2).filter(|w| run_tag(&w[0]) != run_tag(&w[1])).count();
+    assert!(switches > 1, "the fixture must interleave sources");
+    let measure = |r: &[u8]| if terminal { r.len() + 4 } else { r.len() };
+    let expected = expected_batches(&want, count, byte_limit, measure);
+    let got: Vec<(usize, usize)> = run.batches.iter().map(|v| (v.records, v.bytes)).collect();
+    assert_eq!(got, expected, "batches must be full batches plus one final partial");
+    assert_eq!(run.batches.len(), 20_000_usize.div_ceil(count), "⌈records / count⌉ items");
+    assert!(run.batches.windows(2).all(|w| w[1].ordinal == w[0].ordinal + 1), "dense ordinals");
+}
+
+/// The byte cap binding instead of the count cap: the same identity.
+#[test]
+fn stalls_never_close_a_batch_under_the_byte_cap() {
+    let (a, b) = interleaved_runs(4_000, 300);
+    // ≈ 215 records per batch, well under the count cap of 1024.
+    let byte_limit = 64 * 1024;
+    let run = merge_with_a_stall_per_block(
+        (&a, &b),
+        40,
+        true,
+        byte_limit,
+        1024,
+        std::time::Duration::ZERO,
+    );
+    let want = oracle_merge(&a, &b);
+    assert!(run.records == want, "records differ from the oracle");
+    let expected = expected_batches(&want, 1024, byte_limit, |r| r.len() + 4);
+    assert_eq!(run.batches.iter().map(|v| (v.records, v.bytes)).collect::<Vec<_>>(), expected);
+}
+
+/// A long consumer stall does not flush: the merge holds a partial batch while
+/// the feeder withholds the last block for 2 s; nothing is emitted until EOF,
+/// and then exactly one batch (the final partial) carries every record.
+#[rstest]
+#[case::terminal(true)]
+#[case::intermediate(false)]
+fn a_long_stall_does_not_flush(#[case] terminal: bool) {
+    // 500 records < count: one final partial.
+    let (a, _) = interleaved_runs(500, 300);
+    let run = merge_with_a_stall_per_block(
+        (&a, &[]),
+        100,
+        terminal,
+        4 << 20,
+        1024,
+        std::time::Duration::from_secs(2),
+    );
+    assert!(run.records == a, "records differ from the run");
+    let stall_ns = run.demand.snapshot().stall_ns;
+    assert!(stall_ns >= 1_000_000_000, "the merge was stalled ≥ 1 s, saw {stall_ns} ns");
+    assert_eq!(run.batches.len(), 1, "no flush during the stall; Done emits the only batch");
+    assert_eq!(run.batches[0].records, 500);
+}
+
+/// A Serial sink that pops only after the test sends a ticket on `release`,
+/// and freely once `release` is dropped.
+struct GatedSink {
+    received: Arc<Mutex<Vec<RecordBatch>>>,
+    release: std::sync::mpsc::Receiver<()>,
+    have_ticket: bool,
+    drain_freely: bool,
+}
+
+impl Step for GatedSink {
+    type Input = RecordBatch;
+    type Outputs = ();
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: "GatedSink",
+            kind: StepKind::Serial,
+            sticky: false,
+            output_queues: vec![],
+            branch_ordering: vec![],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        use std::sync::mpsc::TryRecvError;
+        if !self.have_ticket {
+            match self.release.try_recv() {
+                Ok(()) => self.have_ticket = true,
+                Err(TryRecvError::Disconnected) => {
+                    self.have_ticket = true;
+                    self.drain_freely = true;
+                }
+                Err(TryRecvError::Empty) => return Ok(StepOutcome::NoProgress),
+            }
+        }
+        match ctx.input.pop() {
+            Some(b) => {
+                self.received.lock().push(b);
+                if !self.drain_freely {
+                    self.have_ticket = false;
+                }
+                Ok(StepOutcome::Progress)
+            }
+            None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+            None => Ok(StepOutcome::NoProgress),
+        }
+    }
+}
+
+/// Fully populated two-slot events (no stalls): each run framed into
+/// `block_records`-record blocks, all inserted, both slots finalized.
+fn populated_two_slot_events(
+    a: &[Vec<u8>],
+    b: &[Vec<u8>],
+    block_records: usize,
+) -> Vec<crate::sort::protocol::SortPhase2Event> {
+    let slots = two_open_slots();
+    for (slot, run) in slots.iter().zip([a, b]) {
+        let blocks: Vec<Vec<u8>> = run.chunks(block_records).map(frame_block).collect();
+        let n = blocks.len();
+        // `bp_insert_drain_finalize` drains at most `PHASE2_DECOMP_CAP` blocks
+        // into the FIFO; with no decompressor in this chain the rest would
+        // never drain.
+        assert!(n <= fgumi_sort::PHASE2_DECOMP_CAP, "{n} blocks exceed the FIFO cap");
+        slot.bp_commit_read(n, true);
+        slot.bp_insert_drain_finalize(0, blocks, n);
+    }
+    let mut events = announce_slots(&slots, a.len() + b.len());
+    if let crate::sort::protocol::SortPhase2Event::SpillReady { records_ingested_so_far, .. } =
+        &mut events[0]
+    {
+        *records_ingested_so_far = a.len() as u64;
+    }
+    events
+}
+
+/// Backpressure: with a one-batch output edge and a sink released one item at
+/// a time, every batch is delivered exactly once, in order, full except the
+/// last, and the edge itself (its hold clock, under pipeline stats) records
+/// that it refused the merge's pushes, so the held-batch path really ran. A
+/// regression guard: the slots are fully populated, so the merge never stalls;
+/// it catches a batch lost or duplicated at a full output edge.
+#[test]
+fn full_batches_under_backpressure_are_delivered_once() {
+    use fgumi_pipeline_core::Ordered as _;
+    use std::time::Duration;
+    let (a, b) = interleaved_runs(3_000, 300);
+    let want = oracle_merge(&a, &b);
+    let received = Arc::new(Mutex::new(Vec::<RecordBatch>::new()));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let sink = GatedSink {
+        received: Arc::clone(&received),
+        release: release_rx,
+        have_ticket: false,
+        drain_freely: false,
+    };
+    // 30 blocks per slot, within the FIFO cap; the merge's output edge holds
+    // one full batch's bytes.
+    let events = populated_two_slot_events(&a, &b, 100);
+    let source = Phase2EventSource::new(events, 1 << 20);
+    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1024 * 300,
+        1024,
+    );
+    let builder = Pipeline::builder();
+    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let pipeline = builder.build().unwrap();
+    let stats = pipeline.stats();
+    let run_stats = Arc::clone(&stats);
+    let runner = std::thread::spawn(move || {
+        pipeline.run(PipelineConfig { threads: 2, stats: Some(run_stats), ..Default::default() })
+    });
+    // `held_retries` counts each rejected retry while a batch is held, so it
+    // moves before the release (`holds` counts only once the push succeeds).
+    let merge_held_retries = || {
+        stats
+            .snapshot()
+            .steps
+            .iter()
+            .find(|(name, _)| *name == "SortMerge")
+            .map_or(0, |s| s.1.held_retries)
+    };
+    for round in 0..6_000_usize.div_ceil(1024) {
+        // The first release waits until the merge has filled the edge and a
+        // held retry was refused, so the run is provably backpressured before
+        // the sink drains anything. Later rounds only pace the sink: near the
+        // end the merge may have nothing left to push, so a refusal is not
+        // owed there (the final `holds > 0` assertion still covers the run).
+        let before = merge_held_retries();
+        let patience = if round == 0 { Duration::from_secs(10) } else { Duration::from_millis(50) };
+        let deadline = std::time::Instant::now() + patience;
+        while merge_held_retries() == before {
+            if std::time::Instant::now() >= deadline {
+                assert!(round > 0, "the output edge never refused a push");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+    }
+    drop(release_tx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done_tx.send(runner.join()).unwrap());
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("merge wedged under backpressure")
+        .unwrap()
+        .unwrap();
+    let batches = std::mem::take(&mut *received.lock());
+    let got: Vec<Vec<u8>> =
+        batches.iter().flat_map(|b| b.iter_record_bytes().map(<[u8]>::to_vec)).collect();
+    assert!(got == want, "records differ from the oracle");
+    assert!(batches.windows(2).all(|w| w[1].ordinal() == w[0].ordinal() + 1), "dense ordinals");
+    let expected = expected_batches(&want, 1024, 1024 * 300, <[u8]>::len);
+    let shape: Vec<(usize, usize)> = batches
+        .iter()
+        .map(|b| (b.len(), b.iter_record_bytes().map(<[u8]>::len).sum::<usize>()))
+        .collect();
+    assert_eq!(shape, expected);
+    let snapshot = stats.snapshot();
+    let merge_stats =
+        &snapshot.steps.iter().find(|(name, _)| *name == "SortMerge").expect("SortMerge").1;
+    assert!(merge_stats.holds > 0, "the output edge never refused a push: {merge_stats:?}");
 }
