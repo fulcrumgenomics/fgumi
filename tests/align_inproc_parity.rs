@@ -30,8 +30,8 @@
 //! ## Version-parity is only defined against the vendored commit
 //!
 //! Byte-parity is defined ONLY against a `bwa-mem3` CLI built from the SAME
-//! commit the in-process backend links (the vendored v0.14.0 `5c1d5e39…`, via
-//! `bwa-mem3-rs` 0.4.2). A *different* CLI version — e.g. the pixi
+//! commit the in-process backend links (the vendored v0.14.1 `d6745b59…`, via
+//! `bwa-mem3-rs` 0.4.3). A *different* CLI version — e.g. the pixi
 //! `bwa-mem3` a dev box happens to carry — will show spurious divergence, so
 //! this test must never be pointed at an arbitrary PATH binary and trusted. The
 //! reference binary is supplied by the CI e2e-parity job, which builds it from
