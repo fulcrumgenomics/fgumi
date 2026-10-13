@@ -5928,6 +5928,32 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
 /// Returns an error if the file cannot be opened, or its magic or length
 /// cannot be read.
 pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortMergeSlot>> {
+    open_spill_slot_as(path, file_id, file_id)
+}
+
+/// [`open_spill_slot`] under supply identity `slot_id`
+/// ([`SortMergeSlot::slot_id`]): a consolidation input, opened under a fresh
+/// id so it never shares a supply-map key with another slot of its `file_id`.
+///
+/// # Errors
+///
+/// As [`open_spill_slot`]; also `InvalidInput` when `file_id` is at or above
+/// [`crate::merge_slots::CONSOLIDATION_SLOT_IDS_START`] (the minted range).
+pub fn open_spill_slot_as(
+    path: &std::path::Path,
+    file_id: u32,
+    slot_id: u32,
+) -> Result<Arc<SortMergeSlot>> {
+    if file_id >= crate::merge_slots::CONSOLIDATION_SLOT_IDS_START {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "spill run file id {file_id} is in the consolidation slot-id range (>= {})",
+                crate::merge_slots::CONSOLIDATION_SLOT_IDS_START
+            ),
+        )
+        .into());
+    }
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("failed to open spill chunk {}", path.display()))?;
     let mut magic = [0u8; 4];
@@ -5943,7 +5969,9 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
         .metadata()
         .with_context(|| format!("failed to stat spill chunk {}", path.display()))?
         .len();
-    Ok(Arc::new(SortMergeSlot::new(file_id, Arc::new(file), body_start, len, codec)))
+    Ok(Arc::new(
+        SortMergeSlot::new(file_id, Arc::new(file), body_start, len, codec).with_slot_id(slot_id),
+    ))
 }
 
 // ============================================================================
@@ -6198,6 +6226,12 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
     })
 }
 
+/// A slot that ends inside a record: an `UnexpectedEof` I/O error carrying
+/// `msg`, so a caller can tell truncation from other merge failures.
+fn truncated(msg: String) -> anyhow::Error {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg).into()
+}
+
 /// Resumable continuation of [`slot_try_next_record`]'s slow path. Collects the
 /// key prefix (if any), the 4-byte length prefix, then the body across as many
 /// blocks as needed, returning `WouldBlock` (state retained in
@@ -6222,10 +6256,13 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
         if parser.current_pos == parser.current_buf.len() {
             match slot_try_load_block(slot, parser)? {
                 BlockLoad::Loaded => {}
-                BlockLoad::Eof => anyhow::bail!(
-                    "truncated record key in slot {} ({key_have} of {key_size} key bytes at EOF)",
-                    slot.file_id,
-                ),
+                BlockLoad::Eof => {
+                    return Err(truncated(format!(
+                        "truncated record key in slot {} ({key_have} of {key_size} key bytes at \
+                         EOF)",
+                        slot.file_id,
+                    )));
+                }
                 BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
             }
         }
@@ -6245,10 +6282,12 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
         if parser.current_pos == parser.current_buf.len() {
             match slot_try_load_block(slot, parser)? {
                 BlockLoad::Loaded => {}
-                BlockLoad::Eof => anyhow::bail!(
-                    "truncated record length in slot {} ({len_got} of 4 length bytes at EOF)",
-                    slot.file_id,
-                ),
+                BlockLoad::Eof => {
+                    return Err(truncated(format!(
+                        "truncated record length in slot {} ({len_got} of 4 length bytes at EOF)",
+                        slot.file_id,
+                    )));
+                }
                 BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
             }
         }
@@ -6295,11 +6334,13 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
         if parser.current_pos == parser.current_buf.len() {
             match slot_try_load_block(slot, parser)? {
                 BlockLoad::Loaded => {}
-                BlockLoad::Eof => anyhow::bail!(
-                    "truncated record body in slot {} ({} of {body_len} bytes at EOF)",
-                    slot.file_id,
-                    out.len(),
-                ),
+                BlockLoad::Eof => {
+                    return Err(truncated(format!(
+                        "truncated record body in slot {} ({} of {body_len} bytes at EOF)",
+                        slot.file_id,
+                        out.len(),
+                    )));
+                }
                 BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
             }
         }
@@ -6413,6 +6454,18 @@ impl std::fmt::Debug for MergeStep<'_> {
     }
 }
 
+/// One step of a non-blocking k-way merge that frames the merged record into a
+/// caller's buffer ([`MergeDriverDyn::try_step_framed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeStepFramed {
+    /// The next merged record was appended to the buffer.
+    Produced,
+    /// A source is momentarily empty (see [`MergeStep::Stalled`]).
+    Stalled,
+    /// The merge is exhausted.
+    Done,
+}
+
 /// Object-safe view over `MergeDriver<K>` so the pipeline `SortMerge` step can
 /// hold a single concrete type regardless of sort order.
 pub trait MergeDriverDyn: Send {
@@ -6424,12 +6477,30 @@ pub trait MergeDriverDyn: Send {
     /// Propagates spill-file corruption or decompression errors from the
     /// underlying slot sources.
     fn try_step(&mut self) -> Result<MergeStep<'_>>;
+    /// Like [`Self::try_step`], but append the winner to `out` in the spill
+    /// framing — `[key][u32 len][body]` ([`crate::frame_keyed_record_into`]),
+    /// or `[u32 len][body]` for a key embedded in the record — read through the
+    /// borrowed winner, so a consolidated run is framed exactly as a run the
+    /// spill writer wrote.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_step`], plus a framing error (a record too long for its
+    /// length prefix).
+    fn try_step_framed(&mut self, out: &mut Vec<u8>) -> Result<MergeStepFramed>;
+    /// The spill key kind the driver was built for ([`merge_driver_for_kind`];
+    /// tests).
+    #[cfg(test)]
+    fn key_kind(&self) -> Option<crate::SpillKeyKind>;
     /// Total records emitted since the driver was constructed.
     fn records_merged(&self) -> u64;
     /// The slot whose empty FIFO caused the last [`MergeStep::Stalled`], or
     /// `None` after a `Produced` (a memory source never stalls). The merge
     /// awaits this slot so the delivery that refills it can wake the merge.
     fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>>;
+    /// The slot whose read failed the last `try_step`, if that read was a
+    /// slot's (the caller names the failed input).
+    fn failed_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>>;
     /// `(borrowed, assembled)`: records emitted by reference to a source's
     /// block or shared residual chunk, and records emitted from the driver's
     /// scratch buffer.
@@ -6479,12 +6550,15 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> 
     /// `sources` index of the slot that caused the last `Stalled`; cleared on
     /// `Produced`.
     stalled_src: Option<usize>,
+    /// `sources` index of the source whose read returned the last error.
+    failed_src: Option<usize>,
     /// The sort's merge-wide demand; the driver publishes predictions and the
     /// frontier through it. `None` publishes nothing.
     demand: Option<Arc<crate::MergeDemand>>,
-    /// Per `sources` index, the spill file it reads (`None` for a memory
-    /// source, which has no file to read ahead).
-    source_file_id: Vec<Option<u32>>,
+    /// Per `sources` index, the slot id of the spill file it reads (`None` for
+    /// a memory source, which has no file to read ahead): what predictions and
+    /// the frontier publish.
+    source_slot_id: Vec<Option<u32>>,
     /// Per `sources` index, whether a slot source has reached its end.
     slot_drained: Vec<bool>,
     /// `sources` index of the last record's source (a change is a switch).
@@ -6494,6 +6568,9 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> 
     /// The key's merge-wide context for rebuilding slot keys (see
     /// [`RawSortKey::MergeCtx`]).
     ctx: K::MergeCtx,
+    /// The kind [`merge_driver_for_kind`] built this driver for (tests).
+    #[cfg(test)]
+    kind_for_test: Option<crate::SpillKeyKind>,
 }
 
 impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
@@ -6564,10 +6641,10 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         let progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
-        let source_file_id: Vec<Option<u32>> = sources
+        let source_slot_id: Vec<Option<u32>> = sources
             .iter()
             .map(|s| match s {
-                SlotMergeSource::Slot { slot, .. } => Some(slot.file_id),
+                SlotMergeSource::Slot { slot, .. } => Some(slot.slot_id()),
                 SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
             })
             .collect();
@@ -6588,12 +6665,15 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             records_merged: 0,
             progress,
             stalled_src: None,
+            failed_src: None,
             demand: None,
-            source_file_id,
+            source_slot_id,
             slot_drained,
             last_src: None,
             last_predicted: None,
             ctx,
+            #[cfg(test)]
+            kind_for_test: None,
         }
     }
 
@@ -6611,7 +6691,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
     /// Mark `src` as having reached its end; a slot source's drain moves the
     /// frontier.
     fn on_source_end(&mut self, src: usize) {
-        if self.source_file_id[src].is_some() {
+        if self.source_slot_id[src].is_some() {
             self.slot_drained[src] = true;
             self.publish_frontier();
         }
@@ -6629,11 +6709,11 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         let first = self.last_src.is_none();
         self.last_src = Some(src);
         let Some(d) = &self.demand else { return };
-        let now = self.source_file_id[src];
+        let now = self.source_slot_id[src];
         if !first {
             d.stats().record_prediction(now == self.last_predicted);
         }
-        let next = runner_up_src.and_then(|s| self.source_file_id[s]);
+        let next = runner_up_src.and_then(|s| self.source_slot_id[s]);
         self.last_predicted = next;
         d.set_predicted(next);
     }
@@ -6658,13 +6738,13 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         }
     }
 
-    /// Publish the lowest undrained slot source's file id (slot sources come
+    /// Publish the lowest undrained slot source's slot id (slot sources come
     /// first, in `file_id` order). O(k), run only on a drain.
     fn publish_frontier(&self) {
         if let Some(d) = &self.demand {
             let frontier = (0..self.sources.len())
-                .find(|&i| self.source_file_id[i].is_some() && !self.slot_drained[i])
-                .and_then(|i| self.source_file_id[i]);
+                .find(|&i| self.source_slot_id[i].is_some() && !self.slot_drained[i])
+                .and_then(|i| self.source_slot_id[i]);
             d.set_frontier(frontier);
         }
     }
@@ -6684,7 +6764,9 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                 MergePhase::Priming { mut next, mut keys, mut rec } => {
                     let mut stalled = false;
                     while next < self.sources.len() {
-                        match self.sources[next].try_next_record(&mut rec, &self.ctx)? {
+                        let read = self.sources[next].try_next_record(&mut rec, &self.ctx);
+                        let read = read.inspect_err(|_| self.failed_src = Some(next))?;
+                        match read {
                             TryRead::WouldBlock => {
                                 stalled = true;
                                 self.stalled_src = Some(next);
@@ -6732,9 +6814,10 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                     if pending_refill && tree.winner_is_active() {
                         let winner = tree.winner();
                         let src = self.source_map[winner];
-                        match self.sources[src]
-                            .try_next_record(&mut self.records[winner], &self.ctx)?
-                        {
+                        let read =
+                            self.sources[src].try_next_record(&mut self.records[winner], &self.ctx);
+                        let read = read.inspect_err(|_| self.failed_src = Some(src))?;
+                        match read {
                             TryRead::WouldBlock => {
                                 self.stalled_src = Some(src);
                                 self.phase = MergePhase::Merging { tree, pending_refill: true };
@@ -6775,6 +6858,32 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
         }
     }
 
+    fn try_step_framed(&mut self, out: &mut Vec<u8>) -> Result<MergeStepFramed> {
+        match self.try_step()? {
+            MergeStep::Produced(_) => {}
+            MergeStep::Stalled => return Ok(MergeStepFramed::Stalled),
+            MergeStep::Done => return Ok(MergeStepFramed::Done),
+        }
+        // `Produced` defers the winner's refill to the next step, so the tree's
+        // winner is still the record just produced, with its key.
+        let MergePhase::Merging { tree, .. } = &self.phase else {
+            unreachable!("a produced record leaves the driver merging")
+        };
+        let winner = tree.winner();
+        let body = self.record_bytes(winner);
+        if K::EMBEDDED_IN_RECORD {
+            crate::spill_block::frame_embedded_record_into(out, body)?;
+        } else {
+            crate::spill_block::frame_keyed_record_into(out, tree.winner_key(), body)?;
+        }
+        Ok(MergeStepFramed::Produced)
+    }
+
+    #[cfg(test)]
+    fn key_kind(&self) -> Option<crate::SpillKeyKind> {
+        self.kind_for_test
+    }
+
     fn records_merged(&self) -> u64 {
         self.records_merged
     }
@@ -6791,6 +6900,93 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
             SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
         }
     }
+
+    fn failed_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
+        match self.sources.get(self.failed_src?)? {
+            SlotMergeSource::Slot { slot, .. } => Some(slot),
+            SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+        }
+    }
+}
+
+/// The merge-wide context of a kind-dispatched driver
+/// ([`merge_driver_for_kind`]): the class table for the queryname kinds, none
+/// for the rest.
+#[derive(Clone)]
+pub enum MergeCtxErased {
+    /// No context (coordinate and template kinds; a queryname kind then uses an
+    /// empty class table, which is correct, only slower).
+    None,
+    /// The sort's queryname class table.
+    Queryname(Arc<crate::QnClassTable>),
+}
+
+/// A merge driver over `slots` (spill runs, in run order) for runs written with
+/// `kind`, publishing its demand through `demand`: the dispatch from a run's
+/// recorded key kind to `MergeDriver<K>`. Queryname kinds merge on the class
+/// window ([`crate::QnMergeKey`]) with `ctx`'s table; the framing they write
+/// back is the embedded `[u32 len][body]` either way.
+#[must_use]
+pub fn merge_driver_for_kind(
+    kind: crate::SpillKeyKind,
+    slots: Vec<Arc<SortMergeSlot>>,
+    ctx: MergeCtxErased,
+    demand: Arc<crate::MergeDemand>,
+) -> Box<dyn MergeDriverDyn + Send> {
+    use crate::SpillKeyKind as Kind;
+    use crate::{QnKey, QnLex, QnMergeKey, QnNatural};
+    fn build<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>>(
+        slots: Vec<Arc<SortMergeSlot>>,
+        ctx: K::MergeCtx,
+        demand: Arc<crate::MergeDemand>,
+    ) -> Box<dyn MergeDriverDyn + Send> {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut d =
+            MergeDriver::<K, R>::from_slots(slots, MemorySources::Shared(Vec::new()), 0, ctx)
+                .with_demand(demand);
+        #[cfg(test)]
+        {
+            d.kind_for_test = Some(spill_kind_of::<K>());
+        }
+        Box::new(d)
+    }
+    let table = |ctx: MergeCtxErased| match ctx {
+        MergeCtxErased::Queryname(t) => t,
+        MergeCtxErased::None => crate::QnClassTable::new(),
+    };
+    match kind {
+        Kind::Coordinate => {
+            build::<crate::keys::RawCoordinateKey, crate::keys::RawCoordinateKey>(slots, (), demand)
+        }
+        Kind::QuerynameLex => build::<QnMergeKey<QnLex>, QnKey>(slots, table(ctx), demand),
+        Kind::QuerynameNatural => build::<QnMergeKey<QnNatural>, QnKey>(slots, table(ctx), demand),
+        Kind::TemplateK24 => build::<crate::TemplateKey24, crate::TemplateKey24>(slots, (), demand),
+        Kind::TemplateCb32 => build::<crate::CbKey32, crate::CbKey32>(slots, (), demand),
+        Kind::TemplateTert32 => build::<crate::TertKey32, crate::TertKey32>(slots, (), demand),
+        Kind::TemplateK40 => build::<crate::TemplateKey, crate::TemplateKey>(slots, (), demand),
+    }
+}
+
+/// The spill kind whose runs `K` merges, derived from the key type itself, so a
+/// dispatch arm instantiating the wrong key type is caught (tests).
+#[cfg(test)]
+fn spill_kind_of<K: 'static>() -> crate::SpillKeyKind {
+    use crate::SpillKeyKind as Kind;
+    use crate::{QnLex, QnMergeKey, QnNatural};
+    use std::any::TypeId;
+    let t = TypeId::of::<K>();
+    [
+        (TypeId::of::<crate::keys::RawCoordinateKey>(), Kind::Coordinate),
+        (TypeId::of::<QnMergeKey<QnLex>>(), Kind::QuerynameLex),
+        (TypeId::of::<QnMergeKey<QnNatural>>(), Kind::QuerynameNatural),
+        (TypeId::of::<crate::TemplateKey24>(), Kind::TemplateK24),
+        (TypeId::of::<crate::CbKey32>(), Kind::TemplateCb32),
+        (TypeId::of::<crate::TertKey32>(), Kind::TemplateTert32),
+        (TypeId::of::<crate::TemplateKey>(), Kind::TemplateK40),
+    ]
+    .into_iter()
+    .find_map(|(id, kind)| (id == t).then_some(kind))
+    .unwrap_or_else(|| panic!("no spill kind merges {}", std::any::type_name::<K>()))
 }
 
 #[cfg(test)]
@@ -12786,6 +12982,166 @@ mod from_slots_merge_tests {
         }
         assert_eq!(out, expected);
         assert_eq!(d.record_counts(), (n, 0), "every record borrowed, none assembled");
+    }
+}
+
+#[cfg(test)]
+mod kind_dispatch_tests {
+    //! `merge_driver_for_kind` and `try_step_framed`: the consolidation merge's
+    //! routing and its published demand.
+    use super::*;
+    use crate::{MergeDemand, SpillKeyKind, merge_slots::CONSOLIDATION_SLOT_IDS_START};
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn template_key(primary: u64) -> crate::TemplateKey {
+        crate::TemplateKey::new(
+            0,
+            primary as i32,
+            false,
+            i32::MAX,
+            i32::MAX,
+            false,
+            0,
+            0,
+            (0, false),
+            0,
+            false,
+        )
+    }
+
+    /// A slot (`file_id`, supply id `slot_id`) already holding `records` framed
+    /// as `TemplateKey` records in one decompressed block, at EOF: the
+    /// `fgumi-sort`-side twin of pipeline-io's `spill_fixtures::loaded_slot`.
+    fn loaded_slot_raw(file_id: u32, slot_id: u32, records: &[(u64, &[u8])]) -> Arc<SortMergeSlot> {
+        let mut raw = Vec::new();
+        for (k, body) in records {
+            crate::frame_keyed_record_into(&mut raw, &template_key(*k), body).unwrap();
+        }
+        let slot = Arc::new(
+            SortMergeSlot::new(
+                file_id,
+                Arc::new(tempfile::tempfile().unwrap()),
+                0,
+                0,
+                crate::SpillCodec::Zstd,
+            )
+            .with_slot_id(slot_id),
+        );
+        slot.bp_commit_read(1, true);
+        slot.bp_insert_drain_finalize(0, vec![raw], 1);
+        slot
+    }
+
+    /// Every kind is routed to its own key type: the driver's kind is derived
+    /// from the key type the arm instantiates (`spill_kind_of`), not echoed from
+    /// the request. Catches: a copy-pasted arm (e.g. `TemplateCb32` built as
+    /// `TemplateTert32`), which would merge with the wrong comparator and frame
+    /// the wrong key width.
+    #[rstest::rstest]
+    fn merge_driver_for_kind_dispatches_every_kind(
+        #[values(
+            SpillKeyKind::Coordinate,
+            SpillKeyKind::QuerynameLex,
+            SpillKeyKind::QuerynameNatural,
+            SpillKeyKind::TemplateK24,
+            SpillKeyKind::TemplateCb32,
+            SpillKeyKind::TemplateTert32,
+            SpillKeyKind::TemplateK40
+        )]
+        kind: SpillKeyKind,
+    ) {
+        let empty = |id| {
+            let s = Arc::new(SortMergeSlot::new(
+                id,
+                Arc::new(tempfile::tempfile().unwrap()),
+                0,
+                0,
+                crate::SpillCodec::Zstd,
+            ));
+            s.bp_commit_read(0, true);
+            s.bp_drain_and_finalize();
+            s
+        };
+        let ctx = if matches!(kind, SpillKeyKind::QuerynameLex | SpillKeyKind::QuerynameNatural) {
+            MergeCtxErased::Queryname(crate::QnClassTable::new())
+        } else {
+            MergeCtxErased::None
+        };
+        let mut d = merge_driver_for_kind(
+            kind,
+            vec![empty(0), empty(1)],
+            ctx,
+            Arc::new(MergeDemand::new()),
+        );
+        assert_eq!(d.key_kind(), Some(kind));
+        assert_eq!(d.try_step_framed(&mut Vec::new()).unwrap(), MergeStepFramed::Done);
+    }
+
+    /// A slot holding one queryname record named `name` (embedded framing), at
+    /// EOF.
+    fn queryname_slot(file_id: u32, name: &[u8]) -> Arc<SortMergeSlot> {
+        let body = fgumi_raw_bam::testutil::make_bam_bytes(-1, -1, 0x4, name, &[], 0, -1, -1, &[]);
+        let mut raw = Vec::new();
+        crate::frame_embedded_record_into(&mut raw, &body).unwrap();
+        let slot = Arc::new(SortMergeSlot::new(
+            file_id,
+            Arc::new(tempfile::tempfile().unwrap()),
+            0,
+            0,
+            crate::SpillCodec::Zstd,
+        ));
+        slot.bp_commit_read(1, true);
+        slot.bp_insert_drain_finalize(0, vec![raw], 1);
+        slot
+    }
+
+    /// The two queryname kinds merge with their own comparator: `read10` sorts
+    /// before `read9` lexicographically and after it naturally. Catches: the lex and
+    /// natural arms swapped (both frame records identically, so only the
+    /// merge order shows it).
+    #[rstest::rstest]
+    #[case::lexicographic(SpillKeyKind::QuerynameLex, b"read10")]
+    #[case::natural(SpillKeyKind::QuerynameNatural, b"read9")]
+    fn queryname_kinds_merge_with_their_own_comparator(
+        #[case] kind: SpillKeyKind,
+        #[case] first: &[u8],
+    ) {
+        let slots = vec![queryname_slot(0, b"read9"), queryname_slot(1, b"read10")];
+        let mut d = merge_driver_for_kind(
+            kind,
+            slots,
+            MergeCtxErased::Queryname(crate::QnClassTable::new()),
+            Arc::new(MergeDemand::new()),
+        );
+        let mut out = Vec::new();
+        assert_eq!(d.try_step_framed(&mut out).unwrap(), MergeStepFramed::Produced);
+        let name = fgumi_raw_bam::RawRecordView::new(&out[4..]).read_name().to_vec();
+        assert_eq!(name, first, "{kind:?}");
+    }
+
+    /// The consolidation driver publishes predictions by SLOT id (review r2 I3):
+    /// slots with file ids 0/1 but minted slot ids C/C+1; after the first record
+    /// (slot 0 wins, slot 1 is runner-up) the prediction is C+1. Catches: the
+    /// driver still publishing `file_id`, which collides after cascading.
+    #[test]
+    fn consolidation_driver_publishes_its_prediction() {
+        const C: u32 = CONSOLIDATION_SLOT_IDS_START;
+        let s0 = loaded_slot_raw(0, C, &[(1, b"a"), (2, b"b")]);
+        let s1 = loaded_slot_raw(1, C + 1, &[(3, b"c"), (4, b"d")]);
+        let demand = Arc::new(MergeDemand::new());
+        let mut d = merge_driver_for_kind(
+            SpillKeyKind::TemplateK40,
+            vec![s0, s1],
+            MergeCtxErased::None,
+            Arc::clone(&demand),
+        );
+        let mut out = Vec::new();
+        assert_eq!(d.try_step_framed(&mut out).unwrap(), MergeStepFramed::Produced);
+        assert_eq!(demand.predicted(), Some(C + 1));
+        assert_eq!(demand.frontier(), Some(C));
+        let mut want = Vec::new();
+        crate::frame_keyed_record_into(&mut want, &template_key(1), b"a").unwrap();
+        assert_eq!(out, want, "the winner framed with its key prefix");
     }
 }
 

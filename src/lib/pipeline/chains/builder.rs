@@ -624,6 +624,12 @@ pub struct ChainBuilder<'a> {
     /// `SortMerge` holds (test support).
     #[cfg(test)]
     merge_class_tables: Vec<(Arc<fgumi_sort::QnClassTable>, Option<Arc<fgumi_sort::QnClassTable>>)>,
+    /// The class table the sort's `ConsolidateRuns` holds (test support).
+    #[cfg(test)]
+    consolidation_class_table: Option<Arc<fgumi_sort::QnClassTable>>,
+    /// The sort's phase caps, `[phase1, phase2]` (test support).
+    #[cfg(test)]
+    sort_caps: [Option<Arc<fgumi_pipeline_core::PhaseCap>>; 2],
 
     /// `HeaderHandle` stashed by [`Self::add_align`] for consumption by
     /// [`Self::add_sink`].
@@ -739,6 +745,20 @@ pub struct ChainBuilder<'a> {
     /// header-only output behind. Declared last so it drops after `pipeline`,
     /// whose sinks flush their buffered header bytes on drop.
     created_outputs: CreatedOutputs,
+}
+
+/// The `--max-temp-files` consolidation tail's shared state, present only when
+/// the resolved limit can trigger
+/// ([`consolidation_can_trigger`](fgumi_pipeline_io::sort::consolidation_can_trigger)).
+struct ConsolidationTail {
+    /// `WriteConsolidatedRun` reports job completion here; `SpillWrite` waits on it.
+    registry: Arc<fgumi_pipeline_io::sort::ConsolidationRegistry>,
+    /// The consolidation merge's demand (awaited and predicted slots).
+    demand: Arc<fgumi_sort::MergeDemand>,
+    /// Set by the planner at `AllAnnounced`: no consolidation can start after it.
+    all_announced: Arc<std::sync::atomic::AtomicBool>,
+    /// The supply steps' cap: phase 1 while consolidation can run, phase 2 after.
+    phased: Option<Arc<fgumi_pipeline_core::PhasedCap>>,
 }
 
 /// The output files a chain build has created, removed on drop unless the
@@ -876,6 +896,10 @@ impl<'a> ChainBuilder<'a> {
             refill_hints: Vec::new(),
             #[cfg(test)]
             merge_class_tables: Vec::new(),
+            #[cfg(test)]
+            consolidation_class_table: None,
+            #[cfg(test)]
+            sort_caps: [None, None],
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -2115,7 +2139,7 @@ impl<'a> ChainBuilder<'a> {
             Arc::clone(&ledger),
             byte_limit,
         )
-        .with_phase_cap(caps.phase1);
+        .with_step_cap(caps.phase1.map(fgumi_pipeline_core::StepCap::from));
         if let Some(h) = hist {
             pread = pread.with_hist(h);
         }
@@ -2746,7 +2770,6 @@ impl<'a> ChainBuilder<'a> {
                 self.finalize.push(Box::new(
                     crate::pipeline::chains::commands::sort::SortPhaseTimingFinalizeHook {
                         stats: std::sync::Arc::clone(&s),
-                        spill_stats: self.sort_spill_stats.clone(),
                     },
                 ));
             }
@@ -2782,6 +2805,10 @@ impl<'a> ChainBuilder<'a> {
             finalize_on_success: self.finalize_on_success,
             #[cfg(test)]
             merge_class_tables: self.merge_class_tables,
+            #[cfg(test)]
+            consolidation_class_table: self.consolidation_class_table,
+            #[cfg(test)]
+            sort_caps: self.sort_caps,
         })
     }
 
@@ -3749,6 +3776,10 @@ impl<'a> ChainBuilder<'a> {
             // separate counters. An unset flag creates no cap at all: no step is
             // capped, none reports a cap on the DAG or in the summary.
             let SortCaps { phase1: phase1_cap, phase2: phase2_cap } = caps;
+            #[cfg(test)]
+            {
+                self.sort_caps = [phase1_cap.clone(), phase2_cap.clone()];
+            }
             if self.detached_writer {
                 // Standalone-sort terminal only (the flag is set above under
                 // exactly that condition): the output compressor is phase-2 work.
@@ -3783,7 +3814,7 @@ impl<'a> ChainBuilder<'a> {
             // Resolve `--max-temp-files`: `Auto` resolves against the host
             // `RLIMIT_NOFILE` (one snapshot), matching the standalone
             // `Sort::resolved_max_temp_files`. The `SpillWrite` step enforces it
-            // (`with_max_temp_files` below) on every Phase-1 head.
+            // (`with_consolidation` below) on every Phase-1 head.
             let resolved_max_temp_files = match sort.max_temp_files {
                 crate::commands::common::MaxTempFiles::Auto => {
                     fgumi_sort::temp_file_limit_from_nofile(fgumi_sort::soft_nofile())
@@ -3812,6 +3843,29 @@ impl<'a> ChainBuilder<'a> {
             // participant the same pair.
             let supply = SpillSupply::new();
             let merge_demand = Arc::clone(&supply.demand);
+            // `--max-temp-files` consolidation runs through its own tail
+            // (planner branch 2 → `ConsolidateRuns` → a second
+            // `SpillBlockCompress` → `WriteConsolidatedRun`), present only when
+            // the resolved limit can trigger. The CLI limit is always at least 2,
+            // so every CLI sort has it; only `SortOptions` with a limit of 1 omit
+            // it. Consolidation reads, decompression and compression are phase-1
+            // work: the supply steps admit through a phased cap that the planner
+            // switches to the phase-2 cap at `AllAnnounced` (no job can be in
+            // flight then).
+            let consolidation = fgumi_pipeline_io::sort::consolidation_can_trigger(
+                resolved_max_temp_files,
+            )
+            .then(|| ConsolidationTail {
+                registry: fgumi_pipeline_io::sort::ConsolidationRegistry::new(),
+                demand: Arc::new(fgumi_sort::MergeDemand::new()),
+                all_announced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                phased: fgumi_pipeline_core::PhasedCap::new(phase1_cap.clone(), phase2_cap.clone()),
+            });
+            // The cap the three planner-fed supply steps admit through.
+            let supply_cap: Option<fgumi_pipeline_core::StepCap> = match &consolidation {
+                Some(tail) => tail.phased.clone().map(fgumi_pipeline_core::StepCap::Phased),
+                None => phase2_cap.clone().map(fgumi_pipeline_core::StepCap::Fixed),
+            };
             // The merge supply: `SpillReadPlanner` (pool Serial) plans byte-range
             // reads of the spill files from the merge's demand and a read-ahead
             // budget derived from `--max-memory`; `PreadSpillSlices` performs
@@ -3864,10 +3918,19 @@ impl<'a> ChainBuilder<'a> {
                 Arc::clone(&spill_slices),
             )
             .with_read_streams(Arc::clone(&spill_policy))
-            .with_sort_stats(sort.sort_stats);
+            .with_sort_stats(sort.sort_stats)
+            .with_phase1_threads(phases.phase1);
+            let planner = match &consolidation {
+                Some(tail) => planner.with_consolidation(
+                    Arc::clone(&tail.demand),
+                    Arc::clone(&tail.all_announced),
+                    tail.phased.clone(),
+                ),
+                None => planner,
+            };
             #[cfg(test)]
             {
-                self.spill_inflight_slices = Some(planner.max_inflight_slices());
+                self.spill_inflight_slices = Some(planner.merge_max_inflight_slices());
                 self.spill_eligible_clones = Some(spill_eligible);
             }
             // Phase-2 cap (`--merge-threads`): bounds concurrent spill reads and
@@ -3875,13 +3938,23 @@ impl<'a> ChainBuilder<'a> {
             let mut pread = fgumi_pipeline_io::pread::PreadSlices::spill(
                 Arc::clone(&spill_slices),
                 self.tuning.per_step_byte_limit,
-            )
-            .with_phase_cap(phase2_cap.clone());
+            );
+            if let Some(cap) = &supply_cap {
+                pread = pread.with_step_cap(cap.clone());
+            }
             if let Some(h) = &spill_hist {
                 pread = pread.with_hist(Arc::clone(h));
             }
-            let decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit, &supply)
-                .with_phase_cap(phase2_cap.clone());
+            let mut decompress = SortSpillDecompress::new(self.tuning.per_step_byte_limit, &supply);
+            if let Some(cap) = &supply_cap {
+                decompress = decompress.with_step_cap(cap.clone());
+            }
+            if let Some(tail) = &consolidation {
+                decompress = decompress.with_consolidation_demand(
+                    Arc::clone(&tail.demand),
+                    Arc::clone(&tail.all_announced),
+                );
+            }
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -4087,7 +4160,7 @@ impl<'a> ChainBuilder<'a> {
                 // compress instead of being allocated per block.
                 let spill_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();
                 let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit)
-                    .with_phase_cap(phase1_cap.clone())
+                    .with_step_cap(phase1_cap.clone().map(fgumi_pipeline_core::StepCap::from))
                     .with_buf_pool(Arc::clone(&spill_bufs));
                 // `--max-temp-files` bounds the live spill runs: `SpillWrite`
                 // consolidates runs (at the spill compression level) whenever the
@@ -4098,9 +4171,13 @@ impl<'a> ChainBuilder<'a> {
                     self.sort_spill_stats = Some(Arc::clone(&spill_stats));
                 }
                 let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs)
-                    .with_max_temp_files(resolved_max_temp_files, temp_compression)
                     .with_stats(spill_stats)
                     .with_buf_pool(spill_bufs);
+                let write = match &consolidation {
+                    Some(tail) => write
+                        .with_consolidation(resolved_max_temp_files, Arc::clone(&tail.registry)),
+                    None => write,
+                };
                 // Lever 2, Phase-1 analogue: on the standalone-sort terminal,
                 // detach the spill writer onto its own dedicated thread as well,
                 // so the single serial spill-write stream stops occupying a pool
@@ -4121,6 +4198,49 @@ impl<'a> ChainBuilder<'a> {
             let pread_tail = self.pipeline.append_step(pread, planner_tail);
             let decompress_tail = self.pipeline.append_step(decompress, pread_tail);
             let merge_input = (planner_tail.0, BranchIdx(1));
+            // Branch 2: the consolidation tail, or a sink that refuses a job
+            // when the limit cannot trigger (`SpillWrite` then starts none).
+            let jobs = (planner_tail.0, BranchIdx(2));
+            match &consolidation {
+                Some(tail) => {
+                    use fgumi_pipeline_io::sort::{ConsolidateRuns, WriteConsolidatedRun};
+                    let byte_limit = self.tuning.per_step_byte_limit;
+                    // One buffer pool for the tail: raw blocks go
+                    // `ConsolidateRuns` → compressor → pool, compressed ones
+                    // compressor → writer → pool (the phase-1 spill path's
+                    // pattern), so neither is allocated per block.
+                    let tail_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();
+                    let consolidate =
+                        ConsolidateRuns::new(fgumi_bgzf::BGZF_MAX_BLOCK_SIZE, byte_limit)
+                            .with_buf_pool(Arc::clone(&tail_bufs))
+                            .with_merge_demand(Arc::clone(&tail.demand))
+                            .with_supply_ledger(Arc::clone(&supply.ledger))
+                            .with_class_table(Arc::clone(&qn_keys.table));
+                    #[cfg(test)]
+                    {
+                        self.consolidation_class_table =
+                            consolidate.class_table_for_test().cloned();
+                    }
+                    let mut compress =
+                        SpillBlockCompress::new(sort.temp_codec, sort.temp_compression, byte_limit)
+                            .named("SpillBlockCompressConsolidation")
+                            .with_buf_pool(Arc::clone(&tail_bufs));
+                    if let Some(p) = &tail.phased {
+                        compress = compress
+                            .with_step_cap(fgumi_pipeline_core::StepCap::Phased(Arc::clone(p)));
+                    }
+                    let t = self.pipeline.append_step(consolidate, jobs);
+                    let t = self.pipeline.append_step(compress, t);
+                    self.pipeline.append_step(
+                        WriteConsolidatedRun::new(sort.temp_codec, Arc::clone(&tail.registry))
+                            .with_buf_pool(tail_bufs),
+                        t,
+                    );
+                }
+                None => {
+                    self.pipeline.append_step(fgumi_pipeline_io::sort::NoConsolidation, jobs);
+                }
+            }
             // While the merge is starved, pool workers walk the spill supply
             // (`SortSpillDecompress` and the steps before it) before the steps
             // after it, such as the output compressor — the merge parks on a
@@ -7233,6 +7353,10 @@ mod tests {
             refill_hints: Vec::new(),
             #[cfg(test)]
             merge_class_tables: Vec::new(),
+            #[cfg(test)]
+            consolidation_class_table: None,
+            #[cfg(test)]
+            sort_caps: [None, None],
             pending_header_handle: None,
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
@@ -7859,6 +7983,48 @@ mod tests {
         assert!(Arc::ptr_eq(sort, merge), "{order:?}: one table for the sort and its merge");
     }
 
+    /// Consolidation merges queryname jobs against the sort's own class table,
+    /// the one the final merge holds. Catches: a second table minted for the
+    /// consolidation tail.
+    #[test]
+    fn consolidation_shares_the_sort_class_table() {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(4) };
+            let sort = spec.stage_opts.sort.as_mut().unwrap();
+            sort.order = crate::commands::sort::SortOrderArg::Queryname;
+            sort.max_temp_files = crate::commands::common::MaxTempFiles::Fixed(2);
+        });
+        let c = built.consolidation_class_table.as_ref().expect("tail present");
+        let (sort, m) = &built.merge_class_tables[0];
+        let m = m.as_ref().expect("queryname merge");
+        assert!(Arc::ptr_eq(c, m), "one class table for consolidation and the final merge");
+        assert!(Arc::ptr_eq(c, sort));
+    }
+
+    /// The phased arms are the sort's own caps, shared by pointer. Catches: a
+    /// second `PhaseCap` minted for consolidation (two counters for one phase).
+    #[test]
+    fn consolidation_supply_uses_the_sort_phase_caps() {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(8) };
+            let sort = spec.stage_opts.sort.as_mut().unwrap();
+            sort.sort_threads = Some(1);
+            sort.merge_threads = Some(4);
+        });
+        let [c1, c2] = &built.sort_caps;
+        let (c1, c2) = (c1.as_ref().unwrap(), c2.as_ref().unwrap());
+        for step in ["PreadSpillSlices", "SortSpillDecompress", "SpillBlockCompressConsolidation"] {
+            let arms: Vec<*const fgumi_pipeline_core::PhaseCap> = built
+                .pipeline
+                .phase_caps()
+                .iter()
+                .filter(|(n, _)| *n == step)
+                .map(|(_, c)| std::ptr::from_ref(*c))
+                .collect();
+            assert_eq!(arms, [Arc::as_ptr(c1), Arc::as_ptr(c2)], "{step}");
+        }
+    }
+
     /// The step names strictly between `InflateToArena` and `SpillGather` in a
     /// rendered sort DAG: the order's in-memory sort front.
     fn front_steps(dag: &str) -> Vec<String> {
@@ -7944,7 +8110,7 @@ mod tests {
     #[test]
     fn sort_chain_gating_matches_the_table() {
         // (name, kind, output branches, gated branches)
-        const TABLE: [(&str, &str, usize, usize); 17] = [
+        const TABLE: [(&str, &str, usize, usize); 20] = [
             ("PlanInputReads", "Serial", 1, 1),
             ("PreadInputSlices", "Parallel", 1, 1),
             ("FrameBgzfBlocks", "Serial", 1, 1),
@@ -7956,9 +8122,12 @@ mod tests {
             ("SpillGather", "Detached", 1, 1),
             ("SpillBlockCompress", "Parallel", 1, 1),
             ("SpillWrite", "Detached", 1, 1),
-            ("SpillReadPlanner", "Serial", 2, 2),
+            ("SpillReadPlanner", "Serial", 3, 3),
             ("PreadSpillSlices", "Parallel", 1, 1),
             ("SortSpillDecompress", "Parallel", 0, 0),
+            ("ConsolidateRuns", "Detached", 1, 1),
+            ("SpillBlockCompressConsolidation", "Parallel", 1, 1),
+            ("WriteConsolidatedRun", "Detached", 0, 0),
             ("SortMerge", "Detached", 1, 1),
             ("BgzfCompress", "Parallel", 1, 1),
             ("WriteBgzfFile", "Detached", 0, 0),
@@ -8374,7 +8543,8 @@ mod tests {
 
     /// `add_sort` fans the planner out: read requests (branch 0) to
     /// `PreadSpillSlices → SortSpillDecompress` (a leaf), phase events
-    /// (branch 1) to `SortMerge`, in both stage positions.
+    /// (branch 1) to `SortMerge`, consolidation jobs (branch 2) to
+    /// `ConsolidateRuns`, in both stage positions.
     #[rstest::rstest]
     #[case::terminal(vec![Stage::Sort], "BgzfCompress")]
     #[case::intermediate(vec![Stage::Sort, Stage::Group], "DecodeFromRecords")]
@@ -8399,9 +8569,11 @@ mod tests {
             lines[start..end].join("\n")
         };
         let planner = block("SpillReadPlanner");
-        assert!(planner.contains("branches=2"), "{planner}");
+        assert!(planner.contains("branches=3"), "{planner}");
         assert!(planner.contains(".0: ") && planner.contains("→ PreadSpillSlices"), "{planner}");
         assert!(planner.contains(".1: ") && planner.contains("→ SortMerge"), "{planner}");
+        // Branch 2: the consolidation tail (the CLI limit can always trigger).
+        assert!(planner.contains(".2: ") && planner.contains("→ ConsolidateRuns"), "{planner}");
         assert!(block("PreadSpillSlices").contains("→ SortSpillDecompress"), "{dag}");
         let decompress = block("SortSpillDecompress");
         assert!(decompress.contains("branches=0 (sink)"), "{decompress}");

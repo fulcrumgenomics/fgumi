@@ -1605,7 +1605,8 @@ pub enum MemoryReserve {
     Fixed(usize),
 }
 
-/// How many spilled runs may accumulate before the oldest are consolidated.
+/// How many spilled runs may be live at once before adjacent runs are
+/// consolidated (merged into one).
 ///
 /// Mirrors [`MemoryLimit`]: both are host-derived resource budgets, so both are
 /// spelled with an explicit `auto` rather than inferred from the flag's absence.

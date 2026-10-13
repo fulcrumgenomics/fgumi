@@ -73,9 +73,6 @@ pub mod ref_sort;
 // Per-order run boundary key for the arena spill run-former (extend-vs-new-run
 // decision). Surfaced via the re-export below.
 pub(crate) mod run_bound;
-// Cooperative consolidation of arena spill runs (`--max-temp-files`). Surfaced
-// via the re-export below.
-pub(crate) mod run_consolidate;
 pub mod segmented_buf;
 pub mod sort_pool;
 pub mod template_arena;
@@ -252,9 +249,10 @@ pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
 pub use external::MemorySources;
 pub use external::{
-    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, MergeDriver, MergeDriverDyn, MergeStep,
-    RawExternalSorter, ReadStreams, TemplateKeyVariant, cb_hasher, create_sort_temp_dirs,
-    extract_template_key_inline, format_thread_counts, open_spill_slot,
+    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, MergeCtxErased, MergeDriver, MergeDriverDyn,
+    MergeStep, MergeStepFramed, RawExternalSorter, ReadStreams, TemplateKeyVariant, cb_hasher,
+    create_sort_temp_dirs, extract_template_key_inline, format_thread_counts,
+    merge_driver_for_kind, open_spill_slot, open_spill_slot_as,
 };
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
@@ -276,7 +274,9 @@ pub use merge_demand::{
     AwaitedSlotState, HotIds, MAX_HOT_IDS, MergeDemand, MergeDemandSnapshot, MergeDemandStats,
     MergePoolRequest,
 };
-pub use merge_slots::{ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot};
+pub use merge_slots::{
+    CONSOLIDATION_SLOT_IDS_START, ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot,
+};
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use queryname_ref::{
     QN_CLASS_BATCH_RECORDS, QN_MAX_CLASSES, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,
@@ -292,14 +292,11 @@ pub use ref_sort::{
     radix_sorts_in_parallel,
 };
 pub use run_bound::{RunBound, format_run_formation};
-pub use run_consolidate::{
-    RunMergeProgress, RunMergeSpec, RunMergerDyn, SpillKeyKind, new_run_merger,
-};
 pub use segmented_buf::SegmentedBuf;
 pub use sort_pool::BoundedSortPool;
 pub use spill_block::{
-    SpillBlockCompressor, frame_embedded_record_into, frame_keyed_record_into, spill_magic,
-    spill_trailer,
+    SpillBlockCompressor, SpillKeyKind, frame_embedded_record_into, frame_keyed_record_into,
+    spill_magic, spill_trailer,
 };
 pub use spill_block_reader::{RawBlock, SpillBlockDecompressor};
 pub use template_arena::{

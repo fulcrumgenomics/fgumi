@@ -251,7 +251,7 @@ fn cold_inflight_and_slice_caps_are_respected() {
     assert_eq!(f.ledger.inflight_cold_bytes(), COLD_INFLIGHT_BYTES);
 
     let mut f = fixture(&lens, 2, 1);
-    assert_eq!(f.planner.max_inflight_slices(), 4);
+    assert_eq!(f.planner.merge_max_inflight_slices(), 4);
     let reqs = f.planner.plan_pass_for_test();
     assert_eq!(reqs.len(), 4, "2 phase-2 threads → 4 outstanding slices");
     assert!(f.planner.plan_pass_for_test().is_empty());
@@ -526,7 +526,7 @@ fn cold_slot_fifo_stops_at_8_hot_at_32() {
     }
     // Saturate the outstanding-slice cap so the cold rotation visits no slot:
     // only the demotion itself can lower slot 1's cap.
-    f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.max_inflight_slices());
+    f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.merge_max_inflight_slices());
     await_file(&f.demand, 2);
     assert!(f.planner.plan_pass_for_test().is_empty(), "no read: the slice cap binds");
     assert_eq!(caps(&f), vec![8, 8, 32], "the former hot slot is demoted on the next pass");
@@ -575,4 +575,93 @@ fn the_hot_fifo_cap_is_granted_only_from_the_pool() {
     }
     let _ = f.planner.plan_pass_for_test();
     assert_eq!(f.slots[1].fifo_cap(), 32, "granted from the released charge");
+}
+
+/// Review r2 I6: a hard error, not a `debug_assert`.
+#[test]
+fn all_announced_with_a_job_in_flight_is_an_error() {
+    use crate::sort::protocol::ConsolidationInput;
+    use crate::sort::spill_fixtures::write_run_file;
+    use fgumi_pipeline_core::step::StepOutcome;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let dir = tempfile::TempDir::new().unwrap();
+    let inputs: Vec<ConsolidationInput> = (0..2u32)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}"));
+            let len = write_run_file(&path, SpillCodec::Zstd, i, 0..5);
+            ConsolidationInput { file_id: i, path, len }
+        })
+        .collect();
+    let supply = SpillSupply::new();
+    let mut pl = planner(64 << 20, 2, 2, &supply).with_consolidation(
+        Arc::new(MergeDemand::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    );
+    let probe = StepProbe::new(&pl);
+    probe.push_input(SortPhase1Event::ConsolidationStart {
+        job_id: 9,
+        inputs,
+        key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+    });
+    probe.push_input(SortPhase1Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    let err = loop {
+        match probe.try_run(&mut pl) {
+            Ok(StepOutcome::Finished) => panic!("finished without the error"),
+            Ok(_) => {}
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "AllAnnounced arrived with consolidation job 9 in flight");
+}
+
+/// Review I4 (r1): consolidation slots plan under their job budget before the
+/// merge budget exists. Catches: `top_up` returning early on `budget == None`.
+#[test]
+fn planner_plans_consolidation_reads_before_any_merge_budget_exists() {
+    use crate::sort::protocol::{ConsolidationInput, ConsolidationJob};
+    use crate::sort::spill_fixtures::write_run_file;
+    use fgumi_pipeline_core::step::InputHandle;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let dir = tempfile::TempDir::new().unwrap();
+    let inputs: Vec<ConsolidationInput> = (0..2u32)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}"));
+            let len = write_run_file(&path, SpillCodec::Zstd, i, 0..500);
+            ConsolidationInput { file_id: i, path, len }
+        })
+        .collect();
+    let supply = SpillSupply::new();
+    let mut pl = planner(64 << 20, 2, 2, &supply).with_consolidation(
+        Arc::new(MergeDemand::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    );
+    let mut probe = StepProbe::new(&pl);
+    let reads = probe.take_output::<ReadRequest>(0);
+    let jobs = probe.take_output::<ConsolidationJob>(2);
+    probe.push_input(SortPhase1Event::ConsolidationStart {
+        job_id: 1,
+        inputs,
+        key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+    });
+    for _ in 0..4 {
+        probe.try_run(&mut pl).unwrap();
+    }
+    assert!(pl.merge_budget_for_test().is_none());
+    let job = jobs.pop().expect("job forwarded on branch 2");
+    let mut targets = Vec::new();
+    while let Some(r) = reads.pop() {
+        assert!(matches!(class(&r), SpillClass::ConsolidationHot | SpillClass::ConsolidationCold));
+        let ReadTarget::Spill { slot, .. } = r.target else { panic!() };
+        targets.push(slot.slot_id());
+    }
+    for s in &job.slots {
+        assert!(targets.contains(&s.slot_id()), "slot {} got no read", s.slot_id());
+    }
 }

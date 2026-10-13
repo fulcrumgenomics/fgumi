@@ -731,7 +731,7 @@ fn absorb_phase2_event(
 ) -> io::Result<()> {
     match event {
         SortPhase2Event::SpillReady { slot, path: _, records_ingested_so_far } => {
-            if let std::collections::hash_map::Entry::Vacant(e) = slot_index.entry(slot.file_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = slot_index.entry(slot.slot_id()) {
                 e.insert(slots.len());
                 slots.push(slot);
             }
@@ -908,10 +908,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
 /// [`fgumi_sort::ClaimedBlock::decompress_and_publish`] a `SortSpillDecompress`
 /// worker uses (same claim admission, same publish), and never reads the spill
 /// file.
-struct SelfServe<'a> {
-    decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
-    ledger: Option<&'a super::supply_ledger::SupplyLedger>,
-    window_budget: u64,
+pub(crate) struct SelfServe<'a> {
+    pub(crate) decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
+    pub(crate) ledger: Option<&'a super::supply_ledger::SupplyLedger>,
+    pub(crate) window_budget: u64,
 }
 
 impl SelfServe<'_> {
@@ -926,7 +926,7 @@ impl SelfServe<'_> {
     /// # Errors
     /// A decompress failure: the slot is marked failed first, and the error
     /// names the slot as the merge's own failed-slot error does.
-    fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
+    pub(crate) fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
         let mut served = 0u64;
         loop {
             if let Some(block) = slot.bp_claim_raw(self.window_budget) {
@@ -1956,8 +1956,8 @@ impl<O: MergeOutput> Step for SortMerge<O> {
         SPECS
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.fast_path_cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.fast_path_cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {

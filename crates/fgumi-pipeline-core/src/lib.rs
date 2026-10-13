@@ -40,7 +40,10 @@ pub mod topology;
 #[cfg(test)]
 mod tests;
 
-pub use admission::{CapPermit, CapWaker, MAX_PHASE_CAPS, PhaseCap, WholeCap, admit_input};
+pub use admission::{
+    CapPermit, CapPhase, CapWaker, MAX_PHASE_CAPS, PhaseCap, PhasedCap, StepCap, StepCapRef,
+    WholeCap, admit_input,
+};
 pub use builder::{
     BuildError, Chain, DEFAULT_DEADLOCK_TIMEOUT_SECS, InstrumentationLevel, MultiChain2,
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,

@@ -184,6 +184,48 @@ fn a_sort_spilling_more_runs_than_the_descriptor_limit_completes() {
     );
 }
 
+/// Retired runs close their descriptors (review r1 B1). With limit 2 the sort
+/// cascades through every run; under `ulimit -n 24` a leak of one descriptor per
+/// retired slot exhausts the limit long before the end. Catches: a file kept
+/// alive by any supply map after its consolidation job retired.
+#[cfg(unix)]
+#[test]
+fn consolidation_holds_a_bounded_number_of_descriptors() {
+    const DESCRIPTOR_LIMIT: u64 = 24;
+    let dir = TempDir::new().expect("tempdir");
+    let input = write_fixture(dir.path(), 80_000);
+    // The reference never consolidates, so the identity check below compares
+    // a cascading sort against a plain merge, not consolidation against itself.
+    let (reference, log) =
+        sort(&input, dir.path(), "reference", "template-coordinate", "2", UNBOUNDED, &[]);
+    assert!(!log.contains("Consolidating "), "the reference must not consolidate:\n{log}");
+    let runs = logged_count(&log, "Spill runs:").expect("the fixture must spill");
+    assert!(runs > DESCRIPTOR_LIMIT, "only {runs} runs: the descriptor limit would not bind");
+    let output = dir.path().join("bounded.bam");
+    let script = format!(
+        "ulimit -n {DESCRIPTOR_LIMIT} && exec \"$0\" sort -i \"$1\" -o \"$2\" --order \
+         template-coordinate --threads 2 --max-temp-files 2 --max-memory 64K \
+         --memory-per-thread false"
+    );
+    let result = Command::new("sh")
+        .args(["-c", &script, env!("CARGO_BIN_EXE_fgumi")])
+        .arg(&input)
+        .arg(&output)
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("run fgumi sort");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "sort failed under ulimit -n {DESCRIPTOR_LIMIT}:\n{stderr}");
+    assert!(
+        logged_count(&stderr, "Consolidations:").unwrap_or(0) >= runs - 1,
+        "every run after the first cascades:\n{stderr}"
+    );
+    assert!(
+        decompressed_records_without_pg(&output) == decompressed_records_without_pg(&reference),
+        "bounded sort changed the output"
+    );
+}
+
 /// In a fused chain the spill writer is a pool-scheduled step rather than the
 /// standalone sort's dedicated thread; consolidation must behave the same there.
 #[test]

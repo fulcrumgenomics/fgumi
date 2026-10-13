@@ -193,7 +193,10 @@ fn consecutive_blocks_reuse_one_compressor_and_stay_independent(#[case] codec: S
 fn capped_step_follows_the_admission_contract() {
     fgumi_pipeline_core::testing::assert_admission_contract(
         "sort-phase1",
-        |cap| SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).with_phase_cap(cap),
+        |cap| {
+            SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20)
+                .with_step_cap(cap.map(fgumi_pipeline_core::StepCap::from))
+        },
         SpillBlockEvent::AllAnnounced {
             ordinal: 0,
             slot_count: 0,

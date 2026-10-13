@@ -374,6 +374,51 @@ pub enum SortPhase1Event {
     /// Sentinel emitted as the LAST event by the Phase-1 producer
     /// (`SpillWrite`) on its drained-completion path.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
+    /// `SpillWrite` asks for `inputs` (a contiguous range of live runs, in run
+    /// order) to be merged into one run. The read planner opens the inputs as
+    /// slots and forwards a [`ConsolidationJob`]; `WriteConsolidatedRun` creates
+    /// the merged run at the path `SpillWrite` registered for the job
+    /// (`ConsolidationRegistry::begin`, the one place the path is carried) and
+    /// reports completion through the registry.
+    ConsolidationStart { job_id: u32, inputs: Vec<ConsolidationInput>, key_kind: SpillKeyKind },
+    /// Job `job_id` completed and its inputs were unlinked: the read planner
+    /// retires the job's slots, so every supply map releases them (closing their
+    /// files) within one pass. Unlinking while a slot still holds the file open
+    /// is safe on the Unix targets.
+    ConsolidationRetire { job_id: u32 },
+}
+
+/// One input run of a consolidation job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsolidationInput {
+    /// The run's merge-order identity.
+    pub file_id: u32,
+    /// The run's file.
+    pub path: PathBuf,
+    /// The run's size on disk.
+    pub len: u64,
+}
+
+/// A consolidation job as the read planner forwards it to `ConsolidateRuns`:
+/// the inputs opened as slots (in run order, under fresh slot ids) whose reads
+/// the planner plans.
+pub struct ConsolidationJob {
+    /// The job, as `SpillWrite` numbered it.
+    pub job_id: u32,
+    /// The input slots, in run order.
+    pub slots: Vec<Arc<SortMergeSlot>>,
+    /// The key type the inputs were written with.
+    pub key_kind: SpillKeyKind,
+    /// Each input's path, by slot index (for error messages only).
+    pub input_paths: Vec<PathBuf>,
+}
+
+impl HeapSize for ConsolidationJob {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.slots.len() * std::mem::size_of::<Arc<SortMergeSlot>>()
+            + self.input_paths.iter().map(|p| p.as_os_str().len()).sum::<usize>()
+    }
 }
 
 /// Events from `SortSpillDecompress` → `SortMerge`.
@@ -395,7 +440,7 @@ pub enum SortPhase2Event {
 /// Phase-2 (`SortMerge`) input. This macro removes the duplicated impl bodies without
 /// collapsing the two types.
 macro_rules! impl_spill_phase_event {
-    ($ty:ty) => {
+    ($ty:ty $(, $job:ident, $retire:ident)?) => {
         impl HeapSize for $ty {
             fn heap_size(&self) -> usize {
                 // Charge a fixed per-event base so the byte-bounded transport queues
@@ -407,25 +452,34 @@ macro_rules! impl_spill_phase_event {
                     Self::SpillReady { path, .. } => base + path.as_os_str().len(),
                     Self::MemoryChunk { chunk, .. } => base + chunk.approx_heap_bytes(),
                     Self::AllAnnounced { .. } => base,
+                    $(Self::$job { inputs, .. } => {
+                        base + inputs
+                                .iter()
+                                .map(|i| std::mem::size_of::<ConsolidationInput>() + i.path.as_os_str().len())
+                                .sum::<usize>()
+                    }
+                    Self::$retire { .. } => base,)?
                 }
             }
         }
 
         impl $ty {
-            /// Running snapshot of records ingested at the moment this event was emitted.
+            /// Running snapshot of records ingested at the moment this event was
+            /// emitted (`0` for the consolidation events, which ingest nothing).
             #[must_use]
             pub fn records_ingested_so_far(&self) -> u64 {
                 match self {
                     Self::SpillReady { records_ingested_so_far, .. }
                     | Self::MemoryChunk { records_ingested_so_far, .. } => *records_ingested_so_far,
                     Self::AllAnnounced { total_records, .. } => *total_records,
+                    $(Self::$job { .. } | Self::$retire { .. } => 0,)?
                 }
             }
         }
     };
 }
 
-impl_spill_phase_event!(SortPhase1Event);
+impl_spill_phase_event!(SortPhase1Event, ConsolidationStart, ConsolidationRetire);
 impl_spill_phase_event!(SortPhase2Event);
 
 #[cfg(test)]

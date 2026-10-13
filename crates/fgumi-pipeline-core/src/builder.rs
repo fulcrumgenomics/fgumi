@@ -643,8 +643,7 @@ impl PipelineBuilder {
             }
         }
         // A worker notes the caps it is recorded on in one 64-bit mask.
-        let caps =
-            crate::admission::distinct_caps(inner.steps.iter().filter_map(|s| s.phase_cap()));
+        let caps = crate::admission::distinct_caps(inner.steps.iter().flat_map(|s| s.bound_caps()));
         if caps.len() > crate::MAX_PHASE_CAPS {
             return Err(BuildError::TooManyPhaseCaps { caps: caps.len() });
         }
@@ -1140,7 +1139,7 @@ impl Pipeline {
     }
 
     /// Every capped step in chain order, as `(step name, its cap)`. Steps
-    /// without a [`crate::Step::phase_cap`] are skipped. The caps are the live
+    /// without a [`crate::Step::step_cap`] are skipped. The caps are the live
     /// shared counters, so tests can check which steps share one (compare the
     /// references with [`std::ptr::eq`]) or probe them with
     /// [`crate::PhaseCap::try_acquire`]. Test support only.
@@ -1149,7 +1148,10 @@ impl Pipeline {
     pub fn phase_caps(&self) -> Vec<(&'static str, &crate::PhaseCap)> {
         self.steps
             .iter()
-            .filter_map(|step| step.phase_cap().map(|cap| (step.profile().name, cap)))
+            .flat_map(|step| {
+                let name = step.profile().name;
+                step.bound_caps().into_iter().map(move |cap| (name, cap))
+            })
             .collect()
     }
 
@@ -1185,7 +1187,7 @@ impl Pipeline {
     /// readable summary, intended to be `println!`'d during debugging or
     /// embedded in error messages.
     ///
-    /// A step with a `phase_cap()` renders `cap=<name>(<max>)` after its
+    /// A step with a `step_cap()` renders `cap=<name>(<max>)` after its
     /// branch count. A `Parallel` step with a non-default `pool_placement()`
     /// renders `placement=<placement>` after that, and `host=driver(<label>)`
     /// when, at this thread count, its single clone runs on its Detached
@@ -1303,8 +1305,8 @@ impl Pipeline {
                 sticky = profile.sticky,
                 n_branches = n_branches,
             );
-            if let Some(cap) = step.phase_cap() {
-                let _ = write!(s, " cap={}", cap.describe());
+            if let Some(label) = step.cap_label() {
+                let _ = write!(s, " cap={label}");
             }
             if step.kind() == super::step::StepKind::Parallel
                 && step.pool_placement() != super::step::PoolPlacement::AllWorkers
@@ -1391,7 +1393,7 @@ impl Pipeline {
         // bind this run's signal to every cap so a cancelled or failed run does
         // not leave it parked.
         for step in &steps {
-            if let Some(cap) = step.phase_cap() {
+            for cap in step.bound_caps() {
                 cap.bind_signal(&signal);
             }
         }
@@ -1567,8 +1569,16 @@ impl Pipeline {
         // `dag_at` uses — and the drain counters read placement, so they follow
         // it. All of this precedes `build_worker_storage`, which consumes
         // `steps`.
-        let step_caps: Vec<Option<Arc<crate::PhaseCap>>> =
-            steps.iter().map(|s| s.phase_cap().and_then(crate::PhaseCap::arc)).collect();
+        let step_caps: Vec<Option<crate::StepCap>> =
+            steps.iter().map(|s| s.step_cap().and_then(crate::StepCapRef::to_step_cap)).collect();
+        // Every cap any step may admit through, a phased step's inactive arm
+        // included: each is bound to this run's waker below. The wake plan
+        // keeps a phased step's selector, so its cap-parked skip and pool
+        // fallback read the arm active when they ask — the arm a poll would
+        // admit through — and indexes both arms, so a refusal on either is
+        // tracked for wake forwarding.
+        let bound_caps: Vec<Arc<crate::PhaseCap>> =
+            steps.iter().flat_map(|s| s.bound_caps()).filter_map(crate::PhaseCap::arc).collect();
         let detached_driver_of = super::runtime::detached::driver_index_of(&steps);
         let mut detached_steps = extract_detached_steps(&mut steps);
         let hosts = crate::runtime::placement::plan_parallel_hosts(
@@ -1657,7 +1667,7 @@ impl Pipeline {
         // steps were extracted (their placeholders report no cap), so a cap
         // only a Detached step reports is bound too. A cap several steps share
         // is bound once per step; binding is idempotent.
-        for cap in step_caps.iter().flatten() {
+        for cap in &bound_caps {
             cap.bind_waker(Arc::clone(&cap_waker));
         }
         install_edge_tracking(&wake, &contexts, &kinds, stats_arc.as_ref(), n_threads + n_detached);
@@ -3140,8 +3150,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            Some(&self.0)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.0))
         }
         fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             Ok(StepOutcome::Finished)
@@ -4450,7 +4460,7 @@ mod tests {
         assert!(dag.contains("→ SinkU32"), "DAG missing source→sink wiring: {dag}");
     }
 
-    /// A step that reports a `phase_cap()` renders it on its DAG line; one that
+    /// A step that reports a `step_cap()` renders it on its DAG line; one that
     /// does not shows no `cap=` token.
     #[test]
     fn dag_renders_phase_cap_on_capped_steps() {
@@ -4471,8 +4481,8 @@ mod tests {
                     branch_ordering: vec![BranchOrdering::None],
                 }
             }
-            fn phase_cap(&self) -> Option<&PhaseCap> {
-                Some(&self.0)
+            fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+                Some(crate::StepCapRef::Fixed(&self.0))
             }
             fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
                 Ok(StepOutcome::NoProgress)
@@ -4499,6 +4509,93 @@ mod tests {
             .find(|l| l.contains("Source") && l.contains("branches="))
             .expect("source line");
         assert!(!source.contains("cap="), "uncapped step must not render a cap token: {source}");
+    }
+
+    /// A phased step renders its label once, with both arms, and run start binds
+    /// both arms. Catches: `dag_at` reading `phase_cap()` (active arm only), and
+    /// the bind loop skipping the inactive arm. Mirrors
+    /// `dag_renders_phase_cap_on_capped_steps` (`StubSource` finishes at once).
+    #[test]
+    fn dag_renders_and_run_binds_both_arms_of_a_phased_cap() {
+        use crate::admission::{CapPhase, PhaseCap, PhasedCap, StepCap};
+        struct PhasedTransform(StepCap);
+        impl Step for PhasedTransform {
+            type Input = u32;
+            type Outputs = Single<u32>;
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "PhasedTransform",
+                    kind: StepKind::Serial,
+                    sticky: false,
+                    output_queues: vec![QueueSpec::Unbounded],
+                    branch_ordering: vec![BranchOrdering::None],
+                }
+            }
+            fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+                Some(self.0.view())
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(if ctx.input.is_drained() {
+                    StepOutcome::Finished
+                } else {
+                    StepOutcome::NoProgress
+                })
+            }
+        }
+        // `StubSinkU32` never finishes, so the run needs a sink that does.
+        struct DrainingSink;
+        impl Step for DrainingSink {
+            type Input = u32;
+            type Outputs = ();
+            fn profile(&self) -> StepProfile {
+                StepProfile {
+                    name: "DrainingSink",
+                    kind: StepKind::Exclusive,
+                    sticky: false,
+                    output_queues: vec![],
+                    branch_ordering: vec![],
+                }
+            }
+            fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+                Ok(if ctx.input.is_drained() {
+                    StepOutcome::Finished
+                } else {
+                    StepOutcome::NoProgress
+                })
+            }
+        }
+        let c1 = PhaseCap::new("sort-phase1", 2);
+        let c2 = PhaseCap::new("sort-phase2", 8);
+        let phased =
+            PhasedCap::new(Some(std::sync::Arc::clone(&c1)), Some(std::sync::Arc::clone(&c2)))
+                .unwrap();
+        assert_eq!(phased.phase(), CapPhase::One);
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(StubSource)
+            .chain(PhasedTransform(StepCap::Phased(phased)))
+            .chain(DrainingSink)
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+        let dag = pipeline.dag();
+        let line = dag
+            .lines()
+            .find(|l| l.contains("PhasedTransform") && l.contains("branches="))
+            .expect("step line");
+        assert!(line.contains("cap=phased(sort-phase1(2)→sort-phase2(8))"), "{line}");
+        let listed: Vec<*const PhaseCap> =
+            pipeline.phase_caps().iter().map(|(_, c)| std::ptr::from_ref(*c)).collect();
+        assert_eq!(
+            listed,
+            [std::sync::Arc::as_ptr(&c1), std::sync::Arc::as_ptr(&c2)],
+            "both arms, phase order"
+        );
+        pipeline.run(PipelineConfig { threads: 1, ..Default::default() }).unwrap();
+        assert_eq!(
+            (c1.binds_for_test(), c2.binds_for_test()),
+            (1, 1),
+            "both arms bound at run start, once"
+        );
     }
 
     #[test]
@@ -5421,8 +5518,8 @@ mod tests {
                     None => Ok(StepOutcome::NoProgress),
                 }
             }
-            fn phase_cap(&self) -> Option<&PhaseCap> {
-                Some(&self.cap)
+            fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+                Some(crate::StepCapRef::Fixed(&self.cap))
             }
             fn new_worker_copy(&self) -> Self {
                 self.clone()
@@ -6957,8 +7054,8 @@ mod tests {
         fn pool_placement(&self) -> crate::step::PoolPlacement {
             crate::step::PoolPlacement::ExcludeReader
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            Some(&self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.cap))
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
             let _permit = match crate::admit_input(ctx.input, Some(&self.cap)) {

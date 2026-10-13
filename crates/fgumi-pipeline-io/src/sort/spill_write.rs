@@ -28,12 +28,14 @@
 //! while spilling continues, so the merge starts on cold slots.
 //!
 //! When the stack's policy asks for it (see `RunStack`), a contiguous range of
-//! runs is merged into one with a [`RunMergerDyn`]. The merge is driven
-//! **cooperatively** — a bounded batch of records per `try_run`, returning
-//! `Progress` — because a `Detached` step must never block inside `try_run`, and a
-//! step that stops reporting progress for long enough is cancelled as wedged.
-//! While a merge is in flight no input is taken, so upstream back-pressures while
-//! the live-run count is being brought back under the limit.
+//! runs is merged into one by a consolidation job: `SpillWrite` emits
+//! `ConsolidationStart`, the read planner opens the inputs and plans their reads,
+//! `ConsolidateRuns` merges them and `WriteConsolidatedRun` writes the merged
+//! run, reporting completion through the [`ConsolidationRegistry`], which
+//! unparks this step's thread. On completion the merged run replaces its inputs,
+//! the inputs are unlinked and `ConsolidationRetire` follows. While a job is in
+//! flight no input is taken, so upstream back-pressures while the live-run count
+//! is being brought back under the limit.
 //!
 //! This step owns the `TmpDirAllocator` (Serial ⇒ the pick is uncontended) and
 //! the RAII temp-dir handles, which live as long as the step so the spill files
@@ -48,16 +50,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{
-    RunMergeProgress, RunMergeSpec, RunMergerDyn, SpillCodec, SpillKeyKind, TmpDirAllocator,
-    new_run_merger, spill_magic, spill_trailer,
-};
+use fgumi_sort::{SpillCodec, SpillKeyKind, TmpDirAllocator, spill_magic, spill_trailer};
 use log::{info, warn};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
-use crate::sort::protocol::{SortPhase1Event, SpillBlockEvent};
+use crate::sort::consolidation::ConsolidationRegistry;
+use crate::sort::protocol::{ConsolidationInput, SortPhase1Event, SpillBlockEvent};
 use crate::sort::run_stack::{RunStack, SpillRun};
 use crate::sort::spill_block_compress::SpillBufPool;
 use fgumi_pipeline_core::{
@@ -73,19 +72,6 @@ use fgumi_pipeline_core::{
 
 /// Counter slot index: bytes written to the spill file this call.
 const SPILL_BYTES_WRITTEN: usize = 0;
-
-/// Counter slot index: records rewritten by consolidation this call.
-const CONSOLIDATION_RECORDS: usize = 1;
-
-/// Records merged per `try_run` while a consolidation is in flight. Large enough
-/// that per-call overhead is negligible for short reads.
-const CONSOLIDATION_RECORDS_PER_CALL: usize = 16 * 1024;
-
-/// Record bytes merged per `try_run`, whichever of the two budgets is reached
-/// first. Long reads make a record budget alone unbounded in time (16 Ki records
-/// of 100 kb reads is ~1.6 GB to decompress and recompress), and a step that
-/// reports no progress for long enough is cancelled as wedged.
-const CONSOLIDATION_BYTES_PER_CALL: u64 = 8 * 1024 * 1024;
 
 /// Spill blocks written per `try_run`, whichever of this and
 /// [`WRITE_BYTES_PER_CALL`] is reached first. One block per call made the
@@ -122,14 +108,14 @@ impl SpillRunStats {
         self.consolidations.load(Ordering::Relaxed)
     }
 
-    /// Time spent merging runs during consolidation, in seconds.
+    /// Wall time of the consolidation jobs (start to completion), in seconds.
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // display value; > 2^52 ns is ~52 days
     pub fn consolidation_secs(&self) -> f64 {
         self.consolidation_nanos.load(Ordering::Relaxed) as f64 / 1e9
     }
 
-    /// Time spent merging runs during consolidation, in nanoseconds.
+    /// Wall time of the consolidation jobs, in nanoseconds.
     #[must_use]
     pub fn consolidation_nanos(&self) -> u64 {
         self.consolidation_nanos.load(Ordering::Relaxed)
@@ -146,11 +132,11 @@ impl SpillRunStats {
         self.runs_written.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one consolidation that spent `busy` merging.
-    pub fn record_consolidation(&self, busy: Duration) {
+    /// Count one consolidation job that took `wall` from start to completion.
+    pub fn record_consolidation(&self, wall: Duration) {
         self.consolidations.fetch_add(1, Ordering::Relaxed);
         self.consolidation_nanos
-            .fetch_add(u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            .fetch_add(u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Record how many spill runs the final merge reads.
@@ -168,15 +154,14 @@ struct OpenSpill {
     writer: BufWriter<File>,
 }
 
-/// A consolidation in flight.
-struct ActiveMerge {
-    /// Range of `runs` being merged. No run is pushed while a merge is in flight,
-    /// so the range stays valid until the merge completes.
+/// A consolidation job in flight.
+pub(crate) struct ActiveJob {
+    job_id: u32,
+    /// Range of `runs` being merged. No run is pushed while a job is in flight,
+    /// so the range stays valid until the job completes.
     range: std::ops::Range<usize>,
-    merger: Box<dyn RunMergerDyn>,
     output: PathBuf,
-    /// Time spent inside the merger's `step` calls (not the time between them).
-    busy: Duration,
+    started: Instant,
 }
 
 /// `Serial + Affinity::Writer` step that writes per-`file_id` spill files from
@@ -188,18 +173,19 @@ pub struct SpillWrite {
     alloc: Arc<Mutex<TmpDirAllocator>>,
     /// Spill codec for chunk files (bgzf or zstd).
     codec: SpillCodec,
-    /// Compression level consolidated runs are written at (the spill level).
-    compression: u32,
     /// The currently-open spill file, if any.
     current: Option<OpenSpill>,
     /// Closed runs awaiting the merge, and the consolidation policy over them.
     runs: RunStack,
     /// Key type of every run so far; all runs of one sort share it.
     key_kind: Option<SpillKeyKind>,
-    /// The consolidation in flight, if any.
-    active: Option<ActiveMerge>,
-    /// Consolidations started, for naming merged files.
-    merges_started: usize,
+    /// The consolidation job in flight, if any.
+    pub(crate) active: Option<ActiveJob>,
+    /// Consolidation jobs started: the next job id, and the merged file's name.
+    jobs_started: u32,
+    /// Where consolidation jobs report completion; `None` leaves consolidation
+    /// off (no tail downstream runs a job).
+    registry: Option<Arc<ConsolidationRegistry>>,
     /// Spill runs this step has closed; checked against upstream's announced
     /// count. Kept apart from `stats`, which a caller may share.
     runs_closed: u64,
@@ -245,7 +231,7 @@ impl SpillWrite {
     /// handles alive for the step's lifetime. `output_byte_limit` byte-bounds the
     /// forwarded-event output queue.
     ///
-    /// Consolidation is off until [`Self::with_max_temp_files`] is applied.
+    /// Consolidation is off until [`Self::with_consolidation`] is applied.
     #[must_use]
     pub fn new(
         alloc: Arc<Mutex<TmpDirAllocator>>,
@@ -256,12 +242,12 @@ impl SpillWrite {
         Self {
             alloc,
             codec,
-            compression: 1,
             current: None,
             runs: RunStack::new(0),
             key_kind: None,
             active: None,
-            merges_started: 0,
+            jobs_started: 0,
+            registry: None,
             runs_closed: 0,
             announced: false,
             outbox: VecDeque::new(),
@@ -276,14 +262,25 @@ impl SpillWrite {
         }
     }
 
-    /// Keep at most `max_temp_files` spill runs live, consolidating runs written
-    /// at `compression` (the spill compression level) when the limit is reached.
-    /// A limit below 2 leaves consolidation off.
+    /// Keep at most `max_temp_files` spill runs live, consolidating when the
+    /// limit is reached through the chain's consolidation tail, which reports
+    /// each job's completion to `registry`. A limit below 2 leaves consolidation
+    /// off ([`consolidation_can_trigger`](super::consolidation_can_trigger)).
     #[must_use]
-    pub fn with_max_temp_files(mut self, max_temp_files: usize, compression: u32) -> Self {
+    pub fn with_consolidation(
+        mut self,
+        max_temp_files: usize,
+        registry: Arc<ConsolidationRegistry>,
+    ) -> Self {
         self.runs = RunStack::new(max_temp_files);
-        self.compression = compression;
+        self.registry = Some(registry);
         self
+    }
+
+    /// Live runs (tests).
+    #[cfg(test)]
+    pub(crate) fn live_runs_for_test(&self) -> usize {
+        self.runs.runs().len()
     }
 
     /// Share spill-run accounting with the caller (the sort summary).
@@ -341,12 +338,12 @@ impl SpillWrite {
 
     /// Process one input event, performing any disk writes and queueing the
     /// `SortPhase1Event`s it produces in `outbox`. A closed run may start a
-    /// consolidation (see [`Self::advance_consolidation`]). `StepCtx`-free for
-    /// unit testing.
+    /// consolidation job (see [`Self::poll_registry`]). `StepCtx`-free for unit
+    /// testing.
     ///
     /// # Errors
     ///
-    /// Propagates file-create / write / slot-open / merger-open errors. Also
+    /// Propagates file-create / write / slot-open errors. Also
     /// errors if a block arrives for a different `file_id` than the open file
     /// while one is open without an intervening `is_last_in_file` — a
     /// framework-ordering invariant violation that must fail loud rather than
@@ -494,59 +491,70 @@ impl SpillWrite {
         self.start_consolidation_if_needed()
     }
 
-    /// Start the consolidation the run stack asks for, if any and none is in
-    /// flight.
+    /// Start the consolidation job the run stack asks for, if any, none is in
+    /// flight and a consolidation tail is wired: record its output with the
+    /// registry and queue its `ConsolidationStart`.
     fn start_consolidation_if_needed(&mut self) -> io::Result<()> {
         if self.active.is_some() {
             return Ok(());
         }
+        let Some(registry) = self.registry.clone() else { return Ok(()) };
         let Some(range) = self.runs.next_merge() else { return Ok(()) };
         let key_kind = self.key_kind.expect("a live run implies a known key kind");
-        let inputs: Vec<PathBuf> =
-            self.runs.runs()[range.clone()].iter().map(|r| r.path.clone()).collect();
-        let input_bytes: u64 = self.runs.runs()[range.clone()].iter().map(|r| r.bytes).sum();
-        let output = self.next_path(&format!("merged_{:04}.keyed", self.merges_started))?;
-        self.merges_started += 1;
+        let inputs: Vec<ConsolidationInput> = self.runs.runs()[range.clone()]
+            .iter()
+            .map(|r| ConsolidationInput { file_id: r.file_id, path: r.path.clone(), len: r.bytes })
+            .collect();
+        let input_bytes: u64 = inputs.iter().map(|i| i.len).sum();
+        let job_id = self.jobs_started;
+        let output = self.next_path(&format!("merged_{job_id:04}.keyed"))?;
+        self.jobs_started += 1;
         info!(
             "Consolidating {} spill runs ({input_bytes} bytes) into 1; {} live runs",
             inputs.len(),
             self.runs.runs().len()
         );
-        let merger = new_run_merger(
-            key_kind,
-            &RunMergeSpec {
-                inputs: &inputs,
-                output: &output,
-                codec: self.codec,
-                compression: self.compression,
-                block_size: BGZF_MAX_BLOCK_SIZE,
-            },
-        )?;
-        self.active = Some(ActiveMerge { range, merger, output, busy: Duration::ZERO });
+        registry.begin(job_id, output.clone());
+        self.outbox.push_back(SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind });
+        self.active = Some(ActiveJob { job_id, range, output, started: Instant::now() });
         Ok(())
     }
 
-    /// Merge the next bounded batch of the in-flight consolidation. When it
-    /// completes, replace its inputs with the merged run, delete the inputs, and
-    /// start the next consolidation the policy asks for. Returns the records
-    /// merged by this call; `0` when no consolidation is in flight.
+    /// Consume the in-flight job's completion, if it has arrived: replace its
+    /// inputs with the merged run, unlink them, queue `ConsolidationRetire` and
+    /// start the next job the policy asks for. Returns whether a completion was
+    /// consumed. With none, registers this thread with the registry and checks
+    /// once more (a completion between the first check and the registration
+    /// would otherwise wait on this thread's timer), so a `false` lets the
+    /// caller report `NoProgress` and park: the completion unparks it.
     ///
     /// # Errors
     ///
-    /// Propagates merge (read / decompress / compress / write) errors.
-    fn advance_consolidation(&mut self, max_records: usize, max_bytes: u64) -> io::Result<u64> {
-        let Some(active) = self.active.as_mut() else { return Ok(0) };
-        let before_records = active.merger.records_written();
-        let before = Instant::now();
-        let progress = active.merger.step(max_records, max_bytes)?;
-        active.busy += before.elapsed();
-        let merged = active.merger.records_written() - before_records;
-        if progress == RunMergeProgress::Working {
-            return Ok(merged);
+    /// A completion for a job other than the one in flight (a protocol
+    /// violation), or a failure to start the next job.
+    pub(crate) fn poll_registry(&mut self) -> io::Result<bool> {
+        let Some(registry) = self.registry.clone() else { return Ok(false) };
+        if self.active.is_none() {
+            return Ok(false);
         }
-        let ActiveMerge { range, output, busy, .. } =
-            self.active.take().expect("active merge present");
-        let merged_bytes = std::fs::metadata(&output)?.len();
+        let completed = registry.take_completed().or_else(|| {
+            #[cfg(test)]
+            registry.run_hook_before_register_for_test();
+            registry.register_waiter();
+            registry.take_completed()
+        });
+        let Some((job_id, merged_bytes)) = completed else { return Ok(false) };
+        let ActiveJob { job_id: active_id, range, output, started } =
+            self.active.take().expect("active job checked above");
+        if job_id != active_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SpillWrite: consolidation job {job_id} completed while job {active_id} was \
+                     in flight"
+                ),
+            ));
+        }
         let absorbed = self.runs.complete_merge(range, output, merged_bytes);
         for run in &absorbed {
             if let Err(e) = std::fs::remove_file(&run.path) {
@@ -555,9 +563,10 @@ impl SpillWrite {
                 warn!("SpillWrite: could not remove consolidated run {}: {e}", run.path.display());
             }
         }
-        self.stats.record_consolidation(busy);
+        self.outbox.push_back(SortPhase1Event::ConsolidationRetire { job_id });
+        self.stats.record_consolidation(started.elapsed());
         self.start_consolidation_if_needed()?;
-        Ok(merged)
+        Ok(true)
     }
 
     /// On `AllAnnounced`: open a merge slot for every surviving run and queue its
@@ -574,7 +583,7 @@ impl SpillWrite {
         memory_chunk_count: u32,
         total_records: u64,
     ) -> io::Result<()> {
-        debug_assert!(self.active.is_none(), "no input is taken while a merge is in flight");
+        debug_assert!(self.active.is_none(), "no input is taken while a job is in flight");
         let runs_written = self.runs_closed;
         if u64::from(runs_announced) != runs_written {
             return Err(io::Error::other(format!(
@@ -670,10 +679,7 @@ impl Step for SpillWrite {
     }
 
     fn counters(&self) -> &'static [CounterSpec] {
-        const SPECS: &[CounterSpec] = &[
-            CounterSpec::new("spill_bytes_written", "bytes"),
-            CounterSpec::new("consolidation_records", "records"),
-        ];
+        const SPECS: &[CounterSpec] = &[CounterSpec::new("spill_bytes_written", "bytes")];
         SPECS
     }
 
@@ -690,17 +696,15 @@ impl Step for SpillWrite {
             return Ok(StepOutcome::Progress);
         }
 
-        // An in-flight consolidation takes priority over new input: the live-run
-        // count is at its limit until it finishes, so upstream waits (the same
-        // back-pressure `RawExternalSorter`'s synchronous consolidation applies),
-        // while each call still makes and reports progress.
+        // A job in flight blocks new input: the live-run count is at its limit
+        // until the job completes, so upstream waits. Its completion unparks this
+        // thread (`poll_registry`), whether it runs on a pool worker or a driver.
         if self.active.is_some() {
-            let merged = self.advance_consolidation(
-                CONSOLIDATION_RECORDS_PER_CALL,
-                CONSOLIDATION_BYTES_PER_CALL,
-            )?;
-            ctx.counters.add(CONSOLIDATION_RECORDS, merged);
-            return Ok(StepOutcome::Progress);
+            return Ok(if self.poll_registry()? {
+                StepOutcome::Progress
+            } else {
+                StepOutcome::NoProgress
+            });
         }
 
         if let Some(event) = ctx.input.pop() {

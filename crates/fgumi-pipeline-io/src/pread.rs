@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fgumi_bam_io::pread::{PositionalSource, SliceBufferPool, SliceLease, read_at_exact};
 use fgumi_pipeline_core::{
-    HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, Unpushed, admit_input,
+    HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, StepCap, StepCapRef, Unpushed,
+    admit_input,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -58,6 +59,25 @@ pub enum SpillClass {
     Hot,
     /// Any other live spill file.
     Cold,
+    /// A consolidation input the consolidation merge needs next (awaited or
+    /// predicted).
+    ConsolidationHot,
+    /// Any other input of a consolidation in flight.
+    ConsolidationCold,
+}
+
+impl SpillClass {
+    /// Whether the class reads in hot fills toward the hot allowance.
+    #[must_use]
+    pub fn is_hot(self) -> bool {
+        matches!(self, Self::Hot | Self::ConsolidationHot)
+    }
+
+    /// Whether the read belongs to a consolidation (phase 1), not the merge.
+    #[must_use]
+    pub fn is_consolidation(self) -> bool {
+        matches!(self, Self::ConsolidationHot | Self::ConsolidationCold)
+    }
 }
 
 /// Where a slice's bytes go once read.
@@ -317,7 +337,7 @@ pub struct PreadSlices {
     input_ledger: Option<Arc<InputLedger>>,
     /// The phase cap shared with the phase's other pool steps; `None` unless a
     /// per-phase thread flag was given.
-    cap: Option<Arc<PhaseCap>>,
+    cap: Option<StepCap>,
 }
 
 impl PreadSlices {
@@ -358,11 +378,12 @@ impl PreadSlices {
         }
     }
 
-    /// Share a phase admission cap with the other pool steps of this phase
-    /// (`None` = uncapped).
+    /// Admit through `cap` (`None` = uncapped): a fixed phase cap shared with
+    /// the other pool steps of its phase, or a phased one that switches from
+    /// phase 1 to phase 2 at `AllAnnounced`.
     #[must_use]
-    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.cap = cap;
+    pub fn with_step_cap(mut self, cap: impl Into<Option<StepCap>>) -> Self {
+        self.cap = cap.into();
         self
     }
 
@@ -483,7 +504,7 @@ impl Step for PreadSlices {
         // Moved out for the call: the permit borrows the cap while the read
         // needs `&mut self`.
         let cap = self.cap.take();
-        let outcome = self.run_once(ctx, cap.as_deref());
+        let outcome = self.run_once(ctx, cap.as_ref().and_then(StepCap::active));
         self.cap = cap;
         outcome
     }
@@ -492,8 +513,8 @@ impl Step for PreadSlices {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.cap.as_ref().map(StepCap::view)
     }
 }
 

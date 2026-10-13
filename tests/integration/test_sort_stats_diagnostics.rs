@@ -939,3 +939,24 @@ fn read_blocks_logs_the_arena_line_only_with_sort_stats(#[values(false, true)] w
         assert!(line.contains("from return to reuse"), "{line}");
     }
 }
+
+/// `Consolidation supply:` is a `--sort-stats` line, present only when a job
+/// ran. Uses the shuffled fixture ([`sort_spilling_with`]: 20 000 families at
+/// `--max-memory 1M`, coordinate) — [`sort_spilling`]'s generation-ordered
+/// fixture spills into one coalesced run, which cannot consolidate — and
+/// [`assert_really_spilled`]. Catches: the line printed without the flag, or on
+/// sorts that never consolidated.
+#[rstest]
+#[case::flag_and_jobs(&["--sort-stats", "--max-temp-files", "2"], true)]
+#[case::jobs_without_flag(&["--max-temp-files", "2"], false)]
+#[case::flag_without_jobs(&["--sort-stats", "--max-temp-files", "100000"], false)]
+fn sort_stats_gates_the_consolidation_supply_line(
+    #[case] extra_args: &[&str],
+    #[case] expect_present: bool,
+) {
+    let stderr = sort_spilling_with("coordinate", extra_args);
+    assert_really_spilled(&stderr);
+    let consolidated = stderr.contains("Consolidations: ");
+    assert_eq!(consolidated, extra_args.contains(&"2"), "fixture precondition:\n{stderr}");
+    assert_eq!(stderr.contains("Consolidation supply:"), expect_present, "{stderr}");
+}

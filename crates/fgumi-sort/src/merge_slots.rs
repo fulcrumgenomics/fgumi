@@ -154,6 +154,12 @@ use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 /// above); the confusable part is only which command each one bounds.
 pub const PHASE2_DECOMP_CAP: usize = 32;
 
+/// The first slot id minted for a consolidation input
+/// ([`SortMergeSlot::with_slot_id`]). Run `file_id`s are counters far below it
+/// (`open_spill_slot_as` rejects one at or above it), so a minted id never
+/// equals a run's default slot id.
+pub const CONSOLIDATION_SLOT_IDS_START: u32 = 1 << 31;
+
 /// Parse state for a single spill file: the slices that arrived out of order,
 /// the frame parser, and the raw-block sequence. Mutex'd separately from
 /// `decompressed` so parsing never blocks the consumer's pop. The slot holds no
@@ -214,6 +220,16 @@ pub struct SortMergeSlot {
     /// `file_id` so the `LoserTree` tie-break for equal sort keys
     /// is deterministic and matches the legacy chunk-files order.
     pub file_id: u32,
+    /// The slot's identity in every supply map (the read planner's table, the
+    /// decompressor's registry, the merge demands' published slots). Defaults
+    /// to `file_id`; a consolidation input gets a fresh one, because a
+    /// consolidated run inherits its first input's `file_id` and is read again
+    /// while the absorbed slot may still be named somewhere.
+    slot_id: u32,
+    /// Set when the slot's consolidation job completed: every supply map drops
+    /// it on its next pass, releasing the file. A std atomic even under loom:
+    /// it is retirement bookkeeping, not the slot protocol the model checks.
+    retired: std::sync::atomic::AtomicBool,
     /// Spill codec of this chunk's file, detected from the file magic when the
     /// slot is opened (`open_spill_slot`). The `SortSpillDecompress` step
     /// reads it to decompress BGZF blocks or zstd frames.
@@ -330,6 +346,8 @@ impl SortMergeSlot {
     ) -> Self {
         Self {
             file_id,
+            slot_id: file_id,
+            retired: std::sync::atomic::AtomicBool::new(false),
             codec,
             source,
             body_start,
@@ -360,6 +378,32 @@ impl SortMergeSlot {
     #[must_use]
     pub fn for_test(file_id: u32, codec: SpillCodec) -> Self {
         Self::new(file_id, Arc::new(tempfile::tempfile().expect("tempfile")), 0, 0, codec)
+    }
+
+    /// This slot with supply identity `slot_id` (set before the slot is
+    /// shared).
+    #[must_use]
+    pub fn with_slot_id(mut self, slot_id: u32) -> Self {
+        self.slot_id = slot_id;
+        self
+    }
+
+    /// The slot's identity in every supply map (see the field docs).
+    #[must_use]
+    pub fn slot_id(&self) -> u32 {
+        self.slot_id
+    }
+
+    /// Mark the slot retired: its consolidation completed and no reader will
+    /// read it again. Supply maps drop it on their next pass.
+    pub fn retire(&self) {
+        self.retired.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::retire`] was called.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The positional handle on the spill file.

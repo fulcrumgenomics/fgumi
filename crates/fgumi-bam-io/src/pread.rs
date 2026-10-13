@@ -320,8 +320,10 @@ pub fn slice_ranges(start: u64, window: usize, slices: usize) -> impl Iterator<I
 /// read-ahead bound to miss. Request sizes repeat (the fill and slice sizes
 /// are fixed per path and per stream count), so exact reuse hits as often as a
 /// looser fit would; a pool whose sizes change (the read-stream ratchet
-/// shrinking slices, or a file's short tail read) releases one mismatched
-/// buffer per miss and converges to the sizes it is asked for. The gauges
+/// shrinking slices) releases one mismatched buffer per miss and converges to
+/// the sizes it is asked for. The released buffer is one of the rarest size in
+/// the free list, so a one-off size (a spill run's short tail read) drains
+/// first and the common size's buffers stay for the next hit. The gauges
 /// charge capacity: `resident` is the capacity of live leases, `idle` the
 /// capacity of the free list, and the peak is of their sum — the read path's
 /// slice memory.
@@ -365,17 +367,21 @@ impl SliceBufferPool {
 
     /// A buffer of exactly `len` bytes and capacity: a pooled one of that
     /// capacity, else a fresh zeroed allocation (`calloc`, so the OS supplies zero pages
-    /// rather than a memset). On a miss one pooled buffer is released, so a
-    /// free list of the wrong sizes drains instead of pinning memory. Its
+    /// rather than a memset). On a miss one pooled buffer of the rarest idle
+    /// size is released, so a free list of the wrong sizes drains instead of
+    /// pinning memory, while the common size keeps its buffers. Its
     /// contents are unspecified; a caller overwrites every byte before leasing
     /// it.
     #[must_use]
     pub fn take(&self, len: usize) -> Vec<u8> {
         let (hit, evicted) = {
             let mut free = self.free.lock();
-            match free.iter().position(|b| fits(b.capacity(), len)) {
-                Some(i) => (Some(free.swap_remove(i)), None),
-                None => (None, free.pop()),
+            if let Some(i) = free.iter().position(|b| fits(b.capacity(), len)) {
+                (Some(free.swap_remove(i)), None)
+            } else {
+                let count = |cap: usize| free.iter().filter(|b| b.capacity() == cap).count();
+                let victim = (0..free.len()).min_by_key(|&i| count(free[i].capacity()));
+                (None, victim.map(|i| free.swap_remove(i)))
             }
         };
         if let Some(e) = evicted {
@@ -921,6 +927,24 @@ mod tests {
         assert_eq!(pool.peak_held_bytes(), 1 << 20);
         drop(smaller);
         assert_eq!((pool.resident_bytes(), pool.idle_bytes()), (0, 600 << 10));
+    }
+
+    /// A miss releases a buffer of the rarest idle size, not whichever came
+    /// back last: three full-size buffers and one tail-sized one, then a miss
+    /// for a third size, keep the full-size buffers for the next full read.
+    /// Catches: evicting by position (`pop`), which here drops a full-size
+    /// buffer and forces the next full read to allocate.
+    #[test]
+    fn a_miss_releases_the_rarest_idle_size() {
+        let pool = SliceBufferPool::new(8);
+        let full: Vec<_> = (0..3).map(|_| pool.lease(pool.take(1 << 20))).collect();
+        let tail = pool.lease(pool.take(5_000));
+        drop(tail);
+        drop(full); // the full-size buffers return last
+        assert_eq!(pool.free_len(), 4);
+        drop(pool.take(7_000)); // a miss
+        assert_eq!(pool.free_len(), 3);
+        assert_eq!(pool.idle_bytes(), 3 << 20, "the tail buffer was released");
     }
 
     #[test]

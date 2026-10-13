@@ -17,11 +17,15 @@ anyhow = "1.0.102"
 log = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 parking_lot = "0.12"
+# The seeded fixture generator of the `test-utils` sort oracle (`sort::testing`).
+rand = { workspace = true, optional = true }
 rayon = "1.10"
 tempfile = "3.4"
 
 [features]
-test-utils = []
+# Test support exported to other crates' tests: the sort oracle
+# (`sort::testing`) builds its fixtures with `fgumi-raw-bam`'s test utilities.
+test-utils = ["fgumi-raw-bam/test-utils", "dep:rand"]
 # Multi-minute soak / matrix / proptest suites. Off by default so PR CI stays
 # fast; run on the nightly schedule via `cargo ci-test-stress`, matching the
 # root crate's `stress-tests` convention.
@@ -47,6 +51,7 @@ fgumi-sort = { workspace = true, features = ["test-utils"] }
 fgumi-pipeline-core = { workspace = true, features = ["test-utils"] }
 noodles = { workspace = true, features = ["bam", "sam"] }
 rstest = "0.26"
+rand = { workspace = true }
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 # Allocation counting in the `spill_merge_supply` bench (a safe global allocator).

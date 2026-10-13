@@ -842,8 +842,8 @@ impl<X: ArenaKeyExtractor> Step for ExtractKeys<X> {
         }
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -1203,8 +1203,8 @@ impl<X: ArenaKeyExtractor> Step for SortRun<X> {
         Ok(StepOutcome::Finished)
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 

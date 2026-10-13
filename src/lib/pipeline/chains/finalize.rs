@@ -97,6 +97,13 @@ pub struct BuiltPipeline {
         std::sync::Arc<fgumi_sort::QnClassTable>,
         Option<std::sync::Arc<fgumi_sort::QnClassTable>>,
     )>,
+    /// The class table the sort's `ConsolidateRuns` merges queryname jobs
+    /// against (`None` without a consolidation tail; test support).
+    #[cfg(test)]
+    pub(crate) consolidation_class_table: Option<std::sync::Arc<fgumi_sort::QnClassTable>>,
+    /// The sort's phase caps, `[phase1, phase2]` (test support).
+    #[cfg(test)]
+    pub(crate) sort_caps: [Option<std::sync::Arc<fgumi_pipeline_core::PhaseCap>>; 2],
 }
 
 impl BuiltPipeline {
@@ -126,6 +133,10 @@ impl BuiltPipeline {
             finalize_on_success,
             #[cfg(test)]
                 merge_class_tables: _,
+            #[cfg(test)]
+                consolidation_class_table: _,
+            #[cfg(test)]
+                sort_caps: _,
         } = self;
 
         // Capture the run result but do not short-circuit: the finalize

@@ -37,24 +37,41 @@
 //! because one call starts at most the device's read-ahead window
 //! (`fgumi_bam_io::os_hints::advise_willneed_range`). The advice is never
 //! binding: whatever the kernel skips or evicts, the read fetches itself.
+//!
+//! # Consolidation
+//!
+//! Before `AllAnnounced`, `SpillWrite` may start consolidation jobs
+//! (`ConsolidationStart`). The planner opens each job's inputs as slots under
+//! fresh slot ids (from [`fgumi_sort::CONSOLIDATION_SLOT_IDS_START`]: a merged
+//! run inherits its first input's `file_id` and is read again, so supply maps
+//! key by slot id), plans their reads under the job's own budget
+//! (`ReadAheadBudget::for_consolidation`), which exists before the merge
+//! budget does, and forwards a [`ConsolidationJob`] on its third output to
+//! `ConsolidateRuns`. The consolidation merge's demand (awaited, predicted)
+//! joins the hot set. On `ConsolidationRetire` the job's slots are marked
+//! retired and dropped here, the demands forget them, and the retire epoch
+//! moves so the decompress step drops them too; their files close within one
+//! pass. At `AllAnnounced` — with no job in flight, or the sort fails — the
+//! shared `all_announced` flag is set and the phased cap switches to phase 2
+//! before the first merge read is issued, and outstanding slices are capped at
+//! twice the phase-2 thread count instead of the phase-1 count.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fgumi_bam_io::pread::{PositionalSource, ReadStreamsPolicy, SliceBufferPool, slice_ranges};
 use fgumi_pipeline_core::{
-    HeldSlot, Unpushed,
+    CapPhase, HeldSlot, PhasedCap, Unpushed,
     queues::QueueSpec,
     reorder::BranchOrdering,
     step::{CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 use fgumi_sort::{MergeDemand, SortMergeSlot};
 
-use super::protocol::{SortPhase1Event, SortPhase2Event};
-use super::read_ahead_budget::{
-    COLD_INFLIGHT_BYTES, FIFO_CAP_COLD, FIFO_CAP_HOT, ReadAheadBudget, fifo_charge,
-};
+use super::protocol::{ConsolidationJob, SortPhase1Event, SortPhase2Event};
+use super::read_ahead_budget::{COLD_INFLIGHT_BYTES, ReadAheadBudget, fifo_charge};
 use super::supply_ledger::{SpillSupply, SupplyLedger};
 use crate::pread::{ReadRequest, ReadTarget, SpillClass};
 
@@ -63,6 +80,15 @@ const FILLS: usize = 0;
 /// Counter slot: bytes issued.
 const BYTES_ISSUED: usize = 1;
 
+/// The budget a planned slot reads under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BudgetRef {
+    /// The merge's, resolved at `AllAnnounced`.
+    Merge,
+    /// Consolidation job `0`'s.
+    Job(u32),
+}
+
 /// One registered slot and the planner's cursor into it.
 struct PlannedSlot {
     slot: Arc<SortMergeSlot>,
@@ -70,13 +96,41 @@ struct PlannedSlot {
     next_offset: u64,
     next_seq: u32,
     eof_issued: bool,
+    budget: BudgetRef,
+}
+
+/// What one input event forwards.
+enum Forward {
+    /// A phase event for the merge (branch 1).
+    Phase2(SortPhase2Event),
+    /// A consolidation job for `ConsolidateRuns` (branch 2).
+    Job(ConsolidationJob),
+    /// Nothing (a retire).
+    None,
 }
 
 /// `Serial` planner of the merge's spill reads (see the module docs).
 pub struct SpillReadPlanner {
     slots: Vec<PlannedSlot>,
-    by_file_id: HashMap<u32, usize>,
+    by_slot_id: HashMap<u32, usize>,
     demand: Arc<MergeDemand>,
+    /// The consolidation merge's demand (`None`: no consolidation tail).
+    cons_demand: Option<Arc<MergeDemand>>,
+    /// Set at `AllAnnounced`; the decompress step reads it to stop notifying
+    /// the consolidation demand.
+    all_announced: Arc<AtomicBool>,
+    /// The supply steps' phased cap, switched to phase 2 at `AllAnnounced`.
+    phased: Option<Arc<PhasedCap>>,
+    /// Each consolidation job in flight: its budget and its slot ids.
+    jobs: HashMap<u32, (ReadAheadBudget, Vec<u32>)>,
+    /// The next consolidation slot id to mint.
+    next_slot_id: u32,
+    /// Bumped on every retire (shared with the decompress step).
+    retire_epoch: Arc<AtomicU64>,
+    /// Outstanding-slice caps before and after `AllAnnounced`: twice the
+    /// phase-1 and twice the phase-2 thread count.
+    phase1_inflight_slices: u32,
+    phase2_inflight_slices: u32,
     policy: Arc<ReadStreamsPolicy>,
     ledger: Arc<SupplyLedger>,
     /// The spill slice pool: its idle buffers are charged to the budget's pool.
@@ -94,6 +148,7 @@ pub struct SpillReadPlanner {
     outbox: VecDeque<ReadRequest>,
     held_read: HeldSlot<Unpushed<ReadRequest>>,
     held_event: HeldSlot<Unpushed<SortPhase2Event>>,
+    held_job: HeldSlot<Unpushed<ConsolidationJob>>,
     announced: bool,
     sort_stats: bool,
     output_byte_limit: u64,
@@ -121,15 +176,24 @@ impl SpillReadPlanner {
         supply: &SpillSupply,
         slices: Arc<SliceBufferPool>,
     ) -> Self {
+        let inflight = u32::try_from(2 * phase2_threads.max(1)).unwrap_or(u32::MAX);
         Self {
             slots: Vec::new(),
-            by_file_id: HashMap::new(),
+            by_slot_id: HashMap::new(),
             demand: Arc::clone(&supply.demand),
+            cons_demand: None,
+            all_announced: Arc::new(AtomicBool::new(false)),
+            phased: None,
+            jobs: HashMap::new(),
+            next_slot_id: fgumi_sort::CONSOLIDATION_SLOT_IDS_START,
+            retire_epoch: Arc::clone(&supply.retire_epoch),
+            phase1_inflight_slices: inflight,
+            phase2_inflight_slices: inflight,
             policy: ReadStreamsPolicy::fixed(1),
             ledger: Arc::clone(&supply.ledger),
             slices,
             total_memory,
-            max_inflight_slices: u32::try_from(2 * phase2_threads.max(1)).unwrap_or(u32::MAX),
+            max_inflight_slices: inflight,
             cold_inflight_bytes: COLD_INFLIGHT_BYTES,
             eligible_clones: eligible_clones.max(1),
             budget: None,
@@ -139,6 +203,7 @@ impl SpillReadPlanner {
             outbox: VecDeque::new(),
             held_read: HeldSlot::new(),
             held_event: HeldSlot::new(),
+            held_job: HeldSlot::new(),
             announced: false,
             sort_stats: false,
             output_byte_limit,
@@ -156,6 +221,35 @@ impl SpillReadPlanner {
         self
     }
 
+    /// Plan consolidation jobs: `cons_demand` is the consolidation merge's
+    /// demand (its awaited and predicted slots join the hot set),
+    /// `all_announced` the flag set at `AllAnnounced` (shared with the
+    /// decompress step) and `phased` the supply steps' cap, switched to phase 2
+    /// there.
+    #[must_use]
+    pub fn with_consolidation(
+        mut self,
+        cons_demand: Arc<MergeDemand>,
+        all_announced: Arc<AtomicBool>,
+        phased: Option<Arc<PhasedCap>>,
+    ) -> Self {
+        self.cons_demand = Some(cons_demand);
+        self.all_announced = all_announced;
+        self.phased = phased;
+        self
+    }
+
+    /// Cap outstanding slices at twice `phase1_threads` until `AllAnnounced`
+    /// (the consolidation reads are phase-1 work).
+    #[must_use]
+    pub fn with_phase1_threads(mut self, phase1_threads: usize) -> Self {
+        self.phase1_inflight_slices = u32::try_from(2 * phase1_threads.max(1)).unwrap_or(u32::MAX);
+        if !self.announced {
+            self.max_inflight_slices = self.phase1_inflight_slices;
+        }
+        self
+    }
+
     /// Log the budget line at `AllAnnounced` (`--sort-stats`).
     #[must_use]
     pub fn with_sort_stats(mut self, on: bool) -> Self {
@@ -163,11 +257,23 @@ impl SpillReadPlanner {
         self
     }
 
-    /// The cap on outstanding read slices: twice the phase-2 thread count (a
-    /// read occupies a pool worker).
+    /// The cap on outstanding read slices in the merge: twice the phase-2
+    /// thread count (a read occupies a pool worker).
     #[must_use]
-    pub fn max_inflight_slices(&self) -> u32 {
-        self.max_inflight_slices
+    pub fn merge_max_inflight_slices(&self) -> u32 {
+        self.phase2_inflight_slices
+    }
+
+    /// Every planned slot's id (tests).
+    #[cfg(test)]
+    pub(crate) fn planned_slot_ids_for_test(&self) -> Vec<u32> {
+        self.slots.iter().map(|s| s.slot.slot_id()).collect()
+    }
+
+    /// The merge budget, `None` before `AllAnnounced` (tests).
+    #[cfg(test)]
+    pub(crate) fn merge_budget_for_test(&self) -> Option<ReadAheadBudget> {
+        self.budget
     }
 
     /// The resolved budget (test support).
@@ -211,52 +317,162 @@ impl SpillReadPlanner {
         self.outbox.drain(..).collect()
     }
 
-    /// The hot set's file ids, in order (test support).
+    /// The hot set's slot ids, in order (test support).
     #[cfg(test)]
     pub(crate) fn hot_set_for_test(&self) -> Vec<u32> {
-        self.hot_set().into_iter().map(|i| self.slots[i].slot.file_id).collect()
+        self.hot_set().into_iter().map(|i| self.slots[i].slot.slot_id()).collect()
     }
 
-    /// Handle one phase event (test support).
+    /// Handle one phase event that forwards a phase-2 event (test support).
     #[cfg(test)]
     pub(crate) fn on_event_for_test(&mut self, e: SortPhase1Event) -> SortPhase2Event {
-        self.on_event(e)
+        match self.on_event(e) {
+            Ok(Forward::Phase2(ev)) => ev,
+            Ok(Forward::Job(_) | Forward::None) => panic!("not a phase-2 event"),
+            Err(e) => panic!("{e}"),
+        }
     }
 
     /// Register a spill slot at the cold FIFO cap (it holds a hot-sized FIFO
     /// only while in the hot set); an empty one is finalized here without a
     /// read.
-    fn register(&mut self, slot: &Arc<SortMergeSlot>) {
-        if self.by_file_id.contains_key(&slot.file_id) {
+    fn register(&mut self, slot: &Arc<SortMergeSlot>, budget: BudgetRef, fifo_cold: u32) {
+        let id = slot.slot_id();
+        if self.by_slot_id.contains_key(&id) {
             return;
         }
-        slot.set_fifo_cap(FIFO_CAP_COLD);
+        slot.set_fifo_cap(fifo_cold);
         let empty = slot.is_empty();
         if empty {
             slot.bp_commit_read(0, true);
             slot.bp_drain_and_finalize();
-            self.demand.notify_delivered(slot.file_id);
+            self.notify_delivered(id);
         }
-        self.by_file_id.insert(slot.file_id, self.slots.len());
+        self.by_slot_id.insert(id, self.slots.len());
         self.slots.push(PlannedSlot {
             slot: Arc::clone(slot),
             source: Arc::clone(slot.source()) as Arc<dyn PositionalSource>,
             next_offset: slot.body_start(),
             next_seq: 0,
             eof_issued: empty,
+            budget,
         });
     }
 
-    fn on_event(&mut self, e: SortPhase1Event) -> SortPhase2Event {
-        match e {
+    /// Wake whichever merge awaits `slot_id`.
+    fn notify_delivered(&self, slot_id: u32) {
+        self.demand.notify_delivered(slot_id);
+        if let Some(d) = &self.cons_demand {
+            d.notify_delivered(slot_id);
+        }
+    }
+
+    /// The budget slot `s` reads under, if it exists yet.
+    fn budget_of(&self, s: &PlannedSlot) -> Option<ReadAheadBudget> {
+        match s.budget {
+            BudgetRef::Merge => self.budget,
+            BudgetRef::Job(id) => self.jobs.get(&id).map(|(b, _)| *b),
+        }
+    }
+
+    /// Open a job's inputs as slots under fresh slot ids, register them under
+    /// the job's budget and build the job for `ConsolidateRuns`.
+    fn start_job(
+        &mut self,
+        job_id: u32,
+        inputs: Vec<super::protocol::ConsolidationInput>,
+        key_kind: fgumi_sort::SpillKeyKind,
+    ) -> io::Result<ConsolidationJob> {
+        if self.announced {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("consolidation job {job_id} started after AllAnnounced"),
+            ));
+        }
+        let budget = ReadAheadBudget::for_consolidation(self.total_memory, inputs.len());
+        self.ledger.note_consolidation_job(&budget);
+        let mut slots = Vec::with_capacity(inputs.len());
+        let mut input_paths = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let slot_id = self.next_slot_id;
+            self.next_slot_id = slot_id.checked_add(1).ok_or_else(|| {
+                io::Error::other("consolidation slot ids exhausted (more than 2^31 inputs)")
+            })?;
+            let slot = fgumi_sort::open_spill_slot_as(&input.path, input.file_id, slot_id)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "SpillReadPlanner: failed to open consolidation input {}: {e:#}",
+                        input.path.display()
+                    ))
+                })?;
+            self.register(&slot, BudgetRef::Job(job_id), budget.fifo_cold);
+            slots.push(slot);
+            input_paths.push(input.path);
+        }
+        let ids = slots.iter().map(|s| s.slot_id()).collect();
+        self.jobs.insert(job_id, (budget, ids));
+        Ok(ConsolidationJob { job_id, slots, key_kind, input_paths })
+    }
+
+    /// Retire a completed job's slots: mark them, drop them here, make the
+    /// demands forget them and move the retire epoch for the decompress step.
+    fn retire_job(&mut self, job_id: u32) -> io::Result<()> {
+        let Some((_, ids)) = self.jobs.remove(&job_id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ConsolidationRetire for unknown consolidation job {job_id}"),
+            ));
+        };
+        for s in &self.slots {
+            if s.budget == BudgetRef::Job(job_id) {
+                s.slot.retire();
+            }
+        }
+        for &id in &ids {
+            self.demand.forget(id);
+            if let Some(d) = &self.cons_demand {
+                d.forget(id);
+            }
+        }
+        self.slots.retain(|s| s.budget != BudgetRef::Job(job_id));
+        self.by_slot_id =
+            self.slots.iter().enumerate().map(|(i, s)| (s.slot.slot_id(), i)).collect();
+        self.hot_prev.clear();
+        self.cursor = 0;
+        self.retire_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn on_event(&mut self, e: SortPhase1Event) -> io::Result<Forward> {
+        Ok(match e {
             SortPhase1Event::SpillReady { slot, path, records_ingested_so_far } => {
-                self.register(&slot);
-                SortPhase2Event::SpillReady { slot, path, records_ingested_so_far }
+                self.register(&slot, BudgetRef::Merge, super::read_ahead_budget::FIFO_CAP_COLD);
+                Forward::Phase2(SortPhase2Event::SpillReady { slot, path, records_ingested_so_far })
             }
             SortPhase1Event::MemoryChunk { chunk, records_ingested_so_far } => {
-                SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far }
+                Forward::Phase2(SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far })
+            }
+            SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind } => {
+                Forward::Job(self.start_job(job_id, inputs, key_kind)?)
+            }
+            SortPhase1Event::ConsolidationRetire { job_id } => {
+                self.retire_job(job_id)?;
+                Forward::None
             }
             SortPhase1Event::AllAnnounced { slot_count, memory_chunk_count, total_records } => {
+                if let Some(&id) = self.jobs.keys().min() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("AllAnnounced arrived with consolidation job {id} in flight"),
+                    ));
+                }
+                // Before the first merge read is planned: every phase-2 read,
+                // decompress and compress runs under the phase-2 cap.
+                self.all_announced.store(true, Ordering::Release);
+                if let Some(p) = &self.phased {
+                    p.switch_to(CapPhase::Two);
+                }
+                self.max_inflight_slices = self.phase2_inflight_slices;
                 let budget = ReadAheadBudget::resolve(self.total_memory, slot_count as usize);
                 #[cfg(test)]
                 let budget = match self.fills_for_test {
@@ -273,22 +489,32 @@ impl SpillReadPlanner {
                 }
                 self.budget = Some(budget);
                 self.announced = true;
-                SortPhase2Event::AllAnnounced { slot_count, memory_chunk_count, total_records }
+                Forward::Phase2(SortPhase2Event::AllAnnounced {
+                    slot_count,
+                    memory_chunk_count,
+                    total_records,
+                })
             }
-        }
+        })
     }
 
     /// The hot set: the merge's demand ([`MergeDemand::hot_ids`]: awaited,
     /// predicted and frontier slots, deduplicated), each only while registered
     /// and not yet EOF (at most [`super::read_ahead_budget::HOT_SLOTS`]).
     fn hot_set(&self) -> Vec<usize> {
-        self.demand
-            .hot_ids()
-            .as_slice()
-            .iter()
-            .filter_map(|id| self.by_file_id.get(id).copied())
-            .filter(|&i| !self.slots[i].slot.queue_eof())
-            .collect()
+        let merge = self.demand.hot_ids();
+        let cons = self.cons_demand.as_ref().map(|d| [d.awaited(), d.predicted()]);
+        let mut hot = Vec::new();
+        let ids = merge.as_slice().iter().copied().chain(cons.into_iter().flatten().flatten());
+        for id in ids {
+            if let Some(&i) = self.by_slot_id.get(&id)
+                && !hot.contains(&i)
+                && !self.slots[i].slot.queue_eof()
+            {
+                hot.push(i);
+            }
+        }
+        hot
     }
 
     /// What slot `s` holds against its allowance: requested bytes plus its
@@ -314,8 +540,12 @@ impl SpillReadPlanner {
     /// The pool in use: every slot's charge above its cold terms (read-ahead
     /// and FIFO), plus the idle slice buffers waiting for reuse. One pass over
     /// the slots' mirrors, as the cold rotation already makes.
-    fn pool_used(&self, budget: &ReadAheadBudget) -> u64 {
-        self.slots.iter().map(|s| Self::excess(s, budget) + Self::fifo_excess(s)).sum::<u64>()
+    fn pool_used(&self, group: BudgetRef, budget: &ReadAheadBudget) -> u64 {
+        self.slots
+            .iter()
+            .filter(|s| s.budget == group)
+            .map(|s| Self::excess(s, budget) + Self::fifo_excess(s))
+            .sum::<u64>()
             + self.slices.idle_bytes()
     }
 
@@ -324,41 +554,55 @@ impl SpillReadPlanner {
     /// it keeps the cold cap, which still lets the merge's awaited slot fill.
     fn grant_hot_fifo(&mut self, i: usize, budget: &ReadAheadBudget, pool_used: &mut u64) {
         let s = &self.slots[i];
-        if s.slot.fifo_cap() == FIFO_CAP_HOT {
+        if s.slot.fifo_cap() == budget.fifo_hot {
             return;
         }
         let before = Self::fifo_excess(s);
-        let after = fifo_charge(u64::from(FIFO_CAP_HOT).max(s.slot.fifo_len_relaxed() as u64));
+        let after = fifo_charge(u64::from(budget.fifo_hot).max(s.slot.fifo_len_relaxed() as u64));
         if pool_used.saturating_sub(before) + after <= budget.pool {
-            s.slot.set_fifo_cap(FIFO_CAP_HOT);
+            s.slot.set_fifo_cap(budget.fifo_hot);
             *pool_used = pool_used.saturating_sub(before) + after;
         }
     }
 
     /// One pass: demote the slots that left the hot set, top up the hot set,
-    /// then the cold rotation. Returns the number of fills queued.
+    /// then the cold rotation, each slot under its own budget (the merge's, or
+    /// its consolidation job's; one not yet resolved plans nothing). Returns
+    /// the number of fills queued.
     fn plan_pass(&mut self) -> u64 {
-        let Some(budget) = self.budget else { return 0 };
+        if self.slots.is_empty() {
+            return 0;
+        }
         let hot = self.hot_set();
         for &i in &self.hot_prev {
-            if !hot.contains(&i) {
-                self.slots[i].slot.set_fifo_cap(FIFO_CAP_COLD);
+            if !hot.contains(&i)
+                && let Some(b) = self.budget_of(&self.slots[i])
+            {
+                self.slots[i].slot.set_fifo_cap(b.fifo_cold);
             }
         }
         self.hot_prev.clone_from(&hot);
         if let Some(&awaited) = hot.first()
-            && self.demand.awaited() == Some(self.slots[awaited].slot.file_id)
+            && self.demand.awaited() == Some(self.slots[awaited].slot.slot_id())
         {
             let s = &self.slots[awaited];
             if !s.eof_issued && s.slot.issued_bytes() == 0 && s.slot.stash_len_relaxed() == 0 {
                 self.ledger.note_awaited_starved();
             }
         }
-        let mut pool_used = self.pool_used(&budget);
+        // Each budget's pool in use, computed once per pass on first touch.
+        let mut pool_used: HashMap<BudgetRef, u64> = HashMap::new();
         let mut fills = 0;
         for &i in &hot {
-            self.grant_hot_fifo(i, &budget, &mut pool_used);
-            fills += self.top_up(i, SpillClass::Hot, &budget, &mut pool_used);
+            let group = self.slots[i].budget;
+            let Some(budget) = self.budget_of(&self.slots[i]) else { continue };
+            let mut u = match pool_used.get(&group) {
+                Some(&u) => u,
+                None => self.pool_used(group, &budget),
+            };
+            self.grant_hot_fifo(i, &budget, &mut u);
+            fills += self.top_up(i, Self::class_of(group, true), &budget, &mut u);
+            pool_used.insert(group, u);
         }
         let k = self.slots.len();
         for _ in 0..k {
@@ -367,11 +611,29 @@ impl SpillReadPlanner {
             }
             let i = self.cursor;
             self.cursor = (self.cursor + 1) % k;
-            if !hot.contains(&i) {
-                fills += self.top_up(i, SpillClass::Cold, &budget, &mut pool_used);
+            if hot.contains(&i) {
+                continue;
             }
+            let group = self.slots[i].budget;
+            let Some(budget) = self.budget_of(&self.slots[i]) else { continue };
+            let mut u = match pool_used.get(&group) {
+                Some(&u) => u,
+                None => self.pool_used(group, &budget),
+            };
+            fills += self.top_up(i, Self::class_of(group, false), &budget, &mut u);
+            pool_used.insert(group, u);
         }
         fills
+    }
+
+    /// The read class of a slot in `group`, hot or not.
+    fn class_of(group: BudgetRef, hot: bool) -> SpillClass {
+        match (group, hot) {
+            (BudgetRef::Merge, true) => SpillClass::Hot,
+            (BudgetRef::Merge, false) => SpillClass::Cold,
+            (BudgetRef::Job(_), true) => SpillClass::ConsolidationHot,
+            (BudgetRef::Job(_), false) => SpillClass::ConsolidationCold,
+        }
     }
 
     /// The next fill for slot `i` of `class`, or `None` when it may read no
@@ -393,8 +655,8 @@ impl SpillReadPlanner {
             return None;
         }
         let held = Self::held(s);
-        if class == SpillClass::Hot {
-            let (hot_allowance, hot_fill) = budget.for_class(SpillClass::Hot);
+        if class.is_hot() {
+            let (hot_allowance, hot_fill) = budget.for_class(class);
             let excess = held.saturating_sub(budget.cold_allowance);
             let excess_after = (held + hot_fill).saturating_sub(budget.cold_allowance);
             // `saturating_sub`: the mirrors move under the planner (claims
@@ -425,8 +687,8 @@ impl SpillReadPlanner {
         budget: &ReadAheadBudget,
         pool_used: &mut u64,
     ) -> u64 {
-        if class == SpillClass::Cold {
-            self.slots[i].slot.set_fifo_cap(FIFO_CAP_COLD);
+        if !class.is_hot() {
+            self.slots[i].slot.set_fifo_cap(budget.fifo_cold);
         }
         let mut fills = 0;
         while let Some(fill) = self.next_fill(i, class, budget, *pool_used) {
@@ -462,7 +724,7 @@ impl SpillReadPlanner {
             for (offset, slice_len) in slice_ranges(s.next_offset, want_usize, slices) {
                 self.outbox.push_back(ReadRequest {
                     ordinal: self.next_ordinal,
-                    stream: s.slot.file_id,
+                    stream: s.slot.slot_id(),
                     seq: s.next_seq,
                     source: Arc::clone(&s.source),
                     offset,
@@ -494,7 +756,7 @@ impl SpillReadPlanner {
 
 impl Step for SpillReadPlanner {
     type Input = SortPhase1Event;
-    type Outputs = (ReadRequest, SortPhase2Event);
+    type Outputs = (ReadRequest, SortPhase2Event, ConsolidationJob);
 
     fn profile(&self) -> StepProfile {
         StepProfile {
@@ -504,8 +766,9 @@ impl Step for SpillReadPlanner {
             output_queues: vec![
                 QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit },
                 QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit },
+                QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit },
             ],
-            branch_ordering: vec![BranchOrdering::None, BranchOrdering::None],
+            branch_ordering: vec![BranchOrdering::None, BranchOrdering::None, BranchOrdering::None],
         }
     }
 
@@ -527,14 +790,28 @@ impl Step for SpillReadPlanner {
         {
             self.held_event.put(again);
         }
-        if self.held_read.is_held() || self.held_event.is_held() {
+        if let Some(u) = self.held_job.take()
+            && let Err(again) = view.c.retry(u)
+        {
+            self.held_job.put(again);
+        }
+        if self.held_read.is_held() || self.held_event.is_held() || self.held_job.is_held() {
             return Ok(StepOutcome::Contention);
         }
         let mut progressed = false;
         if let Some(e) = ctx.input.pop() {
-            let forwarded = self.on_event(e);
-            if let Err(u) = view.b.push(forwarded) {
-                self.held_event.put(u);
+            match self.on_event(e)? {
+                Forward::Phase2(ev) => {
+                    if let Err(u) = view.b.push(ev) {
+                        self.held_event.put(u);
+                    }
+                }
+                Forward::Job(job) => {
+                    if let Err(u) = view.c.push(job) {
+                        self.held_job.put(u);
+                    }
+                }
+                Forward::None => {}
             }
             progressed = true;
         }
@@ -569,6 +846,7 @@ impl Step for SpillReadPlanner {
             && self.outbox.is_empty()
             && !self.held_read.is_held()
             && !self.held_event.is_held()
+            && !self.held_job.is_held()
         {
             return Ok(StepOutcome::Finished);
         }

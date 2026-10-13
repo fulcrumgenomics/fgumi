@@ -949,6 +949,7 @@ dependencies = [
  "noodles",
  "parking_lot",
  "proptest",
+ "rand 0.10.2",
  "rayon",
  "rstest",
  "tempfile",

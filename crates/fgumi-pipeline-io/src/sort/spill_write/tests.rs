@@ -1,16 +1,17 @@
 //! Unit tests for `SpillWrite`'s `StepCtx`-free core: per-file demux, codec
-//! magic/trailer bracketing, runs held closed until `AllAnnounced`, bounded
-//! consolidation of runs under `--max-temp-files`, and event mapping.
-//! Byte-exact readback of a merged sort is gated end-to-end by the sort
+//! magic/trailer bracketing, runs held closed until `AllAnnounced`, the
+//! consolidation-job lifecycle under `--max-temp-files`, and event mapping.
+//! The jobs themselves run through the real tail in `consolidate_runs`' tests;
+//! byte-exact readback of a consolidated sort is gated end-to-end by the sort
 //! command's consolidation parity tests.
 
 use super::*;
 use crate::sort::protocol::MemoryChunkErased;
-use fgumi_sort::{
-    InMemoryChunk, RawCoordinateKey, RawSortKey, SpillBlockCompressor, TemplateKey,
-    frame_keyed_record_into,
-};
+use crate::sort::spill_fixtures::{compress, keyed_run, write_run_file};
+use fgumi_pipeline_core::testing::StepProbe;
+use fgumi_sort::{InMemoryChunk, RawCoordinateKey};
 use rstest::rstest;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Build a `SpillWrite` writing into a fresh temp dir; returns it plus the dir
@@ -20,11 +21,6 @@ fn make_writer(codec: SpillCodec) -> (SpillWrite, TempDir) {
     let alloc = TmpDirAllocator::new(vec![dir.path().to_path_buf()]).unwrap();
     let writer = SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, 1 << 20, Arc::new(Vec::new()));
     (writer, dir)
-}
-
-/// Kernel-compress one raw block for `codec`, mirroring `SpillBlockCompress`.
-fn compress(codec: SpillCodec, raw: &[u8]) -> Vec<u8> {
-    SpillBlockCompressor::new(codec, 1).unwrap().compress_block(raw).unwrap()
 }
 
 fn block(codec: SpillCodec, file_id: u32, is_last: bool, raw: &[u8]) -> SpillBlockEvent {
@@ -40,57 +36,6 @@ fn block(codec: SpillCodec, file_id: u32, is_last: bool, raw: &[u8]) -> SpillBlo
 
 fn announced(slot_count: u32, memory_chunk_count: u32, total_records: u64) -> SpillBlockEvent {
     SpillBlockEvent::AllAnnounced { ordinal: 0, slot_count, memory_chunk_count, total_records }
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn template_key(primary: u64) -> TemplateKey {
-    TemplateKey::new(
-        0,
-        primary as i32,
-        false,
-        i32::MAX,
-        i32::MAX,
-        false,
-        0,
-        0,
-        (0, false),
-        0,
-        false,
-    )
-}
-
-/// A single-block spill run of real keyed records (template-coordinate, so the
-/// key is a prefix and any body will do), as `SpillGather` + `SpillBlockCompress`
-/// would deliver it. Each body is [`run_body`]`(file_id, key)`, unique across
-/// runs even where keys repeat.
-fn keyed_run(codec: SpillCodec, file_id: u32, keys: std::ops::Range<u64>) -> SpillBlockEvent {
-    let mut raw = Vec::new();
-    for k in keys {
-        frame_keyed_record_into(&mut raw, &template_key(k), &run_body(file_id, k)).unwrap();
-    }
-    SpillBlockEvent::Block {
-        ordinal: 0,
-        file_id,
-        key_kind: SpillKeyKind::TemplateK40,
-        is_last_in_file: true,
-        records_ingested_so_far: u64::from(file_id) + 1,
-        bytes: compress(codec, &raw),
-    }
-}
-
-/// The body [`keyed_run`] gives the record keyed `key` in run `file_id`.
-fn run_body(file_id: u32, key: u64) -> Vec<u8> {
-    [file_id.to_le_bytes().as_slice(), key.to_le_bytes().as_slice()].concat()
-}
-
-/// Drive any in-flight consolidation (and the ones it chains into) to the end,
-/// returning how many records it rewrote.
-fn finish_consolidation(w: &mut SpillWrite) -> u64 {
-    let mut rewritten = 0;
-    while w.active.is_some() {
-        rewritten += w.advance_consolidation(7, u64::MAX).unwrap();
-    }
-    rewritten
 }
 
 #[rstest]
@@ -147,7 +92,9 @@ fn runs_are_announced_in_file_id_order_with_distinct_files() {
                 paths.push(path);
             }
             SortPhase1Event::AllAnnounced { slot_count, .. } => assert_eq!(slot_count, 3),
-            SortPhase1Event::MemoryChunk { .. } => panic!("no memory chunk was sent"),
+            SortPhase1Event::MemoryChunk { .. }
+            | SortPhase1Event::ConsolidationStart { .. }
+            | SortPhase1Event::ConsolidationRetire { .. } => panic!("only runs were announced"),
         }
     }
     assert_eq!(ids, vec![0, 1, 4]);
@@ -177,91 +124,6 @@ fn runs_with_different_key_types_fail_closed() {
         Err(err) => assert!(err.to_string().contains("keyed"), "got: {err}"),
         Ok(()) => panic!("mixed key types must fail closed"),
     }
-}
-
-#[rstest]
-#[case::zstd(SpillCodec::Zstd)]
-#[case::bgzf(SpillCodec::Bgzf)]
-fn consolidation_keeps_live_runs_under_the_limit_and_preserves_every_record(
-    #[case] codec: SpillCodec,
-) {
-    const LIMIT: usize = 4;
-    const RUNS: u32 = 25;
-    const PER_RUN: u64 = 10;
-    let (w, dir) = make_writer(codec);
-    let mut w = w.with_max_temp_files(LIMIT, 1);
-    for file_id in 0..RUNS {
-        // Overlapping key ranges, so merges genuinely interleave runs.
-        let start = u64::from(file_id) * 3;
-        w.process_event(keyed_run(codec, file_id, start..start + PER_RUN)).unwrap();
-        finish_consolidation(&mut w);
-        assert!(
-            w.runs.runs().len() < LIMIT,
-            "live runs {} after run {file_id}",
-            w.runs.runs().len()
-        );
-    }
-    assert!(w.stats.consolidations() > 0, "25 runs under a limit of 4 must consolidate");
-    assert_eq!(w.stats.runs_written(), u64::from(RUNS));
-
-    w.process_event(announced(RUNS, 0, 99)).unwrap();
-    let mut slots = Vec::new();
-    while let Some(event) = w.outbox.pop_front() {
-        match event {
-            SortPhase1Event::SpillReady { slot, path, .. } => slots.push((slot.file_id, path)),
-            SortPhase1Event::AllAnnounced { slot_count, .. } => {
-                assert_eq!(slot_count as usize, slots.len());
-            }
-            SortPhase1Event::MemoryChunk { .. } => panic!("no memory chunk was sent"),
-        }
-    }
-    assert!(slots.len() < LIMIT, "{} merge sources exceed the limit", slots.len());
-    assert_eq!(w.stats.merge_sources(), slots.len() as u64);
-    assert!(slots.windows(2).all(|p| p[0].0 < p[1].0), "slots in file_id order: {slots:?}");
-
-    // Every record survives exactly once across the surviving runs, and each
-    // run is sorted.
-    let mut dec = fgumi_sort::SpillBlockDecompressor::new();
-    let mut survivors: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for (_, path) in &slots {
-        let bytes = std::fs::read(path).unwrap();
-        let body = if codec == SpillCodec::Zstd { &bytes[4..] } else { &bytes[..] };
-        let raw: Vec<u8> = dec.read_blocks(&mut &body[..], codec, 4096).unwrap().concat();
-        let mut at = 0;
-        let mut previous: Option<Vec<u8>> = None;
-        while at < raw.len() {
-            let key = raw[at..at + 40].to_vec();
-            let len = u32::from_le_bytes(raw[at + 40..at + 44].try_into().unwrap()) as usize;
-            survivors.push((key.clone(), raw[at + 44..at + 44 + len].to_vec()));
-            at += 44 + len;
-            if let Some(p) = &previous {
-                let (a, b) = (
-                    TemplateKey::read_from(&mut &p[..]).unwrap(),
-                    TemplateKey::read_from(&mut &key[..]).unwrap(),
-                );
-                assert!(a <= b, "run {path:?} is out of order");
-            }
-            previous = Some(key);
-        }
-    }
-    // Identity, not just a count: a dropped record plus a duplicated one would
-    // keep the total and still fail here.
-    let mut expected: Vec<(Vec<u8>, Vec<u8>)> = (0..RUNS)
-        .flat_map(|file_id| {
-            let start = u64::from(file_id) * 3;
-            (start..start + PER_RUN).map(move |k| {
-                let mut key = Vec::new();
-                template_key(k).write_to(&mut key).unwrap();
-                (key, run_body(file_id, k))
-            })
-        })
-        .collect();
-    expected.sort_by(|a, b| a.1.cmp(&b.1));
-    survivors.sort_by(|a, b| a.1.cmp(&b.1));
-    assert_eq!(survivors, expected, "records lost, duplicated or altered by consolidation");
-    // Consolidated inputs are removed; only the surviving runs remain on disk.
-    let on_disk = std::fs::read_dir(dir.path()).unwrap().count();
-    assert_eq!(on_disk, slots.len(), "consolidated inputs must be deleted");
 }
 
 /// Runs are held until `AllAnnounced`; an input that drains without it would
@@ -295,7 +157,8 @@ fn an_event_after_all_announced_fails_closed() {
 fn a_limit_below_two_never_consolidates() {
     let codec = SpillCodec::Zstd;
     let (w, _dir) = make_writer(codec);
-    let mut w = w.with_max_temp_files(1, 1);
+    let registry = ConsolidationRegistry::new();
+    let mut w = w.with_consolidation(1, registry);
     for file_id in 0..10 {
         w.process_event(keyed_run(codec, file_id, 0..3)).unwrap();
         assert!(w.active.is_none());
@@ -657,8 +520,8 @@ fn try_run_bumps_spill_bytes_written_counter() {
     let name_rows: Vec<&str> = names.lines().skip(1).filter(|l| l.starts_with("1\t")).collect();
     assert_eq!(
         name_rows,
-        vec!["1\t0\tspill_bytes_written\tbytes", "1\t1\tconsolidation_records\trecords"],
-        "SpillWrite declares its spill-bytes and consolidation counters"
+        vec!["1\t0\tspill_bytes_written\tbytes"],
+        "SpillWrite declares its spill-bytes counter (consolidation records are ConsolidateRuns')"
     );
 
     let counters = std::fs::read_to_string(telemetry_dir.join("run.ticks.counters.tsv")).unwrap();
@@ -778,4 +641,114 @@ fn written_block_buffers_return_to_the_pool() {
     let reused = pool.take();
     assert_eq!(reused.as_ptr(), ptr, "the written block's buffer is reused");
     assert!(reused.is_empty() && reused.capacity() > 0, "cleared, capacity kept");
+}
+
+fn job_writer(limit: usize) -> (SpillWrite, TempDir, Arc<ConsolidationRegistry>) {
+    let (w, dir) = make_writer(SpillCodec::Zstd);
+    let registry = ConsolidationRegistry::new();
+    (w.with_consolidation(limit, Arc::clone(&registry)), dir, registry)
+}
+
+/// Review S2 (r1): `next_merge` fires at `n >= limit`, so with limit 2 the job
+/// appears after the SECOND run. Catches: retiring before completion, losing the
+/// merged run, or leaving absorbed inputs on disk.
+#[test]
+fn start_emits_a_job_and_retire_follows_completion() {
+    let (mut w, dir, registry) = job_writer(2);
+    w.process_event(keyed_run(SpillCodec::Zstd, 0, 0..10)).unwrap();
+    assert!(w.outbox.is_empty(), "one run: no job");
+    w.process_event(keyed_run(SpillCodec::Zstd, 1, 5..15)).unwrap();
+    let Some(SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind }) =
+        w.outbox.pop_front()
+    else {
+        panic!("expected a job")
+    };
+    let output = registry.output_of(job_id).expect("the job's output is registered");
+    assert_eq!(inputs.iter().map(|i| i.file_id).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(key_kind, SpillKeyKind::TemplateK40);
+    for i in &inputs {
+        assert_eq!(i.len, std::fs::metadata(&i.path).unwrap().len(), "{:?}", i.path);
+    }
+    assert!(!output.exists(), "WriteConsolidatedRun creates it");
+
+    assert!(!w.poll_registry().unwrap(), "no completion yet");
+    assert!(w.outbox.is_empty());
+    let bytes = write_run_file(&output, SpillCodec::Zstd, 0, 0..15);
+    registry.complete(job_id, bytes);
+    assert!(w.poll_registry().unwrap());
+    assert!(matches!(
+        w.outbox.pop_front(),
+        Some(SortPhase1Event::ConsolidationRetire { job_id: j }) if j == job_id
+    ));
+    assert_eq!(
+        w.runs.runs().iter().map(|r| (r.file_id, r.path.clone(), r.bytes)).collect::<Vec<_>>(),
+        [(0, output.clone(), bytes)]
+    );
+    for i in &inputs {
+        assert!(!i.path.exists(), "absorbed input {:?} removed", i.path);
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(w.stats.consolidations(), 1);
+}
+
+/// Backpressure: while a job is in flight, `try_run` takes no input. Catches: a
+/// third run accepted mid-job (the phase switch could then precede a retire).
+#[test]
+fn no_input_is_taken_while_a_job_is_in_flight() {
+    let (mut w, _dir, _registry) = job_writer(2);
+    let probe = StepProbe::new(&w);
+    probe.push_input(keyed_run(SpillCodec::Zstd, 0, 0..10));
+    probe.push_input(keyed_run(SpillCodec::Zstd, 1, 0..10));
+    probe.push_input(keyed_run(SpillCodec::Zstd, 2, 0..10));
+    let mut outcomes = Vec::new();
+    for _ in 0..8 {
+        outcomes.push(probe.try_run(&mut w).unwrap());
+    }
+    assert!(w.active.is_some(), "the job is in flight: {outcomes:?}");
+    assert!(!probe.input_is_empty(), "run 2 stays queued while the job runs");
+    assert_eq!(*outcomes.last().unwrap(), StepOutcome::NoProgress);
+}
+
+#[test]
+fn registry_complete_unparks_the_registered_waiter() {
+    let registry = ConsolidationRegistry::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let r2 = Arc::clone(&registry);
+    let parked = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        r2.register_waiter();
+        let got = loop {
+            if let Some(c) = r2.take_completed() {
+                break c;
+            }
+            std::thread::park_timeout(Duration::from_secs(10));
+        };
+        tx.send((got, t0.elapsed())).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(50)); // let it park
+    registry.complete(7, 4096);
+    let (got, waited) =
+        rx.recv_timeout(Duration::from_secs(5)).expect("the waiter must not sit out its 10 s park");
+    assert_eq!(got, (7, 4096));
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    parked.join().unwrap();
+}
+
+/// The lost-wake window, deterministically: the completion lands before the
+/// waiter registers, and `poll_registry`'s re-check after `register_waiter`
+/// returns it. Catches: register-then-park without the re-check.
+#[test]
+fn register_then_recheck_catches_a_completion_in_between() {
+    let (mut w, _dir, registry) = job_writer(2);
+    w.process_event(keyed_run(SpillCodec::Zstd, 0, 0..10)).unwrap();
+    w.process_event(keyed_run(SpillCodec::Zstd, 1, 0..10)).unwrap();
+    let Some(SortPhase1Event::ConsolidationStart { job_id, .. }) = w.outbox.pop_front() else {
+        panic!()
+    };
+    let output = registry.output_of(job_id).expect("registered");
+    let bytes = write_run_file(&output, SpillCodec::Zstd, 0, 0..20);
+    registry.set_hook_before_register_for_test(Box::new(move |r: &ConsolidationRegistry| {
+        r.complete(job_id, bytes);
+    }));
+    assert!(w.poll_registry().unwrap(), "the re-check after register_waiter finds the completion");
 }

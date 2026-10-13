@@ -623,6 +623,26 @@ serially, and withheld until the next chunk shows whether the run extends —
 which is what lets the gather drop the chunk, so its arena returns as soon as
 the last range is compressed. Spill files are byte-identical to serial framing.
 
+### Spill consolidation (`--max-temp-files`)
+
+`SpillWrite` keeps the run-stack policy (`run_stack.rs`) but no longer merges:
+when the stack asks for a merge it emits `ConsolidationStart`, and the chain's
+consolidation tail runs the job — `SpillReadPlanner` opens the inputs as slots
+under fresh slot ids (from `CONSOLIDATION_SLOT_IDS_START`; a merged run inherits
+its first input's `file_id` and is read again, so every supply map keys by
+`slot_id`) and plans their reads under a per-job budget
+(`ReadAheadBudget::for_consolidation`, `R_c = clamp(total / 64, 8, 64 MiB)`),
+`PreadSpillSlices`/`SortSpillDecompress` read and decompress them,
+`ConsolidateRuns` (`sort-io`) merges and frames them with the gather's cut rule,
+`SpillBlockCompressConsolidation` compresses on the pool and
+`WriteConsolidatedRun` writes the run and completes the job through
+`ConsolidationRegistry`, which unparks `SpillWrite`'s thread (pool writer or
+`sort-io` driver). `ConsolidationRetire` then retires the inputs' slots; every
+supply map drops them within one pass. The three supply steps admit through a
+`PhasedCap`: phase 1's cap until `AllAnnounced` (no job may be in flight then —
+a protocol error), phase 2's after. The tail exists whenever the limit can
+trigger (always on the CLI); `NoConsolidation` takes branch 2 otherwise.
+
 ### Queryname sort refs
 
 A queryname run sorts 40-byte refs, not owned name keys

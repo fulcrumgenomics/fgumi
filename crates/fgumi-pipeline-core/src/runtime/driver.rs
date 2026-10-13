@@ -2666,8 +2666,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(&self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.cap))
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             if let Some(u) = self.held.take() {
@@ -2829,8 +2829,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(self.cap))
         }
         fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             let first = {
@@ -3024,8 +3024,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(self.cap))
         }
         fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             let first = {
@@ -3127,8 +3127,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(self.cap))
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3314,8 +3314,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(self.cap))
         }
         fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -3413,8 +3413,8 @@ mod tests {
                 branch_ordering: vec![BranchOrdering::None],
             }
         }
-        fn phase_cap(&self) -> Option<&crate::admission::PhaseCap> {
-            Some(self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(self.cap))
         }
         fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             self.calls += 1;

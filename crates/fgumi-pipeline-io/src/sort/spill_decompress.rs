@@ -51,7 +51,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fgumi_sort::{SortMergeSlot, SpillBlockDecompressor};
 use parking_lot::RwLock;
@@ -59,7 +59,7 @@ use parking_lot::RwLock;
 use super::supply_ledger::{SpillSupply, SupplyLedger};
 use crate::pread::{ReadSlice, ReadTarget};
 use fgumi_pipeline_core::{
-    PhaseCap,
+    PhaseCap, StepCap, StepCapRef,
     step::{Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
@@ -77,11 +77,17 @@ pub(crate) fn reorder_window_budget(output_byte_limit: u64) -> u64 {
     if output_byte_limit == 0 { DEFAULT_REORDER_WINDOW_BYTES } else { output_byte_limit }
 }
 
-/// The slots seen so far (append-only), and their index by file id.
+/// The live slots, and their index by slot id. Retired slots are removed
+/// (`drop_retired` compacts the vector and bumps `generation`), so the registry
+/// stays as large as the live slot set. A scan returns indices together with
+/// the generation they belong to; an index from an older generation is never
+/// resolved (`slot_at`), so compaction by one clone cannot redirect another
+/// clone's pending scan to a different slot.
 #[derive(Default)]
 struct Registry {
     slots: Vec<Arc<SortMergeSlot>>,
-    by_file_id: HashMap<u32, usize>,
+    by_slot_id: HashMap<u32, usize>,
+    generation: u64,
 }
 
 /// `Parallel` spill-slice ingest + decompress step (see the module docs).
@@ -90,7 +96,7 @@ pub struct SortSpillDecompress {
     block_dec: SpillBlockDecompressor,
     /// Phase-2 admission cap shared with the other merge-phase pool steps
     /// (`None` = uncapped).
-    cap: Option<Arc<PhaseCap>>,
+    cap: Option<StepCap>,
     /// Per-slot reorder-window byte budget for claims.
     window_budget: u64,
     /// The sort's merge-wide demand: deliveries to the awaited slot wake the
@@ -102,6 +108,16 @@ pub struct SortSpillDecompress {
     /// The rotation start, shared by every clone: each scan takes the next
     /// one, so concurrent clones start at different slots.
     cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// The consolidation demand, and the flag the read planner sets at
+    /// `AllAnnounced`: deliveries also notify the consolidation merge, and its
+    /// hot set joins the scan, only before that (`None`: no consolidation tail).
+    consolidation: Option<(Arc<fgumi_sort::MergeDemand>, Arc<AtomicBool>)>,
+    /// The planner's retire epoch (shared through [`SpillSupply`]), and the
+    /// value this clone last acted on.
+    retire_epoch: Arc<AtomicU64>,
+    seen_epoch: u64,
+    /// This clone's scan buffer, reused across polls.
+    scan_scratch: Vec<usize>,
 }
 
 impl SortSpillDecompress {
@@ -119,14 +135,67 @@ impl SortSpillDecompress {
             demand: Arc::clone(&supply.demand),
             ledger: Arc::clone(&supply.ledger),
             cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            consolidation: None,
+            retire_epoch: Arc::clone(&supply.retire_epoch),
+            seen_epoch: 0,
+            scan_scratch: Vec::new(),
         }
     }
 
-    /// Share the phase-2 admission cap with the other merge-phase pool steps
-    /// (`--merge-threads`; `None` = uncapped).
+    /// Also notify `demand` (the consolidation merge's) of deliveries, and scan
+    /// its hot set first, until `all_announced` is set (the read planner sets it
+    /// at `AllAnnounced`; no consolidation runs after it, so phase-2 deliveries
+    /// pay nothing for it).
     #[must_use]
-    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.cap = cap;
+    pub fn with_consolidation_demand(
+        mut self,
+        demand: Arc<fgumi_sort::MergeDemand>,
+        all_announced: Arc<AtomicBool>,
+    ) -> Self {
+        self.consolidation = Some((demand, all_announced));
+        self
+    }
+
+    /// The live consolidation demand: set, and `AllAnnounced` not yet seen.
+    fn consolidation_demand(&self) -> Option<&fgumi_sort::MergeDemand> {
+        self.consolidation
+            .as_ref()
+            .filter(|(_, announced)| !announced.load(Ordering::Acquire))
+            .map(|(d, _)| &**d)
+    }
+
+    /// Drop retired slots from the registry when the planner's retire epoch
+    /// moved since this clone last looked (one `Acquire` load otherwise), so
+    /// their files close.
+    fn drop_retired(&mut self) {
+        let epoch = self.retire_epoch.load(Ordering::Acquire);
+        if epoch == self.seen_epoch {
+            return;
+        }
+        self.seen_epoch = epoch;
+        let mut r = self.registry.write();
+        let Registry { slots, by_slot_id, generation } = &mut *r;
+        let before = slots.len();
+        slots.retain(|slot| !slot.is_retired());
+        if slots.len() != before {
+            by_slot_id.clear();
+            by_slot_id.extend(slots.iter().enumerate().map(|(i, s)| (s.slot_id(), i)));
+            *generation += 1;
+        }
+    }
+
+    /// The live registered slots' ids (tests).
+    #[cfg(test)]
+    pub(crate) fn registered_slot_ids_for_test(&self) -> Vec<u32> {
+        self.registry.read().slots.iter().map(|s| s.slot_id()).collect()
+    }
+
+    /// Admit through `cap` (`None` = uncapped): the phase-2 cap shared with
+    /// the other merge-phase pool steps (`--merge-threads`), or a phased one
+    /// that switches from phase 1 to phase 2 at `AllAnnounced`.
+    #[must_use]
+    pub fn with_step_cap(mut self, cap: impl Into<Option<StepCap>>) -> Self {
+        self.cap = cap.into();
         self
     }
 
@@ -144,13 +213,14 @@ impl SortSpillDecompress {
     }
 
     fn register(&self, slot: &Arc<SortMergeSlot>) {
-        if self.registry.read().by_file_id.contains_key(&slot.file_id) {
+        let id = slot.slot_id();
+        if self.registry.read().by_slot_id.contains_key(&id) || slot.is_retired() {
             return;
         }
         let mut r = self.registry.write();
-        if !r.by_file_id.contains_key(&slot.file_id) {
+        if !r.by_slot_id.contains_key(&id) {
             let i = r.slots.len();
-            r.by_file_id.insert(slot.file_id, i);
+            r.by_slot_id.insert(id, i);
             r.slots.push(Arc::clone(slot));
         }
     }
@@ -175,19 +245,27 @@ impl SortSpillDecompress {
         claimable || drainable || finalizable
     }
 
-    /// The registry indices this clone visits, in order, and whether any of
-    /// them has work: demand first (the merge's hot set,
+    /// Fill `order` with the registry indices this clone visits, in order, and
+    /// return the registry generation they belong to and whether any of them
+    /// has work: demand first (the merge's hot set,
     /// [`fgumi_sort::MergeDemand::hot_ids`], unless EOF), then a rotation from
     /// the shared cursor over the slots with work. One pass over the slots'
-    /// atomics, never a slot lock; returns indices so a scan clones no slot
-    /// handle it does not serve.
-    pub(crate) fn scan_order(&self) -> (Vec<usize>, bool) {
+    /// atomics, never a slot lock; returns indices, into the caller's reused
+    /// buffer, so a scan neither allocates nor clones a slot handle it does
+    /// not serve.
+    pub(crate) fn scan_order(&self, order: &mut Vec<usize>) -> (u64, bool) {
+        order.clear();
         let r = self.registry.read();
         let k = r.slots.len();
-        let mut order = Vec::new();
         let mut any_work = false;
-        for id in self.demand.hot_ids().as_slice() {
-            if let Some(&i) = r.by_file_id.get(id)
+        let merge_hot = self.demand.hot_ids();
+        let cons_hot = self.consolidation_demand().map(fgumi_sort::MergeDemand::hot_ids);
+        let hot = merge_hot
+            .as_slice()
+            .iter()
+            .chain(cons_hot.iter().flat_map(fgumi_sort::HotIds::as_slice));
+        for id in hot {
+            if let Some(&i) = r.by_slot_id.get(id)
                 && !order.contains(&i)
                 && !r.slots[i].queue_eof()
             {
@@ -206,12 +284,15 @@ impl SortSpillDecompress {
                 }
             }
         }
-        (order, any_work)
+        (r.generation, any_work)
     }
 
-    /// The registered slot at index `i`.
-    fn slot_at(&self, i: usize) -> Arc<SortMergeSlot> {
-        Arc::clone(&self.registry.read().slots[i])
+    /// The registered slot at index `i` of registry `generation`; `None` once
+    /// a compaction moved on from that generation (the caller rescans next
+    /// poll).
+    fn slot_at(&self, generation: u64, i: usize) -> Option<Arc<SortMergeSlot>> {
+        let r = self.registry.read();
+        (r.generation == generation).then(|| Arc::clone(&r.slots[i]))
     }
 
     fn all_eof(&self) -> bool {
@@ -262,24 +343,29 @@ impl SortSpillDecompress {
     }
 
     fn run_once(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        self.drop_retired();
         // A slice to ingest is work; otherwise one scan both decides whether
         // there is work (before a permit is taken) and orders the serve.
-        let order = if ctx.input.is_empty() {
-            let (order, any_work) = self.scan_order();
+        let mut order = std::mem::take(&mut self.scan_scratch);
+        let scanned = if ctx.input.is_empty() {
+            let (generation, any_work) = self.scan_order(&mut order);
             if !any_work {
+                self.scan_scratch = order;
                 if ctx.input.is_drained() && self.all_eof() {
                     return Ok(StepOutcome::Finished);
                 }
                 ctx.input.note_empty_poll();
                 return Ok(StepOutcome::NoProgress);
             }
-            Some(order)
+            Some(generation)
         } else {
             None
         };
         let cap = self.cap.take();
-        let outcome = self.run_admitted(ctx, cap.as_deref(), order);
+        let outcome =
+            self.run_admitted(ctx, cap.as_ref().and_then(StepCap::active), scanned, &mut order);
         self.cap = cap;
+        self.scan_scratch = order;
         outcome
     }
 
@@ -287,7 +373,8 @@ impl SortSpillDecompress {
         &mut self,
         ctx: &mut StepCtx<'_, Self>,
         cap: Option<&PhaseCap>,
-        order: Option<Vec<usize>>,
+        scanned: Option<u64>,
+        order: &mut Vec<usize>,
     ) -> io::Result<StepOutcome> {
         let _permit = match cap {
             Some(cap) => match cap.try_acquire() {
@@ -300,9 +387,12 @@ impl SortSpillDecompress {
             self.ingest(slice)?;
             return Ok(StepOutcome::Progress);
         }
-        let order = order.unwrap_or_else(|| self.scan_order().0);
-        for i in order {
-            let slot = self.slot_at(i);
+        let generation = match scanned {
+            Some(generation) => generation,
+            None => self.scan_order(order).0,
+        };
+        for &i in order.iter() {
+            let Some(slot) = self.slot_at(generation, i) else { break };
             if self.serve_one(&slot)? {
                 return Ok(StepOutcome::Progress);
             }
@@ -318,7 +408,10 @@ impl SortSpillDecompress {
     /// slot's `decompressed` mutex is released).
     #[inline]
     fn notify(&self, slot: &SortMergeSlot) {
-        self.demand.notify_delivered(slot.file_id);
+        self.demand.notify_delivered(slot.slot_id());
+        if let Some(d) = self.consolidation_demand() {
+            d.notify_delivered(slot.slot_id());
+        }
     }
 }
 
@@ -332,6 +425,10 @@ impl Clone for SortSpillDecompress {
             demand: self.demand.clone(),
             ledger: self.ledger.clone(),
             cursor: Arc::clone(&self.cursor),
+            consolidation: self.consolidation.clone(),
+            retire_epoch: Arc::clone(&self.retire_epoch),
+            seen_epoch: self.seen_epoch,
+            scan_scratch: Vec::new(),
         }
     }
 }
@@ -358,8 +455,8 @@ impl Step for SortSpillDecompress {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.cap.as_ref().map(StepCap::view)
     }
 }
 

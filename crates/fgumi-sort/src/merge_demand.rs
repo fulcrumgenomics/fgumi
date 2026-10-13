@@ -328,7 +328,7 @@ impl HotIds {
 
 /// Merge-wide demand state; see the module doc.
 pub struct MergeDemand {
-    /// `file_id + 1`; [`NONE`] = the consumer is not waiting. On its own cache
+    /// `slot_id + 1`; [`NONE`] = the consumer is not waiting. On its own cache
     /// line: every decompress worker reads it on every delivery, and nothing
     /// else that is written often may share its line.
     awaited: CachePadded<AtomicU64>,
@@ -346,7 +346,7 @@ pub struct MergeDemand {
     stats: MergeDemandStats,
 }
 
-/// The merge's scan-order hints (`file_id + 1`; [`NONE`] = no file). Plain std
+/// The merge's scan-order hints (`slot_id + 1`; [`NONE`] = no slot). Plain std
 /// atomics even under loom: a stale value costs a read in the wrong order,
 /// never correctness.
 struct ScanHints {
@@ -428,8 +428,8 @@ impl MergeDemand {
     /// [`Self::await_slot`], which re-checks the slot afterwards: a bare
     /// `set_awaited` followed by a park can lose a wake, so it is crate
     /// private.
-    pub(crate) fn set_awaited(&self, file_id: u32) {
-        self.awaited.store(u64::from(file_id) + 1, Ordering::Release);
+    pub(crate) fn set_awaited(&self, slot_id: u32) {
+        self.awaited.store(u64::from(slot_id) + 1, Ordering::Release);
         self.stats.registrations.fetch_add(1, Relaxed);
     }
 
@@ -479,7 +479,7 @@ impl MergeDemand {
     /// poisoned.
     pub fn await_slot(&self, slot: &SortMergeSlot) -> bool {
         self.register_consumer();
-        self.set_awaited(slot.file_id);
+        self.set_awaited(slot.slot_id());
         if slot.has_block_or_eof() {
             self.clear_awaited();
             return true;
@@ -499,8 +499,8 @@ impl MergeDemand {
     /// # Panics
     ///
     /// Panics if the consumer mutex is poisoned.
-    pub fn notify_delivered(&self, file_id: u32) -> bool {
-        let id = u64::from(file_id) + 1;
+    pub fn notify_delivered(&self, slot_id: u32) -> bool {
+        let id = u64::from(slot_id) + 1;
         if self.awaited.load(Ordering::Acquire) != id {
             return false;
         }
@@ -524,8 +524,8 @@ impl MergeDemand {
     /// the next source is in memory, or none remains). Stores only on a
     /// change: the merge publishes on every source switch, often the same
     /// file again, and every worker reads this line.
-    pub fn set_predicted(&self, file_id: Option<u32>) {
-        let v = encode(file_id);
+    pub fn set_predicted(&self, slot_id: Option<u32>) {
+        let v = encode(slot_id);
         if self.hints.predicted.load(Relaxed) != v {
             self.hints.predicted.store(v, Relaxed);
         }
@@ -539,8 +539,19 @@ impl MergeDemand {
 
     /// Publish the lowest-numbered file the merge has not drained (`None`:
     /// every file is drained).
-    pub fn set_frontier(&self, file_id: Option<u32>) {
-        self.hints.frontier.store(encode(file_id), Relaxed);
+    pub fn set_frontier(&self, slot_id: Option<u32>) {
+        self.hints.frontier.store(encode(slot_id), Relaxed);
+    }
+
+    /// Forget `slot_id` wherever it is published (awaited, predicted,
+    /// frontier): a retired slot must not stay hot. Called by the read planner
+    /// when it retires a consolidation job's slots; a CAS per published value,
+    /// so a newer publication is never cleared.
+    pub fn forget(&self, slot_id: u32) {
+        let id = u64::from(slot_id) + 1;
+        let _ = self.awaited.compare_exchange(id, NONE, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.hints.predicted.compare_exchange(id, NONE, Relaxed, Relaxed);
+        let _ = self.hints.frontier.compare_exchange(id, NONE, Relaxed, Relaxed);
     }
 
     /// The lowest-numbered file the merge has not drained, if any.

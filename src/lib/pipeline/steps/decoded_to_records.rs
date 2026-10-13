@@ -139,8 +139,8 @@ impl Step for DecodedRecordBatchToRecordBatch {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 

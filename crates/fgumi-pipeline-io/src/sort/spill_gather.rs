@@ -102,7 +102,7 @@ const FRAMES_PER_RANGE: usize = 8;
 /// single record larger than `block_size`, which forms its own oversized block
 /// (BAM long reads can exceed 64 KiB; the codec re-blocks/​frames it safely,
 /// matching the streaming `SyncSpillWriter`, so this is not an error).
-fn frame_one_block(
+pub(crate) fn frame_one_block(
     chunk: &MemoryChunkErased,
     start: usize,
     block_size: usize,

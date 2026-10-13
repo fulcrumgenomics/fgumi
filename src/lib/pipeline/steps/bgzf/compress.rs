@@ -302,8 +302,8 @@ impl Step for BgzfCompress {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -319,16 +319,23 @@ mod tests {
     fn phase_cap_is_none_by_default_and_shared_by_worker_copies() {
         use crate::pipeline::core::{PhaseCap, Step};
         let plain = BgzfCompress::new(1, 1 << 20, false);
-        assert!(plain.phase_cap().is_none(), "uncapped by default");
+        assert!(plain.step_cap().is_none(), "uncapped by default");
 
         let cap = PhaseCap::new("sort-phase2", 2);
         let capped = plain.with_phase_cap(Some(std::sync::Arc::clone(&cap)));
-        assert_eq!(capped.phase_cap().map(PhaseCap::describe).as_deref(), Some("sort-phase2(2)"));
+        assert_eq!(
+            capped.step_cap().map(fgumi_pipeline_core::StepCapRef::label).as_deref(),
+            Some("sort-phase2(2)")
+        );
         let copy = capped.new_worker_copy();
         let _p1 = cap.try_acquire().expect("1 of 2");
         let _p2 = cap.try_acquire().expect("2 of 2");
         assert!(
-            copy.phase_cap().expect("capped").try_acquire().is_none(),
+            copy.step_cap()
+                .and_then(fgumi_pipeline_core::StepCapRef::active)
+                .expect("capped")
+                .try_acquire()
+                .is_none(),
             "the worker copy shares the exhausted counter"
         );
     }

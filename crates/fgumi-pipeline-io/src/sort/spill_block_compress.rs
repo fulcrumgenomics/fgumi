@@ -25,7 +25,7 @@ use fgumi_sort::{SpillBlockCompressor, SpillCodec};
 
 use crate::sort::protocol::SpillBlockEvent;
 use fgumi_pipeline_core::{
-    HeldRetry, PhaseCap, Unpushed, admit_input,
+    HeldRetry, PhaseCap, StepCap, StepCapRef, Unpushed, admit_input,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -81,6 +81,9 @@ impl SpillBufPool {
 /// each block on a pool worker; the disk write is the separate `SpillWrite`
 /// step.
 pub struct SpillBlockCompress {
+    /// The step's name (`SpillBlockCompress`, or the consolidation tail's
+    /// `SpillBlockCompressConsolidation`): its stats row and phase.
+    name: &'static str,
     codec: SpillCodec,
     compression: u32,
     /// Per-worker compressor, built lazily on the first block. `None` until then
@@ -96,7 +99,7 @@ pub struct SpillBlockCompress {
     output_byte_limit: u64,
     /// Admission cap shared with the other phase-1 pool steps (set by the
     /// chain builder via `with_phase_cap`; `None` = uncapped).
-    cap: Option<Arc<PhaseCap>>,
+    cap: Option<StepCap>,
     /// Where compressed-block buffers come from (shared with `SpillWrite`).
     buf_pool: Option<Arc<SpillBufPool>>,
 }
@@ -107,6 +110,7 @@ impl SpillBlockCompress {
     #[must_use]
     pub fn new(codec: SpillCodec, compression: u32, output_byte_limit: u64) -> Self {
         Self {
+            name: "SpillBlockCompress",
             codec,
             compression,
             compressor: None,
@@ -134,6 +138,13 @@ impl SpillBlockCompress {
         Ok(self.compressor.as_mut().expect("compressor built above"))
     }
 
+    /// Name the step (its stats row and phase classification).
+    #[must_use]
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
     /// Take compressed-block buffers from `pool` (shared with `SpillWrite`).
     #[must_use]
     pub fn with_buf_pool(mut self, pool: Arc<SpillBufPool>) -> Self {
@@ -146,11 +157,12 @@ impl SpillBlockCompress {
         self.buf_pool.as_ref().map(|p| p.take()).unwrap_or_default()
     }
 
-    /// Share a phase admission cap with the other pool steps of this phase. At
-    /// most `cap.max()` workers are inside any of those steps at once.
+    /// Admit through `cap` (`None` = uncapped): a fixed phase cap shared with
+    /// the other pool steps of its phase, or a phased one that switches from
+    /// phase 1 to phase 2 at `AllAnnounced`.
     #[must_use]
-    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.cap = cap;
+    pub fn with_step_cap(mut self, cap: impl Into<Option<StepCap>>) -> Self {
+        self.cap = cap.into();
         self
     }
 
@@ -296,6 +308,11 @@ impl SpillBlockCompress {
             } => {
                 let mut compressed = self.out_buf();
                 self.compressor()?.compress_block_into(&bytes, &mut compressed)?;
+                // The raw block is done with: recycle it for the producer that
+                // draws its blocks from the same pool (`ConsolidateRuns`).
+                if let Some(pool) = &self.buf_pool {
+                    pool.give(bytes);
+                }
                 Ok(SpillBlockEvent::Block {
                     ordinal,
                     file_id,
@@ -317,6 +334,7 @@ impl Clone for SpillBlockCompress {
     fn clone(&self) -> Self {
         // Fresh per-worker compressor + held slot; shared config copied.
         Self {
+            name: self.name,
             codec: self.codec,
             compression: self.compression,
             compressor: None,
@@ -336,7 +354,7 @@ impl Step for SpillBlockCompress {
 
     fn profile(&self) -> StepProfile {
         StepProfile {
-            name: "SpillBlockCompress",
+            name: self.name,
             kind: StepKind::Parallel,
             sticky: false,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
@@ -348,7 +366,7 @@ impl Step for SpillBlockCompress {
         // Moved out for the call: the permit borrows the cap while `compress_event`
         // needs `&mut self`. A move, so no reference-count traffic.
         let cap = self.cap.take();
-        let outcome = self.run_once(ctx, cap.as_deref());
+        let outcome = self.run_once(ctx, cap.as_ref().and_then(StepCap::active));
         self.cap = cap;
         outcome
     }
@@ -357,8 +375,8 @@ impl Step for SpillBlockCompress {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.cap.as_ref().map(StepCap::view)
     }
 }
 

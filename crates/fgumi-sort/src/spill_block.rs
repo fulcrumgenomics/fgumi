@@ -54,6 +54,45 @@ pub(crate) const MAX_SPILL_BLOCK_LEN: usize = 64 * 1024 * 1024;
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::keys::RawSortKey;
 
+/// The sort key type a spill run was written with.
+///
+/// Consolidation must decode keys at the width they were written, and for
+/// template-coordinate that width is only chosen at runtime (from the first
+/// record), so the kind travels with the spilled data instead of being fixed
+/// when the chain is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpillKeyKind {
+    /// Coordinate order ([`RawCoordinateKey`](crate::RawCoordinateKey), embedded in the record).
+    Coordinate,
+    /// Queryname order, lexicographic ([`RawQuerynameLexKey`](crate::RawQuerynameLexKey)).
+    QuerynameLex,
+    /// Queryname order, natural ([`RawQuerynameKey`](crate::RawQuerynameKey)).
+    QuerynameNatural,
+    /// Template-coordinate, 24-byte core-only lane ([`TemplateKey24`](crate::TemplateKey24)).
+    TemplateK24,
+    /// Template-coordinate, 32-byte cell-barcode lane ([`CbKey32`](crate::CbKey32)).
+    TemplateCb32,
+    /// Template-coordinate, 32-byte tertiary lane ([`TertKey32`](crate::TertKey32)).
+    TemplateTert32,
+    /// Template-coordinate, full 40-byte key ([`TemplateKey`](crate::TemplateKey)).
+    TemplateK40,
+}
+
+impl SpillKeyKind {
+    /// Bytes of key a spilled record of this kind carries ahead of its length
+    /// prefix: 0 for the orders whose key is embedded in the record
+    /// (coordinate, queryname), the lane width for template-coordinate.
+    #[must_use]
+    pub const fn serialized_key_bytes(self) -> usize {
+        match self {
+            Self::Coordinate | Self::QuerynameLex | Self::QuerynameNatural => 0,
+            Self::TemplateK24 => 24,
+            Self::TemplateCb32 | Self::TemplateTert32 => 32,
+            Self::TemplateK40 => 40,
+        }
+    }
+}
+
 /// Append one keyed record to `block` in the spill record framing:
 /// `[key bytes if !K::EMBEDDED_IN_RECORD][u32 LE record-len][record body]`.
 ///

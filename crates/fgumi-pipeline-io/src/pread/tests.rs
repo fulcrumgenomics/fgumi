@@ -214,7 +214,7 @@ fn profile_and_placement() {
     assert_eq!(s.pool_placement(), PoolPlacement::AllWorkers);
     assert_eq!(i.profile().branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
     assert_eq!(s.profile().branch_ordering, vec![BranchOrdering::None]);
-    assert!(i.phase_cap().is_none() && s.phase_cap().is_none(), "uncapped unless given a cap");
+    assert!(i.step_cap().is_none() && s.step_cap().is_none(), "uncapped unless given a cap");
 }
 
 /// A refused permit leaves the request queued (the oracle is the input queue,
@@ -224,8 +224,8 @@ fn refused_permit_leaves_the_request_queued() {
     let cap = PhaseCap::new("sort-phase1", 1);
     let held = cap.try_acquire().expect("the test holds the only permit");
     let src: Arc<dyn PositionalSource> = Arc::new(MemSource::new(vec![7u8; 1 << 20]));
-    let mut step =
-        PreadSlices::spill(SliceBufferPool::new(2), 1 << 20).with_phase_cap(Some(Arc::clone(&cap)));
+    let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20)
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let mut probe = StepProbe::new(&step);
     probe.push_input(requests_over(&src, 1 << 20, 1 << 20).remove(0));
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Capped);
@@ -243,8 +243,8 @@ fn refused_permit_leaves_the_request_queued() {
 fn pread_does_not_take_a_permit_without_input() {
     let cap = PhaseCap::new("sort-phase1", 1);
     let _held = cap.try_acquire().unwrap();
-    let mut step =
-        PreadSlices::spill(SliceBufferPool::new(2), 1 << 20).with_phase_cap(Some(Arc::clone(&cap)));
+    let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20)
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let probe = StepProbe::new(&step);
     let refused_before = cap.refused();
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
@@ -260,7 +260,10 @@ fn pread_slices_meets_the_admission_contract(#[case] input: bool) {
     let item = requests_over(&src, 4096, 4096).remove(0);
     assert_admission_contract(
         "sort-phase1",
-        |cap| instance(input, SliceBufferPool::new(2)).with_phase_cap(cap),
+        |cap| {
+            instance(input, SliceBufferPool::new(2))
+                .with_step_cap(cap.map(fgumi_pipeline_core::StepCap::from))
+        },
         item,
     );
 }
