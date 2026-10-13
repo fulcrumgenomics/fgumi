@@ -14,10 +14,15 @@
 //!      step is complete — `mark_outputs_drained` (counter-gated for `Parallel`)
 //!      and remove it from the worklist. `NoProgress`/`Contention` are idle ticks.
 //!   4. If no work happened this iteration, idle: block on the pool
-//!      event-count (an unpinned pool worker that holds nothing), or park with
-//!      an exponential-backoff `park_timeout` (pinned workers, a worker holding
-//!      an item, the lone worker of a one-worker run, and driver threads) that a
-//!      directed wake (`runtime::wake`) can end early.
+//!      event-count (an unpinned pool worker that holds nothing; the
+//!      `EventCount` policy, a 200µs → 50 ms ramp with each deadline ±25%), or
+//!      park with an exponential-backoff `park_timeout` (pinned workers, a
+//!      worker holding an item, the lone worker of a one-worker run, and driver
+//!      threads) that a directed wake (`runtime::wake`) can end early. The
+//!      event-count idle arms the waiter, re-polls once, then waits. After a
+//!      wait that timed out, the next iteration skips the sticky re-entry and
+//!      the round-robin pass (the pre-arm pass) and goes straight to that arm →
+//!      re-poll → wait, so a timed-out episode costs one pass, not two.
 //!
 //! Completion: every step — source, mid, or sink — terminates by returning
 //! `StepOutcome::Finished` from `try_run` once its input edges are drained and
@@ -39,7 +44,7 @@ use crate::runtime::scheduler::{Scheduler, WalkDirection};
 use crate::runtime::stats::{PipelineStats, WakeCounts};
 use crate::runtime::storage::WorkerStepEntry;
 use crate::runtime::wake::{PoolHandle, PushSnapshot, WakePlan};
-use crate::runtime::worker_core::{WorkerCore, WorkerRole};
+use crate::runtime::worker_core::{BackoffPolicy, WorkerCore, WorkerRole};
 use crate::runtime::worker_state::WorkerStateBoard;
 use crate::signal::{PipelineError, PipelineSignal};
 use crate::step::StepOutcome;
@@ -120,10 +125,16 @@ impl LoopDiag {
 /// keeps the loop's stamping a no-op (telemetry-off parity).
 /// `state_slot` — this thread's slot in `board` (ignored when `board` is `None`).
 /// `wake` — the chain's wake plan: owns the pool event-count (`wake.pool()`,
-/// the idle wait of non-pinned workers that hold nothing) and routes every
+/// the idle wait of `EventCount` workers that hold nothing) and routes every
 /// `Progress`/`Finished` to the thread that consumes it.
-/// `pinned` — this worker is the sole eligible dispatcher of some step; it idles
-/// on its timer (`park_timeout`), never on the event-count.
+///
+/// `worker`'s policy alone picks the idle branch: an `EventCount` worker waits
+/// on the pool event-count (which must exist: it panics otherwise); every
+/// other policy idles on its timer (`park_timeout`).
+///
+/// # Panics
+///
+/// If `worker` has the `EventCount` policy and `wake` has no pool event-count.
 #[allow(clippy::too_many_arguments)] // per-step shared state plus the liveness shard; a struct would only rename it
 #[allow(clippy::too_many_lines)] // the whole-pass sticky + round-robin + backoff discipline is documented inline; splitting it would scatter the invariant across functions
 pub(crate) fn run_worker_loop(
@@ -138,7 +149,6 @@ pub(crate) fn run_worker_loop(
     board: Option<&WorkerStateBoard>,
     state_slot: usize,
     wake: &WakePlan,
-    pinned: bool,
 ) {
     // A pinned worker (the sole eligible dispatcher of an Exclusive/sticky step,
     // or the affinity target of a Serial step) must NOT deep-park on the shared
@@ -150,8 +160,11 @@ pub(crate) fn run_worker_loop(
     // direct-park fallback); the timer is only the self-heal. Its step is also often driven by out-of-engine
     // events (a reader's prefetch thread, the affinity-pinned grouper) that no
     // push notifies anyway. The plan still routes a pinned worker's own
-    // `Progress` wakes.
-    let idle_parker = if pinned { None } else { wake.pool() };
+    // `Progress` wakes. `Pipeline::run` builds exactly the unpinned workers of
+    // a multi-worker run (which has a pool) with `EventCount`, so the policy is
+    // the one input that decides the idle branch.
+    let idle_parker = (worker.policy() == BackoffPolicy::EventCount)
+        .then(|| wake.pool().expect("an EventCount worker waits on the pool event-count"));
     // Per-worker worklist of still-dispatchable steps, in chain order. A step
     // is removed when it returns `StepOutcome::Finished`; the worker exits once
     // the list is empty. Build-time `Skip` placeholders (Exclusive steps owned
@@ -177,6 +190,17 @@ pub(crate) fn run_worker_loop(
     let is_driver = matches!(worker.role(), WorkerRole::Driver { .. });
     let mut diag = LoopDiag::new(is_driver);
 
+    // The last event-count wait ran to its deadline: skip the next iteration's
+    // pre-arm pass. Set only by the event-count idle branch.
+    let mut rearm_after_timeout = false;
+
+    // This run's test hooks (none unless its test installed them), and whether
+    // this thread has recorded its first idle deadline there.
+    #[cfg(test)]
+    let hooks = worker.test_hooks().cloned();
+    #[cfg(test)]
+    let mut first_deadline_recorded = false;
+
     loop {
         if signal.is_done() {
             break;
@@ -193,6 +217,8 @@ pub(crate) fn run_worker_loop(
         // that no cap recorded, to a timer park.
         let _ = crate::runtime::wake_slot::take_rejected();
         let _ = crate::runtime::wake_slot::take_cap_refused();
+        #[cfg(test)]
+        let _ = crate::runtime::wake_slot::take_stash_held();
         // A cap's record of this thread covers the pass that made it: a new
         // pass starts clean, and re-records on whatever refuses it.
         wake.start_pass();
@@ -242,6 +268,18 @@ pub(crate) fn run_worker_loop(
             }
         }
 
+        // After a wait that timed out, nothing announced work, so the pre-arm
+        // pass below is skipped and the iteration goes straight to the idle
+        // branch. The skipped pass is the *pre-arm* pass. It exists only to
+        // avoid the `waiters` RMW when work is likely, and after a timeout it is
+        // not. The arm → re-poll → wait protocol still runs in full, so no
+        // wakeup is lost.
+        let skip_pre_arm = std::mem::take(&mut rearm_after_timeout);
+        #[cfg(test)]
+        if skip_pre_arm && let Some(hook) = hooks.as_ref().and_then(|h| h.take_at_loop_top()) {
+            hook(worker.thread_id, worker);
+        }
+
         // 1. Sticky re-entry for sticky-owned steps (either an Exclusive
         // sticky step this worker owns, or a Serial+sticky step whose
         // Affinity targets this worker). The Pipeline::run path only
@@ -257,7 +295,7 @@ pub(crate) fn run_worker_loop(
         // moving anything. An unbounded re-entry would then never reach the
         // round-robin pass that dispatches the downstream step draining that
         // output.
-        if let Some(owned_idx) = worker.sticky_owner.filter(|_| sticky_live) {
+        if !skip_pre_arm && let Some(owned_idx) = worker.sticky_owner.filter(|_| sticky_live) {
             let mut mark_skip = false;
             for _ in 0..STICKY_BURST_LIMIT {
                 if signal.is_done() {
@@ -312,7 +350,9 @@ pub(crate) fn run_worker_loop(
         }
 
         // 2. Round-robin priority dispatch over all live steps.
-        if !signal.is_done() {
+        if !skip_pre_arm && !signal.is_done() {
+            #[cfg(test)]
+            test_hooks::count_pass(hooks.as_deref(), worker.thread_id, is_driver);
             let outcome = round_robin_dispatch(
                 entries,
                 &mut live,
@@ -359,10 +399,18 @@ pub(crate) fn run_worker_loop(
         // pool under-utilisation (cores parked while one worker drives a Serial
         // step) is visible in `--pipeline-stats`.
         if did_work {
+            #[cfg(test)]
+            test_hooks::reset_passes(hooks.as_deref(), worker.thread_id, is_driver);
             worker.reset_backoff();
         } else if signal.is_done() {
             break;
         } else {
+            #[cfg(test)]
+            if !std::mem::replace(&mut first_deadline_recorded, true)
+                && let Some(h) = &hooks
+            {
+                h.record_first_deadline(worker);
+            }
             // A thread whose push was rejected since its last idle may be
             // holding an item. Its wake is a direct `unpark` from whoever makes
             // room, which the event-count cannot deliver — so it idles on its
@@ -403,8 +451,13 @@ pub(crate) fn run_worker_loop(
                 crate::runtime::wake_slot::set_ec_armed(true);
 
                 // Phase 2: re-poll the *real* condition — one full dispatch
-                // pass. One pass per park episode (amortised over the block),
-                // not per iteration.
+                // pass. Never skipped: it is the protocol's pass. Only the
+                // pre-arm pass before it is skipped, after a wait that timed out.
+                // A productive re-poll is busy time (after a timeout it is the
+                // iteration's only pass); an empty one is neither busy nor idle.
+                let repoll_start = stats.filter(|_| !is_driver).map(|_| Instant::now());
+                #[cfg(test)]
+                test_hooks::count_pass(hooks.as_deref(), worker.thread_id, is_driver);
                 let recheck = round_robin_dispatch(
                     entries,
                     &mut live,
@@ -435,6 +488,14 @@ pub(crate) fn run_worker_loop(
                     ec.cancel_wait(key);
                     crate::runtime::wake_slot::set_ec_armed(false);
                     wake.acknowledge_request();
+                    if recheck.did_work
+                        && let (Some(stats), Some(rs)) = (stats, repoll_start)
+                    {
+                        let ns = u64::try_from(rs.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        stats.record_worker_busy(worker.thread_id, ns);
+                    }
+                    #[cfg(test)]
+                    test_hooks::end_iteration(hooks.as_deref(), worker.thread_id, is_driver, None);
                     worker.reset_backoff();
                     continue;
                 }
@@ -472,11 +533,29 @@ pub(crate) fn run_worker_loop(
                     // wake. The exponential backoff is the wait *timeout* so a
                     // missed wakeup cannot hang longer than the cap, and the
                     // deadlock monitor still ticks. Re-poll on return regardless.
+                    worker.note_idle_episode();
                     let deadline = worker.backoff_deadline();
+                    #[cfg(test)]
+                    if let Some(hook) = hooks.as_ref().and_then(|h| h.before_wait.as_ref()) {
+                        hook(worker.thread_id, ec);
+                    }
                     let outcome = ec.wait(key, deadline);
                     crate::runtime::wake_slot::set_ec_armed(false);
                     wake.acknowledge_request();
                     worker.increase_backoff();
+                    // A timed-out wait means nothing announced work: the next
+                    // iteration runs only the protocol's re-poll. A notify (or
+                    // a generation that moved before the wait) gets the full
+                    // pre-arm pass again.
+                    rearm_after_timeout =
+                        outcome == crate::runtime::event_count::WaitOutcome::TimedOut;
+                    #[cfg(test)]
+                    test_hooks::end_iteration(
+                        hooks.as_deref(),
+                        worker.thread_id,
+                        is_driver,
+                        Some(outcome),
+                    );
 
                     if let (Some(stats), Some(ss)) = (stats, sleep_start) {
                         let ns = u64::try_from(ss.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -534,6 +613,10 @@ pub(crate) fn run_worker_loop(
                 // spent on one whose step has nothing for it is forwarded by the
                 // thread's next pass.
                 wake.start_pass();
+                // As on the event-count path: a productive re-poll is busy.
+                let repoll_start = stats.filter(|_| !is_driver).map(|_| Instant::now());
+                #[cfg(test)]
+                test_hooks::count_pass(hooks.as_deref(), worker.thread_id, is_driver);
                 let recheck = round_robin_dispatch(
                     entries,
                     &mut live,
@@ -558,6 +641,12 @@ pub(crate) fn run_worker_loop(
                 }
                 if recheck.did_work || signal.is_done() {
                     disarm(wake, worker.thread_id);
+                    if recheck.did_work
+                        && let (Some(stats), Some(rs)) = (stats, repoll_start)
+                    {
+                        let ns = u64::try_from(rs.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        stats.record_worker_busy(worker.thread_id, ns);
+                    }
                     worker.reset_backoff();
                     continue;
                 }
@@ -583,11 +672,22 @@ pub(crate) fn run_worker_loop(
             let deadline =
                 if cap_only { worker.max_backoff_deadline() } else { worker.backoff_deadline() };
             let sleep_start = stats.map(|_| Instant::now());
+            // A holder whose item the reorder stash cap refused (its latch
+            // recorded it for the in-order pop's unpark), and when its park began.
+            #[cfg(test)]
+            let stash_park = (crate::runtime::wake_slot::take_stash_held() && hooks.is_some())
+                .then(Instant::now);
             std::thread::park_timeout(deadline);
             worker.increase_backoff();
             if armed {
                 disarm(wake, worker.thread_id);
             }
+            #[cfg(test)]
+            if let (Some(h), Some(start)) = (&hooks, stash_park) {
+                h.note_stash_holder_park(start.elapsed() < deadline);
+            }
+            #[cfg(test)]
+            test_hooks::reset_passes(hooks.as_deref(), worker.thread_id, is_driver);
             if let (Some(stats), Some(ss)) = (stats, sleep_start) {
                 let elapsed = ss.elapsed();
                 let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -1085,6 +1185,128 @@ fn deliver_flushed_wake(
     }
 }
 
+/// This run's test hooks as `Pipeline::run` hands them to a driver thread:
+/// the `PipelineConfig::test_hooks` handle in this crate's tests, nothing
+/// otherwise.
+#[cfg(test)]
+pub(crate) type RunTestHooks = Option<Arc<test_hooks::TestHooks>>;
+/// See the test-build alias: nothing outside this crate's tests.
+#[cfg(not(test))]
+pub(crate) type RunTestHooks = ();
+
+/// Test-only observation and injection points in [`run_worker_loop`], owned
+/// by one run: a test builds a [`TestHooks`](test_hooks::TestHooks), passes it
+/// in `PipelineConfig::test_hooks`, and `Pipeline::run` hands it to that run's
+/// worker and driver cores only. A run without hooks records nothing, and no
+/// other run (a concurrent test under plain `cargo test`) can see or fire them.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    use crate::runtime::event_count::{PoolEventCount, WaitOutcome};
+    use crate::runtime::worker_core::{WorkerCore, WorkerRole};
+
+    /// Pool workers whose passes a run's hooks count; a test that reads
+    /// [`TestHooks::iterations`] runs at most this many.
+    pub(crate) const MAX_TEST_WORKERS: usize = 8;
+
+    /// Called with the worker id and the event-count right before `ec.wait`,
+    /// after the key is armed.
+    pub(crate) type BeforeWait = Box<dyn Fn(usize, &PoolEventCount) + Send + Sync>;
+    /// Called once, at the loop top of the iteration that follows a timed-out
+    /// event-count wait.
+    pub(crate) type AtLoopTop = Box<dyn FnOnce(usize, &mut WorkerCore) + Send>;
+
+    /// One run's hooks and recorders.
+    #[derive(Default)]
+    pub(crate) struct TestHooks {
+        /// Per pool worker: `round_robin_dispatch` passes in the current idle
+        /// iteration (reset when an iteration does work or ends).
+        passes: [AtomicU64; MAX_TEST_WORKERS],
+        /// One entry per event-count idle iteration, pushed when it ends: at
+        /// `ec.wait`'s return (its outcome) or at `cancel_wait` on a productive
+        /// re-poll (`None`). `(worker, passes, outcome)`.
+        pub(crate) iterations: Mutex<Vec<(usize, u64, Option<WaitOutcome>)>>,
+        /// See [`BeforeWait`]. Set before the run; called with no lock held.
+        pub(super) before_wait: Option<BeforeWait>,
+        /// See [`AtLoopTop`]; taken out of its lock before it runs.
+        pub(crate) at_loop_top_after_timeout: Mutex<Option<AtLoopTop>>,
+        /// `(thread, deadline)`: the first idle deadline each thread computes,
+        /// on its first idle iteration of any policy and before the episode is
+        /// counted. Threads are named from their ids — `fgumi-worker-{w}` for a
+        /// pool worker (the lone worker on the caller's thread included) and
+        /// `fgumi-driver-{d}` for a driver — not from the OS thread name.
+        pub(crate) first_deadlines: Mutex<Vec<(String, Duration)>>,
+        /// Timer parks of a thread holding an item the reorder stash cap
+        /// refused (latched by `note_rejected_holder`), and how many of them an
+        /// `unpark` ended before the deadline.
+        pub(crate) stash_holder_parks: AtomicU64,
+        pub(crate) stash_holder_unparks: AtomicU64,
+    }
+
+    impl TestHooks {
+        /// Hooks whose only injection is `before_wait`.
+        pub(crate) fn with_before_wait(before_wait: BeforeWait) -> Self {
+            Self { before_wait: Some(before_wait), ..Self::default() }
+        }
+
+        /// The counter of pool worker `thread_id`: `None` for a driver, and
+        /// for a worker past [`MAX_TEST_WORKERS`] (a test that reads the pass
+        /// counts asserts its own `threads <= MAX_TEST_WORKERS`).
+        fn passes(&self, thread_id: usize, is_driver: bool) -> Option<&AtomicU64> {
+            if is_driver { None } else { self.passes.get(thread_id) }
+        }
+
+        pub(super) fn take_at_loop_top(&self) -> Option<AtLoopTop> {
+            self.at_loop_top_after_timeout.lock().take()
+        }
+
+        pub(super) fn record_first_deadline(&self, worker: &WorkerCore) {
+            let name = match worker.role() {
+                WorkerRole::Pool => format!("fgumi-worker-{}", worker.thread_id),
+                WorkerRole::Driver { driver, .. } => format!("fgumi-driver-{}", driver.0),
+            };
+            self.first_deadlines.lock().push((name, worker.backoff_deadline()));
+        }
+
+        pub(super) fn note_stash_holder_park(&self, unparked: bool) {
+            self.stash_holder_parks.fetch_add(1, Ordering::Relaxed);
+            if unparked {
+                self.stash_holder_unparks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn count_pass(hooks: Option<&TestHooks>, thread_id: usize, is_driver: bool) {
+        if let Some(p) = hooks.and_then(|h| h.passes(thread_id, is_driver)) {
+            p.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn reset_passes(hooks: Option<&TestHooks>, thread_id: usize, is_driver: bool) {
+        if let Some(p) = hooks.and_then(|h| h.passes(thread_id, is_driver)) {
+            p.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn end_iteration(
+        hooks: Option<&TestHooks>,
+        thread_id: usize,
+        is_driver: bool,
+        outcome: Option<WaitOutcome>,
+    ) {
+        if let Some(h) = hooks
+            && let Some(p) = h.passes(thread_id, is_driver)
+        {
+            let n = p.swap(0, Ordering::Relaxed);
+            h.iterations.lock().push((thread_id, n, outcome));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -1141,7 +1363,7 @@ mod tests {
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::ParkedSleep);
 
         signal.cancel();
         run_worker_loop(
@@ -1156,7 +1378,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
         // If we reach this line, the loop exited cleanly.
     }
@@ -1181,7 +1402,7 @@ mod tests {
             step_counters: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::ParkedSleep);
 
         let board = WorkerStateBoard::new(1);
         board.stamp(0, WorkerState::Running, Some(StepIdx(0)));
@@ -1199,7 +1420,6 @@ mod tests {
             Some(&board),
             0,
             &WakePlan::standalone(),
-            false,
         );
         assert_eq!(board.read(0).0, WorkerState::Parked);
     }
@@ -1669,7 +1889,7 @@ mod tests {
         ];
         let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
         let signal = PipelineSignal::new();
-        let mut worker = WorkerCore::new(0, Some(src));
+        let mut worker = WorkerCore::new(0, Some(src), BackoffPolicy::ParkedSleep);
 
         // The source finishes immediately; the sink then sees its input drained
         // and finishes too. `run_worker_loop` must return (no hang).
@@ -1685,7 +1905,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
     }
 
@@ -1733,7 +1952,7 @@ mod tests {
         ];
         let drain_counters = vec![StepDrainCounter::new(1), StepDrainCounter::new(1)];
         let signal = PipelineSignal::new();
-        let mut worker = WorkerCore::new(0, Some(src));
+        let mut worker = WorkerCore::new(0, Some(src), BackoffPolicy::ParkedSleep);
 
         // First sticky call → NoProgress (yield to round-robin); the source then
         // returns Finished during a round-robin pass, which must remove it and
@@ -1752,7 +1971,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
 
         // The source must have been called EXACTLY twice: call 1 = idle in the
@@ -1899,7 +2117,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -2051,7 +2268,7 @@ mod tests {
         }
 
         // Forward walk: the source is idx 0 and is this worker's sticky owner.
-        let mut worker = WorkerCore::new(0, Some(src));
+        let mut worker = WorkerCore::new(0, Some(src), BackoffPolicy::ParkedSleep);
         run_worker_loop(
             &mut worker,
             &mut entries,
@@ -2064,7 +2281,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -2197,7 +2413,7 @@ mod tests {
             });
         }
 
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::ParkedSleep);
         run_worker_loop(
             &mut worker,
             &mut entries,
@@ -2210,7 +2426,6 @@ mod tests {
             None,
             0,
             &WakePlan::standalone(),
-            false,
         );
         done.store(true, Ordering::SeqCst);
 
@@ -2575,7 +2790,7 @@ mod tests {
         let drain_counters: Vec<Arc<StepDrainCounter>> =
             (0..3).map(|_| StepDrainCounter::new(1)).collect();
         let _ = crate::runtime::wake_slot::take_rejected();
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -2588,7 +2803,6 @@ mod tests {
             None,
             0,
             &plan,
-            false,
         );
         assert_eq!(*armed_seen.lock(), Some(1), "the idle re-poll ran armed on the event-count");
     }
@@ -2680,7 +2894,7 @@ mod tests {
         let drain_counters: Vec<Arc<StepDrainCounter>> =
             (0..3).map(|_| StepDrainCounter::new(1)).collect();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(1);
-        let mut worker = WorkerCore::new(1, None);
+        let mut worker = WorkerCore::new(1, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -2693,7 +2907,6 @@ mod tests {
             None,
             1,
             &plan,
-            false,
         );
         assert_eq!(
             *seen.lock(),
@@ -2772,7 +2985,7 @@ mod tests {
         let drain_counters: Vec<Arc<StepDrainCounter>> =
             (0..3).map(|_| StepDrainCounter::new(1)).collect();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(1);
-        let mut worker = WorkerCore::new(1, None);
+        let mut worker = WorkerCore::new(1, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -2785,7 +2998,6 @@ mod tests {
             None,
             1,
             &plan,
-            false,
         );
         assert_eq!(*seen.lock(), vec![false, false], "cleared when the re-poll started");
         drop(held);
@@ -2870,7 +3082,7 @@ mod tests {
         let drain_counters: Vec<Arc<StepDrainCounter>> =
             (0..3).map(|_| StepDrainCounter::new(1)).collect();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(1);
-        let mut worker = WorkerCore::new(1, None);
+        let mut worker = WorkerCore::new(1, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -2883,7 +3095,6 @@ mod tests {
             None,
             1,
             &plan,
-            false,
         );
         assert_eq!(*seen.lock(), vec![false, false], "the re-poll did not call the step");
         assert_eq!(cap.refused(), 1, "only the main pass's call was refused");
@@ -3068,7 +3279,8 @@ mod tests {
             (0..3).map(|_| StepDrainCounter::new(1)).collect();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(slot);
         plan.register_worker(slot, std::thread::current());
-        let mut worker = WorkerCore::new(slot, None).with_backoff_override(backoff_us);
+        let mut worker = WorkerCore::new(slot, None, BackoffPolicy::EventCount)
+            .with_backoff_override(backoff_us);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -3081,7 +3293,6 @@ mod tests {
             None,
             slot,
             plan,
-            false,
         );
     }
 
@@ -3330,7 +3541,6 @@ mod tests {
                     None,
                     0,
                     &WakePlan::standalone(),
-                    true,
                 );
             })
         };
@@ -3598,7 +3808,7 @@ mod tests {
         };
         armed_rx.recv().unwrap();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(0);
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -3611,7 +3821,6 @@ mod tests {
             None,
             0,
             &plan,
-            false,
         );
         assert_eq!(
             *requested.lock(),
@@ -3719,7 +3928,7 @@ mod tests {
         };
         armed_rx.recv().unwrap();
         let _slot = crate::runtime::wake_slot::SlotGuard::enter(0);
-        let mut worker = WorkerCore::new(0, None);
+        let mut worker = WorkerCore::new(0, None, BackoffPolicy::EventCount);
         run_worker_loop(
             &mut worker,
             &mut row,
@@ -3732,7 +3941,6 @@ mod tests {
             None,
             0,
             &plan,
-            false,
         );
         assert_eq!(
             *requested.lock(),

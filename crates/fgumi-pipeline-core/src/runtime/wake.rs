@@ -4007,7 +4007,7 @@ pub(crate) mod tests_support {
 mod e2e {
     use std::io;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering as AO};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
     use std::time::{Duration, Instant};
 
     use rstest::rstest;
@@ -4017,6 +4017,8 @@ mod e2e {
     use crate::outputs::Single;
     use crate::queues::QueueSpec;
     use crate::reorder::BranchOrdering;
+    use crate::runtime::driver::test_hooks;
+    use crate::runtime::event_count::WaitOutcome;
     use crate::runtime::stats::StatsSnapshot;
     use crate::runtime::wake_slot;
     use crate::runtime::worker_core::{TestBackoff, TestBackoffTarget as T};
@@ -6284,5 +6286,446 @@ mod e2e {
         assert!(matches!(res, Err(crate::signal::PipelineError::Cancelled)), "{res:?}");
         assert!(elapsed < Duration::from_secs(1), "cancel took {elapsed:?}");
         assert!(!snap.workers.is_empty(), "the run must be scheduled (per-worker rows), not fused");
+    }
+
+    // ───── Event-count idle policy: one pass after a timed-out wait ─────
+
+    /// A Parallel step that ignores its (empty) queue input and instead takes
+    /// items from a test queue, on wake slot `w` only. A hook injects an item
+    /// with no other worker's help, and worker `w` is the only thread that can
+    /// deliver it. Non-target clones never touch the queue's contents
+    /// (`is_empty` does not consume), so they cannot steal the item. `closed` is
+    /// set by the hook after its last push; every clone finishes once its input
+    /// is drained, `closed` is set and the queue is empty, so the Parallel drain
+    /// counter reaches zero.
+    #[derive(Clone)]
+    struct ChannelPar {
+        w: usize,
+        rx: Arc<crossbeam_queue::SegQueue<Blob>>,
+        closed: Arc<AtomicBool>,
+        held: Option<Blob>,
+    }
+    impl ChannelPar {
+        fn finished(&self, drained: bool) -> bool {
+            drained && self.held.is_none() && self.closed.load(AO::SeqCst) && self.rx.is_empty()
+        }
+    }
+    impl Step for ChannelPar {
+        type Input = Blob;
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ChannelPar",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            let _ = ctx.input.pop(); // the source sends nothing; keep the input drained
+            if wake_slot::current_slot() != Some(self.w) {
+                return Ok(if self.finished(ctx.input.is_drained()) {
+                    StepOutcome::Finished
+                } else {
+                    StepOutcome::NoProgress
+                });
+            }
+            let item = match self.held.take() {
+                Some(b) => Some(b),
+                None => self.rx.pop(),
+            };
+            match item {
+                Some(b) => match ctx.outputs.push(b) {
+                    Ok(()) => Ok(StepOutcome::Progress),
+                    Err(u) => {
+                        self.held = Some(u.into_item());
+                        Ok(StepOutcome::NoProgress)
+                    }
+                },
+                None if self.finished(ctx.input.is_drained()) => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            Self { held: None, ..self.clone() }
+        }
+    }
+
+    /// A source that finishes at once (its edge carries nothing). A sticky
+    /// Reader, so it pins worker 0 (`ParkedSleep`), leaving worker 1 as the
+    /// only `EventCount` waiter.
+    struct EmptySource;
+    impl Step for EmptySource {
+        type Input = ();
+        type Outputs = Single<Blob>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "EmptySource",
+                kind: StepKind::Serial,
+                sticky: true,
+                output_queues: vec![EDGE],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn affinity(&self) -> Affinity {
+            Affinity::Reader
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// A Parallel sink that consumes on any worker (unpinned, so worker 1 stays
+    /// on the `EventCount` policy) and counts items.
+    #[derive(Clone)]
+    struct ParallelCountingSink {
+        seen: Arc<AtomicU64>,
+    }
+    impl Step for ParallelCountingSink {
+        type Input = Blob;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ParallelCountingSink",
+                kind: StepKind::Parallel,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            match ctx.input.pop() {
+                Some(_) => {
+                    self.seen.fetch_add(1, AO::Relaxed);
+                    Ok(StepOutcome::Progress)
+                }
+                None if ctx.input.is_drained() => Ok(StepOutcome::Finished),
+                None => Ok(StepOutcome::NoProgress),
+            }
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Like [`run`], with this run's own worker-loop hooks
+    /// (`PipelineConfig::test_hooks`): only this run's threads see them.
+    fn run_with_hooks(
+        threads: usize,
+        test_backoff: Vec<TestBackoff>,
+        hooks: &Arc<test_hooks::TestHooks>,
+        build: impl FnOnce(&crate::builder::PipelineBuilder),
+    ) -> StatsSnapshot {
+        let builder = Pipeline::builder();
+        build(&builder);
+        let pipeline = builder.build().expect("build");
+        let stats = pipeline.stats();
+        pipeline
+            .run(
+                PipelineConfig {
+                    threads,
+                    test_backoff,
+                    test_hooks: Some(Arc::clone(hooks)),
+                    ..Default::default()
+                }
+                .with_stats(Arc::clone(&stats)),
+            )
+            .expect("run");
+        stats.snapshot()
+    }
+
+    /// `EmptySource` (w0, pinned) → `ChannelPar` (w1 only) →
+    /// `ParallelCountingSink`, 2 threads, with `hooks`. Worker 0 has a 10 s
+    /// timer; worker 1's starts at `w1_us`.
+    fn run_channel_chain(
+        rx: Arc<crossbeam_queue::SegQueue<Blob>>,
+        closed: Arc<AtomicBool>,
+        w1_us: u64,
+        seen: &Arc<AtomicU64>,
+        hooks: &Arc<test_hooks::TestHooks>,
+    ) {
+        let seen = Arc::clone(seen);
+        let backoff = vec![
+            TestBackoff { target: T::Worker(0), us: TEN_S },
+            TestBackoff { target: T::Worker(1), us: w1_us },
+        ];
+        let _ = run_with_hooks(2, backoff, hooks, move |b| {
+            b.chain(EmptySource)
+                .chain(ChannelPar { w: 1, rx, closed, held: None })
+                .chain(ParallelCountingSink { seen })
+                .into_sink_marker();
+        });
+    }
+
+    /// Worker 1's idle iterations from `hooks`: `(passes, outcome)`.
+    fn worker1_iterations(hooks: &test_hooks::TestHooks) -> Vec<(u64, Option<WaitOutcome>)> {
+        hooks.iterations.lock().iter().filter(|(w, ..)| *w == 1).map(|&(_, p, o)| (p, o)).collect()
+    }
+
+    /// Worker 1 is the only `EventCount` waiter (worker 0 is pinned by
+    /// `EmptySource`). Its override is 1 ms, so idle iterations time out
+    /// deterministically (nothing can wake it). On its 5th armed wait, the
+    /// hook — running after `prepare_wait` and before `wait` — pushes an item
+    /// and calls `ec.notify_one()`, so that wait's outcome is deterministically
+    /// `Woken`. Expected pass counts: 2 for the first idle iteration, 1 after a
+    /// `TimedOut`, 2 after anything else. The hooks are this run's own, so the
+    /// test holds under plain `cargo test` too.
+    #[test]
+    fn timed_out_wait_skips_the_pre_arm_pass() {
+        let tx = Arc::new(crossbeam_queue::SegQueue::new());
+        let rx = Arc::clone(&tx);
+        let closed = Arc::new(AtomicBool::new(false));
+        let waits = AtomicU64::new(0);
+        let c2 = Arc::clone(&closed);
+        let hooks = Arc::new(test_hooks::TestHooks::with_before_wait(Box::new(move |w, ec| {
+            if w == 1 && waits.fetch_add(1, AO::SeqCst) == 4 {
+                tx.push(Blob(1));
+                c2.store(true, AO::SeqCst);
+                let _ = ec.notify_one(); // after prepare_wait, before wait → that wait returns Woken
+            }
+        })));
+        let seen = Arc::new(AtomicU64::new(0));
+        run_under_watchdog("pass counts", 5, {
+            let seen = Arc::clone(&seen);
+            let hooks = Arc::clone(&hooks);
+            move || run_channel_chain(rx, closed, 1_000, &seen, &hooks)
+        });
+        assert_eq!(seen.load(AO::Relaxed), 1);
+        let w1 = worker1_iterations(&hooks);
+        assert!(w1.len() >= 5, "worker 1 waited at least five times: {w1:?}");
+        assert_eq!(w1[0].0, 2, "first idle iteration has two passes: {w1:?}");
+        for pair in w1.windows(2) {
+            let expected = if pair[0].1 == Some(WaitOutcome::TimedOut) { 1 } else { 2 };
+            assert_eq!(pair[1].0, expected, "{w1:?}");
+        }
+        // EmptySource's Finished (on_finished → notify_all) can wake w1's first
+        // wait, so only "some timeout before the hook" is asserted.
+        assert!(
+            w1[1..4].iter().any(|(_, o)| *o == Some(WaitOutcome::TimedOut)),
+            "a timed-out wait precedes the hook: {w1:?}"
+        );
+        assert_eq!(
+            w1[4].1,
+            Some(WaitOutcome::Woken),
+            "fifth wait sees the hook's notify (generation moved before wait): {w1:?}"
+        );
+    }
+
+    /// After a `TimedOut`, the pre-arm pass is skipped but the post-arm re-poll
+    /// is not. At the loop top after the first timeout, the hook pushes one item
+    /// (no waiter is armed, so nothing notifies), closes the queue, and raises
+    /// worker 1's deadline to 10 s. Worker 0 is on a 10 s timer and cannot
+    /// deliver (`ChannelPar` runs only on worker 1). Only worker 1's post-arm
+    /// re-poll can find the item: the iteration right after the hook must end
+    /// in that re-poll (`cancel_wait`, outcome `None`) after one pass. A loop
+    /// that skipped the re-poll waits 10 s and trips the 5 s watchdog, or, if a
+    /// stray notify cut that wait short, ends the iteration with a wait outcome.
+    #[test]
+    fn skip_after_timeout_keeps_the_post_arm_repoll() {
+        let tx = Arc::new(crossbeam_queue::SegQueue::new());
+        let rx = Arc::clone(&tx);
+        let closed = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&closed);
+        let hooks = Arc::new(test_hooks::TestHooks::default());
+        *hooks.at_loop_top_after_timeout.lock() = Some(Box::new(move |w, core| {
+            assert_eq!(w, 1);
+            tx.push(Blob(7)); // no waiter is armed, and nothing notifies
+            c2.store(true, AO::SeqCst);
+            core.set_override_for_test(TEN_S);
+        }));
+        let seen = Arc::new(AtomicU64::new(0));
+        run_under_watchdog("post-arm re-poll after timeout", 5, {
+            let seen = Arc::clone(&seen);
+            let hooks = Arc::clone(&hooks);
+            move || run_channel_chain(rx, closed, 1_000, &seen, &hooks)
+        });
+        assert_eq!(seen.load(AO::Relaxed), 1);
+        assert!(hooks.at_loop_top_after_timeout.lock().is_none(), "the hook ran");
+        let w1 = worker1_iterations(&hooks);
+        let first_timeout = w1
+            .iter()
+            .position(|(_, o)| *o == Some(WaitOutcome::TimedOut))
+            .unwrap_or_else(|| panic!("worker 1 timed out before the hook: {w1:?}"));
+        assert_eq!(
+            w1.get(first_timeout + 1).copied(),
+            Some((1, None)),
+            "the iteration after the hook found the item in its own re-poll: {w1:?}"
+        );
+    }
+
+    /// A regression guard for the stash-cap reverse wake under the event-count
+    /// idle policy. An ordered Parallel pass behind a one-item stash cap
+    /// (`test_reorder_overflow_bytes`), into a slow recording sink; every worker
+    /// on a 10 s timer, so only the reverse wake can finish. `holds > 0` is the
+    /// precondition; the oracle is the in-order values inside the watchdog.
+    #[test]
+    fn stash_cap_hold_is_woken_by_its_reverse_wake() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        run_under_watchdog("stash-cap hold", 5, move || {
+            let builder = Pipeline::builder();
+            builder
+                .chain(Source::exclusive(400, 0))
+                .chain(OrderedPass::new("OrderedPar", ONE_BLOB))
+                .chain(RecordingSink {
+                    seen: s2,
+                    affinity: Affinity::None,
+                    delay: Duration::from_micros(300),
+                })
+                .into_sink_marker();
+            let pipeline = builder.build().expect("build");
+            let stats = pipeline.stats();
+            pipeline
+                .run(
+                    PipelineConfig {
+                        threads: 4,
+                        test_backoff: vec![TestBackoff { target: T::AllWorkers, us: TEN_S }],
+                        test_reorder_overflow_bytes: Some(1),
+                        ..Default::default()
+                    }
+                    .with_stats(Arc::clone(&stats)),
+                )
+                .expect("run");
+            *sn2.lock() = Some(stats.snapshot());
+        });
+        assert_eq!(*seen.lock(), (0..400).collect::<Vec<u32>>());
+        let s = snap.lock().take().unwrap();
+        assert!(row(&s, "OrderedPar").holds > 0, "fixture never hit the stash cap");
+    }
+
+    /// The same chain with NO timer override (the 200µs floor in force) and an
+    /// immediate sink: items held at the reorder stash cap are released by the
+    /// directed holder wake. The stash-cap refusal latches its holder
+    /// (`note_rejected_holder`, which also marks the thread for this test) and
+    /// the in-order pop that shrinks the stash unparks it. Oracle: the run's
+    /// hooks count the timer parks of exactly those latched holders that an
+    /// `unpark` ended before their deadline. Without the latch no thread is
+    /// ever marked, so the count is exactly 0; with it, it is positive and
+    /// grows with the holds. Nothing else feeds it — not the pinned source's
+    /// unparks, nor a transport-full hold, nor a holder's timer — so the oracle
+    /// does not depend on how far scheduling delays a wake. `holds > 0` is the
+    /// precondition; 1 000 items keep the run short under a loaded host (the
+    /// 10 s watchdog is the hang guard, not a latency bound). Hold latency (p99 / mean / max) is printed, not asserted:
+    /// it tracks the consumer's scheduling, so it is measured on a quiet host.
+    #[test]
+    fn stash_cap_holds_are_released_by_the_directed_wake() {
+        let snap = Arc::new(parking_lot::Mutex::new(None));
+        let sn2 = Arc::clone(&snap);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let hooks = Arc::new(test_hooks::TestHooks::default());
+        let h2 = Arc::clone(&hooks);
+        run_under_watchdog("stash-cap holds at the floor", 10, move || {
+            let builder = Pipeline::builder();
+            builder
+                .chain(Source::exclusive(1_000, 0))
+                .chain(OrderedPass::new("OrderedPar", ONE_BLOB))
+                .chain(RecordingSink { seen: s2, affinity: Affinity::None, delay: Duration::ZERO })
+                .into_sink_marker();
+            let pipeline = builder.build().expect("build");
+            let stats = pipeline.stats();
+            pipeline
+                .run(
+                    PipelineConfig {
+                        threads: 4,
+                        test_reorder_overflow_bytes: Some(1),
+                        test_hooks: Some(h2),
+                        ..Default::default()
+                    }
+                    .with_stats(Arc::clone(&stats)),
+                )
+                .expect("run");
+            *sn2.lock() = Some(stats.snapshot());
+        });
+        assert_eq!(*seen.lock(), (0..1_000).collect::<Vec<u32>>());
+        let s = snap.lock().take().unwrap();
+        let step = row(&s, "OrderedPar");
+        assert!(step.holds > 0, "fixture never hit the stash cap");
+        let parks = hooks.stash_holder_parks.load(AO::Relaxed);
+        let unparked = hooks.stash_holder_unparks.load(AO::Relaxed);
+        eprintln!(
+            "stash-cap holds={} held_retries={} p99={} ns mean={} ns max={} ns; \
+             stash-cap holder parks={parks} unparked={unparked}; worker_waits={:?}",
+            step.holds,
+            step.held_retries,
+            step.held_wait_quantile_ns(0.99),
+            step.held_wait_ns / step.holds,
+            step.held_wait_max_ns,
+            s.worker_waits,
+        );
+        assert!(
+            unparked > 0,
+            "no stash-cap holder was unparked by the in-order pop: {parks} parks for {} holds",
+            step.holds
+        );
+    }
+
+    // ───── Idle policies by role ─────
+
+    /// Runs `Src(Serial, Reader) → Par → [Tap(Detached) →] Sink(Serial,
+    /// Writer)` with a 20 ms first-item delay, so every pool worker and driver
+    /// goes idle before any item exists (a worker that never idles would leave
+    /// fewer records than workers). 64 items keep the run short. Returns each
+    /// thread's first idle deadline, from this run's own hooks.
+    fn run_and_record_first_deadlines(n: usize, with_detached: bool) -> Vec<(String, Duration)> {
+        let seen = Arc::new(AtomicU64::new(0));
+        let hooks = Arc::new(test_hooks::TestHooks::default());
+        let builder = Pipeline::builder();
+        let mut sink = Sink::new(StepKind::Serial, &seen);
+        sink.affinity = Affinity::Writer;
+        let par = builder
+            .chain(Source::serial_with_affinity(64, 20, Affinity::Reader))
+            .chain(Pass::new("Par", StepKind::Parallel));
+        if with_detached {
+            par.chain(Pass::new("Tap", StepKind::Detached)).chain(sink).into_sink_marker();
+        } else {
+            par.chain(sink).into_sink_marker();
+        }
+        builder
+            .build()
+            .expect("build")
+            .run(PipelineConfig {
+                threads: n,
+                test_hooks: Some(Arc::clone(&hooks)),
+                ..Default::default()
+            })
+            .expect("run");
+        assert_eq!(seen.load(AO::Relaxed), 64);
+        std::mem::take(&mut *hooks.first_deadlines.lock())
+    }
+
+    /// Behavioural oracle: the first idle deadline each thread computes, before
+    /// its first episode is counted. An unpinned worker (`EventCount`) records
+    /// `jittered_wait_micros(200, w, 0)` ∈ [150, 250]µs, a pinned or lone
+    /// worker (`ParkedSleep`) 20µs, a driver (`Park`) 10µs. No `test_backoff`
+    /// overrides are set.
+    #[rstest]
+    #[case::four_workers(4, false)]
+    #[case::one_worker_with_a_driver(1, true)]
+    fn policies_are_assigned_by_role(#[case] n: usize, #[case] with_detached: bool) {
+        // n = 4: w0 (Reader) and w3 (Writer) pinned; w1, w2 not.
+        // n = 1: the lone worker; the Detached step keeps the chain from fusing.
+        assert!(n <= test_hooks::MAX_TEST_WORKERS);
+        let firsts = run_and_record_first_deadlines(n, with_detached);
+        for (name, d) in &firsts {
+            match name.as_str() {
+                "fgumi-worker-1" | "fgumi-worker-2" => {
+                    assert!((150..=250).contains(&d.as_micros()), "{name}: {d:?}");
+                }
+                "fgumi-worker-0" | "fgumi-worker-3" => {
+                    assert_eq!(*d, Duration::from_micros(20), "{name}");
+                }
+                n if n.starts_with("fgumi-driver") => {
+                    assert_eq!(*d, Duration::from_micros(10), "{n}");
+                }
+                other => panic!("unexpected thread {other}"),
+            }
+        }
+        let workers = firsts.iter().filter(|(n, _)| n.starts_with("fgumi-worker")).count();
+        assert_eq!(workers, n, "exactly one record per pool worker: {firsts:?}");
+        assert_eq!(firsts.iter().any(|(n, _)| n.starts_with("fgumi-driver")), with_detached);
     }
 }

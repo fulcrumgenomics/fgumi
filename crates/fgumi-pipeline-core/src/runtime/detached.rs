@@ -19,7 +19,9 @@
 //! [`WorkerCore::driver`](crate::runtime::WorkerCore) (Park backoff — a
 //! 10 µs → 2 ms `park_timeout` ramp, ended early by the `unpark` every producer
 //! of its live steps delivers through the wake plan — off-pool stats
-//! attribution) and the [`DrainFirstScheduler`]. So a driver is literally a
+//! attribution) and the [`DrainFirstScheduler`]. (The pool's unpinned workers
+//! idle with `EventCount` instead, waiting on the pool event-count; a driver
+//! never does.) So a driver is literally a
 //! 1-thread (or, for a group, still 1-thread over several `Owned` steps) instance
 //! of the pool loop. Several detached steps sharing a
 //! [`DetachedGroup::Shared`](crate::step::DetachedGroup) label are driven by ONE
@@ -493,20 +495,28 @@ pub(crate) fn run_detached_driver(
     board: Option<&crate::runtime::worker_state::WorkerStateBoard>,
     state_slot: usize,
     // The chain's wake plan; a driver is a notifier/unparker and is woken by
-    // `unpark`, never an event-count waiter. Passed with `pinned = true` below
-    // so the driver keeps its `Park` backoff and never deep-parks on the
-    // shared event-count.
+    // `unpark`, never an event-count waiter: its `Park` policy keeps it off the
+    // shared event-count (the `EventCount` policy is the pool's unpinned
+    // workers' alone).
     wake: &crate::runtime::wake::WakePlan,
     // A test override of this driver's idle-backoff bounds
     // (`PipelineConfig::test_backoff`); `None` in every real run.
     backoff_override: Option<u64>,
+    // This run's test hooks (`PipelineConfig::test_hooks`); `()` outside this
+    // crate's tests.
+    hooks: crate::runtime::driver::RunTestHooks,
     // This driver's index in `wake` (its wake slot is `n_workers + driver`).
     driver: crate::runtime::placement::DriverIdx,
 ) {
     let primary = group.primary_step();
     debug_assert_eq!(drain_counters.len(), contexts.inputs.len(), "one counter per step");
     let mut row = build_driver_storage(group.into_steps(), drain_counters);
-    let mut worker = WorkerCore::driver(primary, driver).with_backoff_override(backoff_override);
+    let worker = WorkerCore::driver(primary, driver).with_backoff_override(backoff_override);
+    #[cfg(test)]
+    let worker = worker.with_test_hooks(hooks);
+    #[cfg(not(test))]
+    let () = hooks;
+    let mut worker = worker;
     run_worker_loop(
         &mut worker,
         &mut row,
@@ -519,10 +529,6 @@ pub(crate) fn run_detached_driver(
         board,
         state_slot,
         wake,
-        // `pinned`: a detached driver is not a pool waiter. This routes its idle
-        // to the `Park` backoff rather than the shared event-count wait, while
-        // the plan above still routes its wakes.
-        true,
     );
 }
 
@@ -669,6 +675,7 @@ mod tests {
             None,
             0,
             &crate::runtime::wake::WakePlan::standalone(),
+            None,
             None,
             crate::runtime::placement::DriverIdx(0),
         );
