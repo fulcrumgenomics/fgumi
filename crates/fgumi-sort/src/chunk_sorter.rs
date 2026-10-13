@@ -37,17 +37,17 @@ use fgumi_raw_bam::SamTag;
 use rayon::ThreadPool;
 
 use crate::arena_pool::ArenaPool;
-use crate::external::{
-    KeyTypesSpec, LibraryLookup, TemplateKeyVariant, dropped_lane_error,
-    extract_template_key_inline, select_template_variant, verify_dropped_lanes,
-    violation_read_name,
-};
 use crate::inline::{
     CbKey32, InMemoryChunk, RecordBuffer, TemplateKey, TemplateKey24, TemplateKey40,
     TemplateLaneKey, TemplateRecordBuffer, TertKey32,
 };
 use crate::keys::RawCoordinateKey;
 use crate::memory_probe::force_mi_collect;
+use crate::template_key::{
+    KeyTypesSpec, LibraryLookup, TemplateKeyVariant, dropped_lane_error,
+    extract_template_key_inline, select_template_variant, verify_dropped_lanes,
+    violation_read_name,
+};
 
 /// In-memory coordinate buffering sorter that emits owned sorted chunks.
 pub struct CoordinateChunkSorter {
@@ -803,7 +803,7 @@ mod tests {
     /// (Pre-P6 the streaming production path skipped this validation entirely.)
     #[test]
     fn template_chunk_sorter_rejects_dropped_lane_violation() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         // Raw BAM aux for `MI:i:<v>` (tag bytes + 'i' type + i32 LE value).
         fn mi_aux(v: i32) -> Vec<u8> {
@@ -835,7 +835,7 @@ mod tests {
     /// under a placeholder name, not a slice panic in the violation branch.
     #[test]
     fn template_chunk_sorter_reports_a_violation_whose_read_name_overruns_its_body() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
         let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .memory_limit(256 * 1024 * 1024)
             .threads(1)
@@ -856,7 +856,7 @@ mod tests {
     /// validation passes and the sort proceeds — the common case.
     #[test]
     fn template_chunk_sorter_accepts_constant_dropped_lanes() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
         let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .memory_limit(256 * 1024 * 1024)
             .threads(1)
@@ -878,7 +878,7 @@ mod tests {
     /// producing a correctly ordered chunk keyed by the full [`TemplateKey`].
     #[test]
     fn template_chunk_sorter_selects_narrow_variant_without_cb_or_mi() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
         let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .memory_limit(256 * 1024 * 1024)
             .threads(2)
@@ -921,7 +921,7 @@ mod tests {
     /// each tie group in input order under both key widths.
     #[test]
     fn template_chunk_sorter_narrow_matches_full_key_order() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
         for i in 0..120i32 {
@@ -976,7 +976,7 @@ mod tests {
     /// `TemplateKey40`) key widths.
     #[test]
     fn template_arena_drain_matches_owned_materialize() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
         for i in 0..120i32 {
@@ -1034,9 +1034,9 @@ mod tests {
     #[allow(unsafe_code)]
     fn template_arena_accumulator_matches_owned_sorter() {
         use crate::arena_pool::PooledSegmentedBuf;
-        use crate::external::KeyTypesSpec;
         use crate::segmented_buf::SegmentedBuf;
         use crate::template_arena::TemplateArenaAccumulator;
+        use crate::template_key::KeyTypesSpec;
         use std::sync::Arc;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
@@ -1096,7 +1096,7 @@ mod tests {
     /// residual (the lazy `Option<TemplateBuffer>` stays `None`).
     #[test]
     fn template_chunk_sorter_empty_stream_yields_empty_residual() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
         let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .memory_limit(256 * 1024 * 1024)
             .threads(1)

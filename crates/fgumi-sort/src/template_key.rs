@@ -13,13 +13,10 @@ use std::sync::Arc;
 
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
 use noodles::sam::Header;
+use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+use std::collections::{HashMap, HashSet};
 
 use crate::arena_pool::PooledSegmentedBuf;
-use crate::external::{
-    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, TemplateKeyVariant, cb_hasher,
-    dropped_lane_error, extract_template_key_inline, select_template_variant, verify_dropped_lanes,
-    violation_read_name,
-};
 use crate::inline::{
     CbKey32, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordRef,
     TertKey32,
@@ -430,6 +427,484 @@ impl TemplateKeyContext {
     }
 }
 
+// ============================================================================
+// Library Lookup for Template-Coordinate Sort
+// ============================================================================
+
+/// Deterministic hasher for cell barcode hashing in template-coordinate sort.
+///
+/// Delegates to the shared [`fgumi_dna::deterministic_state`] so the fixed seed table lives in
+/// exactly one place; hash values remain reproducible across runs.
+#[must_use]
+pub fn cb_hasher() -> ahash::RandomState {
+    fgumi_dna::deterministic_state()
+}
+
+/// Maps read group ID -> library ordinal for O(1) comparison.
+///
+/// Pre-computes ordinals by sorting library names alphabetically.
+/// Empty/unknown library sorts first (ordinal 0).
+#[derive(Clone)]
+pub struct LibraryLookup {
+    /// RG ID -> library ordinal
+    rg_to_ordinal: HashMap<Vec<u8>, u32>,
+    /// Deterministic hasher for read name hashing, constructed once for reuse.
+    hasher: ahash::RandomState,
+}
+
+impl LibraryLookup {
+    /// Build lookup from BAM header.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_header(header: &Header) -> Self {
+        // Collect all unique library names from read groups
+        let mut libraries: Vec<String> = header
+            .read_groups()
+            .iter()
+            .filter_map(|(_, rg)| {
+                rg.other_fields().get(&rg_tag::LIBRARY).map(std::string::ToString::to_string)
+            })
+            .collect();
+
+        // Sort alphabetically and deduplicate
+        libraries.sort();
+        libraries.dedup();
+
+        // Build library name -> ordinal mapping
+        // Empty string gets ordinal 0, then libraries in sorted order
+        let mut lib_to_ordinal: HashMap<String, u32> = HashMap::new();
+        lib_to_ordinal.insert(String::new(), 0);
+        for (i, lib) in libraries.iter().enumerate() {
+            lib_to_ordinal.insert(lib.clone(), (i + 1) as u32);
+        }
+
+        // Build RG ID -> ordinal mapping
+        let rg_to_ordinal: HashMap<Vec<u8>, u32> = header
+            .read_groups()
+            .iter()
+            .map(|(id, rg)| {
+                let lib = rg
+                    .other_fields()
+                    .get(&rg_tag::LIBRARY)
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_default();
+                let ordinal = *lib_to_ordinal.get(&lib).unwrap_or(&0);
+                (id.to_vec(), ordinal)
+            })
+            .collect();
+
+        // Arbitrary fixed seeds — chosen for uniqueness, not cryptographic strength.
+        let hasher = ahash::RandomState::with_seeds(
+            0x517c_c1b7_2722_0a95,
+            0x1234_5678_90ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+        );
+
+        Self { rg_to_ordinal, hasher }
+    }
+
+    /// Hash a read name deterministically.
+    #[inline]
+    #[must_use]
+    pub fn hash_name(&self, name: &[u8]) -> u64 {
+        self.hasher.hash_one(name)
+    }
+
+    /// Get library ordinal for a record (from RG tag in aux data).
+    ///
+    /// Only used in tests; production code uses [`ordinal_from_rg`](Self::ordinal_from_rg)
+    /// with pre-extracted RG bytes from the single-pass aux scan.
+    #[cfg(test)]
+    #[must_use]
+    pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
+        fgumi_raw_bam::RawRecordView::new(bam)
+            .tags()
+            .find_string(SamTag::RG)
+            .and_then(|rg| self.rg_to_ordinal.get(rg))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Get library ordinal from pre-extracted RG tag bytes.
+    #[inline]
+    #[must_use]
+    pub fn ordinal_from_rg(&self, rg: Option<&[u8]>) -> u32 {
+        rg.and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
+    }
+
+    /// Number of distinct library ordinals realized by the header's read groups.
+    ///
+    /// Used to decide whether the template-key `tertiary` library lane can vary:
+    /// `<= 1` means every header read group maps to the same library ordinal, so
+    /// the lane is provisionally constant (decode-time verify still backstops the
+    /// case where a record carries an RG absent from the header → ordinal 0).
+    /// Returns 0 when the header declares no read groups.
+    #[must_use]
+    pub fn distinct_header_ordinals(&self) -> usize {
+        self.rg_to_ordinal.values().copied().collect::<HashSet<u32>>().len()
+    }
+}
+
+/// Extract a packed `TemplateKey` directly from BAM record bytes.
+///
+/// This function computes the template-coordinate sort key inline, avoiding
+/// heap allocations for the read name by using a hash instead.
+///
+/// When `cell_tag` is `Some`, the CB (cellular barcode) tag value is hashed
+/// and included in the sort key between neg2 and MI, matching fgbio's order.
+#[must_use]
+pub fn extract_template_key_inline(
+    bam_bytes: &[u8],
+    lib_lookup: &LibraryLookup,
+    cell_tag: Option<SamTag>,
+    cb_hasher: &ahash::RandomState,
+) -> TemplateKey {
+    use fgumi_raw_bam;
+    use fgumi_raw_bam::{flags, mate_unclipped_5prime, unclipped_5prime_raw};
+
+    // Single-pass extraction of all aux tags (MI, RG, cell barcode, MC)
+    let aux = fgumi_raw_bam::extract_template_aux_tags(bam_bytes, cell_tag);
+    let mi = aux.mi;
+    let library = lib_lookup.ordinal_from_rg(aux.rg);
+    let cb_hash = aux.cell.map_or(0u64, |cb_bytes| cb_hasher.hash_one(cb_bytes));
+
+    // Extract fields from raw bytes
+    let v = fgumi_raw_bam::RawRecordView::new(bam_bytes);
+    let tid = v.ref_id();
+    let pos = v.pos();
+    let l_read_name = v.l_read_name() as usize;
+    let flag = v.flags();
+    let mate_tid = v.mate_ref_id();
+    let mate_pos = v.mate_pos();
+
+    // Extract flags
+    let is_unmapped = (flag & flags::UNMAPPED) != 0;
+    let mate_unmapped = (flag & flags::MATE_UNMAPPED) != 0;
+    let is_reverse = (flag & flags::REVERSE) != 0;
+    let mate_reverse = (flag & flags::MATE_REVERSE) != 0;
+    let is_paired = (flag & flags::PAIRED) != 0;
+
+    // Hash read name (exclude null terminator)
+    let name_len = l_read_name.saturating_sub(1);
+    let name = if name_len > 0 && 32 + name_len <= bam_bytes.len() {
+        &bam_bytes[32..32 + name_len]
+    } else {
+        &[]
+    };
+    let name_hash = lib_lookup.hash_name(name);
+
+    // Secondary/supplementary reads cannot reconstruct their template coordinate
+    // from their own record (they carry their own and their mate's position, but
+    // not their own primary's). When `fgumi zipper` has stamped the exact
+    // template coordinate into the `tc` tag, key on it so the read sorts at its
+    // primary pair's coordinate — a placement per-record keying (samtools/fgbio)
+    // cannot achieve. Falls through to the position-based computation when absent.
+    let is_secondary = (flag & flags::SECONDARY) != 0;
+    let is_supplementary = (flag & flags::SUPPLEMENTARY) != 0;
+    if is_secondary || is_supplementary {
+        let aux_slice = fgumi_raw_bam::aux_data_slice(bam_bytes);
+        if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
+            fgumi_raw_bam::read_tc_template_coordinate(aux_slice)
+        {
+            // `tc` is canonicalized by (tid, pos) only (see zipper's
+            // `add_template_coordinate_tags_raw`), whereas the per-record path
+            // additionally tiebreaks on strand for equal positions. In the
+            // degenerate case where both primaries share an identical tid and
+            // unclipped-5' position but differ in strand, the supplementary's
+            // secondary-lane strand order can differ from its primaries'. This is
+            // harmless: the primary lane (tid1, tid2, pos1) still matches, so the
+            // read co-locates with its template; only a same-coordinate tiebreak
+            // differs.
+            //
+            // `TemplateKey::new`'s final argument is the `is_upper` bit, packed
+            // into `name_hash_upper` as the *last* tiebreak (after position,
+            // strand, CB, library, MI, and name). For a mapped read it answers
+            // "is this read's own primary the upper (lane-2) end?", derived from
+            // this read's position vs. its mate. A secondary/supplementary read
+            // cannot recover that: `tc` is canonicalized by (tid, pos) and does
+            // not record which segment (R1/R2) landed on which lane, and the
+            // read's own alignment position is exactly the misleading coordinate
+            // this branch exists to avoid. We use `is_read2` because it mirrors
+            // the primary's `is_upper` for the standard FR pair (R1 is the lower
+            // lane -> is_upper=false; R2 is the upper lane -> is_upper=true) and
+            // is fully deterministic; see
+            // `test_extract_template_key_secondary_supplementary_matches_primary_via_tc`,
+            // which asserts the tc-keyed key is byte-identical to the primary's.
+            // Any residual disagreement (an exotic pair whose R2 is the lower
+            // lane) only reorders same-name records at an identical coordinate,
+            // so it cannot affect co-location or dedup grouping.
+            let is_read2 = (flag & 0x80) != 0;
+            return TemplateKey::new(
+                tid1,
+                pos1,
+                neg1 != 0,
+                tid2,
+                pos2,
+                neg2 != 0,
+                cb_hash,
+                library,
+                mi,
+                name_hash,
+                is_read2,
+            );
+        }
+    }
+
+    // Handle unmapped reads
+    if is_unmapped {
+        if is_paired && !mate_unmapped {
+            // Unmapped read with mapped mate - use mate's position as primary key
+            let mate_unclipped =
+                aux.mc.map_or(mate_pos, |mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc));
+
+            return TemplateKey::new(
+                mate_tid,
+                mate_unclipped,
+                mate_reverse,
+                i32::MAX,
+                i32::MAX,
+                false,
+                cb_hash,
+                library,
+                mi,
+                name_hash,
+                true, // Unmapped read is always "upper" relative to mapped mate
+            );
+        }
+
+        // Completely unmapped - sort to end. Still carry the read's library and
+        // MI lanes so a fully-unmapped read realizes the same tertiary as its
+        // mapped, same-library peers (otherwise the dropped-lane verify treats a
+        // single-library file as if the library varied; see #375).
+        let is_read2 = (flag & 0x80) != 0; // is_last_segment flag
+        return TemplateKey::unmapped(name_hash, cb_hash, library, mi, is_read2);
+    }
+
+    // Calculate unclipped 5' position for this read (zero-alloc: reads cigar directly)
+    let this_pos = unclipped_5prime_raw(bam_bytes, pos, is_reverse);
+
+    // Calculate mate's unclipped 5' position
+    let mate_unclipped = if is_paired && !mate_unmapped {
+        aux.mc.map_or(mate_pos, |mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc))
+    } else {
+        mate_pos
+    };
+
+    // Determine canonical ordering
+    let (tid1, tid2, pos1, pos2, neg1, neg2, is_upper) = if is_paired && !mate_unmapped {
+        // Samtools logic: is_upper if pos > mate_pos, or (pos == mate_pos && this read is reverse)
+        let is_upper = (tid, this_pos) > (mate_tid, mate_unclipped)
+            || ((tid, this_pos) == (mate_tid, mate_unclipped) && is_reverse);
+
+        if is_upper {
+            // Swap: mate's position comes first
+            (mate_tid, tid, mate_unclipped, this_pos, mate_reverse, is_reverse, true)
+        } else {
+            // No swap: this read's position comes first
+            (tid, mate_tid, this_pos, mate_unclipped, is_reverse, mate_reverse, false)
+        }
+    } else {
+        // Unpaired or mate unmapped - use MAX for tid2/pos2
+        (tid, i32::MAX, this_pos, i32::MAX, is_reverse, false, false)
+    };
+
+    TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, cb_hash, library, mi, name_hash, is_upper)
+}
+
+// ============================================================================
+// Template-key variant selection
+// ============================================================================
+
+/// Which optional lanes a chosen template key retains.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateKeyVariant {
+    /// Retain the `cb_hash` lane.
+    pub cb: bool,
+    /// Retain the tertiary (library|mi) lane.
+    pub tertiary: bool,
+}
+
+impl TemplateKeyVariant {
+    /// The widest variant (every optional lane): what a template ref is charged
+    /// at before the sort's first record chooses its lanes.
+    pub const WIDEST: Self = Self { cb: true, tertiary: true };
+
+    /// Number of u64 lanes: 3 + cb + tertiary.
+    #[must_use]
+    pub fn lanes(self) -> usize {
+        3 + usize::from(self.cb) + usize::from(self.tertiary)
+    }
+
+    /// Bytes one accumulated `TemplateRecordRef<K>` occupies for this variant:
+    /// the narrowed key (8 bytes per lane) plus the 16-byte
+    /// `offset`/`len`/`padding` tail. Derived from [`Self::lanes`], which owns the
+    /// lane count; pinned against `size_of` by `ref_width_matches_the_ref_size`.
+    /// A logical size: records × `ref_width` is what the refs hold, while a
+    /// growing `Vec` of them can have up to about twice that allocated.
+    #[must_use]
+    pub fn ref_width(self) -> usize {
+        8 * self.lanes() + 16
+    }
+}
+
+/// Parsed `--key-types` spec controlling which optional sort-key lanes are kept.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum KeyTypesSpec {
+    /// Auto-detect from the first record (default).
+    #[default]
+    Auto,
+    /// Force all lanes (N=5).
+    Full,
+    /// Force no optional lanes (N=3).
+    None,
+    /// Force a specific optional set.
+    Explicit {
+        /// Retain the `cb_hash` lane.
+        cb: bool,
+        /// Retain the tertiary (library|mi) lane.
+        tertiary: bool,
+    },
+}
+
+/// Mask for the MI component of the `tertiary` key lane (low 48 bits).
+/// `tertiary` packs `library_ordinal << 48 | (mi_value << 1 | !mi_suffix)`, so the
+/// high 16 bits are the library ordinal and the low 48 bits encode MI. A nonzero
+/// low-48 region means the first record carries an MI tag.
+const TERTIARY_MI_MASK: u64 = (1u64 << 48) - 1;
+
+/// Choose the template-key variant for this sort.
+///
+/// `first_key` is the full key extracted from the first record (`None` for an
+/// empty input — then the variant is irrelevant; default to lite). `spec` is the
+/// parsed `--key-types` override. `header_library_varies` is `true` when the
+/// header realizes more than one distinct library ordinal (see
+/// [`LibraryLookup::distinct_header_ordinals`]).
+///
+/// Selection only *provisions* the variant; the decode-time verify (fill loop)
+/// still *guarantees* the dropped lanes are constant. Under `Auto`, the tertiary
+/// library lane is kept only when it can actually vary: the first record carries
+/// an MI tag, or the header realizes more than one library ordinal. A single,
+/// constant library ordinal in the high bits is droppable — the header informs
+/// provisioning, while verify backstops the rare case of a record whose RG is
+/// absent from the header (which realizes ordinal 0).
+#[must_use]
+pub fn select_template_variant(
+    first_key: Option<&TemplateKey>,
+    spec: KeyTypesSpec,
+    header_library_varies: bool,
+) -> TemplateKeyVariant {
+    match spec {
+        KeyTypesSpec::Full => TemplateKeyVariant { cb: true, tertiary: true },
+        KeyTypesSpec::None => TemplateKeyVariant { cb: false, tertiary: false },
+        KeyTypesSpec::Explicit { cb, tertiary } => TemplateKeyVariant { cb, tertiary },
+        KeyTypesSpec::Auto => match first_key {
+            None => TemplateKeyVariant { cb: false, tertiary: false },
+            Some(k) => {
+                // Keep the tertiary lane only if it can actually vary: MI present on
+                // the first record (low-48 bits), or the header realizes more than
+                // one library ordinal. A single (constant) library ordinal in the
+                // high bits is droppable — decode-time verify backstops the rare
+                // case of a record whose RG is absent from the header (ordinal 0).
+                let mi_present = (k.tertiary & TERTIARY_MI_MASK) != 0;
+                TemplateKeyVariant {
+                    cb: k.cb_hash != 0,
+                    tertiary: mi_present || header_library_varies,
+                }
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Dropped-lane violation detection
+// ============================================================================
+
+/// A dropped-lane violation discovered during decode-time verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedLaneViolation {
+    /// A record carried a CB tag absent from the first record.
+    Cb,
+    /// A record carried an MI value differing from the first record.
+    Mi,
+    /// A record's realized library ordinal differed from the first record.
+    Library,
+}
+
+impl DroppedLaneViolation {
+    /// The `--key-types` token that re-includes this lane.
+    #[must_use]
+    pub fn key_types_token(self) -> &'static str {
+        match self {
+            DroppedLaneViolation::Cb => "cb",
+            DroppedLaneViolation::Mi => "mi",
+            DroppedLaneViolation::Library => "library",
+        }
+    }
+}
+
+/// Verify that the lanes the chosen `variant` dropped are constant for `cur`
+/// relative to the sort's `first` full key. Returns the first violation found,
+/// or `None` if all dropped lanes match.
+///
+/// Tertiary sub-fields are decoded only to attribute the violation: the high 16
+/// bits are the library ordinal; the low 48 bits are `(mi_value << 1) | !mi_suffix`
+/// (`mi_value` occupies bits 47..1; `!mi_suffix` is bit 0).
+#[must_use]
+pub fn verify_dropped_lanes(
+    first: &TemplateKey,
+    cur: &TemplateKey,
+    variant: TemplateKeyVariant,
+) -> Option<DroppedLaneViolation> {
+    if !variant.cb && cur.cb_hash != first.cb_hash {
+        return Some(DroppedLaneViolation::Cb);
+    }
+    if !variant.tertiary && cur.tertiary != first.tertiary {
+        // Attribute: library is the high 16 bits, mi the low 48.
+        let lib_changed = (cur.tertiary >> 48) != (first.tertiary >> 48);
+        return Some(if lib_changed {
+            DroppedLaneViolation::Library
+        } else {
+            DroppedLaneViolation::Mi
+        });
+    }
+    None
+}
+
+/// The read name of a record that violated a dropped lane, for its error
+/// message: the bytes [`RawRecordView::read_name`](fgumi_raw_bam::RawRecordView::read_name)
+/// returns when `l_read_name` fits inside `body`, else `<malformed read name>`.
+/// The key extractor tolerates a name that overruns its body (it bounds-checks
+/// the name), so such a record can reach the violation branch, which must not
+/// slice past the body while formatting the error.
+pub(crate) fn violation_read_name(body: &[u8]) -> String {
+    let l = body.get(8).map_or(0, |&b| usize::from(b));
+    let name: &[u8] = if l > 1 {
+        match body.get(32..32 + l - 1) {
+            Some(name) => name,
+            None => return "<malformed read name>".to_owned(),
+        }
+    } else {
+        &[]
+    };
+    String::from_utf8_lossy(name).into_owned()
+}
+
+/// Build the actionable error message for a dropped-lane violation.
+#[must_use]
+pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow::Error {
+    let field = match v {
+        DroppedLaneViolation::Cb => "CB",
+        DroppedLaneViolation::Mi => "MI",
+        DroppedLaneViolation::Library => "library",
+    };
+    anyhow::anyhow!(
+        "record {name} carries a {field} value absent from the input's first record; \
+         re-run with --key-types {}",
+        v.key_types_token(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use fgumi_raw_bam::SamTag;
@@ -438,9 +913,9 @@ mod tests {
 
     use super::*;
     use crate::arena_pool::PooledSegmentedBuf;
-    use crate::external::{KeyTypesSpec, extract_template_key_inline};
     use crate::inline::{TemplateKey24, TemplateKey40};
     use crate::segmented_buf::SegmentedBuf;
+    use crate::template_key::{KeyTypesSpec, extract_template_key_inline};
 
     /// `CB:Z:<value>` aux bytes.
     fn cb_aux(value: &[u8]) -> Vec<u8> {
@@ -764,5 +1239,705 @@ mod tests {
         let (arena, start, _) = arena_with(&[first], 0);
         let b = ctx.extract_batch::<TemplateKey24>(&arena, start, start, 0, 9).unwrap();
         assert!(b.refs.is_empty() && b.violation.is_none());
+    }
+}
+
+#[cfg(test)]
+mod moved_key_tests {
+    use super::*;
+    use bstr::BString;
+    use fgumi_raw_bam::flags;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReadGroup;
+    use rstest::rstest;
+
+    // ========================================================================
+    // LibraryLookup tests
+    // ========================================================================
+
+    #[test]
+    fn test_library_lookup_empty_header() {
+        let header = Header::builder().build();
+        let lookup = LibraryLookup::from_header(&header);
+        assert!(lookup.rg_to_ordinal.is_empty());
+    }
+
+    #[test]
+    fn test_library_lookup_single_rg() {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let header = Header::builder().add_read_group(BString::from("rg1"), rg).build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        assert_eq!(lookup.rg_to_ordinal.len(), 1);
+        // LibA is the only library, so it gets ordinal 1 (0 is reserved for empty/unknown)
+        assert_eq!(
+            *lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("rg1 should be in ordinal map"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_library_lookup_multiple_libraries() {
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibC"))
+            .build()
+            .expect("valid");
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_c = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibB"))
+            .build()
+            .expect("valid");
+
+        let header = Header::builder()
+            .add_read_group(BString::from("rg1"), rg_a)
+            .add_read_group(BString::from("rg2"), rg_b)
+            .add_read_group(BString::from("rg3"), rg_c)
+            .build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        assert_eq!(lookup.rg_to_ordinal.len(), 3);
+
+        // Libraries sorted alphabetically: LibA=1, LibB=2, LibC=3
+        let rg2 = *lookup.rg_to_ordinal.get(b"rg2".as_slice()).expect("rg2");
+        let rg3 = *lookup.rg_to_ordinal.get(b"rg3".as_slice()).expect("rg3");
+        let rg1 = *lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("rg1");
+        assert_eq!(rg2, 1); // LibA
+        assert_eq!(rg3, 2); // LibB
+        assert_eq!(rg1, 3); // LibC
+    }
+
+    #[test]
+    fn test_distinct_header_ordinals() {
+        // (i) no read groups -> 0.
+        let empty = LibraryLookup::from_header(&Header::builder().build());
+        assert_eq!(empty.distinct_header_ordinals(), 0);
+
+        // (ii) one RG with an LB -> 1.
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let one = LibraryLookup::from_header(
+            &Header::builder().add_read_group(BString::from("rg1"), rg_a).build(),
+        );
+        assert_eq!(one.distinct_header_ordinals(), 1);
+
+        // (iii) two RGs with two different LBs -> 2.
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_c = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibB"))
+            .build()
+            .expect("valid");
+        let two = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_b)
+                .add_read_group(BString::from("rg2"), rg_c)
+                .build(),
+        );
+        assert_eq!(two.distinct_header_ordinals(), 2);
+
+        // (iv) two RGs with the SAME LB -> 1.
+        let rg_d = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_e = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let same = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_d)
+                .add_read_group(BString::from("rg2"), rg_e)
+                .build(),
+        );
+        assert_eq!(same.distinct_header_ordinals(), 1);
+
+        // (v) one RG with an LB + one RG WITHOUT an LB -> 2 (ordinals {1, 0}).
+        let rg_f = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_no_lb = Map::<ReadGroup>::builder().build().expect("valid");
+        let mixed = LibraryLookup::from_header(
+            &Header::builder()
+                .add_read_group(BString::from("rg1"), rg_f)
+                .add_read_group(BString::from("rg2"), rg_no_lb)
+                .build(),
+        );
+        assert_eq!(mixed.distinct_header_ordinals(), 2);
+    }
+
+    #[test]
+    fn test_library_lookup_unknown_rg_returns_zero() {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let header = Header::builder().add_read_group(BString::from("rg1"), rg).build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        // A BAM record with no RG tag or unknown RG should return ordinal 0
+        // We can test get_ordinal with a minimal BAM record that has no aux data
+        let mut bam = vec![0u8; 36];
+        bam[8] = 4; // l_read_name = 4
+        bam[32..36].copy_from_slice(b"rea\0");
+        assert_eq!(lookup.get_ordinal(&bam), 0);
+    }
+
+    // ========================================================================
+    // find_string_tag_in_record tests (via fgumi_raw_bam)
+    // ========================================================================
+
+    /// Helper to build minimal BAM bytes with aux data appended.
+    /// Fixed 32-byte header + read name "rea\0" (`l_read_name=4`) + no cigar + no seq + aux.
+    fn build_bam_with_aux(aux_data: &[u8]) -> Vec<u8> {
+        let l_read_name: u8 = 4; // "rea" + null
+        let mut bam = vec![0u8; 32];
+        bam[8] = l_read_name;
+        // n_cigar_op = 0 (bytes 12-13 already zero)
+        // l_seq = 0 (bytes 16-19 already zero)
+        // read name
+        bam.extend_from_slice(b"rea\0");
+        // no cigar, no seq, no qual
+        // append aux data
+        bam.extend_from_slice(aux_data);
+        bam
+    }
+
+    #[rstest::rstest]
+    #[case::present(b"RGZgroup1\0".as_slice(), Some(b"group1".as_slice()))]
+    #[case::absent(b"".as_slice(), None)]
+    fn test_find_rg_tag(#[case] aux_data: &[u8], #[case] expected: Option<&[u8]>) {
+        let bam = build_bam_with_aux(aux_data);
+        assert_eq!(
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(SamTag::RG),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_find_rg_tag_after_other_tags() {
+        // XY:i:42 followed by RG:Z:mygroup — aux built dynamically for the integer tag
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"XYi");
+        aux.extend_from_slice(&42i32.to_le_bytes());
+        aux.extend_from_slice(b"RGZmygroup\0");
+        let bam = build_bam_with_aux(&aux);
+        assert_eq!(
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(SamTag::RG),
+            Some(b"mygroup".as_slice())
+        );
+    }
+
+    // ========================================================================
+    // extract_template_key_inline cell_tag tests
+    // ========================================================================
+
+    fn test_cb_hasher() -> ahash::RandomState {
+        cb_hasher()
+    }
+
+    /// Build minimal BAM bytes with mapped read at (tid, pos) on the forward strand,
+    /// with optional aux data appended.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_mapped_bam(tid: i32, pos: i32, name: &[u8], aux: &[u8]) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let mut bam = vec![0u8; 32];
+        // ref_id at offset 0..4
+        bam[0..4].copy_from_slice(&tid.to_le_bytes());
+        // pos at offset 4..8
+        bam[4..8].copy_from_slice(&pos.to_le_bytes());
+        // l_read_name at offset 8
+        bam[8] = l_read_name;
+        // flags at offset 14..16: paired + proper pair = 0x03
+        bam[14..16].copy_from_slice(&3u16.to_le_bytes());
+        // mate_ref_id at offset 20..24: same tid
+        bam[20..24].copy_from_slice(&tid.to_le_bytes());
+        // mate_pos at offset 24..28: same pos
+        bam[24..28].copy_from_slice(&pos.to_le_bytes());
+        // read name
+        bam.extend_from_slice(name);
+        bam.push(0); // null terminator
+        // no cigar, no seq, no qual
+        // aux data
+        bam.extend_from_slice(aux);
+        bam
+    }
+
+    /// Build CB:Z: aux tag bytes.
+    fn cb_aux(value: &[u8]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"CBZ");
+        aux.extend_from_slice(value);
+        aux.push(0); // null terminator
+        aux
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_present_has_nonzero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        assert_ne!(key.cb_hash, 0, "CB present should produce non-zero cb_hash");
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_absent_has_zero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        // No CB tag in aux data
+        let bam = build_mapped_bam(0, 100, b"read1", &[]);
+
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        assert_eq!(key.cb_hash, 0, "missing CB tag should produce cb_hash=0");
+    }
+
+    #[test]
+    fn test_extract_template_key_cell_tag_none_has_zero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key = extract_template_key_inline(&bam, &lib_lookup, None, &test_cb_hasher());
+        assert_eq!(key.cb_hash, 0, "cell_tag=None should produce cb_hash=0");
+    }
+
+    #[test]
+    fn test_extract_template_key_different_cb_values_differ() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        let aux1 = cb_aux(b"ACGTACGT");
+        let bam1 = build_mapped_bam(0, 100, b"read1", &aux1);
+        let key1 =
+            extract_template_key_inline(&bam1, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+
+        let aux2 = cb_aux(b"TGCATGCA");
+        let bam2 = build_mapped_bam(0, 100, b"read1", &aux2);
+        let key2 =
+            extract_template_key_inline(&bam2, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+
+        assert_ne!(
+            key1.cb_hash, key2.cb_hash,
+            "different CB values should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_hash_is_deterministic() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key1 =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        let key2 =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        assert_eq!(key1.cb_hash, key2.cb_hash, "same input should produce same cb_hash");
+    }
+
+    /// Encode a `tc:B:i` aux tag carrying the 6-element template-coordinate
+    /// array `[tid1, pos1, neg1, tid2, pos2, neg2]` that `fgumi zipper` stamps
+    /// onto secondary/supplementary reads.
+    fn tc_aux(vals: &[i32; 6]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"tcB"); // tag "tc", array type 'B'
+        aux.push(b'i'); // subtype: int32
+        #[allow(clippy::cast_possible_truncation)]
+        aux.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+        for v in vals {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+        aux
+    }
+
+    /// Build minimal BAM bytes for a mapped secondary/supplementary alignment:
+    /// paired, mate mapped, at `own_pos`, with its mate at `mate_pos`, carrying the
+    /// caller-supplied `sec_supp_flag` (`flags::SECONDARY` or `flags::SUPPLEMENTARY`),
+    /// plus optional aux. Both flags route through the same `tc` keying branch.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_secondary_or_supplementary_bam(
+        own_pos: i32,
+        mate_pos: i32,
+        sec_supp_flag: u16,
+        name: &[u8],
+        aux: &[u8],
+    ) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut bam = vec![0u8; 32];
+        bam[0..4].copy_from_slice(&0i32.to_le_bytes()); // ref_id = chr0
+        bam[4..8].copy_from_slice(&own_pos.to_le_bytes());
+        bam[8] = l_read_name;
+        // flags: PAIRED | (SECONDARY or SUPPLEMENTARY) -- mate is mapped.
+        bam[14..16].copy_from_slice(&(flags::PAIRED | sec_supp_flag).to_le_bytes());
+        bam[20..24].copy_from_slice(&0i32.to_le_bytes()); // mate ref_id = chr0
+        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        bam.extend_from_slice(name);
+        bam.push(0);
+        bam.extend_from_slice(aux);
+        bam
+    }
+
+    /// Build minimal BAM bytes for a mapped primary read on `chr0` with the
+    /// caller-supplied `flag`, aligned at `own_pos` with its mate at `mate_pos`.
+    /// No CIGAR, so the unclipped 5' position equals `own_pos`/`mate_pos`. Used to
+    /// key the two primaries of a pair through the per-record (mapped) path so
+    /// their `TemplateKey`s can be compared against the tc-keyed sec/supp keys.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_primary_bam(own_pos: i32, mate_pos: i32, flag: u16, name: &[u8]) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut bam = vec![0u8; 32];
+        bam[0..4].copy_from_slice(&0i32.to_le_bytes()); // ref_id = chr0
+        bam[4..8].copy_from_slice(&own_pos.to_le_bytes());
+        bam[8] = l_read_name;
+        bam[14..16].copy_from_slice(&flag.to_le_bytes());
+        bam[20..24].copy_from_slice(&0i32.to_le_bytes()); // mate ref_id = chr0
+        bam[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        bam.extend_from_slice(name);
+        bam.push(0);
+        bam
+    }
+
+    /// A secondary/supplementary alignment carries its own position and its mate's
+    /// position, but **not** its own primary's position. Per-record keying (samtools
+    /// / fgbio) can therefore only place it by the mate coordinate, which can drift a
+    /// fragment-length from the template's true coordinate. Because `fgumi zipper`
+    /// pre-computes the exact template coordinate into the `tc` tag, fgumi's
+    /// template-coordinate sort can place the read **exactly** at its primary pair's
+    /// coordinate — a placement samtools/fgbio cannot achieve. This is the novel
+    /// fgumi capability; both SECONDARY and SUPPLEMENTARY take the tc branch.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_uses_tc_tag(#[case] sec_supp_flag: u16) {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        // Sec/supp of a left-anchored R1: the primary is at pos 1000, its mate (R2
+        // primary) at 1400, but this alignment is at 9000. The exact template
+        // coordinate (pos1) is 1000, carried in `tc`.
+        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &tc);
+        let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
+
+        // A different template whose true coordinate (pos1) is 1200 — between the
+        // read's exact coordinate (1000, from tc) and the mate-only approximation
+        // (1400).
+        let filler = build_mapped_bam(0, 1200, b"fillr", &[]);
+        let filler_key = extract_template_key_inline(&filler, &lib_lookup, None, &test_cb_hasher());
+
+        assert!(
+            supp_key < filler_key,
+            "sec/supp must sort at its template coordinate (pos1=1000 via tc), before \
+             the pos1=1200 template; per-record keying misplaces it at the mate \
+             coordinate (1400), after the 1200 template"
+        );
+    }
+
+    /// Without a `tc` tag, a secondary/supplementary must fall back to the per-record
+    /// (own-position / mate) computation — the prior behavior — so the tc branch
+    /// never changes keying for reads zipper did not stamp.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_without_tc_falls_back(
+        #[case] sec_supp_flag: u16,
+    ) {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        // Same geometry as the tc test, but no `tc` tag.
+        let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &[]);
+        let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
+
+        // Fallback keys off the mate coordinate (1400), so it sorts AFTER the
+        // pos1=1200 template — the unchanged, pre-tc behavior.
+        let filler = build_mapped_bam(0, 1200, b"fillr", &[]);
+        let filler_key = extract_template_key_inline(&filler, &lib_lookup, None, &test_cb_hasher());
+
+        assert!(
+            supp_key > filler_key,
+            "without tc, a sec/supp keeps the per-record (mate=1400) placement"
+        );
+    }
+
+    /// Tie-case: with `(tid1, pos1, tid2, pos2)` held identical between a primary
+    /// pair and its tc-stamped sec/supp reads, the tc branch must place the
+    /// sec/supp read at the *exact same* `TemplateKey` as its primary — not merely
+    /// nearby. This is the strong property the reviewer asked for: it pins down the
+    /// full key (position lanes, strand lanes, CB, library, MI, name, **and** the
+    /// `is_upper`/`is_read2` tiebreak), verifying tc ordering matches the mapped
+    /// path rather than only asserting a coarse `<`/`>` placement.
+    ///
+    /// Geometry is a standard FR pair on `chr0`: R1 forward at unclipped-5' 1000
+    /// (the lower/lane-1 end), R2 reverse at 1400 (the upper/lane-2 end). The two
+    /// primaries key through the per-record path; the two sec/supp reads key
+    /// through the tc branch. `is_read2` mirrors the primary `is_upper` here (R1 ->
+    /// false, R2 -> true), so each sec/supp key is byte-identical to its primary's.
+    #[rstest]
+    #[case::secondary(flags::SECONDARY)]
+    #[case::supplementary(flags::SUPPLEMENTARY)]
+    fn test_extract_template_key_secondary_supplementary_matches_primary_via_tc(
+        #[case] sec_supp_flag: u16,
+    ) {
+        const FIRST_SEGMENT: u16 = 0x40;
+        const SECOND_SEGMENT: u16 = 0x80;
+        const REVERSE: u16 = 0x10;
+        const MATE_REVERSE: u16 = 0x20;
+
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let key =
+            |bam: &[u8]| extract_template_key_inline(bam, &lib_lookup, None, &test_cb_hasher());
+
+        // Primaries through the per-record path. R1 (forward, lower) is lane 1;
+        // R2 (reverse, upper) is lane 2. Both canonicalize to the same coordinate.
+        let r1_primary =
+            build_primary_bam(1000, 1400, flags::PAIRED | FIRST_SEGMENT | MATE_REVERSE, b"tmpl");
+        let r2_primary =
+            build_primary_bam(1400, 1000, flags::PAIRED | SECOND_SEGMENT | REVERSE, b"tmpl");
+        let r1_primary_key = key(&r1_primary);
+        let r2_primary_key = key(&r2_primary);
+
+        // The two primaries co-locate but differ only in the is_upper tiebreak.
+        assert_eq!(
+            r1_primary_key.core_cmp(&r2_primary_key),
+            std::cmp::Ordering::Equal,
+            "the pair's two primaries share (tid1, pos1, tid2, pos2)"
+        );
+        assert_ne!(
+            r1_primary_key, r2_primary_key,
+            "primaries differ only in the is_upper tiebreak (R1 lower, R2 upper)"
+        );
+
+        // Sec/supp reads through the tc branch, stamped with the pair's exact
+        // canonical template coordinate, but aligned far away (own pos 9000).
+        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        let r1_ss = build_secondary_or_supplementary_bam(
+            9000,
+            1400,
+            sec_supp_flag | FIRST_SEGMENT,
+            b"tmpl",
+            &tc,
+        );
+        let r2_ss = build_secondary_or_supplementary_bam(
+            9000,
+            1000,
+            sec_supp_flag | SECOND_SEGMENT,
+            b"tmpl",
+            &tc,
+        );
+
+        assert_eq!(
+            key(&r1_ss),
+            r1_primary_key,
+            "R1 sec/supp keyed via tc must be byte-identical to the R1 primary key"
+        );
+        assert_eq!(
+            key(&r2_ss),
+            r2_primary_key,
+            "R2 sec/supp keyed via tc must be byte-identical to the R2 primary key"
+        );
+    }
+
+    #[test]
+    fn test_extract_template_key_unmapped_with_cb() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+
+        // Build unmapped read (flag = PAIRED | UNMAPPED | MATE_UNMAPPED = 0x0D)
+        let mut bam = vec![0u8; 32];
+        bam[8] = 6; // l_read_name = 6 ("read1" + null)
+        bam[14..16].copy_from_slice(&0x000Du16.to_le_bytes()); // flags
+        // ref_id = -1 (unmapped)
+        bam[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        bam[4..8].copy_from_slice(&(-1i32).to_le_bytes()); // pos = -1
+        bam[20..24].copy_from_slice(&(-1i32).to_le_bytes()); // mate_ref_id = -1
+        bam[24..28].copy_from_slice(&(-1i32).to_le_bytes()); // mate_pos = -1
+        bam.extend_from_slice(b"read1\0");
+        bam.extend_from_slice(&aux);
+
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        assert_ne!(key.cb_hash, 0, "unmapped read with CB should have non-zero cb_hash");
+        assert_eq!(key.primary, u64::MAX, "unmapped both-mates should have MAX primary");
+    }
+
+    // ========================================================================
+    // verify_dropped_lanes / dropped_lane_error tests
+    // ========================================================================
+
+    fn full_key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 0, secondary: 0, cb_hash: cb, tertiary, name_hash_upper: 0 }
+    }
+
+    const LITE: TemplateKeyVariant = TemplateKeyVariant { cb: false, tertiary: false };
+
+    #[test]
+    fn verify_detects_cb_appearing() {
+        let v = verify_dropped_lanes(&full_key(0, 0), &full_key(123, 0), LITE);
+        assert_eq!(v, Some(DroppedLaneViolation::Cb));
+        assert_eq!(v.unwrap().key_types_token(), "cb");
+    }
+
+    #[test]
+    fn verify_detects_mi_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 0b10); // mi_value bit set, library still 0
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Mi));
+    }
+
+    #[test]
+    fn verify_detects_library_change() {
+        let first = full_key(0, 0);
+        let cur = full_key(0, 1u64 << 48); // library ordinal 1
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Library));
+    }
+
+    #[test]
+    fn verify_passes_when_dropped_lanes_constant() {
+        let variant = TemplateKeyVariant { cb: true, tertiary: false };
+        assert_eq!(verify_dropped_lanes(&full_key(1, 5), &full_key(2, 5), variant), None);
+    }
+
+    #[test]
+    fn verify_error_message_names_field_and_token() {
+        let e = dropped_lane_error("read42", DroppedLaneViolation::Library);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("read42")
+                && msg.contains("library")
+                && msg.contains("--key-types library"),
+            "{msg}"
+        );
+    }
+
+    // ========================================================================
+    // select_template_variant tests
+    // ========================================================================
+
+    fn key(cb: u64, tertiary: u64) -> TemplateKey {
+        TemplateKey { primary: 1, secondary: 2, cb_hash: cb, tertiary, name_hash_upper: 3 }
+    }
+
+    #[test]
+    fn auto_lite_when_no_cb_no_tertiary() {
+        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_cb_only_when_first_record_has_cb() {
+        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: false });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_tertiary_only_when_first_record_has_mi_or_library() {
+        // 0xABCD is in the low-48 bits => MI present => keep tertiary, even though
+        // the header library does not vary.
+        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_full_when_both_present() {
+        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: true });
+        assert_eq!(v.lanes(), 5);
+    }
+
+    // tertiary high bits only = a single library ordinal, no MI. With a non-varying
+    // header, the constant library lane is dropped -> lite.
+    #[test]
+    fn auto_drops_constant_single_library_lane() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
+        assert_eq!(v.lanes(), 3);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_when_header_library_varies() {
+        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, true); // >1 library
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+        assert_eq!(v.lanes(), 4);
+    }
+
+    #[test]
+    fn auto_keeps_tertiary_for_mi_even_with_constant_library() {
+        // MI present (low bits) -> keep tertiary even though header library is constant.
+        let k = key(0, (1u64 << 48) | 0b10); // library ordinal 1 + MI value bit
+        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
+        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
+    }
+
+    #[test]
+    fn none_forces_lite() {
+        assert_eq!(
+            select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None, true).lanes(),
+            3
+        );
+    }
+
+    #[test]
+    fn full_forces_all_lanes() {
+        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full, false).lanes(), 5);
+    }
+
+    #[test]
+    fn explicit_spec_passthrough() {
+        assert_eq!(
+            select_template_variant(
+                None,
+                KeyTypesSpec::Explicit { cb: true, tertiary: false },
+                false
+            )
+            .lanes(),
+            4
+        );
+    }
+
+    #[test]
+    fn empty_input_defaults_to_lite() {
+        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto, false).lanes(), 3);
+    }
+
+    /// `ref_width` is the bytes one accumulated template ref occupies for the
+    /// variant; memory accounting multiplies records by it, so it must
+    /// equal the real `size_of` for every lane, not a hand-kept table.
+    #[rstest]
+    #[case::k24(false, false, std::mem::size_of::<TemplateRecordRef<TemplateKey24>>())]
+    #[case::cb32(true, false, std::mem::size_of::<TemplateRecordRef<CbKey32>>())]
+    #[case::tert32(false, true, std::mem::size_of::<TemplateRecordRef<TertKey32>>())]
+    #[case::k40(true, true, std::mem::size_of::<TemplateRecordRef<TemplateKey>>())]
+    fn ref_width_matches_the_ref_size(
+        #[case] cb: bool,
+        #[case] tertiary: bool,
+        #[case] size: usize,
+    ) {
+        assert_eq!(TemplateKeyVariant { cb, tertiary }.ref_width(), size);
     }
 }

@@ -34,7 +34,6 @@ use anyhow::Result;
 use noodles::sam::Header;
 
 use crate::arena_pool::PooledSegmentedBuf;
-use crate::external::{KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, violation_read_name};
 use crate::frame_keyed_record_into;
 use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
@@ -44,6 +43,9 @@ use crate::run_bound::RunBound;
 use crate::sort_pool::BoundedSortPool;
 use crate::template_key::{
     ExtractedRefs, TemplateKeyContext, TemplateKeySeed, lane_variant, with_lane_refs,
+};
+use crate::template_key::{
+    KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, violation_read_name,
 };
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
 

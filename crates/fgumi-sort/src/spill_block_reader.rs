@@ -22,7 +22,6 @@ use libdeflater::Decompressor as BgzfDecompressor;
 use zstd::bulk::Decompressor as ZstdDecompressor;
 
 use crate::codec::SpillCodec;
-use crate::worker_pool::read_length_prefix;
 
 /// Hard cap on the `u32 LE` length prefix of any zstd spill frame, shared by
 /// every spill reader. Frames are produced one per ~64 KiB of input; even
@@ -500,6 +499,56 @@ impl Default for SpillBlockDecompressor {
     }
 }
 
+/// Read exactly `buf.len()` bytes, distinguishing clean EOF from truncation.
+///
+/// Returns `Ok(true)` when `buf` is fully filled, `Ok(false)` when zero bytes are
+/// available (clean EOF), and `Err` for any partial read or I/O error.
+pub(crate) fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return if offset == 0 {
+                    Ok(false) // clean EOF
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("truncated chunk: read {} of {} bytes", offset, buf.len()),
+                    ))
+                };
+            }
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Read a `u32 LE` length prefix and validate it against `MAX_ZSTD_FRAME_BYTES`.
+///
+/// Returns `Ok(None)` only when the reader is at a clean frame boundary (no
+/// bytes consumed before EOF). A 1–3-byte partial prefix surfaces as
+/// `UnexpectedEof` so truncation is not silently treated as a clean stop.
+pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+) -> std::io::Result<Option<usize>> {
+    let mut first = [0u8; 1];
+    match reader.read(&mut first)? {
+        0 => return Ok(None),
+        1 => {}
+        n => {
+            return Err(std::io::Error::other(format!(
+                "Read returned {n} bytes for a 1-byte buffer",
+            )));
+        }
+    }
+    let mut rest = [0u8; 3];
+    reader.read_exact(&mut rest)?;
+    let len_buf = [first[0], rest[0], rest[1], rest[2]];
+    checked_zstd_len(&len_buf).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +702,8 @@ mod tests {
         // slots_for_chunk_files does.
         let mut file = std::fs::File::open(&path).expect("open");
         let mut magic = [0u8; 4];
-        let filled = crate::external::read_exact_or_eof(&mut file, &mut magic).expect("magic");
+        let filled =
+            crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic).expect("magic");
         let detected = if filled {
             SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
         } else {
@@ -737,7 +787,8 @@ mod tests {
         let open = || {
             let mut file = std::fs::File::open(&path).expect("open");
             let mut magic = [0u8; 4];
-            let filled = crate::external::read_exact_or_eof(&mut file, &mut magic).expect("magic");
+            let filled =
+                crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic).expect("magic");
             let detected = if filled {
                 SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
             } else {
@@ -961,5 +1012,124 @@ mod tests {
         p.push(&pool.lease(stream[body_start(codec)..stream.len() - 40].to_vec()), &mut Vec::new())
             .unwrap();
         assert_eq!(p.finish().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[cfg(test)]
+mod read_exact_tests {
+    use super::*;
+    use rstest::rstest;
+    use std::io::Cursor;
+
+    // ========================================================================
+    // read_exact_or_eof tests
+    // ========================================================================
+
+    /// A `Read` impl that returns at most one byte per `read()` call. This is
+    /// legal for `Read` (which may return any `0 < n <= buf.len()`) and is what
+    /// motivates using `read_exact_or_eof` over a single `read()` call for
+    /// fixed-size magic-byte detection.
+    struct OneBytePerRead<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+    impl std::io::Read for OneBytePerRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() || self.pos >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_clean_eof() {
+        // Empty stream -> Ok(false), buffer untouched.
+        let mut src: &[u8] = &[];
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("clean eof");
+        assert!(!filled, "clean EOF should return Ok(false)");
+        assert_eq!(buf, [0u8; 4]);
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_full_read() {
+        // Source has exactly buf.len() bytes -> Ok(true), buffer filled.
+        let mut src: &[u8] = b"ZSP1";
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("full read");
+        assert!(filled, "full read should return Ok(true)");
+        assert_eq!(&buf, b"ZSP1");
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_short_reads_fill_buffer() {
+        // Regression: a `Read` impl that returns 1 byte per call must still
+        // fill the 4-byte buffer. A naive single `read()` would only get 1
+        // byte and `SpillCodec::from_magic` would return None, silently
+        // routing a real ZSP1 spill through the uncompressed fallback path.
+        let mut src = OneBytePerRead { bytes: b"ZSP1", pos: 0 };
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("short-read source");
+        assert!(filled, "partial reads should still fill the buffer");
+        assert_eq!(&buf, b"ZSP1");
+        // And `from_magic` correctly identifies the codec from the filled
+        // buffer — proving the original bug is fixed end-to-end.
+        assert_eq!(
+            crate::codec::SpillCodec::from_magic(&buf),
+            Some(crate::codec::SpillCodec::Zstd)
+        );
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_truncated_is_error() {
+        // Source has fewer bytes than requested but is non-empty:
+        // must error with UnexpectedEof (not silently report short fill).
+        let mut src: &[u8] = b"ZSP"; // only 3 of 4 bytes
+        let mut buf = [0u8; 4];
+        let err = read_exact_or_eof(&mut src, &mut buf).expect_err("truncated read should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_read_length_prefix_clean_eof_returns_none() {
+        // No bytes available at all → clean stream end.
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let got = read_length_prefix(&mut reader).expect("clean EOF must not be an error");
+        assert!(got.is_none(), "empty reader must yield Ok(None), got {got:?}");
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn test_read_length_prefix_partial_prefix_is_unexpected_eof(#[case] partial: usize) {
+        // 1–3 bytes after a frame boundary is a truncated length prefix, not a
+        // clean EOF; the parser must surface UnexpectedEof so corruption is not
+        // silently swallowed.
+        let bytes = vec![0xABu8; partial];
+        let err = read_length_prefix(&mut Cursor::new(bytes))
+            .expect_err("partial prefix must error, partial={partial}");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "partial={partial}, got {err:?}");
+    }
+
+    #[test]
+    fn test_read_length_prefix_oversized_is_invalid_data() {
+        let bogus_len: u32 =
+            u32::try_from(MAX_ZSTD_FRAME_BYTES).expect("MAX_ZSTD_FRAME_BYTES fits u32") + 1;
+        let buf = bogus_len.to_le_bytes().to_vec();
+        let err =
+            read_length_prefix(&mut Cursor::new(buf)).expect_err("oversized length must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_length_prefix_valid() {
+        let valid_len: u32 = 1234;
+        let buf = valid_len.to_le_bytes().to_vec();
+        let got = read_length_prefix(&mut Cursor::new(buf)).expect("valid prefix");
+        assert_eq!(got, Some(valid_len as usize));
     }
 }

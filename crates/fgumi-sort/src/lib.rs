@@ -31,14 +31,10 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::path::Path;
-
-use anyhow::{Context, Result};
 use bstr::BString;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
-use tempfile::TempDir;
 
 // Sub-modules are crate-private except where a consumer needs to name the type
 // itself rather than just receive it (`arena_pool`, `segmented_buf`, `codec`,
@@ -57,6 +53,8 @@ pub(crate) mod memory_probe;
 // The merge's demand facts (awaited file, consumer wake, demand counters),
 // shared by the spill supply and the merge. Surfaced via the re-export below.
 pub(crate) mod merge_demand;
+// The k-way merge driver and slot parser. Surfaced via the re-export below.
+pub(crate) mod merge_driver;
 pub(crate) mod merge_phases;
 pub(crate) mod merge_slots;
 pub(crate) mod merge_stalls;
@@ -236,28 +234,10 @@ pub fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Hea
     builder.build()
 }
 
-/// Create a temporary directory for sort spill files.
-fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
-    match base {
-        Some(base) => {
-            std::fs::create_dir_all(base)?;
-            TempDir::new_in(base).context("Failed to create temp directory")
-        }
-        None => TempDir::new().context("Failed to create temp directory"),
-    }
-}
-
 pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
 pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
-pub use external::MemorySources;
-pub use external::{
-    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, MergeCtxErased, MergeDriver, MergeDriverDyn,
-    MergeStep, MergeStepFramed, RawExternalSorter, ReadStreams, RecordRewrite, TemplateKeyVariant,
-    cb_hasher, create_sort_temp_dirs, extract_template_key_inline, format_thread_counts,
-    input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
-    open_spill_slot_as,
-};
+pub use external::{RawExternalSorter, ReadStreams};
 pub use fd_limit::{
     FALLBACK_MAX_TEMP_FILES, FD_RESERVE, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
     temp_file_limit_from_nofile,
@@ -277,6 +257,11 @@ pub use keys::{
 pub use merge_demand::{
     AwaitedSlotState, HotIds, MAX_HOT_IDS, MergeDemand, MergeDemandSnapshot, MergeDemandStats,
     MergePoolRequest,
+};
+pub use merge_driver::{
+    MemorySources, MergeCtxErased, MergeDriver, MergeDriverDyn, MergeStep, MergeStepFramed,
+    RecordRewrite, input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
+    open_spill_slot_as,
 };
 pub use merge_slots::{
     CONSOLIDATION_SLOT_IDS_START, ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot,
@@ -308,28 +293,33 @@ pub use template_arena::{
     TemplateArenaAccumulator, TemplateArenaRefs, TemplateMemChunk, seal_template_refs,
     seal_template_refs_pieces, template_chunk_from_arena_refs,
 };
+pub use template_key::{
+    DroppedLaneViolation, KeyTypesSpec, LibraryLookup, TemplateKeyVariant, cb_hasher,
+    extract_template_key_inline,
+};
 pub use template_key::{ExtractedRefs, KeyViolation, TemplateKeyContext, TemplateKeySeed};
 pub use tmp_dir_alloc::TmpDirAllocator;
+pub use tmp_dir_alloc::create_sort_temp_dirs;
 pub use verify::{VerifySummary, verify_sort_order};
+
+/// Render the effective per-phase worker counts for a log line.
+///
+/// Collapses to a single number when the phases agree (the common case, where
+/// neither `--sort-threads` nor `--merge-threads` was overridden) and spells
+/// both out otherwise. Shared by the engine's end-of-run summary and the `sort`
+/// command's config dump so the two emitters cannot drift.
+#[must_use]
+pub fn format_thread_counts(sort_threads: usize, merge_threads: usize) -> String {
+    if sort_threads == merge_threads {
+        format!("{sort_threads}")
+    } else {
+        format!("sort {sort_threads}, merge {merge_threads}")
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_create_temp_dir_default() {
-        let dir = create_temp_dir(None).expect("creating temp dir should succeed");
-        assert!(dir.path().exists());
-    }
-
-    #[test]
-    fn test_create_temp_dir_with_base() {
-        let base = tempfile::tempdir().expect("creating temp file/dir should succeed");
-        let subdir = base.path().join("sort_spill");
-        let dir = create_temp_dir(Some(&subdir)).expect("creating temp dir should succeed");
-        assert!(dir.path().exists());
-        assert!(dir.path().starts_with(&subdir));
-    }
 
     #[test]
     fn test_sort_stats_default() {

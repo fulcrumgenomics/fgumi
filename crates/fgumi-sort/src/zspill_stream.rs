@@ -55,7 +55,8 @@ impl<R: Read> ZspillStreamReader<R> {
     /// length prefix is truncated, exceeds `MAX_ZSTD_FRAME_BYTES`, or the
     /// frame body is short.
     fn fill_next_frame(&mut self) -> io::Result<bool> {
-        let Some(frame_len) = crate::worker_pool::read_length_prefix(&mut self.inner)? else {
+        let Some(frame_len) = crate::spill_block_reader::read_length_prefix(&mut self.inner)?
+        else {
             return Ok(false);
         };
         let mut frame = vec![0u8; frame_len];

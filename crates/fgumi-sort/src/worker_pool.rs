@@ -88,7 +88,7 @@ pub(crate) fn read_raw_zstd_frames<R: std::io::Read + ?Sized>(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut total_bytes: usize = 0;
     for _ in 0..n {
-        match read_length_prefix(reader)? {
+        match crate::spill_block_reader::read_length_prefix(reader)? {
             None => break,
             Some(frame_len) => {
                 let mut frame = vec![0u8; frame_len];
@@ -102,30 +102,6 @@ pub(crate) fn read_raw_zstd_frames<R: std::io::Read + ?Sized>(
         }
     }
     Ok(out)
-}
-
-/// Read a `u32 LE` length prefix and validate it against `MAX_ZSTD_FRAME_BYTES`.
-///
-/// Returns `Ok(None)` only when the reader is at a clean frame boundary (no
-/// bytes consumed before EOF). A 1–3-byte partial prefix surfaces as
-/// `UnexpectedEof` so truncation is not silently treated as a clean stop.
-pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
-    reader: &mut R,
-) -> std::io::Result<Option<usize>> {
-    let mut first = [0u8; 1];
-    match reader.read(&mut first)? {
-        0 => return Ok(None),
-        1 => {}
-        n => {
-            return Err(std::io::Error::other(format!(
-                "Read returned {n} bytes for a 1-byte buffer",
-            )));
-        }
-    }
-    let mut rest = [0u8; 3];
-    reader.read_exact(&mut rest)?;
-    let len_buf = [first[0], rest[0], rest[1], rest[2]];
-    crate::spill_block_reader::checked_zstd_len(&len_buf).map(Some)
 }
 
 /// Cap on uncompressed size of a zstd spill frame. Production frames are
@@ -3335,14 +3311,14 @@ impl SortWorkerPool {
             // through the BGZF fallback. Clean EOF preserves the existing
             // BGZF-fallback behavior (empty file → BGZF reader will error).
             let mut magic = [0u8; 4];
-            let read_n =
-                if crate::external::read_exact_or_eof(&mut file, &mut magic).map_err(|e| {
+            let read_n = if crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic)
+                .map_err(|e| {
                     anyhow::anyhow!("Failed to read chunk magic {}: {e}", path.display())
                 })? {
-                    4
-                } else {
-                    0
-                };
+                4
+            } else {
+                0
+            };
             let codec = SpillCodec::from_magic(&magic[..read_n]).unwrap_or(SpillCodec::Bgzf);
             // Zstd consumes the magic itself; BGZF wants the file rewound to
             // byte 0 since its decoder reads the gzip header.
@@ -4982,46 +4958,6 @@ mod tests {
 
     use rstest::rstest;
     use std::io::Cursor;
-
-    #[test]
-    fn test_read_length_prefix_clean_eof_returns_none() {
-        // No bytes available at all → clean stream end.
-        let mut reader = Cursor::new(Vec::<u8>::new());
-        let got = read_length_prefix(&mut reader).expect("clean EOF must not be an error");
-        assert!(got.is_none(), "empty reader must yield Ok(None), got {got:?}");
-    }
-
-    #[rstest]
-    #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    fn test_read_length_prefix_partial_prefix_is_unexpected_eof(#[case] partial: usize) {
-        // 1–3 bytes after a frame boundary is a truncated length prefix, not a
-        // clean EOF; the parser must surface UnexpectedEof so corruption is not
-        // silently swallowed.
-        let bytes = vec![0xABu8; partial];
-        let err = read_length_prefix(&mut Cursor::new(bytes))
-            .expect_err("partial prefix must error, partial={partial}");
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "partial={partial}, got {err:?}");
-    }
-
-    #[test]
-    fn test_read_length_prefix_oversized_is_invalid_data() {
-        let bogus_len: u32 =
-            u32::try_from(MAX_ZSTD_FRAME_BYTES).expect("MAX_ZSTD_FRAME_BYTES fits u32") + 1;
-        let buf = bogus_len.to_le_bytes().to_vec();
-        let err =
-            read_length_prefix(&mut Cursor::new(buf)).expect_err("oversized length must error");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn test_read_length_prefix_valid() {
-        let valid_len: u32 = 1234;
-        let buf = valid_len.to_le_bytes().to_vec();
-        let got = read_length_prefix(&mut Cursor::new(buf)).expect("valid prefix");
-        assert_eq!(got, Some(valid_len as usize));
-    }
 
     #[test]
     fn test_read_raw_zstd_frames_clean_eof_returns_empty() {
