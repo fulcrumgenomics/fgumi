@@ -33,6 +33,7 @@ use crate::memory_probe::{
     BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
 };
 use crate::merge_slots::SortMergeSlot;
+use crate::output_target::{MergeOutputTarget, resolve_symlink_output};
 use crate::pooled_chunk_writer::PooledChunkWriter;
 use crate::read_ahead::{PooledInputStream, RawReadAheadReader, RecordSource};
 use crate::tmp_dir_alloc::TmpDirAllocator;
@@ -305,150 +306,6 @@ impl SortPhaseTimer {
 #[must_use]
 pub fn cb_hasher() -> ahash::RandomState {
     fgumi_dna::deterministic_state()
-}
-
-/// Where a merge writes its output.
-///
-/// For a regular file, the merge writes to an exclusive, uniquely-named
-/// [`tempfile::NamedTempFile`] in the output's directory and atomically
-/// [`persist`](MergeOutputTarget::persist)s it into place on success. Because the
-/// temp is RAII-owned, *any* error path (a sort-order violation, a write failure,
-/// `finish` failing) drops it and removes the file — a rejected or failed merge
-/// never leaves a partial/corrupt output or a stray temp behind. The
-/// same-directory temp keeps the rename atomic (same filesystem), and exclusive
-/// creation avoids clobbering a concurrent run or a stale leftover.
-///
-/// Stdout can't be renamed, so it is written directly (a mid-merge failure there
-/// leaves whatever was already streamed, which is unavoidable for a pipe).
-///
-/// A `NamedTempFile` is created `0600`, so persisting it verbatim would silently
-/// make merged output owner-only. To preserve the semantics of the pre-atomic-temp
-/// direct write (`File::create`), [`persist`](MergeOutputTarget::persist) re-stamps
-/// the temp to the mode the final file must carry — via the shared
-/// [`fgumi_bam_io::restamp_for_persist`] — before the rename.
-enum MergeOutputTarget {
-    /// A regular-file output, staged in a same-directory temp. `dest` is the
-    /// resolved final path the temp is atomically renamed onto (a symlinked
-    /// output is followed to its real target, so the temp is staged next to —
-    /// and renamed onto — the linked file rather than the link itself). The temp
-    /// is re-stamped to `dest`'s `File::create` mode at persist time (see
-    /// [`persist`](MergeOutputTarget::persist)).
-    Temp {
-        temp: tempfile::NamedTempFile,
-        dest: PathBuf,
-    },
-    Stdout(PathBuf),
-}
-
-impl MergeOutputTarget {
-    fn create(output: &Path) -> Result<Self> {
-        if is_stdout_path(output) {
-            return Ok(Self::Stdout(output.to_path_buf()));
-        }
-        // Follow a symlinked destination to the real file it points at, so the
-        // atomic rename updates the linked file in place (matching `File::create`,
-        // which follows symlinks) instead of replacing the symlink with a regular
-        // file. The temp is then staged next to — and renamed onto — that real
-        // target, keeping the rename same-directory (hence same-filesystem/atomic).
-        let dest = resolve_symlink_output(output)?;
-        // The temp+rename `persist` replaces `dest` with a regular file, so an
-        // existing FIFO, device, socket, or directory would be silently clobbered
-        // (a plain `File::create` would instead write *through* a FIFO/device).
-        // Only a missing path or an existing regular file can be staged this way;
-        // reject anything else with a clear error rather than corrupt it.
-        if let Ok(metadata) = std::fs::metadata(&dest) {
-            anyhow::ensure!(
-                metadata.file_type().is_file(),
-                "merge output must be a regular file or stdout: {}",
-                dest.display()
-            );
-        }
-        let dir = dest
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let temp = tempfile::Builder::new()
-            .prefix(".fgumi-merge-")
-            .suffix(".tmp")
-            .tempfile_in(&dir)
-            .with_context(|| format!("failed to create a merge temp file in {}", dir.display()))?;
-        Ok(Self::Temp { temp, dest })
-    }
-
-    /// The path the merged BAM is written to.
-    fn path(&self) -> &Path {
-        match self {
-            Self::Temp { temp, .. } => temp.path(),
-            Self::Stdout(path) => path,
-        }
-    }
-
-    /// Renames the finished temp onto its resolved destination (a no-op for
-    /// stdout), first stamping the resolved mode so the output is not left
-    /// temp-private (`0600`). Consumes `self`, disarming the RAII auto-remove.
-    ///
-    /// The merge wrote the temp through its own descriptor, which its writer
-    /// already closed with the result checked (`OutputFile`); the temp's own
-    /// handle is closed here, also checked, before the rename. The rename is
-    /// atomic against a failure of this process, not a host crash: the data is
-    /// not synced first (see `fgumi_bam_io::persist_after_close`).
-    fn persist(self) -> Result<()> {
-        self.persist_with(|file| fgumi_bam_io::OutputFile::from(file).close())
-    }
-
-    /// [`persist`](Self::persist) with the temp handle's close supplied.
-    /// Production always passes a checked `OutputFile` close; the parameter
-    /// exists so tests can make the close fail.
-    fn persist_with<F>(self, close: F) -> Result<()>
-    where
-        F: FnOnce(std::fs::File) -> std::io::Result<()>,
-    {
-        if let Self::Temp { temp, dest } = self {
-            // Re-stamp the temp to the mode `File::create(dest)` would produce
-            // before the rename: `NamedTempFile` is `0600`, and `persist` keeps
-            // that mode, so merged output would otherwise be owner-only. The
-            // shared helper derives that mode by probing `File::create` once per
-            // process (cached) rather than mutating the process-wide umask, so it
-            // is safe under concurrent output creation regardless of when it
-            // first runs.
-            fgumi_bam_io::restamp_for_persist(temp.as_file(), &dest).with_context(|| {
-                format!("failed to set mode on merge temp for {}", dest.display())
-            })?;
-            fgumi_bam_io::persist_after_close(temp, &dest, close).with_context(|| {
-                format!("failed to finalize merged output at {}", dest.display())
-            })?;
-        }
-        Ok(())
-    }
-}
-
-/// Resolves a symlinked output path to the real file the atomic rename must
-/// target, so a `latest.bam -> run.bam` symlink is followed and updated in
-/// place (matching `File::create`, which follows symlinks) instead of being
-/// replaced by a regular file. Non-symlink paths — including ones that do not
-/// exist yet — are returned unchanged. Bails on a symlink cycle (or an
-/// unreasonably long chain) rather than looping forever.
-fn resolve_symlink_output(output: &Path) -> Result<PathBuf> {
-    // POSIX ELOOP triggers around 40 levels; cap here at the same bound so a
-    // cyclic/pathological chain fails fast instead of spinning.
-    const MAX_LINKS: usize = 40;
-    let mut path = output.to_path_buf();
-    for _ in 0..MAX_LINKS {
-        // `is_symlink` returns false for a nonexistent path, so a brand-new
-        // output (or its final component) short-circuits here unchanged.
-        if !path.is_symlink() {
-            return Ok(path);
-        }
-        let target = std::fs::read_link(&path)
-            .with_context(|| format!("failed to read symlink output {}", path.display()))?;
-        // Relative link targets resolve against the link's own directory.
-        path = if target.is_absolute() {
-            target
-        } else {
-            path.parent().map_or_else(|| target.clone(), |parent| parent.join(&target))
-        };
-    }
-    anyhow::bail!("too many levels of symbolic links while resolving output {}", output.display())
 }
 
 /// Maps read group ID -> library ordinal for O(1) comparison.
@@ -3278,13 +3135,7 @@ impl RawExternalSorter {
             // The path is named for identification only; the remediation commands
             // use a `<input>` placeholder so a path with shell metacharacters
             // can't turn the copy-pasteable hint into something unexpected.
-            anyhow::bail!(
-                "Input '{source}' is not sorted in {order} order: record {record_no} sorts \
-                 before a preceding record from the same input, so the k-way merge would \
-                 corrupt the output. Sort that input in {order} order first \
-                 (`fgumi sort -i <input> -o sorted.bam --order {order}`), or locate the \
-                 violation with `fgumi sort -i <input> --verify --order {order}`."
-            );
+            anyhow::bail!(input_order_violation(&source.to_string(), order, record_no));
         }
 
         writer.finish()?;
@@ -5931,6 +5782,36 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
     open_spill_slot_as(path, file_id, file_id)
 }
 
+/// Open a merge input — a BAM file or stream behind `source` — as a
+/// body-keyed slot: its BGZF stream read from byte 0, the `header_len`
+/// decompressed header bytes skipped, keys extracted from the record bodies.
+/// `len` is the file's length, or `None` for a stream (a sequential slot,
+/// whose EOF is its first short read).
+///
+/// # Errors
+///
+/// `InvalidInput` when `file_id` is in the consolidation slot-id range.
+pub fn open_bam_slot(
+    source: Arc<dyn fgumi_bam_io::pread::PositionalSource>,
+    file_id: u32,
+    header_len: u64,
+    len: Option<u64>,
+) -> Result<Arc<SortMergeSlot>> {
+    if file_id >= crate::merge_slots::CONSOLIDATION_SLOT_IDS_START {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("merge input {file_id} is in the consolidation slot-id range"),
+        )
+        .into());
+    }
+    let codec = crate::codec::SpillCodec::Bgzf;
+    let slot = match len {
+        Some(len) => SortMergeSlot::new(file_id, source, 0, len, codec),
+        None => SortMergeSlot::new_sequential(file_id, source, codec),
+    };
+    Ok(Arc::new(slot.with_skip_bytes(header_len).body_keyed()))
+}
+
 /// [`open_spill_slot`] under supply identity `slot_id`
 /// ([`SortMergeSlot::slot_id`]): a consolidation input, opened under a fresh
 /// id so it never shares a supply-map key with another slot of its `file_id`.
@@ -6044,7 +5925,21 @@ struct SlotParserState {
     /// so the read returned `WouldBlock` mid-record; the next call resumes from
     /// here.
     pending: Option<PendingRecord>,
+    /// Decompressed bytes still to skip before the first record (a BAM
+    /// input's header; [`SortMergeSlot::skip_bytes`]).
+    skip_remaining: u64,
+    /// The slot's records carry no key prefix: keys come from their bodies
+    /// ([`SortMergeSlot::is_body_keyed`]).
+    body_keyed: bool,
+    /// Applied to every record body before its key is extracted (the merge's
+    /// read-tag rewrite), with the slot's `file_id`; the rewritten record is
+    /// what the merge emits.
+    rewrite: Option<RecordRewrite>,
 }
+
+/// A rewrite applied to each record of a merge source before its key is
+/// extracted: `(file_id, record)`, editing the raw record in place.
+pub type RecordRewrite = Arc<dyn Fn(u32, &mut Vec<u8>) + Send + Sync>;
 
 /// Partially-read record, retained across a `WouldBlock` so the non-blocking
 /// slot reader can resume. The wire layout is `[key:ksize][len:4][body:len]`
@@ -6068,7 +5963,19 @@ struct PendingRecord {
 
 impl SlotParserState {
     fn new() -> Self {
-        Self { current_buf: Vec::new(), current_pos: 0, pending: None }
+        Self {
+            current_buf: Vec::new(),
+            current_pos: 0,
+            pending: None,
+            skip_remaining: 0,
+            body_keyed: false,
+            rewrite: None,
+        }
+    }
+
+    /// The parser for `slot`: its header skip and key layout.
+    fn for_slot(slot: &crate::merge_slots::SortMergeSlot) -> Self {
+        Self { skip_remaining: slot.skip_bytes(), body_keyed: slot.is_body_keyed(), ..Self::new() }
     }
 
     fn remaining(&self) -> usize {
@@ -6138,6 +6045,28 @@ pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
     key_bytes: &[u8],
     body: &[u8],
 ) -> Result<K> {
+    slot_parse_key_in::<K>(ctx, hint, key_bytes, body, false)
+}
+
+/// [`slot_parse_key`] for a slot whose records may be body-keyed: a
+/// body-keyed slot's key is extracted from the body whatever `K`'s spill
+/// layout ([`RawSortKey::extract_from_record_in`] with the merge's context).
+pub(crate) fn slot_parse_key_in<K: RawSortKey + Default + 'static>(
+    ctx: &K::MergeCtx,
+    hint: &mut K::MergeHint,
+    key_bytes: &[u8],
+    body: &[u8],
+    body_keyed: bool,
+) -> Result<K> {
+    if body_keyed {
+        // A body-keyed slot's records come from a user's BAM, not from a spill
+        // run fgumi wrote: hold them to the BAM layout before any extractor
+        // indexes into them, as the sort's ingest does, so a short or
+        // inconsistent record is an error naming the input (`MergeDriver`
+        // adds the input and record), not a panic.
+        check_bam_record_layout(body)?;
+        return Ok(K::extract_from_record_in(ctx, hint, body));
+    }
     if K::EMBEDDED_IN_RECORD {
         // An embedded key is read out of the body, so an empty body cannot
         // carry one. Every extractor indexes straight into the slice
@@ -6162,6 +6091,25 @@ pub(crate) fn slot_parse_key<K: RawSortKey + Default + 'static>(
     }
 }
 
+/// A user BAM record's layout holds: at least the 32-byte fixed core, and the
+/// read name, CIGAR, sequence and qualities its core declares fit inside it.
+fn check_bam_record_layout(body: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        body.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN,
+        "block_size {} is shorter than a BAM record ({} bytes)",
+        body.len(),
+        fgumi_raw_bam::MIN_BAM_RECORD_LEN,
+    );
+    let needed = fgumi_raw_bam::aux_data_offset_from_record(body).unwrap_or(usize::MAX);
+    anyhow::ensure!(
+        needed <= body.len(),
+        "block_size {} is shorter than the {needed} bytes its read name, CIGAR, sequence and \
+         qualities need",
+        body.len(),
+    );
+    Ok(())
+}
+
 /// Non-blocking, resumable read of the next record from a slot.
 ///
 /// Returns `Ready(Some((key, loc)))` with `loc` naming where the record body
@@ -6182,9 +6130,31 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
     ctx: &K::MergeCtx,
     hint: &mut K::MergeHint,
 ) -> Result<TryRead<(K, RecLoc)>> {
-    let key_size = slot_key_size::<K>()?;
+    let key_size = if parser.body_keyed { 0 } else { slot_key_size::<K>()? };
 
     if parser.pending.is_none() {
+        // A BAM input's header precedes its first record: skip its
+        // decompressed bytes, across as many blocks as it takes.
+        while parser.skip_remaining > 0 {
+            if parser.remaining() == 0 {
+                match slot_try_load_block(slot, parser)? {
+                    BlockLoad::Loaded => {}
+                    BlockLoad::Eof => {
+                        return Err(truncated(format!(
+                            "slot {} ends inside its {}-byte header",
+                            slot.file_id,
+                            slot.skip_bytes()
+                        )));
+                    }
+                    BlockLoad::WouldBlock => return Ok(TryRead::WouldBlock),
+                }
+            }
+            let take = usize::try_from(parser.skip_remaining)
+                .unwrap_or(usize::MAX)
+                .min(parser.remaining());
+            parser.current_pos += take;
+            parser.skip_remaining -= take as u64;
+        }
         // Ensure at least one byte is available, or detect clean EOF at a
         // record boundary.
         if parser.remaining() == 0 {
@@ -6205,11 +6175,22 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
             if parser.remaining() >= header + len {
                 let start = p + header;
                 let end = start + len;
-                let key = slot_parse_key::<K>(
+                if let Some(rewrite) = &parser.rewrite {
+                    // A rewritten record may change length, so it is emitted
+                    // from the scratch, not the block.
+                    out.clear();
+                    out.extend_from_slice(&parser.current_buf[start..end]);
+                    parser.current_pos = end;
+                    rewrite(slot.file_id, out);
+                    let key = slot_parse_key_in::<K>(ctx, hint, &[], out, parser.body_keyed)?;
+                    return Ok(TryRead::Ready(Some((key, RecLoc::Scratch))));
+                }
+                let key = slot_parse_key_in::<K>(
                     ctx,
                     hint,
                     &parser.current_buf[p..p + key_size],
                     &parser.current_buf[start..end],
+                    parser.body_keyed,
                 )?;
                 parser.current_pos = end;
                 return Ok(TryRead::Ready(Some((key, RecLoc::Block { start, end }))));
@@ -6236,6 +6217,7 @@ fn truncated(msg: String) -> anyhow::Error {
 /// key prefix (if any), the 4-byte length prefix, then the body across as many
 /// blocks as needed, returning `WouldBlock` (state retained in
 /// `parser.pending`) whenever the next block isn't ready yet.
+#[allow(clippy::too_many_lines)]
 fn slot_collect_pending<K: RawSortKey + Default + 'static>(
     slot: &Arc<crate::merge_slots::SortMergeSlot>,
     parser: &mut SlotParserState,
@@ -6350,9 +6332,12 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
         parser.current_pos += take;
     }
 
+    if let Some(rewrite) = &parser.rewrite {
+        rewrite(slot.file_id, out);
+    }
     let key = {
         let pending = parser.pending.as_ref().expect("pending set");
-        slot_parse_key::<K>(ctx, hint, &pending.key_buf, out)?
+        slot_parse_key_in::<K>(ctx, hint, &pending.key_buf, out, parser.body_keyed)?
     };
     parser.pending = None;
     Ok(TryRead::Ready(Some(key)))
@@ -6505,6 +6490,10 @@ pub trait MergeDriverDyn: Send {
     /// block or shared residual chunk, and records emitted from the driver's
     /// scratch buffer.
     fn record_counts(&self) -> (u64, u64);
+    /// [`MergeDriver::with_input_order_check`] on a built driver.
+    fn set_input_order_check(&mut self, inputs: Vec<String>, order: &'static str);
+    /// [`MergeDriver::with_record_rewrite`] on a built driver.
+    fn set_record_rewrite(&mut self, rewrite: &RecordRewrite);
 }
 
 /// Internal phase of the [`MergeDriver`] non-blocking state machine.
@@ -6571,6 +6560,25 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> 
     /// The kind [`merge_driver_for_kind`] built this driver for (tests).
     #[cfg(test)]
     kind_for_test: Option<crate::SpillKeyKind>,
+    /// Check each source is sorted ([`Self::with_input_order_check`]): the
+    /// inputs' names (by `file_id`) and the order's CLI name.
+    order_check: Option<(Vec<String>, &'static str)>,
+    /// Per `sources` index, records read so far (for the order check's
+    /// 1-based record number).
+    pulled: Vec<u64>,
+}
+
+/// The error of a merge input that is not sorted in the merge order:
+/// `record_no` (1-based within `input`) sorts before the record read before it.
+#[must_use]
+pub fn input_order_violation(input: &str, order: &str, record_no: u64) -> String {
+    format!(
+        "Input '{input}' is not sorted in {order} order: record {record_no} sorts \
+         before a preceding record from the same input, so the k-way merge would \
+         corrupt the output. Sort that input in {order} order first \
+         (`fgumi sort -i <input> -o sorted.bam --order {order}`), or locate the \
+         violation with `fgumi sort -i <input> --verify --order {order}`."
+    )
 }
 
 impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
@@ -6616,8 +6624,8 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         slots.sort_by_key(|s| s.file_id);
         for slot in slots {
             sources.push(SlotMergeSource::Slot {
+                parser: SlotParserState::for_slot(&slot),
                 slot,
-                parser: SlotParserState::new(),
                 hint: K::MergeHint::default(),
             });
         }
@@ -6674,7 +6682,51 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             ctx,
             #[cfg(test)]
             kind_for_test: None,
+            order_check: None,
+            pulled: vec![0; num_sources],
         }
+    }
+
+    /// Fail when a source is not sorted: a record whose key sorts before the
+    /// previous record of its source is an
+    /// [`input_order_violation`]`(inputs[file_id], order, record_no)` error.
+    /// For a merge of independently sorted inputs, whose order the merge
+    /// assumes; a spill run is sorted by construction.
+    #[must_use]
+    pub fn with_input_order_check(mut self, inputs: Vec<String>, order: &'static str) -> Self {
+        MergeDriverDyn::set_input_order_check(&mut self, inputs, order);
+        self
+    }
+
+    /// Apply `rewrite` to every slot source's records before their keys are
+    /// extracted (see [`RecordRewrite`]).
+    #[must_use]
+    pub fn with_record_rewrite(mut self, rewrite: &RecordRewrite) -> Self {
+        MergeDriverDyn::set_record_rewrite(&mut self, rewrite);
+        self
+    }
+
+    /// Record `src` as the failed source and, for a merge of named inputs
+    /// ([`Self::with_input_order_check`]), name the input and the record being
+    /// read in `e`.
+    fn source_error(&mut self, src: usize, e: anyhow::Error) -> anyhow::Error {
+        self.failed_src = Some(src);
+        let Some((inputs, _)) = &self.order_check else { return e };
+        let SlotMergeSource::Slot { slot, .. } = &self.sources[src] else { return e };
+        let name = inputs.get(slot.file_id as usize).map_or("?", String::as_str);
+        e.context(format!("Input '{name}': record {}", self.pulled[src] + 1))
+    }
+
+    /// The order-check error for `src`'s latest record, if it sorts before the
+    /// record `prev` its source emitted last.
+    fn order_violation(&self, src: usize, key: &K, prev: &K) -> Option<anyhow::Error> {
+        let (inputs, order) = self.order_check.as_ref()?;
+        if key >= prev {
+            return None;
+        }
+        let SlotMergeSource::Slot { slot, .. } = &self.sources[src] else { return None };
+        let name = inputs.get(slot.file_id as usize).map_or("?", String::as_str);
+        Some(anyhow::anyhow!(input_order_violation(name, order, self.pulled[src])))
     }
 
     /// The sort's merge-wide demand; the driver publishes predictions and the
@@ -6765,7 +6817,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                     let mut stalled = false;
                     while next < self.sources.len() {
                         let read = self.sources[next].try_next_record(&mut rec, &self.ctx);
-                        let read = read.inspect_err(|_| self.failed_src = Some(next))?;
+                        let read = read.map_err(|e| self.source_error(next, e))?;
                         match read {
                             TryRead::WouldBlock => {
                                 stalled = true;
@@ -6773,6 +6825,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                                 break;
                             }
                             TryRead::Ready(Some((key, loc))) => {
+                                self.pulled[next] += 1;
                                 keys.push(key);
                                 // Only a scratch-held record hands its buffer to
                                 // the leaf; otherwise `rec` (empty) serves the
@@ -6816,7 +6869,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                         let src = self.source_map[winner];
                         let read =
                             self.sources[src].try_next_record(&mut self.records[winner], &self.ctx);
-                        let read = read.inspect_err(|_| self.failed_src = Some(src))?;
+                        let read = read.map_err(|e| self.source_error(src, e))?;
                         match read {
                             TryRead::WouldBlock => {
                                 self.stalled_src = Some(src);
@@ -6824,6 +6877,11 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                                 return Ok(MergeStep::Stalled);
                             }
                             TryRead::Ready(Some((key, loc))) => {
+                                self.pulled[src] += 1;
+                                if let Some(e) = self.order_violation(src, &key, tree.winner_key())
+                                {
+                                    return Err(e);
+                                }
                                 self.locs[winner] = loc;
                                 tree.replace_winner(key);
                             }
@@ -6894,6 +6952,18 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
         (self.records_merged - self.assembled, self.assembled)
     }
 
+    fn set_input_order_check(&mut self, inputs: Vec<String>, order: &'static str) {
+        self.order_check = Some((inputs, order));
+    }
+
+    fn set_record_rewrite(&mut self, rewrite: &RecordRewrite) {
+        for s in &mut self.sources {
+            if let SlotMergeSource::Slot { parser, .. } = s {
+                parser.rewrite = Some(Arc::clone(rewrite));
+            }
+        }
+    }
+
     fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
         match self.sources.get(self.stalled_src?)? {
             SlotMergeSource::Slot { slot, .. } => Some(slot),
@@ -6919,6 +6989,9 @@ pub enum MergeCtxErased {
     None,
     /// The sort's queryname class table.
     Queryname(Arc<crate::QnClassTable>),
+    /// The full template key's context: a merge of independently sorted
+    /// template-coordinate inputs (`fgumi merge`, body-keyed slots).
+    Template(Arc<crate::TemplateKeyContext>),
 }
 
 /// A merge driver over `slots` (spill runs, in run order) for runs written with
@@ -6952,7 +7025,11 @@ pub fn merge_driver_for_kind(
     }
     let table = |ctx: MergeCtxErased| match ctx {
         MergeCtxErased::Queryname(t) => t,
-        MergeCtxErased::None => crate::QnClassTable::new(),
+        MergeCtxErased::None | MergeCtxErased::Template(_) => crate::QnClassTable::new(),
+    };
+    let template = |ctx: MergeCtxErased| match ctx {
+        MergeCtxErased::Template(c) => Some(c),
+        MergeCtxErased::None | MergeCtxErased::Queryname(_) => None,
     };
     match kind {
         Kind::Coordinate => {
@@ -6963,7 +7040,9 @@ pub fn merge_driver_for_kind(
         Kind::TemplateK24 => build::<crate::TemplateKey24, crate::TemplateKey24>(slots, (), demand),
         Kind::TemplateCb32 => build::<crate::CbKey32, crate::CbKey32>(slots, (), demand),
         Kind::TemplateTert32 => build::<crate::TertKey32, crate::TertKey32>(slots, (), demand),
-        Kind::TemplateK40 => build::<crate::TemplateKey, crate::TemplateKey>(slots, (), demand),
+        Kind::TemplateK40 => {
+            build::<crate::TemplateKey, crate::TemplateKey>(slots, template(ctx), demand)
+        }
     }
 }
 
@@ -7022,96 +7101,6 @@ mod tests {
     use noodles::sam::header::record::value::Map;
     use noodles::sam::header::record::value::map::ReadGroup;
     use rstest::rstest;
-
-    // ========================================================================
-    // Merge output permissions
-    // ========================================================================
-
-    /// `MergeOutputTarget::persist` must re-stamp the temp to the mode a plain
-    /// `File::create(dest)` would produce, so merged output is never left with
-    /// `NamedTempFile`'s owner-only `0o600`. The mode-derivation itself is unit-
-    /// tested in `fgumi-bam-io`; this is the merge-level guard that the
-    /// `restamp_for_persist` call is actually wired into `persist` — without it,
-    /// dropping that call ships `0o600` and nothing in this crate fails.
-    ///
-    /// Two cases mirror `File::create` semantics: a new destination lands at
-    /// `0o666 & !umask` (compared against a live `File::create` reference so the
-    /// assertion tracks the runner's umask), and overwriting an existing file
-    /// keeps that file's mode.
-    #[cfg(unix)]
-    #[rstest]
-    #[case::new_dest(None)]
-    #[case::overwrite_existing(Some(0o640))]
-    fn merge_persist_restamps_output_to_file_create_mode(#[case] preexisting_mode: Option<u32>) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("failed to create temp directory");
-        let dest = dir.path().join("merged.bam");
-
-        // The mode `File::create(dest)` would leave: an existing file's own mode
-        // on overwrite, else `0o666 & !umask` observed via a live reference.
-        let expected_mode = if let Some(mode) = preexisting_mode {
-            std::fs::File::create(&dest).expect("pre-create destination");
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
-                .expect("chmod destination");
-            mode
-        } else {
-            let reference = dir.path().join("reference");
-            std::fs::File::create(&reference).expect("create reference");
-            std::fs::metadata(&reference).expect("stat reference").permissions().mode() & 0o777
-        };
-
-        let target = MergeOutputTarget::create(&dest).expect("create merge target");
-        target.persist().expect("persist merge output");
-
-        let mode =
-            std::fs::metadata(&dest).expect("stat merged output").permissions().mode() & 0o777;
-        // Guard against the temp file's owner-only 0o600 leaking through -- but only when
-        // File::create's own mode differs from 0o600. Under a restrictive umask (e.g. 0o077)
-        // File::create legitimately yields 0o600, so this guard would otherwise fire on a
-        // correct result; the assert_eq below fully pins the mode in that case.
-        if expected_mode != 0o600 {
-            assert_ne!(mode, 0o600, "merged output must not inherit the temp's owner-only 0o600");
-        }
-        assert_eq!(mode, expected_mode, "persisted merge output must match File::create's mode");
-    }
-
-    /// The merge temp is closed before it is renamed, and a failed close fails
-    /// the merge: nothing is renamed onto `dest` (an existing output is left
-    /// as it was) and the temp is removed.
-    #[test]
-    fn merge_persist_close_error_leaves_dest_and_removes_temp() {
-        let dir = tempfile::tempdir().expect("failed to create temp directory");
-        let dest = dir.path().join("merged.bam");
-        std::fs::write(&dest, b"previous").expect("pre-create destination");
-
-        let target = MergeOutputTarget::create(&dest).expect("create merge target");
-        let temp_path = target.path().to_path_buf();
-        std::fs::write(&temp_path, b"merged").expect("write merge temp");
-        let err = target
-            .persist_with(|_| {
-                assert_eq!(std::fs::read(&dest).unwrap(), b"previous", "closed before rename");
-                Err(std::io::Error::other("input/output error at close"))
-            })
-            .expect_err("a failed close must fail the merge");
-
-        assert!(format!("{err:#}").contains("error at close"), "{err:#}");
-        assert_eq!(std::fs::read(&dest).expect("read dest"), b"previous");
-        assert!(!temp_path.exists(), "the merge temp must be removed");
-    }
-
-    /// A clean persist renames the merged bytes onto `dest` and leaves no temp.
-    #[test]
-    fn merge_persist_renames_temp_onto_dest() {
-        let dir = tempfile::tempdir().expect("failed to create temp directory");
-        let dest = dir.path().join("merged.bam");
-        let target = MergeOutputTarget::create(&dest).expect("create merge target");
-        let temp_path = target.path().to_path_buf();
-        std::fs::write(&temp_path, b"merged").expect("write merge temp");
-        target.persist().expect("persist merge output");
-        assert_eq!(std::fs::read(&dest).expect("read dest"), b"merged");
-        assert!(!temp_path.exists(), "the temp must be renamed away");
-    }
 
     // ========================================================================
     // Record-count invariant
@@ -7444,47 +7433,6 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(should_spill_chunk(memory_used, memory_limit, chunk_records), expected);
-    }
-
-    // ========================================================================
-    // resolve_symlink_output
-    // ========================================================================
-
-    /// A non-symlink path — even one that does not exist yet — is returned
-    /// unchanged, so a brand-new merge output is not perturbed by the resolver.
-    #[cfg(unix)]
-    #[test]
-    fn test_resolve_symlink_output_passthrough_for_nonexistent() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("merged.bam");
-        assert_eq!(resolve_symlink_output(&out).unwrap(), out);
-    }
-
-    /// A relative symlink target resolves against the link's own directory, so a
-    /// `latest.bam -> run.bam` link is followed to the sibling it points at.
-    #[cfg(unix)]
-    #[test]
-    fn test_resolve_symlink_output_follows_relative_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("run.bam");
-        std::fs::write(&target, b"x").unwrap();
-        let link = dir.path().join("latest.bam");
-        // Relative target ("run.bam") must resolve against the link's directory.
-        std::os::unix::fs::symlink("run.bam", &link).unwrap();
-        assert_eq!(resolve_symlink_output(&link).unwrap(), target);
-    }
-
-    /// A cyclic symlink chain bails at `MAX_LINKS` with an error instead of
-    /// looping forever.
-    #[cfg(unix)]
-    #[test]
-    fn test_resolve_symlink_output_detects_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        std::os::unix::fs::symlink(&b, &a).unwrap();
-        std::os::unix::fs::symlink(&a, &b).unwrap();
-        assert!(resolve_symlink_output(&a).is_err());
     }
 
     // ========================================================================
@@ -13142,6 +13090,287 @@ mod kind_dispatch_tests {
         let mut want = Vec::new();
         crate::frame_keyed_record_into(&mut want, &template_key(1), b"a").unwrap();
         assert_eq!(out, want, "the winner framed with its key prefix");
+    }
+}
+
+#[cfg(test)]
+mod bam_slot_tests {
+    //! Body-keyed slots over BAM inputs (`fgumi merge`): the header skip, keys
+    //! from the bodies, the per-source order check and the full template key.
+    use super::*;
+    use crate::keys::RawCoordinateKey;
+    use crate::{TemplateKey, TemplateKeySeed};
+    use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
+    use std::ops::Range;
+
+    fn one_ref_header() -> Header {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(1_000_000).unwrap()),
+            )
+            .build()
+    }
+
+    fn write_records(path: &Path, header: &Header, records: &[RawRecord]) {
+        let mut w = fgumi_bam_io::create_raw_bam_writer(path, header, 1, 1).unwrap();
+        for r in records {
+            w.write_raw_record(r.as_ref()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// `n` coordinate-sorted mapped records (`r{i}` at pos 10·i); returns the
+    /// path and each record's body bytes in file order.
+    fn write_test_bam(dir: &Path, n: usize) -> (PathBuf, Vec<Vec<u8>>) {
+        let recs: Vec<RawRecord> = (0..n)
+            .map(|i| {
+                let mut b = SamBuilder::new();
+                b.read_name(format!("r{i}").as_bytes())
+                    .ref_id(0)
+                    .pos(i32::try_from(10 * i).unwrap())
+                    .mapq(60)
+                    .cigar_ops(&[8 << 4])
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8]);
+                b.build()
+            })
+            .collect();
+        let p = dir.join("t.bam");
+        write_records(&p, &one_ref_header(), &recs);
+        (p, recs.iter().map(|r| r.as_ref().to_vec()).collect())
+    }
+
+    fn template_test_record_at(
+        name: &str,
+        pos: i32,
+        cb: Option<&str>,
+        mi: Option<&str>,
+    ) -> RawRecord {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .mate_ref_id(0)
+            .mate_pos(pos + 100)
+            .template_length(108)
+            .add_string_tag(SamTag::MC, b"8M");
+        if let Some(cb) = cb {
+            b.add_string_tag(SamTag::CB, cb.as_bytes());
+        }
+        if let Some(mi) = mi {
+            b.add_string_tag(SamTag::MI, mi.as_bytes());
+        }
+        b.build()
+    }
+
+    fn template_test_record(cb: Option<&str>, mi: Option<&str>) -> Vec<u8> {
+        template_test_record_at("q", 100, cb, mi).as_ref().to_vec()
+    }
+
+    /// One R1 per template `p{i}` at pos 100·i with MI `"{i}"` and CB only on
+    /// odd i, sorted by the full template key; returns path and bodies in file
+    /// order.
+    fn write_template_sorted_test_bam(
+        dir: &Path,
+        name: &str,
+        range: Range<u32>,
+    ) -> (PathBuf, Vec<Vec<u8>>) {
+        let header = one_ref_header();
+        let mut recs: Vec<RawRecord> = range
+            .map(|i| {
+                template_test_record_at(
+                    &format!("p{i}"),
+                    i32::try_from(100 * i).unwrap(),
+                    (i % 2 == 1).then_some("ACGT"),
+                    Some(&i.to_string()),
+                )
+            })
+            .collect();
+        let ctx = TemplateKeySeed::from_header(&header, Some(SamTag::CB), KeyTypesSpec::Full)
+            .provision(recs[0].as_ref());
+        recs.sort_by_key(|r| ctx.extract_one(r.as_ref()).0);
+        let p = dir.join(format!("{name}.bam"));
+        write_records(&p, &header, &recs);
+        (p, recs.iter().map(|r| r.as_ref().to_vec()).collect())
+    }
+
+    /// Decompressed length of a BAM's header block (magic, text, references):
+    /// the bytes a body-keyed slot skips.
+    fn bam_header_len_for_test(path: &Path) -> u64 {
+        let mut raw = Vec::new();
+        noodles_bgzf::io::Reader::new(std::fs::File::open(path).unwrap())
+            .read_to_end(&mut raw)
+            .unwrap();
+        let l_text = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        let mut at = 8 + l_text;
+        let n_ref = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+        at += 4;
+        for _ in 0..n_ref {
+            let l_name = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + l_name + 4;
+        }
+        at as u64
+    }
+
+    fn read_header_for_test(path: &Path) -> Header {
+        create_raw_bam_reader(path, 1).unwrap().1
+    }
+
+    /// Ingest the whole file as one last slice and serve every frame, so the
+    /// merge never stalls.
+    fn feed_whole_file(slot: &SortMergeSlot, path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        slot.bp_note_issued(bytes.len() as u64);
+        slot.bp_ingest_slice(0, fgumi_bam_io::pread::SliceBufferPool::new(1).lease(bytes), true)
+            .unwrap();
+        let mut dec = crate::SpillBlockDecompressor::new();
+        while let Some(block) = slot.bp_claim_raw(u64::MAX) {
+            block.decompress_and_publish(&mut dec).unwrap();
+        }
+        slot.bp_drain_and_finalize();
+    }
+
+    fn open_file_slot(path: &Path, id: u32) -> Arc<SortMergeSlot> {
+        let f = std::fs::File::open(path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let slot =
+            open_bam_slot(Arc::new(f), id, bam_header_len_for_test(path), Some(len)).unwrap();
+        feed_whole_file(&slot, path);
+        slot
+    }
+
+    /// Bodies framed embedded-key in one block, body-keyed, at EOF.
+    fn loaded_body_slot(file_id: u32, bodies: &[Vec<u8>]) -> Arc<SortMergeSlot> {
+        let raw: Vec<u8> = bodies
+            .iter()
+            .flat_map(|b| {
+                let mut v = Vec::new();
+                crate::frame_embedded_record_into(&mut v, b).unwrap();
+                v
+            })
+            .collect();
+        let slot = Arc::new(
+            SortMergeSlot::new(
+                file_id,
+                Arc::new(tempfile::tempfile().unwrap()),
+                0,
+                0,
+                crate::SpillCodec::Bgzf,
+            )
+            .body_keyed(),
+        );
+        slot.bp_commit_read(1, true);
+        slot.bp_insert_drain_finalize(0, vec![raw], 1);
+        slot
+    }
+
+    fn coordinate_body(tid: i32, pos: i32, tag: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 36];
+        body[0..4].copy_from_slice(&tid.to_le_bytes());
+        body[4..8].copy_from_slice(&pos.to_le_bytes());
+        body[32..36].copy_from_slice(&tag.to_le_bytes());
+        body
+    }
+
+    /// The skipped bytes are the BAM header; the first parsed record is the
+    /// BAM's first record. Catches: skip applied to compressed bytes, or off by
+    /// one block.
+    #[test]
+    fn skip_bytes_skips_the_bam_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam, records) = write_test_bam(dir.path(), 200);
+        let slot = open_file_slot(&bam, 0);
+        let mut d = MergeDriver::<RawCoordinateKey>::from_slots(
+            vec![slot],
+            MemorySources::Shared(vec![]),
+            1,
+            (),
+        );
+        let first = match d.try_step().unwrap() {
+            MergeStep::Produced(b) => b.to_vec(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first, records[0]);
+    }
+
+    /// Review B5 (r1): BAM slots carry no key prefix; keys come from the body.
+    /// Catches: the 40-byte `TemplateKey` prefix read off the BAM body.
+    #[test]
+    fn template_bam_slot_parses_records_with_no_key_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, ra) = write_template_sorted_test_bam(dir.path(), "a", 0..50);
+        let (b, rb) = write_template_sorted_test_bam(dir.path(), "b", 25..75);
+        let header = read_header_for_test(&a);
+        let ctx = TemplateKeySeed::from_header(&header, Some(SamTag::CB), KeyTypesSpec::Full)
+            .provision(&ra[0]);
+        let slots = vec![open_file_slot(&a, 0), open_file_slot(&b, 1)];
+        let mut d = MergeDriver::<TemplateKey>::from_slots(
+            slots,
+            MemorySources::Shared(vec![]),
+            1,
+            Some(Arc::clone(&ctx)),
+        );
+        let mut got = Vec::new();
+        while let MergeStep::Produced(body) = d.try_step().unwrap() {
+            got.push(body.to_vec());
+        }
+        let mut want: Vec<Vec<u8>> = ra.into_iter().chain(rb).collect();
+        want.sort_by_key(|body| ctx.extract_one(body).0); // stable: input order on ties
+        assert_eq!(got, want);
+    }
+
+    /// Catches: the order check missing, or reporting the wrong input/index.
+    #[test]
+    fn input_order_check_rejects_a_descending_pair() {
+        let a = loaded_body_slot(
+            0,
+            &[coordinate_body(0, 10, 1), coordinate_body(0, 20, 2), coordinate_body(0, 15, 3)],
+        );
+        let b = loaded_body_slot(1, &[coordinate_body(0, 12, 4)]);
+        let mut d = MergeDriver::<RawCoordinateKey>::from_slots(
+            vec![a, b],
+            MemorySources::Shared(vec![]),
+            1,
+            (),
+        )
+        .with_input_order_check(vec!["a.bam".into(), "b.bam".into()], "coordinate");
+        let err = loop {
+            match d.try_step() {
+                Ok(MergeStep::Produced(_)) => {}
+                Ok(other) => panic!("{other:?}"),
+                Err(e) => break e,
+            }
+        };
+        // a.bam: positions 10, 20, 15 → the third record (1-based 3) sorts before its predecessor.
+        assert_eq!(err.to_string(), input_order_violation("a.bam", "coordinate", 3));
+    }
+
+    /// Review B4 (r1): the merge context yields the full key, CB and MI included.
+    #[rstest::rstest]
+    #[case::no_cb_no_mi(None, None)]
+    #[case::cb_only(Some("AAAA"), None)]
+    #[case::mi_only(None, Some("7"))]
+    #[case::cb_and_mi(Some("CCCC"), Some("7/A"))]
+    fn template_merge_context_extracts_the_full_key(
+        #[case] cb: Option<&str>,
+        #[case] mi: Option<&str>,
+    ) {
+        let header = one_ref_header();
+        let rec = template_test_record(cb, mi);
+        let ctx = TemplateKeySeed::from_header(&header, Some(SamTag::CB), KeyTypesSpec::Full)
+            .provision(&template_test_record(None, None));
+        let merge_ctx: <TemplateKey as RawSortKey>::MergeCtx = Some(Arc::clone(&ctx));
+        assert_eq!(
+            TemplateKey::extract_from_record_in(&merge_ctx, &mut (), &rec),
+            extract_template_key_inline(&rec, &ctx.lib_lookup, ctx.cell_tag, &ctx.cb_hasher)
+        );
     }
 }
 

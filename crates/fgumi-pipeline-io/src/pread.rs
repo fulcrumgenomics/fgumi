@@ -35,7 +35,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use fgumi_bam_io::pread::{PositionalSource, SliceBufferPool, SliceLease, read_at_exact};
+use fgumi_bam_io::pread::{
+    PositionalSource, SliceBufferPool, SliceLease, read_at_exact, read_until_eof,
+};
 use fgumi_pipeline_core::{
     HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, StepCap, StepCapRef, Unpushed,
     admit_input,
@@ -116,10 +118,15 @@ pub struct ReadRequest {
     pub source: Arc<dyn PositionalSource>,
     /// Byte offset of the read.
     pub offset: u64,
-    /// Bytes to read; the read fails unless exactly this many arrive.
+    /// Bytes to read; the read fails unless exactly this many arrive (a
+    /// sequential read may end short, at the stream's EOF).
     pub len: u32,
     /// Whether the read covers the stream's final byte.
     pub last: bool,
+    /// The source is a stream ([`fgumi_bam_io::pread::SequentialSource`]): the
+    /// read loops partial reads until `len` bytes or EOF, and a short fill is
+    /// the stream's last slice. File reads fail closed on a short read.
+    pub sequential: bool,
     /// Where the bytes go.
     pub target: ReadTarget,
 }
@@ -147,10 +154,15 @@ pub struct ReadSlice {
     pub seq: u32,
     /// The request's offset.
     pub offset: u64,
-    /// Exactly `len` bytes (a short read is an error, never a short slice).
+    /// Exactly `len` bytes (a short read is an error, never a short slice),
+    /// except for a sequential read, which ends short at the stream's EOF.
     pub bytes: SliceLease,
     /// Whether the slice covers the stream's final byte.
     pub last: bool,
+    /// Bytes the request asked for that never arrived: `0`, except for a
+    /// sequential read that ended at the stream's EOF. The ledger lands the
+    /// whole request (`bytes.len() + shortfall`), as the planner issued it.
+    pub shortfall: u32,
     /// Where the bytes go.
     pub target: ReadTarget,
 }
@@ -431,7 +443,24 @@ impl PreadSlices {
         if let Some(h) = &self.hist {
             h.inflight_enter();
         }
-        let result = read_at_exact(&*req.source, &mut buf, req.offset);
+        let mut last = req.last;
+        let mut shortfall = 0u32;
+        let result = if req.sequential {
+            read_until_eof(&*req.source, &mut buf, req.offset).map(|n| {
+                // A short fill is the stream's EOF: the slot's last slice. The
+                // bytes that will never arrive leave the slot's issued count.
+                if n < buf.len() {
+                    last = true;
+                    shortfall = u32::try_from(buf.len() - n).expect("a request length fits u32");
+                    if let ReadTarget::Spill { slot, .. } = &req.target {
+                        slot.bp_note_unissued((buf.len() - n) as u64);
+                    }
+                    buf.truncate(n);
+                }
+            })
+        } else {
+            read_at_exact(&*req.source, &mut buf, req.offset)
+        };
         if let Some(h) = &self.hist {
             h.inflight_exit();
         }
@@ -450,7 +479,8 @@ impl PreadSlices {
             seq: req.seq,
             offset: req.offset,
             bytes: self.pool.lease(buf),
-            last: req.last,
+            last,
+            shortfall,
             target: req.target,
         })
     }

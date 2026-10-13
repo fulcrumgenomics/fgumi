@@ -104,6 +104,10 @@ pub struct BuiltPipeline {
     /// The sort's phase caps, `[phase1, phase2]` (test support).
     #[cfg(test)]
     pub(crate) sort_caps: [Option<std::sync::Arc<fgumi_pipeline_core::PhaseCap>>; 2],
+    /// The `PreadSpillSlices` clone count the chain's spill read planner was
+    /// built for (`None` without one; test support).
+    #[cfg(test)]
+    pub(crate) spill_eligible_clones: Option<usize>,
 }
 
 impl BuiltPipeline {
@@ -137,6 +141,8 @@ impl BuiltPipeline {
                 consolidation_class_table: _,
             #[cfg(test)]
                 sort_caps: _,
+            #[cfg(test)]
+                spill_eligible_clones: _,
         } = self;
 
         // Capture the run result but do not short-circuit: the finalize

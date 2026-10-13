@@ -26,7 +26,7 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 
 ### No-flag Fast Path (default)
 - **Usage**: Omit `--threads` entirely
-- **Behavior**: Command-dependent. Commands that special-case `ThreadingMode::SingleThreaded` run an optimized fast path with minimal pipeline overhead; others (e.g. `correct`) always run the declarative chain and simply execute it with a single worker. Either way, omitting `--threads` never runs more than one worker.
+- **Behavior**: Command-dependent. Commands that special-case `ThreadingMode::SingleThreaded` run an optimized fast path with minimal pipeline overhead; others (e.g. `correct`) always run the declarative chain and simply execute it with a single worker. Either way, omitting `--threads` never runs more than one worker. (`fgumi merge` has no fast path: its `--threads` defaults to 1 and counts output-compression threads, beside which it runs read and decompress workers — see [Merge](#merge).)
 - **Best for**: Small files, memory-constrained systems, debugging
 
 ### Explicit Single-threaded Mode
@@ -36,7 +36,7 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 
 ### Multi-threaded Mode
 - **Usage**: `--threads N` where N > 1
-- **Behavior**: Uses the declarative chain pipeline with N worker threads (the same engine as `--threads 1`, scaled out); the legacy `--scheduler` flag is inert on the chain — it selects no dispatch policy
+- **Behavior**: Uses the declarative chain pipeline with N worker threads (the same engine as `--threads 1`, scaled out); the legacy `--scheduler` flag is inert on the chain — it selects no dispatch policy. `fgumi merge` is the exception: it runs up to N more workers that read and decompress its inputs (see [Merge](#merge))
 - **Best for**: Large files, high-performance systems, production workloads
 
 ## Memory Management
@@ -454,7 +454,14 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 
 ### Merge
 - `fgumi merge` performs a k-way merge using a LoserTree for efficient multi-file merging
-- Thread count (`--threads`) controls compression parallelism, not merge concurrency
+- Thread count (`--threads`, default 1) is the number of threads that compress the output.
+  The merge adds one worker per input, at most `--threads` more, that reads and decompresses
+  the inputs while the output is compressed, so it runs `--threads` + min(inputs, `--threads`)
+  pool workers — two at `--threads 1` — and the k-way merge itself runs on one more thread.
+  Size a CPU allocation (cgroup quota, scheduler slot) for that total, not for `--threads`
+- `--threads` also sizes the merge's read-ahead: 768 MiB per thread, as `fgumi sort`'s default
+  budget. `fgumi merge` has no `--max-memory`; its inter-step queues share a small fixed
+  budget of 16 MiB per pool worker
 - For template-coordinate merges with single-cell data, the `CB` tag is included automatically
 
 ### Group/Dedup

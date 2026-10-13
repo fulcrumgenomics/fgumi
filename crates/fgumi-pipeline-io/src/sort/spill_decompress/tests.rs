@@ -40,11 +40,10 @@ fn spill_slot(
 /// rest) into leased slices with dense per-slot sequences, each recorded as
 /// issued (the planner's half of `issued_bytes`).
 fn slices(slot: &Arc<SortMergeSlot>, cuts: &[usize]) -> Vec<ReadSlice> {
-    use std::os::unix::fs::FileExt;
     let pool = SliceBufferPool::new(0);
     let start = slot.body_start();
     let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
-    slot.source().read_exact_at(&mut body, start).unwrap();
+    fgumi_bam_io::pread::read_at_exact(&**slot.source(), &mut body, start).unwrap();
     let mut sizes = Vec::new();
     let mut left = body.len();
     for &c in cuts {
@@ -70,6 +69,7 @@ fn slices(slot: &Arc<SortMergeSlot>, cuts: &[usize]) -> Vec<ReadSlice> {
             offset: start + at as u64,
             bytes: pool.lease(bytes),
             last: at + n == body.len(),
+            shortfall: 0,
             target: ReadTarget::Spill { slot: Arc::clone(slot), class: SpillClass::Cold },
         });
         at += n;
@@ -282,6 +282,7 @@ fn ingest_error_marks_the_slot_and_fails_the_step() {
         offset: 0,
         bytes: SliceBufferPool::new(0).lease(vec![0xAB; 64]),
         last: true,
+        shortfall: 0,
         target: ReadTarget::Spill { slot: Arc::clone(&slot), class: SpillClass::Cold },
     });
     assert!(probe.try_run(&mut step).is_err());
@@ -540,6 +541,7 @@ fn decompress_notifies_the_consolidation_demand_only_before_all_announced() {
             offset: slot.body_start(),
             bytes: pool.lease(body),
             last: true,
+            shortfall: 0,
             target: ReadTarget::Spill {
                 slot: Arc::clone(&slot),
                 class: SpillClass::ConsolidationCold,

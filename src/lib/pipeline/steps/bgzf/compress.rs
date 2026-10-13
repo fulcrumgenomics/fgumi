@@ -55,10 +55,12 @@ pub struct BgzfCompress {
     /// When unset, the frame walk and per-physical-block length capture are
     /// skipped entirely (zero overhead on the non-indexed path).
     index_bam: bool,
-    /// Admission cap for the standalone sort's merge phase (`--merge-threads`).
-    /// `None` (uncapped) by default; `ChainBuilder::add_sink` sets it only on the
-    /// standalone-sort terminal, so every other chain's output compressor is
-    /// untouched.
+    /// Admission cap on how many pool workers compress at once. `None`
+    /// (uncapped) by default. `ChainBuilder::add_sink` sets the standalone
+    /// sort's phase-2 cap (`--merge-threads`) on its terminal, and
+    /// `build_merge` caps `fgumi merge`'s terminal at `--threads` so the
+    /// merge's extra pool workers only read and decompress; every other
+    /// chain's output compressor is untouched.
     cap: Option<Arc<PhaseCap>>,
 }
 
@@ -312,9 +314,10 @@ mod tests {
     use super::*;
 
     /// The output compressor is phase-neutral: uncapped by default (every
-    /// non-sort chain's terminal shows no `cap=` token), capped only when the
-    /// builder hands it the standalone sort's phase-2 cap — and worker copies
-    /// share that same counter, not an equal-looking new one.
+    /// chain's terminal but the standalone sort's and the merge's shows no
+    /// `cap=` token), capped only when a builder hands it a cap (the standalone
+    /// sort's phase-2 cap, or the merge's `--threads` compression cap) — and
+    /// worker copies share that same counter, not an equal-looking new one.
     #[test]
     fn phase_cap_is_none_by_default_and_shared_by_worker_copies() {
         use crate::pipeline::core::{PhaseCap, Step};

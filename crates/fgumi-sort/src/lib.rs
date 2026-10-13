@@ -70,6 +70,9 @@ pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub mod ref_sort;
+// A merge or sort output staged beside its destination and persisted on
+// success. Surfaced via the re-export below.
+pub(crate) mod output_target;
 // Per-order run boundary key for the arena spill run-former (extend-vs-new-run
 // decision). Surfaced via the re-export below.
 pub(crate) mod run_bound;
@@ -250,12 +253,13 @@ pub use codec::SpillCodec;
 pub use external::MemorySources;
 pub use external::{
     DroppedLaneViolation, KeyTypesSpec, LibraryLookup, MergeCtxErased, MergeDriver, MergeDriverDyn,
-    MergeStep, MergeStepFramed, RawExternalSorter, ReadStreams, TemplateKeyVariant, cb_hasher,
-    create_sort_temp_dirs, extract_template_key_inline, format_thread_counts,
-    merge_driver_for_kind, open_spill_slot, open_spill_slot_as,
+    MergeStep, MergeStepFramed, RawExternalSorter, ReadStreams, RecordRewrite, TemplateKeyVariant,
+    cb_hasher, create_sort_temp_dirs, extract_template_key_inline, format_thread_counts,
+    input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
+    open_spill_slot_as,
 };
 pub use fd_limit::{
-    FALLBACK_MAX_TEMP_FILES, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
+    FALLBACK_MAX_TEMP_FILES, FD_RESERVE, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
     temp_file_limit_from_nofile,
 };
 pub use inline::{
@@ -277,6 +281,7 @@ pub use merge_demand::{
 pub use merge_slots::{
     CONSOLIDATION_SLOT_IDS_START, ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot,
 };
+pub use output_target::MergeOutputTarget;
 pub use prefetch::KEY_PREFETCH_DISTANCE;
 pub use queryname_ref::{
     QN_CLASS_BATCH_RECORDS, QN_MAX_CLASSES, QnBatchLcp, QnClassTable, QnCmpStats, QnComparator,

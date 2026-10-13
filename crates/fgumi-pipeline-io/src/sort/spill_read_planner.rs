@@ -570,6 +570,20 @@ impl SpillReadPlanner {
     /// its consolidation job's; one not yet resolved plans nothing). Returns
     /// the number of fills queued.
     fn plan_pass(&mut self) -> u64 {
+        // A stream's slot leaves the table once its EOF was ingested: it will
+        // never be read again.
+        if self.slots.iter().any(|s| s.slot.is_sequential() && s.slot.eof_seen()) {
+            for s in &mut self.slots {
+                if s.slot.is_sequential() && s.slot.eof_seen() {
+                    s.eof_issued = true;
+                }
+            }
+            self.slots.retain(|s| !(s.slot.is_sequential() && s.slot.eof_seen()));
+            self.by_slot_id =
+                self.slots.iter().enumerate().map(|(i, s)| (s.slot.slot_id(), i)).collect();
+            self.hot_prev.clear();
+            self.cursor = 0;
+        }
         if self.slots.is_empty() {
             return 0;
         }
@@ -691,36 +705,53 @@ impl SpillReadPlanner {
             self.slots[i].slot.set_fifo_cap(budget.fifo_cold);
         }
         let mut fills = 0;
+        let sequential = self.slots[i].slot.is_sequential();
+        if sequential {
+            // A stream is read in order, one read in flight: the next read is
+            // issued only once the previous one is ingested, and none after a
+            // short read (the stream's EOF).
+            let s = &mut self.slots[i];
+            if s.slot.eof_seen() {
+                s.eof_issued = true;
+            }
+            if s.eof_issued || s.slot.ingested_slices() != s.next_seq {
+                return 0;
+            }
+        }
         while let Some(fill) = self.next_fill(i, class, budget, *pool_used) {
             let excess_before = Self::excess(&self.slots[i], budget);
             let s = &mut self.slots[i];
             let len = s.slot.len();
             let want = fill.min(len - s.next_offset);
             let want_usize = usize::try_from(want).expect("a fill fits usize");
-            let slices = self.policy.slices_for(want_usize, self.eligible_clones);
-            // Ask the kernel to start reading the whole fill now, so the
-            // pool worker that later reads each slice finds it in the page
-            // cache or in flight instead of starting the device read
-            // itself. Bounded to the fill just planned. Issued here, at plan
-            // time, for every fill (hot ones included: they are the awaited
-            // ones), so the device read gets the lead time the queued request
-            // waits.
-            //
-            // The advised pages are page cache: they are charged to no
-            // budget and the kernel may evict them before the slice is
-            // read. That is acceptable because the hint is advisory only;
-            // a miss degrades to the blocking read there was before.
-            //
-            // Cost, on the serial planner: measured warm on macOS (one
-            // `F_RDADVISE` per fill), a three-input 5.3 GB merge advised
-            // 1,264 fills in 44-46 ms (~35 us a fill) and a small
-            // consolidating sort 5.9-6.4 k fills in 146-165 ms (~25 us),
-            // on a planner that stayed under 0.5% busy; wall time with the
-            // hint was no worse than without it in either run, two runs
-            // each. That is not material, so there is no size threshold.
-            // Linux advises a 4 MiB fill in 32 calls; their cost on Linux
-            // was not measured.
-            s.source.will_need(s.next_offset, want);
+            let slices = if sequential {
+                1
+            } else {
+                // Ask the kernel to start reading the whole fill now, so the
+                // pool worker that later reads each slice finds it in the page
+                // cache or in flight instead of starting the device read
+                // itself. Bounded to the fill just planned; a stream has
+                // nothing to advise. Issued here, at plan time, for every
+                // fill (hot ones included: they are the awaited ones), so the
+                // device read gets the lead time the queued request waits.
+                //
+                // The advised pages are page cache: they are charged to no
+                // budget and the kernel may evict them before the slice is
+                // read. That is acceptable because the hint is advisory only;
+                // a miss degrades to the blocking read there was before.
+                //
+                // Cost, on the serial planner: measured warm on macOS (one
+                // `F_RDADVISE` per fill), a three-input 5.3 GB merge advised
+                // 1,264 fills in 44-46 ms (~35 us a fill) and a small
+                // consolidating sort 5.9-6.4 k fills in 146-165 ms (~25 us),
+                // on a planner that stayed under 0.5% busy; wall time with the
+                // hint was no worse than without it in either run, two runs
+                // each. That is not material, so there is no size threshold.
+                // Linux advises a 4 MiB fill in 32 calls; their cost on Linux
+                // was not measured.
+                s.source.will_need(s.next_offset, want);
+                self.policy.slices_for(want_usize, self.eligible_clones)
+            };
             for (offset, slice_len) in slice_ranges(s.next_offset, want_usize, slices) {
                 self.outbox.push_back(ReadRequest {
                     ordinal: self.next_ordinal,
@@ -729,7 +760,8 @@ impl SpillReadPlanner {
                     source: Arc::clone(&s.source),
                     offset,
                     len: slice_len,
-                    last: offset + u64::from(slice_len) == len,
+                    last: !sequential && offset + u64::from(slice_len) == len,
+                    sequential,
                     target: ReadTarget::Spill { slot: Arc::clone(&s.slot), class },
                 });
                 self.next_ordinal += 1;
@@ -744,6 +776,9 @@ impl SpillReadPlanner {
             *pool_used =
                 pool_used.saturating_sub(excess_before) + Self::excess(&self.slots[i], budget);
             fills += 1;
+            if sequential {
+                break;
+            }
         }
         fills
     }

@@ -63,6 +63,18 @@ pub enum SortOrderArg {
 }
 
 impl SortOrderArg {
+    /// The `--order` value naming this order, as [`Self::parse`] accepts it: the
+    /// one table every error hint and test uses.
+    #[must_use]
+    pub fn flag_value(self) -> &'static str {
+        match self {
+            Self::Coordinate => "coordinate",
+            Self::Queryname => "queryname",
+            Self::QuerynameNatural => "queryname::natural",
+            Self::TemplateCoordinate => "template-coordinate",
+        }
+    }
+
     /// Parse a sort order string, supporting `::` sub-sort syntax for queryname.
     ///
     /// Valid values:
@@ -850,11 +862,12 @@ impl Sort {
     ///   above them leaves them alone.
     #[must_use]
     pub fn queue_memory_options(&self) -> QueueMemoryOptions {
-        QueueMemoryOptions {
-            max_memory: self.max_memory,
-            memory_reserve: self.memory_reserve,
-            memory_per_thread: self.memory_per_thread,
-        }
+        crate::commands::common::sort_chain_runtime(
+            self.max_memory,
+            self.memory_reserve,
+            self.memory_per_thread,
+        )
+        .1
     }
 
     /// Builds the declarative [`ChainSpec`] that `fgumi sort` runs.
@@ -883,6 +896,11 @@ impl Sort {
         resolved_max_temp_files: usize,
         command_line: &str,
     ) -> ChainSpec {
+        let (scheduler, queue_memory) = crate::commands::common::sort_chain_runtime(
+            self.max_memory,
+            self.memory_reserve,
+            self.memory_per_thread,
+        );
         let mut sort_options = self.to_sort_options();
         sort_options.tmp_dirs = resolved_tmp_dirs;
         // Bake in the already-resolved value so the chain builder does not
@@ -904,23 +922,22 @@ impl Sort {
             stage_opts,
             threading: ThreadingOptions { threads: Some(self.threads) },
             compression: self.compression.clone(),
-            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
-            // Carry the sort command's diagnostic instrumentation flags (sort does not
-            // flatten `SchedulerOptions`, so they must be forwarded explicitly) — this
-            // is what makes `fgumi sort --pipeline-trace <level>` reach the chain.
+            // The runtime every sort-chain command shares (`sort_chain_runtime`:
+            // the deadlock monitor on, and the inter-stage queue budget bounded by
+            // the same `--max-memory` as the sorter buffer, see
+            // `queue_memory_options`). The queue budget scales by `--threads`; the
+            // sorter's by the effective sort-phase count
+            // (`PhaseThreads::memory_budget_threads`). The sort command's
+            // diagnostic flags are forwarded on top (sort does not flatten
+            // `SchedulerOptions`) — this is what makes
+            // `fgumi sort --pipeline-trace <level>` reach the chain.
             scheduler: SchedulerOptions {
-                deadlock_timeout: 10,
                 pipeline_stats: self.pipeline_stats,
                 pipeline_trace: self.pipeline_trace,
                 pipeline_trace_out: self.pipeline_trace_out.clone(),
-                ..Default::default()
+                ..scheduler
             },
-            // The single `--max-memory` knob bounds the inter-stage queue budget too,
-            // not just the sorter buffer (see `queue_memory_options`). The queue
-            // budget scales by `--threads`; the sorter's by the effective sort-phase
-            // count (`PhaseThreads::memory_budget_threads`: an explicit
-            // `--sort-threads` within the worker pool, else `--threads`).
-            queue_memory: self.queue_memory_options(),
+            queue_memory,
             async_reader: false,
             // Thread the sort command's --read-streams into the chain's BAM
             // source: anything but Fixed(1) over a regular BGZF file selects the

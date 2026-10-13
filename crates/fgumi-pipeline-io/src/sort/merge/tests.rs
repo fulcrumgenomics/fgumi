@@ -300,3 +300,103 @@ fn a_stashed_slot_is_served_not_parked_on() {
         "the self-served registration is not a parking one: {s:?}"
     );
 }
+
+/// The merge of `fgumi merge`'s inputs checks, before it accepts `Done`, that
+/// every input was read to its clean end: a merge whose driver retired a
+/// source early (simulated here by a driver over only the first of the two
+/// inputs) is an error naming the unread input, not a short clean exit. With
+/// every input drained, the same merge completes.
+#[rstest::rstest]
+#[case::an_unread_input_fails(false)]
+#[case::every_input_drained_completes(true)]
+fn merge_inputs_done_requires_every_input_read(#[case] second_drained: bool) {
+    use fgumi_pipeline_core::testing::StepProbe;
+    let mode = MergeInputs {
+        inputs: vec!["a.bam".to_string(), "b.bam".to_string()],
+        order_name: "coordinate",
+        template_ctx: None,
+        rewrite: None,
+    };
+    let mut step = SortMerge::<RecordBatchOutput>::with_target_batch_count(
+        SortOrder::Coordinate,
+        1 << 20,
+        1024,
+    )
+    .with_merge_inputs(mode.clone());
+    let probe = StepProbe::new(&step);
+    let slots: Vec<Arc<SortMergeSlot>> = (0..2u32)
+        .map(|file_id| Arc::new(SortMergeSlot::for_test(file_id, fgumi_sort::SpillCodec::Bgzf)))
+        .collect();
+    for slot in &slots {
+        probe.push_input(SortPhase2Event::SpillReady {
+            slot: Arc::clone(slot),
+            path: std::path::PathBuf::from("input"),
+            records_ingested_so_far: 0,
+        });
+    }
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 2,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    // Nothing is decompressed yet: the merge sets up and stalls.
+    let _ = probe.try_run(&mut step).unwrap();
+    assert!(matches!(step.state, SortMergeState::Merging { .. }), "the merge set up");
+    assert_eq!(step.merge_input_slots.len(), 2, "both inputs are kept for the check");
+    // Swap in a driver that has lost the second input, then finish the first.
+    let short = build_merge_inputs_driver(
+        SortOrder::Coordinate,
+        vec![Arc::clone(&slots[0])],
+        None,
+        None,
+        &mode,
+    )
+    .expect("driver");
+    let SortMergeState::Merging { driver, .. } = &mut step.state else { unreachable!() };
+    *driver = short;
+    slots[0].push_decompressed_for_test(one_record_block(0));
+    slots[0].set_queue_eof_for_test();
+    if second_drained {
+        slots[1].set_queue_eof_for_test();
+    }
+    let mut result = Ok(StepOutcome::Progress);
+    for _ in 0..8 {
+        result = probe.try_run(&mut step);
+        if result.is_err() || matches!(step.state, SortMergeState::Done) {
+            break;
+        }
+    }
+    if second_drained {
+        result.expect("every input drained: the merge completes");
+        assert!(matches!(step.state, SortMergeState::Done));
+    } else {
+        let err = result.expect_err("an unread input must fail the merge");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("b.bam"), "names the unread input: {err}");
+    }
+}
+
+/// `ensure_merge_inputs_read` rejects a failed input and one with blocks left
+/// or no EOF, and accepts inputs that each reached a clean, empty EOF.
+#[test]
+fn ensure_merge_inputs_read_needs_a_clean_end_on_every_input() {
+    let names = vec!["a.bam".to_string()];
+    let slot = || Arc::new(SortMergeSlot::for_test(0, fgumi_sort::SpillCodec::Bgzf));
+    let not_at_eof = slot();
+    let err = ensure_merge_inputs_read(&[not_at_eof], &names).expect_err("an input not at EOF");
+    assert!(err.to_string().contains("lost records"), "{err}");
+    assert!(err.to_string().contains("a.bam"), "{err}");
+    let left_over = slot();
+    left_over.push_decompressed_for_test(one_record_block(0));
+    left_over.set_queue_eof_for_test();
+    let err = ensure_merge_inputs_read(&[left_over], &names).expect_err("blocks left over");
+    assert!(err.to_string().contains("lost records"), "{err}");
+    assert!(err.to_string().contains("a.bam"), "{err}");
+    let failed = slot();
+    failed.mark_failed();
+    let err = ensure_merge_inputs_read(&[failed], &names).expect_err("a failed input");
+    assert!(err.to_string().contains("failed reading input a.bam"), "{err}");
+    let clean = slot();
+    clean.set_queue_eof_for_test();
+    ensure_merge_inputs_read(&[clean], &names).expect("a clean end");
+}

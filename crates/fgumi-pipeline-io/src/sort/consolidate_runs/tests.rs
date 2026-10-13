@@ -264,7 +264,7 @@ fn consolidation_reads_go_through_the_planner() {
             let body_start = spill_magic(SpillCodec::Zstd).len() as u64;
             // The open descriptor's length (fstat): the original file, not the
             // decoy now at its path.
-            assert_eq!(read, src.metadata().unwrap().len() - body_start, "slot {sid}");
+            assert_eq!(read, src.byte_len().unwrap() - body_start, "slot {sid}");
         }
     }
 }
@@ -315,10 +315,11 @@ fn supply_steps_take_the_phase1_cap_during_consolidation() {
         ordinal: 0,
         stream: 0,
         seq: 0,
-        source: Arc::clone(slot.source()) as Arc<dyn fgumi_bam_io::pread::PositionalSource>,
+        source: Arc::clone(slot.source()),
         offset: slot.body_start(),
         len: body_len,
         last: true,
+        sequential: false,
         target: ReadTarget::Spill { slot: Arc::clone(&slot), class: SpillClass::ConsolidationCold },
     };
     let pool = SliceBufferPool::new(2);
@@ -331,6 +332,7 @@ fn supply_steps_take_the_phase1_cap_during_consolidation() {
         offset: slot.body_start(),
         bytes: pool.lease(body.clone()),
         last: true,
+        shortfall: 0,
         target: ReadTarget::Spill { slot: Arc::clone(&slot), class: SpillClass::ConsolidationCold },
     };
     let block = || SpillBlockEvent::Block {

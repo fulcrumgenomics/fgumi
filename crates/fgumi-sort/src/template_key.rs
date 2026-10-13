@@ -151,6 +151,25 @@ impl TemplateKeySeed {
     /// returns an error, and `extract_batch` returns `InvalidData`.
     #[must_use]
     pub fn provision(&self, first_body: &[u8]) -> Arc<TemplateKeyContext> {
+        self.provision_inner(first_body)
+    }
+
+    /// The full-width context a merge of independently sorted inputs extracts
+    /// its keys with (`fgumi merge`): every lane, CB included, whatever this
+    /// seed's `--key-types`. No first record is needed: a full key drops no
+    /// lane, so there is no dropped-lane baseline to check against.
+    #[must_use]
+    pub fn merge_context(&self) -> Arc<TemplateKeyContext> {
+        Arc::new(TemplateKeyContext {
+            lib_lookup: self.lib_lookup.clone(),
+            cell_tag: self.cell_tag,
+            cb_hasher: self.cb_hasher.clone(),
+            first_key: TemplateKey::default(),
+            variant: select_template_variant(None, KeyTypesSpec::Full, self.header_library_varies),
+        })
+    }
+
+    fn provision_inner(&self, first_body: &[u8]) -> Arc<TemplateKeyContext> {
         let first_key = extract_template_key_inline(
             first_body,
             &self.lib_lookup,
@@ -236,13 +255,14 @@ fn malformed(first_record_index: u64, what: &str) -> io::Error {
 
 impl TemplateKeyContext {
     /// The single extraction implementation: full key + dropped-lane verify
-    /// against `first_key`. Both the per-record accumulator and the batched
-    /// path call this, so they cannot drift.
+    /// against `first_key`. The per-record accumulator, the batched path and a
+    /// body-keyed merge slot (`fgumi merge`) call this, so they cannot drift.
     ///
     /// # Panics
     ///
     /// Panics if `body` is shorter than [`MIN_BAM_RECORD_LEN`], as
-    /// [`TemplateKeySeed::provision`] does; both callers check first.
+    /// [`TemplateKeySeed::provision`] does; every caller checks first (the
+    /// merge slot parser checks the whole record layout).
     #[inline]
     #[must_use]
     pub fn extract_one(&self, body: &[u8]) -> (TemplateKey, Option<DroppedLaneViolation>) {

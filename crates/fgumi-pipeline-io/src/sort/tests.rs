@@ -2722,7 +2722,6 @@ fn stashed_two_slots(
     corrupt: bool,
 ) -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
     use std::io::Write;
-    use std::os::unix::fs::FileExt;
     let pool = fgumi_bam_io::pread::SliceBufferPool::new(0);
     (0..2usize)
         .map(|id| {
@@ -2745,7 +2744,7 @@ fn stashed_two_slots(
                 .expect("open spill slot");
             let start = slot.body_start();
             let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
-            slot.source().read_exact_at(&mut body, start).unwrap();
+            fgumi_bam_io::pread::read_at_exact(&**slot.source(), &mut body, start).unwrap();
             slot.bp_note_issued(body.len() as u64);
             let out = slot.bp_ingest_slice(0, pool.lease(body), true).expect("ingest");
             assert_eq!(out.frames, per_slot, "every block stashed");

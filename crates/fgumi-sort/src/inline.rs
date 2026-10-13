@@ -956,7 +956,11 @@ impl TemplateKey {
 pub type TemplateKey40 = TemplateKey;
 
 impl RawSortKey for TemplateKey {
-    type MergeCtx = ();
+    /// The merge of independently sorted BAM inputs (`fgumi merge`) extracts
+    /// each key from the record body with the merged header's context, full
+    /// width (every lane, CB included). A spill run carries its key as a
+    /// prefix, so a sort's merge passes `None`.
+    type MergeCtx = Option<Arc<crate::template_key::TemplateKeyContext>>;
 
     type MergeHint = ();
 
@@ -972,6 +976,21 @@ impl RawSortKey for TemplateKey {
             "TemplateKey::extract() should not be called directly. \
              Use extract_template_key_inline() with LibraryLookup instead."
         )
+    }
+
+    /// The full key of `bam`, from the merge context.
+    ///
+    /// # Panics
+    ///
+    /// Without a context: only a body-keyed merge (which always passes one)
+    /// extracts template keys from bodies.
+    #[inline]
+    fn extract_from_record_in(
+        ctx: &Self::MergeCtx,
+        _hint: &mut Self::MergeHint,
+        bam: &[u8],
+    ) -> Self {
+        ctx.as_ref().expect("a body-keyed template merge passes its key context").extract_one(bam).0
     }
 
     #[inline]

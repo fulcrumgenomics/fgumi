@@ -97,7 +97,6 @@
 //! `9d6d7e9` / PR #395.)
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
@@ -115,7 +114,7 @@ use std::sync::Mutex;
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use fgumi_bam_io::pread::SliceLease;
+use fgumi_bam_io::pread::{PositionalSource, SliceLease};
 use fgumi_bam_io::reorder::ReorderBuffer;
 
 use crate::codec::SpillCodec;
@@ -234,13 +233,29 @@ pub struct SortMergeSlot {
     /// slot is opened (`open_spill_slot`). The `SortSpillDecompress` step
     /// reads it to decompress BGZF blocks or zstd frames.
     pub codec: SpillCodec,
-    /// Positional handle on the spill file (no buffer: reads are positional
-    /// slices into pooled buffers).
-    source: Arc<File>,
+    /// Positional handle on the spill file — or a merge input's BAM file or
+    /// stream (no buffer: reads are positional slices into pooled buffers).
+    source: Arc<dyn PositionalSource>,
     /// Offset of the first frame (past any codec file magic).
     body_start: u64,
-    /// File length in bytes.
+    /// File length in bytes; `u64::MAX` for a sequential slot, whose length
+    /// is discovered at EOF.
     len: u64,
+    /// The source is a stream (a pipe input of `fgumi merge`): read in order,
+    /// one read at a time, until a short read ([`Self::new_sequential`]).
+    sequential: bool,
+    /// Decompressed bytes before the first record (a BAM input's header),
+    /// skipped by the merge's parser.
+    skip_bytes: u64,
+    /// Records carry no key prefix; the merge extracts each key from its body
+    /// (a BAM input's records). Spill runs of a prefix-keyed kind are not.
+    body_keyed: bool,
+    /// Lock-free mirror: slices ingested in sequence order (by
+    /// [`Self::bp_ingest_slice`], under `reader`). A sequential slot's planner
+    /// issues its next read only once the previous one is ingested.
+    ingested_slices: AtomicU32,
+    /// Lock-free mirror: a last slice was ingested (stored under `reader`).
+    eof_seen: AtomicBool,
     /// Parse state. Lock order (outermost first): `reader` → `raw_stash` →
     /// `reorder` → `decompressed`; the consumer takes only `raw_stash` and
     /// `decompressed`.
@@ -339,7 +354,7 @@ impl SortMergeSlot {
     #[must_use]
     pub fn new(
         file_id: u32,
-        source: Arc<File>,
+        source: Arc<dyn PositionalSource>,
         body_start: u64,
         len: u64,
         codec: SpillCodec,
@@ -352,6 +367,11 @@ impl SortMergeSlot {
             source,
             body_start,
             len,
+            sequential: false,
+            skip_bytes: 0,
+            body_keyed: false,
+            ingested_slices: AtomicU32::new(0),
+            eof_seen: AtomicBool::new(false),
             reader: Mutex::new(SortMergeReader::new(codec)),
             raw_stash: Mutex::new(VecDeque::new()),
             stash_bytes: AtomicU64::new(0),
@@ -406,9 +426,73 @@ impl SortMergeSlot {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// The positional handle on the spill file.
+    /// A slot over a stream (`source` serves reads only at its cursor, as a
+    /// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource) does): its
+    /// length is unknown (`u64::MAX`) and its EOF is the first short read.
     #[must_use]
-    pub fn source(&self) -> &Arc<File> {
+    pub fn new_sequential(
+        file_id: u32,
+        source: Arc<dyn PositionalSource>,
+        codec: SpillCodec,
+    ) -> Self {
+        Self { sequential: true, ..Self::new(file_id, source, 0, u64::MAX, codec) }
+    }
+
+    /// This slot, skipping `n` decompressed bytes before its first record.
+    #[must_use]
+    pub fn with_skip_bytes(mut self, n: u64) -> Self {
+        self.skip_bytes = n;
+        self
+    }
+
+    /// This slot with its keys extracted from the record bodies (no key
+    /// prefix on the wire).
+    #[must_use]
+    pub fn body_keyed(mut self) -> Self {
+        self.body_keyed = true;
+        self
+    }
+
+    /// Whether the source is a stream ([`Self::new_sequential`]).
+    #[must_use]
+    pub fn is_sequential(&self) -> bool {
+        self.sequential
+    }
+
+    /// Decompressed bytes before the first record.
+    #[must_use]
+    pub fn skip_bytes(&self) -> u64 {
+        self.skip_bytes
+    }
+
+    /// Whether keys come from the record bodies ([`Self::body_keyed`]).
+    #[must_use]
+    pub fn is_body_keyed(&self) -> bool {
+        self.body_keyed
+    }
+
+    /// Slices ingested in sequence order, read lock-free.
+    #[must_use]
+    pub fn ingested_slices(&self) -> u32 {
+        self.ingested_slices.load(Ordering::Acquire)
+    }
+
+    /// Whether a last slice was ingested, read lock-free.
+    #[must_use]
+    pub fn eof_seen(&self) -> bool {
+        self.eof_seen.load(Ordering::Acquire)
+    }
+
+    /// Pop one decompressed block (tests: the merge's side of the FIFO).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn pop_block_for_test(&self) -> Option<Vec<u8>> {
+        self.pop_decompressed()
+    }
+
+    /// The positional handle on the slot's bytes.
+    #[must_use]
+    pub fn source(&self) -> &Arc<dyn PositionalSource> {
         &self.source
     }
 
@@ -544,6 +628,14 @@ impl SortMergeSlot {
         self.issued_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Withdraw `bytes` of an issued read that will not arrive: a sequential
+    /// read that ended short at the stream's EOF delivers fewer bytes than it
+    /// asked for.
+    pub fn bp_note_unissued(&self, bytes: u64) {
+        let prev = self.issued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        debug_assert!(prev >= bytes, "withdrew {bytes} unissued bytes with only {prev} issued");
+    }
+
     /// Ingest one read slice of this file (slice sequence `seq`; `last` when it
     /// covers the file's final byte). Under `reader`: reorder the slice by
     /// `seq`, then for every slice now in order parse ALL its frames, publish
@@ -577,6 +669,10 @@ impl SortMergeSlot {
         r.slices.insert_with_size(u64::from(seq), (lease, last), size);
         let mut frames = Vec::new();
         while let Some((lease, last)) = r.slices.try_pop_next() {
+            self.ingested_slices.fetch_add(1, Ordering::Release);
+            if last {
+                self.eof_seen.store(true, Ordering::Release);
+            }
             let parsed = r
                 .parser
                 .push(&lease, &mut frames)
@@ -1891,6 +1987,19 @@ mod tests {
         // Deliver 1 of the 2 reserved blocks: without the assertion this
         // finalizes a clean queue_eof over the missing seq 1.
         slot.bp_insert_drain_finalize(0, vec![vec![0xAAu8; 8]], 2);
+    }
+
+    /// Withdrawing more unissued bytes than were issued would wrap
+    /// `issued_bytes` (the slot then reads as `Issued` forever); the debug
+    /// assertion catches the caller bug, as `bp_ingest_slice`'s does for a
+    /// slice that was never issued.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unissued bytes with only 4 issued")]
+    fn bp_note_unissued_over_withdrawal_is_rejected() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Bgzf);
+        slot.bp_note_issued(4);
+        slot.bp_note_unissued(5);
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub use spec::{ChainSpec, SingleStageContext};
 pub mod validate;
 
 pub mod build;
-pub use build::build_for;
+pub use build::{MergeSpec, build_for, build_merge};
 
 pub mod builder;
 

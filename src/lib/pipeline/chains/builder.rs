@@ -699,7 +699,8 @@ pub struct ChainBuilder<'a> {
 
     /// Phase-2 cap for the standalone sort's terminal `BgzfCompress`. Set by
     /// `add_sort` beside `detached_writer`, consumed by `add_sink`; `None` on
-    /// every other chain so no other command's output compressor is capped.
+    /// every other chain this builder builds, so no other such chain's output
+    /// compressor is capped (`build_merge` caps `fgumi merge`'s itself).
     sink_phase_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
 
     /// The sort's per-phase counts and caps, resolved once by
@@ -932,8 +933,6 @@ impl<'a> ChainBuilder<'a> {
     /// `Fixed(n>1)` it cannot honour warns here (`Auto` falls back silently).
     /// A missing or unreadable file is left to [`Self::open_source`] to report.
     fn native_input_path(spec: &ChainSpec) -> Option<NativeInput> {
-        use std::io::Seek as _;
-
         if spec.read_streams == fgumi_bam_io::ReadStreams::Fixed(1)
             || !matches!(spec.stages.as_slice(), [Stage::Sort, ..])
         {
@@ -952,25 +951,20 @@ impl<'a> ChainBuilder<'a> {
                 );
             }
         };
-        if fgumi_bam_io::is_stdin_path(path) {
-            unavailable("stdin", "is not a seekable regular file");
-            return None;
+        match fgumi_bam_io::pread::open_seekable_bgzf(path).ok()? {
+            fgumi_bam_io::pread::SeekableInput::Bgzf { file, len } => {
+                Some(NativeInput { file: Arc::new(file), len })
+            }
+            fgumi_bam_io::pread::SeekableInput::Sequential(reason) => {
+                let subject = if fgumi_bam_io::is_stdin_path(path) {
+                    "stdin".to_owned()
+                } else {
+                    path.display().to_string()
+                };
+                unavailable(&subject, reason);
+                None
+            }
         }
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() {
-            unavailable(&path.display().to_string(), "is not a seekable regular file");
-            return None;
-        }
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut prefix = [0u8; fgumi_bam_io::FORMAT_PREFIX_LEN];
-        let n = fgumi_bam_io::read_prefix(&mut file, &mut prefix).ok()?;
-        if fgumi_bam_io::classify_input(&prefix[..n]) != fgumi_bam_io::InputFormat::Bgzf {
-            unavailable(&path.display().to_string(), "is not BGZF");
-            return None;
-        }
-        file.rewind().ok()?;
-        let len = fgumi_bam_io::pread::PositionalSource::byte_len(&file).ok()?;
-        Some(NativeInput { file: Arc::new(file), len })
     }
 
     /// Open the input source and extract the header. For `Bam`/`Sam` specs,
@@ -2809,6 +2803,8 @@ impl<'a> ChainBuilder<'a> {
             consolidation_class_table: self.consolidation_class_table,
             #[cfg(test)]
             sort_caps: self.sort_caps,
+            #[cfg(test)]
+            spill_eligible_clones: self.spill_eligible_clones,
         })
     }
 

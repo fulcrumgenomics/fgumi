@@ -335,13 +335,17 @@ fn diverse_unsorted_records(num_pairs: usize) -> Vec<RawRecord> {
 /// accepts. The case labels use hyphens (`queryname-natural`) to read cleanly
 /// as rstest case names; the CLI's own spelling uses `::` sub-sort syntax.
 fn order_flag(order_label: &str) -> &'static str {
-    match order_label {
-        "coordinate" => "coordinate",
-        "queryname" => "queryname",
-        "queryname-natural" => "queryname::natural",
-        "template-coordinate" => "template-coordinate",
-        other => panic!("unhandled order label {other:?} in test case table"),
-    }
+    use fgumi_lib::commands::sort::SortOrderArg;
+    [
+        SortOrderArg::Coordinate,
+        SortOrderArg::Queryname,
+        SortOrderArg::QuerynameNatural,
+        SortOrderArg::TemplateCoordinate,
+    ]
+    .into_iter()
+    .map(SortOrderArg::flag_value)
+    .find(|flag| flag.replace("::", "-") == order_label)
+    .unwrap_or_else(|| panic!("unhandled order label {order_label:?} in test case table"))
 }
 
 /// Four-order parity gate: the cutover build's sort output must be

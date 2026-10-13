@@ -17,6 +17,7 @@ pub const SORT_COORD_GROUP: &str = "sort-coord";
 /// for the second dedicated thread).
 pub const SORT_IO_GROUP: &str = "sort-io";
 
+pub mod announce_merge_inputs;
 pub mod arena_ingest;
 pub mod arena_split;
 pub mod consolidate_runs;
@@ -37,6 +38,7 @@ pub mod spill_write;
 pub mod supply_ledger;
 pub mod write_consolidated_run;
 
+pub use announce_merge_inputs::{AnnounceMergeInputs, MergeInput};
 pub use arena_ingest::{
     ArenaBlock, ArenaSortStrategy, CoordinateStrategy, InflateToArena, InflatedBlock,
     QuerynameStrategy, ReadBlocks, TemplateStrategy,
@@ -50,7 +52,9 @@ pub use arena_split::{
 };
 pub use consolidate_runs::{ConsolidateRuns, NoConsolidation};
 pub use consolidation::ConsolidationRegistry;
-pub use merge::{BlockOutput, MergeBatchBuilder, MergeOutput, RecordBatchOutput, SortMerge};
+pub use merge::{
+    BlockOutput, MergeBatchBuilder, MergeInputs, MergeOutput, RecordBatchOutput, SortMerge,
+};
 pub use run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, RunPrior, run_cap_for};
 pub use run_stack::consolidation_can_trigger;
 pub use sort_buffer::{SortBuffer, SortBufferConfig};

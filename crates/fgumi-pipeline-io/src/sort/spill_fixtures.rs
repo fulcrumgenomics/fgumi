@@ -321,7 +321,8 @@ impl Default for KOpts {
 }
 
 /// A recorded job: `(job_id, slot ids, input paths, a clone of each slot's file)`.
-pub(crate) type RecordedJob = (u32, Vec<u32>, Vec<PathBuf>, Vec<Arc<std::fs::File>>);
+pub(crate) type RecordedJob =
+    (u32, Vec<u32>, Vec<PathBuf>, Vec<Arc<dyn fgumi_bam_io::pread::PositionalSource>>);
 
 /// `SpillWrite → SpillReadPlanner ⇒ (.0 PreadSpillSlices → 2 × SortSpillDecompress)
 /// (.1 collected phase-2 events) (.2 ConsolidateRuns → SpillBlockCompress →

@@ -325,7 +325,9 @@ impl SortSpillDecompress {
             return Err(io::Error::other("SortSpillDecompress received an input-path slice"));
         };
         self.register(&slot);
-        let len = slice.bytes.len() as u64;
+        // The whole request lands: a sequential read that ended short at the
+        // stream's EOF releases the bytes it never delivered too.
+        let len = slice.bytes.len() as u64 + u64::from(slice.shortfall);
         let out = match slot.bp_ingest_slice(slice.seq, slice.bytes, slice.last) {
             Ok(out) => out,
             Err(e) => {

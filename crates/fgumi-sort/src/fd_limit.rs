@@ -37,7 +37,7 @@ pub const FALLBACK_MAX_TEMP_FILES: usize = 64;
 /// shares one input reader, spill files are written one at a time, and the
 /// temp-directory allocator holds paths rather than descriptors. 32 leaves
 /// substantial headroom over the observed peak.
-pub(crate) const FD_RESERVE: u64 = 32;
+pub const FD_RESERVE: u64 = 32;
 
 /// Smallest limit worth consolidating at.
 ///

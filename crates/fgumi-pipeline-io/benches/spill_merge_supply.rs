@@ -411,6 +411,7 @@ impl Step for Requests {
                     offset,
                     len,
                     last: offset + u64::from(len) == self.len,
+                    sequential: false,
                     target: ReadTarget::Input,
                 });
                 self.ordinal += 1;
