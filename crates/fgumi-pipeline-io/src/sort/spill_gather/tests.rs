@@ -512,7 +512,7 @@ fn a_residual_closes_the_open_run_before_a_later_spill() {
 #[test]
 fn run_formation_summary_matches_the_owned_engine_wording() {
     // Three contiguous chunks → one run, so 2 of the 3 chunks extended it. The
-    // line must read exactly like fgumi_sort::external::log_run_formation.
+    // line must read exactly like the retired engine's run-formation line.
     let mut step = SpillGather::new(1 << 20);
     drive(
         &mut step,
@@ -578,8 +578,8 @@ fn run_formation_summary_counts_each_run_when_nothing_coalesces() {
 
 #[test]
 fn run_formation_summary_is_none_when_nothing_spilled() {
-    // A residual-only sort (no spills) reports no run-formation line, matching
-    // the owned engine (which only logs when it spilled).
+    // A residual-only sort (no spills) reports no run-formation line: the line
+    // is logged only when something spilled.
     let mut step = SpillGather::new(1 << 20);
     drive(
         &mut step,

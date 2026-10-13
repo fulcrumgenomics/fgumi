@@ -670,9 +670,10 @@ thread_local! {
 /// `RecordStreamSource` reads; it returns its own result, and a failure it
 /// returns is also sent down the channel so the sort aborts rather than
 /// finishing on a truncated stream. The output is staged beside its
-/// destination ([`fgumi_sort::MergeOutputTarget`]: stdout streamed directly, a
-/// symlink followed, a non-regular destination refused, the mode re-stamped)
-/// and persisted only when both the sort and the generator succeed. The sort
+/// destination (`StagedSortOutput`: stdout streamed directly, a symlink
+/// followed, a non-regular destination refused, the mode re-stamped) and
+/// published only when both the sort and the generator succeed and the sort
+/// wrote every record it read. The sort
 /// runs with the runtime every sort-chain command shares
 /// ([`sort_chain_runtime`](crate::commands::common::sort_chain_runtime)). The
 /// pipeline —
@@ -695,8 +696,10 @@ where
     G: FnOnce(Sender<RecordBatch>) -> Result<T> + Send,
     T: Send,
 {
-    use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
-    let target = fgumi_sort::MergeOutputTarget::create_for(output, "simulate")?;
+    use crate::pipeline::chains::{ChainSpec, SourceSpec, Stage, StageOptionsBag};
+    let staged = crate::pipeline::chains::staged_output::StagedSortOutput::create(
+        output, false, "simulate",
+    )?;
     let (gen_tx, gen_rx) = bounded::<RecordBatch>(RECORD_CHANNEL_CAPACITY);
     #[cfg(test)]
     let tee = TEE_FOR_TEST.with(|t| t.borrow().clone());
@@ -720,7 +723,7 @@ where
             header: Box::new(header.clone()),
             stream: std::sync::Arc::new(parking_lot::Mutex::new(Some(sort_rx))),
         },
-        sink: SinkSpec::Bam(target.path().to_path_buf()),
+        sink: staged.sink(),
         stage_opts: StageOptionsBag { sort: Some(sort.clone()), ..Default::default() },
         threading: crate::commands::common::ThreadingOptions { threads: Some(threads) },
         compression: crate::commands::common::CompressionOptions { compression_level: compression },
@@ -764,7 +767,7 @@ where
         }
         let stats = sorted.context("Failed to template-coordinate sort simulated reads")?;
         let value = generated?;
-        target.persist()?;
+        staged.finish(&stats)?;
         Ok((value, stats))
     })
 }

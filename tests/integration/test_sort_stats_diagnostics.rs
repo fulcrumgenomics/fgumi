@@ -669,7 +669,7 @@ fn sort_stats_gates_fast_path_note(#[case] extra_args: &[&str], #[case] expect_p
 // ─────────────────────────────────────────────────────────────────────────
 //
 // The chain cutover dropped the owned engine's unconditional phase-timing
-// block (the retired `RawExternalSorter::sort` was its only caller). It is
+// block (the retired standalone sort was its only caller). It is
 // restored as a roll-up derived from the pipeline's per-step timings, gated on
 // the stats collector being attached so the default sort path is unaffected.
 

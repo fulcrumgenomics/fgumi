@@ -17,7 +17,7 @@
 //! space; otherwise skips this slot and tries the next. The consumer
 //! is also **non-blocking**: when the queue is empty but the slot is
 //! not yet `queue_eof` it reports `WouldBlock` (see
-//! `external.rs::slot_try_load_block`) and the cooperative `SortMerge`
+//! `merge_driver.rs::slot_try_load_block`) and the cooperative `SortMerge`
 //! step yields: it declares the slot awaited
 //! ([`crate::MergeDemand::await_slot`]) and its driver thread parks until
 //! the producer's next delivery, EOF or failure on that slot unparks it
@@ -78,23 +78,12 @@
 //!
 //! ## Who drives it, and the OTHER Phase-2 implementation
 //!
-//! `SortMergeSlot` is the Phase-2 of the chain sort — standalone `fgumi sort`
-//! and the fused `runall` sort. The spill writer opens each spill file as a
-//! slot (`external.rs::open_spill_slot`), `fgumi sort`'s `SortSpillDecompress`
-//! fills it (the `bp_*` methods), and `SortMerge` merges the set through
-//! `MergeDriver::from_slots`.
-//!
-//! `worker_pool::Phase2FileState` is the other Phase-2: `RawExternalSorter`'s
-//! `sort_records` drives it (`fgumi simulate`, and the `#[cfg(test)]` parity
-//! oracle). `fgumi merge` uses neither: `RawExternalSorter::merge_bams` merges
-//! its sorted inputs with `run_merge_loop`, which has no spill files and no
-//! Phase-2 slots. `Phase2FileState` keeps
-//! its own reorder buffer and in-flight counter because its
-//! single-reader/**multi-decompressor** topology needs them, and it retains
-//! the gap-filler this module dropped. Which implementation each command runs
-//! is stated here, on [`PHASE2_DECOMP_CAP`], and on
-//! `worker_pool::Phase2FileState`; keep the three in sync. (History: commit
-//! `9d6d7e9` / PR #395.)
+//! `SortMergeSlot` is the Phase-2 of every sort and merge: standalone
+//! `fgumi sort`, the fused `runall` sort, `fgumi simulate`'s sort and
+//! `fgumi merge`. The spill writer opens each spill file as a slot
+//! (`merge_driver.rs::open_spill_slot`), `fgumi merge` opens each input BAM as a
+//! body-keyed slot (`open_bam_slot`), `SortSpillDecompress` fills it (the `bp_*`
+//! methods), and `SortMerge` merges the set through `MergeDriver::from_slots`.
 
 use std::collections::VecDeque;
 use std::io;
@@ -128,9 +117,7 @@ use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 ///
 /// Raised from 8 to 32 (increment 1a) to give the work-stealing decompressor
 /// more runway ahead of the `Detached` merge, which was input-starved
-/// (`MergeDiag stalls`) at the spill-heavy operating point. The `worker_pool.rs`
-/// copy (the `cfg(test)`/library oracle path) is intentionally left at 8 — these
-/// two are no longer equal.
+/// (`MergeDiag stalls`) at the spill-heavy operating point.
 ///
 /// The ceiling of each slot's FIFO cap ([`SortMergeSlot::fifo_cap`], which the
 /// read planner sets per slot — 32 for the slots the merge needs next, 8 for
@@ -139,18 +126,6 @@ use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 /// admitted over the cap ([`SortMergeSlot::bp_claim_raw`]); its block then
 /// waits in `reorder` until the consumer makes room. It stays a per-slot,
 /// independent bound (deadlock-safety is unchanged — see the module header).
-///
-/// # Not the only bound of that name
-///
-/// `worker_pool.rs` declares a *different* constant of the same name
-/// (`pub(crate) const PHASE2_DECOMP_CAP: usize = 8`) for its own Phase-2, and
-/// that is the one governing `RawExternalSorter::sort_records`' merge
-/// (`fgumi simulate`, and the test parity oracle). This constant bounds the
-/// chain sort's slots (`fgumi sort`, the `runall` sort). So
-/// `fgumi_sort::PHASE2_DECOMP_CAP` resolves to 32 while `fgumi simulate`'s
-/// sort runs bounded at 8 (`fgumi merge`'s `merge_bams` has no Phase-2 slots,
-/// so neither bounds it). The two are deliberately unequal (see this constant's history
-/// above); the confusable part is only which command each one bounds.
 pub const PHASE2_DECOMP_CAP: usize = 32;
 
 /// The first slot id minted for a consolidation input

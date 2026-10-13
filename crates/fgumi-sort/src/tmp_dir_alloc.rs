@@ -254,8 +254,7 @@ fn default_free_space_probe(path: &Path) -> Result<u64> {
 /// (or a single one under the system temp location when it is empty) and an
 /// allocator over them. The returned [`TempDir`] handles own the subdirs, which
 /// are removed on drop; the allocator hands out their paths for spill-file
-/// placement. This is what [`RawExternalSorter::create_spill_dirs`] does for its
-/// configured directories, available without building a sorter.
+/// placement.
 ///
 /// # Errors
 ///

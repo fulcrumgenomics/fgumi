@@ -7,9 +7,37 @@ use anyhow::Result;
 use fgumi_sam::SamBuilder;
 use fgumi_sort::QuerynameComparator;
 use fgumi_sort::{
-    RawBamRecordReader, RawExternalSorter, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
-    SortContext, SortOrder, extract_coordinate_key_inline, verify_sort_order,
+    RawBamRecordReader, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, SortOrder,
+    extract_coordinate_key_inline, verify_sort_order,
 };
+
+use crate::common::sort_bam_in_memory;
+
+/// Sort `input` into `output` in `order` with the local reference sort.
+fn reference_sort_bam(
+    order: SortOrder,
+    input: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<()> {
+    let (_, header) = fgumi_bam_io::create_bam_reader(input, 1)?;
+    let ctx = SortContext::from_header(&header);
+    match order {
+        SortOrder::Coordinate => {
+            let nref = u32::try_from(header.reference_sequences().len())
+                .expect("reference sequence count fits in u32");
+            sort_bam_in_memory(input, output, |bam| extract_coordinate_key_inline(bam, nref))
+        }
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+            sort_bam_in_memory(input, output, |bam| RawQuerynameLexKey::extract(bam, &ctx))
+        }
+        SortOrder::Queryname(QuerynameComparator::Natural) => {
+            sort_bam_in_memory(input, output, |bam| RawQuerynameKey::extract(bam, &ctx))
+        }
+        SortOrder::TemplateCoordinate => {
+            Err(anyhow::anyhow!("template-coordinate is not used by these verifier tests"))
+        }
+    }
+}
 
 // ============================================================================
 // Basic verify_sort_order tests
@@ -113,7 +141,7 @@ fn sort_and_verify_pass(order: SortOrder) -> Result<()> {
     let sorted_bam = dir.path().join("sorted.bam");
     builder.write_bam(&input_bam)?;
 
-    RawExternalSorter::new(order).threads(1).output_compression(6).sort(&input_bam, &sorted_bam)?;
+    reference_sort_bam(order, &input_bam, &sorted_bam)?;
 
     let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
     let file = std::fs::File::open(&sorted_bam)?;
@@ -188,10 +216,11 @@ fn test_verify_queryname_lex_fails_with_natural_verifier() -> Result<()> {
     let sorted_bam = dir.path().join("sorted.bam");
     builder.write_bam(&input_bam)?;
 
-    RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::Lexicographic))
-        .threads(1)
-        .output_compression(6)
-        .sort(&input_bam, &sorted_bam)?;
+    reference_sort_bam(
+        SortOrder::Queryname(QuerynameComparator::Lexicographic),
+        &input_bam,
+        &sorted_bam,
+    )?;
 
     let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
     let file = std::fs::File::open(&sorted_bam)?;
@@ -221,10 +250,11 @@ fn test_verify_queryname_natural_fails_with_lex_verifier() -> Result<()> {
     let sorted_bam = dir.path().join("sorted.bam");
     builder.write_bam(&input_bam)?;
 
-    RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::Natural))
-        .threads(1)
-        .output_compression(6)
-        .sort(&input_bam, &sorted_bam)?;
+    reference_sort_bam(
+        SortOrder::Queryname(QuerynameComparator::Natural),
+        &input_bam,
+        &sorted_bam,
+    )?;
 
     let (_, header) = fgumi_bam_io::create_bam_reader(&sorted_bam, 1)?;
     let file = std::fs::File::open(&sorted_bam)?;

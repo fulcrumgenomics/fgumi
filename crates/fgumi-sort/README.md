@@ -1,9 +1,13 @@
 # fgumi-sort
 
-High-performance external merge-sort engine for BAM files.
+Engine components for sorting and merging BAM records.
 
-This crate powers `fgumi sort` and is published so that downstream consumers can build
-their own BAM sort tools without taking on the rest of fgumi.
+This crate holds the pieces `fgumi sort`, `fgumi merge` and `fgumi simulate` are
+built from: sort keys and their inline extractors, the in-memory chunk sorters,
+the spill-file block format, the k-way merge driver and its loser tree, the merge
+slots the spill read planner feeds, and a sort-order verifier. The sort itself is
+a chain-native pipeline that lives in the `fgumi` crate; this crate no longer
+ships a standalone sorter.
 
 ## Sort orders
 
@@ -11,39 +15,34 @@ their own BAM sort tools without taking on the rest of fgumi.
 - `queryname` (lexicographic or natural) — read-name ordering
 - `template-coordinate` — paired-end template position, used for UMI grouping
 
-## Performance
-
-External merge-sort with parallel radix sort over packed sort keys, K-way merge via a
-loser tree, async I/O prefetch, libdeflate-backed BGZF, and free-space-aware temp-dir
-round-robin. Faster than `samtools sort` on the workloads it targets.
-
 ## Usage
 
 ### Sort a BAM file
 
-```rust,no_run
-use fgumi_sort::{RawExternalSorter, SortOrder};
-use fgumi_sort::keys::QuerynameComparator;
-use std::path::Path;
+Use the `fgumi sort` command, or, from Rust, `fgumi_lib::sort::sort_bam` (in the
+`fgumi` crate), which builds the same chain the command runs. The full option set
+is `fgumi_lib::commands::sort::Sort`.
 
-// Coordinate sort (for IGV, variant callers, etc.)
-RawExternalSorter::new(SortOrder::Coordinate)
-    .threads(4)
-    .output_compression(6)
-    .sort(Path::new("input.bam"), Path::new("sorted.bam"))
-    .expect("sort failed");
+```rust,ignore
+use fgumi_lib::commands::sort::SortOrderArg;
+use fgumi_lib::sort::{KeyTypesSpec, SortConfig, sort_bam};
+use std::path::PathBuf;
 
-// Queryname sort — natural ordering (read1 < read2 < read10)
-RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::Natural))
-    .threads(4)
-    .sort(Path::new("input.bam"), Path::new("by-name.bam"))
-    .expect("sort failed");
-
-// Template-coordinate sort (required before fgumi group)
-RawExternalSorter::new(SortOrder::TemplateCoordinate)
-    .threads(4)
-    .sort(Path::new("input.bam"), Path::new("template-coord.bam"))
-    .expect("sort failed");
+let stats = sort_bam(&SortConfig {
+    input: PathBuf::from("input.bam"),
+    output: PathBuf::from("sorted.bam"),
+    order: SortOrderArg::Coordinate,
+    threads: 8,
+    // A 4 GiB in-memory budget for the whole run (None: 768 MiB per thread).
+    max_memory: Some(4 * 1024 * 1024 * 1024),
+    // Spill to a fast scratch volume (empty: the system temp directory).
+    tmp_dirs: vec![PathBuf::from("/scratch/sort-spill")],
+    compression: 6,
+    write_index: true,
+    key_types: KeyTypesSpec::default(),
+})
+.expect("sort failed");
+println!("sorted {} records", stats.total_records);
 ```
 
 ### Verify an existing sort order
@@ -72,23 +71,6 @@ if violations == 0 {
     let (rec_num, name) = first_violation.unwrap();
     println!("{violations} violations; first at record {rec_num} ({name})");
 }
-```
-
-### Memory and temp-dir tuning
-
-```rust,no_run
-use fgumi_sort::{RawExternalSorter, SortOrder};
-use std::path::{Path, PathBuf};
-
-RawExternalSorter::new(SortOrder::Coordinate)
-    .threads(8)
-    // Limit in-memory sort buffer to ~4 GiB (default: 80% of available RAM)
-    .max_memory_bytes(4 * 1024 * 1024 * 1024)
-    // Write spill files to a fast scratch volume
-    .tmp_dirs(vec![PathBuf::from("/scratch/sort-spill")])
-    .output_compression(6)
-    .sort(Path::new("large.bam"), Path::new("large_sorted.bam"))
-    .expect("sort failed");
 ```
 
 ## Status

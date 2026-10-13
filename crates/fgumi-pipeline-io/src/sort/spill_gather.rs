@@ -13,15 +13,13 @@
 //!
 //! # Run extension (spill coalescing)
 //!
-//! `SpillGather` is also the arena's **run-former**, the coalescing counterpart of
-//! the owned engine's `RunFormer`. It sees spill chunks in seal order on a single
+//! `SpillGather` is also the sort's **run-former**. It sees spill chunks in seal order on a single
 //! `Detached` thread, so it can compare each incoming chunk's minimum key against
 //! the currently-open run's maximum key ([`RunBound::precedes_or_equal`]): when the
 //! chunk is contiguous with the run, its blocks reuse the run's `file_id`, so a
 //! whole run of contiguous chunks becomes **one physical spill file** (one merge
 //! source) instead of one file per chunk. On an already-sorted input every chunk
-//! is contiguous, so the N-way merge collapses to a trivial 1-way pass — matching
-//! the owned engine's headline behaviour. The read side is unchanged: a slot is
+//! is contiguous, so the N-way merge collapses to a trivial 1-way pass. The read side is unchanged: a slot is
 //! still one file; there are simply fewer, longer files.
 //!
 //! Whether a run's final block is the *last block of its file* is only known once
@@ -101,7 +99,7 @@ const FRAMES_PER_RANGE: usize = 8;
 /// block past `block_size` is left for the next block. The sole exception is a
 /// single record larger than `block_size`, which forms its own oversized block
 /// (BAM long reads can exceed 64 KiB; the codec re-blocks/​frames it safely,
-/// matching the streaming `SyncSpillWriter`, so this is not an error).
+/// so this is not an error).
 pub(crate) fn frame_one_block(
     chunk: &MemoryChunkErased,
     start: usize,
@@ -327,10 +325,9 @@ impl SpillGather {
         o
     }
 
-    /// The owned-engine-style run-formation summary line, or `None` when nothing
-    /// spilled. Formats through the shared [`fgumi_sort::format_run_formation`] so
-    /// both sort engines report run formation with byte-identical wording (the
-    /// owned engine's `log_run_formation` calls the same function).
+    /// The run-formation summary line, or `None` when nothing spilled. Formats
+    /// through the shared [`fgumi_sort::format_run_formation`] so the wording
+    /// benchmark log parsing relies on has a single source of truth.
     fn run_formation_summary(&self) -> Option<String> {
         if self.chunks_spilled == 0 {
             return None;
@@ -589,9 +586,9 @@ impl Step for SpillGather {
                      never flushed by AllAnnounced)",
                 ));
             }
-            // Report run formation once, matching the owned engine's line so
-            // benchmark log parsing and cross-engine comparison see the same
-            // "Spill runs: R from C chunks (E extended…)" wording.
+            // Report run formation once, in the stable
+            // "Spill runs: R from C chunks (E extended…)" wording benchmark log
+            // parsing relies on.
             if !self.summary_logged {
                 self.summary_logged = true;
                 if let Some(line) = self.run_formation_summary() {

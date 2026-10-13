@@ -148,7 +148,7 @@ impl BackoffPolicy {
 /// therefore step its offset by +1µs and wrap every `2r` episodes (each offset
 /// in `0..2r` once per period), while different workers start from unrelated
 /// offsets. This departs from the previous engine's seed
-/// (`worker_id × golden-ratio + iter`, in `fgumi-sort`'s `worker_pool.rs`):
+/// (`worker_id × golden-ratio + iter`, in the retired `fgumi-sort` worker pool):
 /// modulo the small `2r` of the 200µs and 400µs levels, that seed gave workers
 /// `w` and `w + 8` the same deadline, so 7 of 16 workers still shared one.
 ///

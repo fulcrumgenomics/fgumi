@@ -3,10 +3,9 @@
 //!
 //! A spill chunk is either a BGZF block-stream (self-framed `1f 8b` blocks) or
 //! a zstd "ZSP1" stream (`[u32 LE frame-len][zstd frame]` records after the
-//! 4-byte file magic). Both standalone `fgumi sort` (via the worker pool) and
-//! the fused streaming sort write spill chunks with whichever
-//! [`SpillCodec`] the sorter is configured for; this
-//! decompressor lets the streaming `SortSpillDecompress` step read either.
+//! 4-byte file magic). The sort's spill steps write spill chunks with whichever
+//! [`SpillCodec`] the sort is configured for; this decompressor lets the
+//! `SortSpillDecompress` step read either.
 //!
 //! Each decompressed BGZF block (or zstd frame) is returned as one `Vec<u8>`.
 //! The block/frame boundaries are immaterial: the downstream `MergeDriver`
@@ -219,9 +218,9 @@ pub(crate) fn checked_zstd_len(prefix: &[u8]) -> io::Result<usize> {
     Ok(len)
 }
 
-/// Output staging-buffer capacity for a single decompressed block/frame. Mirrors
-/// the worker pool's `ZSTD_FRAME_DECOMP_CAP` / `BgzfDecompress` scratch sizing so
-/// the mimalloc size-class reuse pattern matches.
+/// Output staging-buffer capacity for a single decompressed block/frame: the
+/// largest zstd frame a spill writer produces, so the scratch stays in one
+/// mimalloc size class across blocks.
 const SCRATCH_CAP: usize = 256 * 1024;
 
 /// Ceiling for sizing the scratch buffer up from [`SCRATCH_CAP`].
@@ -534,13 +533,19 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<Option<usize>> {
     let mut first = [0u8; 1];
-    match reader.read(&mut first)? {
-        0 => return Ok(None),
-        1 => {}
-        n => {
-            return Err(std::io::Error::other(format!(
-                "Read returned {n} bytes for a 1-byte buffer",
-            )));
+    // Retry an interrupted read, as `read_exact_or_eof` and the `read_exact`
+    // below do: EINTR at a frame boundary is not an error.
+    loop {
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(n) => {
+                return Err(std::io::Error::other(format!(
+                    "Read returned {n} bytes for a 1-byte buffer",
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     let mut rest = [0u8; 3];
@@ -552,10 +557,32 @@ pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pooled_chunk_writer::PooledChunkWriter;
-    use crate::worker_pool::SortWorkerPool;
     use std::io::Cursor;
-    use std::sync::Arc;
+
+    /// Write `records` as a coordinate-keyed spill file through the production
+    /// block kernel (`frame_keyed_record_into` + `SpillBlockCompressor`), cutting
+    /// a block whenever it reaches 64 KiB, bracketed by the codec magic and
+    /// trailer.
+    fn write_keyed_spill(path: &std::path::Path, codec: SpillCodec, records: &[Vec<u8>]) {
+        use crate::keys::{RawCoordinateKey, RawSortKey};
+        use std::io::Write as _;
+        let mut comp = crate::spill_block::SpillBlockCompressor::new(codec, 6).expect("compressor");
+        let mut out = std::fs::File::create(path).expect("create");
+        out.write_all(crate::spill_block::spill_magic(codec)).expect("magic");
+        let mut block = Vec::new();
+        for rec in records {
+            let key = RawCoordinateKey::extract_from_record(rec);
+            crate::spill_block::frame_keyed_record_into(&mut block, &key, rec).expect("frame");
+            if block.len() >= 64 * 1024 {
+                out.write_all(&comp.compress_block(&block).expect("compress")).expect("write");
+                block.clear();
+            }
+        }
+        if !block.is_empty() {
+            out.write_all(&comp.compress_block(&block).expect("compress")).expect("write");
+        }
+        out.write_all(crate::spill_block::spill_trailer(codec)).expect("trailer");
+    }
 
     /// A length prefix that promises more bytes than follow must surface
     /// `UnexpectedEof` from BOTH zstd read paths.
@@ -665,7 +692,6 @@ mod tests {
     /// stream that was written — for BOTH codecs. This is the round-trip the
     /// streaming merge depends on.
     fn roundtrip(codec: SpillCodec) {
-        use crate::keys::{RawCoordinateKey, RawSortKey};
         // Build framed records whose total size (~440 KB) far exceeds the
         // writer's ~64 KB block cap, so the chunk is written as MANY blocks /
         // frames. That is what actually exercises the per-block decompress and
@@ -687,16 +713,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("chunk.spill");
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
-        {
-            let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
-                .expect("writer");
-            for rec in &records {
-                let key = RawCoordinateKey::extract_from_record(rec);
-                w.write_record(&key, rec).expect("write");
-            }
-            w.start_finish().expect("start_finish").wait().expect("finish");
-        }
+        write_keyed_spill(&path, codec, &records);
 
         // Re-open + position past the codec magic exactly like
         // slots_for_chunk_files does.
@@ -756,8 +773,6 @@ mod tests {
     /// `SortSpillDecompress`) must yield the exact same per-block bytes as the
     /// inline `read_blocks` path. We read the same chunk twice and compare.
     fn read_raw_matches_read_blocks(codec: SpillCodec) {
-        use crate::keys::{RawCoordinateKey, RawSortKey};
-
         let records: Vec<Vec<u8>> = (0usize..80)
             .map(|i| {
                 let size = 3000 + (i % 13) * 500;
@@ -772,16 +787,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("chunk.spill");
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
-        {
-            let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
-                .expect("writer");
-            for rec in &records {
-                let key = RawCoordinateKey::extract_from_record(rec);
-                w.write_record(&key, rec).expect("write");
-            }
-            w.start_finish().expect("start_finish").wait().expect("finish");
-        }
+        write_keyed_spill(&path, codec, &records);
 
         // Helper: open the chunk positioned past any codec magic.
         let open = || {
@@ -1093,6 +1099,33 @@ mod read_exact_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
+    /// A reader that reports `Interrupted` before each of its first reads,
+    /// then serves `inner`.
+    struct InterruptFirst<R> {
+        inner: R,
+        interrupts: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for InterruptFirst<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// An interrupted read at a frame boundary is retried, not surfaced: the
+    /// prefix still parses, and a clean EOF behind the interruption is still
+    /// `None`.
+    #[test]
+    fn test_read_length_prefix_retries_an_interrupted_first_byte() {
+        let mut reader = InterruptFirst { inner: Cursor::new(7u32.to_le_bytes()), interrupts: 2 };
+        assert_eq!(read_length_prefix(&mut reader).expect("retried"), Some(7));
+        let mut empty = InterruptFirst { inner: Cursor::new(Vec::<u8>::new()), interrupts: 1 };
+        assert_eq!(read_length_prefix(&mut empty).expect("retried"), None);
+    }
     #[test]
     fn test_read_length_prefix_clean_eof_returns_none() {
         // No bytes available at all → clean stream end.

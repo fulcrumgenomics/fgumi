@@ -26,8 +26,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fgumi_pipeline_io::boundaries::BoundaryState;
 use fgumi_raw_bam::testutil::make_bam_bytes;
-use fgumi_sort::{RawExternalSorter, RecordRef, SortOrder, extract_coordinate_key_inline};
-use noodles::sam::Header;
+use fgumi_sort::{RecordRef, extract_coordinate_key_inline};
 
 /// Build a decompressed-BAM-style buffer of `n` framed records: each record is
 /// `[block_size: u32 LE][body]`, exactly what `BoundaryState::scan` walks. Bodies
@@ -68,9 +67,7 @@ fn bench_serial_ingest(c: &mut Criterion) {
     group.bench_function("scan_copy_push", |b| {
         b.iter_batched(
             || {
-                RawExternalSorter::new(SortOrder::Coordinate)
-                    .threads(1)
-                    .into_coordinate_chunk_sorter(&Header::default())
+                fgumi_sort::CoordinateChunkSorter::new(512 * 1024 * 1024, 0, 1)
                     .expect("build coordinate chunk sorter")
             },
             |mut sorter| {

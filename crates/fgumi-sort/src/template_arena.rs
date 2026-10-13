@@ -395,8 +395,7 @@ pub struct TemplateArenaAccumulator {
 impl TemplateArenaAccumulator {
     /// Build an accumulator from the BAM `header`, the sort's cell-barcode tag,
     /// and the `--key-types` spec, deriving the library lookup and CB hasher
-    /// exactly as
-    /// [`RawExternalSorter::into_template_chunk_sorter`](crate::RawExternalSorter::into_template_chunk_sorter).
+    /// exactly as [`TemplateKeySeed::from_header`](crate::TemplateKeySeed::from_header).
     #[must_use]
     pub fn from_header(header: &Header, cell_tag: Option<SamTag>, key_types: KeyTypesSpec) -> Self {
         Self {
@@ -457,8 +456,8 @@ impl TemplateArenaAccumulator {
     /// Sort the refs accumulated for the current run and drain them into an
     /// arena-backed [`TemplateMemChunk`] (zero body copies) via
     /// [`seal_template_refs`]. The chosen variant + baseline are RETAINED for
-    /// subsequent runs (spills), matching the owned sorter. Empty if nothing was
-    /// pushed.
+    /// subsequent runs (spills), so every run of a sort uses the same lane
+    /// layout. Empty if nothing was pushed.
     ///
     /// Featherweight seal: each arm emits the variant-matching narrow
     /// [`TemplateMemChunk`] lane using the key already resident in the ref — no
@@ -660,8 +659,9 @@ mod tests {
         #[case] mis: &[&str],
         #[case] want: (bool, bool),
     ) {
+        use crate::TemplateChunkSorter;
         use crate::segmented_buf::SegmentedBuf;
-        use crate::{RawExternalSorter, SortOrder};
+        use crate::template_key::TemplateKeySeed;
         use fgumi_raw_bam::testutil::make_bam_bytes;
 
         let z_tag = |tag: SamTag, value: &str| {
@@ -716,13 +716,12 @@ mod tests {
         let arena = Arc::new(PooledSegmentedBuf::unpooled(buf));
 
         // Owned oracle.
-        let mut owned = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(2)
-            .cell_tag(SamTag::CB)
-            .key_types(key_types)
-            .into_template_chunk_sorter(&Header::default())
-            .expect("build owned template sorter");
+        let mut owned = TemplateChunkSorter::new(
+            256 * 1024 * 1024,
+            TemplateKeySeed::from_header(&Header::default(), Some(SamTag::CB), key_types),
+            2,
+        )
+        .expect("build owned template sorter");
         for r in &records {
             owned.push(r).expect("owned push");
         }

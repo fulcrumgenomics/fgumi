@@ -1,4 +1,4 @@
-//! The retired engine's `merge_bams` tests (`fgumi-sort`'s `external.rs`),
+//! The retired standalone engine's merge tests (`fgumi-sort`'s `external.rs`),
 //! ported to the `fgumi merge` command: each fixture is sorted with `fgumi
 //! sort` and merged with `fgumi merge`; every assertion is the original's, and
 //! each merge is also checked record for record against the stable sort of its
@@ -126,7 +126,7 @@ fn merge(inputs: &[PathBuf], merged: &Path, order: &str) -> u64 {
 }
 
 #[test]
-fn test_merge_bams_coordinate_sort() {
+fn test_merge_ported_coordinate_sort() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, "coordinate");
     let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, "coordinate");
@@ -146,7 +146,7 @@ fn test_merge_bams_coordinate_sort() {
 }
 
 #[test]
-fn test_merge_bams_template_coordinate_sort() {
+fn test_merge_ported_template_coordinate_sort() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, "template-coordinate");
     let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, "template-coordinate");
@@ -183,7 +183,7 @@ fn test_merge_bams_template_coordinate_sort() {
 }
 
 #[test]
-fn test_merge_bams_queryname_sort() {
+fn test_merge_ported_queryname_sort() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, "queryname");
     let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, "queryname");
@@ -202,7 +202,7 @@ fn test_merge_bams_queryname_sort() {
 }
 
 #[test]
-fn test_merge_bams_single_input() {
+fn test_merge_ported_single_input() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, _) = create_sorted_bam(dir.path(), "a", 15, 0, "coordinate");
 
@@ -215,7 +215,7 @@ fn test_merge_bams_single_input() {
 }
 
 #[test]
-fn test_merge_bams_preserves_all_records() {
+fn test_merge_ported_preserves_all_records() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, names_a) = create_sorted_bam(dir.path(), "a", 5, 0, "queryname");
     let (bam_b, names_b) = create_sorted_bam(dir.path(), "b", 5, 10_000, "queryname");
@@ -234,7 +234,7 @@ fn test_merge_bams_preserves_all_records() {
 }
 
 #[test]
-fn test_merge_bams_many_inputs() {
+fn test_merge_ported_many_inputs() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let k = 8;
     let pairs_per_input = 5;
@@ -266,7 +266,7 @@ fn test_merge_bams_many_inputs() {
 }
 
 #[test]
-fn test_merge_bams_queryname_natural_sort() {
+fn test_merge_ported_queryname_natural_sort() {
     let dir = tempfile::tempdir().expect("failed to create temp directory");
     let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, "queryname::natural");
     let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, "queryname::natural");

@@ -39,8 +39,7 @@ use std::thread::{self as thread_mod, Thread};
 use crate::merge_slots::SortMergeSlot;
 
 /// What the awaited slot was doing when the merge stalled on it
-/// ([`SortMergeSlot::awaited_state`]). Not `merge_stalls`' finer-grained
-/// stall census state, which classifies the owned engine's awaited file.
+/// ([`SortMergeSlot::awaited_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AwaitedSlotState {
     /// Nothing read, stashed or in flight for the slot.

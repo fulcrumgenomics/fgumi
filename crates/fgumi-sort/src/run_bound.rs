@@ -3,7 +3,7 @@
 //!
 //! # Run extension
 //!
-//! The owned external sorter coalesces contiguous sorted spill chunks into a
+//! The spill run-former (`SpillGather`) coalesces contiguous sorted spill chunks into a
 //! single run: when a new chunk's minimum key is `>=` the open run's maximum
 //! key, every record in the run precedes every record in the new chunk, so
 //! concatenating the new chunk's blocks after the run keeps the run globally
@@ -34,8 +34,8 @@
 //! Note the `pos` field on the queryname keys ([`RawQuerynameKey`],
 //! [`RawQuerynameLexKey`]) does **not** change this. `pos` is a per-chunk ingest
 //! index and is the keys' final `cmp` tie-break, but it is set (via
-//! [`RawSortKey::set_position`](crate::RawSortKey::set_position)) **only** in the
-//! owned engine's `RunFormer`, which never uses `RunBound`. The arena ingest that
+//! [`RawSortKey::set_position`](crate::RawSortKey::set_position)) by no
+//! production path. The arena ingest that
 //! builds `RunBound` breaks equal-key ties by arena offset in the sort comparator
 //! and never calls `set_position`, so every arena queryname key carries `pos == 0`
 //! — an exact name+flags tie therefore compares `Equal` and the run extends. And
@@ -95,10 +95,9 @@ impl RunBound {
     }
 }
 
-/// The run-formation summary line both sort engines log, so the wording and the
-/// `extended = chunks_spilled - runs` arithmetic have a single source of truth:
-/// the owned engine's `log_run_formation` and the arena's
-/// `SpillGather::run_formation_summary` both format through this.
+/// The run-formation summary line the sort logs (`SpillGather::run_formation_summary`
+/// formats through this), so the wording and the
+/// `extended = chunks_spilled - runs` arithmetic have a single source of truth.
 ///
 /// Every spilled chunk either starts a run or extends an existing one, so the
 /// number that extended is exactly `chunks_spilled - runs`.
@@ -163,7 +162,7 @@ mod tests {
     /// tie-break when the two keys carry different `pos` values. This pins the
     /// comparator itself; note the differing-`pos` state does NOT arise in the
     /// arena path (see `queryname_exact_name_tie_with_default_pos_extends`) — it
-    /// is only reachable through the owned engine's `set_position`.
+    /// is only reachable through an explicit `set_position`.
     #[test]
     fn run_bound_queryname_compare_honours_pos_tiebreak() {
         let mut later = RawQuerynameLexKey::new(b"readAAA".to_vec(), 0);

@@ -5,9 +5,9 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable,
-    QnKey, QnLex, QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot,
-    SortOrder, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
+    CbKey32, InMemoryChunk, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable, QnKey, QnLex,
+    QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot, SortOrder,
+    TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
 
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
@@ -542,7 +542,7 @@ fn build_driver(
         SortOrder::Coordinate => Box::new(attach(
             MergeDriver::<RawCoordinateKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.coordinate),
+                chunks.coordinate,
                 total_records,
                 (),
             ),
@@ -551,7 +551,7 @@ fn build_driver(
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
             MergeDriver::<QnMergeKey<QnLex>, QnKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.queryname_lex),
+                chunks.queryname_lex,
                 total_records,
                 table(),
             ),
@@ -560,7 +560,7 @@ fn build_driver(
         SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
             MergeDriver::<QnMergeKey<QnNatural>, QnKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.queryname_natural),
+                chunks.queryname_natural,
                 total_records,
                 table(),
             ),
@@ -587,49 +587,24 @@ fn build_driver(
                     ));
                 }
                 Box::new(attach(
-                    MergeDriver::<TemplateKey>::from_slots(
-                        slots,
-                        MemorySources::Shared(Vec::new()),
-                        total_records,
-                        None,
-                    ),
+                    MergeDriver::<TemplateKey>::from_slots(slots, Vec::new(), total_records, None),
                     demand,
                 ))
             }
             TemplateChunks::K24(v) => Box::new(attach(
-                MergeDriver::<TemplateKey24>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<TemplateKey24>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::Cb32(v) => Box::new(attach(
-                MergeDriver::<CbKey32>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<CbKey32>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::Tert32(v) => Box::new(attach(
-                MergeDriver::<TertKey32>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<TertKey32>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::K40(v) => Box::new(attach(
-                MergeDriver::<TemplateKey>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    None,
-                ),
+                MergeDriver::<TemplateKey>::from_slots(slots, v, total_records, None),
                 demand,
             )),
         },

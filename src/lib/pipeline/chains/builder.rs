@@ -1439,9 +1439,8 @@ impl<'a> ChainBuilder<'a> {
                         // (`DecodedRecordBatch`); `add_sort` bridges that to the
                         // sort ingest's `RecordBatch` shape via
                         // `DecodedRecordBatchToRecordBatch` when
-                        // `chain_tail_kind == DecodedRecordBatch`. The owned
-                        // engine (`RawExternalSorter`, used by `execute_sort`
-                        // pre-cutover) accepts SAM input directly, and
+                        // `chain_tail_kind == DecodedRecordBatch`. The retired
+                        // standalone engine accepted SAM input directly, and
                         // `test_input_source_matrix`'s `CONTRACTS` table declares
                         // `sam: Required` for `sort` — so SAM-first is a binding
                         // contract, not an optional extra.
@@ -3823,7 +3822,7 @@ impl<'a> ChainBuilder<'a> {
             let cell_tag = crate::commands::sort::parse_cell_tag(sort.order)?;
             // What the record-input `SortBuffer` reads — exactly its inputs, so
             // no knob can be set here and silently ignored (the chain once
-            // configured it through a whole `RawExternalSorter`, whose
+            // configured it through the whole retired standalone sorter, whose
             // `max_temp_files` it never read back: #991). Everything else comes
             // straight from `sort` / the locals above: the spill codec and
             // compression, the Phase-2 thread count, `--max-temp-files`, and the
@@ -3852,7 +3851,7 @@ impl<'a> ChainBuilder<'a> {
 
             // NOTE: the legacy `build_sort_step` clamped the sorter's *initial*
             // in-memory capacity (768 MiB/thread) for standalone `--max-memory
-            // auto`, relying on the old `RawExternalSorter`'s lazy buffer growth.
+            // auto`, relying on the retired standalone sorter's lazy buffer growth.
             // That knob does not carry over to the arena front used below
             // (`ReadBlocks`): it sizes its arena segment to the FULL budget, and
             // each run's cap leaves room in that budget for the run's sort refs
@@ -4335,12 +4334,10 @@ impl<'a> ChainBuilder<'a> {
                 // produced as part of the sink's own drained-finish, not by a
                 // post-pipeline re-read step queued from this branch.
                 if let Some(slot) = sort_stats_slot {
-                    let output_path = self.spec.sink.output_path().clone();
                     self.finalize_on_success.push(Box::new(
                         crate::pipeline::chains::commands::sort::SortSummaryFinalizeHook {
                             stats_slot: slot,
                             spill_stats: self.sort_spill_stats.clone(),
-                            output_path,
                             timer: crate::logging::OperationTimer::new("Sorting BAM"),
                             phase_caps: phase1_cap.iter().chain(&phase2_cap).cloned().collect(),
                             input_fetch: self
@@ -4401,8 +4398,7 @@ impl<'a> ChainBuilder<'a> {
             }
 
             // Update self.header to reflect the sort order so downstream
-            // add_group's sort-order header check passes. This is the same header
-            // update the external sorter writes into the temp BAM. Applied as a
+            // add_group's sort-order header check passes. Applied as a
             // header *transform* so that, when Align is upstream, the sort-order
             // rewrite is re-applied to the aligner's runtime-resolved header at
             // sink time (preserving its @PG/@RG/@CO) instead of dropping it.

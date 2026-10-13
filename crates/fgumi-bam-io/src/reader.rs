@@ -825,7 +825,7 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
 /// [`TeeReader`] for the parse, then dismantled: its readahead is moved into
 /// the replay buffer and the original stream is handed back unwrapped. Leaving
 /// it in place would put a second buffer under consumers that already have one
-/// — `fgumi_sort::RawBamRecordReader` and the sort worker pool both read BGZF
+/// — `fgumi_sort::RawBamRecordReader` and the chain's BGZF readers both read
 /// block by block, so a resident layer here would copy every byte of the input
 /// a second time on the hot path. Draining it into the replay buffer costs one
 /// memcpy of at most `BGZF_INPUT_BUFFER_SIZE`, which [`ChainedReader`] frees

@@ -1,28 +1,14 @@
-//! High-performance BAM sorting module.
+//! Engine components for sorting and merging BAM records.
 //!
-//! This module provides efficient BAM file sorting with support for multiple sort orders:
-//! - **Template-coordinate**: Groups paired-end reads by template position (for `fgumi group`)
-//! - **Queryname**: Groups reads by read name (for `fgumi zipper`)
-//! - **Coordinate**: Standard genomic coordinate order (for IGV, `fgumi review`)
-//!
-//! # Performance Features
-//!
-//! - **External merge-sort**: Handles BAM files larger than available RAM via spill-to-disk
-//! - **Lazy decoding**: Only parses fields needed for sort key extraction
-//! - **N+2 worker pool**: Dedicated reader, writer, and N sort workers stream
-//!   chunks through the pipeline; in-memory sort uses parallel radix sort
-//! - **Buffer recycling**: Reuses buffers via channel-based allocation patterns
-//! - **Fast compression**: Uses zstd (default) or BGZF/libdeflate for temporary file compression
-//!
-//! # Architecture
-//!
-//! The sorting process follows this pipeline:
-//!
-//! 1. **Read phase**: Stream BAM records, extract sort keys lazily
-//! 2. **Accumulate phase**: Buffer records until memory limit reached
-//! 3. **Sort phase**: Parallel radix sort over the in-memory record buffer
-//! 4. **Spill phase**: Compress and write sorted chunk to temp file
-//! 5. **Merge phase**: K-way merge of sorted temp files using a loser tree
+//! The pieces `fgumi sort`, `fgumi merge` and `fgumi simulate` are built from:
+//! sort keys and their inline extractors (coordinate, queryname lexicographic
+//! and natural, template-coordinate with its `--key-types` lanes), the
+//! in-memory record buffers, arenas and parallel radix sorts, the spill-file
+//! block format and its decompressor, the merge slots the spill read planner
+//! feeds, the k-way merge driver and its loser tree, and a sort-order verifier.
+//! The sort itself is a chain-native pipeline in the `fgumi` crate
+//! (`fgumi_lib::sort::sort_bam`, or the `fgumi sort` command); this crate does
+//! not ship a standalone sorter.
 
 // Unsafe code is prohibited at the crate level. Approved exceptions carry
 // #[allow(unsafe_code)] on the item: memory_probe::platform_ffi (CLAUDE.md
@@ -41,10 +27,8 @@ use noodles::sam::header::record::value::map::header::tag as header_tag;
 // `prefetch`, `ref_sort`, `sort_pool`, `template_arena`, `template_key`).
 // Everything else is re-exported at the crate root below.
 pub mod arena_pool;
-pub(crate) mod bgzf_io;
 pub(crate) mod chunk_sorter;
 pub mod codec;
-pub(crate) mod external;
 pub(crate) mod fd_limit;
 pub(crate) mod inline;
 pub(crate) mod keys;
@@ -55,15 +39,9 @@ pub(crate) mod memory_probe;
 pub(crate) mod merge_demand;
 // The k-way merge driver and slot parser. Surfaced via the re-export below.
 pub(crate) mod merge_driver;
-pub(crate) mod merge_phases;
 pub(crate) mod merge_slots;
-pub(crate) mod merge_stalls;
-pub(crate) mod merge_trace;
-pub(crate) mod pipeline;
-pub(crate) mod pooled_bam_writer;
-pub(crate) mod pooled_chunk_writer;
 pub mod prefetch;
-pub mod queryname_ref;
+pub(crate) mod queryname_ref;
 pub(crate) mod radix;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
@@ -83,14 +61,8 @@ pub mod template_key;
 // below.
 pub(crate) mod spill_block;
 pub(crate) mod spill_block_reader;
-// Streaming single-chunk spill writer: the reference the block-parallel spill
-// compressor is tested against, and nothing else.
-#[cfg(test)]
-pub(crate) mod sync_spill_writer;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
-pub(crate) mod worker_pool;
-pub(crate) mod zspill_stream;
 
 /// Print mimalloc allocator statistics to stderr.
 ///
@@ -116,11 +88,8 @@ pub use memory_probe::{RETAINED_PURGE_DELAY_MS, mi_purge_delay_ms, retain_freed_
 /// which reads two inputs concurrently and needs each decode off the main thread.
 pub use read_ahead::RawReadAheadReader;
 
-/// Buffer size for `BufReader` during merge phase.
-const MERGE_BUFFER_SIZE: usize = 64 * 1024;
-
 /// Statistics from a sort operation.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortStats {
     /// Total records read from input.
     pub total_records: u64,
@@ -134,33 +103,6 @@ pub struct SortStats {
     /// starting a file. So an input already in the requested order spills a single
     /// run, and this is below the number of chunks that were spilled.
     pub runs_written: usize,
-}
-
-/// Whether `header` already declares the order a sort to `sort_order` would produce.
-///
-/// Used only to warn: re-sorting a file into the order it is already in is
-/// usually unintended. It is no longer the shape the merge handles *worst* --
-/// natural run formation collapses an already-ordered input to a single spill
-/// run, so there is effectively no k-way merge left to do -- but it is still a
-/// full read, sort, spill and rewrite of every record to reproduce the order the
-/// input already had.
-///
-/// Deliberately conservative. `SO` must match, and when the order defines a
-/// sub-sort tag the input's `SS` must match too — so a `queryname` input with no
-/// `SS` does not warn for either queryname flavor, since the header does not say
-/// which one it is. A header that lies still gets sorted; nothing here skips work.
-pub(crate) fn header_declares_order(header: &Header, sort_order: keys::SortOrder) -> bool {
-    let Some(hd) = header.header() else {
-        return false;
-    };
-    let field = |tag| hd.other_fields().get(&tag).map(ToString::to_string);
-    if field(header_tag::SORT_ORDER).as_deref() != Some(sort_order.header_so_tag()) {
-        return false;
-    }
-    match sort_order.header_ss_tag() {
-        None => true,
-        Some(expected) => field(header_tag::SUBSORT_ORDER).as_deref() == Some(expected),
-    }
 }
 
 /// Create an output header with appropriate sort order tags (SO, GO, SS).
@@ -237,9 +179,8 @@ pub fn create_output_header(sort_order: keys::SortOrder, header: &Header) -> Hea
 pub use arena_pool::{ArenaPool, PooledSegmentedBuf};
 pub use chunk_sorter::{CoordinateChunkSorter, TemplateChunkSorter};
 pub use codec::SpillCodec;
-pub use external::{RawExternalSorter, ReadStreams};
 pub use fd_limit::{
-    FALLBACK_MAX_TEMP_FILES, FD_RESERVE, fits_nofile_budget, resolve_temp_file_limit, soft_nofile,
+    FALLBACK_MAX_TEMP_FILES, FD_RESERVE, fits_nofile_budget, soft_nofile,
     temp_file_limit_from_nofile,
 };
 pub use inline::{
@@ -259,8 +200,8 @@ pub use merge_demand::{
     MergePoolRequest,
 };
 pub use merge_driver::{
-    MemorySources, MergeCtxErased, MergeDriver, MergeDriverDyn, MergeStep, MergeStepFramed,
-    RecordRewrite, input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
+    MergeCtxErased, MergeDriver, MergeDriverDyn, MergeStep, MergeStepFramed, RecordRewrite,
+    input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
     open_spill_slot_as,
 };
 pub use merge_slots::{
@@ -327,98 +268,6 @@ mod tests {
         assert_eq!(stats.total_records, 0);
         assert_eq!(stats.output_records, 0);
         assert_eq!(stats.runs_written, 0);
-    }
-
-    /// Build a header whose `@HD` carries the given SO/SS values.
-    fn header_with_sort_tags(so: Option<&str>, ss: Option<&str>) -> Header {
-        let mut builder = Map::<noodles::sam::header::record::value::map::Header>::builder();
-        if let Some(so) = so {
-            builder = builder.insert(header_tag::SORT_ORDER, BString::from(so));
-        }
-        if let Some(ss) = ss {
-            builder = builder.insert(header_tag::SUBSORT_ORDER, BString::from(ss));
-        }
-        Header::builder().set_header(builder.build().expect("valid header")).build()
-    }
-
-    #[test]
-    fn test_header_declares_order_matches_coordinate() {
-        let header = header_with_sort_tags(Some("coordinate"), None);
-        assert!(header_declares_order(&header, keys::SortOrder::Coordinate));
-    }
-
-    #[test]
-    fn test_header_declares_order_rejects_a_different_order() {
-        let header = header_with_sort_tags(Some("coordinate"), None);
-        assert!(!header_declares_order(&header, keys::SortOrder::TemplateCoordinate));
-        assert!(!header_declares_order(
-            &header,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
-        ));
-    }
-
-    #[test]
-    fn test_header_declares_order_needs_no_hd_line() {
-        let header = Header::builder().build();
-        assert!(!header_declares_order(&header, keys::SortOrder::Coordinate));
-    }
-
-    /// A `queryname` header with no `SS` does not say *which* queryname order it
-    /// is in, so neither flavor may claim it. Warning here would fire on every
-    /// `samtools sort -n` output regardless of which comparator was requested.
-    #[test]
-    fn test_header_declares_order_queryname_without_subsort_is_ambiguous() {
-        let header = header_with_sort_tags(Some("queryname"), None);
-        assert!(!header_declares_order(
-            &header,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
-        ));
-        assert!(!header_declares_order(
-            &header,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic)
-        ));
-    }
-
-    #[test]
-    fn test_header_declares_order_discriminates_queryname_flavors() {
-        let natural = header_with_sort_tags(Some("queryname"), Some("queryname:natural"));
-        assert!(header_declares_order(
-            &natural,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural)
-        ));
-        assert!(!header_declares_order(
-            &natural,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic)
-        ));
-    }
-
-    /// Template-coordinate shares `SO:unsorted` with plain unsorted input, so the
-    /// sub-sort tag is the only thing that distinguishes them.
-    #[test]
-    fn test_header_declares_order_template_coordinate_requires_subsort() {
-        let bare = header_with_sort_tags(Some("unsorted"), None);
-        assert!(!header_declares_order(&bare, keys::SortOrder::TemplateCoordinate));
-
-        let tagged = header_with_sort_tags(Some("unsorted"), Some("unsorted:template-coordinate"));
-        assert!(header_declares_order(&tagged, keys::SortOrder::TemplateCoordinate));
-    }
-
-    /// The predicate must agree with what `create_output_header` writes, or fgumi
-    /// would fail to recognise its own output as already sorted.
-    #[test]
-    fn test_header_declares_order_accepts_fgumi_own_output() {
-        for order in [
-            keys::SortOrder::Coordinate,
-            keys::SortOrder::TemplateCoordinate,
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Natural),
-            keys::SortOrder::Queryname(keys::QuerynameComparator::Lexicographic),
-        ] {
-            let written = create_output_header(order, &Header::builder().build());
-            assert!(
-                header_declares_order(&written, order),
-                "fgumi's own {order:?} output header should be recognised"
-            );
-        }
     }
 
     #[test]

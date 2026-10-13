@@ -304,3 +304,64 @@ fn uncompressed_bgzf_spills_match_the_default_codec(
         "uncompressed-BGZF spills must not change the sorted records ({order}, sam={sam_input})"
     );
 }
+
+/// Twin of the retired engine-driven `test_max_temp_files_consolidation_is_record_identical`
+/// (`src/lib/commands/sort.rs`), driving the chain: `--max-temp-files 2` forces
+/// consolidation to fire repeatedly, a limit far above the spill count never
+/// consolidates, and both must emit the same records in the same order (and the
+/// same count). Reverse-ordered, all-distinct starts make the coordinate sort a
+/// total order; 4,000 pairs at the file's 64 KiB budget spill well over a dozen
+/// runs (the engine test's 60 pairs at 1 KiB fit one chain buffer). The
+/// control pins an explicit large limit rather than `auto`, which derives from
+/// `ulimit -n` and could itself consolidate on a low-limit host.
+#[test]
+fn max_temp_files_consolidation_is_record_identical() {
+    let mut builder = fgumi_sam::SamBuilder::new();
+    for i in 0..4_000 {
+        let _ = builder
+            .add_pair()
+            .name(&format!("read{i:04}"))
+            .start1((4_000 - i) * 100 + 1)
+            .start2((4_000 - i) * 100 + 51)
+            .build();
+    }
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("in.bam");
+    builder.write_bam(&input).expect("write bam");
+
+    let run = |limit: &str, name: &str| {
+        let output = dir.path().join(format!("{name}.bam"));
+        let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .env("RUST_LOG", "info")
+            .args(["sort", "-i"])
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["--order", "coordinate", "--threads", "1", "--max-temp-files", limit])
+            .args(["--max-memory", "64K", "--memory-per-thread", "false"])
+            .output()
+            .expect("run fgumi sort");
+        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        assert!(result.status.success(), "fgumi sort failed:\n{stderr}");
+        (output, stderr)
+    };
+    let (default_out, default_log) = run(UNBOUNDED, "default");
+    let (limited_out, limited_log) = run("2", "limited");
+
+    assert!(
+        logged_count(&limited_log, "Spill runs:").expect("the fixture must spill") > 2,
+        "{limited_log}"
+    );
+    assert!(limited_log.contains("Consolidating "), "the limited sort must consolidate");
+    assert!(!default_log.contains("Consolidating "), "the control must not consolidate");
+    assert_eq!(
+        logged_count(&limited_log, "Records written:"),
+        logged_count(&default_log, "Records written:"),
+        "consolidation must not drop or duplicate records",
+    );
+    assert!(
+        decompressed_records_without_pg(&limited_out)
+            == decompressed_records_without_pg(&default_out),
+        "--max-temp-files is a consolidation knob and must not change the emitted records",
+    );
+}

@@ -539,12 +539,10 @@ dominates the sort work", and pair with `tricorder`'s `mean_load` / `--trace`
 above for the wall-clock / core-utilisation picture. The block is emitted only
 for a standalone `fgumi sort` (a sole-sort chain, where the chain's phases are
 exactly the sort's); a fused pipeline such as `runall` does not print it, and
-SAM-input parse time (a source adapter, not a sort step) is not counted. The
-library-level
-`fgumi-sort` engine still carries its own always-on `SortPhaseTimer`
-(`crates/fgumi-sort/src/external.rs`, per-phase `f64` accumulators + a
-`time()`-wrapped `log_summary()`) for callers that drive `RawExternalSorter`
-directly rather than through the chain.
+SAM-input parse time (a source adapter, not a sort step) is not counted.
+`fgumi-sort` has no standalone sorter of its own: library callers sort through
+the same chain (`fgumi_lib::sort::sort_bam`), so this block is the only sort
+phase timer.
 
 Mirror the phase-timing pattern when optimizing any other command: the phases
 you would name in a design doc are exactly the phases worth timing, it works

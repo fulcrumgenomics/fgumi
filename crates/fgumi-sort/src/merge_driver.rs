@@ -10,34 +10,6 @@ use fgumi_bam_io::ProgressTracker;
 use log::info;
 use std::sync::Arc;
 
-/// Container for the in-memory chunks passed into the merge.
-///
-/// Inline-buffer sorts (coordinate, template) produce
-/// `Shared` chunks that share an `Arc<SegmentedBuf>` backing store —
-/// zero per-record allocation; the merge reads each record in place.
-///
-/// The queryname streaming path accumulates records upstream as
-/// individual `RawRecord`s and produces `Owned` chunks — the
-/// per-record allocation is sunk cost, so we preserve the original
-/// zero-copy `mem::swap` merge bridge.
-pub enum MemorySources<K: RawSortKey + Default + 'static, R = K> {
-    /// Arena-backed residual chunks sharing an `Arc<SegmentedBuf>` — zero
-    /// per-record allocation. Each record's stored ref `R` yields its merge key
-    /// ([`ChunkRef`]).
-    Shared(Vec<InMemoryChunk<R>>),
-    /// Queryname-style residual chunks (each record an owned `RawRecord`).
-    Owned(Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>),
-}
-
-impl<K: RawSortKey + Default + 'static, R> MemorySources<K, R> {
-    pub(crate) fn num_non_empty(&self) -> usize {
-        match self {
-            Self::Shared(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
-            Self::Owned(chunks) => chunks.iter().filter(|c| !c.is_empty()).count(),
-        }
-    }
-}
-
 /// Open `path` as a single [`SortMergeSlot`] with the given `file_id`.
 ///
 /// The spill codec is auto-detected from the file magic: for zstd (`ZSP1`) the
@@ -134,34 +106,17 @@ pub fn open_spill_slot_as(
 }
 
 // ============================================================================
-// CoordinateSortStream — streaming coordinate-sort handle
-// ============================================================================
-
-// ============================================================================
-// QuerynameSortStream — streaming queryname-sort handle (lex or natural)
-// ============================================================================
-
-// ============================================================================
-// TemplateCoordinateSortStream — streaming template-coordinate-sort handle
-// ============================================================================
-
-// ============================================================================
-// Streaming-sort merge path (the chain's `SortMerge` step)
+// The merge driver (the chain's `SortMerge` and `ConsolidateRuns` steps)
 // ============================================================================
 //
-// Ported from the issue-#330 branch onto main's sort engine. This is the
-// slot-backed, *non-blocking* merge driver used exclusively by the typed-step
-// pipeline (`MergeDriver::from_slots`). It reads records out of
-// `SortMergeSlot` queues, which the `SortSpillDecompress` step has *already*
-// filled with decompressed `Vec<u8>` blocks — so this path is **codec-agnostic**
-// (it never touches disk or the spill codec) and carries no chunk-corruption
-// risk. The eager pool-integrated `MergeDriver::new` path from #330 is
-// intentionally NOT ported: standalone `fgumi sort` uses main's own
-// `merge_chunks_*` engine, and the pipeline only ever calls `from_slots`.
+// The slot-backed, *non-blocking* merge driver (`MergeDriver::from_slots`). It
+// reads records out of `SortMergeSlot` queues, which the `SortSpillDecompress`
+// step has *already* filled with decompressed `Vec<u8>` blocks — so this path
+// is **codec-agnostic** (it never touches disk or the spill codec).
 
 /// Result of a non-blocking source read. `WouldBlock` is only ever produced by
 /// `Slot` sources whose decompressed queue is momentarily empty and not yet at
-/// EOF; the in-memory source always returns `Ready`.
+/// EOF; an in-memory chunk source always returns `Ready`.
 pub(crate) enum TryRead<T> {
     /// A record was read (`Some`) or the source is at clean EOF (`None`).
     Ready(Option<T>),
@@ -171,10 +126,7 @@ pub(crate) enum TryRead<T> {
 }
 
 /// Where a merge source's current record lives, so the driver can emit it by
-/// reference instead of copying it. The slot-driver counterpart of the
-/// pool-merge path's `CurRecord`, kept separate because the pool path has no
-/// shared-chunk location: one enum would give it an unreachable `Chunk` arm
-/// and lose the exhaustiveness check on both matches.
+/// reference instead of copying it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecLoc {
     /// `[start, end)` of the source's `SlotParserState::current_buf`: the
@@ -182,17 +134,15 @@ enum RecLoc {
     Block { start: usize, end: usize },
     /// Record `idx` of the source's shared residual chunk (`MemoryShared`).
     Chunk { idx: usize },
-    /// The leaf's scratch buffer: a record that spanned blocks, or the owned
-    /// residual's swapped-in body.
+    /// The leaf's scratch buffer: a record that spanned blocks.
     Scratch,
 }
 
 /// Per-slot byte-stream parser state for the non-blocking merge reader.
 ///
 /// As decompressed blocks are popped from a `SortMergeSlot`, their bytes are
-/// stashed in `current_buf` and consumed left-to-right by the record parser.
-/// Named distinctly from main's own `SourceParserState` (the pool-merge path)
-/// because this one additionally carries resumable cross-block framing state.
+/// stashed in `current_buf` and consumed left-to-right by the record parser,
+/// with resumable cross-block framing state.
 struct SlotParserState {
     /// Current decompressed block being consumed.
     current_buf: Vec<u8>,
@@ -460,6 +410,11 @@ fn slot_try_next_record<K: RawSortKey + Default + 'static>(
                     out.clear();
                     out.extend_from_slice(&parser.current_buf[start..end]);
                     parser.current_pos = end;
+                    // The rewriter walks the aux data, so a user's record is
+                    // held to the BAM layout before it, not only after.
+                    if parser.body_keyed {
+                        check_bam_record_layout(out)?;
+                    }
                     rewrite(slot.file_id, out);
                     let key = slot_parse_key_in::<K>(ctx, hint, &[], out, parser.body_keyed)?;
                     return Ok(TryRead::Ready(Some((key, RecLoc::Scratch))));
@@ -612,6 +567,10 @@ fn slot_collect_pending<K: RawSortKey + Default + 'static>(
     }
 
     if let Some(rewrite) = &parser.rewrite {
+        // As on the fast path: check the layout before the rewriter reads it.
+        if parser.body_keyed {
+            check_bam_record_layout(out)?;
+        }
         rewrite(slot.file_id, out);
     }
     let key = {
@@ -635,9 +594,6 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static, R: ChunkRef<K> = K> {
         parser: SlotParserState,
         hint: K::MergeHint,
     },
-    /// In-memory sorted residual records from a queryname-style sort (each
-    /// record an owned `RawRecord`). Read via a zero-copy `mem::swap` bridge.
-    Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// In-memory sorted residual from an inline-buffer (coordinate / template)
     /// sort, sharing an `Arc<SegmentedBuf>` — zero per-record allocation. A
     /// read names the record's index; the driver emits its bytes straight from
@@ -647,8 +603,8 @@ enum SlotMergeSource<K: RawSortKey + Default + 'static, R: ChunkRef<K> = K> {
 
 impl<K: RawSortKey + Default + 'static, R: ChunkRef<K>> SlotMergeSource<K, R> {
     /// Non-blocking read of the next record, returning its sort key and where
-    /// its bytes live ([`RecLoc`]). Only a record that spans blocks, or an
-    /// owned residual record, is placed in `scratch`. `Slot` sources may return
+    /// its bytes live ([`RecLoc`]). Only a record that spans blocks is placed
+    /// in `scratch`. `Slot` sources may return
     /// `WouldBlock`; memory sources always return `Ready`.
     fn try_next_record(
         &mut self,
@@ -658,19 +614,6 @@ impl<K: RawSortKey + Default + 'static, R: ChunkRef<K>> SlotMergeSource<K, R> {
         match self {
             SlotMergeSource::Slot { slot, parser, hint } => {
                 slot_try_next_record::<K>(slot, parser, scratch, ctx, hint)
-            }
-            SlotMergeSource::Memory { records, idx } => {
-                if *idx < records.len() {
-                    let (ref mut key, ref mut data) = records[*idx];
-                    // Bridge: RawRecord wraps Vec<u8>; swap via the inner vec to
-                    // avoid re-allocating. The scratch is a plain Vec<u8>.
-                    std::mem::swap(scratch, data.as_mut_vec());
-                    let key = std::mem::take(key);
-                    *idx += 1;
-                    Ok(TryRead::Ready(Some((key, RecLoc::Scratch))))
-                } else {
-                    Ok(TryRead::Ready(None))
-                }
             }
             SlotMergeSource::MemoryShared { chunk, idx } => {
                 if *idx < chunk.len() {
@@ -862,7 +805,10 @@ pub fn input_order_violation(input: &str, order: &str, record_no: u64) -> String
 
 impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R> {
     /// Construct a driver from `SortMergeSlot`s and already-sorted in-memory
-    /// chunks. Used by the cooperative pipeline `SortMerge` step.
+    /// chunks (arena-backed residuals sharing an `Arc<SegmentedBuf>`: zero
+    /// per-record allocation, each record's stored ref `R` yielding its merge
+    /// key through [`ChunkRef`]). Used by the cooperative pipeline `SortMerge`
+    /// step.
     ///
     /// Each slot becomes a slot source read **non-blocking** by
     /// [`MergeDriverDyn::try_step`]. Priming is **lazy**: the loser tree is
@@ -875,12 +821,12 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
     #[must_use]
     pub fn from_slots(
         slots: Vec<Arc<crate::merge_slots::SortMergeSlot>>,
-        memory: MemorySources<K, R>,
+        memory: Vec<InMemoryChunk<R>>,
         total_records: u64,
         ctx: K::MergeCtx,
     ) -> Self {
         let num_slots = slots.len();
-        let num_memory = memory.num_non_empty();
+        let num_memory = memory.iter().filter(|c| !c.is_empty()).count();
         let num_sources = num_slots + num_memory;
 
         if num_slots > 0 {
@@ -908,20 +854,9 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
                 hint: K::MergeHint::default(),
             });
         }
-        match memory {
-            MemorySources::Owned(chunks) => {
-                for chunk in chunks {
-                    if !chunk.is_empty() {
-                        sources.push(SlotMergeSource::Memory { records: chunk, idx: 0 });
-                    }
-                }
-            }
-            MemorySources::Shared(chunks) => {
-                for chunk in chunks {
-                    if !chunk.is_empty() {
-                        sources.push(SlotMergeSource::MemoryShared { chunk, idx: 0 });
-                    }
-                }
+        for chunk in memory {
+            if !chunk.is_empty() {
+                sources.push(SlotMergeSource::MemoryShared { chunk, idx: 0 });
             }
         }
 
@@ -932,7 +867,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             .iter()
             .map(|s| match s {
                 SlotMergeSource::Slot { slot, .. } => Some(slot.slot_id()),
-                SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+                SlotMergeSource::MemoryShared { .. } => None,
             })
             .collect();
         let slot_drained = vec![false; sources.len()];
@@ -967,7 +902,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
     }
 
     /// Fail when a source is not sorted: a record whose key sorts before the
-    /// previous record of its source is an
+    /// previous record of its source ([`RawSortKey::input_order_cmp`]) is an
     /// [`input_order_violation`]`(inputs[file_id], order, record_no)` error.
     /// For a merge of independently sorted inputs, whose order the merge
     /// assumes; a spill run is sorted by construction.
@@ -997,10 +932,11 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
     }
 
     /// The order-check error for `src`'s latest record, if it sorts before the
-    /// record `prev` its source emitted last.
+    /// record `prev` its source emitted last under
+    /// [`RawSortKey::input_order_cmp`].
     fn order_violation(&self, src: usize, key: &K, prev: &K) -> Option<anyhow::Error> {
         let (inputs, order) = self.order_check.as_ref()?;
-        if key >= prev {
+        if key.input_order_cmp(prev) != std::cmp::Ordering::Less {
             return None;
         }
         let SlotMergeSource::Slot { slot, .. } = &self.sources[src] else { return None };
@@ -1060,11 +996,15 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             RecLoc::Scratch => &self.records[leaf],
             RecLoc::Block { start, end } => match &self.sources[self.source_map[leaf]] {
                 SlotMergeSource::Slot { parser, .. } => &parser.current_buf[start..end],
-                _ => unreachable!("a block location on a non-slot source"),
+                SlotMergeSource::MemoryShared { .. } => {
+                    unreachable!("a block location on a non-slot source")
+                }
             },
             RecLoc::Chunk { idx } => match &self.sources[self.source_map[leaf]] {
                 SlotMergeSource::MemoryShared { chunk, .. } => chunk.record_bytes(idx),
-                _ => unreachable!("a chunk location on a non-chunk source"),
+                SlotMergeSource::Slot { .. } => {
+                    unreachable!("a chunk location on a non-chunk source")
+                }
             },
         }
     }
@@ -1246,14 +1186,14 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
     fn stalled_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
         match self.sources.get(self.stalled_src?)? {
             SlotMergeSource::Slot { slot, .. } => Some(slot),
-            SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+            SlotMergeSource::MemoryShared { .. } => None,
         }
     }
 
     fn failed_slot(&self) -> Option<&Arc<crate::merge_slots::SortMergeSlot>> {
         match self.sources.get(self.failed_src?)? {
             SlotMergeSource::Slot { slot, .. } => Some(slot),
-            SlotMergeSource::Memory { .. } | SlotMergeSource::MemoryShared { .. } => None,
+            SlotMergeSource::MemoryShared { .. } => None,
         }
     }
 }
@@ -1293,9 +1233,7 @@ pub fn merge_driver_for_kind(
         demand: Arc<crate::MergeDemand>,
     ) -> Box<dyn MergeDriverDyn + Send> {
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut d =
-            MergeDriver::<K, R>::from_slots(slots, MemorySources::Shared(Vec::new()), 0, ctx)
-                .with_demand(demand);
+        let mut d = MergeDriver::<K, R>::from_slots(slots, Vec::new(), 0, ctx).with_demand(demand);
         #[cfg(test)]
         {
             d.kind_for_test = Some(spill_kind_of::<K>());
@@ -1355,7 +1293,7 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             SlotMergeSource::Slot { parser, .. } => {
                 parser.current_buf.as_ptr_range().contains(&ptr)
             }
-            _ => false,
+            SlotMergeSource::MemoryShared { .. } => false,
         }
     }
 

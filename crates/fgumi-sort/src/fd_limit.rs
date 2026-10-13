@@ -9,13 +9,9 @@
 //! already sorted — so the limit should be as high as the process's descriptor
 //! budget genuinely allows, and no higher.
 //!
-//! This module is a **helper a caller opts into**, not a policy the engine
-//! applies. [`RawExternalSorter`](crate::RawExternalSorter) keeps a fixed,
-//! portable default so that an embedder who never thinks about the knob gets
-//! the same behaviour on every host; deciding to derive the limit from the
-//! environment instead belongs to whoever owns the command line. `fgumi sort`
-//! makes that decision, so its default is derived and every other sorter
-//! construction site is unaffected.
+//! This module is a **helper a caller opts into**: deciding to derive the
+//! limit from the environment belongs to whoever owns the command line.
+//! `fgumi sort` makes that decision, so its default is derived.
 //!
 //! Nothing here *raises* the descriptor limit. A process may raise its own soft
 //! limit to the hard limit without privileges, but `fgumi-sort` is a library and
@@ -23,8 +19,7 @@
 //! ask for.
 
 /// Limit used when the process descriptor limit cannot be read, or on a
-/// non-Unix target. Also the fixed default of a bare
-/// [`RawExternalSorter`](crate::RawExternalSorter).
+/// non-Unix target.
 ///
 /// Matches samtools' implementation, which is where fgumi's original hardcoded
 /// default came from.
@@ -33,8 +28,8 @@ pub const FALLBACK_MAX_TEMP_FILES: usize = 64;
 /// Descriptors reserved for everything the sort holds open besides spill files.
 ///
 /// At peak that is stdio (3), the input BAM, the output BAM and the optional
-/// index writer — roughly 7. Nothing scales with `--threads`: the worker pool
-/// shares one input reader, spill files are written one at a time, and the
+/// index writer — roughly 7. Nothing scales with `--threads`: the input is
+/// read through one handle, spill files are written one at a time, and the
 /// temp-directory allocator holds paths rather than descriptors. 32 leaves
 /// substantial headroom over the observed peak.
 pub const FD_RESERVE: u64 = 32;
@@ -129,28 +124,6 @@ pub fn temp_file_limit_from_nofile(soft: Option<u64>) -> usize {
     soft.map_or(FALLBACK_MAX_TEMP_FILES, temp_file_limit_from_soft_nofile)
 }
 
-/// A consolidation limit derived from the process's descriptor budget.
-///
-/// Falls back to [`FALLBACK_MAX_TEMP_FILES`] on a non-Unix target.
-///
-/// The convenience form, for a caller that wants only the number. A caller that
-/// also reports or checks the budget should take one [`soft_nofile`] reading and
-/// use [`temp_file_limit_from_nofile`] and [`fits_nofile_budget`] instead, so
-/// all three answers describe the same budget.
-///
-/// This is deliberately silent — see [`fits_nofile_budget`] for the check a caller
-/// should warn on.
-///
-/// # Concurrency
-///
-/// The whole descriptor budget is assumed to be available to one sort. A host
-/// running several sorts concurrently in one process should divide the budget
-/// itself rather than calling this once per sort.
-#[must_use]
-pub fn resolve_temp_file_limit() -> usize {
-    temp_file_limit_from_nofile(soft_nofile())
-}
-
 /// Whether `limit` open files fit within the descriptor budget `soft` describes.
 ///
 /// Deliberately independent of where `limit` came from: an explicitly requested
@@ -211,8 +184,8 @@ mod tests {
     /// `||` whose right side never runs on a Unix host would leave the fallback
     /// arm silently unasserted.
     #[test]
-    fn test_resolve_temp_file_limit_is_in_range() {
-        let limit = resolve_temp_file_limit();
+    fn test_temp_file_limit_from_this_hosts_budget_is_in_range() {
+        let limit = temp_file_limit_from_nofile(soft_nofile());
         let expected = if soft_nofile().is_some() {
             MIN_TEMP_FILES..=MAX_DERIVED_TEMP_FILES
         } else {

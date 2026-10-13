@@ -72,6 +72,7 @@ mod test_simplex_metrics_command;
 mod test_simplex_pipeline;
 mod test_simulate_aligner;
 mod test_simulate_sort;
+mod test_sort_bam_api;
 mod test_sort_consolidation_wake;
 mod test_sort_correctness;
 mod test_sort_cutover_parity;

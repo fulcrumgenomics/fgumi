@@ -21,7 +21,6 @@
 //! is no longer a self-contained file→file sort step or a sort-only chain
 //! builder.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::logging::OperationTimer;
@@ -45,7 +44,6 @@ pub(crate) struct SortSummaryFinalizeHook {
     /// Spill-run accounting from `SpillWrite`: runs written, consolidations and
     /// the final merge's fan-in. `None` when the chain has no spill writer.
     pub(crate) spill_stats: Option<Arc<SpillRunStats>>,
-    pub(crate) output_path: PathBuf,
     pub(crate) timer: OperationTimer,
     /// The standalone sort's phase caps — one per explicit `--sort-threads` /
     /// `--merge-threads` — reported as high-water marks. Empty when neither
@@ -89,14 +87,15 @@ impl FinalizeHook for SortSummaryFinalizeHook {
         let SortSummaryFinalizeHook {
             stats_slot,
             spill_stats,
-            output_path,
             timer,
             phase_caps,
             input_fetch,
             queryname_keys,
             sort_stats,
         } = *self;
-        let stats = stats_slot.lock().take().unwrap_or_default();
+        // Read, not taken: a library caller (`fgumi_lib::sort::sort_bam`) reads
+        // the slot after the run.
+        let stats = stats_slot.lock().unwrap_or_default();
         info!("=== Summary ===");
         info!("Records processed: {}", stats.total_records);
         info!("Records written: {}", stats.output_records);
@@ -148,7 +147,6 @@ impl FinalizeHook for SortSummaryFinalizeHook {
                 described.join("; ")
             );
         }
-        info!("Output: {}", output_path.display());
         timer.log_completion(stats.total_records);
         Ok(())
     }
@@ -156,7 +154,7 @@ impl FinalizeHook for SortSummaryFinalizeHook {
 
 // ─────────────────────────── Sort phase timing ───────────────────────────
 //
-// Pre-cutover, the owned `RawExternalSorter` engine emitted a
+// Pre-cutover, the owned standalone sort engine emitted a
 // `=== Sort Phase Timing ===` per-phase wall-time breakdown at `info!` on every
 // sort. Standalone `fgumi sort` now runs through the declarative chain, whose
 // sort phases are modeled as discrete pipeline steps
@@ -418,7 +416,6 @@ mod tests {
                 ..Default::default()
             }))),
             spill_stats: None,
-            output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
@@ -458,7 +455,6 @@ mod tests {
                 ..Default::default()
             }))),
             spill_stats: Some(spill),
-            output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: Vec::new(),
             input_fetch: None,
@@ -489,7 +485,6 @@ mod tests {
         let hook = SortSummaryFinalizeHook {
             stats_slot: Arc::new(Mutex::new(Some(fgumi_sort::SortStats::default()))),
             spill_stats: None,
-            output_path: PathBuf::from("out.bam"),
             timer: OperationTimer::new("Sort"),
             phase_caps: vec![phase1, phase2],
             input_fetch: None,

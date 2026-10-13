@@ -113,15 +113,22 @@ pub struct TemplateKeySeed {
 }
 
 impl TemplateKeySeed {
-    /// Derive the seed from the BAM header: the library lookup and CB hasher are
-    /// built exactly as
-    /// [`RawExternalSorter::into_template_chunk_sorter`](crate::RawExternalSorter::into_template_chunk_sorter)
-    /// builds them, so both paths key records identically.
+    /// Derive the seed from the BAM header: the library lookup from its read
+    /// groups and the fixed-seed CB hasher, so every front keys records
+    /// identically.
     #[must_use]
     pub fn from_header(header: &Header, cell_tag: Option<SamTag>, key_types: KeyTypesSpec) -> Self {
         let lib_lookup = LibraryLookup::from_header(header);
         let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
         Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types, header_library_varies }
+    }
+
+    /// The seed's parts: library lookup, cell tag, CB hasher, `--key-types`, and
+    /// whether the header realizes more than one library.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (LibraryLookup, Option<SamTag>, ahash::RandomState, KeyTypesSpec, bool) {
+        (self.lib_lookup, self.cell_tag, self.cb_hasher, self.key_types, self.header_library_varies)
     }
 
     /// The lanes `--key-types` fixes before any record is seen; `None` under
@@ -133,8 +140,7 @@ impl TemplateKeySeed {
     }
 
     /// Extract the sort's FIRST record's full key, choose the lane variant from
-    /// it (`select_template_variant`, the same choice the owned sorter makes on
-    /// its first push), and freeze both into a shared context. Called once per
+    /// it (`select_template_variant`), and freeze both into a shared context. Called once per
     /// sort, with the sort's first record in input order: the variant and the
     /// dropped-lane baseline are properties of the sort, so every worker and
     /// every batch must see the same ones.

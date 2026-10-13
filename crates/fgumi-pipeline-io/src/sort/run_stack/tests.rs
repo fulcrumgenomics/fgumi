@@ -56,7 +56,7 @@ fn simulate(max_temp_files: usize, sizes: &[u64]) -> Simulation {
     Simulation { survivors, peak_settled, widths, bytes_rewritten }
 }
 
-/// Bytes the legacy `RawExternalSorter` policy rewrites for the same runs: each time the
+/// Bytes the retired standalone engine's policy rewrites for the same runs: each time the
 /// live count reaches the limit, merge the oldest `limit / 2` runs and put the
 /// result back at the front.
 fn legacy_policy_bytes(max_temp_files: usize, sizes: &[u64]) -> u64 {

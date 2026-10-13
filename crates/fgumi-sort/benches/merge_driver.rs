@@ -20,8 +20,8 @@ use std::sync::Arc;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fgumi_raw_bam::testutil::make_bam_bytes;
 use fgumi_sort::{
-    MemorySources, MergeDriver, MergeDriverDyn, MergeStep, RawCoordinateKey, SortMergeSlot,
-    SpillCodec, frame_keyed_record_into,
+    MergeDriver, MergeDriverDyn, MergeStep, RawCoordinateKey, SortMergeSlot, SpillCodec,
+    frame_keyed_record_into,
 };
 
 /// Records merged per iteration.
@@ -77,12 +77,8 @@ fn slots(blocks: &[Vec<Vec<u8>>]) -> Vec<Arc<SortMergeSlot>> {
 /// Merge every record, appending each to a reused output buffer; returns the
 /// record count.
 fn merge(slots: Vec<Arc<SortMergeSlot>>, out: &mut Vec<u8>) -> u64 {
-    let mut driver = MergeDriver::<RawCoordinateKey>::from_slots(
-        slots,
-        MemorySources::Shared(Vec::new()),
-        RECORDS as u64,
-        (),
-    );
+    let mut driver =
+        MergeDriver::<RawCoordinateKey>::from_slots(slots, Vec::new(), RECORDS as u64, ());
     loop {
         match driver.try_step().expect("merge step") {
             MergeStep::Produced(bytes) => {

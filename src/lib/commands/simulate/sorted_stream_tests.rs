@@ -142,6 +142,40 @@ fn sort_failure_mid_stream_does_not_hang() {
     assert!(!out_exists, "an output was left behind");
 }
 
+/// Twin of the retired engine's empty-stream test: a generator that sends
+/// nothing yields a valid, header-only output.
+#[test]
+fn an_empty_generator_writes_a_header_only_output() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("o.bam");
+    let ((), stats) =
+        run_simulated_sort(|_tx| Ok(()), &header(), &out, &tiny_sort(dir.path()), 2, 1).unwrap();
+    assert_eq!(stats.total_records, 0);
+    assert!(read_bam(&out).1.is_empty());
+}
+
+/// Twin of the retired engine's first-record-error test: an error before any
+/// record fails the sort and leaves no output.
+#[test]
+fn an_error_before_any_record_fails_the_pipeline() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("o.bam");
+    let err = run_simulated_sort(
+        |tx| {
+            tx.send(Err(anyhow::anyhow!("generator broke at once"))).unwrap();
+            Ok(())
+        },
+        &header(),
+        &out,
+        &tiny_sort(dir.path()),
+        2,
+        1,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("generator broke at once"), "{err:#}");
+    assert!(!out.exists(), "no output on failure");
+}
+
 /// Twin of the retired engine's producer-error test: the generator itself
 /// returns `Err` (not through the channel). Catches: an output left behind.
 #[test]
@@ -162,6 +196,35 @@ fn aborted_simulate_leaves_no_output() {
     .unwrap_err();
     assert!(format!("{err:#}").contains("generator aborted"), "{err:#}");
     assert!(!out.exists(), "no output on failure");
+}
+
+/// A failed simulate publishes nothing over an existing destination: it keeps
+/// its bytes. Catches: the sink writing the destination in place.
+#[test]
+fn a_failed_simulate_leaves_an_existing_destination_as_it_was() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("o.bam");
+    std::fs::write(&out, b"previous contents").unwrap();
+    let err = run_simulated_sort(
+        |tx| -> anyhow::Result<()> {
+            tx.send(Ok(records(500))).unwrap();
+            anyhow::bail!("generator aborted")
+        },
+        &header(),
+        &out,
+        &tiny_sort(dir.path()),
+        2,
+        1,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("generator aborted"), "{err:#}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"previous contents");
+    let staged: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".fgumi-"))
+        .collect();
+    assert!(staged.is_empty(), "the staged output is removed: {staged:?}");
 }
 
 /// A deterministic two-contig reference for the subcommands.

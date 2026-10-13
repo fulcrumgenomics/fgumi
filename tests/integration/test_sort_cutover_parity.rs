@@ -1,6 +1,6 @@
 //! Smoke test for the sort-command cutover (Task 3): `Sort::execute` runs its
 //! coordinate sort through the declarative chain builder (`build_for(spec)?.run()`)
-//! instead of the owned `RawExternalSorter` engine, and still produces
+//! instead of the owned standalone sort engine, and still produces
 //! correctly sorted output.
 //!
 //! **Not a genuine RED/GREEN gate.** Pre-cutover, `execute_sort`'s owned-engine

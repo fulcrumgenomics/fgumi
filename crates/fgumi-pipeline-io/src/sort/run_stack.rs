@@ -22,11 +22,10 @@
 //!
 //! Small runs are therefore merged before large ones, the way an optimal merge
 //! pattern does, and a large consolidated run is not rewritten again until
-//! merging it is the cheapest way to make room. The legacy `RawExternalSorter`
-//! engine (which the library and `fgumi simulate` still use) instead merges the
-//! oldest `L / 2` runs each time the limit is hit and puts the result back at the
-//! front, so its first consolidated run absorbs — and rewrites — the oldest
-//! records on every later pass. When the limit is hit once (the common case of a
+//! merging it is the cheapest way to make room. The retired standalone engine
+//! (v0.7.0's) instead merged the oldest `L / 2` runs each time the limit was hit
+//! and put the result back at the front, so its first consolidated run absorbed
+//! — and rewrote — the oldest records on every later pass. When the limit is hit once (the common case of a
 //! sort just past it) and `L ≤ 2 · MAX_FAN_IN`, both policies do the same single
 //! `L / 2`-wide merge; above that this one merges at most `MAX_FAN_IN` runs at a
 //! time. When the limit is hit repeatedly this one rewrites several times less.
