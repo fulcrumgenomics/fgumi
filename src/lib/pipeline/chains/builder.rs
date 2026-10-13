@@ -77,6 +77,10 @@ pub(crate) enum PendingSource {
     /// Boxed to keep enum size comparable to the smaller variants.
     Single(Box<crate::pipeline::steps::source::InputSource>),
 
+    /// `SourceSpec::RecordStream` — a generator's channel, read by
+    /// `RecordStreamSource`.
+    RecordStream(crossbeam_channel::Receiver<fgumi_pipeline_io::source::RecordStreamItem>),
+
     /// `SourceSpec::PairedBams` — zipper's two-input form: mapped BAM +
     /// unmapped BAM + reference path, consumed by `add_source` to build both
     /// source preambles for the zipper merge.
@@ -627,6 +631,8 @@ pub struct ChainBuilder<'a> {
     /// The class table the sort's `ConsolidateRuns` holds (test support).
     #[cfg(test)]
     consolidation_class_table: Option<Arc<fgumi_sort::QnClassTable>>,
+    /// A standalone sort's summary-counts slot, handed to [`BuiltPipeline`].
+    sort_stats_slot: Option<crate::pipeline::chains::finalize::SortStatsSlot>,
     /// The sort's phase caps, `[phase1, phase2]` (test support).
     #[cfg(test)]
     sort_caps: [Option<Arc<fgumi_pipeline_core::PhaseCap>>; 2],
@@ -867,7 +873,13 @@ impl<'a> ChainBuilder<'a> {
         // legacy simplex/codec `execute()`, which likewise synthesizes `@HD`
         // before writing rejects but never stamps `@PG` on the rejects header.
         let raw_source_header = raw_header.clone();
-        let header = crate::commands::common::add_pg_record(raw_header, &spec.command_line)?;
+        // A generator's records keep the generator's header: no `@PG` of a
+        // command that read nothing.
+        let header = if matches!(spec.source, SourceSpec::RecordStream { .. }) {
+            raw_header
+        } else {
+            crate::commands::common::add_pg_record(raw_header, &spec.command_line)?
+        };
 
         Ok(Self {
             spec,
@@ -899,6 +911,7 @@ impl<'a> ChainBuilder<'a> {
             merge_class_tables: Vec::new(),
             #[cfg(test)]
             consolidation_class_table: None,
+            sort_stats_slot: None,
             #[cfg(test)]
             sort_caps: [None, None],
             pending_header_handle: None,
@@ -1077,6 +1090,12 @@ impl<'a> ChainBuilder<'a> {
                 let (header, pending) =
                     Self::open_fastq_source(spec, std::slice::from_ref(path), true)?;
                 Ok((header, Some(pending)))
+            }
+            SourceSpec::RecordStream { header, stream } => {
+                let rx = stream.lock().take().ok_or_else(|| {
+                    anyhow!("a record-stream source can be built once; its receiver was taken")
+                })?;
+                Ok(((**header).clone(), Some(PendingSource::RecordStream(rx))))
             }
         }
     }
@@ -1450,6 +1469,17 @@ impl<'a> ChainBuilder<'a> {
                     }
                 }
             }
+            PendingSource::RecordStream(rx) => {
+                // Generated records feed the record-input sort front
+                // (`SortBuffer`), as a SAM source's do.
+                let step = fgumi_pipeline_io::source::RecordStreamSource::new(
+                    rx,
+                    self.tuning.per_step_byte_limit,
+                );
+                let tail = self.pipeline.append_source(step);
+                self.current_tail = Some(tail);
+                self.chain_tail_kind = ChainTailKind::RecordBatch;
+            }
             PendingSource::Paired { mapped: boxed_mapped, unmapped: boxed_unmapped, reference } => {
                 // Zipper's two-input preamble. Both chains end at GroupByQueryname
                 // so their output type is OrderedBytesSingle<BamTemplateBatch>,
@@ -1688,6 +1718,7 @@ impl<'a> ChainBuilder<'a> {
             SourceSpec::PairedBams { mapped, .. } => mapped.clone(),
             SourceSpec::Fastqs { paths, .. } => paths.first().cloned().unwrap_or_default(),
             SourceSpec::InterleavedFastq { path, .. } => path.clone(),
+            SourceSpec::RecordStream { .. } => std::path::PathBuf::from("<record stream>"),
         }
     }
 
@@ -2797,6 +2828,7 @@ impl<'a> ChainBuilder<'a> {
             config,
             finalize: self.finalize,
             finalize_on_success: self.finalize_on_success,
+            sort_stats_slot: self.sort_stats_slot,
             #[cfg(test)]
             merge_class_tables: self.merge_class_tables,
             #[cfg(test)]
@@ -3957,6 +3989,7 @@ impl<'a> ChainBuilder<'a> {
             // `SortMerge` on completion and read by `SortSummaryFinalizeHook`.
             let sort_stats_slot = is_standalone_sort
                 .then(|| Arc::new(parking_lot::Mutex::new(None::<fgumi_sort::SortStats>)));
+            self.sort_stats_slot.clone_from(&sort_stats_slot);
             // `SortMerge` is constructed inside the Terminal/Intermediate branch
             // below, because its output-framing strategy differs by position:
             //
@@ -7351,6 +7384,7 @@ mod tests {
             merge_class_tables: Vec::new(),
             #[cfg(test)]
             consolidation_class_table: None,
+            sort_stats_slot: None,
             #[cfg(test)]
             sort_caps: [None, None],
             pending_header_handle: None,

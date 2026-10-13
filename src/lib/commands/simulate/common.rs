@@ -4,15 +4,17 @@ use crate::commands::common::{
     MemoryLimit, MemoryReserve, MethylationModeArg, parse_memory, parse_memory_reserve,
     resolve_memory_budget,
 };
-use crate::commands::sort::{TMP_DIRS_ENV, resolve_tmp_dirs};
+use crate::commands::sort::{SortOptions, TMP_DIRS_ENV, resolve_tmp_dirs};
 use anyhow::{Context, Result, anyhow, bail};
 use bytesize::ByteSize;
 use clap::Args;
-use crossbeam_channel::{Receiver, Sender, bounded};
+#[cfg(test)]
+use crossbeam_channel::Receiver;
+use crossbeam_channel::{Sender, bounded};
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::is_cpg_context;
 use fgumi_raw_bam::RawRecord;
-use fgumi_sort::{RawExternalSorter, SortOrder};
+use fgumi_sort::SortOrder;
 use log::info;
 use noodles::fasta;
 use noodles::sam::header::record::value::Map;
@@ -615,16 +617,18 @@ pub struct SortResourceArgs {
 }
 
 impl SortResourceArgs {
-    /// Apply the resolved memory budget and temp directories to `sorter`.
+    /// Apply the memory budget and temp directories to `sort`, the options
+    /// of the sort chain the simulated records run through.
     ///
     /// `threads` is the command's thread count, which scales the per-thread
-    /// memory budget exactly as it does in `fgumi sort`.
+    /// memory budget exactly as it does in `fgumi sort`; the resolved budget
+    /// is logged.
     ///
     /// # Errors
     ///
     /// Returns an error if the memory budget cannot be resolved (e.g. zero
     /// threads, or an overflowing per-thread limit).
-    pub fn apply(&self, sorter: RawExternalSorter, threads: usize) -> Result<RawExternalSorter> {
+    pub fn apply_to(&self, sort: &mut SortOptions, threads: usize) -> Result<()> {
         let effective_memory = resolve_memory_budget(
             self.max_memory,
             self.memory_reserve,
@@ -632,19 +636,9 @@ impl SortResourceArgs {
             self.memory_per_thread,
         )?;
         info!("Sort memory: {}", ByteSize(effective_memory as u64));
-
-        let mut sorter = sorter.memory_limit(effective_memory);
-
-        // For auto mode, cap the initial buffer pre-allocation at 768 MiB/thread
-        // so an `auto` budget on a large host doesn't allocate the whole budget
-        // upfront for what may be a tiny simulation. Mirrors `fgumi sort`.
-        if matches!(self.max_memory, MemoryLimit::Auto) {
-            let init = 768_usize
-                .checked_mul(1024 * 1024)
-                .and_then(|b| b.checked_mul(threads))
-                .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
-            sorter = sorter.initial_capacity(effective_memory.min(init));
-        }
+        sort.max_memory = self.max_memory;
+        sort.memory_reserve = self.memory_reserve;
+        sort.memory_per_thread = self.memory_per_thread;
 
         let env_value = std::env::var(TMP_DIRS_ENV).ok();
         let tmp_dirs = resolve_tmp_dirs(&self.tmp_dirs, env_value.as_deref());
@@ -652,11 +646,151 @@ impl SortResourceArgs {
             let joined =
                 tmp_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
             info!("Sort temp directories: {joined}");
-            sorter = sorter.temp_dirs(tmp_dirs);
         }
-
-        Ok(sorter)
+        sort.tmp_dirs = tmp_dirs;
+        Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set on the calling thread, `run_simulated_sort` also writes every
+    /// generated record, unsorted and in generation order, to a BAM at this
+    /// path: the fixed-seed tests' oracle input, sorted by the independent
+    /// reference sort.
+    pub(crate) static TEE_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sort the records `generate` produces into `output` through the same chain
+/// `fgumi sort` builds (`sort`: order, key types, budget, temp dirs), writing
+/// the output at `compression` under `header`.
+///
+/// `generate` runs on a scoped thread feeding a bounded channel the chain's
+/// `RecordStreamSource` reads; it returns its own result, and a failure it
+/// returns is also sent down the channel so the sort aborts rather than
+/// finishing on a truncated stream. The output is staged beside its
+/// destination ([`fgumi_sort::MergeOutputTarget`]: stdout streamed directly, a
+/// symlink followed, a non-regular destination refused, the mode re-stamped)
+/// and persisted only when both the sort and the generator succeed. The sort
+/// runs with the runtime every sort-chain command shares
+/// ([`sort_chain_runtime`](crate::commands::common::sort_chain_runtime)). The
+/// pipeline —
+/// and with it the receiver — is dropped BEFORE the generator is joined, so a
+/// generator blocked in `send` after a sort failure sees a closed channel and
+/// exits instead of deadlocking the join.
+///
+/// # Errors
+///
+/// The sort's error, or else the generator's.
+pub(crate) fn run_simulated_sort<G, T>(
+    generate: G,
+    header: &noodles::sam::Header,
+    output: &std::path::Path,
+    sort: &SortOptions,
+    threads: usize,
+    compression: u32,
+) -> Result<(T, fgumi_sort::SortStats)>
+where
+    G: FnOnce(Sender<RecordBatch>) -> Result<T> + Send,
+    T: Send,
+{
+    use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
+    let target = fgumi_sort::MergeOutputTarget::create_for(output, "simulate")?;
+    let (gen_tx, gen_rx) = bounded::<RecordBatch>(RECORD_CHANNEL_CAPACITY);
+    #[cfg(test)]
+    let tee = TEE_FOR_TEST.with(|t| t.borrow().clone());
+    #[cfg(test)]
+    let (sort_rx, tee_feed) = if tee.is_some() {
+        let (tx, rx) = bounded::<RecordBatch>(RECORD_CHANNEL_CAPACITY);
+        (rx, Some((gen_rx, tx)))
+    } else {
+        (gen_rx, None)
+    };
+    #[cfg(not(test))]
+    let sort_rx = gen_rx;
+    let (scheduler, queue_memory) = crate::commands::common::sort_chain_runtime(
+        sort.max_memory,
+        sort.memory_reserve,
+        sort.memory_per_thread,
+    );
+    let spec = ChainSpec {
+        stages: vec![Stage::Sort],
+        source: SourceSpec::RecordStream {
+            header: Box::new(header.clone()),
+            stream: std::sync::Arc::new(parking_lot::Mutex::new(Some(sort_rx))),
+        },
+        sink: SinkSpec::Bam(target.path().to_path_buf()),
+        stage_opts: StageOptionsBag { sort: Some(sort.clone()), ..Default::default() },
+        threading: crate::commands::common::ThreadingOptions { threads: Some(threads) },
+        compression: crate::commands::common::CompressionOptions { compression_level: compression },
+        scheduler,
+        queue_memory,
+        async_reader: false,
+        read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
+        verify_crc: true,
+        command_line: String::new(),
+    };
+    std::thread::scope(|scope| -> Result<(T, fgumi_sort::SortStats)> {
+        let generator = scope.spawn(move || {
+            let report = gen_tx.clone();
+            let result = generate(gen_tx);
+            if let Err(e) = &result {
+                // A closed channel means the sort failed first; its error wins.
+                let _ = report.send(Err(anyhow!("{e:#}")));
+            }
+            result
+        });
+        #[cfg(test)]
+        let teer = tee_feed.map(|(from, to)| {
+            let path = tee.clone().expect("a tee feed implies a tee path");
+            let header = header.clone();
+            scope.spawn(move || tee_records(&from, &to, &path, &header))
+        });
+
+        let sorted = (|| -> Result<fgumi_sort::SortStats> {
+            let built = crate::pipeline::chains::build_for(spec)?;
+            let slot = built.sort_stats_slot.clone();
+            built.run()?;
+            Ok(slot.and_then(|s| s.lock().take()).unwrap_or_default())
+        })();
+        // The pipeline (and the receiver it held) is gone here, before the
+        // generator is joined: a generator blocked in `send` sees the hang-up.
+        let generated =
+            generator.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        #[cfg(test)]
+        if let Some(t) = teer {
+            t.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))?;
+        }
+        let stats = sorted.context("Failed to template-coordinate sort simulated reads")?;
+        let value = generated?;
+        target.persist()?;
+        Ok((value, stats))
+    })
+}
+
+/// Forward every batch from `from` to `to`, also writing its records to a BAM
+/// at `path` (the [`TEE_FOR_TEST`] copy).
+#[cfg(test)]
+fn tee_records(
+    from: &Receiver<RecordBatch>,
+    to: &Sender<RecordBatch>,
+    path: &std::path::Path,
+    header: &noodles::sam::Header,
+) -> Result<()> {
+    let mut writer = fgumi_bam_io::create_raw_bam_writer(path, header, 1, 1)?;
+    for batch in from {
+        if let Ok(records) = &batch {
+            for r in records {
+                writer.write_raw_record(r.as_ref())?;
+            }
+        }
+        if to.send(batch).is_err() {
+            break;
+        }
+    }
+    writer.finish()?;
+    Ok(())
 }
 
 /// Number of record *batches* in flight between the generator thread and the
@@ -677,12 +811,12 @@ const RECORD_CHANNEL_CAPACITY: usize = 64;
 const RECORD_BATCH_SIZE: usize = 256;
 
 /// A batch of generated records, or the generator's terminal error.
-type RecordBatch = Result<Vec<RawRecord>>;
+pub(crate) type RecordBatch = fgumi_pipeline_io::source::RecordStreamItem;
 
 /// Sending half of the generator → sorter record stream.
 ///
 /// The simulation commands generate records on a background thread and hand
-/// them straight to [`RawExternalSorter::sort_records`], so no unsorted
+/// them straight to the sort chain ([`run_simulated_sort`]), so no unsorted
 /// intermediate BAM is ever written: runs that fit in memory touch disk only
 /// for the final output, and runs that don't spill exactly like `fgumi sort`.
 pub(super) struct RecordSink {
@@ -693,8 +827,7 @@ pub(super) struct RecordSink {
 impl RecordSink {
     /// Create a sink/stream pair to connect a generator thread to the sorter.
     ///
-    /// Pass the receiver through [`into_record_stream`] to get the per-record
-    /// iterator [`RawExternalSorter::sort_records`] takes; the sink goes to the
+    /// The receiver feeds the sort chain's record source; the sink goes to the
     /// generator.
     ///
     /// The generator must **own** the sink and drop it when it finishes:
@@ -704,9 +837,16 @@ impl RecordSink {
     /// deliver the last partial batch; a sink dropped with records still
     /// buffered fails the sort rather than silently truncating it (see the
     /// [`Drop`] impl).
+    #[cfg(test)]
     pub(super) fn new() -> (Self, Receiver<RecordBatch>) {
         let (sender, receiver) = bounded(RECORD_CHANNEL_CAPACITY);
-        (Self { sender, batch: Vec::with_capacity(RECORD_BATCH_SIZE) }, receiver)
+        (Self::from_sender(sender), receiver)
+    }
+
+    /// A sink over an existing channel's sending end (the one
+    /// [`run_simulated_sort`] hands its generator).
+    pub(super) fn from_sender(sender: Sender<RecordBatch>) -> Self {
+        Self { sender, batch: Vec::with_capacity(RECORD_BATCH_SIZE) }
     }
 
     /// Hand one record to the sorter, sending it once a batch has accumulated.
@@ -778,23 +918,6 @@ impl Drop for RecordSink {
              buffered; they were never handed to the sort"
         )));
     }
-}
-
-/// Adapt a [`RecordSink`]'s batched receiver into the per-record stream
-/// [`RawExternalSorter::sort_records`] consumes.
-///
-/// Batching is a transport detail of the generator → sorter handoff, so it is
-/// unwrapped here rather than pushed into the sort's API.
-pub(super) fn into_record_stream(
-    receiver: Receiver<RecordBatch>,
-) -> impl Iterator<Item = Result<RawRecord>> + Send + 'static {
-    receiver.into_iter().flat_map(|batch| -> Box<dyn Iterator<Item = Result<RawRecord>> + Send> {
-        // One `Box` per batch, not per record.
-        match batch {
-            Ok(records) => Box::new(records.into_iter().map(Ok)),
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        }
-    })
 }
 
 /// Generate a random DNA sequence of the given length.

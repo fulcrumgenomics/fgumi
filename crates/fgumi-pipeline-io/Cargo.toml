@@ -14,6 +14,7 @@ fgumi-pipeline-core = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-sort = { workspace = true }
 anyhow = "1.0.102"
+crossbeam-channel = { workspace = true }
 log = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 parking_lot = "0.12"

@@ -939,6 +939,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "crossbeam-channel",
  "dhat",
  "fgumi-bam-io",
  "fgumi-bgzf",

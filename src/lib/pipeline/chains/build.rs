@@ -300,6 +300,7 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         config,
         finalize: Vec::new(),
         finalize_on_success: Vec::new(),
+        sort_stats_slot: None,
         #[cfg(test)]
         merge_class_tables: Vec::new(),
         #[cfg(test)]

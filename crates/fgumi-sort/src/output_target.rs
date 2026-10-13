@@ -50,6 +50,17 @@ impl MergeOutputTarget {
     /// An existing destination that is not a regular file, a symlink chain that
     /// does not resolve, or a temp that cannot be created.
     pub fn create(output: &Path) -> Result<Self> {
+        Self::create_for(output, "merge")
+    }
+
+    /// [`Self::create`] for `command`'s output: `command` names the staged
+    /// temp (`.fgumi-<command>-*.tmp`) and the error for a non-regular
+    /// destination.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub fn create_for(output: &Path, command: &str) -> Result<Self> {
         if is_stdout_path(output) {
             return Ok(Self::Stdout(output.to_path_buf()));
         }
@@ -67,7 +78,7 @@ impl MergeOutputTarget {
         if let Ok(metadata) = std::fs::metadata(&dest) {
             anyhow::ensure!(
                 metadata.file_type().is_file(),
-                "merge output must be a regular file or stdout: {}",
+                "{command} output must be a regular file or stdout: {}",
                 dest.display()
             );
         }
@@ -76,10 +87,12 @@ impl MergeOutputTarget {
             .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let temp = tempfile::Builder::new()
-            .prefix(".fgumi-merge-")
+            .prefix(&format!(".fgumi-{command}-"))
             .suffix(".tmp")
             .tempfile_in(&dir)
-            .with_context(|| format!("failed to create a merge temp file in {}", dir.display()))?;
+            .with_context(|| {
+                format!("failed to create a {command} temp file in {}", dir.display())
+            })?;
         Ok(Self::Temp { temp, dest })
     }
 

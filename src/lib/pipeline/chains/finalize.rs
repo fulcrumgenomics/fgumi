@@ -74,6 +74,9 @@ impl FinalizeHook for StageTimingFinalizeHook {
 /// Output of [`crate::pipeline::chains::build_for`]. The
 /// caller calls [`BuiltPipeline::run`] which executes the pipeline and
 /// drains the finalize hooks in order.
+/// The slot a standalone sort's merge fills with its counts.
+pub(crate) type SortStatsSlot = std::sync::Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>;
+
 pub struct BuiltPipeline {
     pub pipeline: Pipeline,
     pub config: PipelineConfig,
@@ -90,6 +93,9 @@ pub struct BuiltPipeline {
     /// NOT an example of this: it is written inline by the `WriteBgzfFile`
     /// sink as part of the run itself, not by a finalize hook.
     pub finalize_on_success: Vec<Box<dyn FinalizeHook>>,
+    /// A standalone sort's summary counts, filled when its merge completes
+    /// (`None` for any other chain).
+    pub(crate) sort_stats_slot: Option<SortStatsSlot>,
     /// Per sort stage, the sort's queryname class table and the one its
     /// `SortMerge` merges against (test support: compared by pointer).
     #[cfg(test)]
@@ -135,6 +141,7 @@ impl BuiltPipeline {
             config,
             finalize,
             finalize_on_success,
+            sort_stats_slot: _,
             #[cfg(test)]
                 merge_class_tables: _,
             #[cfg(test)]

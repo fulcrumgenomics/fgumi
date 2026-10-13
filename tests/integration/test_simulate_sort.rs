@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use noodles::sam::alignment::RecordBuf;
 use rstest::rstest;
 use tempfile::TempDir;
 
@@ -145,7 +146,7 @@ fn simulate_output_is_template_coordinate_sorted(
 /// The header cannot be part of an output comparison: its `@PG` record embeds
 /// the command line, which differs between any two runs invoked with different
 /// flags.
-fn read_records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+fn read_records(path: &Path) -> Vec<RecordBuf> {
     let mut reader = noodles::bam::io::Reader::new(
         std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display())),
     );
@@ -179,4 +180,73 @@ fn simulate_output_is_identical_regardless_of_spilling(
         read_records(&spilled),
         "spilling changed the simulated output"
     );
+}
+
+/// The simulate arguments for `mapped-reads` into `output` (a path or `-`).
+fn mapped_reads_args(dir: &Path, output: &str) -> Vec<String> {
+    let reference = write_reference(dir);
+    [
+        "simulate",
+        "mapped-reads",
+        "-o",
+        output,
+        "--truth",
+        dir.join("truth.tsv").to_str().unwrap(),
+        "--reference",
+        reference.to_str().unwrap(),
+        "--num-molecules",
+        "200",
+        "--seed",
+        "42",
+        "--tmp-dir",
+        dir.to_str().unwrap(),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// `-o -` streams the BAM to stdout, as every other fgumi writer does, and
+/// creates no file named `-`. Catches: the output staged next to `.` and
+/// renamed onto a regular file literally named `-`.
+#[test]
+fn mapped_reads_to_stdout_streams_the_bam() {
+    let dir = TempDir::new().unwrap();
+    let to_file = dir.path().join("file.bam");
+    fgumi(
+        &mapped_reads_args(dir.path(), to_file.to_str().unwrap())
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let out = Command::new(FGUMI)
+        .current_dir(dir.path())
+        .args(mapped_reads_args(dir.path(), "-"))
+        .output()
+        .expect("spawn fgumi");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!dir.path().join("-").exists(), "a file named `-` was created");
+    let piped = dir.path().join("piped.bam");
+    std::fs::write(&piped, &out.stdout).unwrap();
+    assert_eq!(read_records(&piped), read_records(&to_file), "stdout carries the same BAM");
+}
+
+/// The output BAM gets the mode `File::create` gives a new file in the same
+/// directory (the process umask applied), not a temp file's private `0600`.
+#[cfg(unix)]
+#[test]
+fn mapped_reads_output_has_the_file_create_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("sim.bam");
+    fgumi(
+        &mapped_reads_args(dir.path(), out.to_str().unwrap())
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let reference = dir.path().join("reference-mode");
+    std::fs::File::create(&reference).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&out), mode(&reference), "the output is not temp-private");
 }
