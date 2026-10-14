@@ -59,12 +59,24 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// keep up to this many filled chunks buffered ahead of the consumer.
 pub const DEFAULT_PREFETCH_DEPTH: usize = 4;
 
-/// How far ahead (in bytes) the producer thread asks the kernel to page in via
-/// `posix_fadvise(POSIX_FADV_WILLNEED)` after each chunk fill. Only used when
-/// the reader was constructed via [`PrefetchReader::from_file`], which captures
-/// the raw fd needed for the syscall. 128 MiB is generous enough to cover
-/// ~1 second of EBS gp3 baseline throughput (125 MiB/s), ensuring pages are
-/// warm by the time the producer's `read()` reaches them.
+/// How far ahead (in bytes) the producer thread asks the kernel to page in
+/// after each chunk fill, in one [`crate::os_hints::advise_willneed`] call.
+/// Only used when the reader was constructed via
+/// [`PrefetchReader::from_file`], which captures the descriptor needed for the
+/// call.
+///
+/// The platforms treat the same 128 MiB request differently:
+/// - **Linux** (`posix_fadvise(POSIX_FADV_WILLNEED)`): the kernel clips the
+///   single call to the device's read-ahead window (`read_ahead_kb`, 128 KiB by
+///   default) from the current position, so the 128 MiB is an upper bound that
+///   Linux never reaches. Production benchmarks run on Linux, so this is the
+///   behaviour they measure.
+/// - **macOS** (`fcntl(F_RDADVISE)`): the whole 128 MiB range is honoured, and
+///   because a hint is issued per chunk fill, consecutive hints overlap the
+///   previous one. The cold-cache cost of that overlap is unmeasured; the
+///   advice is non-binding and the read path does not depend on it.
+///
+/// The 128 MiB figure is ~1 second of EBS gp3 baseline throughput (125 MiB/s).
 ///
 /// Stored as `i64` to match `posix_fadvise`'s `off_t` signature directly.
 const WILLNEED_LOOKAHEAD: i64 = 128 * 1024 * 1024;
@@ -120,7 +132,7 @@ impl PrefetchReader {
     /// Construct a `PrefetchReader` from an arbitrary reader with default
     /// chunk size and prefetch depth.
     ///
-    /// No `posix_fadvise(WILLNEED)` hints are issued because the inner reader
+    /// No WILLNEED hints are issued because the inner reader
     /// may not be backed by a file descriptor. Use [`from_file`](Self::from_file)
     /// when wrapping a [`File`] to get kernel page-cache warming for free.
     #[must_use]
@@ -149,12 +161,11 @@ impl PrefetchReader {
     /// Construct a `PrefetchReader` from a [`File`] with default chunk size
     /// and prefetch depth.
     ///
-    /// On Linux the producer thread will call
-    /// `posix_fadvise(POSIX_FADV_WILLNEED)` after each chunk fill to
-    /// proactively page in the next 128 MiB of data,
-    /// making the reader independent of the kernel's default read-ahead
-    /// window (`read_ahead_kb`). On non-Linux platforms this behaves
-    /// identically to [`new`](Self::new).
+    /// On Linux and macOS the producer thread advises the kernel after each
+    /// chunk fill to page in the data ahead of it
+    /// ([`crate::os_hints::advise_willneed`], 128 MiB ahead, of which Linux
+    /// reads at most the device's read-ahead window per call). On other
+    /// platforms this behaves identically to [`new`](Self::new).
     ///
     /// The file should be positioned at offset 0 when passed in — the
     /// WILLNEED hints assume reading starts from the beginning of the file.
@@ -164,7 +175,7 @@ impl PrefetchReader {
     }
 
     /// Construct a `PrefetchReader` from a [`File`] with explicit `chunk_size`
-    /// and `prefetch_depth`, plus kernel WILLNEED hints on Linux.
+    /// and `prefetch_depth`, plus kernel WILLNEED hints on Linux and macOS.
     ///
     /// # Panics
     ///
@@ -252,10 +263,10 @@ fn producer_main<R: Read>(
 /// channel traffic. Tolerates `Interrupted` errors. Exits on EOF, I/O error,
 /// or when the consumer drops the receiver.
 ///
-/// When `hint_fd` is `Some`, the loop calls
-/// `posix_fadvise(POSIX_FADV_WILLNEED)` after each chunk to proactively page
-/// in the next [`WILLNEED_LOOKAHEAD`] bytes. This removes the
-/// dependence on the kernel's default `read_ahead_kb` setting.
+/// When `hint_fd` is `Some`, the loop advises the kernel after each chunk to
+/// page in the next [`WILLNEED_LOOKAHEAD`] bytes
+/// ([`crate::os_hints::advise_willneed`], which on Linux reads at most the
+/// device's read-ahead window per call).
 fn producer_loop<R: Read>(
     mut inner: R,
     chunk_size: usize,

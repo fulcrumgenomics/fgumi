@@ -68,6 +68,15 @@ pub trait PositionalSource: Send + Sync {
     /// # Errors
     /// Propagates any I/O error from querying the source's length.
     fn byte_len(&self) -> io::Result<u64>;
+
+    /// Hint that `len` bytes from `offset` will be read soon, so the source
+    /// can start fetching them before a later [`Self::read_at`] of the range.
+    /// Advisory only: the read stays correct whatever the hint did, and waits
+    /// on the device for any part not yet fetched. Allocation-free; the
+    /// default does nothing.
+    fn will_need(&self, offset: u64, len: u64) {
+        let _ = (offset, len);
+    }
 }
 
 #[cfg(unix)]
@@ -78,6 +87,11 @@ impl PositionalSource for std::fs::File {
 
     fn byte_len(&self) -> io::Result<u64> {
         Ok(self.metadata()?.len())
+    }
+
+    /// See [`crate::os_hints::advise_willneed_range`].
+    fn will_need(&self, offset: u64, len: u64) {
+        crate::os_hints::advise_willneed_range(self, offset, len);
     }
 }
 

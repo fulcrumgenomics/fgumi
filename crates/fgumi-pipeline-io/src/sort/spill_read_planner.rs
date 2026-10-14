@@ -28,6 +28,15 @@
 //!
 //! Slices per fill adopt the input's `--read-streams` count
 //! ([`ReadStreamsPolicy::slices_for`]); the planner never moves the ratchet.
+//!
+//! Each positional fill is advised to the kernel as it is planned
+//! ([`PositionalSource::will_need`]): the kernel is asked to start reading the
+//! fill's whole range then, so the pool worker that later reads its slices
+//! finds some or all of it in the page cache or already in flight, and waits
+//! on the device for less. On Linux the advice is issued in 128 KiB calls,
+//! because one call starts at most the device's read-ahead window
+//! (`fgumi_bam_io::os_hints::advise_willneed_range`). The advice is never
+//! binding: whatever the kernel skips or evicts, the read fetches itself.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -427,6 +436,29 @@ impl SpillReadPlanner {
             let want = fill.min(len - s.next_offset);
             let want_usize = usize::try_from(want).expect("a fill fits usize");
             let slices = self.policy.slices_for(want_usize, self.eligible_clones);
+            // Ask the kernel to start reading the whole fill now, so the
+            // pool worker that later reads each slice finds it in the page
+            // cache or in flight instead of starting the device read
+            // itself. Bounded to the fill just planned. Issued here, at plan
+            // time, for every fill (hot ones included: they are the awaited
+            // ones), so the device read gets the lead time the queued request
+            // waits.
+            //
+            // The advised pages are page cache: they are charged to no
+            // budget and the kernel may evict them before the slice is
+            // read. That is acceptable because the hint is advisory only;
+            // a miss degrades to the blocking read there was before.
+            //
+            // Cost, on the serial planner: measured warm on macOS (one
+            // `F_RDADVISE` per fill), a three-input 5.3 GB merge advised
+            // 1,264 fills in 44-46 ms (~35 us a fill) and a small
+            // consolidating sort 5.9-6.4 k fills in 146-165 ms (~25 us),
+            // on a planner that stayed under 0.5% busy; wall time with the
+            // hint was no worse than without it in either run, two runs
+            // each. That is not material, so there is no size threshold.
+            // Linux advises a 4 MiB fill in 32 calls; their cost on Linux
+            // was not measured.
+            s.source.will_need(s.next_offset, want);
             for (offset, slice_len) in slice_ranges(s.next_offset, want_usize, slices) {
                 self.outbox.push_back(ReadRequest {
                     ordinal: self.next_ordinal,
