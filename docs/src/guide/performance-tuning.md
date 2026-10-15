@@ -26,7 +26,7 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 
 ### No-flag Fast Path (default)
 - **Usage**: Omit `--threads` entirely
-- **Behavior**: Command-dependent. Commands that special-case `ThreadingMode::SingleThreaded` run an optimized fast path with minimal pipeline overhead; others (e.g. `correct`) always run the declarative chain and simply execute it with a single worker. Either way, omitting `--threads` never runs more than one worker.
+- **Behavior**: Command-dependent. Commands that special-case `ThreadingMode::SingleThreaded` run an optimized fast path with minimal pipeline overhead; others (e.g. `correct`) always run the declarative chain and simply execute it with a single worker. Either way, omitting `--threads` never runs more than one worker. (`fgumi merge` has no fast path: its `--threads` defaults to 1 and counts output-compression threads, beside which it runs read and decompress workers — see [Merge](#merge).)
 - **Best for**: Small files, memory-constrained systems, debugging
 
 ### Explicit Single-threaded Mode
@@ -36,7 +36,7 @@ For memory-constrained environments, pass `--max-memory auto` to detect (cgroup-
 
 ### Multi-threaded Mode
 - **Usage**: `--threads N` where N > 1
-- **Behavior**: Uses the declarative chain pipeline with N worker threads (the same engine as `--threads 1`, scaled out); the legacy `--scheduler` flag is inert on the chain — it selects no dispatch policy
+- **Behavior**: Uses the declarative chain pipeline with N worker threads (the same engine as `--threads 1`, scaled out); the legacy `--scheduler` flag is inert on the chain — it selects no dispatch policy. `fgumi merge` is the exception: it runs up to N more workers that read and decompress its inputs (see [Merge](#merge))
 - **Best for**: Large files, high-performance systems, production workloads
 
 ## Memory Management
@@ -319,7 +319,7 @@ Every k-way merge then prints `Merge output: records borrowed B / assembled A`, 
 
 The spill supply then reports, in this order (the budget line is logged when the merge starts, the rest when it ends):
 
-- `Spill supply: read-ahead budget R=...` the read-ahead target derived from `--max-memory` (one sixteenth, between 64 MiB and 512 MiB), each slot's cold allowance, the shared pool the hot slots top up from, and the merge's peak memory above the sort buffer: `k x (cold + one carried frame) + pool + decoded`. The read-ahead adds to the sort buffer: the last run is merged from memory, so up to one full buffer stays resident through the merge.
+- `Spill supply: read-ahead budget R=...` the read-ahead target derived from the sort's total memory budget (`--max-memory`, times the sort threads under the default `--memory-per-thread`): one sixteenth of it, between 64 MiB and 512 MiB, each slot's cold allowance, the shared pool the hot slots top up from, and the merge's peak memory above the sort buffer: `k x (cold + one carried frame) + pool + decoded`. The read-ahead adds to the sort buffer: the last run is merged from memory, so up to one full buffer stays resident through the merge.
 - `Byte fetch:` the spill read requests (hot / cold, request size p50 / p90 / min, reads in flight) and the read-stream count they adopted.
 - `Spill blocks:` the mean compressed spill block size measured over the run, beside the fixed 4 MiB hot fill.
 - `Spill disk read:` fills and slices read, hot and cold, and the bytes read.
@@ -430,7 +430,13 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
   whole-genome sort, keeping freed memory mapped for 60 s raised peak RSS by 3–5 GiB and made
   the sort no faster. `MIMALLOC_PURGE_DELAY` still applies if you set it.
 - `--max-temp-files` sets how many spilled runs may be live at once; when the limit is reached,
-  adjacent runs are merged — the smallest first — until the count is back under it. The final k-way merge opens every remaining run at once, so
+  adjacent runs are merged — the smallest first — until the count is back under it. A
+  consolidation reads, decompresses and recompresses its runs on the worker pool, as phase-1
+  work: an explicit `--sort-threads` caps it together with ingest and spilling, and it adds a
+  small read-ahead to the sort's memory while it runs, targeting the sort's total memory budget
+  / 64 (between 8 and 64 MiB; the charged peak per consolidation adds one carried frame and the
+  cold FIFOs per input run, so it can exceed that target slightly). The final
+  k-way merge opens every remaining run at once, so
   this limit is what bounds the sort's open file descriptors — and consolidation rewrites data
   that is already sorted, making it pure overhead whenever the descriptor budget could have
   carried the runs. The default, `auto`, sizes the limit to the process's soft open-file limit
@@ -448,7 +454,14 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 
 ### Merge
 - `fgumi merge` performs a k-way merge using a LoserTree for efficient multi-file merging
-- Thread count (`--threads`) controls compression parallelism, not merge concurrency
+- Thread count (`--threads`, default 1) is the number of threads that compress the output.
+  The merge adds one worker per input, at most `--threads` more, that reads and decompresses
+  the inputs while the output is compressed, so it runs `--threads` + min(inputs, `--threads`)
+  pool workers — two at `--threads 1` — and the k-way merge itself runs on one more thread.
+  Size a CPU allocation (cgroup quota, scheduler slot) for that total, not for `--threads`
+- `--threads` also sizes the merge's read-ahead: 768 MiB per thread, as `fgumi sort`'s default
+  budget. `fgumi merge` has no `--max-memory`; its inter-step queues share a small fixed
+  budget of 16 MiB per pool worker
 - For template-coordinate merges with single-cell data, the `CB` tag is included automatically
 
 ### Group/Dedup

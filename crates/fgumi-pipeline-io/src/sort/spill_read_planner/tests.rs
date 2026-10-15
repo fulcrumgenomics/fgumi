@@ -251,7 +251,7 @@ fn cold_inflight_and_slice_caps_are_respected() {
     assert_eq!(f.ledger.inflight_cold_bytes(), COLD_INFLIGHT_BYTES);
 
     let mut f = fixture(&lens, 2, 1);
-    assert_eq!(f.planner.max_inflight_slices(), 4);
+    assert_eq!(f.planner.merge_max_inflight_slices(), 4);
     let reqs = f.planner.plan_pass_for_test();
     assert_eq!(reqs.len(), 4, "2 phase-2 threads → 4 outstanding slices");
     assert!(f.planner.plan_pass_for_test().is_empty());
@@ -291,6 +291,80 @@ fn seq_is_dense_per_slot_and_last_is_set_once(#[case] streams: usize) {
     assert_eq!(at, len);
     assert_eq!(all.iter().filter(|r| r.last).count(), 1);
     assert!(all.last().unwrap().last);
+}
+
+/// A source of `len` zero bytes that records the ranges advised to it.
+struct AdviceRecorder {
+    len: u64,
+    advised: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+impl fgumi_bam_io::pread::PositionalSource for AdviceRecorder {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let n =
+            usize::try_from(self.len.saturating_sub(offset)).unwrap_or(usize::MAX).min(buf.len());
+        buf[..n].fill(0);
+        Ok(n)
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Ok(self.len)
+    }
+
+    fn will_need(&self, offset: u64, len: u64) {
+        self.advised.lock().expect("advice log").push((offset, len));
+    }
+}
+
+/// Each fill is advised to its source as one range when it is planned: the
+/// advised ranges tile the file in order, every slice read lies inside one,
+/// and there is one hint per fill, not per slice.
+#[test]
+fn every_planned_fill_is_advised_to_its_source() {
+    let len = 5 * MIB + MIB / 2 + 3;
+    let source = Arc::new(AdviceRecorder { len, advised: std::sync::Mutex::default() });
+    let supply = SpillSupply::new();
+    let (demand, ledger) = (Arc::clone(&supply.demand), Arc::clone(&supply.ledger));
+    let mut planner =
+        planner(TOTAL, 16, 16, &supply).with_read_streams(ReadStreamsPolicy::fixed(4));
+    let slot = Arc::new(SortMergeSlot::new(
+        0,
+        Arc::clone(&source) as Arc<dyn fgumi_bam_io::pread::PositionalSource>,
+        0,
+        len,
+        SpillCodec::Zstd,
+    ));
+    let _ = planner.on_event_for_test(spill_ready(&slot));
+    let _ = planner.on_event_for_test(all_announced(1));
+    await_file(&demand, 0);
+    let mut all = Vec::new();
+    loop {
+        let reqs = planner.plan_pass_for_test();
+        if reqs.is_empty() {
+            break;
+        }
+        slot.set_read_ahead_for_test(0, 0);
+        for r in &reqs {
+            ledger.land(class(r), u64::from(r.len));
+        }
+        all.extend(reqs);
+    }
+    let advised = source.advised.lock().expect("advice log").clone();
+    let mut at = 0;
+    for &(offset, n) in &advised {
+        assert_eq!(offset, at, "advised ranges tile the file: {advised:?}");
+        at += n;
+    }
+    assert_eq!(at, len, "{advised:?}");
+    for r in &all {
+        let end = r.offset + u64::from(r.len);
+        assert!(
+            advised.iter().any(|&(o, n)| r.offset >= o && end <= o + n),
+            "slice {:?} outside every advised fill {advised:?}",
+            (r.offset, r.len)
+        );
+    }
+    assert!(advised.len() < all.len(), "one hint per fill: {advised:?} vs {}", all.len());
 }
 
 /// A spill file with no frame bytes is finalized at
@@ -526,7 +600,7 @@ fn cold_slot_fifo_stops_at_8_hot_at_32() {
     }
     // Saturate the outstanding-slice cap so the cold rotation visits no slot:
     // only the demotion itself can lower slot 1's cap.
-    f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.max_inflight_slices());
+    f.ledger.add_inflight(SpillClass::Hot, 0, f.planner.merge_max_inflight_slices());
     await_file(&f.demand, 2);
     assert!(f.planner.plan_pass_for_test().is_empty(), "no read: the slice cap binds");
     assert_eq!(caps(&f), vec![8, 8, 32], "the former hot slot is demoted on the next pass");
@@ -575,4 +649,178 @@ fn the_hot_fifo_cap_is_granted_only_from_the_pool() {
     }
     let _ = f.planner.plan_pass_for_test();
     assert_eq!(f.slots[1].fifo_cap(), 32, "granted from the released charge");
+}
+
+/// Review r2 I6: a hard error, not a `debug_assert`.
+#[test]
+fn all_announced_with_a_job_in_flight_is_an_error() {
+    use crate::sort::protocol::ConsolidationInput;
+    use crate::sort::spill_fixtures::write_run_file;
+    use fgumi_pipeline_core::step::StepOutcome;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let dir = tempfile::TempDir::new().unwrap();
+    let inputs: Vec<ConsolidationInput> = (0..2u32)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}"));
+            let len = write_run_file(&path, SpillCodec::Zstd, i, 0..5);
+            ConsolidationInput { file_id: i, path, len }
+        })
+        .collect();
+    let supply = SpillSupply::new();
+    let mut pl = planner(64 << 20, 2, 2, &supply).with_consolidation(
+        Arc::new(MergeDemand::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    );
+    let probe = StepProbe::new(&pl);
+    probe.push_input(SortPhase1Event::ConsolidationStart {
+        job_id: 9,
+        inputs,
+        key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+    });
+    probe.push_input(SortPhase1Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 0,
+        total_records: 0,
+    });
+    let err = loop {
+        match probe.try_run(&mut pl) {
+            Ok(StepOutcome::Finished) => panic!("finished without the error"),
+            Ok(_) => {}
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "AllAnnounced arrived with consolidation job 9 in flight");
+}
+
+/// Review I4 (r1): consolidation slots plan under their job budget before the
+/// merge budget exists. Catches: `top_up` returning early on `budget == None`.
+#[test]
+fn planner_plans_consolidation_reads_before_any_merge_budget_exists() {
+    use crate::sort::protocol::{ConsolidationInput, ConsolidationJob};
+    use crate::sort::spill_fixtures::write_run_file;
+    use fgumi_pipeline_core::step::InputHandle;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let dir = tempfile::TempDir::new().unwrap();
+    let inputs: Vec<ConsolidationInput> = (0..2u32)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}"));
+            let len = write_run_file(&path, SpillCodec::Zstd, i, 0..500);
+            ConsolidationInput { file_id: i, path, len }
+        })
+        .collect();
+    let supply = SpillSupply::new();
+    let mut pl = planner(64 << 20, 2, 2, &supply).with_consolidation(
+        Arc::new(MergeDemand::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    );
+    let mut probe = StepProbe::new(&pl);
+    let reads = probe.take_output::<ReadRequest>(0);
+    let jobs = probe.take_output::<ConsolidationJob>(2);
+    probe.push_input(SortPhase1Event::ConsolidationStart {
+        job_id: 1,
+        inputs,
+        key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+    });
+    for _ in 0..4 {
+        probe.try_run(&mut pl).unwrap();
+    }
+    assert!(pl.merge_budget_for_test().is_none());
+    let job = jobs.pop().expect("job forwarded on branch 2");
+    let mut targets = Vec::new();
+    while let Some(r) = reads.pop() {
+        assert!(matches!(class(&r), SpillClass::ConsolidationHot | SpillClass::ConsolidationCold));
+        let ReadTarget::Spill { slot, .. } = r.target else { panic!() };
+        targets.push(slot.slot_id());
+    }
+    for s in &job.slots {
+        assert!(targets.contains(&s.slot_id()), "slot {} got no read", s.slot_id());
+    }
+}
+
+/// Review r2 I1 + Design issue 9: one read in flight per sequential slot, and
+/// the planner stops at EOF. A BGZF stream (a Bgzf-codec spill run: plain BGZF
+/// blocks plus the EOF block) is read through a `Trickle` source; the planner,
+/// `PreadSlices` and one decompressor are pumped by hand, and the merge's side
+/// drains the FIFO so it never caps. Catches: two outstanding reads on a stream
+/// (a `read_at` at the wrong cursor → `InvalidInput`), and requests issued after
+/// EOF.
+#[test]
+fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
+    use crate::pread::{PreadSlices, ReadSlice};
+    use crate::sort::spill_decompress::SortSpillDecompress;
+    use crate::sort::spill_fixtures::{keyed_frame, template_key, write_frames_run};
+    use fgumi_bam_io::pread::{PositionalSource, SequentialSource, test_sources::Trickle};
+    use fgumi_pipeline_core::step::InputHandle;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stream");
+    let frames: Vec<Vec<u8>> =
+        (0..3_000u64).map(|i| keyed_frame(&template_key(i), &[3u8; 90])).collect();
+    write_frames_run(&path, SpillCodec::Bgzf, &frames, 60_000);
+    let bytes = std::fs::read(&path).unwrap();
+    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
+        &path,
+        Box::new(Trickle(std::io::Cursor::new(bytes.clone()))),
+    ));
+    let slot = Arc::new(SortMergeSlot::new_sequential(0, Arc::clone(&src), SpillCodec::Bgzf));
+    let supply = SpillSupply::new();
+    let slices = SliceBufferPool::new(4);
+    let mut pl = SpillReadPlanner::new(64 << 20, 2, 2, 1 << 20, &supply, Arc::clone(&slices));
+    let mut pr = PreadSlices::spill(slices, 1 << 20);
+    let mut dc = SortSpillDecompress::new(1 << 20, &supply);
+    let (mut plp, mut prp, dcp) = (StepProbe::new(&pl), StepProbe::new(&pr), StepProbe::new(&dc));
+    let (reads, events, out) = (
+        plp.take_output::<ReadRequest>(0),
+        plp.take_output::<SortPhase2Event>(1),
+        prp.take_output::<ReadSlice>(0),
+    );
+    plp.push_input(SortPhase1Event::SpillReady {
+        slot: Arc::clone(&slot),
+        path: path.clone(),
+        records_ingested_so_far: 0,
+    });
+    plp.push_input(all_announced(1));
+    plp.close_input();
+    let (mut issued, mut decoded) = (0u32, Vec::new());
+    for _ in 0..1_000_000 {
+        plp.try_run(&mut pl).unwrap();
+        while let Some(r) = reads.pop() {
+            assert!(r.sequential && !r.last);
+            assert_eq!(
+                issued,
+                slot.ingested_slices(),
+                "a second read issued before the first was ingested"
+            );
+            issued += 1;
+            prp.push_input(r);
+        }
+        while events.pop().is_some() {}
+        prp.try_run(&mut pr).unwrap();
+        if let Some(s) = out.pop() {
+            dcp.push_input(s);
+        }
+        dcp.try_run(&mut dc).unwrap();
+        while let Some(block) = slot.pop_block_for_test() {
+            decoded.extend(block); // the merge's side: drain the FIFO
+        }
+        if slot.queue_eof() && dcp.input_is_empty() {
+            break;
+        }
+    }
+    assert!(slot.eof_seen());
+    for _ in 0..4 {
+        plp.try_run(&mut pl).unwrap();
+    }
+    assert!(reads.pop().is_none(), "no request after EOF");
+    assert!(!pl.planned_slot_ids_for_test().contains(&slot.slot_id()));
+    // The smallest fill, so the bound is loose.
+    let fill = ReadAheadBudget::resolve(64 << 20, 1).for_class(SpillClass::Cold).1;
+    assert!(
+        u64::from(issued) <= (bytes.len() as u64).div_ceil(fill) + 1,
+        "at most one extra read: {issued}"
+    );
+    assert_eq!(decoded, frames.concat(), "every byte of the stream, in order");
 }

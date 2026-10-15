@@ -383,7 +383,7 @@ pub fn mate_unclipped_5prime_1based(
 /// start below it, and that is true of real data, not just malformed MC values.
 /// The record's own side ([`unclipped_start_from_raw_cigar`]) does not clamp
 /// either, and the template-coordinate key compares the two against each other
-/// (see `external.rs`), so clamping only here would make the two records of one
+/// (see `fgumi-sort`'s `template_key.rs`), so clamping only here would make the two records of one
 /// template canonicalize differently — and would diverge from fgbio and
 /// `samtools sort --template-coordinate`.
 #[inline]
@@ -1553,7 +1553,7 @@ mod tests {
     /// MC is a *text* tag, so its run lengths are not bounded by BAM's 28-bit
     /// CIGAR op field, and its bytes are not guaranteed to be ASCII. Both
     /// parsers are reachable in release builds from `fgumi sort`'s template
-    /// key (`external.rs`) and from the decode step's `GroupKey` construction.
+    /// key (`template_key.rs`) and from the decode step's `GroupKey` construction.
     ///
     /// Expectations are literal, not computed from the previous implementation
     /// -- for these inputs the old code panicked or wrapped, so it cannot serve

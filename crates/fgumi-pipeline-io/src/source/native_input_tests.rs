@@ -342,6 +342,7 @@ fn frame_with_cuts(stream: &[u8], cut: usize) -> (Vec<BgzfBlock>, Arc<SliceBuffe
             offset: (i * cut) as u64,
             bytes: pool.lease(chunk.to_vec()),
             last: i + 1 == n,
+            shortfall: 0,
             target: ReadTarget::Input,
         });
     }

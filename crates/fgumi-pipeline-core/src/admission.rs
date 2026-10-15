@@ -203,6 +203,9 @@ pub struct PhaseCap {
     plan_index: std::sync::atomic::AtomicUsize,
     max: usize,
     name: &'static str,
+    /// Times [`Self::bind_signal`] ran (tests: a run binds every cap once).
+    #[cfg(test)]
+    binds: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for PhaseCap {
@@ -319,6 +322,203 @@ pub fn admit_input<'a, T: Send + HeapSize + 'static>(
     cap.try_acquire().map(Some).ok_or(StepOutcome::Capped)
 }
 
+/// Which of a [`PhasedCap`]'s two caps admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapPhase {
+    /// The first phase (a sort's spill phase, while a consolidation runs).
+    One,
+    /// The second phase (a sort's merge, after every run is announced).
+    Two,
+}
+
+/// Which of two phase caps currently admits: phase 1 while a consolidation
+/// runs, phase 2 after every run is announced. Either arm may be absent (that
+/// phase is uncapped). A selector, not a cap of its own: a permit borrows the
+/// [`PhaseCap`] it came from, so it is released into that phase's counter even
+/// after a switch.
+pub struct PhasedCap {
+    caps: [Option<Arc<PhaseCap>>; 2],
+    /// `0` = phase one, `1` = phase two. A std atomic even under loom: it is
+    /// the selection, not the admission protocol the loom model checks.
+    phase: std::sync::atomic::AtomicU8,
+    /// This selector, so a run's wake plan can hold it from a borrowed
+    /// [`StepCapRef`] (`Arc::new_cyclic`).
+    this: Weak<PhasedCap>,
+}
+
+impl std::fmt::Debug for PhasedCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhasedCap")
+            .field("phase", &self.phase())
+            .field("caps", &self.caps)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PhasedCap {
+    /// A selector over `p1` and `p2`, starting in phase one; `None` when both
+    /// arms are absent (there is nothing to select).
+    #[must_use]
+    pub fn new(p1: Option<Arc<PhaseCap>>, p2: Option<Arc<PhaseCap>>) -> Option<Arc<Self>> {
+        if p1.is_none() && p2.is_none() {
+            return None;
+        }
+        Some(Arc::new_cyclic(|this| Self {
+            caps: [p1, p2],
+            phase: std::sync::atomic::AtomicU8::new(0),
+            this: this.clone(),
+        }))
+    }
+
+    /// This selector as a shared handle (the one every step reporting it holds).
+    pub(crate) fn arc(&self) -> Option<Arc<Self>> {
+        self.this.upgrade()
+    }
+
+    /// Make `phase`'s arm the one that admits (a `Release` store, so an admission
+    /// that observes the switch also observes what preceded it).
+    pub fn switch_to(&self, phase: CapPhase) {
+        let v = match phase {
+            CapPhase::One => 0,
+            CapPhase::Two => 1,
+        };
+        self.phase.store(v, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The phase whose arm admits (an `Acquire` load).
+    #[must_use]
+    pub fn phase(&self) -> CapPhase {
+        if self.phase.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            CapPhase::One
+        } else {
+            CapPhase::Two
+        }
+    }
+
+    /// The active phase's cap, or `None` when that phase is uncapped.
+    #[must_use]
+    pub fn active(&self) -> Option<&PhaseCap> {
+        let i = usize::from(self.phase() == CapPhase::Two);
+        self.caps[i].as_deref()
+    }
+
+    /// Both arms, in phase order: `phased(sort-phase1(4)→sort-phase2(16))`; an
+    /// absent arm renders `uncapped`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let arm = |c: &Option<Arc<PhaseCap>>| {
+            c.as_ref().map_or_else(|| "uncapped".to_owned(), |c| c.describe())
+        };
+        format!("phased({}→{})", arm(&self.caps[0]), arm(&self.caps[1]))
+    }
+
+    /// The present arms, in phase order.
+    #[must_use]
+    pub fn arms(&self) -> Vec<&PhaseCap> {
+        self.caps.iter().filter_map(Option::as_deref).collect()
+    }
+}
+
+/// The cap a pool step admits through: one fixed [`PhaseCap`], or a
+/// [`PhasedCap`] that switches between two.
+#[derive(Clone, Debug)]
+pub enum StepCap {
+    /// Always this cap.
+    Fixed(Arc<PhaseCap>),
+    /// Whichever of two caps is active.
+    Phased(Arc<PhasedCap>),
+}
+
+impl From<Arc<PhaseCap>> for StepCap {
+    fn from(cap: Arc<PhaseCap>) -> Self {
+        Self::Fixed(cap)
+    }
+}
+
+impl From<Arc<PhasedCap>> for StepCap {
+    fn from(cap: Arc<PhasedCap>) -> Self {
+        Self::Phased(cap)
+    }
+}
+
+impl StepCap {
+    /// A borrowed view of this cap: what [`Step::step_cap`](crate::Step::step_cap)
+    /// returns.
+    #[must_use]
+    pub fn view(&self) -> StepCapRef<'_> {
+        match self {
+            Self::Fixed(cap) => StepCapRef::Fixed(cap),
+            Self::Phased(p) => StepCapRef::Phased(p),
+        }
+    }
+
+    /// The cap that admits now (`None` when the active phase is uncapped):
+    /// what the step passes to [`admit_input`].
+    #[must_use]
+    pub fn active(&self) -> Option<&PhaseCap> {
+        self.view().active()
+    }
+}
+
+/// A borrowed [`StepCap`]: the one cap hook a step reports
+/// ([`Step::step_cap`](crate::Step::step_cap)). The admitting cap, the DAG
+/// label and the caps a run binds are all derived from it.
+#[derive(Clone, Copy, Debug)]
+pub enum StepCapRef<'a> {
+    /// Always this cap.
+    Fixed(&'a PhaseCap),
+    /// Whichever of two caps is active.
+    Phased(&'a PhasedCap),
+}
+
+impl<'a> StepCapRef<'a> {
+    /// The cap that admits now (`None` when the active phase is uncapped).
+    #[must_use]
+    pub fn active(self) -> Option<&'a PhaseCap> {
+        match self {
+            Self::Fixed(cap) => Some(cap),
+            Self::Phased(p) => p.active(),
+        }
+    }
+
+    /// The DAG label: the cap's [`PhaseCap::describe`], or both arms'
+    /// ([`PhasedCap::describe`]).
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Fixed(cap) => cap.describe(),
+            Self::Phased(p) => p.describe(),
+        }
+    }
+
+    /// Every cap the step may admit through, in phase order: what a run binds
+    /// to its signal and waker and lists in `Pipeline::phase_caps`.
+    #[must_use]
+    pub fn bound_caps(self) -> Vec<&'a PhaseCap> {
+        match self {
+            Self::Fixed(cap) => vec![cap],
+            Self::Phased(p) => p.arms(),
+        }
+    }
+
+    /// The owned [`StepCap`] this view borrows, selector included: what a
+    /// run's wake plan keeps, so it routes by whichever arm is active when it
+    /// asks rather than by the arm active at run start. `None` only for a cap
+    /// not held in an `Arc` (every constructor returns one).
+    pub(crate) fn to_step_cap(self) -> Option<StepCap> {
+        match self {
+            Self::Fixed(cap) => cap.arc().map(StepCap::Fixed),
+            Self::Phased(p) => p.arc().map(StepCap::Phased),
+        }
+    }
+}
+
+impl<'a> From<&'a PhaseCap> for StepCapRef<'a> {
+    fn from(cap: &'a PhaseCap) -> Self {
+        Self::Fixed(cap)
+    }
+}
+
 impl PhaseCap {
     /// A cap admitting at most `max` holders (`0` is treated as 1: a zero cap
     /// would wedge the phase).
@@ -338,6 +538,8 @@ impl PhaseCap {
             plan_index: std::sync::atomic::AtomicUsize::new(usize::MAX),
             max: max.max(1),
             name,
+            #[cfg(test)]
+            binds: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -348,6 +550,14 @@ impl PhaseCap {
     pub(crate) fn bind_signal(&self, signal: &Arc<PipelineSignal>) {
         *self.signal.lock() = Arc::downgrade(signal);
         signal.register_cap(self.this.clone());
+        #[cfg(test)]
+        self.binds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Times this cap was bound to a run's signal (tests).
+    #[cfg(test)]
+    pub(crate) fn binds_for_test(&self) -> usize {
+        self.binds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// [`Self::bind_signal`] for tests outside the crate (the loom model and
@@ -721,7 +931,7 @@ impl PhaseCap {
     /// the caller checks under.
     ///
     /// The cap must be bound to the current run's signal, which `Pipeline::run`
-    /// does for every cap a step reports through [`Step::phase_cap`]. An unbound
+    /// does for every cap a step reports through [`Step::step_cap`]. An unbound
     /// cap's wait could never observe a cancel (the wait is untimed), so a step
     /// that takes the whole cap without reporting it would park forever on a
     /// cancelled run. Debug builds assert the binding here, which turns that
@@ -731,13 +941,13 @@ impl PhaseCap {
     ///
     /// In debug builds, if no live cancel signal is bound (see above).
     ///
-    /// [`Step::phase_cap`]: crate::step::Step::phase_cap
+    /// [`Step::step_cap`]: crate::step::Step::step_cap
     #[must_use]
     pub fn acquire_whole(&self) -> Option<WholeCap<'_>> {
         debug_assert!(
             self.signal.lock().strong_count() > 0,
             "PhaseCap `{}`: acquire_whole on a cap no live run signal is bound to; a step that \
-             takes the whole cap must report it through `Step::phase_cap`",
+             takes the whole cap must report it through `Step::step_cap`",
             self.name
         );
         self.reserving.0.fetch_add(1, Ordering::Relaxed);
@@ -1239,6 +1449,116 @@ mod tests {
         fn note_empty_poll(&self) {
             self.noted.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn caps(
+        p1: Option<usize>,
+        p2: Option<usize>,
+    ) -> (Option<Arc<PhaseCap>>, Option<Arc<PhaseCap>>) {
+        (p1.map(|m| PhaseCap::new("sort-phase1", m)), p2.map(|m| PhaseCap::new("sort-phase2", m)))
+    }
+    fn full_input() -> FakeInput {
+        FakeInput { empty: false, drained: false, noted: AtomicUsize::new(0) }
+    }
+
+    /// The active arm admits; the other arm's counter is untouched. Catches: the
+    /// wrong arm admitting, or `active()` ignoring `phase`.
+    #[test]
+    fn phased_cap_admits_under_the_active_phase() {
+        let (c1, c2) = caps(Some(1), Some(3));
+        let phased = PhasedCap::new(c1.clone(), c2.clone()).expect("two arms");
+        let input = full_input();
+        assert_eq!(phased.phase(), CapPhase::One);
+        let first =
+            admit_input(&input, phased.active()).expect("phase 1 has room").expect("capped");
+        assert!(
+            matches!(admit_input(&input, phased.active()), Err(StepOutcome::Capped)),
+            "phase 1 holds 1"
+        );
+        assert_eq!((c1.as_ref().unwrap().active(), c2.as_ref().unwrap().active()), (1, 0));
+        phased.switch_to(CapPhase::Two);
+        let held: Vec<_> = (0..3)
+            .map(|i| {
+                admit_input(&input, phased.active())
+                    .unwrap_or_else(|o| panic!("permit {i}: {o:?}"))
+                    .expect("capped")
+            })
+            .collect();
+        assert!(
+            matches!(admit_input(&input, phased.active()), Err(StepOutcome::Capped)),
+            "phase 2 holds 3"
+        );
+        assert_eq!((c1.as_ref().unwrap().active(), c2.as_ref().unwrap().active()), (1, 3));
+        drop((first, held));
+    }
+
+    /// A permit borrows the `PhaseCap` it came from. Catches: a permit that
+    /// releases into whichever arm is active at drop time.
+    #[test]
+    fn permits_taken_before_the_switch_release_into_their_own_cap() {
+        let (c1, c2) = caps(Some(2), Some(2));
+        let phased = PhasedCap::new(c1.clone(), c2.clone()).unwrap();
+        let input = full_input();
+        let p = admit_input(&input, phased.active()).unwrap().unwrap();
+        phased.switch_to(CapPhase::Two);
+        assert_eq!((c1.as_ref().unwrap().active(), c2.as_ref().unwrap().active()), (1, 0));
+        drop(p);
+        assert_eq!((c1.as_ref().unwrap().active(), c2.as_ref().unwrap().active()), (0, 0));
+    }
+
+    /// An absent arm is uncapped (PR 0 round 3: caps only for explicit flags).
+    /// Catches: a default cap invented for an unset flag.
+    #[test]
+    fn absent_arms_are_uncapped() {
+        let (_, c2) = caps(None, Some(1));
+        let phased = PhasedCap::new(None, c2.clone()).expect("one arm is enough");
+        let input = full_input();
+        for _ in 0..100 {
+            assert!(matches!(admit_input(&input, phased.active()), Ok(None)), "phase 1 uncapped");
+        }
+        phased.switch_to(CapPhase::Two);
+        let _p = admit_input(&input, phased.active()).unwrap().expect("phase 2 capped");
+        assert!(matches!(admit_input(&input, phased.active()), Err(StepOutcome::Capped)));
+        assert!(PhasedCap::new(None, None).is_none());
+    }
+
+    #[test]
+    fn describe_renders_both_phases() {
+        let (c1, c2) = caps(Some(4), Some(16));
+        assert_eq!(
+            PhasedCap::new(c1.clone(), c2.clone()).unwrap().describe(),
+            "phased(sort-phase1(4)→sort-phase2(16))"
+        );
+        assert_eq!(
+            PhasedCap::new(None, c2).unwrap().describe(),
+            "phased(uncapped→sort-phase2(16))"
+        );
+        assert_eq!(PhasedCap::new(c1, None).unwrap().describe(), "phased(sort-phase1(4)→uncapped)");
+    }
+
+    /// Review r2 I2: both arms are bound to the run's signal, so a phase-2
+    /// whole-cap reservation made while phase 1 is active still returns on
+    /// cancel. Catches: binding only `phase_cap()` (the active arm) at run start.
+    #[test]
+    fn phased_cap_binds_both_arms_to_the_run_signal() {
+        let (c1, c2) = caps(Some(1), Some(1));
+        let phased = PhasedCap::new(c1, c2.clone()).unwrap();
+        let step = StepCap::Phased(Arc::clone(&phased));
+        assert_eq!(step.view().bound_caps().len(), 2);
+        let signal = PipelineSignal::new();
+        for cap in step.view().bound_caps() {
+            cap.bind_signal(&signal); // what Pipeline::run's loop now does
+        }
+        let c2 = c2.unwrap();
+        let _held = c2.try_acquire().expect("phase-2 permit, so the reservation must wait");
+        let rx = whole_cap_caller(&c2);
+        await_reservations(&c2, 1);
+        signal.cancel();
+        assert!(
+            !rx.recv_timeout(std::time::Duration::from_secs(10)).expect("woken by the cancel"),
+            "cancelled: no permits"
+        );
+        assert_eq!(c2.pending_reservations(), 0);
     }
 
     /// The capped preamble records an empty poll on the edge (so starvation

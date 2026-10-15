@@ -132,6 +132,7 @@ impl PlanInputReads {
                 offset,
                 len,
                 last: offset + u64::from(len) == self.len,
+                sequential: false,
                 target: ReadTarget::Input,
             });
             self.next_ordinal += 1;

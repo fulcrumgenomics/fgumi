@@ -2044,6 +2044,7 @@ fn read_targets<'a>(
 
     let mut targets: Vec<(&std::path::Path, &'static str)> = match source {
         SourceSpec::Bam(path) | SourceSpec::Sam(path) => vec![(path.as_path(), "--input")],
+        SourceSpec::RecordStream { .. } => Vec::new(),
         SourceSpec::PairedBams { unmapped, mapped, reference: _ } => {
             vec![(mapped.as_path(), "--input"), (unmapped.as_path(), "--unmapped")]
         }

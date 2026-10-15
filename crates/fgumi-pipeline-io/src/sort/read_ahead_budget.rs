@@ -78,6 +78,24 @@ pub const CARRIED_FRAME_BYTES: u64 = 64 << 10;
 /// Bytes of one decompressed block, for the decoded ceiling.
 pub const DECOMPRESSED_BLOCK_BYTES: u64 = 64 << 10;
 
+/// Consolidation read-ahead `R_c = total memory / R_C_DIVISOR`, clamped to
+/// `R_C_FLOOR ..= R_C_CEIL`. Phase 1's arena is live while a consolidation
+/// runs, so this read-ahead adds to peak RSS; it is small, derived and
+/// reported, not charged to the sort buffer.
+pub const R_C_DIVISOR: u64 = 64;
+/// Lower bound of `R_c`.
+pub const R_C_FLOOR: u64 = 8 << 20;
+/// Upper bound of `R_c`.
+pub const R_C_CEIL: u64 = 64 << 20;
+/// Slots a consolidation keeps hot: awaited and predicted.
+pub const CONSOLIDATION_HOT_SLOTS: u64 = 2;
+/// Bytes per consolidation hot read.
+pub const CONSOLIDATION_HOT_FILL_BYTES: u64 = 1 << 20;
+/// Largest consolidation cold allowance.
+pub const CONSOLIDATION_COLD_ALLOWANCE_MAX_BYTES: u64 = 1 << 20;
+/// Decompressed FIFO cap of a hot consolidation slot.
+pub const CONSOLIDATION_FIFO_CAP_HOT: u32 = 16;
+
 /// The pool charge of a decompressed FIFO of `blocks` (its cap, or its length
 /// when that is larger): the blocks above [`FIFO_CAP_COLD`].
 #[must_use]
@@ -102,6 +120,10 @@ pub struct ReadAheadBudget {
     pub cold_fill: u64,
     /// The shared pool every byte held above a cold allowance is charged to.
     pub pool: u64,
+    /// Decompressed FIFO cap of a hot slot.
+    pub fifo_hot: u32,
+    /// Decompressed FIFO cap of a cold slot.
+    pub fifo_cold: u32,
 }
 
 impl ReadAheadBudget {
@@ -126,7 +148,48 @@ impl ReadAheadBudget {
         cold_fill: u64,
     ) -> Self {
         let pool = r.saturating_sub(k as u64 * cold_allowance).max(HOT_SLOTS * hot_allowance);
-        Self { r, k, hot_allowance, hot_fill, cold_allowance, cold_fill, pool }
+        Self {
+            r,
+            k,
+            hot_allowance,
+            hot_fill,
+            cold_allowance,
+            cold_fill,
+            pool,
+            fifo_hot: FIFO_CAP_HOT,
+            fifo_cold: FIFO_CAP_COLD,
+        }
+    }
+
+    /// One consolidation job's budget over its `k` inputs: `R_c = clamp(total
+    /// / 64, 8 MiB, 64 MiB)`; two hot slots (awaited, predicted) of
+    /// `min(16 MiB, R_c / 4)` each, filled 1 MiB at a time; cold allowance
+    /// `(R_c − 2 × hot) / k` clamped to one 256 KiB IOP ..= 1 MiB, filled half
+    /// of it (at least 256 KiB); FIFO caps 16 hot, 8 cold. The pool every byte
+    /// above a cold allowance is charged to is `max(R_c − k × cold, 2 × hot)`.
+    #[must_use]
+    pub fn for_consolidation(total_memory: u64, k: usize) -> Self {
+        let r = (total_memory / R_C_DIVISOR).clamp(R_C_FLOOR, R_C_CEIL);
+        let hot_allowance = HOT_ALLOWANCE_BYTES.min(r / 4);
+        let hot_fill = CONSOLIDATION_HOT_FILL_BYTES.min(hot_allowance);
+        let cold_allowance = (r.saturating_sub(CONSOLIDATION_HOT_SLOTS * hot_allowance)
+            / k.max(1) as u64)
+            .clamp(COLD_FILL_MIN_BYTES, CONSOLIDATION_COLD_ALLOWANCE_MAX_BYTES);
+        let cold_fill = (cold_allowance / 2).max(COLD_FILL_MIN_BYTES).min(cold_allowance);
+        let pool = r
+            .saturating_sub(k as u64 * cold_allowance)
+            .max(CONSOLIDATION_HOT_SLOTS * hot_allowance);
+        Self {
+            r,
+            k,
+            hot_allowance,
+            hot_fill,
+            cold_allowance,
+            cold_fill,
+            pool,
+            fifo_hot: CONSOLIDATION_FIFO_CAP_HOT,
+            fifo_cold: FIFO_CAP_COLD,
+        }
     }
 
     /// This budget with fills of `hot_fill` / `cold_fill` bytes and the design's
@@ -148,10 +211,36 @@ impl ReadAheadBudget {
     /// `(allowance, fill)` for a slot of class `c`.
     #[must_use]
     pub fn for_class(&self, c: SpillClass) -> (u64, u64) {
-        match c {
-            SpillClass::Hot => (self.hot_allowance, self.hot_fill),
-            SpillClass::Cold => (self.cold_allowance, self.cold_fill),
+        if c.is_hot() {
+            (self.hot_allowance, self.hot_fill)
+        } else {
+            (self.cold_allowance, self.cold_fill)
         }
+    }
+
+    /// The decompressed FIFO cap of a slot of class `c`.
+    #[must_use]
+    pub fn fifo_cap(&self, c: SpillClass) -> u32 {
+        if c.is_hot() { self.fifo_hot } else { self.fifo_cold }
+    }
+
+    /// The `--sort-stats` description of a consolidation budget.
+    #[must_use]
+    pub fn consolidation_line(&self) -> String {
+        format!(
+            "R_c={} over {} inputs -> hot {} x {} (fill {}, FIFO {}), cold {} per input (fill \
+             {}, FIFO {}), pool {}",
+            mib(self.r),
+            self.k,
+            CONSOLIDATION_HOT_SLOTS,
+            mib(self.hot_allowance),
+            mib(self.hot_fill),
+            self.fifo_hot,
+            mib(self.cold_allowance),
+            mib(self.cold_fill),
+            self.fifo_cold,
+            mib(self.pool),
+        )
     }
 
     /// The bound on charged read-ahead: `k × cold + P` (every slot's cold
@@ -299,7 +388,14 @@ mod tests {
 
     /// `350 × 8 × 64 KiB = 183_500_800` B (175 MiB) at k = 350.
     #[test]
-    fn budget_rows_decoded_ceiling_at_k350_is_175_mib() {
+    fn budget_rows_decoded_ceiling_at_k350_is_175_mib_and_merge_fifo_caps_are_the_constants() {
+        assert_eq!(
+            (
+                ReadAheadBudget::resolve(768 << 24, 27).fifo_hot,
+                ReadAheadBudget::resolve(1, 1).fifo_cold
+            ),
+            (FIFO_CAP_HOT, FIFO_CAP_COLD)
+        );
         let b = ReadAheadBudget::resolve(768 << 24, 350);
         assert_eq!(b.decoded_ceiling(), 183_500_800);
     }
@@ -320,6 +416,34 @@ mod tests {
         assert_eq!(fifo_charge(0), 0);
         assert_eq!(fifo_charge(u64::from(FIFO_CAP_COLD)), 0);
         assert_eq!(fifo_charge(u64::from(FIFO_CAP_HOT)), 24 * 64 * KIB);
+    }
+
+    /// Items §5.6: `R_c = clamp(total/64, 8, 64 MiB)`; two hot slots of
+    /// `min(16 MiB, R_c/4)` filled 1 MiB at a time (FIFO 16); `cold = (R_c − 2·hot)/k`
+    /// clamped to [256 KiB, 1 MiB], filled max(allowance/2, 256 KiB) (FIFO 8).
+    /// Worked: t16 12 GiB/64 = 192 → 64 MiB, hot 16, cold (64 − 32)/32 = 1 MiB
+    /// fill 512 KiB; sweep 512 MiB/64 = 8 MiB, hot min(16, 2) = 2, cold
+    /// (8 − 4)/32 = 128 KiB → 256 KiB floor; tiny 64 MiB/64 = 1 → 8 MiB floor,
+    /// cold (8 − 4)/2 = 2 MiB → 1 MiB ceiling.
+    #[rstest]
+    #[case::t16_default(768 * MIB * 16, 32, 64 * MIB, (16 * MIB, MIB, 16), (MIB, 512 * KIB, 8))]
+    #[case::sweep_64m_x8(64 * MIB * 8, 32, 8 * MIB, (2 * MIB, MIB, 16), (256 * KIB, 256 * KIB, 8))]
+    #[case::tiny_floor(64 * MIB, 2, 8 * MIB, (2 * MIB, MIB, 16), (MIB, 512 * KIB, 8))]
+    fn for_consolidation_matches_the_items_table(
+        #[case] total: u64,
+        #[case] k: usize,
+        #[case] r_c: u64,
+        #[case] hot: (u64, u64, u32),
+        #[case] cold: (u64, u64, u32),
+    ) {
+        let b = ReadAheadBudget::for_consolidation(total, k);
+        assert_eq!(b.r, r_c);
+        let triple = |c| {
+            let (a, f) = b.for_class(c);
+            (a, f, b.fifo_cap(c))
+        };
+        assert_eq!(triple(SpillClass::ConsolidationHot), hot);
+        assert_eq!(triple(SpillClass::ConsolidationCold), cold);
     }
 
     #[test]

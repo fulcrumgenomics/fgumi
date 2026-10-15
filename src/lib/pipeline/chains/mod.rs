@@ -31,11 +31,12 @@ pub use spec::{ChainSpec, SingleStageContext};
 pub mod validate;
 
 pub mod build;
-pub use build::build_for;
+pub use build::{MergeSpec, build_for, build_merge};
 
 pub mod builder;
 
 pub mod build_helpers;
+pub(crate) mod staged_output;
 pub(crate) use build_helpers::build_pipeline_config_for_chain;
 
 pub mod commands;

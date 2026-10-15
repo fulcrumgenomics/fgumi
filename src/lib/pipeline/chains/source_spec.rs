@@ -44,7 +44,25 @@ pub enum SourceSpec {
     /// SAM text file (or `-` for stdin). Standalone-only — runall does
     /// not accept SAM input (it always reads from a BAM intermediate).
     Sam(PathBuf),
+
+    /// Raw records from an in-process generator (`fgumi simulate`), read off a
+    /// bounded channel by `RecordStreamSource`, under `header` (used as is: no
+    /// `@PG` is added). The receiver is taken once, by the chain build; a
+    /// second build of the same spec fails.
+    RecordStream {
+        /// The records' header (boxed: it dwarfs the other variants).
+        header: Box<noodles::sam::Header>,
+        /// The channel's receiving end, until the build takes it.
+        stream: RecordStreamHandle,
+    },
 }
+
+/// The take-once receiving end of a [`SourceSpec::RecordStream`].
+pub type RecordStreamHandle = std::sync::Arc<
+    parking_lot::Mutex<
+        Option<crossbeam_channel::Receiver<fgumi_pipeline_io::source::RecordStreamItem>>,
+    >,
+>;
 
 impl SourceSpec {
     /// Constructs a [`SourceSpec::Fastqs`] source, enforcing that `paths`
@@ -112,7 +130,7 @@ impl SourceSpec {
                     read_structures.len(),
                 );
             }
-            Self::Bam(_) | Self::PairedBams { .. } | Self::Sam(_) => {}
+            Self::Bam(_) | Self::PairedBams { .. } | Self::Sam(_) | Self::RecordStream { .. } => {}
         }
         Ok(())
     }
@@ -127,7 +145,7 @@ impl SourceSpec {
             | Self::PairedBams { .. }
             | Self::Fastqs { .. }
             | Self::InterleavedFastq { .. } => true,
-            Self::Sam(_) => false,
+            Self::Sam(_) | Self::RecordStream { .. } => false,
         }
     }
 }

@@ -13,20 +13,25 @@
 //! both fronts — so every order, queryname included, is checked for byte
 //! identity.
 
-use std::cmp::Ordering;
+use rand::RngExt as _;
 use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 use fgumi_raw_bam::testutil::make_bam_bytes;
-use fgumi_sort::{KeyTypesSpec, QuerynameComparator, RawSortKey, SortOrder, SpillCodec};
+use fgumi_sort::{KeyTypesSpec, QuerynameComparator, SortOrder, SpillCodec};
 use noodles::sam::Header;
 use parking_lot::Mutex;
 use rstest::rstest;
 
 use super::*;
 use crate::sort::protocol::SortChunkEvent;
+use crate::sort::testing::{
+    N_TEST_REFS, RecordBytes, assert_input_order_within_equal_keys, chance,
+    equal_key_group_spans_a_boundary, fixture_rng, max_equal_key_group, reference_sort,
+    synthetic_header, tie_heavy_records, xi_of,
+};
 use crate::types::RecordBatch;
 use fgumi_pipeline_core::{
     HeldRetry, Unpushed,
@@ -172,10 +177,6 @@ impl Step for SpillBoundaryTap {
         Ok(StepOutcome::Progress)
     }
 }
-
-/// One sort's output as a flat list of raw BAM record-byte payloads, in output
-/// order. Both the streaming pipeline and the reference sort produce this shape.
-type RecordBytes = Vec<Vec<u8>>;
 
 /// Spill codec and compression level a test chain writes its spill files
 /// with. They shape only the temporary files, never the merged records.
@@ -392,7 +393,7 @@ fn attach_spill_and_merge(
         .chain(SpillGather::new(output_byte_limit))
         .chain(
             SpillBlockCompress::new(codec, compression, output_byte_limit)
-                .with_phase_cap(caps.phase1.clone()),
+                .with_step_cap(caps.phase1.clone().map(fgumi_pipeline_core::StepCap::from)),
         )
         .chain(
             SpillWrite::new(Arc::new(Mutex::new(alloc)), codec, output_byte_limit, temp_dirs)
@@ -400,9 +401,12 @@ fn attach_spill_and_merge(
         )
         .chain(planner)
         .into_multi();
+    fan.b2.chain(crate::sort::NoConsolidation).into_sink_marker();
     fan.b0
-        .chain(pread.with_phase_cap(caps.phase2.clone()))
-        .chain(decompress.with_phase_cap(caps.phase2.clone()))
+        .chain(pread.with_step_cap(caps.phase2.clone().map(fgumi_pipeline_core::StepCap::from)))
+        .chain(
+            decompress.with_step_cap(caps.phase2.clone().map(fgumi_pipeline_core::StepCap::from)),
+        )
         .into_sink_marker();
     match sink {
         MergeSink::Batches(kind) => fan
@@ -600,285 +604,6 @@ fn drive_sort_block_pipeline(
         ZSTD_1,
     )?
     .records)
-}
-
-// ── Reference: the stable in-memory sort ────────────────────────────────────
-
-/// One record's key in a sort order — the definition of that order.
-enum OrderKey {
-    Coordinate(fgumi_sort::RawCoordinateKey),
-    QuerynameLex(fgumi_sort::RawQuerynameLexKey),
-    QuerynameNatural(fgumi_sort::RawQuerynameKey),
-    Template(fgumi_sort::TemplateKey),
-}
-
-impl OrderKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Coordinate(a), Self::Coordinate(b)) => a.cmp(b),
-            (Self::QuerynameLex(a), Self::QuerynameLex(b)) => a.cmp(b),
-            (Self::QuerynameNatural(a), Self::QuerynameNatural(b)) => a.cmp(b),
-            (Self::Template(a), Self::Template(b)) => a.cmp(b),
-            _ => unreachable!("keys of one order"),
-        }
-    }
-}
-
-/// Every record's key in `order`, in record order. Template-coordinate uses
-/// the full key: a narrowed lane set orders exactly like the full key.
-fn order_keys<R: AsRef<[u8]>>(
-    order: SortOrder,
-    header: &Header,
-    records: &[R],
-    cell_tag: Option<fgumi_raw_bam::SamTag>,
-) -> Vec<OrderKey> {
-    let ctx = fgumi_sort::SortContext::from_header(header);
-    let lib = fgumi_sort::LibraryLookup::from_header(header);
-    let hasher = fgumi_sort::cb_hasher();
-    records
-        .iter()
-        .map(|r| {
-            let r = r.as_ref();
-            match order {
-                SortOrder::Coordinate => {
-                    OrderKey::Coordinate(fgumi_sort::RawCoordinateKey::extract(r, &ctx))
-                }
-                SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
-                    OrderKey::QuerynameLex(fgumi_sort::RawQuerynameLexKey::extract(r, &ctx))
-                }
-                SortOrder::Queryname(QuerynameComparator::Natural) => {
-                    OrderKey::QuerynameNatural(fgumi_sort::RawQuerynameKey::extract(r, &ctx))
-                }
-                SortOrder::TemplateCoordinate => OrderKey::Template(
-                    fgumi_sort::extract_template_key_inline(r, &lib, cell_tag, &hasher),
-                ),
-            }
-        })
-        .collect()
-}
-
-/// In-memory STABLE sort of `records` by the order's key — the definition of
-/// the output contract: equal keys keep input order.
-fn reference_sort(
-    order: SortOrder,
-    header: &Header,
-    records: &[RawRecord],
-    cell_tag: Option<fgumi_raw_bam::SamTag>,
-) -> RecordBytes {
-    let keys = order_keys(order, header, records, cell_tag);
-    let mut idx: Vec<usize> = (0..records.len()).collect();
-    // `sort_by` is stable.
-    idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
-    idx.into_iter().map(|i| records[i].as_ref().to_vec()).collect()
-}
-
-// ── Tie-heavy fixture ───────────────────────────────────────────────────────
-
-/// The input index a [`tie_heavy_records`] record carries in its last aux
-/// field, `XI:i:<index>`.
-fn xi_of(record: &[u8]) -> u32 {
-    let n = record.len();
-    assert!(n >= 7 && &record[n - 7..n - 4] == b"XIi", "record must end with an XI:i tag");
-    u32::from_le_bytes(record[n - 4..].try_into().expect("4 bytes"))
-}
-
-/// Adjacent runs of `out` whose records share one key in `order`, as index
-/// ranges into `out`.
-fn equal_key_groups(
-    order: SortOrder,
-    header: &Header,
-    out: &[Vec<u8>],
-) -> Vec<std::ops::Range<usize>> {
-    let keys = order_keys(order, header, out, None);
-    let mut groups = Vec::new();
-    let mut start = 0;
-    for i in 1..=keys.len() {
-        if i == keys.len() || keys[i].cmp(&keys[start]) != Ordering::Equal {
-            groups.push(start..i);
-            start = i;
-        }
-    }
-    groups
-}
-
-/// Within every group of equal keys in `out`, the records keep input order:
-/// their `XI` indices strictly ascend.
-fn assert_input_order_within_equal_keys(order: SortOrder, header: &Header, out: &[Vec<u8>]) {
-    for group in equal_key_groups(order, header, out) {
-        let xis: Vec<u32> = out[group.clone()].iter().map(|r| xi_of(r)).collect();
-        assert!(
-            xis.windows(2).all(|w| w[0] < w[1]),
-            "{order:?}: equal keys out of input order at output {group:?}: XI {xis:?}"
-        );
-    }
-}
-
-/// The size of the largest group of equal keys in `out`.
-fn max_equal_key_group(order: SortOrder, header: &Header, out: &[Vec<u8>]) -> usize {
-    equal_key_groups(order, header, out).iter().map(ExactSizeIterator::len).max().unwrap_or(0)
-}
-
-/// Whether some group of equal keys in `out` has members from two different
-/// runs, given the runs' boundaries as input record counts.
-fn equal_key_group_spans_a_boundary(
-    order: SortOrder,
-    header: &Header,
-    out: &[Vec<u8>],
-    spill_boundaries: &[u64],
-) -> bool {
-    let run_of = |record: &Vec<u8>| {
-        let xi = u64::from(xi_of(record));
-        spill_boundaries.iter().filter(|&&b| b <= xi).count()
-    };
-    equal_key_groups(order, header, out).into_iter().any(|group| {
-        let first = run_of(&out[group.start]);
-        out[group].iter().any(|r| run_of(r) != first)
-    })
-}
-
-/// A small seeded generator (splitmix64), so fixtures are reproducible
-/// without a `rand` dependency.
-struct SplitMix(u64);
-
-impl SplitMix {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    /// `true` with probability `percent / 100`.
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
-    }
-}
-
-/// The header every synthetic fixture uses: `N_TEST_REFS` references of 1 Mb.
-fn synthetic_header() -> Header {
-    use noodles::sam::header::record::value::Map;
-    use noodles::sam::header::record::value::map::ReferenceSequence;
-    use std::num::NonZeroUsize;
-    let len = NonZeroUsize::new(1_000_000).expect("nonzero");
-    let mut builder = Header::builder();
-    for i in 0..N_TEST_REFS {
-        builder =
-            builder.add_reference_sequence(format!("chr{i}"), Map::<ReferenceSequence>::new(len));
-    }
-    builder.build()
-}
-
-/// About `n` records, unsorted in every order and rich in equal keys, each
-/// ending with a unique `XI:i:<input index>` so equal-key records are never
-/// byte-identical and their input order is observable in the output.
-///
-/// Templates are read pairs with Illumina-like names. Ties come from:
-/// - secondaries (30 %) and supplementaries (20 %) — one or two each, same
-///   name and flag class; secondaries copy the first read's alignment, so they
-///   tie with it in coordinate and template-coordinate order, and with each
-///   other in queryname order;
-/// - pairs forced onto one shared coordinate (5 %);
-/// - whole templates duplicated under a new name at the same coordinates (3 %);
-/// - unmapped pairs (2 %), which all share the unmapped coordinate key.
-///
-/// The records are shuffled before the `XI` tags are assigned, so equal-key
-/// records are spread over the input, and therefore over the runs.
-fn tie_heavy_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
-    /// `(tid, pos, flags, name, mate_tid, mate_pos)` of one record, before its tag.
-    type Spec = (i32, i32, u16, Vec<u8>, i32, i32);
-    const PAIRED: u16 = 0x1;
-    const UNMAPPED: u16 = 0x4;
-    const MATE_UNMAPPED: u16 = 0x8;
-    const REVERSE: u16 = 0x10;
-    const MATE_REVERSE: u16 = 0x20;
-    const READ1: u16 = 0x40;
-    const READ2: u16 = 0x80;
-    const SECONDARY: u16 = 0x100;
-    const SUPPLEMENTARY: u16 = 0x800;
-
-    let mut rng = SplitMix(seed);
-    let mut specs: Vec<Spec> = Vec::with_capacity(n + n / 4);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    while specs.len() < n {
-        let name = format!(
-            "A00132:53:HFHJ:{}:{}:{}:{}",
-            1 + rng.below(4),
-            1101 + rng.below(1578),
-            rng.below(40_000),
-            rng.below(40_000)
-        )
-        .into_bytes();
-        if rng.chance(2) {
-            for read in [READ1, READ2] {
-                let flags = PAIRED | UNMAPPED | MATE_UNMAPPED | read;
-                specs.push((-1, -1, flags, name.clone(), -1, -1));
-            }
-            continue;
-        }
-        let shared = rng.chance(5);
-        let (t1, p1, r1) = if shared {
-            (0, 5_000, false)
-        } else {
-            (rng.below(N_TEST_REFS as u64) as i32, rng.below(1_000_000) as i32, rng.chance(50))
-        };
-        let (t2, p2, r2) = (t1, p1 + 100 + rng.below(400) as i32, !r1);
-        let strand = |reverse: bool, mate_reverse: bool| {
-            (if reverse { REVERSE } else { 0 }) | if mate_reverse { MATE_REVERSE } else { 0 }
-        };
-        let first: Spec = (t1, p1, PAIRED | READ1 | strand(r1, r2), name.clone(), t2, p2);
-        let second: Spec = (t2, p2, PAIRED | READ2 | strand(r2, r1), name.clone(), t1, p1);
-        let copies = if rng.chance(3) { 2 } else { 1 };
-        for copy in 0..copies {
-            let name = if copy == 0 { name.clone() } else { [&name[..], b"d"].concat() };
-            let (mut a, mut b) = (first.clone(), second.clone());
-            a.3.clone_from(&name);
-            b.3.clone_from(&name);
-            if rng.chance(30) {
-                for _ in 0..=rng.below(2) {
-                    specs.push((a.0, a.1, a.2 | SECONDARY, name.clone(), a.4, a.5));
-                }
-            }
-            if rng.chance(20) {
-                let pos = rng.below(1_000_000) as i32;
-                for _ in 0..=rng.below(2) {
-                    specs.push((b.0, pos, b.2 | SUPPLEMENTARY, name.clone(), b.4, b.5));
-                }
-            }
-            specs.push(a);
-            specs.push(b);
-        }
-    }
-    // Fisher-Yates, seeded.
-    for i in (1..specs.len()).rev() {
-        #[allow(clippy::cast_possible_truncation)]
-        let j = rng.below(i as u64 + 1) as usize;
-        specs.swap(i, j);
-    }
-    let records = specs
-        .into_iter()
-        .enumerate()
-        .map(|(i, (tid, pos, flags, name, mate_tid, mate_pos))| {
-            let mut aux = b"XIi".to_vec();
-            aux.extend_from_slice(&u32::try_from(i).expect("index fits u32").to_le_bytes());
-            RawRecord::from(make_bam_bytes(
-                tid,
-                pos,
-                flags,
-                &name,
-                &[],
-                40,
-                mate_tid,
-                mate_pos,
-                &aux,
-            ))
-        })
-        .collect();
-    (synthetic_header(), records)
 }
 
 // ── Fronts ──────────────────────────────────────────────────────────────────
@@ -2128,9 +1853,6 @@ fn block_parallel_soak_matrix_matches_reference(
     }
 }
 
-/// Number of reference sequences the synthetic header declares.
-const N_TEST_REFS: usize = 4;
-
 fn synthesize_sized_records(n: usize, seed: u64, seq_len: usize) -> (Header, Vec<RawRecord>) {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
     let mut next_u32 = || {
@@ -2375,7 +2097,11 @@ fn collect_merge_batches_with(
     );
     match (opts.demand, opts.ledger) {
         (Some(demand), Some(ledger)) => {
-            merge = merge.with_spill_supply(&SpillSupply { demand, ledger });
+            merge = merge.with_spill_supply(&SpillSupply {
+                demand,
+                ledger,
+                retire_epoch: Arc::default(),
+            });
         }
         (Some(demand), None) => merge = merge.with_merge_demand(demand),
         (None, Some(_)) => panic!("a supply ledger needs the supply's merge demand"),
@@ -2996,7 +2722,6 @@ fn stashed_two_slots(
     corrupt: bool,
 ) -> Vec<Arc<fgumi_sort::SortMergeSlot>> {
     use std::io::Write;
-    use std::os::unix::fs::FileExt;
     let pool = fgumi_bam_io::pread::SliceBufferPool::new(0);
     (0..2usize)
         .map(|id| {
@@ -3019,7 +2744,7 @@ fn stashed_two_slots(
                 .expect("open spill slot");
             let start = slot.body_start();
             let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
-            slot.source().read_exact_at(&mut body, start).unwrap();
+            fgumi_bam_io::pread::read_at_exact(&**slot.source(), &mut body, start).unwrap();
             slot.bp_note_issued(body.len() as u64);
             let out = slot.bp_ingest_slice(0, pool.lease(body), true).expect("ingest");
             assert_eq!(out.frames, per_slot, "every block stashed");
@@ -3312,8 +3037,8 @@ impl Step for CappedBlockPassThrough {
         }
     }
 
-    fn phase_cap(&self) -> Option<&fgumi_pipeline_core::PhaseCap> {
-        Some(&self.cap)
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        Some(fgumi_pipeline_core::StepCapRef::Fixed(&self.cap))
     }
 
     fn new_worker_copy(&self) -> Self {
@@ -4048,18 +3773,24 @@ fn worker_copies_share_the_phase_cap() {
     use fgumi_pipeline_core::PhaseCap;
     let cap = PhaseCap::new("sort-phase1", 2);
     let inflate = InflateToArena::new(4096).with_phase_cap(Some(Arc::clone(&cap)));
-    let compress =
-        SpillBlockCompress::new(SpillCodec::Zstd, 1, 4096).with_phase_cap(Some(Arc::clone(&cap)));
+    let compress = SpillBlockCompress::new(SpillCodec::Zstd, 1, 4096)
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let decompress = SortSpillDecompress::new(4096, &crate::sort::SpillSupply::new())
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let copies =
         (inflate.new_worker_copy(), compress.new_worker_copy(), decompress.new_worker_copy());
     let _p1 = cap.try_acquire().expect("1 of 2");
     let _p2 = cap.try_acquire().expect("2 of 2");
     for (name, copy_cap) in [
-        ("InflateToArena", copies.0.phase_cap()),
-        ("SpillBlockCompress", copies.1.phase_cap()),
-        ("SortSpillDecompress", copies.2.phase_cap()),
+        ("InflateToArena", copies.0.step_cap().and_then(fgumi_pipeline_core::StepCapRef::active)),
+        (
+            "SpillBlockCompress",
+            copies.1.step_cap().and_then(fgumi_pipeline_core::StepCapRef::active),
+        ),
+        (
+            "SortSpillDecompress",
+            copies.2.step_cap().and_then(fgumi_pipeline_core::StepCapRef::active),
+        ),
     ] {
         let copy_cap = copy_cap.unwrap_or_else(|| panic!("{name} copy lost its cap"));
         assert!(copy_cap.try_acquire().is_none(), "{name} copy must share the exhausted counter");
@@ -4236,6 +3967,7 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         .into_multi();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
     fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
+    fan.b2.chain(crate::sort::NoConsolidation).into_sink_marker();
     let pipeline = builder.build().expect("pipeline builds");
     pipeline
         .run(PipelineConfig {
@@ -4419,6 +4151,7 @@ fn planner_tops_up_after_input_drains_with_long_timers() {
         VecSink { received: Arc::clone(&received), kind: StepKind::Detached, progress: None };
     let builder = Pipeline::builder();
     let fan = builder.chain(source).chain(planner).into_multi();
+    fan.b2.chain(crate::sort::NoConsolidation).into_sink_marker();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
     fan.b1.chain(merge).chain(sink).into_sink_marker();
     let pipeline = builder.build().unwrap();
@@ -5041,11 +4774,14 @@ impl LaneCase {
 /// `n` shuffled paired template records, optionally carrying `CB:Z` and
 /// `MI:Z` values that vary across records.
 fn template_records(n: usize, seed: u64, cb: bool, mi: bool) -> (Header, Vec<RawRecord>) {
-    let mut rng = SplitMix(seed);
+    let mut rng = fixture_rng(seed);
     let records = (0..n)
         .map(|i| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let (tid, pos) = (rng.below(N_TEST_REFS as u64) as i32, rng.below(500_000) as i32);
+            let (tid, pos) = (
+                rng.random_range(0..N_TEST_REFS as u64) as i32,
+                rng.random_range(0..500_000) as i32,
+            );
             let mut aux = Vec::new();
             if cb {
                 aux.extend_from_slice(b"CBZ");
@@ -5054,11 +4790,11 @@ fn template_records(n: usize, seed: u64, cb: bool, mi: bool) -> (Header, Vec<Raw
             }
             if mi {
                 aux.extend_from_slice(b"MIZ");
-                aux.extend_from_slice(format!("{}", rng.below(40)).as_bytes());
+                aux.extend_from_slice(format!("{}", rng.random_range(0..40)).as_bytes());
                 aux.push(0);
             }
             let flags = if i % 2 == 0 { 0x63 } else { 0x93 };
-            let name = format!("tpl{}", rng.below(1 << 20));
+            let name = format!("tpl{}", rng.random_range(0..1 << 20));
             RawRecord::from(make_bam_bytes(
                 tid,
                 pos,
@@ -5449,30 +5185,30 @@ fn three_step_chain_large_spill_completes_on_the_arena_split(
 /// carries a unique `XI` tag, so tie order is observable.
 fn instrument_switching_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
     const PREFIXES: [&str; 3] = ["A00132:53:HFHJ", "M04567:12:000000000-ABCDE", "NB551:7:HXY"];
-    let mut rng = SplitMix(seed);
+    let mut rng = fixture_rng(seed);
     let mut specs: Vec<(u16, Vec<u8>)> = Vec::with_capacity(n + 8);
     let mut block = Vec::new();
     while specs.len() < n {
         let prefix = PREFIXES[(specs.len() + block.len()) / 700 % PREFIXES.len()];
-        let width = 1 + u32::try_from(rng.below(5)).unwrap();
+        let width = 1 + u32::try_from(rng.random_range(0..5)).unwrap();
         let name = format!(
             "{prefix}:{}:{}:{}:{}",
-            1 + rng.below(4),
-            1101 + rng.below(30),
-            rng.below(10u64.pow(width)),
-            rng.below(40_000)
+            1 + rng.random_range(0..4),
+            1101 + rng.random_range(0..30),
+            rng.random_range(0..10u64.pow(width)),
+            rng.random_range(0..40_000)
         )
         .into_bytes();
         block.push((0x41u16, name.clone()));
         block.push((0x81u16, name.clone()));
-        if rng.chance(4) {
+        if chance(&mut rng, 4) {
             block.push((0x141u16, name));
             block.push((0x141u16, block.last().unwrap().1.clone()));
         }
         if block.len() >= 700 {
             for i in (1..block.len()).rev() {
                 #[allow(clippy::cast_possible_truncation)]
-                let j = rng.below(i as u64 + 1) as usize;
+                let j = rng.random_range(0..i as u64 + 1) as usize;
                 block.swap(i, j);
             }
             specs.append(&mut block);
@@ -5707,7 +5443,7 @@ fn residual_pieces_merge_to_the_reference(
     // Queryname ties (equal name and flags) are dense in the instrument
     // fixture's duplicated secondaries, so pieces of the final run share them.
     let (header, records) = match order {
-        SortOrder::Queryname(_) => instrument_switching_records(8_000, 61),
+        SortOrder::Queryname(_) => instrument_switching_records(8_000, 62),
         _ => tie_heavy_records(6_000, 61),
     };
     let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();

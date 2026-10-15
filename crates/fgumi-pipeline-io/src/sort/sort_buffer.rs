@@ -421,7 +421,7 @@ pub struct SortBuffer {
     /// `RUST_LOG=info` — distinguishes a slow read path from a stalled one.
     ingest_progress: ProgressTracker,
     /// Phase-1 cap the per-run sort takes whole, reported by
-    /// `phase_cap()` (`None` = uncapped).
+    /// `step_cap()` (`None` = uncapped).
     cap: Option<Arc<PhaseCap>>,
 }
 
@@ -653,8 +653,8 @@ impl Step for SortBuffer {
         Ok(StepOutcome::Finished)
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 

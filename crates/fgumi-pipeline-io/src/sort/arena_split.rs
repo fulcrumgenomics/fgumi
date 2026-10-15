@@ -842,8 +842,8 @@ impl<X: ArenaKeyExtractor> Step for ExtractKeys<X> {
         }
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -1203,8 +1203,8 @@ impl<X: ArenaKeyExtractor> Step for SortRun<X> {
         Ok(StepOutcome::Finished)
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -1538,7 +1538,7 @@ impl QnChunkOrder for QnNatural {
 }
 
 /// Queryname keys: 40-byte refs over the arena (a 24-byte name window behind
-/// a learned prefix class; see `fgumi_sort::queryname_ref`). Each extraction
+/// a learned prefix class; see `fgumi_sort::QnClassTable`). Each extraction
 /// clone carries its own class guess (`QnRefBuilder`) across the batches it
 /// extracts; every batch is classified, and re-windowed when it learns a new
 /// class, before it leaves the extractor. The order is `C`'s.

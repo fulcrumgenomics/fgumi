@@ -171,6 +171,17 @@ pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
         Self::extract_from_record(bam)
     }
 
+    /// The order a merge of named inputs (`fgumi merge`) holds each input to:
+    /// a record whose key compares `Less` than its predecessor's is an input
+    /// out of order. The default is the full `Ord`. A key whose `Ord` breaks
+    /// ties with a lane other sorters don't share overrides this to ignore that
+    /// lane, so an input sorted by another tool is accepted exactly when
+    /// `fgumi sort --verify` would accept it.
+    #[must_use]
+    fn input_order_cmp(&self, prev: &Self) -> Ordering {
+        self.cmp(prev)
+    }
+
     /// Serialize the key to a writer for temp file storage.
     ///
     /// Format should be compact and enable fast deserialization.
@@ -653,7 +664,7 @@ impl Default for RawQuerynameKey {
     /// `name` empty (no terminator), so a default-constructed key would feed a
     /// non-terminated pointer into the comparator (out-of-bounds read). This is
     /// required because generic merge code bounds `K: RawSortKey + Default`
-    /// (e.g. `MergeDriver<K>`, `MemorySources<K>`). The default is the empty
+    /// (e.g. `MergeDriver<K>`). The default is the empty
     /// name `"\0"` — it orders before any non-empty name and terminates
     /// immediately.
     fn default() -> Self {

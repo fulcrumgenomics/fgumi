@@ -40,11 +40,10 @@ fn spill_slot(
 /// rest) into leased slices with dense per-slot sequences, each recorded as
 /// issued (the planner's half of `issued_bytes`).
 fn slices(slot: &Arc<SortMergeSlot>, cuts: &[usize]) -> Vec<ReadSlice> {
-    use std::os::unix::fs::FileExt;
     let pool = SliceBufferPool::new(0);
     let start = slot.body_start();
     let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
-    slot.source().read_exact_at(&mut body, start).unwrap();
+    fgumi_bam_io::pread::read_at_exact(&**slot.source(), &mut body, start).unwrap();
     let mut sizes = Vec::new();
     let mut left = body.len();
     for &c in cuts {
@@ -70,6 +69,7 @@ fn slices(slot: &Arc<SortMergeSlot>, cuts: &[usize]) -> Vec<ReadSlice> {
             offset: start + at as u64,
             bytes: pool.lease(bytes),
             last: at + n == body.len(),
+            shortfall: 0,
             target: ReadTarget::Spill { slot: Arc::clone(slot), class: SpillClass::Cold },
         });
         at += n;
@@ -79,7 +79,11 @@ fn slices(slot: &Arc<SortMergeSlot>, cuts: &[usize]) -> Vec<ReadSlice> {
 
 /// A supply around `demand` with a fresh ledger.
 fn supply_with(demand: &Arc<fgumi_sort::MergeDemand>) -> SpillSupply {
-    SpillSupply { demand: Arc::clone(demand), ledger: Arc::new(SupplyLedger::default()) }
+    SpillSupply {
+        demand: Arc::clone(demand),
+        ledger: Arc::new(SupplyLedger::default()),
+        retire_epoch: Arc::default(),
+    }
 }
 
 /// Pop every queued block.
@@ -160,12 +164,13 @@ fn scan_order_puts_demand_slots_first_and_drops_eof() {
     await_file(&demand, 3);
     demand.set_predicted(Some(1));
     demand.set_frontier(Some(4));
-    let (order, _) = step.scan_order();
+    let mut order = Vec::new();
+    let _ = step.scan_order(&mut order);
     assert_eq!(order[..2], [3, 1], "awaited, predicted; the EOF frontier dropped: {order:?}");
     assert_eq!(order.len(), 4, "the rest once each, no EOF slot: {order:?}");
     demand.set_frontier(Some(1));
     demand.set_predicted(Some(0));
-    let (order, _) = step.scan_order();
+    let _ = step.scan_order(&mut order);
     assert_eq!(order[..3], [3, 0, 1], "{order:?}");
     assert_eq!(order.len(), 4, "{order:?}");
 }
@@ -208,7 +213,7 @@ fn a_slice_for_an_unregistered_file_registers_it() {
     let r = step.registry.read();
     assert_eq!(r.slots.len(), 1);
     assert!(Arc::ptr_eq(&r.slots[0], &slot));
-    assert_eq!(r.by_file_id.get(&4), Some(&0));
+    assert_eq!(r.by_slot_id.get(&4), Some(&0));
 }
 
 /// Declare `file_id` awaited, as the merge does on a stall: through
@@ -245,8 +250,12 @@ fn scan_order_takes_zero_slot_locks() {
     });
     held_rx.recv().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let scanner = std::thread::spawn(move || tx.send(step.scan_order()).unwrap());
-    let (order, any_work) =
+    let scanner = std::thread::spawn(move || {
+        let mut order = Vec::new();
+        let scanned = step.scan_order(&mut order);
+        tx.send((order, scanned)).unwrap();
+    });
+    let (order, (_, any_work)) =
         rx.recv_timeout(Duration::from_secs(5)).expect("scan_order blocked on a slot lock");
     assert!(any_work);
     release_tx.send(()).unwrap();
@@ -273,6 +282,7 @@ fn ingest_error_marks_the_slot_and_fails_the_step() {
         offset: 0,
         bytes: SliceBufferPool::new(0).lease(vec![0xAB; 64]),
         last: true,
+        shortfall: 0,
         target: ReadTarget::Spill { slot: Arc::clone(&slot), class: SpillClass::Cold },
     });
     assert!(probe.try_run(&mut step).is_err());
@@ -379,7 +389,7 @@ fn scan_drains_a_slot_with_an_empty_stash() {
     assert_eq!(slot.pop_decompressed(), Some(vec![0]), "the consumer makes room");
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(1 << 20, &SpillSupply::new())
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     step.register_for_test(&slot);
     let probe = StepProbe::new(&step);
     let held = cap.try_acquire().expect("the only permit");
@@ -407,7 +417,7 @@ fn a_head_behind_a_waiting_front_is_not_work() {
     assert_eq!(slot.stash_len_relaxed(), 1);
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(1 << 20, &SpillSupply::new())
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     step.register_for_test(&slot);
     let probe = StepProbe::new(&step);
     let held = cap.try_acquire().expect("the only permit");
@@ -444,7 +454,7 @@ fn eof_finalize_wakes_the_awaiting_merge() {
 fn idle_poll_takes_no_permit() {
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(1 << 20, &SpillSupply::new())
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let probe = StepProbe::new(&step);
     let held = cap.try_acquire().expect("the only permit");
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
@@ -461,7 +471,7 @@ fn refused_permit_leaves_the_slice_queued() {
     let slot = spill_slot(tmp.path(), 0, 2, 4);
     let cap = PhaseCap::new("sort-phase2", 1);
     let mut step = SortSpillDecompress::new(1 << 20, &SpillSupply::new())
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let probe = StepProbe::new(&step);
     probe.push_input(slices(&slot, &[]).remove(0));
     let held = cap.try_acquire().expect("the only permit");
@@ -478,10 +488,13 @@ fn worker_copies_share_demand_cap_and_registry() {
     let demand = Arc::new(fgumi_sort::MergeDemand::new());
     let cap = PhaseCap::new("sort-phase2", 2);
     let step = SortSpillDecompress::new(1 << 20, &supply_with(&demand))
-        .with_phase_cap(Some(Arc::clone(&cap)));
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let copy = step.new_worker_copy();
     assert!(Arc::ptr_eq(copy.merge_demand_for_test(), &demand));
-    assert!(std::ptr::eq(copy.phase_cap().unwrap(), &raw const *cap));
+    assert!(std::ptr::eq(
+        copy.step_cap().and_then(fgumi_pipeline_core::StepCapRef::active).unwrap(),
+        &raw const *cap
+    ));
     assert!(Arc::ptr_eq(&copy.registry, &step.registry));
     assert!(Arc::ptr_eq(&copy.cursor, &step.cursor));
 }
@@ -495,4 +508,90 @@ fn zero_output_byte_limit_normalizes_reorder_window() {
         DEFAULT_REORDER_WINDOW_BYTES
     );
     assert_eq!(SortSpillDecompress::new(4096, &SpillSupply::new()).window_budget, 4096);
+}
+
+/// Design issue 8: the consolidation demand is notified only before
+/// `AllAnnounced`. `all_announced` is the shared flag the planner sets on
+/// `AllAnnounced`. Catches: phase-2 deliveries still paying the consolidation
+/// demand's CAS and unpark.
+#[test]
+fn decompress_notifies_the_consolidation_demand_only_before_all_announced() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::TempDir::new().unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    let cons = Arc::new(fgumi_sort::MergeDemand::new());
+    let mut step = SortSpillDecompress::new(1 << 20, &SpillSupply::new())
+        .with_consolidation_demand(Arc::clone(&cons), Arc::clone(&flag));
+    let probe = StepProbe::new(&step);
+    let pool = SliceBufferPool::new(4);
+    let deliver = |id: u32, step: &mut SortSpillDecompress| {
+        let path = dir.path().join(format!("r{id}"));
+        crate::sort::spill_fixtures::write_run_file(&path, SpillCodec::Zstd, id, 0..10);
+        let slot = fgumi_sort::open_spill_slot(&path, id).unwrap();
+        let body =
+            std::fs::read(&path).unwrap()[usize::try_from(slot.body_start()).unwrap()..].to_vec();
+        slot.bp_note_issued(body.len() as u64);
+        // Registers this thread and publishes the slot as awaited (the slot is
+        // empty, so the re-check cannot resolve it).
+        assert!(!cons.await_slot(&slot));
+        probe.push_input(ReadSlice {
+            ordinal: 0,
+            stream: 0,
+            seq: 0,
+            offset: slot.body_start(),
+            bytes: pool.lease(body),
+            last: true,
+            shortfall: 0,
+            target: ReadTarget::Spill {
+                slot: Arc::clone(&slot),
+                class: SpillClass::ConsolidationCold,
+            },
+        });
+        assert_eq!(probe.try_run(step).unwrap(), StepOutcome::Progress);
+        cons.awaited()
+    };
+    assert_eq!(
+        deliver(0, &mut step),
+        None,
+        "before AllAnnounced: the delivery clears the awaited slot"
+    );
+    flag.store(true, Ordering::Release);
+    let wakes = cons.snapshot().wakes_delivered;
+    assert_eq!(deliver(1, &mut step), Some(1), "after AllAnnounced: not notified");
+    assert_eq!(cons.snapshot().wakes_delivered, wakes);
+}
+
+/// Retired slots leave the registry (it does not grow with every run ever
+/// consolidated), and a scan taken before the compaction resolves no slot, so
+/// another clone's compaction cannot redirect it to a different slot. Catches:
+/// tombstones that are never removed, and an index from a stale generation
+/// resolving after the vector shifted.
+#[test]
+fn retired_slots_are_compacted_and_a_stale_scan_resolves_nothing() {
+    let slots: Vec<_> =
+        (0..3).map(|i| Arc::new(SortMergeSlot::for_test(i, SpillCodec::Bgzf))).collect();
+    for s in &slots {
+        s.bp_stash_frames_for_test(vec![vec![1, 2, 3]], false);
+    }
+    let demand = Arc::new(fgumi_sort::MergeDemand::new());
+    let supply = supply_with(&demand);
+    let mut step = SortSpillDecompress::new(1 << 20, &supply);
+    for s in &slots {
+        step.register_for_test(s);
+    }
+    let mut order = Vec::new();
+    let (generation, _) = step.scan_order(&mut order);
+    assert_eq!(order.len(), 3);
+    assert!(step.slot_at(generation, 2).is_some());
+
+    slots[0].retire();
+    supply.retire_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+    step.drop_retired();
+    assert_eq!(step.registered_slot_ids_for_test(), [1, 2], "the retired slot is removed");
+    assert!(step.slot_at(generation, 0).is_none(), "a pre-compaction index resolves nothing");
+    let (now, _) = step.scan_order(&mut order);
+    assert_ne!(now, generation);
+    let ids: Vec<u32> = order.iter().map(|&i| step.slot_at(now, i).unwrap().slot_id()).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&0));
 }

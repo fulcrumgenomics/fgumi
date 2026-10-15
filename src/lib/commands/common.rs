@@ -1605,7 +1605,8 @@ pub enum MemoryReserve {
     Fixed(usize),
 }
 
-/// How many spilled runs may accumulate before the oldest are consolidated.
+/// How many spilled runs may be live at once before adjacent runs are
+/// consolidated (merged into one).
 ///
 /// Mirrors [`MemoryLimit`]: both are host-derived resource budgets, so both are
 /// spelled with an explicit `auto` rather than inferred from the flag's absence.
@@ -2112,6 +2113,31 @@ impl Default for QueueMemoryOptions {
             memory_per_thread: true,
         }
     }
+}
+
+/// The deadlock monitor's timeout every sort-chain command runs with.
+pub const SORT_CHAIN_DEADLOCK_TIMEOUT_SECS: u64 = 10;
+
+/// The pipeline runtime options every command running the sort's chain shares
+/// (`fgumi sort`, `fgumi_lib::sort::sort_bam`, `fgumi merge`, `fgumi simulate`):
+/// the deadlock monitor on ([`SORT_CHAIN_DEADLOCK_TIMEOUT_SECS`]), and the
+/// inter-stage queue budget derived from the same `--max-memory`,
+/// `--memory-reserve` and `--memory-per-thread` that size the sort buffer, so a
+/// small budget shrinks the queues too. One helper, so the commands cannot
+/// drift. A command adds its own diagnostics flags to the returned scheduler.
+#[must_use]
+pub fn sort_chain_runtime(
+    max_memory: MemoryLimit,
+    memory_reserve: MemoryReserve,
+    memory_per_thread: bool,
+) -> (SchedulerOptions, QueueMemoryOptions) {
+    (
+        SchedulerOptions {
+            deadlock_timeout: SORT_CHAIN_DEADLOCK_TIMEOUT_SECS,
+            ..SchedulerOptions::default()
+        },
+        QueueMemoryOptions { max_memory, memory_reserve, memory_per_thread },
+    )
 }
 
 impl QueueMemoryOptions {

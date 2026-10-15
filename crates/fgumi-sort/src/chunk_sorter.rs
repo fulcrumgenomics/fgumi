@@ -1,13 +1,12 @@
 //! Lean in-memory buffering sorter for the P6 `SortBuffer` step.
 //!
-//! [`CoordinateChunkSorter`] is the buffer-management slice of the former
-//! `CoordinateSortStream` (the streaming sort engine retired in P7) with **all
-//! the disk and pool machinery removed**: it ingests records into a
+//! [`CoordinateChunkSorter`] buffers records for a sort with **no disk or pool
+//! machinery**: it ingests records into a
 //! [`RecordBuffer`], and on
 //! demand par-sorts the buffer and drains it into an arena-backed sorted chunk
 //! (`InMemoryChunk<RawCoordinateKey>`, zero body copies — the arena is moved,
 //! not copied). It never writes to disk, owns no
-//! `SortWorkerPool`, no temp dirs, and no spill files — compressing and writing
+//! worker pool, no temp dirs, and no spill files — compressing and writing
 //! a chunk is the spill steps' job.
 //!
 //! The driver (`SortBuffer`) calls [`push`](CoordinateChunkSorter::push) per
@@ -19,14 +18,9 @@
 //! # Parity
 //!
 //! `take_sorted_chunk` uses the global stable [`RecordBuffer::par_sort`] plus a
-//! zero-copy arena drain — exactly the no-spill residual path in
-//! `CoordinateSortStream::into_slot_setup`. The legacy with-spill multi-thread
-//! path used `par_sort_into_chunks` to emit *k* sub-runs; emitting one
-//! globally-sorted chunk instead is record-order identical (the sub-runs are
-//! merged back by key with a lower-source-index tie-break, which for a stable
-//! global sort is the same original-insertion order), and it keeps the residual
-//! a single merge source so a parallel spill writer reordering chunks can
-//! never perturb the tie-break.
+//! zero-copy arena drain, emitting one globally-sorted chunk (equal keys in
+//! insertion order), so the residual is a single merge source and a parallel
+//! spill writer reordering chunks can never perturb the tie-break.
 
 use std::sync::Arc;
 
@@ -37,17 +31,17 @@ use fgumi_raw_bam::SamTag;
 use rayon::ThreadPool;
 
 use crate::arena_pool::ArenaPool;
-use crate::external::{
-    KeyTypesSpec, LibraryLookup, TemplateKeyVariant, dropped_lane_error,
-    extract_template_key_inline, select_template_variant, verify_dropped_lanes,
-    violation_read_name,
-};
 use crate::inline::{
     CbKey32, InMemoryChunk, RecordBuffer, TemplateKey, TemplateKey24, TemplateKey40,
     TemplateLaneKey, TemplateRecordBuffer, TertKey32,
 };
 use crate::keys::RawCoordinateKey;
 use crate::memory_probe::force_mi_collect;
+use crate::template_key::{
+    KeyTypesSpec, LibraryLookup, TemplateKeySeed, TemplateKeyVariant, dropped_lane_error,
+    extract_template_key_inline, select_template_variant, verify_dropped_lanes,
+    violation_read_name,
+};
 
 /// In-memory coordinate buffering sorter that emits owned sorted chunks.
 pub struct CoordinateChunkSorter {
@@ -61,19 +55,35 @@ pub struct CoordinateChunkSorter {
     /// Bounded pool of reusable sort arenas (lever-1 RSS fix). The buffer's
     /// backing `SegmentedBuf` is acquired here and returns (reset-for-reuse)
     /// when the emitted chunk's `Arc` drops, so at most `N_arena` arenas are
-    /// ever live. Capacity 1 (default) matches legacy's one-arena-at-a-time
-    /// `drain_pending_spill` model.
+    /// ever live. Capacity 1 (default): one arena at a time.
     arena_pool: Arc<ArenaPool>,
     /// `true` once an arena is installed in `buffer` and not yet drained.
     has_arena: bool,
 }
 
 impl CoordinateChunkSorter {
-    /// Construct from a pre-sized buffer + rayon pool + arena pool. Built via
-    /// [`RawExternalSorter::into_coordinate_chunk_sorter`](crate::RawExternalSorter::into_coordinate_chunk_sorter).
-    /// `buffer` starts drained; the first [`ensure_arena`](Self::ensure_arena)
-    /// installs one from `arena_pool`.
-    pub(crate) fn new(
+    /// A sorter buffering up to `memory_limit` bytes of records over `n_ref`
+    /// reference sequences, sorting each chunk on `sort_threads` threads.
+    ///
+    /// The record arena comes from a capacity-1 [`ArenaPool`] on the first
+    /// [`ensure_arena`](Self::ensure_arena), so a chunk cannot fill until the
+    /// previous one is spilled and its arena returns (one arena resident at a
+    /// time). The buffer's inline-header segment is sized for
+    /// `memory_limit / 240` records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rayon sort pool cannot be built.
+    pub fn new(memory_limit: usize, n_ref: u32, sort_threads: usize) -> Result<Self> {
+        let buffer = RecordBuffer::with_capacity(memory_limit / 240, 0, n_ref);
+        let arena_pool = ArenaPool::new(1, crate::inline::SORT_SEGMENT_SIZE);
+        Ok(Self::from_parts(buffer, sort_rayon_pool(sort_threads)?, memory_limit, arena_pool))
+    }
+
+    /// Construct from a pre-sized buffer + rayon pool + arena pool. `buffer`
+    /// starts drained; the first [`ensure_arena`](Self::ensure_arena) installs
+    /// one from `arena_pool`.
+    fn from_parts(
         buffer: RecordBuffer,
         rayon_pool: ThreadPool,
         memory_limit: usize,
@@ -209,11 +219,9 @@ impl CoordinateChunkSorter {
 
     /// Construct a minimal `CoordinateChunkSorter` for unit tests.
     ///
-    /// Mirrors the construction in
-    /// [`RawExternalSorter::into_coordinate_chunk_sorter`](crate::RawExternalSorter::into_coordinate_chunk_sorter):
-    /// a zero-capacity `RecordBuffer` (the pool hands out the first arena on the
-    /// initial `ensure_arena`/`push`), a single-thread rayon pool, and a
-    /// capacity-1 `ArenaPool` with the standard segment size.
+    /// Like [`Self::new`] with one sort thread, but with a zero-capacity
+    /// `RecordBuffer` (the pool hands out the first arena on the initial
+    /// `ensure_arena`/`push`).
     ///
     /// # Panics
     ///
@@ -226,8 +234,24 @@ impl CoordinateChunkSorter {
         let rayon_pool =
             rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("rayon pool for test");
         let arena_pool = crate::arena_pool::ArenaPool::new(1, crate::inline::SORT_SEGMENT_SIZE);
-        Self::new(buffer, rayon_pool, memory_limit, arena_pool)
+        Self::from_parts(buffer, rayon_pool, memory_limit, arena_pool)
     }
+}
+
+/// Estimated BAM bytes per template-coordinate record, for the narrowed-key
+/// buffer's capacity hints ([`TemplateChunkSorter::new`]).
+const EST_BAM_BYTES_PER_TEMPLATE_RECORD: usize = 250;
+
+/// A rayon pool of `threads` workers for sorting chunks. Every rayon call
+/// site in this module runs inside `pool.install(...)`, so the sort never fans
+/// out past the requested thread count (rayon's global pool would use every
+/// core).
+fn sort_rayon_pool(threads: usize) -> Result<ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .thread_name(|i| format!("fgumi-sort-rayon-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build rayon sort pool: {e}"))
 }
 
 // ============================================================================
@@ -236,8 +260,7 @@ impl CoordinateChunkSorter {
 
 /// The narrowed lane-key buffer the [`TemplateChunkSorter`] sorts on. The
 /// variant is chosen on the first `push` from `--key-types` (via
-/// [`select_template_variant`]) and matches the batch `RawExternalSorter::sort`
-/// dispatch one-for-one: `(cb, tertiary)` → `(false,false)`=`TemplateKey24`
+/// [`select_template_variant`]): `(cb, tertiary)` → `(false,false)`=`TemplateKey24`
 /// (3 lanes), `(true,false)`=`CbKey32`, `(false,true)`=`TertKey32` (4 lanes),
 /// `(true,true)`=`TemplateKey40` (5 lanes, the full key). The radix sort runs
 /// on the narrower key for speed; the emitted chunk re-widens to the full
@@ -387,8 +410,7 @@ struct Provisioned {
 /// radix `TemplateRecordBuffer::par_sort`, so the single-residual-chunk parity
 /// argument is identical to coordinate's.
 ///
-/// **Narrowed radix key (`--key-types`).** Like the batch `RawExternalSorter::sort`
-/// path, the in-memory radix sort runs on the `KeyTypesSpec`-narrowed key
+/// **Narrowed radix key (`--key-types`).** The in-memory radix sort runs on the `KeyTypesSpec`-narrowed key
 /// (`TemplateBuffer` — `TemplateKey24`/`CbKey32`/`TertKey32`/`TemplateKey40`),
 /// chosen lazily on the first `push` once the first record is available to seed
 /// `select_template_variant`. The narrower key is a **speed** optimization
@@ -423,13 +445,44 @@ pub struct TemplateChunkSorter {
 }
 
 impl TemplateChunkSorter {
-    /// Built via
-    /// [`RawExternalSorter::into_template_chunk_sorter`](crate::RawExternalSorter::into_template_chunk_sorter).
+    /// A sorter buffering up to `memory_limit` bytes of template records keyed
+    /// by `seed` (library lookup, cell tag and hasher, `--key-types`), sorting
+    /// each chunk on `sort_threads` threads.
+    ///
+    /// The narrowed-key buffer is built on the first `push`, once the first
+    /// record has chosen the lane variant, so its capacity hints assume the
+    /// widest ref (`TemplateKey40`, 56 B): over-estimating bytes per record
+    /// under-sizes a capacity hint, the safe direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rayon sort pool cannot be built.
+    pub fn new(memory_limit: usize, seed: TemplateKeySeed, sort_threads: usize) -> Result<Self> {
+        let (lib_lookup, cell_tag, cb_hasher, key_types, header_library_varies) = seed.into_parts();
+        let ref_bytes = std::mem::size_of::<crate::inline::TemplateRecordRef<TemplateKey40>>();
+        let data_bytes_per_record =
+            crate::inline::TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD;
+        let bytes_per_record = data_bytes_per_record + ref_bytes;
+        let estimated_records = (memory_limit / bytes_per_record).max(1);
+        let estimated_data_bytes = memory_limit * data_bytes_per_record / bytes_per_record;
+        Ok(Self::from_parts(
+            sort_rayon_pool(sort_threads)?,
+            memory_limit,
+            estimated_records,
+            estimated_data_bytes,
+            lib_lookup,
+            cb_hasher,
+            cell_tag,
+            key_types,
+            header_library_varies,
+        ))
+    }
+
     /// The narrowed-key buffer is deferred to the first `push` (the variant is
     /// chosen from the first record), so this takes capacity hints rather than a
     /// pre-built buffer.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    fn from_parts(
         rayon_pool: ThreadPool,
         memory_limit: usize,
         estimated_records: usize,
@@ -460,7 +513,7 @@ impl TemplateChunkSorter {
     ///
     /// On the first record the dropped-lane variant is provisioned from
     /// `--key-types`; every record then has its dropped lanes verified against
-    /// the first record's, matching the batch `RawExternalSorter::sort` path.
+    /// the first record's.
     ///
     /// # Errors
     ///
@@ -468,6 +521,14 @@ impl TemplateChunkSorter {
     /// a record carries a dropped-lane value (CB / MI / library) absent from the
     /// input's first record.
     pub fn push(&mut self, bam_bytes: &[u8]) -> Result<bool> {
+        // The key extractor indexes the 32-byte core: hold the record to it
+        // first, so a short record is the documented error, not a panic.
+        anyhow::ensure!(
+            bam_bytes.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN,
+            "record of {} bytes is shorter than a BAM record ({} bytes)",
+            bam_bytes.len(),
+            fgumi_raw_bam::MIN_BAM_RECORD_LEN,
+        );
         let key = extract_template_key_inline(
             bam_bytes,
             &self.lib_lookup,
@@ -578,9 +639,10 @@ impl TemplateChunkSorter {
 mod tests {
     use std::sync::Arc;
 
-    use crate::RawExternalSorter;
+    use super::{CoordinateChunkSorter, TemplateChunkSorter};
     use crate::inline::InMemoryChunk;
-    use crate::keys::{RawCoordinateKey, SortOrder};
+    use crate::keys::RawCoordinateKey;
+    use crate::template_key::TemplateKeySeed;
     use fgumi_raw_bam::testutil::make_bam_bytes;
     use noodles::sam::Header;
 
@@ -611,11 +673,8 @@ mod tests {
     #[test]
     fn no_spill_single_sorted_residual_chunk() {
         let records = descending_pos_records(500);
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(2)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(256 * 1024 * 1024, 0, 2).expect("build chunk sorter");
 
         for r in &records {
             assert!(!sorter.push(r).expect("push"), "no spill expected under a large memory limit");
@@ -640,11 +699,8 @@ mod tests {
     #[test]
     fn pooled_arena_returns_to_the_pool_when_its_chunk_drops() {
         let records = descending_pos_records(64);
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024 * 1024)
-            .threads(1)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(8 * 1024 * 1024, 0, 1).expect("build chunk sorter");
         let pool = Arc::clone(sorter.arena_pool());
 
         assert!(sorter.ensure_arena(), "the pool has a free arena to install");
@@ -671,11 +727,8 @@ mod tests {
     #[test]
     fn ensure_arena_is_false_while_the_only_arena_is_in_flight() {
         let records = descending_pos_records(64);
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024 * 1024)
-            .threads(1)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(8 * 1024 * 1024, 0, 1).expect("build chunk sorter");
 
         assert!(sorter.ensure_arena(), "the fresh pool hands out its one arena");
         for r in &records {
@@ -700,11 +753,8 @@ mod tests {
     #[test]
     fn ensure_arena_is_false_mid_fill_so_the_backing_store_is_never_swapped() {
         let records = descending_pos_records(4);
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024 * 1024)
-            .threads(1)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(8 * 1024 * 1024, 0, 1).expect("build chunk sorter");
         let pool = Arc::clone(sorter.arena_pool());
 
         // Drain the pool first so `push`'s best-effort acquire finds nothing and
@@ -729,11 +779,8 @@ mod tests {
     #[test]
     fn tiny_limit_emits_multiple_sorted_chunks_covering_all_records() {
         let records = descending_pos_records(2_000);
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(16 * 1024) // tiny → frequent spills
-            .threads(2)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        // A tiny limit → frequent spills.
+        let mut sorter = CoordinateChunkSorter::new(16 * 1024, 0, 2).expect("build chunk sorter");
 
         let mut chunks = Vec::new();
         for r in &records {
@@ -778,11 +825,8 @@ mod tests {
                 make_bam_bytes(0, 0, 0, name.as_bytes(), &[], 60, -1, -1, &[])
             })
             .collect();
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(2)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(256 * 1024 * 1024, 0, 2).expect("build chunk sorter");
         for r in &records {
             assert!(!sorter.push(r).expect("push"));
         }
@@ -803,7 +847,7 @@ mod tests {
     /// (Pre-P6 the streaming production path skipped this validation entirely.)
     #[test]
     fn template_chunk_sorter_rejects_dropped_lane_violation() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         // Raw BAM aux for `MI:i:<v>` (tag bytes + 'i' type + i32 LE value).
         fn mi_aux(v: i32) -> Vec<u8> {
@@ -812,11 +856,9 @@ mod tests {
             a
         }
 
-        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(1)
-            .key_types(KeyTypesSpec::None) // drop all optional lanes incl. tertiary/MI
-            .into_template_chunk_sorter(&Header::default())
+        // `--key-types none` drops all optional lanes incl. tertiary/MI.
+        let seed = TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::None);
+        let mut sorter = TemplateChunkSorter::new(256 * 1024 * 1024, seed, 1)
             .expect("build template chunk sorter");
 
         let r1 = make_bam_bytes(0, 10, 0, b"r1", &[], 40, -1, -1, &mi_aux(1));
@@ -835,13 +877,13 @@ mod tests {
     /// under a placeholder name, not a slice panic in the violation branch.
     #[test]
     fn template_chunk_sorter_reports_a_violation_whose_read_name_overruns_its_body() {
-        use crate::external::KeyTypesSpec;
-        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(1)
-            .key_types(KeyTypesSpec::None)
-            .into_template_chunk_sorter(&Header::default())
-            .expect("build template chunk sorter");
+        use crate::template_key::KeyTypesSpec;
+        let mut sorter = TemplateChunkSorter::new(
+            256 * 1024 * 1024,
+            TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::None),
+            1,
+        )
+        .expect("build template chunk sorter");
         let mut mi = vec![b'M', b'I', b'i'];
         mi.extend_from_slice(&1i32.to_le_bytes());
         let r1 = make_bam_bytes(0, 10, 0, b"r1", &[], 40, -1, -1, &mi);
@@ -856,13 +898,13 @@ mod tests {
     /// validation passes and the sort proceeds — the common case.
     #[test]
     fn template_chunk_sorter_accepts_constant_dropped_lanes() {
-        use crate::external::KeyTypesSpec;
-        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(1)
-            .key_types(KeyTypesSpec::None)
-            .into_template_chunk_sorter(&Header::default())
-            .expect("build");
+        use crate::template_key::KeyTypesSpec;
+        let mut sorter = TemplateChunkSorter::new(
+            256 * 1024 * 1024,
+            TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::None),
+            1,
+        )
+        .expect("build");
         // No optional lanes present at all → nothing to violate.
         for i in 0..200i32 {
             let pos = 200 - i;
@@ -878,13 +920,13 @@ mod tests {
     /// producing a correctly ordered chunk keyed by the full [`TemplateKey`].
     #[test]
     fn template_chunk_sorter_selects_narrow_variant_without_cb_or_mi() {
-        use crate::external::KeyTypesSpec;
-        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(2)
-            .key_types(KeyTypesSpec::Auto)
-            .into_template_chunk_sorter(&Header::default())
-            .expect("build template chunk sorter");
+        use crate::template_key::KeyTypesSpec;
+        let mut sorter = TemplateChunkSorter::new(
+            256 * 1024 * 1024,
+            TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::Auto),
+            2,
+        )
+        .expect("build template chunk sorter");
         assert!(sorter.chosen_variant().is_none(), "no variant before the first push");
 
         // Descending positions on tid 0 → a correct sort reorders to ascending.
@@ -921,7 +963,7 @@ mod tests {
     /// each tie group in input order under both key widths.
     #[test]
     fn template_chunk_sorter_narrow_matches_full_key_order() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
         for i in 0..120i32 {
@@ -935,12 +977,12 @@ mod tests {
         }
 
         let sort_with = |key_types: KeyTypesSpec| -> (usize, Vec<Vec<u8>>) {
-            let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                .memory_limit(256 * 1024 * 1024)
-                .threads(2)
-                .key_types(key_types)
-                .into_template_chunk_sorter(&Header::default())
-                .expect("build template chunk sorter");
+            let mut sorter = TemplateChunkSorter::new(
+                256 * 1024 * 1024,
+                TemplateKeySeed::from_header(&Header::default(), None, key_types),
+                2,
+            )
+            .expect("build template chunk sorter");
             for r in &records {
                 sorter.push(r).expect("push");
             }
@@ -976,7 +1018,7 @@ mod tests {
     /// `TemplateKey40`) key widths.
     #[test]
     fn template_arena_drain_matches_owned_materialize() {
-        use crate::external::KeyTypesSpec;
+        use crate::template_key::KeyTypesSpec;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
         for i in 0..120i32 {
@@ -988,12 +1030,12 @@ mod tests {
         }
 
         let build = |key_types: KeyTypesSpec| {
-            RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                .memory_limit(256 * 1024 * 1024)
-                .threads(2)
-                .key_types(key_types)
-                .into_template_chunk_sorter(&Header::default())
-                .expect("build template chunk sorter")
+            TemplateChunkSorter::new(
+                256 * 1024 * 1024,
+                TemplateKeySeed::from_header(&Header::default(), None, key_types),
+                2,
+            )
+            .expect("build template chunk sorter")
         };
 
         for key_types in [KeyTypesSpec::Auto, KeyTypesSpec::Full] {
@@ -1034,9 +1076,9 @@ mod tests {
     #[allow(unsafe_code)]
     fn template_arena_accumulator_matches_owned_sorter() {
         use crate::arena_pool::PooledSegmentedBuf;
-        use crate::external::KeyTypesSpec;
         use crate::segmented_buf::SegmentedBuf;
         use crate::template_arena::TemplateArenaAccumulator;
+        use crate::template_key::KeyTypesSpec;
         use std::sync::Arc;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
@@ -1050,12 +1092,12 @@ mod tests {
 
         for key_types in [KeyTypesSpec::Auto, KeyTypesSpec::Full] {
             // ---- Owned oracle ----
-            let mut owned = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                .memory_limit(256 * 1024 * 1024)
-                .threads(2)
-                .key_types(key_types)
-                .into_template_chunk_sorter(&Header::default())
-                .expect("build owned template sorter");
+            let mut owned = TemplateChunkSorter::new(
+                256 * 1024 * 1024,
+                TemplateKeySeed::from_header(&Header::default(), None, key_types),
+                2,
+            )
+            .expect("build owned template sorter");
             for r in &records {
                 owned.push(r).expect("owned push");
             }
@@ -1096,13 +1138,13 @@ mod tests {
     /// residual (the lazy `Option<TemplateBuffer>` stays `None`).
     #[test]
     fn template_chunk_sorter_empty_stream_yields_empty_residual() {
-        use crate::external::KeyTypesSpec;
-        let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(1)
-            .key_types(KeyTypesSpec::Auto)
-            .into_template_chunk_sorter(&Header::default())
-            .expect("build template chunk sorter");
+        use crate::template_key::KeyTypesSpec;
+        let mut sorter = TemplateChunkSorter::new(
+            256 * 1024 * 1024,
+            TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::Auto),
+            1,
+        )
+        .expect("build template chunk sorter");
         assert!(sorter.take_sorted_chunk().is_empty());
         assert_eq!(sorter.total_records(), 0);
         assert!(sorter.chosen_variant().is_none(), "no push → no variant");
@@ -1111,12 +1153,23 @@ mod tests {
     /// An empty stream yields an empty residual (the caller emits no chunk).
     #[test]
     fn empty_stream_yields_empty_residual() {
-        let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(256 * 1024 * 1024)
-            .threads(1)
-            .into_coordinate_chunk_sorter(&Header::default())
-            .expect("build chunk sorter");
+        let mut sorter =
+            CoordinateChunkSorter::new(256 * 1024 * 1024, 0, 1).expect("build chunk sorter");
         assert!(sorter.take_sorted_chunk().is_empty());
         assert_eq!(sorter.total_records(), 0);
+    }
+
+    /// A record shorter than the 32-byte BAM core is an error, not a panic in
+    /// the key extractor. Catches: `push` keying a record before checking it.
+    #[test]
+    fn template_push_rejects_a_record_shorter_than_the_bam_core() {
+        let seed = TemplateKeySeed::from_header(
+            &Header::default(),
+            None,
+            crate::template_key::KeyTypesSpec::Auto,
+        );
+        let mut sorter = TemplateChunkSorter::new(1 << 20, seed, 1).expect("build");
+        let err = sorter.push(&[0u8; 10]).expect_err("a 10-byte record must be rejected");
+        assert!(err.to_string().contains("shorter than a BAM record"), "{err}");
     }
 }

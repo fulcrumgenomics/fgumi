@@ -5,9 +5,9 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_sort::{
-    CbKey32, InMemoryChunk, MemorySources, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable,
-    QnKey, QnLex, QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot,
-    SortOrder, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
+    CbKey32, InMemoryChunk, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable, QnKey, QnLex,
+    QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot, SortOrder,
+    TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
 
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
@@ -55,6 +55,34 @@ fn ensure_all_records_merged(ingested: u64, merged: u64) -> io::Result<()> {
             ingested.abs_diff(merged)
         ),
     ))
+}
+
+/// `fgumi merge`'s counterpart of [`ensure_all_records_merged`]: its inputs'
+/// record counts are not known up front (the merge itself reads them), so
+/// instead every input must have been read to its end, with no error, when the
+/// merge reports done. The driver only retires a source at its clean EOF, so
+/// this fails only if a source was retired early: the merge would otherwise
+/// end short with a clean exit. `inputs` names each slot by `file_id`.
+fn ensure_merge_inputs_read(slots: &[Arc<SortMergeSlot>], inputs: &[String]) -> io::Result<()> {
+    for slot in slots {
+        let name = usize::try_from(slot.file_id)
+            .ok()
+            .and_then(|i| inputs.get(i))
+            .map_or_else(|| format!("slot {}", slot.file_id), Clone::clone);
+        if slot.has_error() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("merge failed reading input {name}"),
+            ));
+        }
+        if !slot.is_drained() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("merge lost records: it ended before input {name} was read to its end"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `SortMerge` counter slot index: records merged/gathered this call.
@@ -445,6 +473,62 @@ impl MemoryChunksByKind {
     }
 }
 
+/// How `SortMerge` merges the inputs of `fgumi merge` rather than a sort's
+/// spill runs ([`SortMerge::with_merge_inputs`]): every slot is a body-keyed BAM
+/// input, merged on the full key with each input's order checked.
+#[derive(Clone)]
+pub struct MergeInputs {
+    /// Each input's name, by `file_id` (the order check's error names it).
+    pub inputs: Vec<String>,
+    /// The order's `fgumi sort --order` name, for the order check's error.
+    pub order_name: &'static str,
+    /// The full template key's context (template-coordinate only).
+    pub template_ctx: Option<Arc<fgumi_sort::TemplateKeyContext>>,
+    /// A rewrite of every record before its key is extracted (the read-tag
+    /// renames of `fgumi merge`), if any input needs one.
+    pub rewrite: Option<fgumi_sort::RecordRewrite>,
+}
+
+/// A driver over `fgumi merge`'s inputs (see [`MergeInputs`]): the kind
+/// dispatch ([`fgumi_sort::merge_driver_for_kind`]) over the order's merge key
+/// (template-coordinate on the full key, with its context), then the input
+/// order check and the read-tag rewrite.
+fn build_merge_inputs_driver(
+    sort_order: SortOrder,
+    slots: Vec<Arc<SortMergeSlot>>,
+    demand: Option<&Arc<fgumi_sort::MergeDemand>>,
+    class_table: Option<&Arc<QnClassTable>>,
+    mode: &MergeInputs,
+) -> io::Result<Box<dyn MergeDriverDyn + Send>> {
+    use fgumi_sort::{MergeCtxErased, SpillKeyKind};
+    let table =
+        || MergeCtxErased::Queryname(class_table.map_or_else(QnClassTable::new, Arc::clone));
+    let (kind, ctx) = match sort_order {
+        SortOrder::Coordinate => (SpillKeyKind::Coordinate, MergeCtxErased::None),
+        SortOrder::Queryname(QuerynameComparator::Lexicographic) => {
+            (SpillKeyKind::QuerynameLex, table())
+        }
+        SortOrder::Queryname(QuerynameComparator::Natural) => {
+            (SpillKeyKind::QuerynameNatural, table())
+        }
+        SortOrder::TemplateCoordinate => {
+            let ctx = mode.template_ctx.clone().ok_or_else(|| {
+                io::Error::other(
+                    "SortMerge: a template-coordinate merge of BAM inputs needs a key context",
+                )
+            })?;
+            (SpillKeyKind::TemplateK40, MergeCtxErased::Template(ctx))
+        }
+    };
+    let demand = demand.map_or_else(|| Arc::new(fgumi_sort::MergeDemand::new()), Arc::clone);
+    let mut driver = fgumi_sort::merge_driver_for_kind(kind, slots, ctx, demand);
+    driver.set_input_order_check(mode.inputs.clone(), mode.order_name);
+    if let Some(rewrite) = &mode.rewrite {
+        driver.set_record_rewrite(rewrite);
+    }
+    Ok(driver)
+}
+
 fn build_driver(
     sort_order: SortOrder,
     slots: Vec<Arc<SortMergeSlot>>,
@@ -458,7 +542,7 @@ fn build_driver(
         SortOrder::Coordinate => Box::new(attach(
             MergeDriver::<RawCoordinateKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.coordinate),
+                chunks.coordinate,
                 total_records,
                 (),
             ),
@@ -467,7 +551,7 @@ fn build_driver(
         SortOrder::Queryname(QuerynameComparator::Lexicographic) => Box::new(attach(
             MergeDriver::<QnMergeKey<QnLex>, QnKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.queryname_lex),
+                chunks.queryname_lex,
                 total_records,
                 table(),
             ),
@@ -476,7 +560,7 @@ fn build_driver(
         SortOrder::Queryname(QuerynameComparator::Natural) => Box::new(attach(
             MergeDriver::<QnMergeKey<QnNatural>, QnKey>::from_slots(
                 slots,
-                MemorySources::Shared(chunks.queryname_natural),
+                chunks.queryname_natural,
                 total_records,
                 table(),
             ),
@@ -503,49 +587,24 @@ fn build_driver(
                     ));
                 }
                 Box::new(attach(
-                    MergeDriver::<TemplateKey>::from_slots(
-                        slots,
-                        MemorySources::Shared(Vec::new()),
-                        total_records,
-                        (),
-                    ),
+                    MergeDriver::<TemplateKey>::from_slots(slots, Vec::new(), total_records, None),
                     demand,
                 ))
             }
             TemplateChunks::K24(v) => Box::new(attach(
-                MergeDriver::<TemplateKey24>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<TemplateKey24>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::Cb32(v) => Box::new(attach(
-                MergeDriver::<CbKey32>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<CbKey32>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::Tert32(v) => Box::new(attach(
-                MergeDriver::<TertKey32>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<TertKey32>::from_slots(slots, v, total_records, ()),
                 demand,
             )),
             TemplateChunks::K40(v) => Box::new(attach(
-                MergeDriver::<TemplateKey>::from_slots(
-                    slots,
-                    MemorySources::Shared(v),
-                    total_records,
-                    (),
-                ),
+                MergeDriver::<TemplateKey>::from_slots(slots, v, total_records, None),
                 demand,
             )),
         },
@@ -731,7 +790,7 @@ fn absorb_phase2_event(
 ) -> io::Result<()> {
     match event {
         SortPhase2Event::SpillReady { slot, path: _, records_ingested_so_far } => {
-            if let std::collections::hash_map::Entry::Vacant(e) = slot_index.entry(slot.file_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = slot_index.entry(slot.slot_id()) {
                 e.insert(slots.len());
                 slots.push(slot);
             }
@@ -888,6 +947,11 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// through the windows phase 1 built against it. `None` merges against an
     /// empty table (class 0: correct, without the window shortcut).
     class_table: Option<Arc<QnClassTable>>,
+    /// Merge `fgumi merge`'s BAM inputs, not spill runs (see [`MergeInputs`]).
+    merge_inputs: Option<MergeInputs>,
+    /// The merge inputs' slots, kept beside the driver for the completion
+    /// check (`ensure_merge_inputs_read`); empty for a sort.
+    merge_input_slots: Vec<Arc<SortMergeSlot>>,
     /// The current stall episode (one episode spans every `Stalled` until the
     /// next `Produced` or `Done`).
     episode: StallEpisode,
@@ -908,10 +972,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
 /// [`fgumi_sort::ClaimedBlock::decompress_and_publish`] a `SortSpillDecompress`
 /// worker uses (same claim admission, same publish), and never reads the spill
 /// file.
-struct SelfServe<'a> {
-    decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
-    ledger: Option<&'a super::supply_ledger::SupplyLedger>,
-    window_budget: u64,
+pub(crate) struct SelfServe<'a> {
+    pub(crate) decomp: &'a mut Option<fgumi_sort::SpillBlockDecompressor>,
+    pub(crate) ledger: Option<&'a super::supply_ledger::SupplyLedger>,
+    pub(crate) window_budget: u64,
 }
 
 impl SelfServe<'_> {
@@ -926,7 +990,7 @@ impl SelfServe<'_> {
     /// # Errors
     /// A decompress failure: the slot is marked failed first, and the error
     /// names the slot as the merge's own failed-slot error does.
-    fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
+    pub(crate) fn run(&mut self, slot: &fgumi_sort::SortMergeSlot) -> io::Result<(u64, bool)> {
         let mut served = 0u64;
         loop {
             if let Some(block) = slot.bp_claim_raw(self.window_budget) {
@@ -1063,11 +1127,21 @@ impl<O: MergeOutput> SortMerge<O> {
             demand: None,
             awaiting: false,
             class_table: None,
+            merge_inputs: None,
+            merge_input_slots: Vec::new(),
             episode: StallEpisode::default(),
             ledger: None,
             decomp: None,
             window_budget: super::spill_decompress::reorder_window_budget(output_byte_limit),
         }
+    }
+
+    /// Merge `fgumi merge`'s BAM inputs instead of a sort's spill runs (see
+    /// [`MergeInputs`]).
+    #[must_use]
+    pub fn with_merge_inputs(mut self, mode: MergeInputs) -> Self {
+        self.merge_inputs = Some(mode);
+        self
     }
 
     /// Join the merge supply: share its merge demand (a stalled merge parks
@@ -1422,6 +1496,16 @@ impl<O: MergeOutput> SortMerge<O> {
                     });
                 }
                 NextBatch::Done(partial, merged) => {
+                    // Before the last batch leaves: a merge of BAM inputs has
+                    // no ingested count to check against (its records are read
+                    // by the merge itself), so it checks every input was read
+                    // to its end instead.
+                    match &self.merge_inputs {
+                        Some(mode) => {
+                            ensure_merge_inputs_read(&self.merge_input_slots, &mode.inputs)?;
+                        }
+                        None => ensure_all_records_merged(self.processed, merged)?,
+                    }
                     if let Some(batch) = partial
                         && let Err(unpushed) = ctx.outputs.push(batch)
                     {
@@ -1429,7 +1513,7 @@ impl<O: MergeOutput> SortMerge<O> {
                         self.held.put(unpushed);
                         return Ok(StepOutcome::Progress);
                     }
-                    ensure_all_records_merged(self.processed, merged)?;
+                    self.merge_input_slots.clear();
                     log::info!("Sort merge complete: {merged} records merged");
                     // INSTRUMENTATION (lever-2): is the serial merge starved on
                     // decompress (stalls/contention high) or blocked on the
@@ -1897,14 +1981,26 @@ impl<O: MergeOutput> SortMerge<O> {
                 SortMergeState::FastPath { chunk, cursor: 0, total, builder, next_ordinal: 0 };
             return Ok(());
         }
-        let driver = build_driver(
-            self.sort_order,
-            slots,
-            memory_chunks,
-            total_records,
-            self.demand.as_ref(),
-            self.class_table.as_ref(),
-        )?;
+        let driver = match &self.merge_inputs {
+            Some(mode) => build_merge_inputs_driver(
+                self.sort_order,
+                {
+                    self.merge_input_slots.clone_from(&slots);
+                    slots
+                },
+                self.demand.as_ref(),
+                self.class_table.as_ref(),
+                mode,
+            )?,
+            None => build_driver(
+                self.sort_order,
+                slots,
+                memory_chunks,
+                total_records,
+                self.demand.as_ref(),
+                self.class_table.as_ref(),
+            )?,
+        };
         let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         // Seed the first buffer modestly; subsequent buffers are sized from the
         // prior batch's actual byte length (see `next_batch`).
@@ -1936,8 +2032,9 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             // `effective_branch_orderings`), so the output transport — a direct
             // byte-bounded queue, no reorder stage — is byte-for-byte identical;
             // the LoserTree core, source order (`slots.sort_by_key(file_id)` +
-            // residual last), and tie-break are untouched. SortMerge is only ever
-            // built by the sort chain's `add_sort`, so this is sort-chain-only.
+            // residual last), and tie-break are untouched. SortMerge is built by
+            // the sort chain's `add_sort` and by `fgumi merge`'s `build_merge`
+            // (with merge inputs); both place it on this detached driver thread.
             kind: StepKind::Detached,
             sticky: false,
             output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
@@ -1956,8 +2053,8 @@ impl<O: MergeOutput> Step for SortMerge<O> {
         SPECS
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.fast_path_cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.fast_path_cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {

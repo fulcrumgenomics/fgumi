@@ -3,11 +3,7 @@
 //! This module provides a reader that bypasses noodles Record objects,
 //! reading raw BAM bytes directly from BGZF blocks. This eliminates
 //! per-record allocation and deserialization overhead.
-//!
-//! `BatchedRawBamReader` is currently unused but retained as an alternative
-//! batched reader for future workloads that benefit from larger I/O units.
 
-#![allow(dead_code)]
 //!
 //! # Architecture
 //!
@@ -383,55 +379,6 @@ impl<R: Read> Iterator for RawBamRecordReader<R> {
     }
 }
 
-/// A batched raw BAM record reader for reduced channel overhead.
-///
-/// Similar to `RawBamRecordReader` but yields batches of records.
-pub struct BatchedRawBamReader<R: Read> {
-    inner: RawBamRecordReader<R>,
-    batch_size: usize,
-}
-
-impl<R: Read> BatchedRawBamReader<R> {
-    /// Create a new batched reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the input is not a valid BAM file.
-    pub fn new(reader: R, batch_size: usize) -> io::Result<Self> {
-        Ok(Self { inner: RawBamRecordReader::new(reader)?, batch_size })
-    }
-
-    /// Skip the BAM header.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the header is already skipped or the header is truncated.
-    pub fn skip_header(&mut self) -> io::Result<Vec<u8>> {
-        self.inner.skip_header()
-    }
-
-    /// Read the next batch of records.
-    ///
-    /// Returns `None` at EOF, otherwise returns a vector of records.
-    /// The vector may be smaller than `batch_size` at the end of the file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a record is truncated or invalid.
-    pub fn next_batch(&mut self) -> io::Result<Option<Vec<RawRecord>>> {
-        let mut batch = Vec::with_capacity(self.batch_size);
-
-        for _ in 0..self.batch_size {
-            match self.inner.next_record()? {
-                Some(record) => batch.push(record),
-                None => break,
-            }
-        }
-
-        if batch.is_empty() { Ok(None) } else { Ok(Some(batch)) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,35 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn test_batched_reader() {
-        let rec_a = make_minimal_record(b"A");
-        let rec_b = make_minimal_record(b"B");
-        let rec_c = make_minimal_record(b"C");
-        let data =
-            build_test_bam("@HD\tVN:1.6\n", &[], &[rec_a.clone(), rec_b.clone(), rec_c.clone()]);
-        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 2)
-            .expect("failed to create batched reader");
-        reader.skip_header().expect("failed to skip header");
-
-        // First batch: 2 records
-        let batch1 = reader.next_batch().expect("failed to read batch 1").expect("batch 1");
-        assert_eq!(batch1.len(), 2);
-        assert_eq!(batch1[0].as_ref(), rec_a.as_slice());
-        assert_eq!(batch1[1].as_ref(), rec_b.as_slice());
-
-        // Second batch: 1 record (remainder)
-        let batch2 = reader.next_batch().expect("failed to read batch 2").expect("batch 2");
-        assert_eq!(batch2.len(), 1);
-        assert_eq!(batch2[0].as_ref(), rec_c.as_slice());
-
-        // No more batches
-        assert!(
-            reader.next_batch().expect("failed to read at end of batches").is_none(),
-            "Expected no more batches"
-        );
-    }
-
-    #[test]
     fn test_from_buf_reader() {
         let data = build_test_bam("@HD\tVN:1.6\n", &[("chr1", 500)], &[]);
         let buf_reader = BufReader::new(io::Cursor::new(data));
@@ -700,25 +618,5 @@ mod tests {
 
         // Verify no records
         assert!(reader.next_record().expect("failed to read at EOF").is_none());
-    }
-
-    #[test]
-    fn test_batched_reader_eof() {
-        let data = build_test_bam("@HD\tVN:1.6\n", &[], &[]);
-        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 10)
-            .expect("failed to create batched reader for empty BAM");
-        reader.skip_header().expect("failed to skip header");
-
-        // No records, should return None immediately
-        assert!(
-            reader.next_batch().expect("failed to read first batch").is_none(),
-            "Expected None for empty BAM"
-        );
-
-        // Calling again should still return None
-        assert!(
-            reader.next_batch().expect("failed to read second batch").is_none(),
-            "Expected None on repeated call"
-        );
     }
 }

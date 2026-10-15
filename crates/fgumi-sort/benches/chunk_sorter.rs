@@ -12,7 +12,7 @@
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fgumi_raw_bam::testutil::make_bam_bytes;
-use fgumi_sort::{RawExternalSorter, SortOrder};
+
 use noodles::sam::Header;
 
 /// Build `n` aligned records at scattered positions on tid 0 so the sort does
@@ -38,9 +38,7 @@ fn bench_materialize(c: &mut Criterion) {
     group.bench_function("coordinate_500k", |b| {
         b.iter_batched(
             || {
-                let mut sorter = RawExternalSorter::new(SortOrder::Coordinate)
-                    .threads(4)
-                    .into_coordinate_chunk_sorter(&Header::default())
+                let mut sorter = fgumi_sort::CoordinateChunkSorter::new(512 * 1024 * 1024, 0, 4)
                     .expect("build coordinate chunk sorter");
                 for r in &records {
                     sorter.push(r).expect("push");
@@ -55,10 +53,16 @@ fn bench_materialize(c: &mut Criterion) {
     group.bench_function("template_coordinate_500k", |b| {
         b.iter_batched(
             || {
-                let mut sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                    .threads(4)
-                    .into_template_chunk_sorter(&Header::default())
-                    .expect("build template chunk sorter");
+                let mut sorter = fgumi_sort::TemplateChunkSorter::new(
+                    512 * 1024 * 1024,
+                    fgumi_sort::TemplateKeySeed::from_header(
+                        &Header::default(),
+                        None,
+                        fgumi_sort::KeyTypesSpec::Auto,
+                    ),
+                    4,
+                )
+                .expect("build template chunk sorter");
                 for r in &records {
                     sorter.push(r).expect("push");
                 }

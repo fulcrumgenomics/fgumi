@@ -8,8 +8,8 @@
 //! pinned by slow compression through `SpillGather`'s bounded `pending` — plus
 //! the next fill), inflating peak RSS to ~2× base.
 //!
-//! This pool **bounds** the live arenas to `capacity` (default 1, matching
-//! legacy's one-arena-at-a-time `drain_pending_spill` model) and **reuses**
+//! This pool **bounds** the live arenas to `capacity` (default 1: one arena
+//! at a time, so the next chunk fills only once the previous one spilled) and **reuses**
 //! their storage: [`try_acquire`](ArenaPool::try_acquire) hands out a
 //! reset-for-reuse buffer or `None` when all `capacity` arenas are in flight
 //! (the caller backpressures with `NoProgress` until an in-flight chunk's `Arc`

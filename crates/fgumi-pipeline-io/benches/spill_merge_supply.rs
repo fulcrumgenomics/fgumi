@@ -271,7 +271,11 @@ fn run_supply(slots: &[Arc<SortMergeSlot>]) -> SupplyRun {
         memory_chunk_count: 0,
         total_records: 0,
     });
-    let supply = SpillSupply { demand: Arc::clone(&demand), ledger: Arc::clone(&ledger) };
+    let supply = SpillSupply {
+        demand: Arc::clone(&demand),
+        ledger: Arc::clone(&ledger),
+        retire_epoch: Arc::default(),
+    };
     let slices = SliceBufferPool::new(2 * THREADS + 8);
     let planner =
         SpillReadPlanner::new(12 << 30, THREADS, THREADS, LIMIT, &supply, Arc::clone(&slices))
@@ -292,6 +296,7 @@ fn run_supply(slots: &[Arc<SortMergeSlot>]) -> SupplyRun {
     };
     let builder = Pipeline::builder();
     let fan = builder.chain(Events { events, held: HeldSlot::new() }).chain(planner).into_multi();
+    fan.b2.chain(fgumi_pipeline_io::sort::NoConsolidation).into_sink_marker();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
     fan.b1.chain(consumer).into_sink_marker();
     let pipeline = builder.build().unwrap();
@@ -406,6 +411,7 @@ impl Step for Requests {
                     offset,
                     len,
                     last: offset + u64::from(len) == self.len,
+                    sequential: false,
                     target: ReadTarget::Input,
                 });
                 self.ordinal += 1;

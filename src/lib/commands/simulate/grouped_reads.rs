@@ -11,8 +11,7 @@ use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
     QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
     StrandBiasArgs, TemplateLocus, body_error_rng, build_sort_order_header_map,
-    convert_molecule_strand, generate_random_sequence, into_record_stream,
-    introduce_errors_inplace, pad_sequence,
+    convert_molecule_strand, generate_random_sequence, introduce_errors_inplace, pad_sequence,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -27,7 +26,7 @@ use fgumi_bam_io::{OutputFile, ProgressTracker, create_raw_bam_reader, create_ra
 use fgumi_raw_bam::{
     RawRecord, SamBuilder, aux_data_slice, find_string_tag, flags as raw_flags, update_string_tag,
 };
-use fgumi_sort::{KeyTypesSpec, RawExternalSorter, SortOrder};
+use fgumi_sort::{KeyTypesSpec, SortOrder};
 use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
@@ -253,48 +252,39 @@ impl Command for GroupedReads {
         let staged_bam = temp_sibling(&self.output, "staged");
         let staged_truth = temp_sibling(&self.truth_output, "staged");
 
-        let sorter = self
-            .sort_resources
-            .apply(
-                RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                    .threads(self.threads)
-                    .output_compression(TEMP_BAM_COMPRESSION_LEVEL)
-                    // grouped-reads always writes MI tags, so include the tertiary
-                    // (library|mi) lane in the template-coordinate key rather than
-                    // relying on first-record auto-detection (equivalent to
-                    // `fgumi sort --key-types mi`).
-                    .key_types(KeyTypesSpec::Explicit { cb: false, tertiary: true }),
-                self.threads,
-            )
+        let mut sort = crate::commands::sort::SortOptions {
+            order: crate::commands::sort::SortOrderArg::TemplateCoordinate,
+            // grouped-reads always writes MI tags, so include the tertiary
+            // (library|mi) lane in the template-coordinate key rather than
+            // relying on first-record auto-detection (equivalent to
+            // `fgumi sort --key-types mi`).
+            key_types: Some(KeyTypesSpec::Explicit { cb: false, tertiary: true }),
+            ..crate::commands::sort::SortOptions::default()
+        };
+        self.sort_resources
+            .apply_to(&mut sort, self.threads)
             .context("Failed to configure the sort for simulated reads")?;
 
-        let (sink, records) = RecordSink::new();
-
-        // Generation runs on its own thread so it overlaps the sort's accumulate,
-        // spill, and merge work. `scope` lets it borrow the reference genome and
-        // parameters instead of cloning them. `sink` is moved into the closure so
-        // its sender is dropped when generation ends — that is what signals
-        // end-of-stream to the sort.
-        let total_pairs = std::thread::scope(|scope| -> Result<usize> {
-            let generator = scope.spawn(|| {
+        // Generation runs on its own thread (`run_simulated_sort`), overlapping
+        // the sort chain's ingest, spill and merge work, and borrows the
+        // reference genome and parameters instead of cloning them.
+        let (total_pairs, _) = super::common::run_simulated_sort(
+            |tx| {
                 self.generate_records(
-                    sink,
+                    RecordSink::from_sender(tx),
                     &temp_truth,
                     &params,
                     &ref_genome,
                     &position_table,
                     &mut seed_rng,
                 )
-            });
-
-            // Consumes `records`, so a sort failure drops the receiver and the
-            // generator's next `send` returns false, unblocking it.
-            sorter
-                .sort_records(into_record_stream(records), &header, &temp_bam)
-                .context("Failed to template-coordinate sort simulated reads")?;
-
-            generator.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-        })?;
+            },
+            &header,
+            &temp_bam,
+            &sort,
+            self.threads,
+            TEMP_BAM_COMPRESSION_LEVEL,
+        )?;
 
         // Renumber the sorted temp BAM and remap the truth TSV (written during
         // generation with the pre-sort ids) into their staging paths, then publish
@@ -542,7 +532,7 @@ impl GroupedReads {
             // Flush the final partial batch, then close the stream.
             Ok(total_pairs) => {
                 // `false` means the sort had already hung up on its own error,
-                // which `sort_records` surfaces; reporting ours would mask it.
+                // which `run_simulated_sort` surfaces; reporting ours would mask it.
                 let _delivered = sink.finish();
                 Ok(total_pairs)
             }

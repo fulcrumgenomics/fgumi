@@ -3,10 +3,9 @@
 //!
 //! A spill chunk is either a BGZF block-stream (self-framed `1f 8b` blocks) or
 //! a zstd "ZSP1" stream (`[u32 LE frame-len][zstd frame]` records after the
-//! 4-byte file magic). Both standalone `fgumi sort` (via the worker pool) and
-//! the fused streaming sort write spill chunks with whichever
-//! [`SpillCodec`] the sorter is configured for; this
-//! decompressor lets the streaming `SortSpillDecompress` step read either.
+//! 4-byte file magic). The sort's spill steps write spill chunks with whichever
+//! [`SpillCodec`] the sort is configured for; this decompressor lets the
+//! `SortSpillDecompress` step read either.
 //!
 //! Each decompressed BGZF block (or zstd frame) is returned as one `Vec<u8>`.
 //! The block/frame boundaries are immaterial: the downstream `MergeDriver`
@@ -22,7 +21,6 @@ use libdeflater::Decompressor as BgzfDecompressor;
 use zstd::bulk::Decompressor as ZstdDecompressor;
 
 use crate::codec::SpillCodec;
-use crate::worker_pool::read_length_prefix;
 
 /// Hard cap on the `u32 LE` length prefix of any zstd spill frame, shared by
 /// every spill reader. Frames are produced one per ~64 KiB of input; even
@@ -220,9 +218,9 @@ pub(crate) fn checked_zstd_len(prefix: &[u8]) -> io::Result<usize> {
     Ok(len)
 }
 
-/// Output staging-buffer capacity for a single decompressed block/frame. Mirrors
-/// the worker pool's `ZSTD_FRAME_DECOMP_CAP` / `BgzfDecompress` scratch sizing so
-/// the mimalloc size-class reuse pattern matches.
+/// Output staging-buffer capacity for a single decompressed block/frame: the
+/// largest zstd frame a spill writer produces, so the scratch stays in one
+/// mimalloc size class across blocks.
 const SCRATCH_CAP: usize = 256 * 1024;
 
 /// Ceiling for sizing the scratch buffer up from [`SCRATCH_CAP`].
@@ -500,13 +498,91 @@ impl Default for SpillBlockDecompressor {
     }
 }
 
+/// Read exactly `buf.len()` bytes, distinguishing clean EOF from truncation.
+///
+/// Returns `Ok(true)` when `buf` is fully filled, `Ok(false)` when zero bytes are
+/// available (clean EOF), and `Err` for any partial read or I/O error.
+pub(crate) fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return if offset == 0 {
+                    Ok(false) // clean EOF
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("truncated chunk: read {} of {} bytes", offset, buf.len()),
+                    ))
+                };
+            }
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Read a `u32 LE` length prefix and validate it against `MAX_ZSTD_FRAME_BYTES`.
+///
+/// Returns `Ok(None)` only when the reader is at a clean frame boundary (no
+/// bytes consumed before EOF). A 1–3-byte partial prefix surfaces as
+/// `UnexpectedEof` so truncation is not silently treated as a clean stop.
+pub(crate) fn read_length_prefix<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+) -> std::io::Result<Option<usize>> {
+    let mut first = [0u8; 1];
+    // Retry an interrupted read, as `read_exact_or_eof` and the `read_exact`
+    // below do: EINTR at a frame boundary is not an error.
+    loop {
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(n) => {
+                return Err(std::io::Error::other(format!(
+                    "Read returned {n} bytes for a 1-byte buffer",
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut rest = [0u8; 3];
+    reader.read_exact(&mut rest)?;
+    let len_buf = [first[0], rest[0], rest[1], rest[2]];
+    checked_zstd_len(&len_buf).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pooled_chunk_writer::PooledChunkWriter;
-    use crate::worker_pool::SortWorkerPool;
     use std::io::Cursor;
-    use std::sync::Arc;
+
+    /// Write `records` as a coordinate-keyed spill file through the production
+    /// block kernel (`frame_keyed_record_into` + `SpillBlockCompressor`), cutting
+    /// a block whenever it reaches 64 KiB, bracketed by the codec magic and
+    /// trailer.
+    fn write_keyed_spill(path: &std::path::Path, codec: SpillCodec, records: &[Vec<u8>]) {
+        use crate::keys::{RawCoordinateKey, RawSortKey};
+        use std::io::Write as _;
+        let mut comp = crate::spill_block::SpillBlockCompressor::new(codec, 6).expect("compressor");
+        let mut out = std::fs::File::create(path).expect("create");
+        out.write_all(crate::spill_block::spill_magic(codec)).expect("magic");
+        let mut block = Vec::new();
+        for rec in records {
+            let key = RawCoordinateKey::extract_from_record(rec);
+            crate::spill_block::frame_keyed_record_into(&mut block, &key, rec).expect("frame");
+            if block.len() >= 64 * 1024 {
+                out.write_all(&comp.compress_block(&block).expect("compress")).expect("write");
+                block.clear();
+            }
+        }
+        if !block.is_empty() {
+            out.write_all(&comp.compress_block(&block).expect("compress")).expect("write");
+        }
+        out.write_all(crate::spill_block::spill_trailer(codec)).expect("trailer");
+    }
 
     /// A length prefix that promises more bytes than follow must surface
     /// `UnexpectedEof` from BOTH zstd read paths.
@@ -616,7 +692,6 @@ mod tests {
     /// stream that was written — for BOTH codecs. This is the round-trip the
     /// streaming merge depends on.
     fn roundtrip(codec: SpillCodec) {
-        use crate::keys::{RawCoordinateKey, RawSortKey};
         // Build framed records whose total size (~440 KB) far exceeds the
         // writer's ~64 KB block cap, so the chunk is written as MANY blocks /
         // frames. That is what actually exercises the per-block decompress and
@@ -638,22 +713,14 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("chunk.spill");
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
-        {
-            let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
-                .expect("writer");
-            for rec in &records {
-                let key = RawCoordinateKey::extract_from_record(rec);
-                w.write_record(&key, rec).expect("write");
-            }
-            w.start_finish().expect("start_finish").wait().expect("finish");
-        }
+        write_keyed_spill(&path, codec, &records);
 
         // Re-open + position past the codec magic exactly like
         // slots_for_chunk_files does.
         let mut file = std::fs::File::open(&path).expect("open");
         let mut magic = [0u8; 4];
-        let filled = crate::external::read_exact_or_eof(&mut file, &mut magic).expect("magic");
+        let filled =
+            crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic).expect("magic");
         let detected = if filled {
             SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
         } else {
@@ -706,8 +773,6 @@ mod tests {
     /// `SortSpillDecompress`) must yield the exact same per-block bytes as the
     /// inline `read_blocks` path. We read the same chunk twice and compare.
     fn read_raw_matches_read_blocks(codec: SpillCodec) {
-        use crate::keys::{RawCoordinateKey, RawSortKey};
-
         let records: Vec<Vec<u8>> = (0usize..80)
             .map(|i| {
                 let size = 3000 + (i % 13) * 500;
@@ -722,22 +787,14 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("chunk.spill");
-        let pool = Arc::new(SortWorkerPool::new(1, 1, 6, codec));
-        {
-            let mut w = PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &path, codec)
-                .expect("writer");
-            for rec in &records {
-                let key = RawCoordinateKey::extract_from_record(rec);
-                w.write_record(&key, rec).expect("write");
-            }
-            w.start_finish().expect("start_finish").wait().expect("finish");
-        }
+        write_keyed_spill(&path, codec, &records);
 
         // Helper: open the chunk positioned past any codec magic.
         let open = || {
             let mut file = std::fs::File::open(&path).expect("open");
             let mut magic = [0u8; 4];
-            let filled = crate::external::read_exact_or_eof(&mut file, &mut magic).expect("magic");
+            let filled =
+                crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic).expect("magic");
             let detected = if filled {
                 SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
             } else {
@@ -961,5 +1018,151 @@ mod tests {
         p.push(&pool.lease(stream[body_start(codec)..stream.len() - 40].to_vec()), &mut Vec::new())
             .unwrap();
         assert_eq!(p.finish().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[cfg(test)]
+mod read_exact_tests {
+    use super::*;
+    use rstest::rstest;
+    use std::io::Cursor;
+
+    // ========================================================================
+    // read_exact_or_eof tests
+    // ========================================================================
+
+    /// A `Read` impl that returns at most one byte per `read()` call. This is
+    /// legal for `Read` (which may return any `0 < n <= buf.len()`) and is what
+    /// motivates using `read_exact_or_eof` over a single `read()` call for
+    /// fixed-size magic-byte detection.
+    struct OneBytePerRead<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+    impl std::io::Read for OneBytePerRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() || self.pos >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_clean_eof() {
+        // Empty stream -> Ok(false), buffer untouched.
+        let mut src: &[u8] = &[];
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("clean eof");
+        assert!(!filled, "clean EOF should return Ok(false)");
+        assert_eq!(buf, [0u8; 4]);
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_full_read() {
+        // Source has exactly buf.len() bytes -> Ok(true), buffer filled.
+        let mut src: &[u8] = b"ZSP1";
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("full read");
+        assert!(filled, "full read should return Ok(true)");
+        assert_eq!(&buf, b"ZSP1");
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_short_reads_fill_buffer() {
+        // Regression: a `Read` impl that returns 1 byte per call must still
+        // fill the 4-byte buffer. A naive single `read()` would only get 1
+        // byte and `SpillCodec::from_magic` would return None, silently
+        // routing a real ZSP1 spill through the uncompressed fallback path.
+        let mut src = OneBytePerRead { bytes: b"ZSP1", pos: 0 };
+        let mut buf = [0u8; 4];
+        let filled = read_exact_or_eof(&mut src, &mut buf).expect("short-read source");
+        assert!(filled, "partial reads should still fill the buffer");
+        assert_eq!(&buf, b"ZSP1");
+        // And `from_magic` correctly identifies the codec from the filled
+        // buffer — proving the original bug is fixed end-to-end.
+        assert_eq!(
+            crate::codec::SpillCodec::from_magic(&buf),
+            Some(crate::codec::SpillCodec::Zstd)
+        );
+    }
+
+    #[test]
+    fn test_read_exact_or_eof_truncated_is_error() {
+        // Source has fewer bytes than requested but is non-empty:
+        // must error with UnexpectedEof (not silently report short fill).
+        let mut src: &[u8] = b"ZSP"; // only 3 of 4 bytes
+        let mut buf = [0u8; 4];
+        let err = read_exact_or_eof(&mut src, &mut buf).expect_err("truncated read should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A reader that reports `Interrupted` before each of its first reads,
+    /// then serves `inner`.
+    struct InterruptFirst<R> {
+        inner: R,
+        interrupts: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for InterruptFirst<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// An interrupted read at a frame boundary is retried, not surfaced: the
+    /// prefix still parses, and a clean EOF behind the interruption is still
+    /// `None`.
+    #[test]
+    fn test_read_length_prefix_retries_an_interrupted_first_byte() {
+        let mut reader = InterruptFirst { inner: Cursor::new(7u32.to_le_bytes()), interrupts: 2 };
+        assert_eq!(read_length_prefix(&mut reader).expect("retried"), Some(7));
+        let mut empty = InterruptFirst { inner: Cursor::new(Vec::<u8>::new()), interrupts: 1 };
+        assert_eq!(read_length_prefix(&mut empty).expect("retried"), None);
+    }
+    #[test]
+    fn test_read_length_prefix_clean_eof_returns_none() {
+        // No bytes available at all → clean stream end.
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let got = read_length_prefix(&mut reader).expect("clean EOF must not be an error");
+        assert!(got.is_none(), "empty reader must yield Ok(None), got {got:?}");
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn test_read_length_prefix_partial_prefix_is_unexpected_eof(#[case] partial: usize) {
+        // 1–3 bytes after a frame boundary is a truncated length prefix, not a
+        // clean EOF; the parser must surface UnexpectedEof so corruption is not
+        // silently swallowed.
+        let bytes = vec![0xABu8; partial];
+        let err = read_length_prefix(&mut Cursor::new(bytes))
+            .expect_err("partial prefix must error, partial={partial}");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "partial={partial}, got {err:?}");
+    }
+
+    #[test]
+    fn test_read_length_prefix_oversized_is_invalid_data() {
+        let bogus_len: u32 =
+            u32::try_from(MAX_ZSTD_FRAME_BYTES).expect("MAX_ZSTD_FRAME_BYTES fits u32") + 1;
+        let buf = bogus_len.to_le_bytes().to_vec();
+        let err =
+            read_length_prefix(&mut Cursor::new(buf)).expect_err("oversized length must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_length_prefix_valid() {
+        let valid_len: u32 = 1234;
+        let buf = valid_len.to_le_bytes().to_vec();
+        let got = read_length_prefix(&mut Cursor::new(buf)).expect("valid prefix");
+        assert_eq!(got, Some(valid_len as usize));
     }
 }

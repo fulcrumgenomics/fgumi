@@ -9,7 +9,7 @@
 //! - `try_run` returns `Progress` when it took, pushed or newly held an item, `NoProgress`
 //!   when there's nothing useful to do this call (input empty but not drained,
 //!   no held items), `Contention` when a Serial-step mutex is held by another
-//!   worker, and `Capped` when a `Parallel` step's shared [`PhaseCap`] refused
+//!   worker, and `Capped` when a `Parallel` step's shared [`PhaseCap`](crate::admission::PhaseCap) refused
 //!   this worker; the scheduler reroutes either way.
 //!
 //! **Last-worker barrier for `Parallel` steps.** A `Parallel` step has one
@@ -244,7 +244,7 @@ pub enum StepOutcome {
     /// that push's forward wake. Returning `Progress` after a flush remains
     /// correct.
     Contention,
-    /// Work may exist, but the step's shared [`PhaseCap`] refused this worker
+    /// Work may exist, but the step's shared [`PhaseCap`](crate::admission::PhaseCap) refused this worker
     /// admission (see [`crate::admission`]). Scheduled exactly like
     /// `Contention`; counted separately so a deliberately binding cap is not
     /// reported as mutex thrash.
@@ -278,7 +278,7 @@ use std::io;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
-use crate::admission::PhaseCap;
+use crate::admission::StepCapRef;
 // `StepCounters` is a leaf counter-handle (an `Option<Arc<[AtomicU64]>>` with no
 // runtime logic) that lives with its primary owner `ChainContexts` in
 // `runtime::contexts`; the ctx types below hold a `&StepCounters`. This one
@@ -461,11 +461,15 @@ pub trait Step: Send + Sized + 'static {
 
     /// The admission cap this step *instance* shares with the other steps of
     /// its phase, if the chain builder gave it one; `None` means uncapped (the
-    /// default). Read by [`crate::Pipeline::dag`] (rendered as
-    /// `cap=<name>(<max>)`), so caps can be reviewed without running, and by
-    /// `Pipeline::run`, which binds the run's cancel signal to it. The builder,
-    /// not the step type, decides the phase: a `BgzfCompress` is capped on the
-    /// standalone-sort terminal and uncapped everywhere else.
+    /// default). A [`StepCapRef::Fixed`] is one [`PhaseCap`](crate::admission::PhaseCap); a
+    /// [`StepCapRef::Phased`] switches between two (`PhasedCap`). This one hook is
+    /// the only cap a step reports: the admitting cap
+    /// ([`ErasedStep::phase_cap`](crate::ErasedStep::phase_cap)), the
+    /// `cap=` label [`crate::Pipeline::dag`] renders, and the caps
+    /// `Pipeline::run` binds to its cancel signal and waker (both arms of a
+    /// phased cap) are all derived from it, so they cannot disagree. The
+    /// builder, not the step type, decides the phase: a `BgzfCompress` is
+    /// capped on the standalone-sort terminal and uncapped everywhere else.
     ///
     /// Two kinds of step report a cap, and each must take its permits from that
     /// same cap, or the DAG would advertise a limit the step never applies:
@@ -474,7 +478,7 @@ pub trait Step: Send + Sized + 'static {
     ///   decompress steps, and the output compressor) take one permit per item
     ///   through [`crate::admission::admit_input`] (or
     ///   [`PhaseCap::try_acquire`](crate::admission::PhaseCap::try_acquire)
-    ///   around a narrower section).
+    ///   around a narrower section), passing [`StepCapRef::active`].
     /// - **Serial / Detached steps with off-pool parallel work** (`SortBuffer`
     ///   and the split front's `Sort*Run` for the per-run sort, `SortMerge` for the
     ///   in-memory fast-path gather) take the whole cap for that work through
@@ -482,7 +486,7 @@ pub trait Step: Send + Sized + 'static {
     ///   which may park the step until the cap's pool holders finish their
     ///   current items. Their serial part (one worker or driver thread) is not
     ///   counted against the cap.
-    fn phase_cap(&self) -> Option<&PhaseCap> {
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
         None
     }
 

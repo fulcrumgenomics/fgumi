@@ -11,8 +11,7 @@ use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, PositionDistArgs,
     QualityArgs, RecordSink, ReferenceArgs, ReferenceGenome, SimulationCommon, SortResourceArgs,
     TemplateLocus, body_error_rng, build_sort_order_header_map, convert_molecule_strand,
-    generate_random_sequence, into_record_stream, introduce_errors_inplace, pad_sequence,
-    validate_rate,
+    generate_random_sequence, introduce_errors_inplace, pad_sequence, validate_rate,
 };
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
@@ -26,7 +25,7 @@ use clap::Parser;
 use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
-use fgumi_sort::{RawExternalSorter, SortOrder};
+use fgumi_sort::SortOrder;
 use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
@@ -235,27 +234,21 @@ impl Command for MappedReads {
         // sorted chunks exactly like `fgumi sort` would.
         info!("Generating records and sorting into template-coordinate order...");
 
-        let sorter = self
-            .sort_resources
-            .apply(
-                RawExternalSorter::new(SortOrder::TemplateCoordinate)
-                    .threads(self.threads)
-                    .output_compression(self.compression.compression_level),
-                self.threads,
-            )
+        let mut sort = crate::commands::sort::SortOptions {
+            order: crate::commands::sort::SortOrderArg::TemplateCoordinate,
+            ..crate::commands::sort::SortOptions::default()
+        };
+        self.sort_resources
+            .apply_to(&mut sort, self.threads)
             .context("Failed to configure the sort for simulated reads")?;
 
-        let (sink, records) = RecordSink::new();
-
-        // Generation runs on its own thread so it overlaps the sort's accumulate,
-        // spill, and merge work. `scope` lets it borrow the reference genome and
-        // parameters instead of cloning them. `sink` is moved into the closure so
-        // its sender is dropped when generation ends — that is what signals
-        // end-of-stream to the sort.
-        let total_pairs = std::thread::scope(|scope| -> Result<usize> {
-            let generator = scope.spawn(|| {
+        // Generation runs on its own thread (`run_simulated_sort`), overlapping
+        // the sort chain's ingest, spill and merge work, and borrows the
+        // reference genome and parameters instead of cloning them.
+        let (total_pairs, _) = super::common::run_simulated_sort(
+            |tx| {
                 self.generate_records(
-                    sink,
+                    RecordSink::from_sender(tx),
                     &params,
                     &ref_genome,
                     &position_table,
@@ -263,16 +256,13 @@ impl Command for MappedReads {
                     &mut seed_rng,
                     &mut unmapped_rng,
                 )
-            });
-
-            // Consumes `records`, so a sort failure drops the receiver and the
-            // generator's next `send` returns false, unblocking it.
-            sorter
-                .sort_records(into_record_stream(records), &header, &self.output)
-                .context("Failed to template-coordinate sort simulated reads")?;
-
-            generator.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-        })?;
+            },
+            &header,
+            &self.output,
+            &sort,
+            self.threads,
+            self.compression.compression_level,
+        )?;
 
         info!("Generated {total_pairs} read pairs");
         info!("Done");
@@ -316,7 +306,7 @@ impl MappedReads {
             // Flush the final partial batch, then close the stream.
             Ok(total_pairs) => {
                 // `false` means the sort had already hung up on its own error,
-                // which `sort_records` surfaces; reporting ours would mask it.
+                // which `run_simulated_sort` surfaces; reporting ours would mask it.
                 let _delivered = sink.finish();
                 Ok(total_pairs)
             }

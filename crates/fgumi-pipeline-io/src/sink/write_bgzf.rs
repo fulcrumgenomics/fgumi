@@ -121,8 +121,7 @@ impl WriteBgzfFile {
     ///
     /// Opens the sink through [`open_output_writer`], so `-`/`/dev/stdout`
     /// stream to the pipe rather than creating a regular file with that name
-    /// (mirrors the owned sort engine's `PooledBamWriter::new_inner`, the only
-    /// other production BAM writer in the tree, and `WriteRawFile::new`, which
+    /// (mirrors `WriteRawFile::new`, which
     /// opens the FASTQ sink through the same `open_output_sink`). `SinkSpec::BamWithIndex` still rejects
     /// stdout upstream in `add_sink` (`with_bai_index` requires a seekable
     /// sidecar path), so this only ever streams for the plain `SinkSpec::Bam`

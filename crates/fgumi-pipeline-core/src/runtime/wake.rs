@@ -67,7 +67,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::admission::PhaseCap;
+use crate::admission::{PhaseCap, StepCap};
 use crate::padded::Padded;
 use crate::queues::{BoundedQueueHandle, HolderQueue, SEALED};
 use crate::runtime::contexts::{RegisteredHolderOnlyQueue, RegisteredQueue};
@@ -121,10 +121,11 @@ struct BranchWake {
     /// is then `None`). Read only by `on_flushed`.
     same_thread: bool,
     /// The branch's consumer, for its phase cap (`WakePlan::caps`, stored
-    /// once per step). A `Pool` wake for it claims a cap-parked worker only
-    /// while that cap admits (`PhaseCap::has_free_permit`): when it is full,
-    /// the worker would only be refused again, and the cap's release wakes the
-    /// threads recorded on it.
+    /// once per step; a phased cap's active arm). A `Pool` wake for it claims
+    /// a cap-parked worker only while that cap admits
+    /// (`PhaseCap::has_free_permit`): when it is full, the worker would only
+    /// be refused again, and the cap's release wakes the threads recorded on
+    /// it.
     consumer: Option<StepIdx>,
     /// `Some` ⇒ a `Pool` target whose consumer has clones on only some workers
     /// (`ParallelHosts::workers`): one bit per host worker. The direct-park and
@@ -318,11 +319,13 @@ pub struct WakePlan {
     /// still deliver there: the queue-memory rebalancer's holder wakes
     /// ([`Self::wake_holders`]) reach the lone worker of a one-thread run.
     gates: bool,
-    /// By `StepIdx`: the phase cap the step reports, if any. Empty in the
-    /// standalone plan.
-    caps: Box<[Option<Arc<PhaseCap>>]>,
-    /// Each cap in `caps` once, in a fixed order: a cap's position here is its
-    /// run index (`PhaseCap::set_plan_index`), the bit a worker's
+    /// By `StepIdx`: the cap the step reports, if any — a phased cap as its
+    /// selector, so every lookup reads the arm active now (a sort's supply
+    /// steps switch arms mid-run). Empty in the standalone plan.
+    caps: Box<[Option<StepCap>]>,
+    /// Each cap in `caps` once — both arms of a phased cap — in a fixed
+    /// order: a cap's position here is its run index
+    /// (`PhaseCap::set_plan_index`), the bit a worker's
     /// thread-local record masks use for it, which is what lets a pass start
     /// tell which wakes the thread owes ([`Self::start_pass`]). The dedup is
     /// what makes the index well defined for a cap several steps share.
@@ -338,15 +341,17 @@ pub struct WakePlan {
     request_pending: Padded<AtomicBool>,
 }
 
-/// Each distinct cap among `caps` once, in step order, each told its index
+/// Each distinct cap among `caps` once — every arm of a phased cap, the one
+/// inactive at run start included — in step order, each told its index
 /// in the list (`PhaseCap::set_plan_index`): the bit a worker's record masks
 /// use for it.
 ///
 /// # Panics
 ///
 /// Panics if `caps` holds more than `MAX_PHASE_CAPS` distinct caps.
-fn index_caps(caps: &[Option<Arc<PhaseCap>>]) -> Box<[Arc<PhaseCap>]> {
-    let distinct = crate::admission::distinct_caps(caps.iter().flatten().map(|c| &**c));
+fn index_caps(caps: &[Option<StepCap>]) -> Box<[Arc<PhaseCap>]> {
+    let distinct =
+        crate::admission::distinct_caps(caps.iter().flatten().flat_map(|c| c.view().bound_caps()));
     // `PipelineBuilder::build` refuses such a pipeline; this is the backstop
     // for a plan built any other way.
     assert!(
@@ -403,7 +408,8 @@ impl WakePlan {
     /// affinity target, range-checked, or Exclusive owner); `driver_of[i]` the
     /// driver hosting a Detached step; `caps[i]` the phase cap step `i`
     /// reports (a step past the end of a shorter slice, `&[]` included, is
-    /// uncapped); `edges` the bounded transports, by kind.
+    /// uncapped; [`Self::build_with_hosts`] also takes a phased one); `edges`
+    /// the bounded transports, by kind.
     ///
     /// Gates: every producer's byte-bounded branch, whatever the producer's
     /// kind, wakes its consumer only if the dispatch pushed; on an ordered
@@ -436,12 +442,14 @@ impl WakePlan {
         pool: Option<Arc<PoolEventCount>>,
         n_threads: usize,
     ) -> Arc<Self> {
+        let caps: Vec<Option<StepCap>> =
+            caps.iter().map(|c| c.clone().map(StepCap::Fixed)).collect();
         Self::build_with_hosts(
             graph,
             kinds,
             pinned_worker,
             driver_of,
-            caps,
+            &caps,
             edges,
             pool,
             n_threads,
@@ -468,7 +476,7 @@ impl WakePlan {
         kinds: &[StepKind],
         pinned_worker: &[Option<usize>],
         driver_of: &[Option<DriverIdx>],
-        caps: &[Option<Arc<PhaseCap>>],
+        caps: &[Option<StepCap>],
         edges: WakeEdges<'_>,
         pool: Option<Arc<PoolEventCount>>,
         n_threads: usize,
@@ -566,8 +574,7 @@ impl WakePlan {
             .collect();
         tracked.sort_by_key(|&(s, b)| (s.0, b.0));
         tracked.dedup();
-        let caps: Box<[Option<Arc<PhaseCap>>]> =
-            (0..n).map(|i| caps.get(i).cloned().flatten()).collect();
+        let caps: Box<[Option<StepCap>]> = (0..n).map(|i| caps.get(i).cloned().flatten()).collect();
         let distinct_caps = index_caps(&caps);
 
         Arc::new(Self {
@@ -974,10 +981,11 @@ impl WakePlan {
         Self::fence_arm(parking || cap)
     }
 
-    /// The phase cap `step` reports, if any (`None` in the standalone plan).
+    /// The cap `step` admits through now, if any: a phased cap's active arm
+    /// (`None` while that phase is uncapped, and in the standalone plan).
     #[inline]
     fn cap_of(&self, step: StepIdx) -> Option<&PhaseCap> {
-        self.caps.get(step.0).and_then(Option::as_deref)
+        self.caps.get(step.0).and_then(Option::as_ref).and_then(StepCap::active)
     }
 
     /// Whether a worker woken for `consumer` could be admitted there: it is
@@ -3141,6 +3149,52 @@ mod tests {
         }
     }
 
+    /// A phased consumer is routed by the arm active when the plan asks, not
+    /// the arm active when it was built: after the switch to phase two, a
+    /// cap-parked re-poll skips exactly when the phase-2 arm is full, whatever
+    /// the phase-1 arm holds, and the pool fallback claims a cap-parked worker
+    /// only while the phase-2 arm has room. Both arms carry a run index, so a
+    /// refusal on the phase-2 arm is tracked for wake forwarding. Catches: the
+    /// plan keeping the build-time arm (`phase_cap()` at run start), and
+    /// indexing only that arm.
+    #[rstest]
+    #[case::phase2_full_phase1_idle(0, 1, true)]
+    #[case::phase2_free_phase1_full(1, 0, false)]
+    fn a_phased_consumer_is_routed_by_its_active_arm(
+        #[case] held1: usize,
+        #[case] held2: usize,
+        #[case] skip: bool,
+    ) {
+        use crate::admission::{CapPhase, PhasedCap};
+        let c1 = crate::PhaseCap::new("p1", 1);
+        let c2 = crate::PhaseCap::new("p2", 1);
+        let phased = PhasedCap::new(Some(Arc::clone(&c1)), Some(Arc::clone(&c2))).unwrap();
+        let mut g = ChainGraph::new();
+        let d = g.register_step("Det", 1);
+        let p = g.register_step("Par", 0);
+        g.wire(d, BranchIdx(0), p);
+        let plan = WakePlan::build_with_hosts(
+            &g,
+            &[StepKind::Detached, StepKind::Parallel],
+            &[None, None],
+            &[Some(DriverIdx(0)), None],
+            &[None, Some(StepCap::Phased(Arc::clone(&phased)))],
+            WakeEdges::NONE,
+            Some(Arc::new(PoolEventCount::new(2))),
+            2,
+            &[],
+        );
+        assert!(c1.plan_bit().is_some() && c2.plan_bit().is_some(), "both arms indexed");
+        phased.switch_to(CapPhase::Two);
+        let held: Vec<_> = (0..held1)
+            .map(|i| c1.try_acquire_as(10 + i))
+            .chain((0..held2).map(|i| c2.try_acquire_as(20 + i)))
+            .collect();
+        assert!(held.iter().all(Option::is_some), "idle caps admit");
+        assert_eq!(plan.skip_full_cap(p), skip, "skip follows the phase-2 arm");
+        assert_eq!(plan.admits(Some(p)), !skip, "the fallback follows the phase-2 arm");
+    }
+
     /// A cap-parked worker that skips a full cap is recorded on it: the release
     /// that frees a permit wakes it.
     #[test]
@@ -3478,7 +3532,7 @@ mod tests {
     }
 
     /// Step names of [`native_input_sort_topology`], in `StepIdx` order.
-    const NATIVE_INPUT_SORT_NAMES: [&str; 17] = [
+    const NATIVE_INPUT_SORT_NAMES: [&str; 20] = [
         "PlanInputReads",
         "PreadInputSlices",
         "FrameBgzfBlocks",
@@ -3493,13 +3547,16 @@ mod tests {
         "SpillReadPlanner",
         "PreadSpillSlices",
         "SortSpillDecompress",
+        "ConsolidateRuns",
+        "SpillBlockCompressConsolidation",
+        "WriteConsolidatedRun",
         "SortMerge",
         "BgzfCompress",
         "WriteBgzfFile",
     ];
 
     /// A hand-written model of `fgumi sort`'s template-coordinate chain with
-    /// native input, at t16: 17 steps, two driver groups (coord, io), the
+    /// native input, at t16: 20 steps, two driver groups (coord, io), the
     /// planner and framer pinned to the reader worker, every edge
     /// byte-bounded. Its step names, kinds, branch counts and per-branch
     /// gating mirror the table fgumi's `sort_chain_gating_matches_the_table`
@@ -3508,8 +3565,8 @@ mod tests {
     /// checked by nothing but the tests below.
     pub(super) fn native_input_sort_topology() -> Topology {
         use StepKind::{Detached as D, Parallel as P, Serial as S};
-        let kinds = vec![S, P, S, D, P, D, P, D, D, P, D, S, P, P, D, P, D];
-        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        let kinds = vec![S, P, S, D, P, D, P, D, D, P, D, S, P, P, D, P, D, D, P, D];
+        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 1, 1, 0];
         let mut g = ChainGraph::new();
         let idx: Vec<StepIdx> = NATIVE_INPUT_SORT_NAMES
             .iter()
@@ -3521,19 +3578,22 @@ mod tests {
         }
         g.wire(idx[11], BranchIdx(0), idx[12]);
         g.wire(idx[12], BranchIdx(0), idx[13]);
-        g.wire(idx[11], BranchIdx(1), idx[14]);
+        g.wire(idx[11], BranchIdx(2), idx[14]);
         g.wire(idx[14], BranchIdx(0), idx[15]);
         g.wire(idx[15], BranchIdx(0), idx[16]);
+        g.wire(idx[11], BranchIdx(1), idx[17]);
+        g.wire(idx[17], BranchIdx(0), idx[18]);
+        g.wire(idx[18], BranchIdx(0), idx[19]);
         let (coord, io) = (Some(DriverIdx(0)), Some(DriverIdx(1)));
         let driver_of = vec![
             None, None, None, coord, None, coord, None, coord, coord, None, io, None, None, None,
-            coord, None, io,
+            io, None, io, coord, None, io,
         ];
-        let mut pinned = vec![None; 17];
+        let mut pinned = vec![None; 20];
         pinned[0] = Some(0);
         pinned[2] = Some(0);
         let mut queues: Vec<_> = (0..=11).map(|s| q(s, 0)).collect();
-        queues.extend([q(11, 1), q(12, 0), q(14, 0), q(15, 0)]);
+        queues.extend([q(11, 1), q(11, 2), q(12, 0), q(14, 0), q(15, 0), q(17, 0), q(18, 0)]);
         (g, kinds, pinned, driver_of, queues)
     }
 
@@ -3554,7 +3614,7 @@ mod tests {
         );
         // Every branch of a step with outputs is gated; `SortSpillDecompress`
         // (a zero-output Parallel step) and the `WriteBgzfFile` sink have none.
-        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0, 1, 1, 0];
+        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 1, 1, 0];
         for (i, want) in want.iter().enumerate() {
             assert_eq!(
                 plan.gated_branches(StepIdx(i)),
@@ -4722,8 +4782,8 @@ mod e2e {
             }
             Ok(StepOutcome::Progress)
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            Some(&self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.cap))
         }
         fn new_worker_copy(&self) -> Self {
             self.clone()
@@ -4859,8 +4919,8 @@ mod e2e {
                 None => Ok(StepOutcome::NoProgress),
             }
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            Some(&self.cap)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.cap))
         }
     }
 
@@ -5017,8 +5077,8 @@ mod e2e {
                 None => Ok(StepOutcome::NoProgress),
             }
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            Some(&self.0)
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            Some(crate::StepCapRef::Fixed(&self.0))
         }
     }
 
@@ -5115,8 +5175,8 @@ mod e2e {
                 None => Ok(StepOutcome::NoProgress),
             }
         }
-        fn phase_cap(&self) -> Option<&crate::PhaseCap> {
-            self.1.as_deref()
+        fn step_cap(&self) -> Option<crate::StepCapRef<'_>> {
+            self.1.as_deref().map(crate::StepCapRef::Fixed)
         }
         fn new_worker_copy(&self) -> Self {
             self.clone()

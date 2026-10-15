@@ -74,6 +74,9 @@ impl FinalizeHook for StageTimingFinalizeHook {
 /// Output of [`crate::pipeline::chains::build_for`]. The
 /// caller calls [`BuiltPipeline::run`] which executes the pipeline and
 /// drains the finalize hooks in order.
+/// The slot a standalone sort's merge fills with its counts.
+pub(crate) type SortStatsSlot = std::sync::Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>;
+
 pub struct BuiltPipeline {
     pub pipeline: Pipeline,
     pub config: PipelineConfig,
@@ -90,6 +93,9 @@ pub struct BuiltPipeline {
     /// NOT an example of this: it is written inline by the `WriteBgzfFile`
     /// sink as part of the run itself, not by a finalize hook.
     pub finalize_on_success: Vec<Box<dyn FinalizeHook>>,
+    /// A standalone sort's summary counts, filled when its merge completes
+    /// (`None` for any other chain).
+    pub(crate) sort_stats_slot: Option<SortStatsSlot>,
     /// Per sort stage, the sort's queryname class table and the one its
     /// `SortMerge` merges against (test support: compared by pointer).
     #[cfg(test)]
@@ -97,6 +103,17 @@ pub struct BuiltPipeline {
         std::sync::Arc<fgumi_sort::QnClassTable>,
         Option<std::sync::Arc<fgumi_sort::QnClassTable>>,
     )>,
+    /// The class table the sort's `ConsolidateRuns` merges queryname jobs
+    /// against (`None` without a consolidation tail; test support).
+    #[cfg(test)]
+    pub(crate) consolidation_class_table: Option<std::sync::Arc<fgumi_sort::QnClassTable>>,
+    /// The sort's phase caps, `[phase1, phase2]` (test support).
+    #[cfg(test)]
+    pub(crate) sort_caps: [Option<std::sync::Arc<fgumi_pipeline_core::PhaseCap>>; 2],
+    /// The `PreadSpillSlices` clone count the chain's spill read planner was
+    /// built for (`None` without one; test support).
+    #[cfg(test)]
+    pub(crate) spill_eligible_clones: Option<usize>,
 }
 
 impl BuiltPipeline {
@@ -124,8 +141,15 @@ impl BuiltPipeline {
             config,
             finalize,
             finalize_on_success,
+            sort_stats_slot: _,
             #[cfg(test)]
                 merge_class_tables: _,
+            #[cfg(test)]
+                consolidation_class_table: _,
+            #[cfg(test)]
+                sort_caps: _,
+            #[cfg(test)]
+                spill_eligible_clones: _,
         } = self;
 
         // Capture the run result but do not short-circuit: the finalize

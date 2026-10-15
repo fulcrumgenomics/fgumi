@@ -42,7 +42,7 @@ use crate::keys::{
     NameBuf, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, qn_name_and_flags,
     read_queryname_key, write_queryname_key,
 };
-use crate::run_consolidate::SpillKeyKind;
+use crate::spill_block::SpillKeyKind;
 
 /// Name bytes a [`QnKey`] carries after its class's elided common prefix.
 pub const QN_WINDOW: usize = 24;

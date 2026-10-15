@@ -944,3 +944,317 @@ fn test_merge_program_record_records_command_line() {
         )]
     );
 }
+
+// -----------------------------------------------------------------------------
+// The chain-native merge: record and header identity with the stable merge,
+// the full template key, empty inputs, a mid-file order violation, and
+// non-seekable (pipe) inputs.
+// -----------------------------------------------------------------------------
+
+use crate::helpers::merge_fixtures::{
+    header_text_without_pg, merge_cli, read_raw, sort_for, sorted_inputs, write_raw_bam,
+};
+use fgumi_pipeline_io::sort::testing::reference_sort_full_template;
+use fgumi_sort::{QuerynameComparator, SortOrder, create_output_header, input_order_violation};
+use std::io::Write as _;
+use std::time::Duration;
+
+const ORDERS: [(&str, SortOrder); 4] = [
+    ("coordinate", SortOrder::Coordinate),
+    ("queryname", SortOrder::Queryname(QuerynameComparator::Lexicographic)),
+    ("queryname::natural", SortOrder::Queryname(QuerynameComparator::Natural)),
+    ("template-coordinate", SortOrder::TemplateCoordinate),
+];
+
+/// Record-byte and header identity with the stable merge (review I10). Ties
+/// across inputs resolve in input order. Catches: a lost/duplicated record,
+/// ties in the wrong order, a narrowed template key, a header other than the
+/// inputs' (beside the merge's own @PG).
+#[rstest::rstest]
+fn merge_records_and_header_match_the_reference(
+    #[values(0usize, 1, 2, 3)] which: usize,
+    #[values(1usize, 4)] threads: usize,
+) {
+    let (flag, order) = ORDERS[which];
+    let dir = TempDir::new().unwrap();
+    let (inputs, header, concat) = sorted_inputs(dir.path(), order, 3_000, 3, 11);
+    let out = dir.path().join("merged.bam");
+    let log = merge_cli(&inputs, &out, flag, threads);
+    assert!(log.contains("Merging from 3 sources"), "{log}");
+    let (got_header, got) = read_raw(&out);
+    assert_eq!(got, sort_for(order, &header, &concat));
+    assert_eq!(
+        header_text_without_pg(&got_header),
+        header_text_without_pg(&create_output_header(order, &header)),
+        "the same header, beside the merge's own @PG"
+    );
+    assert_eq!(got_header.programs().as_ref().len(), 1, "one @PG: this merge's");
+}
+
+/// `mapped_pair` with `CB` on both mates when given.
+fn mapped_pair_cb(name: &str, umi: &str, start: i32, cb: Option<&str>) -> Vec<RawRecord> {
+    let mate = |first: bool| {
+        let mut r = SamBuilder::new();
+        let (flag, pos, mate_pos, tlen) = if first {
+            (flags::PAIRED | flags::FIRST_SEGMENT, start, start + 100, 108)
+        } else {
+            (flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE, start + 100, start, -108)
+        };
+        r.read_name(name.as_bytes())
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flag)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .cigar_ops(&[8 << 4])
+            .mate_ref_id(0)
+            .mate_pos(mate_pos)
+            .template_length(tlen)
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
+        if let Some(cb) = cb {
+            r.add_string_tag(SamTag::CB, cb.as_bytes());
+        }
+        r.build()
+    };
+    vec![mate(true), mate(false)]
+}
+
+/// Review Focus 3: input 0's first record has no CB; later inputs' records do.
+/// A key narrowed from input 0's first record would drop the CB lane.
+#[test]
+fn template_merge_keeps_cb_when_the_first_record_has_none() {
+    let dir = TempDir::new().unwrap();
+    let header = create_output_header(
+        SortOrder::TemplateCoordinate,
+        &create_minimal_header("chr1", 100_000),
+    );
+    // Same positions and UMIs in every input: only CB separates the templates.
+    let pair = |name: &str, cb: Option<&str>| mapped_pair_cb(name, "ACGTACGT", 1_000, cb);
+    let inputs: Vec<(PathBuf, Vec<RawRecord>)> = [
+        ("in0", vec![pair("a0", None), pair("a1", Some("TTTT"))]),
+        ("in1", vec![pair("b0", Some("AAAA")), pair("b1", Some("GGGG"))]),
+        ("in2", vec![pair("c0", Some("CCCC"))]),
+    ]
+    .into_iter()
+    .map(|(n, pairs)| {
+        let recs: Vec<RawRecord> = pairs.concat();
+        let sorted = reference_sort_full_template(&header, &recs, Some(SamTag::CB));
+        let p = dir.path().join(format!("{n}.bam"));
+        write_raw_bam(&p, &header, &sorted);
+        (p, sorted.into_iter().map(RawRecord::from).collect())
+    })
+    .collect();
+    let concat: Vec<RawRecord> = inputs.iter().flat_map(|(_, r)| r.clone()).collect();
+    let out = dir.path().join("merged.bam");
+    merge_cli(
+        &inputs.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        &out,
+        "template-coordinate",
+        2,
+    );
+    assert_eq!(read_raw(&out).1, reference_sort_full_template(&header, &concat, Some(SamTag::CB)));
+}
+
+#[test]
+fn empty_inputs_merge_to_empty() {
+    let dir = TempDir::new().unwrap();
+    let header = create_output_header(SortOrder::Coordinate, &create_minimal_header("chr1", 1_000));
+    let inputs: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let p = dir.path().join(format!("e{i}.bam"));
+            write_bam(&p, &header, &[]);
+            p
+        })
+        .collect();
+    let out = dir.path().join("merged.bam");
+    merge_cli(&inputs, &out, "coordinate", 2);
+    let (h, records) = read_raw(&out);
+    assert!(records.is_empty());
+    assert_eq!(header_text_without_pg(&h), header_text_without_pg(&header));
+}
+
+/// Review Focus 4: a violation deep in input 1 (record 151) names the input
+/// and the record index; no output appears. Catches: the check missing (a
+/// silently unsorted merge), the wrong index, or a partial output left behind.
+#[test]
+fn unsorted_input_mid_file_is_rejected_with_the_record_index() {
+    let dir = TempDir::new().unwrap();
+    let mk = |name: &str, positions: Vec<i32>| {
+        let p = dir.path().join(name);
+        let records: Vec<RawRecord> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &pos)| mapped_record(format!("{name}-{i}").as_bytes(), pos))
+            .collect();
+        write_bam(&p, &bare_header(), &records);
+        p
+    };
+    let good = mk("good.bam", (1..=300).collect());
+    let mut bad_positions: Vec<i32> = (1..=300).collect();
+    // File order …149, 151, 150, …: the 151st record (1-based) sorts before
+    // its predecessor.
+    bad_positions.swap(149, 150);
+    let bad = mk("bad.bam", bad_positions);
+    let out = dir.path().join("merged.bam");
+    let err = merge(&out, vec![good, bad.clone()], SortOrderArg::Coordinate).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&input_order_violation(&bad.display().to_string(), "coordinate", 151)),
+        "{msg}"
+    );
+    assert!(!out.exists(), "no partial output");
+    assert_no_leftover_temp(dir.path());
+}
+
+/// Feed `src` into a new FIFO at `fifo` from a thread, `chunk` bytes at a time
+/// with `pause` between writes. Returns the writer's handle.
+#[cfg(unix)]
+fn fifo_feed(
+    fifo: &Path,
+    src: PathBuf,
+    chunk: usize,
+    pause: Duration,
+) -> std::thread::JoinHandle<()> {
+    assert!(std::process::Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    let fifo = fifo.to_path_buf();
+    std::thread::spawn(move || {
+        let bytes = std::fs::read(src).unwrap();
+        // Blocks until the merge opens the FIFO for reading.
+        let mut w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+        for c in bytes.chunks(chunk) {
+            w.write_all(c).unwrap();
+            std::thread::sleep(pause);
+        }
+    })
+}
+
+/// Catches: ESPIPE on a pipe, a lost header (prefix not replayed), reordering.
+#[cfg(unix)]
+#[rstest::rstest]
+fn merge_from_fifos_is_byte_identical_to_files(#[values(0usize, 1, 2, 3)] which: usize) {
+    let (flag, order) = ORDERS[which];
+    let dir = TempDir::new().unwrap();
+    let (inputs, header, concat) = sorted_inputs(dir.path(), order, 3_000, 3, 5);
+    let from_files = dir.path().join("files.bam");
+    merge_cli(&inputs, &from_files, flag, 2);
+    assert_eq!(
+        read_raw(&from_files).1,
+        sort_for(order, &header, &concat),
+        "the file merge is the oracle"
+    );
+    let fifos: Vec<PathBuf> = (0..3).map(|i| dir.path().join(format!("fifo{i}"))).collect();
+    let writers: Vec<_> = fifos
+        .iter()
+        .zip(&inputs)
+        .map(|(f, i)| fifo_feed(f, i.clone(), 1 << 16, Duration::ZERO))
+        .collect();
+    let from_fifos = dir.path().join("fifos.bam");
+    let log = merge_cli(&fifos, &from_fifos, flag, 2);
+    for w in writers {
+        w.join().unwrap();
+    }
+    assert_eq!(
+        read_raw(&from_fifos).1,
+        read_raw(&from_files).1,
+        "the same records from pipes as from files:\n{log}"
+    );
+    assert_eq!(
+        header_text_without_pg(&read_raw(&from_fifos).0),
+        header_text_without_pg(&read_raw(&from_files).0)
+    );
+}
+
+/// Process substitution, mixing pipe and file inputs.
+#[cfg(unix)]
+#[test]
+fn merge_from_process_substitution_is_byte_identical_to_files() {
+    let dir = TempDir::new().unwrap();
+    let (inputs, _, _) = sorted_inputs(dir.path(), SortOrder::Coordinate, 3_000, 3, 9);
+    let from_files = dir.path().join("files.bam");
+    merge_cli(&inputs, &from_files, "coordinate", 2);
+    let out = dir.path().join("subst.bam");
+    let script = "exec \"$0\" merge --order coordinate --threads 2 -o \"$1\" <(cat \"$2\") <(cat \"$3\") \"$4\"";
+    let st = std::process::Command::new("bash")
+        .args(["-c", script, FGUMI])
+        .arg(&out)
+        .args(&inputs)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(read_raw(&out).1, read_raw(&from_files).1);
+}
+
+/// Review r2 S3: a slow producer, sized so the run takes ~2 s (about 40
+/// writes, 50 ms apart, on the largest input) under a 20 s watchdog, so a
+/// regression that doubles the time still passes but a stall does not.
+#[cfg(unix)]
+#[test]
+fn pipe_input_with_a_slow_producer_completes() {
+    let dir = TempDir::new().unwrap();
+    let (inputs, _, _) = sorted_inputs(dir.path(), SortOrder::Coordinate, 3_000, 3, 13);
+    let size = usize::try_from(std::fs::metadata(&inputs[0]).unwrap().len()).unwrap();
+    let chunk = size.div_ceil(40).max(1);
+    let from_files = dir.path().join("files.bam");
+    merge_cli(&inputs, &from_files, "coordinate", 2);
+    let fifo = dir.path().join("slow");
+    let writer = fifo_feed(&fifo, inputs[0].clone(), chunk, Duration::from_millis(50));
+    let out = dir.path().join("slow.bam");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let args = (vec![fifo.clone(), inputs[1].clone(), inputs[2].clone()], out.clone());
+    std::thread::spawn(move || {
+        merge_cli(&args.0, &args.1, "coordinate", 2);
+        tx.send(()).unwrap();
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("merge stalled on a slow pipe"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the merge thread panicked; see its output above")
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(read_raw(&out).1, read_raw(&from_files).1);
+}
+
+/// A malformed input record fails the merge with an error naming the input and
+/// the record, in every order, never a panic (exit 101): a record shorter than
+/// the 32-byte BAM core, and one whose core declares a read name longer than
+/// the record. `fgumi sort` rejects the same inputs at ingest.
+#[rstest::rstest]
+fn a_malformed_input_record_is_an_error_naming_the_input_and_record(
+    #[values("coordinate", "queryname", "template-coordinate")] order: &str,
+    #[values("short", "name_overrun")] shape: &str,
+) {
+    let dir = TempDir::new().unwrap();
+    let bad = dir.path().join("bad.bam");
+    let good: RawRecord = mapped_record(b"r0", 100);
+    let malformed: Vec<u8> = if shape == "short" {
+        good.as_ref()[..10].to_vec()
+    } else {
+        let mut r = good.as_ref().to_vec();
+        r[8] = 200; // l_read_name far past the record's end
+        r
+    };
+    crate::helpers::merge_fixtures::write_raw_bam(
+        &bad,
+        &bare_header(),
+        &[good.as_ref().to_vec(), malformed],
+    );
+    let out = dir.path().join("merged.bam");
+    let result = std::process::Command::new(FGUMI)
+        .args(["merge", "--order", order, "-o"])
+        .arg(&out)
+        .arg(&bad)
+        .output()
+        .expect("spawn fgumi merge");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{order} {shape}: an error, not a panic:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("Input '{}': record 2", bad.display()))
+            && stderr.contains("block_size"),
+        "{order} {shape}: {stderr}"
+    );
+    assert!(!out.exists(), "no partial output");
+}

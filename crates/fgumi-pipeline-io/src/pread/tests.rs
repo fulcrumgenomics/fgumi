@@ -98,6 +98,7 @@ fn requests_over(src: &Arc<dyn PositionalSource>, len: usize, slice: usize) -> V
                 offset: off as u64,
                 len: u32::try_from(this).unwrap(),
                 last: i + 1 == n,
+                sequential: false,
                 target: ReadTarget::Input,
             }
         })
@@ -214,7 +215,7 @@ fn profile_and_placement() {
     assert_eq!(s.pool_placement(), PoolPlacement::AllWorkers);
     assert_eq!(i.profile().branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
     assert_eq!(s.profile().branch_ordering, vec![BranchOrdering::None]);
-    assert!(i.phase_cap().is_none() && s.phase_cap().is_none(), "uncapped unless given a cap");
+    assert!(i.step_cap().is_none() && s.step_cap().is_none(), "uncapped unless given a cap");
 }
 
 /// A refused permit leaves the request queued (the oracle is the input queue,
@@ -224,8 +225,8 @@ fn refused_permit_leaves_the_request_queued() {
     let cap = PhaseCap::new("sort-phase1", 1);
     let held = cap.try_acquire().expect("the test holds the only permit");
     let src: Arc<dyn PositionalSource> = Arc::new(MemSource::new(vec![7u8; 1 << 20]));
-    let mut step =
-        PreadSlices::spill(SliceBufferPool::new(2), 1 << 20).with_phase_cap(Some(Arc::clone(&cap)));
+    let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20)
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let mut probe = StepProbe::new(&step);
     probe.push_input(requests_over(&src, 1 << 20, 1 << 20).remove(0));
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Capped);
@@ -243,8 +244,8 @@ fn refused_permit_leaves_the_request_queued() {
 fn pread_does_not_take_a_permit_without_input() {
     let cap = PhaseCap::new("sort-phase1", 1);
     let _held = cap.try_acquire().unwrap();
-    let mut step =
-        PreadSlices::spill(SliceBufferPool::new(2), 1 << 20).with_phase_cap(Some(Arc::clone(&cap)));
+    let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20)
+        .with_step_cap(fgumi_pipeline_core::StepCap::from(Arc::clone(&cap)));
     let probe = StepProbe::new(&step);
     let refused_before = cap.refused();
     assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
@@ -260,7 +261,10 @@ fn pread_slices_meets_the_admission_contract(#[case] input: bool) {
     let item = requests_over(&src, 4096, 4096).remove(0);
     assert_admission_contract(
         "sort-phase1",
-        |cap| instance(input, SliceBufferPool::new(2)).with_phase_cap(cap),
+        |cap| {
+            instance(input, SliceBufferPool::new(2))
+                .with_step_cap(cap.map(fgumi_pipeline_core::StepCap::from))
+        },
         item,
     );
 }
@@ -288,4 +292,78 @@ fn hist_percentiles_are_bucket_lower_bounds(#[case] lens: &[u32], #[case] want: 
         h.record(l);
     }
     assert_eq!(h.p50_p90_min(), want);
+}
+
+// ── Sequential (stream) reads ───────────────────────────────────────────────
+
+/// One request through `PreadSlices`; returns the slice's (bytes, last).
+fn pread_one(
+    src: Arc<dyn PositionalSource>,
+    offset: u64,
+    len: u32,
+    sequential: bool,
+) -> io::Result<(Vec<u8>, bool)> {
+    let slot = Arc::new(fgumi_sort::SortMergeSlot::new_sequential(
+        0,
+        Arc::clone(&src),
+        fgumi_sort::SpillCodec::Bgzf,
+    ));
+    slot.bp_note_issued(u64::from(len));
+    let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20);
+    let mut probe = StepProbe::new(&step);
+    let out = probe.take_output::<ReadSlice>(0);
+    probe.push_input(ReadRequest {
+        ordinal: 0,
+        stream: 0,
+        seq: 0,
+        source: src,
+        offset,
+        len,
+        last: false,
+        sequential,
+        target: ReadTarget::Spill { slot, class: SpillClass::Cold },
+    });
+    probe.try_run(&mut step)?;
+    let s = fgumi_pipeline_core::step::InputHandle::pop(&out).expect("one slice");
+    Ok((s.bytes.to_vec(), s.last))
+}
+
+/// Catches: a partial pipe read taken as EOF (truncating every pipe input).
+#[test]
+fn sequential_partial_reads_are_not_eof() {
+    use fgumi_bam_io::pread::{SequentialSource, test_sources::Trickle};
+    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
+        std::path::Path::new("p"),
+        Box::new(Trickle(std::io::Cursor::new(vec![9u8; 100]))),
+    ));
+    assert_eq!(pread_one(src, 0, 64, true).unwrap(), (vec![9u8; 64], false));
+}
+
+/// Catches: EOF on a stream reported as `UnexpectedEof` (every pipe merge fails
+/// at its end), and EOF not marked `last` (the slot never finalizes).
+#[test]
+fn sequential_slot_zero_read_is_eof_not_error() {
+    use fgumi_bam_io::pread::SequentialSource;
+    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
+        std::path::Path::new("p"),
+        Box::new(std::io::Cursor::new(vec![5u8; 100])),
+    ));
+    assert_eq!(pread_one(Arc::clone(&src), 0, 64, true).unwrap(), (vec![5u8; 64], false));
+    assert_eq!(pread_one(Arc::clone(&src), 64, 64, true).unwrap(), (vec![5u8; 36], true));
+    assert_eq!(
+        pread_one(src, 100, 64, true).unwrap(),
+        (vec![], true),
+        "the tolerated extra read at a boundary"
+    );
+}
+
+/// Files still fail closed. Catches: the sequential relaxation leaking into
+/// file reads (a truncated spill read as a short EOF).
+#[test]
+fn a_file_short_read_still_fails_closed() {
+    use std::io::Write;
+    let mut f = tempfile::tempfile().unwrap();
+    f.write_all(&[1u8; 10]).unwrap();
+    let err = pread_one(Arc::new(f), 0, 64, false).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 }

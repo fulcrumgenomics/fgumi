@@ -39,6 +39,15 @@ pub struct SupplyLedger {
     slices_hot: AtomicU64,
     slices_cold: AtomicU64,
     awaited_starved_reads: AtomicU64,
+    /// Consolidation reads (phase 1), apart from the merge's.
+    cons_fills_hot: AtomicU64,
+    cons_fills_cold: AtomicU64,
+    cons_slices: AtomicU64,
+    cons_read_bytes: AtomicU64,
+    cons_inflight_bytes: AtomicU64,
+    cons_jobs: AtomicU64,
+    /// The last consolidation job's budget, for the `--sort-stats` line.
+    cons_budget: parking_lot::Mutex<Option<String>>,
 }
 
 impl SupplyLedger {
@@ -57,18 +66,48 @@ impl SupplyLedger {
                 self.fills_hot.fetch_add(1, Ordering::Relaxed);
                 self.slices_hot.fetch_add(u64::from(slices), Ordering::Relaxed);
             }
+            // Consolidation reads share the planner-global cold cap, so a
+            // consolidation cannot crowd out the input reads beside it.
+            SpillClass::ConsolidationCold => {
+                self.inflight_cold_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.cons_fills_cold.fetch_add(1, Ordering::Relaxed);
+            }
+            SpillClass::ConsolidationHot => {
+                self.cons_fills_hot.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        if c.is_consolidation() {
+            self.cons_inflight_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.cons_slices.fetch_add(u64::from(slices), Ordering::Relaxed);
+        }
+    }
+
+    /// A consolidation job of `budget` was planned.
+    pub fn note_consolidation_job(&self, budget: &super::read_ahead_budget::ReadAheadBudget) {
+        self.cons_jobs.fetch_add(1, Ordering::Relaxed);
+        *self.cons_budget.lock() = Some(budget.consolidation_line());
+    }
+
+    /// Consolidation read bytes issued and not yet landed.
+    #[must_use]
+    pub fn inflight_consolidation_bytes(&self) -> u64 {
+        self.cons_inflight_bytes.load(Ordering::Relaxed)
     }
 
     /// One slice of `bytes` of class `c` landed.
     pub fn land(&self, c: SpillClass, bytes: u64) {
         self.inflight_bytes.fetch_sub(bytes, Ordering::Relaxed);
         self.inflight_slices.fetch_sub(1, Ordering::Relaxed);
-        if c == SpillClass::Cold {
+        if matches!(c, SpillClass::Cold | SpillClass::ConsolidationCold) {
             self.inflight_cold_bytes.fetch_sub(bytes, Ordering::Relaxed);
         }
-        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.read_slices.fetch_add(1, Ordering::Relaxed);
+        if c.is_consolidation() {
+            self.cons_inflight_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.cons_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.read_slices.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Read slices issued and not yet landed.
@@ -141,7 +180,7 @@ impl SupplyLedger {
     pub fn supply_lines(&self, pool_peak_held: u64) -> Vec<String> {
         use super::read_ahead_budget::mib;
         let (workers, consumer) = self.claims();
-        vec![
+        let mut lines = vec![
             format!(
                 "Spill disk read: {} fills [hot {} / cold {}], {} slices, {}",
                 self.fills_hot.load(Ordering::Relaxed) + self.fills_cold.load(Ordering::Relaxed),
@@ -160,7 +199,31 @@ impl SupplyLedger {
                 mib(pool_peak_held),
                 self.awaited_starved_reads(),
             ),
-        ]
+        ];
+        lines.extend(self.consolidation_line());
+        lines
+    }
+
+    /// The `Consolidation supply:` line, present only when a job was planned.
+    #[must_use]
+    pub fn consolidation_line(&self) -> Option<String> {
+        use super::read_ahead_budget::mib;
+        let jobs = self.cons_jobs.load(Ordering::Relaxed);
+        if jobs == 0 {
+            return None;
+        }
+        let (hot, cold) = (
+            self.cons_fills_hot.load(Ordering::Relaxed),
+            self.cons_fills_cold.load(Ordering::Relaxed),
+        );
+        Some(format!(
+            "Consolidation supply: {jobs} jobs, {} fills [hot {hot} / cold {cold}], {} slices, {} \
+             read; last job's read-ahead {}",
+            hot + cold,
+            self.cons_slices.load(Ordering::Relaxed),
+            mib(self.cons_read_bytes.load(Ordering::Relaxed)),
+            self.cons_budget.lock().as_deref().unwrap_or("-"),
+        ))
     }
 }
 
@@ -219,13 +282,22 @@ pub struct SpillSupply {
     pub demand: Arc<MergeDemand>,
     /// The shared byte ledger.
     pub ledger: Arc<SupplyLedger>,
+    /// Bumped by the read planner each time it retires slots (a consolidation
+    /// job's inputs); the decompress step drops retired slots from its
+    /// registry when it sees the epoch move, so the common case costs it one
+    /// load.
+    pub retire_epoch: Arc<AtomicU64>,
 }
 
 impl SpillSupply {
     /// A fresh demand and ledger.
     #[must_use]
     pub fn new() -> Self {
-        Self { demand: Arc::new(MergeDemand::new()), ledger: Arc::new(SupplyLedger::default()) }
+        Self {
+            demand: Arc::new(MergeDemand::new()),
+            ledger: Arc::new(SupplyLedger::default()),
+            retire_epoch: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 

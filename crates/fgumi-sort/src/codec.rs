@@ -1,8 +1,7 @@
 //! Codec selection for spill chunks.
 //!
-//! Spill files are written by the worker pool in one of two codecs:
-//! - **BGZF** (legacy, libdeflate level 1): block-stream with a 1f 8b magic,
-//!   compatible with the existing pool-integrated reader.
+//! Spill files are written in one of two codecs:
+//! - **BGZF** (libdeflate level 1): block-stream with a 1f 8b magic.
 //! - **Zstd** (default since v0.3): a sequence of length-prefixed zstd frames
 //!   preceded by the 4-byte "ZSP1" file magic. Zstd-1 is ~3x faster than
 //!   libdeflate-1 to compress and ~6x faster to decompress at a comparable

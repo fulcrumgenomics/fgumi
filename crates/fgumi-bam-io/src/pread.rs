@@ -68,6 +68,15 @@ pub trait PositionalSource: Send + Sync {
     /// # Errors
     /// Propagates any I/O error from querying the source's length.
     fn byte_len(&self) -> io::Result<u64>;
+
+    /// Hint that `len` bytes from `offset` will be read soon, so the source
+    /// can start fetching them before a later [`Self::read_at`] of the range.
+    /// Advisory only: the read stays correct whatever the hint did, and waits
+    /// on the device for any part not yet fetched. Allocation-free; the
+    /// default does nothing.
+    fn will_need(&self, offset: u64, len: u64) {
+        let _ = (offset, len);
+    }
 }
 
 #[cfg(unix)]
@@ -78,6 +87,11 @@ impl PositionalSource for std::fs::File {
 
     fn byte_len(&self) -> io::Result<u64> {
         Ok(self.metadata()?.len())
+    }
+
+    /// See [`crate::os_hints::advise_willneed_range`].
+    fn will_need(&self, offset: u64, len: u64) {
+        crate::os_hints::advise_willneed_range(self, offset, len);
     }
 }
 
@@ -112,6 +126,168 @@ pub fn read_at_exact<S: PositionalSource + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// A non-seekable input (pipe, FIFO, process substitution) behind the
+/// positional interface. Reads must arrive at the stream's cursor (the read
+/// planner keeps one read in flight per sequential slot), except reads below
+/// the header prefix, which replay the bytes the header parse consumed through
+/// [`Self::header_reader`] — so a reader of the source sees the stream from
+/// byte 0, as it would a file.
+pub struct SequentialSource {
+    path: std::path::PathBuf,
+    state: parking_lot::Mutex<SeqState>,
+}
+
+struct SeqState {
+    reader: Box<dyn io::Read + Send>,
+    /// Stream bytes consumed so far (the header prefix included).
+    cursor: u64,
+    /// The bytes [`SequentialSource::header_reader`] returned, from offset 0.
+    prefix: Vec<u8>,
+}
+
+impl SequentialSource {
+    /// A source reading `reader`, a stream named `path` (for errors).
+    #[must_use]
+    pub fn new(path: &std::path::Path, reader: Box<dyn io::Read + Send>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            state: parking_lot::Mutex::new(SeqState { reader, cursor: 0, prefix: Vec::new() }),
+        }
+    }
+
+    /// A [`io::Read`] for parsing the stream's header: every byte it returns is
+    /// kept in the prefix (replayed by [`PositionalSource::read_at`]) and
+    /// advances the cursor.
+    pub fn header_reader(&self) -> impl io::Read + '_ {
+        HeaderReader(self)
+    }
+
+    /// Bytes the header parse consumed (the replayed prefix).
+    #[must_use]
+    pub fn prefix_len(&self) -> u64 {
+        self.state.lock().prefix.len() as u64
+    }
+}
+
+/// [`SequentialSource::header_reader`]'s reader.
+struct HeaderReader<'a>(&'a SequentialSource);
+
+impl io::Read for HeaderReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut s = self.0.state.lock();
+        let n = s.reader.read(buf)?;
+        s.prefix.extend_from_slice(&buf[..n]);
+        s.cursor += n as u64;
+        Ok(n)
+    }
+}
+
+impl PositionalSource for SequentialSource {
+    /// `offset` below the prefix: a copy from it (possibly fewer bytes than
+    /// `buf` holds); `offset` at the cursor: one `read` of the stream (partial
+    /// reads allowed; `0` is EOF); anything else: `InvalidInput` naming the path.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let mut s = self.state.lock();
+        let prefix_len = s.prefix.len() as u64;
+        if offset < prefix_len {
+            let at = usize::try_from(offset).expect("a prefix offset fits usize");
+            let n = buf.len().min(s.prefix.len() - at);
+            buf[..n].copy_from_slice(&s.prefix[at..at + n]);
+            return Ok(n);
+        }
+        if offset != s.cursor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: out-of-order read at offset {offset}; the stream is at {}",
+                    self.path.display(),
+                    s.cursor
+                ),
+            ));
+        }
+        let n = loop {
+            match s.reader.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                other => break other?,
+            }
+        };
+        s.cursor += n as u64;
+        Ok(n)
+    }
+
+    /// `Unsupported`: a stream has no length (callers pass `len = None`).
+    fn byte_len(&self) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{} is a stream and has no length", self.path.display()),
+        ))
+    }
+}
+
+/// What [`open_seekable_bgzf`] found at a path.
+pub enum SeekableInput {
+    /// A regular BGZF file, opened (cursor at 0), and its length: readable
+    /// positionally.
+    Bgzf {
+        /// The opened file.
+        file: std::fs::File,
+        /// Its length in bytes.
+        len: u64,
+    },
+    /// An input that must be read sequentially, and why: `"is not a seekable
+    /// regular file"` (stdin, a pipe, a FIFO, process substitution) or `"is not
+    /// BGZF"` (SAM text, plain gzip).
+    Sequential(&'static str),
+}
+
+/// Classify `path` as a positional (regular BGZF file) or sequential input:
+/// the one rule every positional reader applies — `stat` first (never opening
+/// a FIFO to sniff it), then a full format prefix read with
+/// [`read_prefix`](crate::read_prefix) and [`classify_input`](crate::classify_input).
+///
+/// # Errors
+///
+/// Opening or reading a regular file failed.
+pub fn open_seekable_bgzf(path: &std::path::Path) -> io::Result<SeekableInput> {
+    use std::io::Seek as _;
+    const NOT_SEEKABLE: &str = "is not a seekable regular file";
+    if crate::is_stdin_path(path) || !std::fs::metadata(path)?.is_file() {
+        return Ok(SeekableInput::Sequential(NOT_SEEKABLE));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0u8; crate::FORMAT_PREFIX_LEN];
+    let n = crate::read_prefix(&mut file, &mut prefix)?;
+    if crate::classify_input(&prefix[..n]) != crate::InputFormat::Bgzf {
+        return Ok(SeekableInput::Sequential("is not BGZF"));
+    }
+    file.rewind()?;
+    let len = file.metadata()?.len();
+    Ok(SeekableInput::Bgzf { file, len })
+}
+
+/// Fill `buf` from `offset` by repeated `read_at`, stopping at a zero read
+/// (EOF); `Interrupted` is retried. Returns the bytes read. The sequential twin
+/// of [`read_at_exact`], which treats a short read as `UnexpectedEof`.
+///
+/// # Errors
+/// Any I/O error from the source other than `Interrupted`.
+pub fn read_until_eof<S: PositionalSource + ?Sized>(
+    source: &S,
+    buf: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match source.read_at(&mut buf[filled..], offset + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 /// One raise of the [`ReadStreamsPolicy`] ratchet, for `--sort-stats`.
@@ -306,8 +482,10 @@ pub fn slice_ranges(start: u64, window: usize, slices: usize) -> impl Iterator<I
 /// read-ahead bound to miss. Request sizes repeat (the fill and slice sizes
 /// are fixed per path and per stream count), so exact reuse hits as often as a
 /// looser fit would; a pool whose sizes change (the read-stream ratchet
-/// shrinking slices, or a file's short tail read) releases one mismatched
-/// buffer per miss and converges to the sizes it is asked for. The gauges
+/// shrinking slices) releases one mismatched buffer per miss and converges to
+/// the sizes it is asked for. The released buffer is one of the rarest size in
+/// the free list, so a one-off size (a spill run's short tail read) drains
+/// first and the common size's buffers stay for the next hit. The gauges
 /// charge capacity: `resident` is the capacity of live leases, `idle` the
 /// capacity of the free list, and the peak is of their sum — the read path's
 /// slice memory.
@@ -351,17 +529,21 @@ impl SliceBufferPool {
 
     /// A buffer of exactly `len` bytes and capacity: a pooled one of that
     /// capacity, else a fresh zeroed allocation (`calloc`, so the OS supplies zero pages
-    /// rather than a memset). On a miss one pooled buffer is released, so a
-    /// free list of the wrong sizes drains instead of pinning memory. Its
+    /// rather than a memset). On a miss one pooled buffer of the rarest idle
+    /// size is released, so a free list of the wrong sizes drains instead of
+    /// pinning memory, while the common size keeps its buffers. Its
     /// contents are unspecified; a caller overwrites every byte before leasing
     /// it.
     #[must_use]
     pub fn take(&self, len: usize) -> Vec<u8> {
         let (hit, evicted) = {
             let mut free = self.free.lock();
-            match free.iter().position(|b| fits(b.capacity(), len)) {
-                Some(i) => (Some(free.swap_remove(i)), None),
-                None => (None, free.pop()),
+            if let Some(i) = free.iter().position(|b| fits(b.capacity(), len)) {
+                (Some(free.swap_remove(i)), None)
+            } else {
+                let count = |cap: usize| free.iter().filter(|b| b.capacity() == cap).count();
+                let victim = (0..free.len()).min_by_key(|&i| count(free[i].capacity()));
+                (None, victim.map(|i| free.swap_remove(i)))
             }
         };
         if let Some(e) = evicted {
@@ -573,6 +755,17 @@ impl fmt::Debug for RawFrame {
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_sources {
     use super::PositionalSource;
+
+    /// A reader returning at most 7 bytes per call, like a pipe with little
+    /// buffered: partial reads are normal and must not be mistaken for EOF.
+    pub struct Trickle(pub std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let n = b.len().min(7);
+            self.0.read(&mut b[..n])
+        }
+    }
     use std::io;
     use std::time::Duration;
 
@@ -909,6 +1102,24 @@ mod tests {
         assert_eq!((pool.resident_bytes(), pool.idle_bytes()), (0, 600 << 10));
     }
 
+    /// A miss releases a buffer of the rarest idle size, not whichever came
+    /// back last: three full-size buffers and one tail-sized one, then a miss
+    /// for a third size, keep the full-size buffers for the next full read.
+    /// Catches: evicting by position (`pop`), which here drops a full-size
+    /// buffer and forces the next full read to allocate.
+    #[test]
+    fn a_miss_releases_the_rarest_idle_size() {
+        let pool = SliceBufferPool::new(8);
+        let full: Vec<_> = (0..3).map(|_| pool.lease(pool.take(1 << 20))).collect();
+        let tail = pool.lease(pool.take(5_000));
+        drop(tail);
+        drop(full); // the full-size buffers return last
+        assert_eq!(pool.free_len(), 4);
+        drop(pool.take(7_000)); // a miss
+        assert_eq!(pool.free_len(), 3);
+        assert_eq!(pool.idle_bytes(), 3 << 20, "the tail buffer was released");
+    }
+
     #[test]
     fn pool_cap_drops_excess_and_reuses_the_allocation() {
         let pool = SliceBufferPool::new(1);
@@ -1038,5 +1249,71 @@ mod tests {
         let mut buf = [0u8; 4];
         read_at_exact(&src, &mut buf, 1).unwrap();
         assert_eq!(&buf, b"bcde");
+    }
+
+    // ---- SequentialSource ----
+
+    fn stream(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The header bytes `merge_headers` consumed are replayed from the prefix;
+    /// reads past them continue the stream; EOF is a zero-byte read.
+    #[test]
+    fn sequential_source_serves_the_header_prefix_then_the_stream() {
+        use super::test_sources::Trickle;
+        use std::io::Read;
+        let data = stream(10_000);
+        let src = SequentialSource::new(
+            std::path::Path::new("<pipe>"),
+            Box::new(Trickle(std::io::Cursor::new(data.clone()))),
+        );
+        let mut head = vec![0u8; 700];
+        src.header_reader().read_exact(&mut head).unwrap(); // what merge_headers does
+        assert_eq!(head, data[..700]);
+        let mut out = vec![0u8; data.len()];
+        let mut at = 0;
+        while at < out.len() {
+            let n = src.read_at(&mut out[at..], at as u64).unwrap();
+            assert!(n > 0, "a zero read before the end at {at}");
+            at += n;
+        }
+        assert_eq!(out, data);
+        assert_eq!(
+            src.read_at(&mut [0u8; 16], data.len() as u64).unwrap(),
+            0,
+            "EOF is a zero read"
+        );
+    }
+
+    /// R9: the error names the input; it is `InvalidInput`, never a wait.
+    #[test]
+    fn sequential_source_rejects_an_out_of_order_offset() {
+        let src = SequentialSource::new(
+            std::path::Path::new("/dev/fd/63"),
+            Box::new(std::io::Cursor::new(stream(100))),
+        );
+        assert_eq!(src.read_at(&mut [0u8; 10], 0).unwrap(), 10);
+        let err = src.read_at(&mut [0u8; 10], 50).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "/dev/fd/63: out-of-order read at offset 50; the stream is at 10"
+        );
+    }
+
+    /// `read_until_eof` (the sequential twin of `read_at_exact`): loops partial
+    /// reads, stops at a zero read, returns the bytes read.
+    #[test]
+    fn read_until_eof_loops_partial_reads_and_stops_at_a_zero_read() {
+        use super::test_sources::Trickle;
+        let src = SequentialSource::new(
+            std::path::Path::new("p"),
+            Box::new(Trickle(std::io::Cursor::new(stream(100)))),
+        );
+        let mut buf = vec![0u8; 64];
+        assert_eq!(read_until_eof(&src, &mut buf, 0).unwrap(), 64);
+        assert_eq!(read_until_eof(&src, &mut buf, 64).unwrap(), 36);
+        assert_eq!(read_until_eof(&src, &mut buf, 100).unwrap(), 0);
     }
 }

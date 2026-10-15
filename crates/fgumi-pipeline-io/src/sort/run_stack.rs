@@ -2,8 +2,10 @@
 //!
 //! [`RunStack`] holds the live spill runs in run order (oldest first) and
 //! answers one question after every change: is there a contiguous range of runs
-//! that should now be merged into one? It performs no I/O; `SpillWrite` does the
-//! merging and reports back through [`RunStack::complete_merge`].
+//! that should now be merged into one? It performs no I/O: `SpillWrite` starts a
+//! consolidation job for the range, the chain's consolidation tail merges it,
+//! and `SpillWrite` reports the merged run back through
+//! [`RunStack::complete_merge`].
 //!
 //! # Policy
 //!
@@ -20,11 +22,10 @@
 //!
 //! Small runs are therefore merged before large ones, the way an optimal merge
 //! pattern does, and a large consolidated run is not rewritten again until
-//! merging it is the cheapest way to make room. The legacy `RawExternalSorter`
-//! engine (which the library and `fgumi simulate` still use) instead merges the
-//! oldest `L / 2` runs each time the limit is hit and puts the result back at the
-//! front, so its first consolidated run absorbs — and rewrites — the oldest
-//! records on every later pass. When the limit is hit once (the common case of a
+//! merging it is the cheapest way to make room. The retired standalone engine
+//! (v0.7.0's) instead merged the oldest `L / 2` runs each time the limit was hit
+//! and put the result back at the front, so its first consolidated run absorbed
+//! — and rewrote — the oldest records on every later pass. When the limit is hit once (the common case of a
 //! sort just past it) and `L ≤ 2 · MAX_FAN_IN`, both policies do the same single
 //! `L / 2`-wide merge; above that this one merges at most `MAX_FAN_IN` runs at a
 //! time. When the limit is hit repeatedly this one rewrites several times less.
@@ -32,6 +33,15 @@
 //! Only contiguous ranges are merged and the merged run takes the range's
 //! position, so the final merge's tie-break order (run order) is unchanged and
 //! the sorted output is identical to an unconsolidated sort.
+
+/// Whether a `--max-temp-files` limit can ever trigger a consolidation: a
+/// merge needs at least two live runs, so a limit below 2 leaves it off. The
+/// one place this rule is encoded (`RunStack::new` and the chain builder,
+/// which wires the consolidation tail only when it holds).
+#[must_use]
+pub const fn consolidation_can_trigger(max_temp_files: usize) -> bool {
+    max_temp_files >= 2
+}
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -69,7 +79,7 @@ impl RunStack {
     /// consolidation: one run cannot be consolidated, and the CLI rejects such
     /// values anyway, so only library callers can reach it.
     pub(crate) fn new(max_temp_files: usize) -> Self {
-        let limit = if max_temp_files < 2 { 0 } else { max_temp_files };
+        let limit = if consolidation_can_trigger(max_temp_files) { max_temp_files } else { 0 };
         let fan_in = (limit / 2).clamp(2, MAX_FAN_IN);
         Self { runs: Vec::new(), limit, fan_in }
     }

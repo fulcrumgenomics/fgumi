@@ -32,7 +32,7 @@ use super::step::{
     Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, PoolPlacement, Step,
     StepCtx, StepKind, StepOutcome, StepProfile,
 };
-use crate::admission::PhaseCap;
+use crate::admission::{PhaseCap, StepCapRef};
 use crate::runtime::contexts::StepCounters;
 
 /// The branch orderings the framework actually *builds* for a single-input
@@ -138,11 +138,28 @@ pub trait ErasedStep: Send + 'static {
         &[]
     }
 
-    /// Forward `Step::phase_cap` for `Pipeline::dag()` / diagnostics. Defaults
-    /// to `None`; the single-input adapter forwards `inner.phase_cap()`
-    /// (`Step2`/`StepK` steps have no pool cap today).
-    fn phase_cap(&self) -> Option<&PhaseCap> {
+    /// Forward [`Step::step_cap`]. Defaults to `None`;
+    /// the single-input adapter forwards `inner.step_cap()` (`Step2`/`StepK`
+    /// steps have no pool cap today). The three views below derive from it and
+    /// are not meant to be overridden.
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
         None
+    }
+
+    /// The cap admitting now ([`StepCapRef::active`]).
+    fn phase_cap(&self) -> Option<&PhaseCap> {
+        self.step_cap().and_then(StepCapRef::active)
+    }
+
+    /// The `cap=` label `Pipeline::dag()` prints ([`StepCapRef::label`]).
+    fn cap_label(&self) -> Option<String> {
+        self.step_cap().map(StepCapRef::label)
+    }
+
+    /// Every cap a run binds for this step, in phase order
+    /// ([`StepCapRef::bound_caps`]): both arms of a phased cap.
+    fn bound_caps(&self) -> Vec<&PhaseCap> {
+        self.step_cap().map(StepCapRef::bound_caps).unwrap_or_default()
     }
 
     /// Dispatch `S::try_run` after downcasting queue handles.
@@ -555,8 +572,8 @@ where
         self.inner.counters()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.inner.phase_cap()
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.inner.step_cap()
     }
 
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {

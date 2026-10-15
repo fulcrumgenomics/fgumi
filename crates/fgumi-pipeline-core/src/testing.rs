@@ -152,9 +152,12 @@ pub fn assert_admission_contract<S: Step>(
 
     let copy = step.new_worker_copy();
     assert!(
-        std::ptr::eq(copy.phase_cap().expect("capped copy"), Arc::as_ptr(&cap)),
+        std::ptr::eq(
+            copy.step_cap().and_then(crate::StepCapRef::active).expect("capped copy"),
+            Arc::as_ptr(&cap)
+        ),
         "a worker copy shares the step's counter"
     );
     drop(held);
-    assert!(make(None).phase_cap().is_none(), "uncapped by default");
+    assert!(make(None).step_cap().is_none(), "uncapped by default");
 }

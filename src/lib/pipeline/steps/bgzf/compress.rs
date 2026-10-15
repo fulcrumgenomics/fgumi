@@ -55,10 +55,12 @@ pub struct BgzfCompress {
     /// When unset, the frame walk and per-physical-block length capture are
     /// skipped entirely (zero overhead on the non-indexed path).
     index_bam: bool,
-    /// Admission cap for the standalone sort's merge phase (`--merge-threads`).
-    /// `None` (uncapped) by default; `ChainBuilder::add_sink` sets it only on the
-    /// standalone-sort terminal, so every other chain's output compressor is
-    /// untouched.
+    /// Admission cap on how many pool workers compress at once. `None`
+    /// (uncapped) by default. `ChainBuilder::add_sink` sets the standalone
+    /// sort's phase-2 cap (`--merge-threads`) on its terminal, and
+    /// `build_merge` caps `fgumi merge`'s terminal at `--threads` so the
+    /// merge's extra pool workers only read and decompress; every other
+    /// chain's output compressor is untouched.
     cap: Option<Arc<PhaseCap>>,
 }
 
@@ -302,8 +304,8 @@ impl Step for BgzfCompress {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -312,23 +314,31 @@ mod tests {
     use super::*;
 
     /// The output compressor is phase-neutral: uncapped by default (every
-    /// non-sort chain's terminal shows no `cap=` token), capped only when the
-    /// builder hands it the standalone sort's phase-2 cap — and worker copies
-    /// share that same counter, not an equal-looking new one.
+    /// chain's terminal but the standalone sort's and the merge's shows no
+    /// `cap=` token), capped only when a builder hands it a cap (the standalone
+    /// sort's phase-2 cap, or the merge's `--threads` compression cap) — and
+    /// worker copies share that same counter, not an equal-looking new one.
     #[test]
     fn phase_cap_is_none_by_default_and_shared_by_worker_copies() {
         use crate::pipeline::core::{PhaseCap, Step};
         let plain = BgzfCompress::new(1, 1 << 20, false);
-        assert!(plain.phase_cap().is_none(), "uncapped by default");
+        assert!(plain.step_cap().is_none(), "uncapped by default");
 
         let cap = PhaseCap::new("sort-phase2", 2);
         let capped = plain.with_phase_cap(Some(std::sync::Arc::clone(&cap)));
-        assert_eq!(capped.phase_cap().map(PhaseCap::describe).as_deref(), Some("sort-phase2(2)"));
+        assert_eq!(
+            capped.step_cap().map(fgumi_pipeline_core::StepCapRef::label).as_deref(),
+            Some("sort-phase2(2)")
+        );
         let copy = capped.new_worker_copy();
         let _p1 = cap.try_acquire().expect("1 of 2");
         let _p2 = cap.try_acquire().expect("2 of 2");
         assert!(
-            copy.phase_cap().expect("capped").try_acquire().is_none(),
+            copy.step_cap()
+                .and_then(fgumi_pipeline_core::StepCapRef::active)
+                .expect("capped")
+                .try_acquire()
+                .is_none(),
             "the worker copy shares the exhausted counter"
         );
     }

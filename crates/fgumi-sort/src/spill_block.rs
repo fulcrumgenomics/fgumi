@@ -1,17 +1,15 @@
 //! Block-granular spill compression kernel shared by the Phase-1 spill steps
 //! (`SpillGather` → `SpillCompress` → `SpillWrite`).
 //!
-//! The legacy streaming `SyncSpillWriter` (now the tests' reference) streams a whole
-//! sorted chunk through one stateful compressor on a single worker. To compress
-//! a spill across the framework pool instead, the chunk is cut into raw blocks by
+//! To compress a spill across the framework pool, a sorted chunk is cut into raw blocks by
 //! the (Serial) serialize step, each block is compressed **independently** by a
 //! (Parallel) compress worker, and the writer concatenates the results per file.
 //! This module holds the three pieces that keep that byte-compatible with the
 //! existing spill readers:
 //!
 //! - [`frame_keyed_record_into`] — append one `[key?][u32 LE len][record]` record
-//!   to a raw block buffer (the identical on-disk record layout
-//!   `SyncSpillWriter::write_record` produces).
+//!   to a raw block buffer: the on-disk record layout, which
+//!   [`frame_embedded_record_into`] writes for a key embedded in the record.
 //! - [`SpillBlockCompressor`] — a per-worker, codec-fixed compressor whose
 //!   [`compress_block`](SpillBlockCompressor::compress_block) turns one raw block
 //!   into a self-contained, independently-decodable unit: framed BGZF block(s)
@@ -22,8 +20,7 @@
 //! Because a BGZF/zstd spill stream is just independent blocks concatenated and
 //! the readers stream across boundaries, **any** blocking of the same raw
 //! `[key?][len][record]…` byte stream reads back to the identical records (see
-//! the round-trip + re-blocking-independence tests below and the format notes in
-//! the test-only `sync_spill_writer` module). Block boundaries are
+//! the round-trip and re-blocking-independence tests below). Block boundaries are
 //! therefore the serialize step's free choice, and compression is a pure function
 //! of each block — so the result is byte-for-byte independent of how many workers
 //! compress concurrently. The one bound on that freedom is
@@ -54,12 +51,51 @@ pub(crate) const MAX_SPILL_BLOCK_LEN: usize = 64 * 1024 * 1024;
 use crate::codec::{SpillCodec, ZSPILL_MAGIC};
 use crate::keys::RawSortKey;
 
+/// The sort key type a spill run was written with.
+///
+/// Consolidation must decode keys at the width they were written, and for
+/// template-coordinate that width is only chosen at runtime (from the first
+/// record), so the kind travels with the spilled data instead of being fixed
+/// when the chain is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpillKeyKind {
+    /// Coordinate order ([`RawCoordinateKey`](crate::RawCoordinateKey), embedded in the record).
+    Coordinate,
+    /// Queryname order, lexicographic ([`RawQuerynameLexKey`](crate::RawQuerynameLexKey)).
+    QuerynameLex,
+    /// Queryname order, natural ([`RawQuerynameKey`](crate::RawQuerynameKey)).
+    QuerynameNatural,
+    /// Template-coordinate, 24-byte core-only lane ([`TemplateKey24`](crate::TemplateKey24)).
+    TemplateK24,
+    /// Template-coordinate, 32-byte cell-barcode lane ([`CbKey32`](crate::CbKey32)).
+    TemplateCb32,
+    /// Template-coordinate, 32-byte tertiary lane ([`TertKey32`](crate::TertKey32)).
+    TemplateTert32,
+    /// Template-coordinate, full 40-byte key ([`TemplateKey`](crate::TemplateKey)).
+    TemplateK40,
+}
+
+impl SpillKeyKind {
+    /// Bytes of key a spilled record of this kind carries ahead of its length
+    /// prefix: 0 for the orders whose key is embedded in the record
+    /// (coordinate, queryname), the lane width for template-coordinate.
+    #[must_use]
+    pub const fn serialized_key_bytes(self) -> usize {
+        match self {
+            Self::Coordinate | Self::QuerynameLex | Self::QuerynameNatural => 0,
+            Self::TemplateK24 => 24,
+            Self::TemplateCb32 | Self::TemplateTert32 => 32,
+            Self::TemplateK40 => 40,
+        }
+    }
+}
+
 /// Append one keyed record to `block` in the spill record framing:
 /// `[key bytes if !K::EMBEDDED_IN_RECORD][u32 LE record-len][record body]`.
 ///
-/// This is the exact layout `SyncSpillWriter::write_record` writes; the
-/// serialize step accumulates records into a raw block with this helper, and the
-/// merge / Phase-2 readers parse it back unchanged.
+/// This is the definition of the spill record layout: the serialize step
+/// accumulates records into a raw block with it, and the merge / Phase-2
+/// readers parse it back unchanged.
 ///
 /// # Errors
 ///
@@ -141,11 +177,11 @@ impl SpillBlockCompressor {
 
     /// Compress one raw block into a self-contained, independently-decodable
     /// unit. Concatenating these units (bracketed by [`spill_magic`] /
-    /// [`spill_trailer`]) reproduces the same decompressed stream as the
-    /// streaming `SyncSpillWriter`, regardless of where the block boundaries fall.
+    /// [`spill_trailer`]) reproduces the concatenated raw blocks, regardless of
+    /// where the block boundaries fall.
     ///
-    /// An empty block yields an empty `Vec` (no empty BGZF block / zstd frame is
-    /// emitted), matching the streaming writer's "no empty frames" invariant.
+    /// An empty block yields an empty `Vec`: no empty BGZF block or zstd frame
+    /// is emitted.
     ///
     /// # Errors
     ///
@@ -242,8 +278,8 @@ pub fn spill_trailer(codec: SpillCodec) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external::GenericKeyedChunkReader;
     use crate::inline::TemplateKey;
+    use crate::spill_block_reader::SpillBlockDecompressor;
     use std::fs::File;
     use std::io::{BufWriter, Write as _};
     use std::path::Path;
@@ -419,13 +455,45 @@ mod tests {
         out.flush().unwrap();
     }
 
+    /// Read a keyed spill file back to its `(key, record)` pairs through the
+    /// production block decompressor: detect the codec from the magic,
+    /// decompress every block, and parse `[key][u32 LE len][record]` frames.
     fn read_back(path: &Path) -> Vec<(TemplateKey, Vec<u8>)> {
-        let mut reader =
-            GenericKeyedChunkReader::<TemplateKey>::open(path, None).expect("open reader");
-        let mut buf = Vec::new();
+        use std::io::{Read as _, Seek as _};
+        let mut file = File::open(path).expect("open spill");
+        let mut magic = [0u8; 4];
+        let filled = crate::spill_block_reader::read_exact_or_eof(&mut file, &mut magic)
+            .expect("read magic");
+        let codec = if filled {
+            SpillCodec::from_magic(&magic).unwrap_or(SpillCodec::Bgzf)
+        } else {
+            SpillCodec::Bgzf
+        };
+        if matches!(codec, SpillCodec::Bgzf) {
+            file.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        }
+        let mut reader = std::io::BufReader::new(file);
+        let mut dec = SpillBlockDecompressor::new();
+        let mut bytes = Vec::new();
+        loop {
+            let blocks = dec.read_blocks(&mut reader, codec, 4).expect("read blocks");
+            let n = blocks.len();
+            for b in blocks {
+                bytes.extend_from_slice(&b);
+            }
+            if n < 4 {
+                break;
+            }
+        }
+        let mut cursor = std::io::Cursor::new(bytes);
         let mut out = Vec::new();
-        while let Some(key) = reader.next_record(&mut buf).expect("read record") {
-            out.push((key, buf.clone()));
+        while cursor.position() < cursor.get_ref().len() as u64 {
+            let key = TemplateKey::read_from(&mut cursor).expect("key");
+            let mut len = [0u8; 4];
+            cursor.read_exact(&mut len).expect("record length");
+            let mut record = vec![0u8; usize::try_from(u32::from_le_bytes(len)).unwrap()];
+            cursor.read_exact(&mut record).expect("record");
+            out.push((key, record));
         }
         out
     }
@@ -443,31 +511,6 @@ mod tests {
             let path = dir.path().join(format!("kernel_{name}.keyed"));
             write_via_kernel(&path, codec, level, &records, 7);
             assert_eq!(read_back(&path), records, "kernel round-trip mismatch for {name}");
-        }
-    }
-
-    /// Kernel output matches the streaming `write_sorted_chunk` oracle, read back
-    /// through the production reader — locks block-granular ≡ streaming.
-    #[test]
-    fn kernel_matches_streaming_oracle_read_back() {
-        let dir = TempDir::new().unwrap();
-        let records = sample_records(500);
-        let keyed: Vec<(TemplateKey, fgumi_raw_bam::RawRecord)> =
-            records.iter().map(|(k, r)| (*k, fgumi_raw_bam::RawRecord::from(r.clone()))).collect();
-        for (codec, level) in [(SpillCodec::Zstd, 3), (SpillCodec::Bgzf, 1)] {
-            // Unique paths per codec: the spill writers now create files
-            // exclusively (`create_new`), so a path may not be reused across
-            // iterations.
-            let kernel_path = dir.path().join(format!("kernel_{codec:?}.keyed"));
-            let oracle_path = dir.path().join(format!("oracle_{codec:?}.keyed"));
-            write_via_kernel(&kernel_path, codec, level, &records, 11);
-            crate::sync_spill_writer::write_sorted_chunk(&oracle_path, codec, level, &keyed)
-                .unwrap();
-            assert_eq!(
-                read_back(&kernel_path),
-                read_back(&oracle_path),
-                "kernel vs streaming-oracle read-back differ ({codec:?})"
-            );
         }
     }
 

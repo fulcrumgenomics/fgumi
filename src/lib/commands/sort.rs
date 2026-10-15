@@ -63,6 +63,18 @@ pub enum SortOrderArg {
 }
 
 impl SortOrderArg {
+    /// The `--order` value naming this order, as [`Self::parse`] accepts it: the
+    /// one table every error hint and test uses.
+    #[must_use]
+    pub fn flag_value(self) -> &'static str {
+        match self {
+            Self::Coordinate => "coordinate",
+            Self::Queryname => "queryname",
+            Self::QuerynameNatural => "queryname::natural",
+            Self::TemplateCoordinate => "template-coordinate",
+        }
+    }
+
     /// Parse a sort order string, supporting `::` sub-sort syntax for queryname.
     ///
     /// Valid values:
@@ -482,8 +494,8 @@ pub struct Sort {
     /// applies to the spill reads (spill files are always seekable) and `auto`
     /// reads them with one stream. SAM, plain-gzip, stdin and other non-seekable
     /// inputs are read sequentially.
-    #[arg(long = "read-streams", default_value_t = fgumi_sort::ReadStreams::Auto)]
-    pub read_streams: fgumi_sort::ReadStreams,
+    #[arg(long = "read-streams", default_value_t = fgumi_bam_io::ReadStreams::Auto)]
+    pub read_streams: fgumi_bam_io::ReadStreams,
 
     /// Emit the sort's performance diagnostics.
     ///
@@ -850,11 +862,12 @@ impl Sort {
     ///   above them leaves them alone.
     #[must_use]
     pub fn queue_memory_options(&self) -> QueueMemoryOptions {
-        QueueMemoryOptions {
-            max_memory: self.max_memory,
-            memory_reserve: self.memory_reserve,
-            memory_per_thread: self.memory_per_thread,
-        }
+        crate::commands::common::sort_chain_runtime(
+            self.max_memory,
+            self.memory_reserve,
+            self.memory_per_thread,
+        )
+        .1
     }
 
     /// Builds the declarative [`ChainSpec`] that `fgumi sort` runs.
@@ -883,6 +896,11 @@ impl Sort {
         resolved_max_temp_files: usize,
         command_line: &str,
     ) -> ChainSpec {
+        let (scheduler, queue_memory) = crate::commands::common::sort_chain_runtime(
+            self.max_memory,
+            self.memory_reserve,
+            self.memory_per_thread,
+        );
         let mut sort_options = self.to_sort_options();
         sort_options.tmp_dirs = resolved_tmp_dirs;
         // Bake in the already-resolved value so the chain builder does not
@@ -904,23 +922,22 @@ impl Sort {
             stage_opts,
             threading: ThreadingOptions { threads: Some(self.threads) },
             compression: self.compression.clone(),
-            // Match sibling chain commands (10s), not the derived Default (0 = monitor off).
-            // Carry the sort command's diagnostic instrumentation flags (sort does not
-            // flatten `SchedulerOptions`, so they must be forwarded explicitly) — this
-            // is what makes `fgumi sort --pipeline-trace <level>` reach the chain.
+            // The runtime every sort-chain command shares (`sort_chain_runtime`:
+            // the deadlock monitor on, and the inter-stage queue budget bounded by
+            // the same `--max-memory` as the sorter buffer, see
+            // `queue_memory_options`). The queue budget scales by `--threads`; the
+            // sorter's by the effective sort-phase count
+            // (`PhaseThreads::memory_budget_threads`). The sort command's
+            // diagnostic flags are forwarded on top (sort does not flatten
+            // `SchedulerOptions`) — this is what makes
+            // `fgumi sort --pipeline-trace <level>` reach the chain.
             scheduler: SchedulerOptions {
-                deadlock_timeout: 10,
                 pipeline_stats: self.pipeline_stats,
                 pipeline_trace: self.pipeline_trace,
                 pipeline_trace_out: self.pipeline_trace_out.clone(),
-                ..Default::default()
+                ..scheduler
             },
-            // The single `--max-memory` knob bounds the inter-stage queue budget too,
-            // not just the sorter buffer (see `queue_memory_options`). The queue
-            // budget scales by `--threads`; the sorter's by the effective sort-phase
-            // count (`PhaseThreads::memory_budget_threads`: an explicit
-            // `--sort-threads` within the worker pool, else `--threads`).
-            queue_memory: self.queue_memory_options(),
+            queue_memory,
             async_reader: false,
             // Thread the sort command's --read-streams into the chain's BAM
             // source: anything but Fixed(1) over a regular BGZF file selects the
@@ -1236,8 +1253,7 @@ impl Sort {
 
         // --- cutover: run via the chain instead of sorter.sort() ---
         // (The banner's thread numbers come from `phase_threads()` above, the
-        //  same resolver the chain builder uses; the owned sorter is not
-        //  constructed or executed here. PR B removes the owned engine.)
+        //  same resolver the chain builder uses.)
         //
         // `output` is already bound at the top of this method (validated in `execute`),
         // and `resolved_tmp_dirs` was resolved above for the banner; hand both to the
@@ -1245,9 +1261,27 @@ impl Sort {
         // above from a single `RLIMIT_NOFILE` snapshot) so the chain builder does not
         // re-resolve `Auto` itself from a second, independent snapshot.
         // `resolved_tmp_dirs` is moved here — its last borrow was the banner log above.
-        let spec =
-            self.build_sort_chain_spec(output, resolved_tmp_dirs, max_temp_files, command_line);
-        build_for(spec)?.run()
+        // The chain writes a staged temp (and its BAI); it replaces the
+        // destination only after a successful run that wrote every record it
+        // read (`StagedSortOutput`), so a failed sort leaves the destination as
+        // it was.
+        let staged = crate::pipeline::chains::staged_output::StagedSortOutput::create(
+            output,
+            self.write_index,
+            "sort",
+        )?;
+        let spec = self.build_sort_chain_spec(
+            staged.path(),
+            resolved_tmp_dirs,
+            max_temp_files,
+            command_line,
+        );
+        let built = build_for(spec)?;
+        let slot = built.sort_stats_slot.clone();
+        built.run()?;
+        staged.finish(&slot.and_then(|s| *s.lock()).unwrap_or_default())?;
+        info!("Output: {}", output.display());
+        Ok(())
     }
 
     /// Execute verify mode: read records and check sort order.
@@ -2069,94 +2103,6 @@ mod tests {
         assert_eq!(sort.resolved_max_temp_files(soft_nofile), expected);
     }
 
-    /// The accessor test above only proves the flag reaches the builder. This
-    /// one proves `--max-temp-files` is purely a *how-we-consolidate* knob and
-    /// never changes *what* is written: with a 1 KiB memory budget (no floor in
-    /// `Fixed` mode) and enough records to spill many runs, `Some(2)` forces the
-    /// consolidation merge to fire repeatedly (oldest runs are merged once their
-    /// count reaches the limit), while a limit far above the spill count never
-    /// consolidates and merges every run in the final k-way pass. Both paths
-    /// must emit the same records in the same order — this guards the
-    /// consolidation path against a stable-order or record-loss regression the
-    /// accessor test cannot catch.
-    ///
-    /// The control arm pins an explicit large limit rather than passing `None`.
-    /// The engine default is derived from the host's `ulimit -n`, so a `None`
-    /// control arm could itself consolidate on a low-limit machine, quietly
-    /// turning this into a consolidation-vs-consolidation comparison that still
-    /// passes while no longer testing what it claims.
-    ///
-    /// We compare decoded records rather than the raw BGZF bytes on purpose:
-    /// the two write paths flush BGZF blocks at different points, so the
-    /// compressed framing legitimately differs even when the record stream is
-    /// identical. The contract consolidation must uphold is record identity,
-    /// not byte identity of the container.
-    #[test]
-    fn test_max_temp_files_consolidation_is_record_identical() {
-        use fgumi_sam::SamBuilder;
-
-        // Reverse-ordered, all-distinct starts so the coordinate sort is a total
-        // order (no ties whose order could depend on merge grouping); 60 pairs
-        // at a 1 KiB budget spill well over a dozen runs.
-        let mut builder = SamBuilder::new();
-        for i in 0..60 {
-            let _ = builder
-                .add_pair()
-                .name(&format!("read{i:04}"))
-                .start1((60 - i) * 100 + 1)
-                .start2((60 - i) * 100 + 51)
-                .build();
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let input = dir.path().join("in.bam");
-        builder.write_bam(&input).expect("write bam");
-
-        // 1 KiB memory forces spilling; this mirrors the order/memory/threads/
-        // max-temp-files fields the command's owned-engine wiring used to set,
-        // so it exercises the same consolidation behavior.
-        let run = |max_temp_files: MaxTempFiles, out: PathBuf| {
-            let mut sort = make_sort(SortOrderArg::Coordinate);
-            sort.max_temp_files = max_temp_files;
-
-            let sorter = fgumi_sort::RawExternalSorter::new(sort.order.into())
-                .memory_limit(1024)
-                .threads(1)
-                .max_temp_files(sort.resolved_max_temp_files(fgumi_sort::soft_nofile()));
-            let stats = sorter.sort(&input, &out).expect("sort should succeed");
-
-            let mut reader =
-                noodles::bam::io::reader::Builder.build_from_path(&out).expect("open output");
-            let header = reader.read_header().expect("read header");
-            let records = reader
-                .record_bufs(&header)
-                .collect::<std::io::Result<Vec<_>>>()
-                .expect("read records");
-            (stats, records)
-        };
-
-        let (default_stats, default_records) =
-            run(MaxTempFiles::Fixed(usize::MAX), dir.path().join("default.bam"));
-        let (limited_stats, limited_records) =
-            run(MaxTempFiles::Fixed(2), dir.path().join("limited.bam"));
-
-        // Precondition: the tiny budget really did spill multiple runs, so the
-        // `Some(2)` run exercised consolidation rather than a trivial in-memory
-        // sort. Without this the identity assertion below could pass vacuously.
-        assert!(
-            default_stats.runs_written >= 2,
-            "test must spill multiple runs to exercise consolidation, got {} run(s)",
-            default_stats.runs_written,
-        );
-        assert_eq!(
-            limited_stats.output_records, default_stats.output_records,
-            "consolidation must not drop or duplicate records",
-        );
-        assert_eq!(
-            limited_records, default_records,
-            "--max-temp-files is a consolidation knob and must not change the emitted records",
-        );
-    }
-
     /// Separately, the knob must not change what is written. Covers the same
     /// asymmetric splits end-to-end through `execute`.
     #[rstest]
@@ -2224,7 +2170,7 @@ mod tests {
             temp_codec: fgumi_sort::SpillCodec::default(),
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
-            read_streams: fgumi_sort::ReadStreams::Auto,
+            read_streams: fgumi_bam_io::ReadStreams::Auto,
             sort_stats: false,
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
@@ -2744,6 +2690,16 @@ mod tests {
         {
             let help = long_help_of(&command, long);
             assert!(help.contains(needle), "`--{long}` help lacks {needle:?}:\n{help}");
+        }
+    }
+
+    /// Catches: help text naming components D-4 deleted.
+    #[test]
+    fn max_temp_files_help_names_no_deleted_component() {
+        use clap::CommandFactory;
+        let help = long_help_of(&Sort::command(), "max-temp-files");
+        for gone in ["RawExternalSorter", "worker pool", "RunMerger"] {
+            assert!(!help.contains(gone), "{gone} in --max-temp-files help: {help}");
         }
     }
 

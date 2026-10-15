@@ -36,7 +36,8 @@ tempfile = { workspace = true }
 test-utils = []
 
 # `unistd::close` (checked close of output files, all Unix) needs no feature;
-# `fs` (the workspace default) is for `posix_fadvise`, used on Linux only.
+# `fs` (the workspace default) is for the read-ahead advice in `os_hints`:
+# `posix_fadvise` on Linux and `fcntl(F_RDADVISE)` on macOS.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 

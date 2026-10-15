@@ -35,9 +35,12 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use fgumi_bam_io::pread::{PositionalSource, SliceBufferPool, SliceLease, read_at_exact};
+use fgumi_bam_io::pread::{
+    PositionalSource, SliceBufferPool, SliceLease, read_at_exact, read_until_eof,
+};
 use fgumi_pipeline_core::{
-    HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, Unpushed, admit_input,
+    HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, StepCap, StepCapRef, Unpushed,
+    admit_input,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -58,6 +61,25 @@ pub enum SpillClass {
     Hot,
     /// Any other live spill file.
     Cold,
+    /// A consolidation input the consolidation merge needs next (awaited or
+    /// predicted).
+    ConsolidationHot,
+    /// Any other input of a consolidation in flight.
+    ConsolidationCold,
+}
+
+impl SpillClass {
+    /// Whether the class reads in hot fills toward the hot allowance.
+    #[must_use]
+    pub fn is_hot(self) -> bool {
+        matches!(self, Self::Hot | Self::ConsolidationHot)
+    }
+
+    /// Whether the read belongs to a consolidation (phase 1), not the merge.
+    #[must_use]
+    pub fn is_consolidation(self) -> bool {
+        matches!(self, Self::ConsolidationHot | Self::ConsolidationCold)
+    }
 }
 
 /// Where a slice's bytes go once read.
@@ -96,10 +118,15 @@ pub struct ReadRequest {
     pub source: Arc<dyn PositionalSource>,
     /// Byte offset of the read.
     pub offset: u64,
-    /// Bytes to read; the read fails unless exactly this many arrive.
+    /// Bytes to read; the read fails unless exactly this many arrive (a
+    /// sequential read may end short, at the stream's EOF).
     pub len: u32,
     /// Whether the read covers the stream's final byte.
     pub last: bool,
+    /// The source is a stream ([`fgumi_bam_io::pread::SequentialSource`]): the
+    /// read loops partial reads until `len` bytes or EOF, and a short fill is
+    /// the stream's last slice. File reads fail closed on a short read.
+    pub sequential: bool,
     /// Where the bytes go.
     pub target: ReadTarget,
 }
@@ -127,10 +154,15 @@ pub struct ReadSlice {
     pub seq: u32,
     /// The request's offset.
     pub offset: u64,
-    /// Exactly `len` bytes (a short read is an error, never a short slice).
+    /// Exactly `len` bytes (a short read is an error, never a short slice),
+    /// except for a sequential read, which ends short at the stream's EOF.
     pub bytes: SliceLease,
     /// Whether the slice covers the stream's final byte.
     pub last: bool,
+    /// Bytes the request asked for that never arrived: `0`, except for a
+    /// sequential read that ended at the stream's EOF. The ledger lands the
+    /// whole request (`bytes.len() + shortfall`), as the planner issued it.
+    pub shortfall: u32,
     /// Where the bytes go.
     pub target: ReadTarget,
 }
@@ -317,7 +349,7 @@ pub struct PreadSlices {
     input_ledger: Option<Arc<InputLedger>>,
     /// The phase cap shared with the phase's other pool steps; `None` unless a
     /// per-phase thread flag was given.
-    cap: Option<Arc<PhaseCap>>,
+    cap: Option<StepCap>,
 }
 
 impl PreadSlices {
@@ -358,11 +390,12 @@ impl PreadSlices {
         }
     }
 
-    /// Share a phase admission cap with the other pool steps of this phase
-    /// (`None` = uncapped).
+    /// Admit through `cap` (`None` = uncapped): a fixed phase cap shared with
+    /// the other pool steps of its phase, or a phased one that switches from
+    /// phase 1 to phase 2 at `AllAnnounced`.
     #[must_use]
-    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.cap = cap;
+    pub fn with_step_cap(mut self, cap: impl Into<Option<StepCap>>) -> Self {
+        self.cap = cap.into();
         self
     }
 
@@ -410,7 +443,24 @@ impl PreadSlices {
         if let Some(h) = &self.hist {
             h.inflight_enter();
         }
-        let result = read_at_exact(&*req.source, &mut buf, req.offset);
+        let mut last = req.last;
+        let mut shortfall = 0u32;
+        let result = if req.sequential {
+            read_until_eof(&*req.source, &mut buf, req.offset).map(|n| {
+                // A short fill is the stream's EOF: the slot's last slice. The
+                // bytes that will never arrive leave the slot's issued count.
+                if n < buf.len() {
+                    last = true;
+                    shortfall = u32::try_from(buf.len() - n).expect("a request length fits u32");
+                    if let ReadTarget::Spill { slot, .. } = &req.target {
+                        slot.bp_note_unissued((buf.len() - n) as u64);
+                    }
+                    buf.truncate(n);
+                }
+            })
+        } else {
+            read_at_exact(&*req.source, &mut buf, req.offset)
+        };
         if let Some(h) = &self.hist {
             h.inflight_exit();
         }
@@ -429,7 +479,8 @@ impl PreadSlices {
             seq: req.seq,
             offset: req.offset,
             bytes: self.pool.lease(buf),
-            last: req.last,
+            last,
+            shortfall,
             target: req.target,
         })
     }
@@ -483,7 +534,7 @@ impl Step for PreadSlices {
         // Moved out for the call: the permit borrows the cap while the read
         // needs `&mut self`.
         let cap = self.cap.take();
-        let outcome = self.run_once(ctx, cap.as_deref());
+        let outcome = self.run_once(ctx, cap.as_ref().and_then(StepCap::active));
         self.cap = cap;
         outcome
     }
@@ -492,8 +543,8 @@ impl Step for PreadSlices {
         self.clone()
     }
 
-    fn phase_cap(&self) -> Option<&PhaseCap> {
-        self.cap.as_deref()
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.cap.as_ref().map(StepCap::view)
     }
 }
 

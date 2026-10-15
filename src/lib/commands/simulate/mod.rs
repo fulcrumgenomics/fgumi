@@ -10,6 +10,8 @@ pub mod correct_reads;
 pub mod fastq_reads;
 pub mod grouped_reads;
 pub mod mapped_reads;
+#[cfg(test)]
+mod sorted_stream_tests;
 
 use crate::commands::command::Command;
 use anyhow::Result;

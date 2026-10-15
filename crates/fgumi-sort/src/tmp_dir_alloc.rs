@@ -9,9 +9,10 @@
 //! - Periodic re-checking of free space; directories whose free space falls
 //!   below a minimum threshold are dropped from rotation automatically.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use log::warn;
 use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 /// Best-effort check: is the path on a tmpfs (RAM-backed) filesystem?
 ///
@@ -249,10 +250,65 @@ fn default_free_space_probe(path: &Path) -> Result<u64> {
     fs4::available_space(path).map_err(anyhow::Error::from)
 }
 
+/// Create one fresh sort-run temp subdirectory under each of `temp_dirs`
+/// (or a single one under the system temp location when it is empty) and an
+/// allocator over them. The returned [`TempDir`] handles own the subdirs, which
+/// are removed on drop; the allocator hands out their paths for spill-file
+/// placement.
+///
+/// # Errors
+///
+/// Returns an error if a temp directory cannot be created or has insufficient
+/// free space.
+pub fn create_sort_temp_dirs(temp_dirs: &[PathBuf]) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
+    if temp_dirs.is_empty() {
+        let td = create_temp_dir(None)?;
+        let base = td.path().to_path_buf();
+        let alloc = TmpDirAllocator::new(vec![base])?;
+        return Ok((vec![td], alloc));
+    }
+
+    let mut handles = Vec::with_capacity(temp_dirs.len());
+    let mut subdirs = Vec::with_capacity(temp_dirs.len());
+    for base in temp_dirs {
+        let td = create_temp_dir(Some(base))?;
+        subdirs.push(td.path().to_path_buf());
+        handles.push(td);
+    }
+    let alloc = TmpDirAllocator::new(subdirs)?;
+    Ok((handles, alloc))
+}
+
+/// Create a temporary directory for sort spill files.
+fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
+    match base {
+        Some(base) => {
+            std::fs::create_dir_all(base)?;
+            TempDir::new_in(base).context("Failed to create temp directory")
+        }
+        None => TempDir::new().context("Failed to create temp directory"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_create_temp_dir_default() {
+        let dir = create_temp_dir(None).expect("creating temp dir should succeed");
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn test_create_temp_dir_with_base() {
+        let base = tempfile::tempdir().expect("creating temp file/dir should succeed");
+        let subdir = base.path().join("sort_spill");
+        let dir = create_temp_dir(Some(&subdir)).expect("creating temp dir should succeed");
+        assert!(dir.path().exists());
+        assert!(dir.path().starts_with(&subdir));
+    }
 
     /// Probe that always returns a fixed free-space value.
     fn always_free(bytes: u64) -> FreeSpaceProbe {

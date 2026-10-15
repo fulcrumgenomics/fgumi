@@ -123,8 +123,18 @@ fn standalone_sort_caps_every_step_of_an_explicit_phase(
     {
         assert_eq!(cap_of(&dag, step).as_deref(), phase1, "{step}:\n{dag}");
     }
-    for step in ["SortSpillDecompress", "SortMerge", "BgzfCompress"] {
+    for step in ["SortMerge", "BgzfCompress"] {
         assert_eq!(cap_of(&dag, step).as_deref(), phase2, "{step}:\n{dag}");
+    }
+    // The planner-fed supply steps also read and decompress consolidation
+    // inputs during phase 1 (the consolidation tail exists on every CLI sort),
+    // so they admit through a phased cap: phase 1's until every run is
+    // announced, phase 2's after.
+    let phased = (phase1.is_some() || phase2.is_some()).then(|| {
+        format!("phased({}→{})", phase1.unwrap_or("uncapped"), phase2.unwrap_or("uncapped"))
+    });
+    for step in ["PreadSpillSlices", "SortSpillDecompress", "SpillBlockCompressConsolidation"] {
+        assert_eq!(cap_of(&dag, step), phased, "{step}:\n{dag}");
     }
     if phase1.is_none() && phase2.is_none() {
         assert!(built.pipeline.phase_caps().is_empty(), "unset flags create no cap:\n{dag}");
@@ -154,10 +164,19 @@ fn standalone_sort_steps_of_one_phase_share_one_counter() {
             .map_or_else(|| panic!("{step} has no phase cap"), |(_, cap)| *cap)
     };
     let (inflate, spill) = (cap("InflateToArena"), cap("SpillBlockCompress"));
-    let (decompress, output_compress) = (cap("SortSpillDecompress"), cap("BgzfCompress"));
+    // A phased step lists both arms, phase order.
+    let caps_of = |step: &str| -> Vec<*const fgumi_pipeline_core::PhaseCap> {
+        caps.iter().filter(|(name, _)| *name == step).map(|(_, c)| std::ptr::from_ref(*c)).collect()
+    };
+    let output_compress = cap("BgzfCompress");
+    let decompress = output_compress;
+    assert_eq!(
+        caps_of("SortSpillDecompress"),
+        [std::ptr::from_ref(inflate), std::ptr::from_ref(output_compress)],
+        "the decompress step admits through phase 1's counter, then phase 2's"
+    );
 
     assert!(std::ptr::eq(inflate, spill), "phase-1 steps must share one counter");
-    assert!(std::ptr::eq(decompress, output_compress), "phase-2 steps must share one counter");
     assert!(
         std::ptr::eq(cap("SortCoordinateRun"), inflate),
         "the per-run sort must hold the phase-1 pool steps' counter"
@@ -196,7 +215,11 @@ fn runall_shaped_chain_leaves_terminal_compress_uncapped() {
     let dag = built.pipeline.dag();
 
     assert_eq!(cap_of(&dag, "InflateToArena").as_deref(), Some("sort-phase1(2)"), "{dag}");
-    assert_eq!(cap_of(&dag, "SortSpillDecompress"), None, "--merge-threads unset: {dag}");
+    assert_eq!(
+        cap_of(&dag, "SortSpillDecompress").as_deref(),
+        Some("phased(sort-phase1(2)→uncapped)"),
+        "--merge-threads unset, so phase 2 is uncapped: {dag}"
+    );
     assert_eq!(cap_of(&dag, "BgzfCompress"), None, "{dag}");
 }
 
@@ -294,7 +317,11 @@ fn zipper_floor_widens_the_sort_caps(
             assert!(std::ptr::eq(cap(step), spill), "{step} must share the phase-1 counter");
         }
     }
-    assert_eq!(cap_of(&dag, "SortSpillDecompress"), None, "--merge-threads unset: {dag}");
+    assert_eq!(
+        cap_of(&dag, "SortSpillDecompress"),
+        phase1.map(|p| format!("phased({p}→uncapped)")),
+        "--merge-threads unset, so phase 2 is uncapped: {dag}"
+    );
     // Sort is the last stage but not the only one, so the terminal output
     // compressor is not phase-2 work (matches `--sort::merge-threads` help).
     assert_eq!(cap_of(&dag, "BgzfCompress"), None, "{dag}");

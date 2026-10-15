@@ -7,19 +7,17 @@
 //! uses the same high-performance merge infrastructure as `fgumi sort`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use bstr::{BStr, BString};
 use clap::Parser;
 #[cfg(test)]
 use fgumi_bam_io::create_bam_reader;
-use fgumi_bam_io::create_raw_bam_reader;
 use fgumi_bam_io::header::{suffixed_id, with_renamed_reference};
-use fgumi_sort::RawExternalSorter;
 use indexmap::IndexMap;
 use log::{info, warn};
 use noodles::sam::Header;
@@ -27,6 +25,7 @@ use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::program::tag as program_tag;
 use noodles::sam::header::record::value::map::read_group::tag as read_group_tag;
 use noodles::sam::header::record::value::map::{Program, ReadGroup};
+use parking_lot::Mutex;
 
 use crate::commands::command::Command;
 use crate::commands::sort::SortOrderArg;
@@ -96,9 +95,12 @@ pub struct Merge {
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
 
-    /// Number of threads for parallel operations.
+    /// Number of threads that compress the output.
     ///
-    /// Used for multi-threaded BGZF compression.
+    /// The merge adds one worker per input, at most this many, that reads and
+    /// decompresses the inputs while the output is compressed, so it runs
+    /// `--threads` + min(inputs, `--threads`) workers (two at the default) plus
+    /// the merge thread. The merge's read-ahead is sized from `--threads`.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
@@ -164,32 +166,76 @@ impl Command for Merge {
             let ct_bytes = *ct;
             info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
         }
-        info!("Threads: {}", self.threads);
 
-        // Read and merge headers from all inputs (also validates each input's
-        // declared sort order against --order; MERGE3-01 fast check).
-        let MergedHeader { header, input_renames } = merge_headers(&input_paths, self.order)?;
+        // Warn before opening anything: the inputs stay open for the whole
+        // merge, so an over-budget merge fails inside the open loop below, and
+        // this is the explanation for that failure.
+        if !fgumi_sort::fits_nofile_budget(fgumi_sort::soft_nofile(), input_paths.len()) {
+            warn!("{}", fd_budget_warning(input_paths.len()));
+        }
+        // Open every input once: a file positionally, a stream (pipe, FIFO,
+        // process substitution) sequentially, its header parsed through the
+        // source so the bytes the parse consumes are replayed to the merge.
+        let mut opened = Vec::with_capacity(input_paths.len());
+        let mut headers = Vec::with_capacity(input_paths.len());
+        for path in &input_paths {
+            let (input, header) = open_merge_input(path)?;
+            opened.push(input);
+            headers.push(header);
+        }
+
+        // Merge the headers (also validates each input's declared sort order
+        // against --order; MERGE3-01 fast check).
+        let MergedHeader { header, input_renames } =
+            merge_headers_from(&input_paths, headers, self.order)?;
         log_renames(&input_paths, &input_renames);
         // Record this merge with one @PG, as every fgumi command does, chained to the last
         // program chain end in merged-header order, which is the last input's when inputs
         // carry separate chains. `samtools merge` instead adds one @PG per chain end; fgumi
         // adds one per command (see `fgumi_bam_io::header::add_pg_record`).
         let header = crate::commands::common::add_pg_record(header, command_line)?;
-        let mut rewriter = ReadTagRewriter::new(&input_paths, input_renames);
+        let rewriter = std::sync::Arc::new(Mutex::new(ReadTagRewriter::new(
+            input_paths.clone(),
+            input_renames,
+        )));
+        let rewrite: Option<fgumi_sort::RecordRewrite> = rewriter.lock().any_renames.then(|| {
+            let rewriter = std::sync::Arc::clone(&rewriter);
+            std::sync::Arc::new(move |input: u32, record: &mut Vec<u8>| {
+                rewriter.lock().rewrite(input as usize, record);
+            }) as fgumi_sort::RecordRewrite
+        });
 
-        let mut sorter = RawExternalSorter::new(self.order.into())
-            .threads(self.threads)
-            .output_compression(self.compression_level);
+        let order: fgumi_sort::SortOrder = self.order.into();
+        let template_ctx = (order == fgumi_sort::SortOrder::TemplateCoordinate).then(|| {
+            fgumi_sort::TemplateKeySeed::from_header(
+                &header,
+                cell_tag,
+                fgumi_sort::KeyTypesSpec::Full,
+            )
+            .merge_context()
+        });
+        let output_header = fgumi_sort::create_output_header(order, &header);
 
-        if let Some(ct) = cell_tag {
-            sorter = sorter.cell_tag(ct);
-        }
-
-        let records_merged =
-            sorter.merge_bams_rewriting(&input_paths, &header, &self.output, |input, record| {
-                rewriter.rewrite(input, record);
-            })?;
-        rewriter.log_undeclared_summary();
+        // Stage the output; it replaces the destination only once the merge
+        // has succeeded, so a failed merge leaves no partial output.
+        let target = fgumi_sort::MergeOutputTarget::create(&self.output)?;
+        let stats_slot = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let built = crate::pipeline::chains::build_merge(crate::pipeline::chains::MergeSpec {
+            inputs: opened,
+            header: output_header,
+            order,
+            order_name: self.order.flag_value(),
+            template_ctx,
+            rewrite,
+            output: target.path().to_path_buf(),
+            compression: self.compression_level,
+            threads: self.threads,
+            stats_slot: std::sync::Arc::clone(&stats_slot),
+        })?;
+        built.run()?;
+        target.persist()?;
+        rewriter.lock().log_undeclared_summary();
+        let records_merged = stats_slot.lock().as_ref().map_or(0, |s| s.output_records);
 
         info!("=== Summary ===");
         info!("Records merged: {records_merged}");
@@ -198,6 +244,58 @@ impl Command for Merge {
         timer.log_completion(records_merged);
         Ok(())
     }
+}
+
+/// One merge input, opened once: a regular BGZF file read positionally, or a
+/// stream (pipe, FIFO, process substitution) or SAM / plain-gzip file,
+/// normalized to BGZF and read in order through a
+/// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource), whose header
+/// parse the source replays to the merge. The classification is the one every
+/// positional reader applies ([`fgumi_bam_io::pread::open_seekable_bgzf`]).
+fn open_merge_input(path: &Path) -> Result<(fgumi_pipeline_io::sort::MergeInput, Header)> {
+    use fgumi_bam_io::pread::{SeekableInput, SequentialSource, open_seekable_bgzf};
+    use std::sync::Arc;
+    let opened = open_seekable_bgzf(path)
+        .with_context(|| format!("failed to open merge input {}", path.display()))?;
+    if let SeekableInput::Bgzf { file, len } = opened {
+        // The header is parsed through the same handle; the merge then reads
+        // the file positionally, so the cursor this leaves does not matter.
+        let header = noodles::bam::io::Reader::new(&file)
+            .read_header()
+            .with_context(|| format!("Failed to read header from: {}", path.display()))?;
+        let input = fgumi_pipeline_io::sort::MergeInput {
+            path: path.to_path_buf(),
+            source: Arc::new(file),
+            len: Some(len),
+            prefix_len: None,
+        };
+        return Ok((input, header));
+    }
+    let stream = fgumi_bam_io::open_normalized_input(path)?;
+    let source = Arc::new(SequentialSource::new(path, stream));
+    let header = noodles::bam::io::Reader::new(source.header_reader())
+        .read_header()
+        .with_context(|| format!("Failed to read header from: {}", path.display()))?;
+    let input = fgumi_pipeline_io::sort::MergeInput {
+        path: path.to_path_buf(),
+        prefix_len: Some(source.prefix_len()),
+        source,
+        len: None,
+    };
+    Ok((input, header))
+}
+
+/// The warning for a merge whose inputs exceed the open-file budget.
+fn fd_budget_warning(num_inputs: usize) -> String {
+    let budget = fgumi_sort::soft_nofile().map_or_else(
+        || "unknown".to_string(),
+        |soft| soft.saturating_sub(fgumi_sort::FD_RESERVE).to_string(),
+    );
+    format!(
+        "Merging {num_inputs} inputs opens {num_inputs} files at once, which exceeds this \
+         process's open file budget of about {budget}. Raise it with `ulimit -n`, or merge in \
+         stages, if this fails with \"Too many open files\"."
+    )
 }
 
 /// A BAM header's *declared* sort order, as far as merge validation cares.
@@ -246,16 +344,6 @@ fn expected_declared_order(order: SortOrderArg) -> DeclaredOrder {
     }
 }
 
-/// The `fgumi sort --order` value string for an order (used in error hints).
-fn order_flag_value(order: SortOrderArg) -> &'static str {
-    match order {
-        SortOrderArg::Coordinate => "coordinate",
-        SortOrderArg::Queryname => "queryname",
-        SortOrderArg::QuerynameNatural => "queryname::natural",
-        SortOrderArg::TemplateCoordinate => "template-coordinate",
-    }
-}
-
 /// MERGE3-01 (fast header check): reject an input whose header *declares* a sort
 /// order that conflicts with the requested merge `order`.
 ///
@@ -285,7 +373,7 @@ fn check_input_declared_order(header: &Header, order: SortOrderArg, source: &str
                  existing order:\n  fgumi merge --order {declared} ...\nor sort the inputs to \
                  {requested} first:\n  fgumi sort -i <input> -o sorted.bam --order {requested}",
             declared = declared.as_str(),
-            requested = order_flag_value(order),
+            requested = order.flag_value(),
         );
     }
     Ok(())
@@ -326,19 +414,29 @@ impl InputIdRenames {
 /// so its reads can be rewritten to follow them. Validates that all inputs share the
 /// same reference sequences (names and order) and that each input's declared sort
 /// order is compatible with `order` (MERGE3-01 fast check).
+#[cfg(test)]
 fn merge_headers(input_paths: &[PathBuf], order: SortOrderArg) -> Result<MergedHeader> {
-    if input_paths.is_empty() {
-        bail!("No input files to merge headers from");
-    }
-
     // Read all headers once (raw reader; records aren't consumed here).
     let headers: Vec<Header> = input_paths
         .iter()
         .map(|path| {
-            let (_, header) = create_raw_bam_reader(path, 1)?;
+            let (_, header) = fgumi_bam_io::create_raw_bam_reader(path, 1)?;
             Ok(header)
         })
         .collect::<Result<Vec<_>>>()?;
+    merge_headers_from(input_paths, headers, order)
+}
+
+/// `merge_headers` over headers the caller already read (one per input,
+/// in input order).
+fn merge_headers_from(
+    input_paths: &[PathBuf],
+    headers: Vec<Header>,
+    order: SortOrderArg,
+) -> Result<MergedHeader> {
+    if input_paths.is_empty() {
+        bail!("No input files to merge headers from");
+    }
 
     // MERGE3-01: reject any input whose declared order conflicts with the merge
     // order (validated for every input, including the single-input case, since
@@ -557,8 +655,8 @@ fn log_renames(input_paths: &[PathBuf], input_renames: &[InputIdRenames]) {
 /// unchanged and reported (once per input and tag, then as a count). When that ID is a
 /// fresh ID minted for a renamed record, the read now joins that record, so the
 /// collision is reported separately.
-struct ReadTagRewriter<'a> {
-    input_paths: &'a [PathBuf],
+struct ReadTagRewriter {
+    input_paths: Vec<PathBuf>,
     input_renames: Vec<InputIdRenames>,
     any_renames: bool,
     /// The fresh @RG IDs minted for any input's renamed read groups.
@@ -571,8 +669,8 @@ struct ReadTagRewriter<'a> {
     fresh_id_collisions: HashMap<(usize, SamTag), u64>,
 }
 
-impl<'a> ReadTagRewriter<'a> {
-    fn new(input_paths: &'a [PathBuf], input_renames: Vec<InputIdRenames>) -> Self {
+impl ReadTagRewriter {
+    fn new(input_paths: Vec<PathBuf>, input_renames: Vec<InputIdRenames>) -> Self {
         let any_renames = input_renames.iter().any(|renames| !renames.is_empty());
         let fresh_read_group_ids = input_renames
             .iter()
@@ -1116,7 +1214,7 @@ mod tests {
         if let Err(e) = result {
             let msg = e.to_string();
             assert!(msg.contains("in.bam"), "message missing source: {msg}");
-            assert!(msg.contains(order_flag_value(order)), "message missing order hint: {msg}");
+            assert!(msg.contains(order.flag_value()), "message missing order hint: {msg}");
         }
     }
 
@@ -1182,7 +1280,7 @@ mod tests {
                 declared_programs: HashSet::from([BString::from("P")]),
             },
         ];
-        let mut rewriter = ReadTagRewriter::new(&input_paths, input_renames);
+        let mut rewriter = ReadTagRewriter::new(input_paths.to_vec(), input_renames);
         let mut record =
             fgumi_raw_bam::SamBuilder::new().add_string_tag(tag, value).build().into_inner();
 
