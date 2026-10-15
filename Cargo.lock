@@ -283,9 +283,9 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bwa-mem3-rs"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb71bec885a4f0cecc553a17b9fdfaa58bf6b3466386e31be78d34063f2b45ba"
+checksum = "0ef69e6886f1e517093a5c0c535cf1889996daf8014e32f7e953eb9c5d687641"
 dependencies = [
  "bwa-mem3-sys",
  "libc",
@@ -294,9 +294,9 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-sys"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b3302f3b3e290ba1993009571636977fa4c289c57cab7d7bc686e05f01d126e"
+checksum = "d1c86e0aa977c7b96e50452faeeb881297deba727814522114c24c116f2294ad"
 dependencies = [
  "cc",
  "libc",
