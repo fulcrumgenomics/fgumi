@@ -441,43 +441,71 @@ fn open_normalized_with_opts(
     opts: PipelineReaderOpts,
     label: &str,
 ) -> Result<Box<dyn Read + Send>> {
-    let opened: Box<dyn Read + Send> = if is_stdin_path(path) {
-        if opts.async_reader {
-            log::info!("async {label} enabled: spawning fgumi-prefetch thread for stdin");
-            Box::new(crate::prefetch_reader::PrefetchReader::new(io::stdin()))
-        } else {
-            Box::new(io::stdin())
-        }
-    } else {
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open input BAM: {}", path.display()))?;
-
-        // Tell the kernel to grow the per-fd read-ahead window. Best-effort;
-        // failure is logged and ignored. On non-Linux targets this is a no-op.
-        crate::os_hints::advise_sequential(&file);
-
-        build_file_reader(file, path, opts.async_reader, label)
-    };
-
-    crate::sam_input::normalize_to_bgzf(opened, path)
+    crate::sam_input::normalize_to_bgzf(open_source(path, opts, label)?.into_reader(), path)
 }
 
-/// Choose the reader for an open regular file: the plain sequential or
-/// async-prefetch reader. Concurrent positional reads are chain-native (the
-/// sort's `PlanInputReads → PreadSlices → FrameBgzfBlocks`, which decides for
-/// itself whether an input qualifies), so this opener never reads
-/// positionally.
-fn build_file_reader(
-    file: File,
-    path: &Path,
-    async_reader: bool,
-    label: &str,
-) -> Box<dyn Read + Send> {
+/// Where an opened input's bytes come from, which decides whether the pipeline
+/// reader buffers it (see [`create_bam_reader_for_pipeline_with_opts`]).
+enum SourceKind {
+    /// Read straight from the kernel: a plain `File` or stdin. Every `read` is
+    /// a syscall, so the pipeline reader buffers it.
+    Kernel(Box<dyn Read + Send>),
+    /// Already staged in memory: a `PrefetchReader` (`--async-reader`), whose
+    /// background thread reads ahead in large chunks. Buffering it again would
+    /// copy every byte a second time, so it is left as is.
+    InMemory(Box<dyn Read + Send>),
+}
+
+impl SourceKind {
+    /// The opened reader, whatever its kind.
+    fn into_reader(self) -> Box<dyn Read + Send> {
+        match self {
+            Self::Kernel(reader) | Self::InMemory(reader) => reader,
+        }
+    }
+}
+
+/// Open `path` (or stdin) per `opts` and classify the result.
+///
+/// Handles stdin (which cannot be re-opened), applies the sequential-readahead
+/// hint to regular files, and honors `opts.async_reader`. `label` names this
+/// reader in the async-reader log line.
+///
+/// # Errors
+///
+/// Returns an error if the input cannot be opened.
+fn open_source(path: &Path, opts: PipelineReaderOpts, label: &str) -> Result<SourceKind> {
+    if is_stdin_path(path) {
+        return Ok(if opts.async_reader {
+            log::info!("async {label} enabled: spawning fgumi-prefetch thread for stdin");
+            SourceKind::InMemory(Box::new(crate::prefetch_reader::PrefetchReader::new(io::stdin())))
+        } else {
+            SourceKind::Kernel(Box::new(io::stdin()))
+        });
+    }
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open input BAM: {}", path.display()))?;
+
+    // Tell the kernel to grow the per-fd read-ahead window. Best-effort;
+    // failure is logged and ignored. On non-Linux targets this is a no-op.
+    crate::os_hints::advise_sequential(&file);
+
+    Ok(build_file_reader(file, path, opts.async_reader, label))
+}
+
+/// Choose and classify the reader for an open regular file: the async-prefetch
+/// reader ([`SourceKind::InMemory`]) or the plain sequential `File`
+/// ([`SourceKind::Kernel`]). Choosing and classifying here, together, keeps the
+/// two from drifting apart: a reader added here is classified where it is
+/// built. Concurrent positional reads are chain-native (the sort's
+/// `PlanInputReads → PreadSlices → FrameBgzfBlocks`, which decides for itself
+/// whether an input qualifies), so this opener never reads positionally.
+fn build_file_reader(file: File, path: &Path, async_reader: bool, label: &str) -> SourceKind {
     if async_reader {
         log::info!("async {label} enabled: spawning fgumi-prefetch thread for {}", path.display());
-        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
+        SourceKind::InMemory(Box::new(crate::prefetch_reader::PrefetchReader::from_file(file)))
     } else {
-        Box::new(file)
+        SourceKind::Kernel(Box::new(file))
     }
 }
 
@@ -784,12 +812,49 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
     opts: PipelineReaderOpts,
 ) -> Result<(Box<dyn Read + Send>, Header)> {
     let path_ref = path.as_ref();
+    build_pipeline_reader_from(open_source(path_ref, opts, "BAM reader")?, path_ref)
+}
 
-    // SAM text is transcoded inside the opener, so the rest of this function —
-    // and every pipeline stage downstream of it — sees one stream format.
-    let reader = open_normalized_with_opts(path_ref, opts, "BAM reader")?;
-    let (header, rest) = read_header_and_replay(reader, path_ref)?;
+/// Buffer the pipeline reader places over a kernel-backed source. The chain's
+/// `ReadBgzfBlocks` pulls one BGZF block at a time (an 18-byte header, then
+/// the body), so an unbuffered `File` or stdin costs two syscalls per block;
+/// 2 MiB matches the buffer the chain's file-path reader (`read_bam`) uses.
+const PIPELINE_SOURCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
+/// Build the pipeline reader over an opened `source`: buffer it once if it is
+/// read from the kernel (never if it is already in memory), transcode SAM to
+/// BGZF, then parse the header and replay the stream from byte zero.
+///
+/// This is where the buffering is decided because this is where the source's
+/// type is known: a `File` or stdin is buffered in [`PIPELINE_SOURCE_BUFFER_SIZE`]
+/// reads; a `PrefetchReader` already hands out large in-memory chunks, and a
+/// second buffer over it would only copy every byte again. The buffer sits
+/// *under* the SAM transcoder and the header replay, so it stays resident for
+/// the whole stream ([`read_header_and_replay`] adds no layer of its own).
+///
+/// One path is still buffered twice: SAM text or plain gzip under a `.bam`
+/// name, where `normalize_to_bgzf` lays its own SAM reader or `MultiGzDecoder`
+/// buffer over this one. Only a mislabeled input reaches it (a real `.sam` is
+/// routed to the text reader before this opener), so it is left as is.
+///
+/// # Errors
+///
+/// Returns an error if the input is empty, is neither BAM nor SAM, or its BAM
+/// header cannot be read.
+fn build_pipeline_reader_from(
+    source: SourceKind,
+    path: &Path,
+) -> Result<(Box<dyn Read + Send>, Header)> {
+    let source: Box<dyn Read + Send> = match source {
+        SourceKind::Kernel(reader) => {
+            Box::new(BufReader::with_capacity(PIPELINE_SOURCE_BUFFER_SIZE, reader))
+        }
+        SourceKind::InMemory(reader) => reader,
+    };
+    // SAM text is transcoded here, so every pipeline stage downstream sees one
+    // stream format.
+    let normalized = crate::sam_input::normalize_to_bgzf(source, path)?;
+    let (header, rest) = read_header_and_replay(normalized, path)?;
     Ok((rest, header))
 }
 
@@ -823,13 +888,16 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
 ///
 /// The buffer is *temporary*, and deliberately so. It is placed under the
 /// [`TeeReader`] for the parse, then dismantled: its readahead is moved into
-/// the replay buffer and the original stream is handed back unwrapped. Leaving
-/// it in place would put a second buffer under consumers that already have one
-/// — `fgumi_sort::RawBamRecordReader` and the chain's BGZF readers both read
-/// block by block, so a resident layer here would copy every byte of the input
-/// a second time on the hot path. Draining it into the replay buffer costs one
-/// memcpy of at most `BGZF_INPUT_BUFFER_SIZE`, which [`ChainedReader`] frees
-/// as soon as it is delivered.
+/// the replay buffer and the original stream is handed back unwrapped. This
+/// function adds no resident layer because whether the stream needs one
+/// depends on what it is, which only the caller knows:
+/// `fgumi_sort::RawBamRecordReader` wraps the replay in its own `BufReader`,
+/// and the pipeline reader ([`create_bam_reader_for_pipeline_with_opts`])
+/// buffers a kernel-backed source once, *beneath* this call, and leaves an
+/// in-memory `PrefetchReader` unbuffered. A resident layer here would copy
+/// every byte a second time on both paths. Draining the temporary buffer into
+/// the replay buffer costs one memcpy of at most `BGZF_INPUT_BUFFER_SIZE`,
+/// which [`ChainedReader`] frees as soon as it is delivered.
 ///
 /// # Errors
 ///
@@ -1622,6 +1690,130 @@ mod tests {
         // `fill_buf` shares the poison too.
         assert!(reader.fill_buf().is_err(), "fill_buf must also honor the poison");
         Ok(())
+    }
+
+    /// Counts the `read` calls that reach the innermost source.
+    struct CountingRead<R> {
+        inner: R,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl<R: Read> Read for CountingRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+
+    /// Records the size of every request that reaches the innermost source.
+    struct SizeRecordingRead<R> {
+        inner: R,
+        sizes: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl<R: Read> Read for SizeRecordingRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.sizes.lock().push(buf.len());
+            self.inner.read(buf)
+        }
+    }
+
+    /// A multi-block BGZF BAM file and its block count.
+    fn multi_block_bam() -> (NamedTempFile, usize) {
+        let file = NamedTempFile::new().expect("temp BAM");
+        write_bgzf_bam(file.path(), &many_record_sam_text(200_000));
+        let bytes = std::fs::read(file.path()).expect("read BAM");
+        let mut cursor = bytes.as_slice();
+        let mut blocks = 0;
+        while !fgumi_bgzf::read_raw_blocks(&mut cursor, 1).expect("frame BGZF block").is_empty() {
+            blocks += 1;
+        }
+        (file, blocks)
+    }
+
+    /// Drain `reader` the way the chain's `ReadBgzfBlocks` does: one BGZF block
+    /// at a time (an 18-byte header, then the body).
+    fn drain_by_block(reader: &mut dyn Read) {
+        while !fgumi_bgzf::read_raw_blocks(reader, 1).expect("frame BGZF block").is_empty() {}
+    }
+
+    /// `open_source` classifies a regular file by `--async-reader`: a plain
+    /// `File` is kernel-backed (the pipeline reader buffers it), a
+    /// `PrefetchReader` is in memory (left unbuffered). The buffering tests call
+    /// `build_pipeline_reader_from` with an explicit kind, so without this a
+    /// misclassification would go unnoticed.
+    #[rstest]
+    #[case::plain(false)]
+    #[case::async_reader(true)]
+    fn open_source_classifies_a_file_by_async_reader(#[case] async_reader: bool) {
+        let (bam, _) = multi_block_bam();
+        let opts = PipelineReaderOpts { async_reader, ..PipelineReaderOpts::default() };
+        let kind = open_source(bam.path(), opts, "test").expect("open BAM");
+        if async_reader {
+            assert!(matches!(kind, SourceKind::InMemory(_)), "--async-reader must be in memory");
+        } else {
+            assert!(matches!(kind, SourceKind::Kernel(_)), "a plain file must be kernel-backed");
+        }
+    }
+
+    /// A kernel-backed source (`File`, stdin) is read in large requests once
+    /// the pipeline reader is built: a block-by-block consumer over an
+    /// unbuffered file costs two `read` calls per BGZF block.
+    #[test]
+    fn file_source_is_read_in_large_chunks() {
+        let (bam, blocks) = multi_block_bam();
+        assert!(blocks >= 20, "fixture must span many BGZF blocks, got {blocks}");
+        let len = usize::try_from(std::fs::metadata(bam.path()).expect("stat").len())
+            .expect("fits usize");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingRead {
+            inner: File::open(bam.path()).expect("open BAM"),
+            calls: Arc::clone(&calls),
+        };
+        let (mut reader, _header) =
+            build_pipeline_reader_from(SourceKind::Kernel(Box::new(source)), bam.path())
+                .expect("build pipeline reader");
+        drain_by_block(&mut reader);
+        let n = calls.load(Ordering::Relaxed);
+        assert!(
+            n <= len / PIPELINE_SOURCE_BUFFER_SIZE + 8,
+            "{n} read() calls for {len} bytes in {blocks} blocks: the source is not buffered"
+        );
+    }
+
+    /// An in-memory source (a `PrefetchReader`) is not buffered a second time:
+    /// once the reader is built, every request that reaches the source is the
+    /// consumer's own (at most one BGZF block), never a buffer's large refill.
+    /// Construction-time requests (the header parse and its replay readahead)
+    /// are out of scope.
+    #[test]
+    fn prefetch_source_is_not_double_buffered() {
+        let (bam, _) = multi_block_bam();
+        let sizes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let source = SizeRecordingRead {
+            inner: io::Cursor::new(std::fs::read(bam.path()).expect("read BAM")),
+            sizes: Arc::clone(&sizes),
+        };
+        let (mut reader, _header) =
+            build_pipeline_reader_from(SourceKind::InMemory(Box::new(source)), bam.path())
+                .expect("build pipeline reader");
+        sizes.lock().clear();
+        drain_by_block(&mut reader);
+        let after = sizes.lock().clone();
+        assert!(
+            !after.is_empty(),
+            "the fixture exceeds the replay: the consumer must reach the source"
+        );
+        assert!(
+            after.contains(&1),
+            "the BGZF reader's 1-byte header probe never reached the source: a buffer sits \
+             between the consumer and the in-memory source"
+        );
+        let max = after.iter().copied().max().unwrap_or(0);
+        assert!(
+            max <= 64 * 1024,
+            "a buffer sits between the consumer and the in-memory source (largest request {max})"
+        );
     }
 
     #[test]
