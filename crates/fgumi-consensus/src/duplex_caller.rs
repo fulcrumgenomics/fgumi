@@ -955,6 +955,191 @@ impl DuplexConsensusCaller {
         }
     }
 
+    /// Combine two strand consensuses base by base with fgbio's duplex rule:
+    /// agreement sums the qualities; disagreement takes the higher-quality base
+    /// at the quality difference (no call on a tie); an `N` on either strand, or
+    /// a minimum quality, masks the base. Errors count source reads disagreeing
+    /// with the call, or are derived from the strands' own error counts when no
+    /// source reads are kept. Returns the duplex `(bases, quals, errors)`.
+    ///
+    /// When `ANNOTATED`, a strand may carry a methylation annotation
+    /// (`a_meth`/`b_meth`, already truncated to `len`): methylation calls are
+    /// made where the two strands' conversion patterns confirm one another, and
+    /// each strand's evidence is kept only at those calls. With neither strand
+    /// annotated no position can be a call, so the caller instantiates
+    /// `ANNOTATED = false`, which compiles the methylation checks out of the
+    /// per-base loop: one rule, two instantiations, and a run without
+    /// methylation does not pay for the per-base call checks.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the per-base methylation-aware combination reads clearest as one loop"
+    )]
+    fn combine_strands<const ANNOTATED: bool>(
+        a: &VanillaConsensusRead,
+        b: &VanillaConsensusRead,
+        len: usize,
+        source_reads: Option<&[SourceRead]>,
+        a_meth: &mut Option<crate::methylation::MethylationAnnotation>,
+        b_meth: &mut Option<crate::methylation::MethylationAnnotation>,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u16>) {
+        const NO_CALL: u8 = b'N';
+        const NO_CALL_QUAL: u8 = MIN_PHRED;
+
+        let mut bases = Vec::with_capacity(len);
+        let mut quals = Vec::with_capacity(len);
+        let mut errors = Vec::with_capacity(len);
+        // Per-strand methylation evidence, kept below only at methylation calls. The
+        // C→T and G→A inputs are told apart by pattern (in the duplex R2 record the
+        // C→T input is the BA strand); without both there is no confirming strand, so
+        // no calls.
+        let ct_input_is_a = if ANNOTATED {
+            match (&a_meth, &b_meth) {
+                (Some(first), Some(second)) if first.pattern != second.pattern => {
+                    Some(first.pattern == ConversionPattern::CToT)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        for i in 0..len {
+            let a_base = a.bases[i];
+            let b_base = b.bases[i];
+            let a_qual = i32::from(a.quals[i]);
+            let b_qual = i32::from(b.quals[i]);
+
+            // At a methylation call only the informative input keeps its counts; every
+            // other position keeps none.
+            let informative_call = if ANNOTATED {
+                ct_input_is_a.and_then(|ct_is_a| {
+                    let (ct_base, ga_base) =
+                        if ct_is_a { (a_base, b_base) } else { (b_base, a_base) };
+                    Self::molecule_call(ct_base, ga_base)
+                })
+            } else {
+                None
+            };
+            // Whether the reference has the cytosine the call is at (read before the
+            // evidence is rewritten below).
+            let reference_has_cytosine = informative_call.is_some_and(|c| {
+                [a_meth.as_ref(), b_meth.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|m| m.pattern == c.pattern && m.evidence[i].informative)
+            });
+            if ANNOTATED {
+                for meth in [a_meth.as_mut(), b_meth.as_mut()].into_iter().flatten() {
+                    let ev = &mut meth.evidence[i];
+                    if informative_call.is_some_and(|c| c.pattern == meth.pattern) {
+                        ev.informative = true;
+                    } else {
+                        *ev = crate::methylation::MethylationEvidence::default();
+                    }
+                }
+            }
+
+            // Calculate raw consensus base and quality (fgbio algorithm)
+            // A call is agreement on the molecule's base: the confirmed base, with the
+            // summed quality. Where the informative strand shows the converted base and
+            // the reference has no cytosine there, the pair is either an unmethylated
+            // cytosine the reference lacks or a T:A (A:T) pair with one error on the
+            // confirming strand, and only the confirming strand supports the cytosine:
+            // the base takes that strand's quality alone.
+            let (raw_base, raw_qual) = if let Some(c) = informative_call {
+                let (_, _, converted) = c.pattern.bases();
+                let confirming_qual =
+                    if (c.pattern == ConversionPattern::CToT) == (ct_input_is_a == Some(true)) {
+                        b_qual
+                    } else {
+                        a_qual
+                    };
+                let qual = if c.call.eq_ignore_ascii_case(&converted) && !reference_has_cytosine {
+                    Self::cap_quality(confirming_qual)
+                } else {
+                    Self::cap_quality(a_qual + b_qual)
+                };
+                (c.confirmed, qual)
+            } else if a_base == b_base {
+                // Agreement: sum qualities (capped)
+                (a_base, Self::cap_quality(a_qual + b_qual))
+            } else if a_qual > b_qual {
+                // Disagreement: take higher quality base
+                (a_base, Self::cap_quality(a_qual - b_qual))
+            } else if b_qual > a_qual {
+                (b_base, Self::cap_quality(b_qual - a_qual))
+            } else {
+                // Equal qualities, different bases: no confidence
+                (a_base, NO_CALL_QUAL)
+            };
+
+            // Mask to N if either input is N or quality is minimum
+            let (final_base, final_qual) =
+                if a_base == NO_CALL || b_base == NO_CALL || raw_qual == NO_CALL_QUAL {
+                    (NO_CALL, NO_CALL_QUAL)
+                } else {
+                    (raw_base, raw_qual)
+                };
+
+            bases.push(final_base);
+            quals.push(final_qual);
+
+            let error_count = if let Some(c) = informative_call {
+                // Each source read is compared with what its own strand should show:
+                // the call on the informative strand, the confirmed base on the other.
+                if let Some(source_reads) = source_reads {
+                    let num_errors = source_reads
+                        .iter()
+                        .filter(|sr| {
+                            let expected =
+                                if ConversionPattern::from_read_flags(sr.flags) == c.pattern {
+                                    c.call
+                                } else {
+                                    c.confirmed
+                                };
+                            sr.bases.len() > i && Self::is_error(sr.bases[i], expected)
+                        })
+                        .count();
+                    clamp_combined_error_to_fgbio_short(
+                        i64::try_from(num_errors).unwrap_or(i64::MAX),
+                    )
+                } else {
+                    clamp_combined_error_to_fgbio_short(
+                        i64::from(a.errors[i]) + i64::from(b.errors[i]),
+                    )
+                }
+            } else if let Some(source_reads) = source_reads {
+                // Exact method: count disagreements with source reads
+                let mut num_errors = 0i32;
+                for sr in source_reads {
+                    if sr.bases.len() > i && Self::is_error(sr.bases[i], raw_base) {
+                        num_errors += 1;
+                    }
+                }
+                clamp_combined_error_to_fgbio_short(i64::from(num_errors))
+            } else {
+                // Approximate method when source reads unavailable
+                let a_err = i32::from(a.errors[i]);
+                let b_err = i32::from(b.errors[i]);
+                let a_dep = i32::from(a.depths[i]);
+                let b_dep = i32::from(b.depths[i]);
+
+                let err = if a_base == b_base {
+                    a_err + b_err
+                } else if raw_base == a_base {
+                    a_err + (b_dep - b_err)
+                } else {
+                    b_err + (a_dep - a_err)
+                };
+                clamp_combined_error_to_fgbio_short(i64::from(err))
+            };
+
+            errors.push(error_count);
+        }
+
+        (bases, quals, errors)
+    }
+
     /// Creates a duplex consensus read from AB and BA single-strand consensuses.
     ///
     /// This matches fgbio's `duplexConsensus` method exactly:
@@ -966,18 +1151,11 @@ impl DuplexConsensusCaller {
     /// * `ab` - Optional AB strand single-strand consensus
     /// * `ba` - Optional BA strand single-strand consensus
     /// * `source_reads` - Optional source reads for error calculation
-    #[expect(
-        clippy::too_many_lines,
-        reason = "duplex consensus building has many sequential steps that are clearest in one function"
-    )]
     pub(crate) fn duplex_consensus(
         ab: Option<&VanillaConsensusRead>,
         ba: Option<&VanillaConsensusRead>,
         source_reads: Option<&[SourceRead]>,
     ) -> Option<DuplexConsensusRead> {
-        const NO_CALL: u8 = b'N';
-        const NO_CALL_QUAL: u8 = MIN_PHRED;
-
         // Calculate length as minimum of both consensuses (fgbio behavior)
         let len = std::cmp::min(
             ab.map_or(usize::MAX, VanillaConsensusRead::len),
@@ -1017,152 +1195,20 @@ impl DuplexConsensusCaller {
             (Some(a), Some(b)) => {
                 // Both strands - combine them
                 let id = a.id.clone();
-                let mut bases = Vec::with_capacity(len);
-                let mut quals = Vec::with_capacity(len);
-                let mut errors = Vec::with_capacity(len);
-                // Per-strand methylation evidence, kept below only at methylation calls. The
-                // C→T and G→A inputs are told apart by pattern (in the duplex R2 record the
-                // C→T input is the BA strand); without both there is no confirming strand, so
-                // no calls.
                 let mut a_meth = a.methylation.as_ref().map(|m| m.truncate(len));
                 let mut b_meth = b.methylation.as_ref().map(|m| m.truncate(len));
-                let ct_input_is_a = match (&a_meth, &b_meth) {
-                    (Some(first), Some(second)) if first.pattern != second.pattern => {
-                        Some(first.pattern == ConversionPattern::CToT)
-                    }
-                    _ => None,
+                let (bases, quals, errors) = if a_meth.is_none() && b_meth.is_none() {
+                    Self::combine_strands::<false>(
+                        a,
+                        b,
+                        len,
+                        source_reads,
+                        &mut a_meth,
+                        &mut b_meth,
+                    )
+                } else {
+                    Self::combine_strands::<true>(a, b, len, source_reads, &mut a_meth, &mut b_meth)
                 };
-
-                for i in 0..len {
-                    let a_base = a.bases[i];
-                    let b_base = b.bases[i];
-                    let a_qual = i32::from(a.quals[i]);
-                    let b_qual = i32::from(b.quals[i]);
-
-                    // At a methylation call only the informative input keeps its counts; every
-                    // other position keeps none.
-                    let informative_call = ct_input_is_a.and_then(|ct_is_a| {
-                        let (ct_base, ga_base) =
-                            if ct_is_a { (a_base, b_base) } else { (b_base, a_base) };
-                        Self::molecule_call(ct_base, ga_base)
-                    });
-                    // Whether the reference has the cytosine the call is at (read before the
-                    // evidence is rewritten below).
-                    let reference_has_cytosine = informative_call.is_some_and(|c| {
-                        [a_meth.as_ref(), b_meth.as_ref()]
-                            .into_iter()
-                            .flatten()
-                            .any(|m| m.pattern == c.pattern && m.evidence[i].informative)
-                    });
-                    for meth in [a_meth.as_mut(), b_meth.as_mut()].into_iter().flatten() {
-                        let ev = &mut meth.evidence[i];
-                        if informative_call.is_some_and(|c| c.pattern == meth.pattern) {
-                            ev.informative = true;
-                        } else {
-                            *ev = crate::methylation::MethylationEvidence::default();
-                        }
-                    }
-
-                    // Calculate raw consensus base and quality (fgbio algorithm)
-                    // A call is agreement on the molecule's base: the confirmed base, with the
-                    // summed quality. Where the informative strand shows the converted base and
-                    // the reference has no cytosine there, the pair is either an unmethylated
-                    // cytosine the reference lacks or a T:A (A:T) pair with one error on the
-                    // confirming strand, and only the confirming strand supports the cytosine:
-                    // the base takes that strand's quality alone.
-                    let (raw_base, raw_qual) = if let Some(c) = informative_call {
-                        let (_, _, converted) = c.pattern.bases();
-                        let confirming_qual = if (c.pattern == ConversionPattern::CToT)
-                            == (ct_input_is_a == Some(true))
-                        {
-                            b_qual
-                        } else {
-                            a_qual
-                        };
-                        let qual =
-                            if c.call.eq_ignore_ascii_case(&converted) && !reference_has_cytosine {
-                                Self::cap_quality(confirming_qual)
-                            } else {
-                                Self::cap_quality(a_qual + b_qual)
-                            };
-                        (c.confirmed, qual)
-                    } else if a_base == b_base {
-                        // Agreement: sum qualities (capped)
-                        (a_base, Self::cap_quality(a_qual + b_qual))
-                    } else if a_qual > b_qual {
-                        // Disagreement: take higher quality base
-                        (a_base, Self::cap_quality(a_qual - b_qual))
-                    } else if b_qual > a_qual {
-                        (b_base, Self::cap_quality(b_qual - a_qual))
-                    } else {
-                        // Equal qualities, different bases: no confidence
-                        (a_base, NO_CALL_QUAL)
-                    };
-
-                    // Mask to N if either input is N or quality is minimum
-                    let (final_base, final_qual) =
-                        if a_base == NO_CALL || b_base == NO_CALL || raw_qual == NO_CALL_QUAL {
-                            (NO_CALL, NO_CALL_QUAL)
-                        } else {
-                            (raw_base, raw_qual)
-                        };
-
-                    bases.push(final_base);
-                    quals.push(final_qual);
-
-                    let error_count = if let Some(c) = informative_call {
-                        // Each source read is compared with what its own strand should show:
-                        // the call on the informative strand, the confirmed base on the other.
-                        if let Some(source_reads) = source_reads {
-                            let num_errors = source_reads
-                                .iter()
-                                .filter(|sr| {
-                                    let expected = if ConversionPattern::from_read_flags(sr.flags)
-                                        == c.pattern
-                                    {
-                                        c.call
-                                    } else {
-                                        c.confirmed
-                                    };
-                                    sr.bases.len() > i && Self::is_error(sr.bases[i], expected)
-                                })
-                                .count();
-                            clamp_combined_error_to_fgbio_short(
-                                i64::try_from(num_errors).unwrap_or(i64::MAX),
-                            )
-                        } else {
-                            clamp_combined_error_to_fgbio_short(
-                                i64::from(a.errors[i]) + i64::from(b.errors[i]),
-                            )
-                        }
-                    } else if let Some(source_reads) = source_reads {
-                        // Exact method: count disagreements with source reads
-                        let mut num_errors = 0i32;
-                        for sr in source_reads {
-                            if sr.bases.len() > i && Self::is_error(sr.bases[i], raw_base) {
-                                num_errors += 1;
-                            }
-                        }
-                        clamp_combined_error_to_fgbio_short(i64::from(num_errors))
-                    } else {
-                        // Approximate method when source reads unavailable
-                        let a_err = i32::from(a.errors[i]);
-                        let b_err = i32::from(b.errors[i]);
-                        let a_dep = i32::from(a.depths[i]);
-                        let b_dep = i32::from(b.depths[i]);
-
-                        let err = if a_base == b_base {
-                            a_err + b_err
-                        } else if raw_base == a_base {
-                            a_err + (b_dep - b_err)
-                        } else {
-                            b_err + (a_dep - a_err)
-                        };
-                        clamp_combined_error_to_fgbio_short(i64::from(err))
-                    };
-
-                    errors.push(error_count);
-                }
 
                 // Truncate AB and BA consensuses to match duplex length
                 let ab_truncated = VanillaConsensusRead {
@@ -2764,6 +2810,63 @@ mod tests {
     use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
     use rstest::rstest;
+
+    /// One strand consensus of `len` positions from per-position
+    /// `(base index into ACGTN, qual, depth, errors)` tuples.
+    fn strand_read(cols: &[(usize, u8, u16, u16)]) -> VanillaConsensusRead {
+        VanillaConsensusRead {
+            id: "m".to_string(),
+            bases: cols.iter().map(|c| b"ACGTN"[c.0]).collect(),
+            quals: cols.iter().map(|c| c.1).collect(),
+            depths: cols.iter().map(|c| c.2).collect(),
+            errors: cols.iter().map(|c| c.3.min(c.2)).collect(),
+            source_reads: None,
+            methylation: None,
+        }
+    }
+
+    proptest::proptest! {
+        /// The no-methylation instantiation (`ANNOTATED = false`, the methylation
+        /// checks compiled out) combines two strands exactly as the
+        /// methylation-aware one does when neither strand carries an
+        /// annotation: same bases, qualities and error counts, with and without
+        /// source reads, over agreement, disagreement, quality ties and `N`s.
+        #[test]
+        fn unannotated_strands_combine_as_the_methylation_path_without_annotations(
+            cols in proptest::collection::vec(
+                ((0usize..5, 2u8..60, 0u16..8, 0u16..8), (0usize..5, 2u8..60, 0u16..8, 0u16..8)),
+                0..60,
+            ),
+            sources in proptest::collection::vec(proptest::collection::vec(0usize..5, 0..70), 0..4),
+            with_sources in proptest::bool::ANY,
+        ) {
+            let a = strand_read(&cols.iter().map(|c| c.0).collect::<Vec<_>>());
+            let b = strand_read(&cols.iter().map(|c| c.1).collect::<Vec<_>>());
+            let source_reads: Vec<SourceRead> = sources
+                .iter()
+                .map(|bases| SourceRead {
+                    original_idx: 0,
+                    bases: bases.iter().map(|&i| b"ACGTN"[i]).collect(),
+                    quals: vec![30; bases.len()],
+                    simplified_cigar: Vec::new(),
+                    flags: 0,
+                    ref_id: 0,
+                    alignment_start: 0,
+                    original_cigar: Vec::new(),
+                    name_hash: 0,
+                })
+                .collect();
+            let sources = with_sources.then_some(source_reads.as_slice());
+            let len = cols.len();
+            let fast = DuplexConsensusCaller::combine_strands::<false>(
+                &a, &b, len, sources, &mut None, &mut None,
+            );
+            let general = DuplexConsensusCaller::combine_strands::<true>(
+                &a, &b, len, sources, &mut None, &mut None,
+            );
+            proptest::prop_assert_eq!(fast, general);
+        }
+    }
 
     #[test]
     fn test_parse_mi_tag() {

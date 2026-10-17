@@ -18,6 +18,8 @@ pub mod extract;
 pub mod fastq;
 pub mod filter;
 pub mod group;
+#[cfg(feature = "consensus")]
+pub(crate) mod output_sizer;
 pub mod retag;
 #[cfg(feature = "consensus")]
 pub mod simplex;
@@ -30,6 +32,13 @@ use fgumi_raw_bam::RawRecord;
 
 use crate::pipeline::steps::parse::decode::validate_record_for_decode;
 use crate::pipeline::steps::types::RecordBatch;
+
+/// Framed size (`4 + len` per record) of a batch's record bodies: the size
+/// those records take once serialized as BAM (`block_size` + body). The filter
+/// and consensus steps size their output buffers from it.
+pub(crate) fn framed_len<'a>(bodies: impl Iterator<Item = &'a [u8]>) -> usize {
+    bodies.map(|body| 4 + body.len()).sum()
+}
 
 /// Drive a per-record transform over a borrowed [`RecordBatch`] without the
 /// per-record heap allocation of the `DecodedRecordBatch` decode path.
@@ -78,6 +87,120 @@ pub(crate) fn for_each_raw_record(
 #[cfg(feature = "consensus")]
 pub(crate) fn append_framed_bytes(dst: &mut Vec<u8>, rec: &[u8]) -> std::io::Result<()> {
     fgumi_raw_bam::write_framed_record(dst, rec)
+}
+
+/// Mapped-pair fixtures shared by the consensus steps' tests. The duplex
+/// caller counts only paired R1/R2 reads per strand and the CODEC caller
+/// rejects unmapped and non-overlapping pairs, so these build mapped,
+/// fully-overlapping FR pairs.
+#[cfg(all(test, feature = "consensus"))]
+pub(crate) mod consensus_fixtures {
+    use fgumi_raw_bam::{RawRecord, SamBuilder};
+
+    use crate::mi_group::MiGroup;
+    use crate::sam::SamTag;
+
+    /// One mapped FR pair at `pos` (`50M`, identical bases, Q30) tagged `MI:Z:mi`.
+    /// `r1_reverse` puts R1 on the reverse strand (the B strand of a duplex).
+    pub(crate) fn mapped_fr_pair(
+        name: &str,
+        pos: i32,
+        mi: &str,
+        r1_reverse: bool,
+    ) -> [RawRecord; 2] {
+        const PAIRED: u16 = 0x1;
+        const PROPER: u16 = 0x2;
+        const REVERSE: u16 = 0x10;
+        const MATE_REVERSE: u16 = 0x20;
+        const FIRST: u16 = 0x40;
+        const LAST: u16 = 0x80;
+        let seq: Vec<u8> = b"ACGT".iter().copied().cycle().take(50).collect();
+        let one = |flags: u16, tlen: i32| {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(flags)
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&[50 << 4])
+                .mate_ref_id(0)
+                .mate_pos(pos)
+                .template_length(tlen)
+                .sequence(&seq)
+                .qualities(&[30; 50])
+                .add_string_tag(SamTag::MI, mi.as_bytes())
+                .add_string_tag(SamTag::MC, b"50M");
+            b.build()
+        };
+        let (r1_strand, r2_strand) =
+            if r1_reverse { (REVERSE, MATE_REVERSE) } else { (MATE_REVERSE, REVERSE) };
+        [one(PAIRED | PROPER | FIRST | r1_strand, 50), one(PAIRED | PROPER | LAST | r2_strand, -50)]
+    }
+
+    /// The output-sizing contract on the second of two identical consensus
+    /// batches: the sizer reserved from what it observed on the first (more
+    /// than nothing, no more than 5/4 of that output plus 4 KiB), and the
+    /// second batch filled that reservation without regrowing.
+    pub(crate) fn assert_sized_from_the_previous_batch(
+        first: &crate::pipeline::steps::types::DecompressedBlock,
+        second: &crate::pipeline::steps::types::DecompressedBlock,
+        last_reserved: usize,
+    ) {
+        let out = first.bytes.len();
+        assert!(out > 0, "fixture produced no consensus");
+        assert_eq!(second.bytes.len(), out, "identical batches must produce identical output");
+        assert!(last_reserved > 0, "nothing reserved: the sizer never observed the first batch");
+        assert!(
+            last_reserved <= out * 5 / 4 + 4096,
+            "reserved {last_reserved} for {out} output bytes: not sized from the observed ratio"
+        );
+        assert_eq!(second.bytes.capacity(), last_reserved, "output regrew past its reservation");
+    }
+
+    /// Simplex: `n_mi` molecules of `pairs` FR pairs each.
+    pub(crate) fn simplex_groups_for_test(n_mi: usize, pairs: usize) -> Vec<MiGroup> {
+        (0..n_mi)
+            .map(|i| {
+                let mi = format!("{i}");
+                let pos = 1_000 + 100 * i32::try_from(i).expect("small fixture");
+                let records = (0..pairs)
+                    .flat_map(|p| mapped_fr_pair(&format!("s{i}p{p}"), pos, &mi, false))
+                    .collect();
+                MiGroup { mi, records }
+            })
+            .collect()
+    }
+
+    /// Duplex: `n_mi` molecules, each one group holding an `/A` family and a
+    /// `/B` family of `pairs` FR pairs (B with R1 on the reverse strand).
+    pub(crate) fn duplex_groups_for_test(n_mi: usize, pairs: usize) -> Vec<MiGroup> {
+        (0..n_mi)
+            .map(|i| {
+                let pos = 1_000 + 100 * i32::try_from(i).expect("small fixture");
+                let records = ["A", "B"]
+                    .into_iter()
+                    .flat_map(|strand| {
+                        let mi = format!("{i}/{strand}");
+                        (0..pairs).flat_map(move |p| {
+                            mapped_fr_pair(&format!("d{i}{strand}p{p}"), pos, &mi, strand == "B")
+                        })
+                    })
+                    .collect();
+                MiGroup { mi: format!("{i}"), records }
+            })
+            .collect()
+    }
+
+    /// CODEC: one overlapping FR pair per molecule.
+    pub(crate) fn codec_groups_for_test(n_mi: usize) -> Vec<MiGroup> {
+        (0..n_mi)
+            .map(|i| {
+                let mi = format!("{i}");
+                let pos = 1_000 + 100 * i32::try_from(i).expect("small fixture");
+                MiGroup { records: mapped_fr_pair(&format!("c{i}"), pos, &mi, false).into(), mi }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

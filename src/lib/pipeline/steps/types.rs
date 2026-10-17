@@ -36,6 +36,29 @@ pub use fgumi_pipeline_io::types::{
     RecordIndexEntry,
 };
 
+/// Slack a queue-bound byte buffer may carry beyond twice its length before
+/// [`fit_for_queue`] shrinks it.
+pub(crate) const QUEUE_FIT_SLACK_BYTES: usize = 64 * 1024;
+
+/// Shrink `buf` to its length when its capacity exceeds
+/// `2 * len + QUEUE_FIT_SLACK_BYTES`.
+///
+/// A [`DecompressedBlock`] is charged to its byte-bounded output queue by
+/// `capacity()`, not `len()`. A step that reserves an output buffer ahead of
+/// time (from its input size, an observed ratio, or a previous batch) can hand
+/// the queue a buffer far larger than the bytes it holds, which throttles the
+/// pipeline early and makes per-stage memory depend on the input rather than
+/// on config. Calling this before the buffer is queued caps the charge at about
+/// twice the bytes held. The threshold is the bound `Vec` doubling already
+/// gives, plus slack, so a buffer that grew normally, or a reservation that
+/// came out close to its length, is never reallocated; only an
+/// over-reservation pays one shrink (a realloc of `len` bytes).
+pub(crate) fn fit_for_queue(buf: &mut Vec<u8>) {
+    if buf.capacity() > 2 * buf.len() + QUEUE_FIT_SLACK_BYTES {
+        buf.shrink_to_fit();
+    }
+}
+
 /// Bytes held by a `Vec`'s backing store, counted by **allocated capacity**.
 ///
 /// The batch types below cache a `total_bytes` that feeds byte-bounded

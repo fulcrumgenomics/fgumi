@@ -10,6 +10,8 @@
 
 use std::io;
 
+use crate::pipeline::steps::types::fit_for_queue;
+
 /// Upper bound on bytes the scanner will carry forward waiting for one record
 /// (or the BAM header) to complete.
 ///
@@ -80,7 +82,15 @@ pub enum BatchCut {
 /// can then be parallelized across multiple threads.
 #[derive(Debug, Clone)]
 pub struct BoundaryBatch {
-    /// The decompressed bytes (with leftover prepended, suffix removed).
+    /// The complete records' bytes (with leftover prepended, suffix removed).
+    ///
+    /// This is the scanner's own buffer, moved out on emit rather than copied:
+    /// in [`BatchCut::Record`] mode the call's work buffer, under
+    /// [`BatchCut::Queryname`] the coalescing accumulator. Only the carry (the
+    /// trailing partial record, or the trailing open queryname run) is copied
+    /// forward. Its capacity is at most `2 * len + 64 KiB` (the scanner calls
+    /// `fit_for_queue` before emitting), since the output queue is charged by
+    /// capacity.
     pub buffer: Vec<u8>,
     /// Byte offsets where each record starts (offsets into buffer).
     /// Length = `num_records` + 1 (last entry is `buffer.len()` for easy slicing).
@@ -93,11 +103,18 @@ pub struct BoundaryBatch {
 /// across BGZF block boundaries. The boundary finding is very fast (~0.1μs
 /// per block) since it only reads 4-byte integers without decoding records.
 ///
-/// Uses a reusable work buffer to minimize allocations on the hot path.
+/// Emits by move. In [`BatchCut::Record`] mode each call scans into a fresh
+/// buffer, which becomes the emitted [`BoundaryBatch::buffer`] as-is; under
+/// [`BatchCut::Queryname`] the scanned records are appended to a coalescing
+/// accumulator, and the accumulator is what is moved out. Either way only the
+/// carry is copied forward: one allocation per emitted batch, as before, and
+/// one copy of the record bytes fewer.
 pub struct BoundaryState {
     /// Leftover bytes from previous block (incomplete record at end).
     leftover: Vec<u8>,
-    /// Reusable working buffer to avoid per-call allocations.
+    /// Working buffer for the current call: leftover + the new block. Moved out
+    /// as the emitted batch in [`BatchCut::Record`] mode (so it is fresh on the
+    /// next call) and kept only when a call emits nothing.
     work_buffer: Vec<u8>,
     /// Whether the BAM header has been skipped.
     header_skipped: bool,
@@ -139,6 +156,14 @@ pub struct BoundaryState {
     /// constant so tests can drive the rejection path with a small cap instead
     /// of buffering 256 MiB; production callers get [`MAX_QUERYNAME_RUN_BYTES`].
     max_queryname_run_bytes: usize,
+    /// Bytes of complete records the most recent call appended to
+    /// `qn_buffer`: one call's worth of input, the headroom the next
+    /// accumulator is reserved with.
+    last_append_len: usize,
+    /// Address of the buffer most recently moved out on emit, so tests can
+    /// assert that the emitted batch *is* that buffer rather than a copy.
+    #[cfg(test)]
+    last_take_ptr: usize,
 }
 
 impl BoundaryState {
@@ -156,6 +181,9 @@ impl BoundaryState {
             qn_buffer: Vec::new(),
             qn_offsets: vec![0],
             max_queryname_run_bytes: MAX_QUERYNAME_RUN_BYTES,
+            last_append_len: 0,
+            #[cfg(test)]
+            last_take_ptr: 0,
         }
     }
 
@@ -174,6 +202,9 @@ impl BoundaryState {
             qn_buffer: Vec::new(),
             qn_offsets: vec![0],
             max_queryname_run_bytes: MAX_QUERYNAME_RUN_BYTES,
+            last_append_len: 0,
+            #[cfg(test)]
+            last_take_ptr: 0,
         }
     }
 
@@ -368,9 +399,11 @@ impl BoundaryState {
     /// `buffer`), so promoting the cross-check to release would re-validate a
     /// tautology at a per-record cost for no correctness benefit.
     pub fn find_boundaries(&mut self, decompressed: &[u8]) -> io::Result<BoundaryBatch> {
-        // Step 1: Combine leftover with new data into reusable work_buffer
-        // This avoids allocating a new Vec on every call
+        // Step 1: Combine leftover with new data into the work buffer, reserved
+        // exactly once: in record mode the buffer is moved out as the emitted
+        // batch, so its capacity is what the output queue is charged for.
         self.work_buffer.clear();
+        self.work_buffer.reserve_exact(self.leftover.len() + decompressed.len());
         if !self.leftover.is_empty() {
             self.work_buffer.append(&mut self.leftover);
         }
@@ -497,11 +530,10 @@ impl BoundaryState {
 
         // Step 4b: emit.
         if self.cut != BatchCut::Queryname {
-            // Record mode (default, unchanged): return this call's complete
-            // records directly. No cross-call accumulation.
+            // Record mode (default): return this call's complete records
+            // directly. No cross-call accumulation.
             self.prev_offsets_len = offsets.len();
-            let buffer = records.to_vec();
-            return Ok(BoundaryBatch { buffer, offsets });
+            return Ok(self.emit_record_batch(start_cursor, cursor, offsets));
         }
 
         // Queryname mode: append this call's complete records to the coalescing
@@ -511,6 +543,7 @@ impl BoundaryState {
         // re-walk.
         let base = self.qn_buffer.len();
         self.qn_buffer.extend_from_slice(records);
+        self.last_append_len = records.len();
         // `offsets[0]` is the leading 0 already present as the last entry of
         // `qn_offsets` (a record-end sentinel); append the rest, shifted into
         // `qn_buffer` coordinates.
@@ -520,6 +553,36 @@ impl BoundaryState {
         self.prev_offsets_len = offsets.len();
 
         self.emit_queryname_batch()
+    }
+
+    /// Record-mode emit: the complete records are `work_buffer[start..end]`.
+    /// Moves the work buffer out as the batch instead of copying that region.
+    /// The carry (the trailing partial record) has already been copied to
+    /// `leftover`; on the one call that consumed the header, the header prefix
+    /// is drained in place. A call with no complete record keeps the work
+    /// buffer for the next call and emits nothing.
+    fn emit_record_batch(
+        &mut self,
+        start: usize,
+        end: usize,
+        offsets: Vec<usize>,
+    ) -> BoundaryBatch {
+        if offsets.len() == 1 {
+            return BoundaryBatch { buffer: Vec::new(), offsets };
+        }
+        let mut buffer = std::mem::take(&mut self.work_buffer);
+        #[cfg(test)]
+        {
+            self.last_take_ptr = buffer.as_ptr() as usize;
+        }
+        buffer.truncate(end);
+        if start > 0 {
+            // Header call only (once per stream): a memmove of at most one
+            // block's records, cheaper than a second buffer for every call.
+            buffer.drain(..start);
+        }
+        fit_for_queue(&mut buffer);
+        BoundaryBatch { buffer, offsets }
     }
 
     /// Decide and perform the queryname emit split on the coalescing
@@ -624,11 +687,30 @@ impl BoundaryState {
         self.last_emitted_name.clear();
         self.last_emitted_name.extend_from_slice(last_name);
 
-        let buffer = self.qn_buffer[..split].to_vec();
+        // Move the accumulator out as the emitted batch and copy only the
+        // carry (the trailing open run) into a fresh accumulator. The fresh one
+        // is sized for the next batch so coalescing does not regrow it block by
+        // block: the carry, the coalescing target (`min_emit_bytes`, config —
+        // never the length of this batch, which after a long run could be
+        // hundreds of MiB), and one call's worth of input. At EOF (`force`)
+        // nothing is carried and nothing is reserved.
+        let mut buffer = std::mem::take(&mut self.qn_buffer);
+        #[cfg(test)]
+        {
+            self.last_take_ptr = buffer.as_ptr() as usize;
+        }
+        let carry = &buffer[split..];
+        let reserve = if force {
+            carry.len()
+        } else {
+            carry.len() + split.min(self.min_emit_bytes) + self.last_append_len.max(64 * 1024)
+        };
+        self.qn_buffer = Vec::with_capacity(reserve);
+        self.qn_buffer.extend_from_slice(carry);
+        buffer.truncate(split);
+        fit_for_queue(&mut buffer);
 
-        // Retain the trailing run: shift its bytes to the front of `qn_buffer`
-        // and rebase its offsets to start at 0.
-        self.qn_buffer.drain(..split);
+        // Rebase the retained run's offsets to start at 0.
         let retained: Vec<usize> = self.qn_offsets[j..].iter().map(|&o| o - split).collect();
         self.qn_offsets = retained;
 
@@ -1443,5 +1525,371 @@ mod tests {
 
         let err = state.finish().expect_err("a partial header is not a valid record stream");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    // ========================================================================
+    // Emit-by-move: every boundary shape, compared with a test-only reference
+    // copy of the copy-on-emit algorithm.
+    // ========================================================================
+
+    /// One emit fixture: `(name, cut, min_emit_bytes, with_header, blocks)`.
+    type EmitFixture = (&'static str, BatchCut, usize, bool, Vec<Vec<u8>>);
+
+    /// The named boundary shapes the emit tests cover.
+    fn emit_fixtures() -> Vec<EmitFixture> {
+        let hdr = bam_header("@HD\tVN:1.6\n", &[("chr1", 1000)]);
+        let recs: Vec<Vec<u8>> = (0..40u8).map(|i| record(&vec![i; 20 + usize::from(i)])).collect();
+        let flat: Vec<u8> = recs.iter().flatten().copied().collect();
+        let names = |spec: &[(&[u8], usize)]| -> Vec<u8> {
+            spec.iter().flat_map(|(n, k)| (0..*k).flat_map(move |_| named_record(n))).collect()
+        };
+        let qn = names(&[(b"a", 3), (b"b", 5), (b"c", 1), (b"d", 7), (b"e", 2)]);
+        let cut_at = |v: &[u8], cuts: &[usize]| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut prev = 0;
+            for &c in cuts {
+                out.push(v[prev..c].to_vec());
+                prev = c;
+            }
+            out.push(v[prev..].to_vec());
+            out
+        };
+        let mut with_hdr = hdr.clone();
+        with_hdr.extend_from_slice(&flat);
+        vec![
+            ("record_straddle", BatchCut::Record, 0, false, cut_at(&flat, &[37, 400, 401])),
+            (
+                "record_header_first_block",
+                BatchCut::Record,
+                0,
+                true,
+                cut_at(&with_hdr, &[hdr.len() + 50]),
+            ),
+            (
+                "record_header_spans_two_blocks",
+                BatchCut::Record,
+                0,
+                true,
+                cut_at(&with_hdr, &[5, hdr.len() + 9]),
+            ),
+            (
+                "qn_run_across_three_blocks",
+                BatchCut::Queryname,
+                0,
+                false,
+                cut_at(&qn, &[150, 300, 450]),
+            ),
+            ("qn_run_ends_at_block_end", BatchCut::Queryname, 0, false, {
+                let ab = names(&[(b"a", 3)]);
+                let rest = names(&[(b"b", 5), (b"c", 1)]);
+                vec![ab, rest]
+            }),
+            ("qn_coalescing_hold", BatchCut::Queryname, 4096, false, cut_at(&qn, &[100, 200, 300])),
+            ("qn_eof_carry", BatchCut::Queryname, 0, false, cut_at(&qn, &[qn.len() - 10])),
+            // Large enough that the capacity bound can bite: 1 000 records of
+            // ~3 KiB in groups of four names, cut into 64 KiB blocks and
+            // coalesced to >= 1 MiB batches, so several batches emit mid-stream.
+            ("qn_large_coalesced", BatchCut::Queryname, 1 << 20, false, {
+                let big: Vec<u8> = (0..1_000u32)
+                    .flat_map(|i| padded_named_record(format!("q{:04}", i / 4).as_bytes(), 3_000))
+                    .collect();
+                big.chunks(64 * 1024).map(<[u8]>::to_vec).collect()
+            }),
+        ]
+    }
+
+    /// `named_record` with `pad` zero bytes after the NUL-terminated name, so a
+    /// record is large without changing its name (the queryname cut reads only
+    /// `l_read_name` at offset 8 and the name).
+    fn padded_named_record(name: &[u8], pad: usize) -> Vec<u8> {
+        let mut body = vec![0u8; 32];
+        body[8] = u8::try_from(name.len() + 1).expect("name < 255");
+        body.extend_from_slice(name);
+        body.push(0);
+        body.resize(body.len() + pad, 0);
+        record(&body)
+    }
+
+    /// Drive one fixture through a scanner and collect every non-empty batch
+    /// as `(buffer, offsets)`, including the EOF flush.
+    fn run_emit_fixture(
+        cut: BatchCut,
+        min_emit: usize,
+        with_header: bool,
+        blocks: &[Vec<u8>],
+    ) -> Vec<(Vec<u8>, Vec<usize>)> {
+        let base = if with_header { BoundaryState::new() } else { BoundaryState::new_no_header() };
+        let mut state = base.with_cut(cut, min_emit);
+        let mut out = Vec::new();
+        for block in blocks {
+            let batch = state.find_boundaries(block).expect("well-formed fixture");
+            if batch.offsets.len() > 1 {
+                out.push((batch.buffer, batch.offsets));
+            }
+        }
+        if let Some(batch) = state.finish().expect("well-formed fixture")
+            && batch.offsets.len() > 1
+        {
+            out.push((batch.buffer, batch.offsets));
+        }
+        out
+    }
+
+    /// Test-only reference scanner: the copy-on-emit algorithm the emit-by-move
+    /// [`BoundaryState`] replaced, written naively. Every call appends its block
+    /// to the unscanned bytes, skips the header once, and peels off the
+    /// complete records as a *copy*. Record mode emits them at once; queryname
+    /// mode appends them to an accumulator and emits the closed prefix (whole
+    /// queryname runs only) once it reaches `min_emit`, flushing everything at
+    /// EOF. It shares no buffer handling with the real scanner, so the two agree
+    /// only if the real one emits the same splits and offsets.
+    struct ReferenceScanner {
+        cut: BatchCut,
+        min_emit: usize,
+        header_skipped: bool,
+        pending: Vec<u8>,
+        acc: Vec<u8>,
+        acc_ends: Vec<usize>,
+    }
+
+    impl ReferenceScanner {
+        fn new(cut: BatchCut, min_emit: usize, with_header: bool) -> Self {
+            Self {
+                cut,
+                min_emit,
+                header_skipped: !with_header,
+                pending: Vec::new(),
+                acc: Vec::new(),
+                acc_ends: vec![0],
+            }
+        }
+
+        /// Peel the complete records off the front of `pending`: their bytes
+        /// and their end offsets (leading 0).
+        fn take_complete(&mut self) -> (Vec<u8>, Vec<usize>) {
+            let mut ends = vec![0];
+            let mut cursor = 0;
+            while cursor + 4 <= self.pending.len() {
+                let size = u32::from_le_bytes(
+                    self.pending[cursor..cursor + 4].try_into().expect("four bytes"),
+                ) as usize;
+                if cursor + 4 + size > self.pending.len() {
+                    break;
+                }
+                cursor += 4 + size;
+                ends.push(cursor);
+            }
+            (self.pending.drain(..cursor).collect(), ends)
+        }
+
+        fn name(buf: &[u8], ends: &[usize], i: usize) -> Vec<u8> {
+            fgumi_raw_bam::read_name(&buf[ends[i] + 4..ends[i + 1]]).to_vec()
+        }
+
+        /// Emit the accumulator's closed prefix, or all of it when `force`.
+        fn emit_queryname(&mut self, force: bool) -> Option<(Vec<u8>, Vec<usize>)> {
+            let n = self.acc_ends.len() - 1;
+            if n == 0 {
+                return None;
+            }
+            let mut j = n - 1;
+            while j > 0
+                && Self::name(&self.acc, &self.acc_ends, j - 1)
+                    == Self::name(&self.acc, &self.acc_ends, j)
+            {
+                j -= 1;
+            }
+            if force {
+                j = n;
+            } else if self.min_emit > 0 && self.acc_ends[j] < self.min_emit {
+                j = 0;
+            }
+            if j == 0 {
+                return None;
+            }
+            let split = self.acc_ends[j];
+            let batch = (self.acc[..split].to_vec(), self.acc_ends[..=j].to_vec());
+            self.acc.drain(..split);
+            self.acc_ends = self.acc_ends[j..].iter().map(|&e| e - split).collect();
+            Some(batch)
+        }
+
+        fn push(&mut self, block: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+            self.pending.extend_from_slice(block);
+            if !self.header_skipped {
+                let header = BoundaryState::parse_header_size(&self.pending).expect("header")?;
+                self.pending.drain(..header);
+                self.header_skipped = true;
+            }
+            let (bytes, ends) = self.take_complete();
+            match self.cut {
+                BatchCut::Record => (ends.len() > 1).then_some((bytes, ends)),
+                BatchCut::Queryname => {
+                    let base = self.acc.len();
+                    self.acc.extend_from_slice(&bytes);
+                    self.acc_ends.extend(ends[1..].iter().map(|&e| base + e));
+                    self.emit_queryname(false)
+                }
+            }
+        }
+
+        fn finish(&mut self) -> Option<(Vec<u8>, Vec<usize>)> {
+            match self.cut {
+                BatchCut::Record => {
+                    let (bytes, ends) = self.take_complete();
+                    assert!(self.pending.is_empty(), "reference given a truncated stream");
+                    (ends.len() > 1).then_some((bytes, ends))
+                }
+                BatchCut::Queryname => self.emit_queryname(true),
+            }
+        }
+    }
+
+    /// Every non-empty batch the reference scanner emits for `blocks`.
+    fn run_reference(
+        cut: BatchCut,
+        min_emit: usize,
+        with_header: bool,
+        blocks: &[Vec<u8>],
+    ) -> Vec<(Vec<u8>, Vec<usize>)> {
+        let mut reference = ReferenceScanner::new(cut, min_emit, with_header);
+        let mut out: Vec<_> = blocks.iter().filter_map(|b| reference.push(b)).collect();
+        out.extend(reference.finish());
+        out
+    }
+
+    /// Every boundary shape (a record straddling blocks, the header in the
+    /// first block and spanning two, `new_no_header`, a queryname run across
+    /// three blocks, a run ending at a block end, the coalescing hold, EOF with a
+    /// carry, large coalesced batches) emits exactly the reference scanner's
+    /// splits and offsets. Catches any carry, header or coalescing drift.
+    #[test]
+    fn emitted_splits_match_the_copy_on_emit_reference() {
+        for (name, cut, min_emit, with_header, blocks) in emit_fixtures() {
+            let real = run_emit_fixture(cut, min_emit, with_header, &blocks);
+            assert!(!real.is_empty(), "{name}: fixture emitted nothing");
+            assert_eq!(real, run_reference(cut, min_emit, with_header, &blocks), "{name}");
+        }
+    }
+
+    /// A generated stream: optional header, then records named from a small
+    /// alphabet in runs of random length with random payloads, cut into blocks
+    /// at random points.
+    fn generated_stream(
+        with_header: bool,
+        runs: &[(u8, usize, usize)],
+        cuts: &[usize],
+    ) -> Vec<Vec<u8>> {
+        let mut stream =
+            if with_header { bam_header("@HD\tVN:1.6\n", &[("chr1", 1000)]) } else { Vec::new() };
+        for &(name, count, pad) in runs {
+            for _ in 0..count {
+                stream.extend(padded_named_record(&[b'a' + name], pad));
+            }
+        }
+        let mut points: Vec<usize> = cuts.iter().map(|&c| c % (stream.len() + 1)).collect();
+        points.sort_unstable();
+        points.dedup();
+        let mut blocks = Vec::new();
+        let mut prev = 0;
+        for p in points {
+            blocks.push(stream[prev..p].to_vec());
+            prev = p;
+        }
+        blocks.push(stream[prev..].to_vec());
+        blocks
+    }
+
+    proptest::proptest! {
+        /// On generated streams — both cut modes, with and without a header,
+        /// random run lengths, payload sizes, block cuts and coalescing targets
+        /// — the real scanner emits exactly the reference's splits and offsets.
+        #[test]
+        fn emitted_splits_match_the_reference_on_generated_streams(
+            queryname in proptest::bool::ANY,
+            with_header in proptest::bool::ANY,
+            runs in proptest::collection::vec((0u8..6, 1usize..5, 0usize..300), 1..40),
+            cuts in proptest::collection::vec(0usize..100_000, 0..30),
+            min_emit in proptest::sample::select(vec![0usize, 64, 512, 4096]),
+        ) {
+            let cut = if queryname { BatchCut::Queryname } else { BatchCut::Record };
+            let blocks = generated_stream(with_header, &runs, &cuts);
+            proptest::prop_assert_eq!(
+                run_emit_fixture(cut, min_emit, with_header, &blocks),
+                run_reference(cut, min_emit, with_header, &blocks)
+            );
+        }
+    }
+
+    /// Mechanism oracle for emit-by-move: the emitted buffer is the buffer
+    /// taken at the `mem::take` site (moved, not copied), and its capacity
+    /// stays within the queue-accounting bound `2 * len + 64 KiB` that
+    /// `fit_for_queue` guarantees. `qn_large_coalesced` emits >= 1 MiB batches
+    /// mid-stream, so a fixed or stale oversize reservation would fail it.
+    #[test]
+    fn emitted_batch_is_the_moved_buffer() {
+        let mut checked_large = 0;
+        for (name, cut, min_emit, with_header, blocks) in emit_fixtures() {
+            let base =
+                if with_header { BoundaryState::new() } else { BoundaryState::new_no_header() };
+            let mut state = base.with_cut(cut, min_emit);
+            for block in &blocks {
+                let batch = state.find_boundaries(block).expect("well-formed fixture");
+                if batch.offsets.len() > 1 {
+                    assert_eq!(
+                        batch.buffer.as_ptr() as usize,
+                        state.last_take_ptr,
+                        "{name}: emitted bytes were copied"
+                    );
+                    let (len, cap) = (batch.buffer.len(), batch.buffer.capacity());
+                    assert!(cap <= 2 * len + 64 * 1024, "{name}: capacity {cap} for len {len}");
+                    if name == "qn_large_coalesced" {
+                        assert!(len >= 1 << 20, "{name}: batch of {len} bytes below the target");
+                        checked_large += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked_large >= 2, "the large fixture must emit at least twice mid-stream");
+    }
+
+    /// A long queryname run (one ~8 MiB name) followed by small runs: the
+    /// batch after the run must not inherit an accumulator sized from the run.
+    /// Every emitted batch's capacity stays within `2 * len + 64 KiB` without a
+    /// shrink (the batches after the run are still the moved buffer), and the
+    /// splits still match the reference. Catches the next accumulator being
+    /// reserved from the previous batch's length.
+    #[test]
+    fn a_long_queryname_run_does_not_inflate_later_batches() {
+        let mut stream: Vec<u8> =
+            (0..2_700).flat_map(|_| padded_named_record(b"long", 3_000)).collect();
+        stream.extend(
+            (0..3_000u32).flat_map(|i| padded_named_record(format!("s{i:05}").as_bytes(), 500)),
+        );
+        let blocks: Vec<Vec<u8>> = stream.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
+        let mut state = BoundaryState::new_no_header().with_cut(BatchCut::Queryname, 1 << 20);
+        let mut after_run = 0;
+        for block in &blocks {
+            let batch = state.find_boundaries(block).expect("well-formed stream");
+            if batch.offsets.len() > 1 {
+                let (len, cap) = (batch.buffer.len(), batch.buffer.capacity());
+                assert!(cap <= 2 * len + 64 * 1024, "capacity {cap} for len {len}");
+                if len < 4 << 20 {
+                    // Sized from config, the accumulator needs no shrink:
+                    // the batch is still the buffer that was moved out.
+                    assert_eq!(
+                        batch.buffer.as_ptr() as usize,
+                        state.last_take_ptr,
+                        "a batch after the run was reallocated (reserved from the run's length)"
+                    );
+                    after_run += 1;
+                }
+            }
+        }
+        assert!(after_run >= 1, "the stream must emit a small batch after the long run");
+        assert_eq!(
+            run_emit_fixture(BatchCut::Queryname, 1 << 20, false, &blocks),
+            run_reference(BatchCut::Queryname, 1 << 20, false, &blocks)
+        );
     }
 }

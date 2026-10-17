@@ -1790,18 +1790,24 @@ impl<'a> ChainBuilder<'a> {
     /// or consume a `GroupKey` at all; the terminal BAM→FASTQ encode (`fastq`)
     /// reads only the raw record (name, flags, SEQ, QUAL, and — under
     /// `--umi-header` — the UMI tag read straight off the record) and touches no
-    /// `GroupKey` field, not even `name_hash`. All of these except `fastq`
-    /// therefore use [`fgumi_bam_io::GroupKeyConfig::name_hash_only`]; `fastq`
-    /// uses the strictly-cheaper [`fgumi_bam_io::GroupKeyConfig::no_key`] (no key
-    /// at all — not even the name hash). Both skip the CIGAR 5′-position walk and
+    /// `GroupKey` field, not even `name_hash`. The consensus callers
+    /// (`simplex`/`duplex`/`codec`) and the standalone consensus-metrics stage
+    /// (`simplex-metrics`/`duplex-metrics`) are fed by `GroupByMi`, which groups
+    /// on the `MI` tag read off the raw record and discards the decoded key
+    /// unread. All of these except `fastq`, the consensus callers and the
+    /// metrics stage therefore use
+    /// [`fgumi_bam_io::GroupKeyConfig::name_hash_only`]; those three use the
+    /// strictly-cheaper
+    /// [`fgumi_bam_io::GroupKeyConfig::no_key`] (no key at all — not even the
+    /// name hash). Both skip the CIGAR 5′-position walk and
     /// the RG/CB/MC aux-tag extraction
     /// pass entirely; for a SAM-first sort that pass runs once per record in
     /// `ParseSamChunk` and would otherwise be pure waste. This changes only the
     /// discarded key, never the record bytes, so output is unchanged.
     /// (The full-key config `new_raw_no_cell` still pays the combined aux pass;
     /// name-hash-only is strictly less work.) All other first stages
-    /// (group/dedup/consensus) need the full position/cell key, so they fall
-    /// through to [`Self::bam_group_key_config`].
+    /// (group/dedup) need the full position/cell key, so they fall through to
+    /// [`Self::bam_group_key_config`].
     ///
     /// Every arm below uses a DEFAULT `LibraryIndex`, never `from_header`:
     /// neither `name_hash_only` nor `no_key` reads `library_index` (see
@@ -1817,8 +1823,12 @@ impl<'a> ChainBuilder<'a> {
             // The terminal BAM→FASTQ encode reads only the raw record and
             // touches no `GroupKey` field (not even `name_hash`), so it computes
             // no key at all — the cheapest decode. In the `fgumi fastq | aligner`
-            // pipe every CPU-second saved here goes to the aligner.
-            Some(Stage::Fastq) => {
+            // pipe every CPU-second saved here goes to the aligner. The
+            // `GroupByMi` that feeds the consensus callers and the standalone
+            // metrics stage likewise reads only the raw record (the `MI` tag),
+            // so a full key — a CIGAR walk plus an RG/CB/MC aux-tag scan per
+            // record — would be computed and thrown away.
+            Some(Stage::Fastq | Stage::Simplex | Stage::Duplex | Stage::Codec | Stage::Metrics) => {
                 Ok(fgumi_bam_io::GroupKeyConfig::no_key(fgumi_bam_io::LibraryIndex::default()))
             }
             Some(
@@ -7513,6 +7523,28 @@ mod tests {
             "Stage::Fastq must not enable UMI-position caching (the encoder reads the tag \
              straight off the record)"
         );
+    }
+
+    /// The consensus callers and the standalone consensus-metrics stage are fed
+    /// by `GroupByMi`, which groups on the `MI` tag read off the raw record
+    /// (`decoded.into_raw_bytes()`) and never reads the decoded `GroupKey`.
+    /// Such a first stage therefore computes no key at all: the full key's
+    /// CIGAR walk and RG/CB/MC aux scan per record would be thrown away unread.
+    #[rstest::rstest]
+    #[case::simplex(Stage::Simplex)]
+    #[case::duplex(Stage::Duplex)]
+    #[case::codec(Stage::Codec)]
+    #[case::metrics(Stage::Metrics)]
+    fn source_group_key_config_is_no_key_for_consensus_first_stage(#[case] stage: Stage) {
+        let spec = empty_spec(vec![stage]);
+        let builder = chain_builder_for_stages(&spec);
+        let config = builder.source_group_key_config().expect("builds");
+        assert_eq!(
+            config.key_mode,
+            fgumi_bam_io::KeyMode::None,
+            "{stage:?} as the first stage must compute no GroupKey (GroupByMi discards it)"
+        );
+        assert!(config.umi_tag.is_none(), "{stage:?} must not enable UMI-position caching");
     }
 
     /// Sanity check that the `Stage::Filter`/`Stage::Clip` additions to

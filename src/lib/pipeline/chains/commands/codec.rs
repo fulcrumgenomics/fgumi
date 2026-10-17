@@ -32,6 +32,7 @@ use crate::logging::OperationTimer;
 use crate::mi_group::MiGroup;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
+use crate::pipeline::chains::commands::output_sizer::OutputSizer;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -74,6 +75,9 @@ pub(crate) struct CodecState {
     /// body — the metrics-off default builds and carries neither.
     pub(crate) header: Option<Arc<noodles::sam::Header>>,
     pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    /// Per-worker estimate of this step's output/input byte ratio, used to
+    /// reserve each batch's output buffer once (see [`OutputSizer`]).
+    pub(crate) sizer: OutputSizer,
 }
 
 impl crate::pipeline::core::item::HeapSize for CodecState {}
@@ -218,6 +222,7 @@ fn make_codec_consensus_init(
     track_rejects: bool,
     header: Option<Arc<noodles::sam::Header>>,
     library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    output_ceiling: usize,
 ) -> impl Fn() -> CodecState + Send + Sync + 'static {
     move || {
         let caller = CodecConsensusCaller::new_with_rejects_tracking(
@@ -226,7 +231,12 @@ fn make_codec_consensus_init(
             consensus_options.clone(),
             track_rejects,
         );
-        CodecState { caller, header: header.clone(), library_index: library_index.clone() }
+        CodecState {
+            caller,
+            header: header.clone(),
+            library_index: library_index.clone(),
+            sizer: OutputSizer::new(output_ceiling),
+        }
     }
 }
 
@@ -248,7 +258,10 @@ fn run_codec_consensus_batch(
     let BatchedMiGroups { batch_serial, groups } = item;
     let groups_count = groups.len() as u64;
 
+    let input_len =
+        super::framed_len(groups.iter().flat_map(|g| g.records.iter()).map(AsRef::as_ref));
     let mut all_output = ConsensusOutput::default();
+    state.sizer.reserve(&mut all_output.data, input_len);
     let mut batch_stats = CodecConsensusStats::default();
     let mut rejects_bytes: Vec<u8> = Vec::new();
 
@@ -307,6 +320,7 @@ fn run_codec_consensus_batch(
         info!("Processed {} records", prev + total_input_records);
     }
 
+    state.sizer.finish(&mut all_output.data, input_len);
     let consensus = DecompressedBlock { batch_serial, bytes: all_output.data };
     let rejects = if rejects_bytes.is_empty() {
         None
@@ -403,6 +417,7 @@ pub(crate) fn build_codec_consensus_step_with_rejects_and_metrics(
         track_rejects,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut CodecState,
                      item: BatchedMiGroups|
@@ -479,6 +494,7 @@ pub(crate) fn build_codec_consensus_step_metrics(
         track_rejects,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut CodecState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -529,6 +545,7 @@ pub(crate) fn build_codec_consensus_step_with_rejects(
         track_rejects,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut CodecState,
                      item: BatchedMiGroups|
@@ -596,6 +613,7 @@ pub(crate) fn build_codec_consensus_step_kept_only(
         track_rejects,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut CodecState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -690,5 +708,42 @@ mod tests {
             fgumi_consensus::TieRule::UlpRelative,
             "--tie-rule must reach the mapping"
         );
+    }
+
+    /// Output sizing (see the simplex counterpart): the second of two identical
+    /// batches is reserved from the observed first batch, fits, and is not
+    /// over-reserved; the fixture produces CODEC consensus.
+    #[test]
+    fn codec_output_is_reserved_from_the_observed_ratio() {
+        use crate::pipeline::chains::commands::consensus_fixtures::{
+            assert_sized_from_the_previous_batch, codec_groups_for_test,
+        };
+        let init = make_codec_consensus_init(
+            "p".into(),
+            "A".into(),
+            CodecConsensusOptions::default(),
+            false,
+            None,
+            None,
+            usize::MAX,
+        );
+        let mut state = init();
+        let groups = codec_groups_for_test(40);
+        let accumulators = PerThreadAccumulator::new(1);
+        let progress = Arc::new(AtomicU64::new(0));
+        let batch = |state: &mut CodecState, serial, groups| {
+            run_codec_consensus_batch(
+                state,
+                BatchedMiGroups::new(serial, groups),
+                false,
+                &accumulators,
+                &progress,
+            )
+            .expect("codec batch")
+            .0
+        };
+        let first = batch(&mut state, 0, groups.clone());
+        let second = batch(&mut state, 1, groups);
+        assert_sized_from_the_previous_batch(&first, &second, state.sizer.last_reserved);
     }
 }
