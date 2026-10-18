@@ -26,6 +26,7 @@ pub(crate) use contexts::build_chain_contexts;
 pub(crate) use detached::extract_detached_steps;
 pub(crate) use detached::run_detached_driver;
 pub(crate) use drain::StepDrainCounter;
+pub use driver::STICKY_BURST_LIMIT;
 pub(crate) use driver::run_worker_loop;
 pub use event_count::{NotifyOutcome, PoolEventCount, WaitKey, WaitOutcome};
 pub(crate) use fused::{run_fused_single_thread, should_fuse_single_thread};

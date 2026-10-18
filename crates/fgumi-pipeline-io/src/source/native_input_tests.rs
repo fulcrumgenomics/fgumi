@@ -12,10 +12,11 @@ use fgumi_bam_io::pread::test_sources::TimedSource;
 use fgumi_bam_io::pread::{FILL_BYTES, PositionalSource, ReadStreamsPolicy, SliceBufferPool};
 use fgumi_pipeline_core::builder::{Pipeline, PipelineConfig};
 use fgumi_pipeline_core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
-use fgumi_pipeline_core::{PipelineError, PoolPlacement};
+use fgumi_pipeline_core::testing::StepProbe;
+use fgumi_pipeline_core::{BranchInputHandle, PipelineError, PoolPlacement};
 use rstest::rstest;
 
-use super::frame_bgzf_blocks::{AFTER_FRAME as frame_hook, FrameBgzfBlocks};
+use super::frame_bgzf_blocks::{AFTER_FRAME as frame_hook, FRAME_BATCH, FrameBgzfBlocks};
 use super::plan_input_reads::PlanInputReads;
 use crate::pread::{AFTER_READ as pread_hook, InputLedger, PreadSlices};
 use crate::types::BgzfBlock;
@@ -216,17 +217,31 @@ fn lookahead_is_bounded() {
     assert!(worst <= (8 << 20) + FILL_BYTES as u64, "lookahead exceeded: {worst}");
 }
 
-/// A BGZF stream of `bytes` stored blocks (64 KiB payloads) plus an EOF
-/// marker.
-fn bgzf_stream(bytes: usize) -> Vec<u8> {
+/// A BGZF stream of stored blocks plus an EOF marker: each payload is written
+/// and flushed in turn, so it starts a new block (and spans several when it is
+/// over 64 KiB).
+fn bgzf_stream_of<P: AsRef<[u8]>>(payloads: impl IntoIterator<Item = P>) -> Vec<u8> {
     let mut compressor = fgumi_bgzf::InlineBgzfCompressor::new(0);
-    let payload: Vec<u8> = (0..bytes).map(|i| u8::try_from(i % 251).unwrap()).collect();
-    compressor.write_all(&payload).unwrap();
-    compressor.flush().unwrap();
+    for payload in payloads {
+        compressor.write_all(payload.as_ref()).unwrap();
+        compressor.flush().unwrap();
+    }
     let mut out = Vec::new();
     compressor.write_blocks_to(&mut out).unwrap();
     out.extend_from_slice(&fgumi_bgzf::BGZF_EOF);
     out
+}
+
+/// A BGZF stream of `bytes` stored blocks (64 KiB payloads) plus an EOF
+/// marker.
+fn bgzf_stream(bytes: usize) -> Vec<u8> {
+    bgzf_stream_of([(0..bytes).map(|i| u8::try_from(i % 251).unwrap()).collect::<Vec<u8>>()])
+}
+
+/// A BGZF stream of `blocks` small blocks (one 16-byte payload each) plus an
+/// EOF marker, for exercising per-dispatch block counts cheaply.
+fn small_block_stream(blocks: usize) -> Vec<u8> {
+    bgzf_stream_of((0..blocks).map(|i| [u8::try_from(i % 251).unwrap(); 16]))
 }
 
 /// Ratchet signal wiring smoke test (the deterministic gate is the predicate
@@ -325,36 +340,122 @@ fn every_read_runs_on_a_pool_worker(#[values(1usize, 4)] threads: usize) {
     assert!(names.iter().all(|n| n.starts_with("fgumi-worker-") || *n == caller), "{names:?}");
 }
 
-/// Frame `stream` cut into `cut`-byte slices leased from a fresh pool, through
-/// `FrameBgzfBlocks` driven by hand; returns the blocks and the pool.
-fn frame_with_cuts(stream: &[u8], cut: usize) -> (Vec<BgzfBlock>, Arc<SliceBufferPool>) {
-    use crate::pread::{ReadSlice, ReadTarget};
-    use fgumi_pipeline_core::testing::StepProbe;
-    let pool = SliceBufferPool::new(64);
-    let mut step = FrameBgzfBlocks::new(Arc::new(InputLedger::default()), 1 << 40);
-    let mut probe = StepProbe::new(&step);
-    let n = stream.len().div_ceil(cut);
-    for (i, chunk) in stream.chunks(cut).enumerate() {
-        probe.push_input(ReadSlice {
-            ordinal: i as u64,
+/// `FrameBgzfBlocks` driven by hand through a `StepProbe`, over slices leased
+/// from its own pool and reporting to its own ledger.
+struct FramerProbe {
+    step: FrameBgzfBlocks,
+    probe: StepProbe<FrameBgzfBlocks>,
+    out: Arc<BranchInputHandle<BgzfBlock>>,
+    ledger: Arc<InputLedger>,
+    pool: Arc<SliceBufferPool>,
+    /// Slices queued so far (the next slice's ordinal).
+    slices: usize,
+    /// Bytes queued so far (the next slice's file offset).
+    offset: usize,
+}
+
+impl FramerProbe {
+    /// A framer with an output byte limit of `output_byte_limit` and a
+    /// per-dispatch cap of `batch` blocks (`None`: the step's own default),
+    /// with nothing queued.
+    fn new(output_byte_limit: u64, batch: Option<usize>) -> Self {
+        let ledger = Arc::new(InputLedger::default());
+        let mut step = FrameBgzfBlocks::new(Arc::clone(&ledger), output_byte_limit);
+        if let Some(batch) = batch {
+            step = step.with_batch(batch);
+        }
+        let mut probe = StepProbe::new(&step);
+        let out = Arc::new(probe.take_output::<BgzfBlock>(0));
+        Self { step, probe, out, ledger, pool: SliceBufferPool::new(64), slices: 0, offset: 0 }
+    }
+
+    /// Queue the next slice of the file, `bytes` long.
+    fn push_slice(&mut self, bytes: &[u8], last: bool) {
+        use crate::pread::{ReadSlice, ReadTarget};
+        self.probe.push_input(ReadSlice {
+            ordinal: self.slices as u64,
             stream: 0,
-            seq: u32::try_from(i).unwrap(),
-            offset: (i * cut) as u64,
-            bytes: pool.lease(chunk.to_vec()),
-            last: i + 1 == n,
+            seq: u32::try_from(self.slices).unwrap(),
+            offset: self.offset as u64,
+            bytes: self.pool.lease(bytes.to_vec()),
+            last,
             shortfall: 0,
             target: ReadTarget::Input,
         });
+        self.slices += 1;
+        self.offset += bytes.len();
     }
-    probe.close_input();
-    while probe.try_run(&mut step).unwrap() != StepOutcome::Finished {}
-    let out = probe.take_output::<BgzfBlock>(0);
+
+    /// Queue all of `stream` cut into `cut`-byte slices, and close the input.
+    fn queue_stream(&mut self, stream: &[u8], cut: usize) {
+        let n = stream.len().div_ceil(cut);
+        for (i, chunk) in stream.chunks(cut).enumerate() {
+            self.push_slice(chunk, i + 1 == n);
+        }
+        self.probe.close_input();
+    }
+
+    /// One `try_run` dispatch.
+    fn run(&mut self) -> StepOutcome {
+        self.probe.try_run(&mut self.step).unwrap()
+    }
+
+    /// Pop every block currently on the output.
+    fn drain(&self) -> Vec<BgzfBlock> {
+        drain_output(&self.out)
+    }
+
+    /// Dispatch until `Finished`, draining the output after each dispatch;
+    /// returns every block in arrival order.
+    fn run_to_end(&mut self) -> Vec<BgzfBlock> {
+        let mut blocks = Vec::new();
+        while self.run() != StepOutcome::Finished {
+            blocks.extend(self.drain());
+        }
+        blocks.extend(self.drain());
+        blocks
+    }
+
+    /// Bytes the framer has reported framed.
+    fn framed(&self) -> u64 {
+        self.ledger.framed.load(Ordering::Relaxed)
+    }
+}
+
+/// Pop every block currently on `out`.
+fn drain_output(out: &BranchInputHandle<BgzfBlock>) -> Vec<BgzfBlock> {
     let mut blocks = Vec::new();
-    while let Some(b) = fgumi_pipeline_core::InputHandle::pop(&out) {
+    while let Some(b) = fgumi_pipeline_core::InputHandle::pop(out) {
         blocks.push(b);
     }
-    drop(step);
-    (blocks, pool)
+    blocks
+}
+
+/// Assert `blocks` are `stream`'s blocks, in order, with dense serials.
+fn assert_frames_stream(blocks: &[BgzfBlock], stream: &[u8]) {
+    let mut reader = stream;
+    let mut oracle = Vec::new();
+    loop {
+        let more = fgumi_bgzf::read_raw_blocks(&mut reader, 1024).unwrap();
+        if more.is_empty() {
+            break;
+        }
+        oracle.extend(more);
+    }
+    assert_eq!(blocks.len(), oracle.len(), "block count");
+    for (i, (b, o)) in blocks.iter().zip(&oracle).enumerate() {
+        assert_eq!(b.batch_serial, i as u64, "dense serials in arrival order");
+        assert_eq!(&b.bytes[..], &o.data[..], "block {i}");
+    }
+}
+
+/// Frame `stream` cut into `cut`-byte slices leased from a fresh pool, through
+/// `FrameBgzfBlocks` driven by hand; returns the blocks and the pool.
+fn frame_with_cuts(stream: &[u8], cut: usize) -> (Vec<BgzfBlock>, Arc<SliceBufferPool>) {
+    let mut probe = FramerProbe::new(1 << 40, None);
+    probe.queue_stream(stream, cut);
+    let blocks = probe.run_to_end();
+    (blocks, probe.pool)
 }
 
 /// Blocks wholly inside a slice are borrowed (zero copy); only a block
@@ -377,4 +478,148 @@ fn framed_blocks_borrow_their_slice() {
     assert!(pool.resident_bytes() > 0, "borrowed blocks keep their slices leased");
     drop(blocks);
     assert_eq!(pool.resident_bytes(), 0, "every slice returned once its blocks dropped");
+}
+
+/// With room on the output and slices queued, one dispatch pushes every
+/// block of every queued slice, not one block: the framer is not sticky, so a
+/// one-block dispatch costs a whole reader-worker walk per block and starves
+/// the pool (the WES sort Phase-1 regression).
+#[test]
+fn framer_pushes_a_batch_per_dispatch() {
+    let stream = bgzf_stream(40 << 16);
+    let mut probe = FramerProbe::new(1 << 40, None);
+    // Several slices, each holding several blocks.
+    probe.queue_stream(&stream, 1 << 20);
+    assert_eq!(probe.run(), StepOutcome::Progress);
+    let first = probe.drain();
+    assert!(first.len() < FRAME_BATCH, "the fixture fits in one batch");
+    assert!(probe.probe.input_is_empty(), "every queued slice was consumed in that dispatch");
+    assert_frames_stream(&first, &stream);
+    assert_eq!(probe.run(), StepOutcome::Finished);
+}
+
+/// A dispatch offers at most its cap of blocks even with room on the output
+/// and slices queued: once the cap is spent it stops, without popping another
+/// slice, and the next dispatch resumes where the batch stopped. The cap here
+/// is 8, well below the output edge's 1024-slot count; at `FRAME_BATCH`, which
+/// equals that count, a hand-driven probe fills the edge first and could not
+/// tell a capped batch from an uncapped one.
+#[test]
+fn framer_batch_is_capped() {
+    const CAP: usize = 8;
+    const BLOCKS: usize = 64;
+    let stream = small_block_stream(BLOCKS);
+    let oracle = fgumi_bgzf::read_raw_blocks(&mut &stream[..], 1024).unwrap();
+    // Slices of three blocks' bytes, so the cap falls inside the third slice.
+    let cut = 3 * oracle[0].data.len();
+    let mut probe = FramerProbe::new(1 << 40, Some(CAP));
+    probe.queue_stream(&stream, cut);
+
+    assert_eq!(probe.run(), StepOutcome::Progress);
+    let mut got = probe.drain();
+    assert_eq!(got.len(), CAP, "the first dispatch stopped at the cap");
+    // It framed only the slices that held the first CAP blocks.
+    let cap_end: usize = oracle[..CAP].iter().map(|o| o.data.len()).sum();
+    assert_eq!(probe.framed(), (cap_end.div_ceil(cut) * cut) as u64, "no slice past the cap");
+    assert!(!probe.probe.input_is_empty(), "later slices are still queued");
+
+    loop {
+        let outcome = probe.run();
+        let blocks = probe.drain();
+        assert!(blocks.len() <= CAP, "every dispatch is capped: {}", blocks.len());
+        got.extend(blocks);
+        if outcome == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(got.len(), BLOCKS);
+    assert_frames_stream(&got, &stream);
+}
+
+/// The step's own cap is `FRAME_BATCH`. A test hook drains the output after
+/// every slice is framed, so the edge (whose slot count equals `FRAME_BATCH`)
+/// never fills and only the cap can end the first dispatch.
+#[test]
+fn framer_default_batch_is_frame_batch() {
+    let total = FRAME_BATCH + FRAME_BATCH / 2;
+    let stream = small_block_stream(total);
+    let mut probe = FramerProbe::new(1 << 40, None);
+    probe.queue_stream(&stream, 4096);
+    let drained = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (out, sink) = (Arc::clone(&probe.out), Arc::clone(&drained));
+    frame_hook.set(move |_| sink.lock().extend(drain_output(&out)));
+    let first = probe.run();
+    frame_hook.clear();
+    assert_eq!(first, StepOutcome::Progress);
+    let mut got = std::mem::take(&mut *drained.lock());
+    got.extend(probe.drain());
+    assert_eq!(got.len(), FRAME_BATCH, "the first dispatch stopped at FRAME_BATCH");
+    got.extend(probe.run_to_end());
+    assert_frames_stream(&got, &stream);
+}
+
+/// A full output ends the batch: the refused block is held (not dropped or
+/// pushed past the bound), the next dispatch reports `Contention` until the
+/// consumer makes room, and the stream then resumes with nothing lost.
+#[test]
+fn framer_batch_stops_at_a_full_output_and_resumes() {
+    let stream = small_block_stream(64);
+    // A 1-byte limit admits one block onto an empty edge and refuses the next.
+    let mut probe = FramerProbe::new(1, None);
+    probe.queue_stream(&stream, stream.len());
+    assert_eq!(probe.run(), StepOutcome::Progress);
+    assert_eq!(probe.run(), StepOutcome::Contention, "held, edge full");
+    let mut got = Vec::new();
+    loop {
+        let blocks = probe.drain();
+        assert!(blocks.len() <= 1, "the edge bound held: {} blocks", blocks.len());
+        got.extend(blocks);
+        if probe.run() == StepOutcome::Finished {
+            break;
+        }
+    }
+    got.extend(probe.drain());
+    assert_frames_stream(&got, &stream);
+}
+
+/// A refused push ends the dispatch before the framer pops another slice:
+/// later slices stay queued on the input edge, not framed into `pending`,
+/// which holds at most the current slice's blocks.
+#[test]
+fn refused_push_stops_framing_further_slices() {
+    let stream = small_block_stream(64);
+    // Slices of four blocks' bytes; a 1-byte limit refuses the second block.
+    let cut = 4 * fgumi_bgzf::read_raw_blocks(&mut &stream[..], 1).unwrap()[0].data.len();
+    let mut probe = FramerProbe::new(1, None);
+    probe.queue_stream(&stream, cut);
+    assert_eq!(probe.run(), StepOutcome::Progress);
+    let mut got = probe.drain();
+    assert_eq!(got.len(), 1, "one block fit before the refusal");
+    assert_eq!(probe.framed(), cut as u64, "only the first slice was framed");
+    assert!(!probe.probe.input_is_empty(), "later slices are still queued");
+
+    got.extend(probe.run_to_end());
+    assert_frames_stream(&got, &stream);
+}
+
+/// A dispatch that pops a slice holding no whole block is still `Progress`
+/// (it freed a slot on the input edge) while the input is open, and the
+/// carried partial block completes from the next slice.
+#[test]
+fn a_slice_that_frames_no_block_is_progress() {
+    let stream = small_block_stream(4);
+    let head = 10;
+    let first_block = fgumi_bgzf::read_raw_blocks(&mut &stream[..], 1).unwrap()[0].data.len();
+    assert!(head < first_block, "the first slice ends inside the first block");
+    let mut probe = FramerProbe::new(1 << 40, None);
+    probe.push_slice(&stream[..head], false);
+    assert_eq!(probe.run(), StepOutcome::Progress, "popping a slice is progress");
+    assert!(probe.drain().is_empty(), "no whole block yet");
+    assert!(probe.probe.input_is_empty());
+    assert_eq!(probe.run(), StepOutcome::NoProgress, "open input, nothing queued");
+
+    probe.push_slice(&stream[head..], true);
+    probe.probe.close_input();
+    let blocks = probe.run_to_end();
+    assert_frames_stream(&blocks, &stream);
 }
