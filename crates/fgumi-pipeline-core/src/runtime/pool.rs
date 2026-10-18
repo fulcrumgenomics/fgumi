@@ -1,5 +1,9 @@
 //! Exclusive owner assignment.
 
+use std::collections::BTreeSet;
+
+use parking_lot::Mutex;
+
 use crate::erased::ErasedStep;
 use crate::signal::PipelineError;
 use crate::step::StepKind;
@@ -56,6 +60,16 @@ pub fn assign_exclusive_owners(
 /// pass and each pass only fills empty slots, so an Exclusive owner beats a
 /// later Serial-sticky-Affinity target on the same worker; the same first-wins
 /// rule resolves Exclusive-vs-Exclusive and Serial-vs-Serial collisions too.
+///
+/// Each losing request is logged at debug level, naming the worker, the step
+/// that kept the slot and the step that lost it, once per such triple per
+/// process: the loser runs without the sticky fast path, a throughput change
+/// that is otherwise invisible. Only a step that declares `sticky: true`
+/// reaches this function's collision check, so a step that opts out at its
+/// profile is never logged, even when it shares a worker with a sticky step
+/// (the sort's `FrameBgzfBlocks` declares `sticky: false` because the planner
+/// holds the reader worker's slot, and batches its pushes instead).
+///
 /// Returns `None` for workers without any sticky-owned step.
 #[must_use]
 pub fn assign_sticky_owners(
@@ -65,6 +79,14 @@ pub fn assign_sticky_owners(
 ) -> Vec<Option<StepIdx>> {
     debug_assert_eq!(steps.len(), exclusive_owners.len());
     let mut sticky: Vec<Option<StepIdx>> = vec![None; n_workers];
+    // Claim `worker`'s slot for `step_usize`; an occupied slot keeps its owner
+    // and the dropped request is reported.
+    let mut claim = |worker: usize, step_usize: usize| match sticky[worker] {
+        None => sticky[worker] = Some(StepIdx(step_usize)),
+        Some(StepIdx(kept)) => {
+            log_dropped_sticky(worker, steps[kept].name(), steps[step_usize].name());
+        }
+    };
 
     // First pass: Exclusive-sticky owners (highest priority).
     for (step_usize, step) in steps.iter().enumerate() {
@@ -72,9 +94,8 @@ pub fn assign_sticky_owners(
             && step.sticky()
             && let Some(owner) = exclusive_owners[step_usize]
             && owner < n_workers
-            && sticky[owner].is_none()
         {
-            sticky[owner] = Some(StepIdx(step_usize));
+            claim(owner, step_usize);
         }
     }
 
@@ -88,13 +109,37 @@ pub fn assign_sticky_owners(
             && step.sticky()
             && let Some(target) = step.affinity().target_worker(n_workers)
             && target < n_workers
-            && sticky[target].is_none()
         {
-            sticky[target] = Some(StepIdx(step_usize));
+            claim(target, step_usize);
         }
     }
 
     sticky
+}
+
+/// Log (at debug level) that `dropped`'s sticky request lost `worker`'s slot
+/// to `kept`, once per `(worker, kept, dropped)` per process: a chain is built
+/// once per run, but a command may build several with the same steps, and a
+/// repeated line adds nothing. The worker is part of the key, so the same pair
+/// colliding on another worker (a pool of another size puts a writer-affine
+/// step on another last worker) is logged with its own worker index.
+///
+/// Debug, not warn: collisions are routine in production chains (two writer
+/// sinks, e.g. `filter --rejects`, both target the last worker; a reader and a
+/// writer share the only worker of a one-worker pool), and the user can do
+/// nothing about any of them. The line is for whoever is diagnosing a step's
+/// dispatch cadence.
+fn log_dropped_sticky(worker: usize, kept: &'static str, dropped: &'static str) {
+    static LOGGED: Mutex<BTreeSet<(usize, &'static str, &'static str)>> =
+        Mutex::new(BTreeSet::new());
+    let first = LOGGED.lock().insert((worker, kept, dropped));
+    if first {
+        log::debug!(
+            "Sticky dispatch for step `{dropped}` was dropped: worker {worker} already drives \
+             sticky step `{kept}`, and a worker drives at most one sticky step. `{dropped}` \
+             runs without the sticky fast path."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -200,13 +245,20 @@ mod tests {
     }
 
     fn sticky_serial_step(affinity: crate::step::Affinity) -> Box<dyn ErasedStep> {
-        struct StickySerial(crate::step::Affinity);
+        named_sticky_serial_step("StickySerial", affinity)
+    }
+
+    fn named_sticky_serial_step(
+        name: &'static str,
+        affinity: crate::step::Affinity,
+    ) -> Box<dyn ErasedStep> {
+        struct StickySerial(&'static str, crate::step::Affinity);
         impl Step for StickySerial {
             type Input = u32;
             type Outputs = Single<u32>;
             fn profile(&self) -> StepProfile {
                 StepProfile {
-                    name: "StickySerial",
+                    name: self.0,
                     kind: StepKind::Serial,
                     sticky: true,
                     output_queues: vec![QueueSpec::CountBounded { capacity: 4 }],
@@ -214,13 +266,13 @@ mod tests {
                 }
             }
             fn affinity(&self) -> crate::step::Affinity {
-                self.0
+                self.1
             }
             fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
                 Ok(StepOutcome::NoProgress)
             }
         }
-        Box::new(TypedStep::new(StickySerial(affinity)))
+        Box::new(TypedStep::new(StickySerial(name, affinity)))
     }
 
     /// Assert that `sticky` holds `Some(StepIdx(0))` in exactly `expected_slot`
@@ -292,5 +344,75 @@ mod tests {
         // Exclusive (step 0) wins slot 0; Serial (step 1) is blocked — and the
         // blocked serial step must not land in any other slot either.
         assert_only_slot(&sticky, 4, Some(0));
+    }
+
+    /// Captured records from this module that mention `needle`.
+    fn records_mentioning(needle: &str) -> Vec<crate::test_support::CapturedRecord> {
+        crate::test_support::captured_logs(module_path!().trim_end_matches("::tests"), needle)
+    }
+
+    #[test]
+    fn dropped_sticky_request_is_logged_once_per_worker_and_pair() {
+        // A synthetic collision: three sticky steps target the reader worker,
+        // and the first keeps its slot.
+        crate::test_support::install_log_capture();
+        let reader_steps = vec![
+            named_sticky_serial_step("DropLogKept", Affinity::Reader),
+            stub_step(StepKind::Parallel),
+            named_sticky_serial_step("DropLogFirst", Affinity::Reader),
+            named_sticky_serial_step("DropLogSecond", Affinity::Reader),
+        ];
+        let sticky = assign_sticky_owners(&reader_steps, &[None, None, None, None], 4);
+        assert_only_slot(&sticky, 4, Some(0));
+        // A second chain with the same collisions (a command may build several)
+        // repeats nothing.
+        let _ = assign_sticky_owners(&reader_steps, &[None, None, None, None], 4);
+
+        // Two writer-affine sticky steps collide on the last worker: worker 3
+        // of four (twice), then worker 1 of two, the same pair on a new worker.
+        let writer_steps = vec![
+            named_sticky_serial_step("DropLogSinkA", Affinity::Writer),
+            named_sticky_serial_step("DropLogSinkB", Affinity::Writer),
+        ];
+        let _ = assign_sticky_owners(&writer_steps, &[None, None], 4);
+        let _ = assign_sticky_owners(&writer_steps, &[None, None], 4);
+        let _ = assign_sticky_owners(&writer_steps, &[None, None], 2);
+
+        let records = records_mentioning("DropLog");
+        let expected = [
+            (0, "DropLogKept", "DropLogFirst"),
+            (0, "DropLogKept", "DropLogSecond"),
+            (3, "DropLogSinkA", "DropLogSinkB"),
+            (1, "DropLogSinkA", "DropLogSinkB"),
+        ];
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "one record per (worker, kept, dropped): {records:?}"
+        );
+        for (worker, kept, dropped) in expected {
+            let hits: Vec<_> = records
+                .iter()
+                .filter(|r| {
+                    r.message.contains(&format!("step `{dropped}` was dropped"))
+                        && r.message.contains(&format!("worker {worker} already"))
+                        && r.message.contains(&format!("sticky step `{kept}`"))
+                })
+                .collect();
+            assert_eq!(hits.len(), 1, "({worker}, {kept}, {dropped}): {records:?}");
+            assert_eq!(hits[0].level, log::Level::Debug, "routine in production chains, so debug");
+        }
+    }
+
+    #[test]
+    fn sticky_requests_on_distinct_workers_are_not_logged() {
+        crate::test_support::install_log_capture();
+        let steps = vec![
+            named_sticky_serial_step("NoLogReader", Affinity::Reader),
+            named_sticky_serial_step("NoLogWriter", Affinity::Writer),
+        ];
+        let sticky = assign_sticky_owners(&steps, &[None, None], 4);
+        assert_eq!(sticky, vec![Some(StepIdx(0)), None, None, Some(StepIdx(1))]);
+        assert!(records_mentioning("NoLog").is_empty());
     }
 }
