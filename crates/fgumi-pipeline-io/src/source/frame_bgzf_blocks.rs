@@ -11,10 +11,15 @@
 //! sequential reader; a stream that ends inside a block fails with
 //! `UnexpectedEof`.
 //!
-//! The step is reader-affine and `Serial` (not sticky: the planner holds the
-//! reader worker's sticky slot). When its pop finds no slice it records that
-//! in the [`InputLedger`]'s `framer_waiting`, the half of the read-streams
-//! ratchet's signal that says the framer — not the device — is idle.
+//! The step is reader-affine and `Serial`, and not sticky: the planner holds
+//! the reader worker's only sticky slot (`assign_sticky_owners` grants one
+//! sticky step per worker). Without the sticky fast path, every dispatch is a
+//! full walk of the reader worker's steps, so each dispatch pushes a batch of
+//! up to `FRAME_BATCH` blocks, framing further slices as the previous one's
+//! blocks drain, until the output refuses or the input runs dry. When its pop
+//! finds no slice it records that in the [`InputLedger`]'s `framer_waiting`,
+//! the half of the read-streams ratchet's signal that says the framer — not
+//! the device — is idle.
 
 use std::collections::VecDeque;
 use std::io;
@@ -29,6 +34,7 @@ use fgumi_pipeline_core::{
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
     reorder::BranchOrdering,
+    runtime::STICKY_BURST_LIMIT,
     step::{Affinity, CounterSpec, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
 
@@ -40,6 +46,25 @@ const BLOCKS: usize = 0;
 /// Counter slot index for slice bytes framed.
 const BYTES_READ: usize = 1;
 
+/// Max blocks `FrameBgzfBlocks` pushes per `try_run` dispatch.
+///
+/// The framer is not sticky, so it is reached only through the reader worker's
+/// walk, which under the sort's drain-first scheduler restarts from the deepest
+/// step on every `Progress` and so takes queued inflate work first. Pushing one
+/// block per dispatch made ingest run at one block per reader-worker loop —
+/// the pool starved while the framer emitted a slice's few hundred blocks one
+/// walk at a time. A batch amortises the walk the same way `ReadBlocks`'
+/// `ADMIT_BATCH` does on the next hop. The output edge's byte and count bounds
+/// usually end the batch first; this cap bounds how long one dispatch can keep
+/// the reader worker when the consumers drain the edge as fast as it fills.
+///
+/// It is the runtime's sticky burst bound ([`STICKY_BURST_LIMIT`]), the most
+/// consecutive calls a sticky step such as `ReadBgzfBlocks` gets before its
+/// worker walks its other steps; a one-block-per-call sticky reader therefore
+/// emits at most this many blocks per visit, and so does this batch. The value
+/// is the runtime's, not a copy, so the two cannot drift apart.
+pub(crate) const FRAME_BATCH: usize = STICKY_BURST_LIMIT;
+
 /// `Serial` BGZF framer over ordered input slices (see the module docs).
 pub struct FrameBgzfBlocks {
     framer: BgzfSliceFramer,
@@ -49,6 +74,9 @@ pub struct FrameBgzfBlocks {
     held: HeldSlot<Unpushed<BgzfBlock>>,
     next_serial: u64,
     output_byte_limit: u64,
+    /// Max blocks offered per dispatch: `FRAME_BATCH`, except in tests that
+    /// need a cap below the output edge's slot count to observe it.
+    batch: usize,
     finished: bool,
 }
 
@@ -64,8 +92,20 @@ impl FrameBgzfBlocks {
             held: HeldSlot::new(),
             next_serial: 0,
             output_byte_limit,
+            batch: FRAME_BATCH,
             finished: false,
         }
+    }
+
+    /// This framer with a per-dispatch cap of `batch` blocks instead of
+    /// `FRAME_BATCH`. `FRAME_BATCH` equals the output edge's slot count, so a
+    /// hand-driven probe fills the edge before it reaches the cap and cannot
+    /// tell a capped batch from an uncapped one; a smaller cap can.
+    #[cfg(test)]
+    pub(crate) fn with_batch(mut self, batch: usize) -> Self {
+        assert!(batch > 0, "a zero cap would never push");
+        self.batch = batch;
+        self
     }
 
     /// Frame one slice into `pending`.
@@ -100,13 +140,21 @@ impl FrameBgzfBlocks {
         Ok(())
     }
 
-    /// Push the next pending block (holding it on a full queue).
-    fn push_one(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
-        let Some(block) = self.pending.pop_front() else { return false };
-        if let Err(unpushed) = ctx.outputs.push(block) {
-            self.held.put(unpushed);
+    /// Push pending blocks until `pending` is empty, the output refuses one
+    /// (it is held for the next dispatch), or `budget` blocks have been
+    /// offered. Returns how many blocks were offered, and whether the output
+    /// refused.
+    fn push_pending(&mut self, ctx: &mut StepCtx<'_, Self>, budget: usize) -> (usize, bool) {
+        let mut offered = 0;
+        while offered < budget {
+            let Some(block) = self.pending.pop_front() else { break };
+            offered += 1;
+            if let Err(unpushed) = ctx.outputs.push(block) {
+                self.held.put(unpushed);
+                return (offered, true);
+            }
         }
-        true
+        (offered, false)
     }
 }
 
@@ -138,33 +186,46 @@ impl Step for FrameBgzfBlocks {
         if matches!(ctx.outputs.retry_held(&mut self.held), HeldRetry::StillHeld) {
             return Ok(StepOutcome::Contention);
         }
-        if self.push_one(ctx) {
-            return Ok(StepOutcome::Progress);
-        }
-        if self.finished {
-            return Ok(StepOutcome::Finished);
-        }
-        let Some(slice) = ctx.input.pop() else {
-            self.ledger.framer_waiting.store(true, Ordering::Relaxed);
-            if ctx.input.is_drained() {
-                // The planner finished without a `last` slice only for an empty
-                // input; a carried partial block is still a truncation.
-                self.framer.finish()?;
-                self.finished = true;
-                return Ok(StepOutcome::Finished);
+        // Batched (see `FRAME_BATCH`): push what is pending, then frame the
+        // next slice and keep pushing, until the output refuses, the batch is
+        // spent, or no slice is ready. A popped slice is progress even when it
+        // framed no whole block (it freed a slot on the input edge).
+        let mut offered = 0;
+        let mut popped_any = false;
+        loop {
+            let (n, refused) = self.push_pending(ctx, self.batch - offered);
+            offered += n;
+            if refused || offered >= self.batch {
+                return Ok(StepOutcome::Progress);
             }
-            return Ok(StepOutcome::NoProgress);
-        };
-        self.ledger.framer_waiting.store(false, Ordering::Relaxed);
-        let blocks_before = self.next_serial;
-        self.frame(&slice)?;
-        ctx.counters.add(BLOCKS, self.next_serial - blocks_before);
-        ctx.counters.add(BYTES_READ, slice.bytes.len() as u64);
-        #[cfg(test)]
-        AFTER_FRAME.fire(slice.bytes.len());
-        drop(slice);
-        self.push_one(ctx);
-        Ok(StepOutcome::Progress)
+            let progressed = offered > 0 || popped_any;
+            if self.finished {
+                return Ok(if progressed { StepOutcome::Progress } else { StepOutcome::Finished });
+            }
+            let Some(slice) = ctx.input.pop() else {
+                self.ledger.framer_waiting.store(true, Ordering::Relaxed);
+                if progressed {
+                    return Ok(StepOutcome::Progress);
+                }
+                if ctx.input.is_drained() {
+                    // The planner finished without a `last` slice only for an
+                    // empty input; a carried partial block is still a truncation.
+                    self.framer.finish()?;
+                    self.finished = true;
+                    return Ok(StepOutcome::Finished);
+                }
+                return Ok(StepOutcome::NoProgress);
+            };
+            popped_any = true;
+            self.ledger.framer_waiting.store(false, Ordering::Relaxed);
+            let blocks_before = self.next_serial;
+            self.frame(&slice)?;
+            ctx.counters.add(BLOCKS, self.next_serial - blocks_before);
+            ctx.counters.add(BYTES_READ, slice.bytes.len() as u64);
+            #[cfg(test)]
+            AFTER_FRAME.fire(slice.bytes.len());
+            drop(slice);
+        }
     }
 }
 

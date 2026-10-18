@@ -65,7 +65,11 @@ use crate::topology::StepIdx;
 /// it is not a tuning knob: forward progress comes from this bound *together
 /// with* round-robin declining to restart the walk on the sticky owner's
 /// `Progress`.
-const STICKY_BURST_LIMIT: usize = 1024;
+///
+/// Public so a non-sticky step that batches its own pushes to stand in for the
+/// fast path (the sort's `FrameBgzfBlocks`) can bound a dispatch by the same
+/// number instead of a copy of it.
+pub const STICKY_BURST_LIMIT: usize = 1024;
 
 /// Per-thread diagnostic state carried across loop iterations.
 ///
