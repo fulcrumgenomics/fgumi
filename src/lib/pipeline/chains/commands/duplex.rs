@@ -37,6 +37,7 @@ use crate::overlapping_consensus::{
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
+use crate::pipeline::chains::commands::output_sizer::OutputSizer;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -89,6 +90,9 @@ pub(crate) struct DuplexState {
     /// body — the metrics-off default builds and carries neither.
     pub(crate) header: Option<Arc<noodles::sam::Header>>,
     pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    /// Per-worker estimate of this step's output/input byte ratio, used to
+    /// reserve each batch's output buffer once (see [`OutputSizer`]).
+    pub(crate) sizer: OutputSizer,
 }
 
 impl crate::pipeline::core::item::HeapSize for DuplexState {}
@@ -279,6 +283,7 @@ fn make_duplex_consensus_init(
     tie_rule: fgumi_consensus::TieRule,
     header: Option<Arc<noodles::sam::Header>>,
     library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    output_ceiling: usize,
 ) -> impl Fn() -> DuplexState + Send + Sync + 'static {
     if methylation_mode.is_enabled()
         && DuplexConsensusCaller::allows_single_strand_consensus(&min_reads)
@@ -327,6 +332,7 @@ fn make_duplex_consensus_init(
             single_strand_allowed,
             header: header.clone(),
             library_index: library_index.clone(),
+            sizer: OutputSizer::new(output_ceiling),
         }
     }
 }
@@ -350,7 +356,10 @@ fn run_duplex_consensus_batch(
     let BatchedMiGroups { batch_serial, groups } = item;
     let groups_count = groups.len() as u64;
 
+    let input_len =
+        super::framed_len(groups.iter().flat_map(|g| g.records.iter()).map(AsRef::as_ref));
     let mut all_output = ConsensusOutput::default();
+    state.sizer.reserve(&mut all_output.data, input_len);
     let mut batch_stats = ConsensusCallingStats::new();
     let mut batch_overlapping = CorrectionStats::new();
     let mut rejects_bytes: Vec<u8> = Vec::new();
@@ -399,6 +408,7 @@ fn run_duplex_consensus_batch(
         info!("Processed {} records", prev + total_input_records);
     }
 
+    state.sizer.finish(&mut all_output.data, input_len);
     let consensus = DecompressedBlock { batch_serial, bytes: all_output.data };
     let rejects = if rejects_bytes.is_empty() {
         None
@@ -532,6 +542,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects_and_metrics(
         tie_rule,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut DuplexState,
                      item: BatchedMiGroups|
@@ -631,6 +642,7 @@ pub(crate) fn build_duplex_consensus_step_metrics(
         tie_rule,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut DuplexState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -704,6 +716,7 @@ pub(crate) fn build_duplex_consensus_step_with_rejects(
         tie_rule,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut DuplexState,
                      item: BatchedMiGroups|
@@ -799,6 +812,7 @@ pub(crate) fn build_duplex_consensus_step_kept_only(
         tie_rule,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut DuplexState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -887,5 +901,54 @@ mod tests {
             fgumi_consensus::MethylationMode::EmSeq,
             "--methylation-mode must reach the mapping"
         );
+    }
+
+    /// Output sizing (see the simplex counterpart): the second of two identical
+    /// batches is reserved from the observed first batch, fits, and is not
+    /// over-reserved; the fixture produces duplex consensus.
+    #[test]
+    fn duplex_output_is_reserved_from_the_observed_ratio() {
+        use crate::pipeline::chains::commands::consensus_fixtures::{
+            assert_sized_from_the_previous_batch, duplex_groups_for_test,
+        };
+        let init = make_duplex_consensus_init(
+            "p".into(),
+            "A".into(),
+            vec![1],
+            10,
+            true,
+            false,
+            None,
+            noodles::sam::alignment::record::data::field::Tag::new(b'C', b'B'),
+            false,
+            45,
+            40,
+            None,
+            fgumi_consensus::MethylationMode::Disabled,
+            false,
+            fgumi_consensus::TieRule::default(),
+            None,
+            None,
+            usize::MAX,
+        );
+        let mut state = init();
+        let groups = duplex_groups_for_test(30, 2);
+        let accumulators = PerThreadAccumulator::new(1);
+        let progress = Arc::new(AtomicU64::new(0));
+        let batch = |state: &mut DuplexState, serial, groups| {
+            run_duplex_consensus_batch(
+                state,
+                BatchedMiGroups::new(serial, groups),
+                false,
+                false,
+                &accumulators,
+                &progress,
+            )
+            .expect("duplex batch")
+            .0
+        };
+        let first = batch(&mut state, 0, groups.clone());
+        let second = batch(&mut state, 1, groups);
+        assert_sized_from_the_previous_batch(&first, &second, state.sizer.last_reserved);
     }
 }

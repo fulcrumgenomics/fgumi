@@ -36,6 +36,7 @@ use crate::overlapping_consensus::{
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
+use crate::pipeline::chains::commands::output_sizer::OutputSizer;
 use crate::pipeline::core::outputs::OrderedBytesTuple2;
 use crate::pipeline::core::step::Step;
 use crate::pipeline::steps::group::mi::BatchedMiGroups;
@@ -84,6 +85,9 @@ pub(crate) struct ConsensusState {
     /// metrics-on batch body reads them.
     pub(crate) header: Option<Arc<noodles::sam::Header>>,
     pub(crate) library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    /// Per-worker estimate of this step's output/input byte ratio, used to
+    /// reserve each batch's output buffer once (see [`OutputSizer`]).
+    pub(crate) sizer: OutputSizer,
 }
 
 impl crate::pipeline::core::item::HeapSize for ConsensusState {}
@@ -239,6 +243,7 @@ fn make_simplex_consensus_init(
     overlapping_enabled: bool,
     header: Option<Arc<noodles::sam::Header>>,
     library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    output_ceiling: usize,
 ) -> impl Fn() -> ConsensusState + Send + Sync + 'static {
     move || {
         let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
@@ -263,6 +268,7 @@ fn make_simplex_consensus_init(
             overlapping,
             header: header.clone(),
             library_index: library_index.clone(),
+            sizer: OutputSizer::new(output_ceiling),
         }
     }
 }
@@ -288,7 +294,10 @@ fn run_simplex_consensus_batch(
     let BatchedMiGroups { batch_serial, groups } = item;
     let groups_count = groups.len() as u64;
 
+    let input_len =
+        super::framed_len(groups.iter().flat_map(|g| g.records.iter()).map(AsRef::as_ref));
     let mut all_output = ConsensusOutput::default();
+    state.sizer.reserve(&mut all_output.data, input_len);
     let mut batch_stats = ConsensusCallingStats::new();
     let mut batch_overlapping = CorrectionStats::new();
     let mut rejects_bytes: Vec<u8> = Vec::new();
@@ -350,6 +359,7 @@ fn run_simplex_consensus_batch(
         info!("Processed {} records", prev + total_input_records);
     }
 
+    state.sizer.finish(&mut all_output.data, input_len);
     let consensus = DecompressedBlock { batch_serial, bytes: all_output.data };
     let rejects = if rejects_bytes.is_empty() {
         None
@@ -462,6 +472,7 @@ pub(crate) fn build_simplex_consensus_step_with_rejects_and_metrics(
         overlapping_enabled,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut ConsensusState,
                      item: BatchedMiGroups|
@@ -548,6 +559,7 @@ pub(crate) fn build_simplex_consensus_step_metrics(
         overlapping_enabled,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut ConsensusState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -606,6 +618,7 @@ pub(crate) fn build_simplex_consensus_step_with_rejects(
         overlapping_enabled,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body = move |state: &mut ConsensusState,
                      item: BatchedMiGroups|
@@ -691,6 +704,7 @@ pub(crate) fn build_simplex_consensus_step_kept_only(
         overlapping_enabled,
         header,
         library_index,
+        usize::try_from(limit_bytes).unwrap_or(usize::MAX),
     );
     let body =
         move |state: &mut ConsensusState, item: BatchedMiGroups| -> io::Result<DecompressedBlock> {
@@ -788,5 +802,49 @@ mod tests {
             fgumi_consensus::MethylationMode::EmSeq,
             "--methylation-mode must reach the mapping"
         );
+    }
+
+    /// Output sizing: the second of two identical batches is reserved from the
+    /// output the sizer observed on the first (not from a seed, not nothing),
+    /// fits that reservation without regrowing, and is not over-reserved.
+    /// Catches a sizer that never observes, `Vec::new()` restored, and an
+    /// estimate that ignores the observed ratio.
+    #[test]
+    fn simplex_output_is_reserved_from_the_observed_ratio() {
+        use crate::pipeline::chains::commands::consensus_fixtures::{
+            assert_sized_from_the_previous_batch, simplex_groups_for_test,
+        };
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let init = make_simplex_consensus_init(
+            "p".into(),
+            "A".into(),
+            options,
+            None,
+            false,
+            false,
+            None,
+            None,
+            usize::MAX,
+        );
+        let mut state = init();
+        let groups = simplex_groups_for_test(40, 4);
+        let accumulators = PerThreadAccumulator::new(1);
+        let progress = Arc::new(AtomicU64::new(0));
+        let batch = |state: &mut ConsensusState, serial, groups| {
+            run_simplex_consensus_batch(
+                state,
+                BatchedMiGroups::new(serial, groups),
+                false,
+                false,
+                1,
+                &accumulators,
+                &progress,
+            )
+            .expect("simplex batch")
+            .0
+        };
+        let first = batch(&mut state, 0, groups.clone());
+        let second = batch(&mut state, 1, groups);
+        assert_sized_from_the_previous_batch(&first, &second, state.sizer.last_reserved);
     }
 }

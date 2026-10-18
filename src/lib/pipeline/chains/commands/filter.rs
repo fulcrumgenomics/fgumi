@@ -33,11 +33,12 @@ use crate::consensus_filter::{is_primary_read, retained_primary_masked_bases};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
+use crate::pipeline::chains::commands::framed_len;
 use crate::pipeline::steps::process::{
     Process2Ordered, ProcessOrdered, process_ordered, process2_ordered,
 };
 use crate::pipeline::steps::types::{
-    BamTemplateBatch, DecodedRecordBatch, DecompressedBlock, RecordBatch,
+    BamTemplateBatch, DecodedRecordBatch, DecompressedBlock, RecordBatch, fit_for_queue,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +414,203 @@ fn filter_template_records(
     Ok(TemplateFilterOutcome { keep, masked_bases, evaluated })
 }
 
+/// Kept and (when `rejects`) rejected output buffers for a batch of `framed`
+/// input bytes (see [`framed_len`]).
+///
+/// Filter emits each input record at most once, framed as `4 + len`, so
+/// `framed` bounds the kept output. Reserving it up front replaces the `Vec`
+/// doubling (realloc + copy) of serializing into an empty buffer; the
+/// reservation is capped at `ceiling`, the step's per-queue byte budget
+/// (config), and [`filter_output_blocks`] shrinks a buffer that a heavy filter
+/// left mostly empty before it is queued (queues are charged by capacity).
+/// Rejects are usually a small fraction of a batch, so their buffer is not
+/// reserved: it grows from empty, which keeps its capacity within twice what it
+/// holds.
+fn filter_output_buffers(
+    framed: usize,
+    ceiling: usize,
+    rejects: bool,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    (Vec::with_capacity(framed.min(ceiling)), rejects.then(Vec::new))
+}
+
+/// Wrap a batch's kept and rejected bytes as `DecompressedBlock`s, each fitted
+/// for its queue (capacity at most `2 * len + 64 KiB`, see [`fit_for_queue`]).
+fn filter_output_blocks(
+    batch_serial: u64,
+    mut kept: Vec<u8>,
+    rejected: Option<Vec<u8>>,
+) -> (DecompressedBlock, Option<DecompressedBlock>) {
+    fit_for_queue(&mut kept);
+    (
+        DecompressedBlock { batch_serial, bytes: kept },
+        rejected.map(|mut bytes| {
+            fit_for_queue(&mut bytes);
+            DecompressedBlock { batch_serial, bytes }
+        }),
+    )
+}
+
+/// The rejects branch of a with-rejects step's output. A with-rejects step
+/// always asks its batch body for rejects, so `rejected` is `Some`; a `None`
+/// here is a wiring bug, and an empty rejects block would silently write an
+/// empty rejects file, so it panics instead.
+///
+/// # Panics
+///
+/// Panics if `rejected` is `None`.
+fn rejects_block(
+    kept: &DecompressedBlock,
+    rejected: Option<DecompressedBlock>,
+) -> DecompressedBlock {
+    rejected.unwrap_or_else(|| {
+        unreachable!(
+            "with-rejects filter step got no rejects block for batch {}",
+            kept.batch_serial
+        )
+    })
+}
+
+/// A step's per-queue byte budget as a reservation ceiling.
+fn reserve_ceiling(limit_bytes: u64) -> usize {
+    usize::try_from(limit_bytes).unwrap_or(usize::MAX)
+}
+
+/// Per-batch body of the single-read filter steps on the decoded path
+/// (`DecodedRecordBatch`). Returns the kept records and, when `rejects` is set,
+/// the rejected ones, serialized framed into the buffers
+/// [`filter_output_buffers`] sizes (kept reserved once, capped at `ceiling`).
+fn filter_single_batch(
+    item: DecodedRecordBatch,
+    captures: &FilterProcessCaptures,
+    accumulators: &PerThreadAccumulator<CollectedFilterMetrics>,
+    ceiling: usize,
+    rejects: bool,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
+    let batch_serial = item.batch_serial();
+    let framed = framed_len(item.records().iter().map(fgumi_bam_io::DecodedRecord::raw_bytes));
+    let records = item.into_records();
+    let records_count = records.len() as u64;
+    let (mut kept_bytes, mut rejected_bytes) = filter_output_buffers(framed, ceiling, rejects);
+    let mut passed_count: u64 = 0;
+    let mut bases_masked_total: u64 = 0;
+
+    for decoded in records {
+        let mut record = decoded.into_raw_bytes();
+        let (pass, masked) =
+            filter_one_record(&mut record, captures, &mut kept_bytes, rejected_bytes.as_mut())?;
+        if pass {
+            passed_count += 1;
+        }
+        bases_masked_total += masked;
+    }
+
+    record_batch_metrics(
+        captures,
+        accumulators,
+        records_count,
+        passed_count,
+        bases_masked_total,
+        records_count, // every record is evaluated
+    );
+
+    Ok(filter_output_blocks(batch_serial, kept_bytes, rejected_bytes))
+}
+
+/// Per-batch body of the single-read filter steps on the decode-free fast path
+/// (`RecordBatch`, the default `filter` chain). Same contract as
+/// [`filter_single_batch`]; iterates borrowed record byte-ranges with one
+/// reused scratch `RawRecord`.
+fn filter_single_raw_batch(
+    item: &RecordBatch,
+    captures: &FilterProcessCaptures,
+    accumulators: &PerThreadAccumulator<CollectedFilterMetrics>,
+    ceiling: usize,
+    rejects: bool,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
+    let batch_serial = item.batch_serial();
+    let records_count = item.len() as u64;
+    let framed = framed_len(item.iter_record_bytes());
+    let (mut kept_bytes, mut rejected_bytes) = filter_output_buffers(framed, ceiling, rejects);
+    let mut passed_count: u64 = 0;
+    let mut bases_masked_total: u64 = 0;
+    // One scratch buffer, reused across every record in this batch.
+    let mut scratch = RawRecord::new();
+
+    crate::pipeline::chains::commands::for_each_raw_record(item, &mut scratch, |record| {
+        let (pass, masked) =
+            filter_one_record(record, captures, &mut kept_bytes, rejected_bytes.as_mut())?;
+        if pass {
+            passed_count += 1;
+        }
+        bases_masked_total += masked;
+        Ok(())
+    })?;
+
+    record_batch_metrics(
+        captures,
+        accumulators,
+        records_count,
+        passed_count,
+        bases_masked_total,
+        records_count, // every record is evaluated
+    );
+
+    Ok(filter_output_blocks(batch_serial, kept_bytes, rejected_bytes))
+}
+
+/// Per-batch body of the template-aware filter steps (`BamTemplateBatch`).
+/// Same output contract as [`filter_single_batch`]; templates are filtered
+/// whole by [`filter_template_records`].
+fn filter_template_batch(
+    item: BamTemplateBatch,
+    captures: &FilterProcessCaptures,
+    accumulators: &PerThreadAccumulator<CollectedFilterMetrics>,
+    ceiling: usize,
+    rejects: bool,
+) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
+    let framed = framed_len(
+        item.templates().iter().flat_map(crate::template::Template::records).map(AsRef::as_ref),
+    );
+    let (batch_serial, templates) = item.into_parts();
+    let (mut kept_bytes, mut rejected_bytes) = filter_output_buffers(framed, ceiling, rejects);
+    let mut total_records: u64 = 0;
+    let mut passed_count: u64 = 0;
+    let mut bases_masked_total: u64 = 0;
+    let mut evaluated_count: u64 = 0;
+
+    for template in templates {
+        let mut template_records: Vec<RawRecord> = template.into_records();
+        total_records += template_records.len() as u64;
+        let outcome = filter_template_records(&mut template_records, captures)?;
+        bases_masked_total += outcome.masked_bases;
+        evaluated_count += outcome.evaluated;
+
+        for (record, keep) in template_records.into_iter().zip(outcome.keep) {
+            let target = if keep {
+                passed_count += 1;
+                &mut kept_bytes
+            } else if let Some(rejected) = rejected_bytes.as_mut() {
+                rejected
+            } else {
+                continue;
+            };
+            fgumi_raw_bam::write_framed_record(target, record.as_ref())?;
+        }
+    }
+
+    record_batch_metrics(
+        captures,
+        accumulators,
+        total_records,
+        passed_count,
+        bases_masked_total,
+        evaluated_count,
+    );
+
+    Ok(filter_output_blocks(batch_serial, kept_bytes, rejected_bytes))
+}
+
 /// Build the single-read, no-rejects filter step.
 ///
 /// `DecodedRecordBatch → DecompressedBlock`. Parallel, `ByItemOrdinal`.
@@ -433,34 +631,15 @@ pub(crate) fn build_filter_step_single_no_rejects(
         "FilterProcess",
         limit_bytes,
         move |item: DecodedRecordBatch| -> io::Result<DecompressedBlock> {
-            let batch_serial = item.batch_serial();
-            let records = item.into_records();
-            let records_count = records.len() as u64;
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-
-            for decoded in records {
-                let mut record = decoded.into_raw_bytes();
-                // No rejects: `None` drops rejected records.
-                let (pass, masked) =
-                    filter_one_record(&mut record, &captures, &mut kept_bytes, None)?;
-                if pass {
-                    passed_count += 1;
-                }
-                bases_masked_total += masked;
-            }
-
-            record_batch_metrics(
+            // No rejects: rejected records are dropped.
+            Ok(filter_single_batch(
+                item,
                 &captures,
                 &accumulators,
-                records_count,
-                passed_count,
-                bases_masked_total,
-                records_count, // every record is evaluated
-            );
-
-            Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
+                reserve_ceiling(limit_bytes),
+                false,
+            )?
+            .0)
         },
     )
 }
@@ -501,41 +680,9 @@ pub(crate) fn build_filter_step_single_with_rejects(
         limit_bytes,
         move |item: DecodedRecordBatch|
               -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
-            let batch_serial = item.batch_serial();
-            let records = item.into_records();
-            let records_count = records.len() as u64;
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut rejected_bytes: Vec<u8> = Vec::new();
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-
-            for decoded in records {
-                let mut record = decoded.into_raw_bytes();
-                let (pass, masked) = filter_one_record(
-                    &mut record,
-                    &captures,
-                    &mut kept_bytes,
-                    Some(&mut rejected_bytes),
-                )?;
-                if pass {
-                    passed_count += 1;
-                }
-                bases_masked_total += masked;
-            }
-
-            record_batch_metrics(
-                &captures,
-                &accumulators,
-                records_count,
-                passed_count,
-                bases_masked_total,
-                records_count, // every record is evaluated
-            );
-
-            Ok(Process2Output::both(
-                DecompressedBlock { batch_serial, bytes: kept_bytes },
-                DecompressedBlock { batch_serial, bytes: rejected_bytes },
-            ))
+            let (kept, rejected) = filter_single_batch(item, &captures, &accumulators, reserve_ceiling(limit_bytes), true)?;
+            let rejects = rejects_block(&kept, rejected);
+            Ok(Process2Output::both(kept, rejects))
         },
     )
 }
@@ -563,38 +710,14 @@ pub(crate) fn build_filter_step_single_no_rejects_raw(
         "FilterProcess",
         limit_bytes,
         move |item: RecordBatch| -> io::Result<DecompressedBlock> {
-            let batch_serial = item.batch_serial();
-            let records_count = item.len() as u64;
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-            // One scratch buffer, reused across every record in this batch.
-            let mut scratch = RawRecord::new();
-
-            crate::pipeline::chains::commands::for_each_raw_record(
+            Ok(filter_single_raw_batch(
                 &item,
-                &mut scratch,
-                |record| {
-                    let (pass, masked) =
-                        filter_one_record(record, &captures, &mut kept_bytes, None)?;
-                    if pass {
-                        passed_count += 1;
-                    }
-                    bases_masked_total += masked;
-                    Ok(())
-                },
-            )?;
-
-            record_batch_metrics(
                 &captures,
                 &accumulators,
-                records_count,
-                passed_count,
-                bases_masked_total,
-                records_count, // every record is evaluated
-            );
-
-            Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
+                reserve_ceiling(limit_bytes),
+                false,
+            )?
+            .0)
         },
     )
 }
@@ -632,45 +755,9 @@ pub(crate) fn build_filter_step_single_with_rejects_raw(
         limit_bytes,
         move |item: RecordBatch|
               -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
-            let batch_serial = item.batch_serial();
-            let records_count = item.len() as u64;
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut rejected_bytes: Vec<u8> = Vec::new();
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-            let mut scratch = RawRecord::new();
-
-            crate::pipeline::chains::commands::for_each_raw_record(
-                &item,
-                &mut scratch,
-                |record| {
-                    let (pass, masked) = filter_one_record(
-                        record,
-                        &captures,
-                        &mut kept_bytes,
-                        Some(&mut rejected_bytes),
-                    )?;
-                    if pass {
-                        passed_count += 1;
-                    }
-                    bases_masked_total += masked;
-                    Ok(())
-                },
-            )?;
-
-            record_batch_metrics(
-                &captures,
-                &accumulators,
-                records_count,
-                passed_count,
-                bases_masked_total,
-                records_count, // every record is evaluated
-            );
-
-            Ok(Process2Output::both(
-                DecompressedBlock { batch_serial, bytes: kept_bytes },
-                DecompressedBlock { batch_serial, bytes: rejected_bytes },
-            ))
+            let (kept, rejected) = filter_single_raw_batch(&item, &captures, &accumulators, reserve_ceiling(limit_bytes), true)?;
+            let rejects = rejects_block(&kept, rejected);
+            Ok(Process2Output::both(kept, rejects))
         },
     )
 }
@@ -695,38 +782,14 @@ pub(crate) fn build_filter_step_template_no_rejects(
         "FilterProcess",
         limit_bytes,
         move |item: BamTemplateBatch| -> io::Result<DecompressedBlock> {
-            let (batch_serial, templates) = item.into_parts();
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut total_records: u64 = 0;
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-            let mut evaluated_count: u64 = 0;
-
-            for template in templates {
-                let mut template_records: Vec<RawRecord> = template.into_records();
-                total_records += template_records.len() as u64;
-                let outcome = filter_template_records(&mut template_records, &captures)?;
-                bases_masked_total += outcome.masked_bases;
-                evaluated_count += outcome.evaluated;
-
-                for (record, keep) in template_records.into_iter().zip(outcome.keep) {
-                    if keep {
-                        passed_count += 1;
-                        fgumi_raw_bam::write_framed_record(&mut kept_bytes, record.as_ref())?;
-                    }
-                }
-            }
-
-            record_batch_metrics(
+            Ok(filter_template_batch(
+                item,
                 &captures,
                 &accumulators,
-                total_records,
-                passed_count,
-                bases_masked_total,
-                evaluated_count,
-            );
-
-            Ok(DecompressedBlock { batch_serial, bytes: kept_bytes })
+                reserve_ceiling(limit_bytes),
+                false,
+            )?
+            .0)
         },
     )
 }
@@ -762,45 +825,9 @@ pub(crate) fn build_filter_step_template_with_rejects(
         limit_bytes,
         move |item: BamTemplateBatch|
               -> io::Result<Process2Output<DecompressedBlock, DecompressedBlock>> {
-            let (batch_serial, templates) = item.into_parts();
-            let mut kept_bytes: Vec<u8> = Vec::new();
-            let mut rejected_bytes: Vec<u8> = Vec::new();
-            let mut total_records: u64 = 0;
-            let mut passed_count: u64 = 0;
-            let mut bases_masked_total: u64 = 0;
-            let mut evaluated_count: u64 = 0;
-
-            for template in templates {
-                let mut template_records: Vec<RawRecord> = template.into_records();
-                total_records += template_records.len() as u64;
-                let outcome = filter_template_records(&mut template_records, &captures)?;
-                bases_masked_total += outcome.masked_bases;
-                evaluated_count += outcome.evaluated;
-
-                for (record, keep) in template_records.into_iter().zip(outcome.keep) {
-                    let target = if keep {
-                        passed_count += 1;
-                        &mut kept_bytes
-                    } else {
-                        &mut rejected_bytes
-                    };
-                    fgumi_raw_bam::write_framed_record(target, record.as_ref())?;
-                }
-            }
-
-            record_batch_metrics(
-                &captures,
-                &accumulators,
-                total_records,
-                passed_count,
-                bases_masked_total,
-                evaluated_count,
-            );
-
-            Ok(Process2Output::both(
-                DecompressedBlock { batch_serial, bytes: kept_bytes },
-                DecompressedBlock { batch_serial, bytes: rejected_bytes },
-            ))
+            let (kept, rejected) = filter_template_batch(item, &captures, &accumulators, reserve_ceiling(limit_bytes), true)?;
+            let rejects = rejects_block(&kept, rejected);
+            Ok(Process2Output::both(kept, rejects))
         },
     )
 }
@@ -961,5 +988,211 @@ mod template_tests {
                     .to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use fgumi_bam_io::DecodedRecord;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
+
+    use crate::commands::filter::{
+        CollectedFilterMetrics, FilterProcessCaptures, MethylationFilterSkips,
+    };
+    use crate::consensus_filter::FilterConfig;
+    use crate::per_thread_accumulator::PerThreadAccumulator;
+    use crate::pipeline::steps::types::{
+        BamTemplateBatch, DecodedRecordBatch, DecompressedBlock, RecordBatch,
+    };
+    use crate::sam::SamTag;
+    use crate::template::Template;
+
+    /// Captures for `--min-reads 3`, no reference, no masking.
+    fn captures() -> FilterProcessCaptures {
+        FilterProcessCaptures {
+            config: Arc::new(FilterConfig::new(&[3], &[1.0], &[1.0], None, None, 1.0)),
+            reference: None,
+            min_base_quality: None,
+            should_reverse_tags: false,
+            min_mean_base_quality: None,
+            max_no_call_fraction: 1.0,
+            require_single_strand_agreement: false,
+            methylation_depth_thresholds: None,
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: fgumi_consensus::MethylationMode::Disabled,
+            ref_names: Arc::new(Vec::new()),
+            progress: Arc::new(AtomicU64::new(0)),
+            header: noodles::sam::Header::default(),
+            methylation_skips: Arc::new(MethylationFilterSkips::default()),
+        }
+    }
+
+    fn accumulators() -> Arc<PerThreadAccumulator<CollectedFilterMetrics>> {
+        PerThreadAccumulator::new(1)
+    }
+
+    /// `n` unmapped simplex-consensus records in templates of two; one template
+    /// in `reject_every` has depth 1 and fails `--min-reads 3`, the rest have
+    /// depth 5 and pass. `flag` is OR-ed in (paired flags for the template
+    /// fixture).
+    fn consensus_records(
+        n: usize,
+        reject_every: usize,
+        flag: impl Fn(usize) -> u16,
+    ) -> Vec<RawRecord> {
+        (0..n)
+            .map(|i| {
+                let mut b = RawSamBuilder::new();
+                let name = format!("r{:06}", i / 2);
+                b.read_name(name.as_bytes())
+                    .flags(flags::UNMAPPED | flag(i))
+                    .sequence(&[b'A'; 50])
+                    .qualities(&[30; 50]);
+                let depth = if (i / 2) % reject_every == 0 { 1 } else { 5 };
+                b.add_int_tag(SamTag::CD, depth).add_float_tag(SamTag::CE, 0.0_f32);
+                b.build()
+            })
+            .collect()
+    }
+
+    fn framed(records: &[RawRecord]) -> usize {
+        records.iter().map(|r| 4 + r.len()).sum()
+    }
+
+    /// Records of one batch: enough that a full-size rejects reservation would
+    /// exceed the queue-fit bound of what one in ten records rejects.
+    const BATCH_RECORDS: usize = 2_000;
+
+    /// The output-buffer contract for a batch that keeps most records:
+    /// - kept is allocated once at the framed input size (an empty `Vec` regrows
+    ///   by doubling to a power-of-two-ish capacity, never exactly `framed`);
+    /// - rejects are not reserved: a buffer grown from empty stays within twice
+    ///   its length, while a full-size reservation would be charged `framed`;
+    /// - every record lands in exactly one of the two.
+    fn assert_output_contract(
+        kept: &DecompressedBlock,
+        rejected: Option<&DecompressedBlock>,
+        framed: usize,
+        rejects: bool,
+    ) {
+        assert_eq!(kept.bytes.capacity(), framed, "kept buffer regrew or was mis-sized");
+        assert!(kept.bytes.len() < framed, "fixture must drop records");
+        if rejects {
+            let rejected = rejected.expect("rejects requested");
+            assert!(!rejected.bytes.is_empty(), "fixture must reject records");
+            assert!(
+                rejected.bytes.capacity() <= 2 * rejected.bytes.len(),
+                "rejects buffer capacity {} for {} bytes: it was reserved, not grown",
+                rejected.bytes.capacity(),
+                rejected.bytes.len()
+            );
+            assert_eq!(
+                kept.bytes.len() + rejected.bytes.len(),
+                framed,
+                "every record is kept or rejected exactly once"
+            );
+        } else {
+            assert!(rejected.is_none());
+        }
+    }
+
+    /// The default filter path (`RecordBatch`, no `--filter-by-template`).
+    #[rstest::rstest]
+    fn filter_single_raw_output_honours_the_reservation_contract(
+        #[values(false, true)] rejects: bool,
+    ) {
+        let records = consensus_records(BATCH_RECORDS, 10, |_| 0);
+        let framed = framed(&records);
+        let batch = RecordBatch::new(0, &records);
+        let (kept, rejected) = super::filter_single_raw_batch(
+            &batch,
+            &captures(),
+            &accumulators(),
+            usize::MAX,
+            rejects,
+        )
+        .expect("filter batch");
+        assert_output_contract(&kept, rejected.as_ref(), framed, rejects);
+    }
+
+    /// The decoded path (`DecodedRecordBatch`).
+    #[rstest::rstest]
+    fn filter_single_output_honours_the_reservation_contract(#[values(false, true)] rejects: bool) {
+        let records = consensus_records(BATCH_RECORDS, 10, |_| 0);
+        let framed = framed(&records);
+        let decoded = records
+            .into_iter()
+            .map(|r| DecodedRecord::from_raw_bytes(r, fgumi_bam_io::GroupKey::default()))
+            .collect();
+        let batch = DecodedRecordBatch::new(0, decoded);
+        let (kept, rejected) =
+            super::filter_single_batch(batch, &captures(), &accumulators(), usize::MAX, rejects)
+                .expect("filter batch");
+        assert_output_contract(&kept, rejected.as_ref(), framed, rejects);
+    }
+
+    /// The template path (`--filter-by-template`): paired R1/R2 per template.
+    #[rstest::rstest]
+    fn filter_template_output_honours_the_reservation_contract(
+        #[values(false, true)] rejects: bool,
+    ) {
+        let records = consensus_records(BATCH_RECORDS, 10, |i| {
+            flags::PAIRED | if i % 2 == 0 { flags::FIRST_SEGMENT } else { flags::LAST_SEGMENT }
+        });
+        let framed = framed(&records);
+        let templates = records
+            .chunks(2)
+            .map(|pair| Template::from_records(pair.to_vec()).expect("template"))
+            .collect();
+        let batch = BamTemplateBatch::new(0, templates);
+        let (kept, rejected) =
+            super::filter_template_batch(batch, &captures(), &accumulators(), usize::MAX, rejects)
+                .expect("filter batch");
+        assert_output_contract(&kept, rejected.as_ref(), framed, rejects);
+    }
+
+    /// A filter that drops nearly everything does not hand its queue the
+    /// full-size kept reservation: the kept block is fitted to what it holds.
+    #[test]
+    fn a_heavy_filter_fits_its_kept_block_for_the_queue() {
+        let records = consensus_records(BATCH_RECORDS, 1, |_| 0)
+            .into_iter()
+            .chain(consensus_records(4, 2, |_| 0).into_iter().skip(2))
+            .collect::<Vec<_>>();
+        let framed = framed(&records);
+        let batch = RecordBatch::new(0, &records);
+        let (kept, _) =
+            super::filter_single_raw_batch(&batch, &captures(), &accumulators(), usize::MAX, false)
+                .expect("filter batch");
+        assert!(!kept.bytes.is_empty(), "fixture must keep a record");
+        assert!(framed > 2 * kept.bytes.len() + 64 * 1024, "fixture must drop most bytes");
+        assert!(
+            kept.bytes.capacity() <= 2 * kept.bytes.len() + 64 * 1024,
+            "kept capacity {} charged for {} bytes",
+            kept.bytes.capacity(),
+            kept.bytes.len()
+        );
+    }
+
+    /// The kept reservation never exceeds the step's per-queue byte budget,
+    /// and rejects are not reserved at all.
+    #[test]
+    fn output_buffers_cap_kept_and_leave_rejects_unreserved() {
+        let (kept, rejected) = super::filter_output_buffers(1 << 30, 4 << 20, true);
+        assert_eq!(kept.capacity(), 4 << 20);
+        assert_eq!(rejected.expect("rejects requested").capacity(), 0);
+    }
+
+    /// A with-rejects step whose batch body returned no rejects block is a
+    /// wiring bug: it fails loudly instead of writing an empty rejects file.
+    #[test]
+    #[should_panic(expected = "got no rejects block for batch 7")]
+    fn a_missing_rejects_block_panics() {
+        let kept = DecompressedBlock { batch_serial: 7, bytes: Vec::new() };
+        let _ = super::rejects_block(&kept, None);
     }
 }
