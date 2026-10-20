@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-18
+
+### Bug Fixes
+
+- Point empty stdin/pipe input at the upstream stage ([#866](https://github.com/fulcrumgenomics/fgumi/pull/866))
+- Return an error instead of panicking on >65,535 libraries ([#956](https://github.com/fulcrumgenomics/fgumi/pull/956))
+- Add one @PG per command instead of one per chain leaf ([#1023](https://github.com/fulcrumgenomics/fgumi/pull/1023))
+- Propagate errors writing the final BGZF EOF block ([#1046](https://github.com/fulcrumgenomics/fgumi/pull/1046))
+- Sync and check close of output files ([#1047](https://github.com/fulcrumgenomics/fgumi/pull/1047))
+- Rename conflicting @RG/@PG IDs per input and rewrite read tags ([#1050](https://github.com/fulcrumgenomics/fgumi/pull/1050))
+
+### Features
+
+- Typed-step pipeline foundation ([#870](https://github.com/fulcrumgenomics/fgumi/pull/870))
+- Inline BAI indexer on the arena sink ([#883](https://github.com/fulcrumgenomics/fgumi/pull/883))
+- Restore --read-streams on the arena chain via a concurrent scatter reader ([#889](https://github.com/fulcrumgenomics/fgumi/pull/889))
+- Add the bam-roundtrip subcommand ([#936](https://github.com/fulcrumgenomics/fgumi/pull/936))
+
+### Performance
+
+- Drop the discarded decode key and add skippable input CRC ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960))
+- Fold UMI-position cache into the group-key aux scan ([#976](https://github.com/fulcrumgenomics/fgumi/pull/976))
+- Stop fdatasync-ing output files on close ([#1054](https://github.com/fulcrumgenomics/fgumi/pull/1054))
+- [**breaking**] Positional reads and a demand-ordered, budgeted spill supply for the merge ([#1057](https://github.com/fulcrumgenomics/fgumi/pull/1057))
+  - the `fgumi_bam_io::scatter_reader` module is now `fgumi_bam_io::pread`; its items keep their names.  * feat(bam-io)!: positional-read primitives, SliceBufferPool, ReadStreamsPolicy ratchet and the PreadSlices step (no caller)  The positional-read primitives the sort's input and spill paths are built on, with no caller yet.  - `fgumi_bam_io::pread`: `PositionalSource` and `read_at_exact`;   `ReadStreamsPolicy`, a monotone ratchet that starts `--read-streams auto` at   one stream and doubles at a window boundary when the device starved the   framer for more than a quarter of the window's wall (`Fixed(n)` pins it);   `SliceBufferPool`/`SliceLease`, a refcounted read-only buffer returned to   its pool on the last drop, reused only for a slice of exactly its size so a   lease's capacity is its length (the gauges charge capacity and count idle   buffers: `resident_bytes`, `idle_bytes`, `peak_held_bytes`);   `RawFrame::{Borrowed, Owned}` with a checked `RawFrame::borrowed`. - `fgumi_bgzf::BgzfSliceFramer` cuts BGZF blocks out of arbitrary slices as   ranges, carrying a block that straddles slices (including a cut inside the   18-byte header) in one allocation of the block's size; `finish()` on a   partial block is `UnexpectedEof`. - `fgumi_pipeline_io::pread::PreadSlices`, one `Parallel` step type for both   read paths, in a module neither `source` nor `sort` owns: it checks for a   request before taking its phase permit, reads each slice into a pooled   buffer and fails closed on a short read. A spill read carries its   read-ahead class on `ReadTarget::Spill { slot, class }`, so an input request   cannot carry a spill class. A queued slice is charged its buffer capacity.  `ScatterReader`, its per-read scoped threads and the stream-count probe are deleted, and with them the openers' `--read-streams` handling (`decide_reader`, `warn_read_streams_unavailable`, `is_scatter_capable`,
+- [**breaking**] Consolidation on the chain, chain-native merge and simulate; delete the v0.7.0 engine ([#1065](https://github.com/fulcrumgenomics/fgumi/pull/1065))
+  - fgumi-sort no longer provides RunMergeProgress, RunMergeSpec, RunMergerDyn or new_run_merger: run consolidation is a chain-native tail of the sort (ConsolidateRuns, WriteConsolidatedRun). SpillWrite takes its limit and its consolidation registry in one with_consolidation(limit, registry) call (with_max_temp_files is gone). fgumi-pipeline-core's Step::phase_cap, cap_label and bound_caps are replaced by the single Step::step_cap hook returning a StepCapRef. SpillKeyKind now lives in spill_block.rs and still resolves as fgumi_sort::SpillKeyKind.  * feat(merge)!: chain-native k-way merge over the spill planner  `fgumi merge` now runs on the sort's phase 2. AnnounceMergeInputs opens each input BAM as a body-keyed merge slot: its BGZF stream read from byte 0 through the spill read planner, its decompressed header skipped, its records keyed from their bodies. A regular BGZF file is read positionally; a pipe, FIFO, process substitution, SAM or plain-gzip input is read once, in order, through a SequentialSource (one read in flight per slot), normalized to BGZF as every other input reader does. SortMerge merges the slots with an input-order check (the unsorted-input error names the input and record) and a per-input record rewrite that renames conflicting RG/PG ids before the key is extracted, as the command did before. Each body-keyed record is held to the BAM layout (the 32-byte core and the variable-length fields it declares) before a key is extracted, so a malformed input record is an error naming the input and the record, not a panic. A regular file is classified (stat, then a full format prefix) by the same open_seekable_bgzf that the sort's native input path now uses, and is opened once. The merge builds its runtime through
+- Restore v0.7.0 single-threaded speed for filter and consensus callers ([#1070](https://github.com/fulcrumgenomics/fgumi/pull/1070))
+
+### Refactor
+
+- [**breaking**] Remove the legacy unified_pipeline engine ([#947](https://github.com/fulcrumgenomics/fgumi/pull/947))
+
+<!-- generated by git-cliff -->
+
 ## [0.7.0] - 2026-08-24
 
 ### Bug Fixes

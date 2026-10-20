@@ -4,6 +4,202 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-18
+
+### Bug Fixes
+
+- Fall back to a name-only group key on an unreadable aux offset ([#880](https://github.com/fulcrumgenomics/fgumi/pull/880))
+- Thread --max-memory into the pipeline queue budget ([#888](https://github.com/fulcrumgenomics/fgumi/pull/888))
+- Resolve --max-temp-files once and bake it into the chain spec ([#891](https://github.com/fulcrumgenomics/fgumi/pull/891))
+- Filter secondary/supplementary reads by flag, not UNKNOWN_REF ([#903](https://github.com/fulcrumgenomics/fgumi/pull/903))
+- Group by molecule by default, add --per-strand opt-out ([#904](https://github.com/fulcrumgenomics/fgumi/pull/904)) ([#906](https://github.com/fulcrumgenomics/fgumi/pull/906))
+- Restore chain-path diagnostic parity (dedup index-threshold banner, copy_umi unwired-flags warning, pair_fastq docstring) ([#914](https://github.com/fulcrumgenomics/fgumi/pull/914))
+- Log the missing/wrong-length-UMI banner at error level on the chain path ([#912](https://github.com/fulcrumgenomics/fgumi/pull/912))
+- Error on --min-corrected with empty input on the legacy paths (parity with the chain/fgbio) ([#919](https://github.com/fulcrumgenomics/fgumi/pull/919))
+- Write --metrics only on success on the chain path (match clip/retag) ([#921](https://github.com/fulcrumgenomics/fgumi/pull/921))
+- Consult the UMI-position cache by assigning UMI groups before clearing duplicate flags ([#918](https://github.com/fulcrumgenomics/fgumi/pull/918))
+- Wire --methylation-mode/--ref into the fused filter stage ([#944](https://github.com/fulcrumgenomics/fgumi/pull/944))
+- Restore the === Sort Phase Timing === per-phase diagnostic ([#945](https://github.com/fulcrumgenomics/fgumi/pull/945))
+- Return an error instead of panicking on >65,535 libraries ([#956](https://github.com/fulcrumgenomics/fgumi/pull/956))
+- Honor --check-crc/--no-check-crc on the BGZF FASTQ split decode ([#959](https://github.com/fulcrumgenomics/fgumi/pull/959))
+- Replace deprecated wide swizzle_relaxed with shuffle ([#992](https://github.com/fulcrumgenomics/fgumi/pull/992))
+- Honor --correct::rejects when correct is fused mid-chain ([#995](https://github.com/fulcrumgenomics/fgumi/pull/995))
+- [**breaking**] Enforce --max-temp-files on the arena spill path ([#993](https://github.com/fulcrumgenomics/fgumi/pull/993))
+  - fgumi-pipeline-io's SpillBlockEvent::Block gains a required key_kind field, and SpillWrite now emits SpillReady for its surviving runs at AllAnnounced (with slot_count set to their number) instead of as each run closes. RunMergerDyn::step takes a byte budget.
+- Honor --extract::no-check-crc on BGZF FASTQ input ([#996](https://github.com/fulcrumgenomics/fgumi/pull/996))
+- [**breaking**] Reject duplex/codec flags the callers never honor ([#997](https://github.com/fulcrumgenomics/fgumi/pull/997))
+  - `fgumi duplex --min-consensus-base-quality`, `fgumi codec --min-consensus-base-quality`, `fgumi codec --trim` and their `runall` forms are removed. `ConsensusCallingOptions` loses `trim` and `min_consensus_base_quality` (now in `QualityTrimOptions` / `MinConsensusBaseQualityOptions`); `DuplexOptions` loses `min_consensus_base_quality`; `CodecOptions` and
+- [**breaking**] Reject the zipper flags the chain never reads ([#998](https://github.com/fulcrumgenomics/fgumi/pull/998))
+  - `fgumi runall --zipper::buffer` and
+- [**breaking**] Enforce the shared consensus Phred bounds ([#1001](https://github.com/fulcrumgenomics/fgumi/pull/1001))
+- Honor both async-reader flags on both FASTQ paths ([#1000](https://github.com/fulcrumgenomics/fgumi/pull/1000))
+- [**breaking**] Reject --clipping-attribute, which extract never honors ([#1004](https://github.com/fulcrumgenomics/fgumi/pull/1004))
+  - `fgumi extract --clipping-attribute` and `fgumi runall --extract::clipping-attribute` are removed. `ExtractRunallOptions` loses the public `clipping_attribute` field.
+- Honor the --zipper:: merge rules on fused align chains ([#1005](https://github.com/fulcrumgenomics/fgumi/pull/1005))
+- Leave no output files behind when a chain fails to build ([#1006](https://github.com/fulcrumgenomics/fgumi/pull/1006))
+- Accept bwa's mid-pair -K split; emit BAM from the bwa-mem3 preset; keep mimalloc from purging ([#988](https://github.com/fulcrumgenomics/fgumi/pull/988))
+- [**breaking**] Store reverse-strand reads in reference orientation ([#1008](https://github.com/fulcrumgenomics/fgumi/pull/1008))
+  - for a given seed, simulate mapped-reads, grouped-reads and consensus-reads now write reverse-strand SEQ and QUAL in reference orientation, soft-clip read-through padding when the insert is shorter than the read (changing CIGAR, MC and bin for those records), and consensus-reads writes reverse-strand per-base arrays reversed.
+- [**breaking**] Give each methylation consensus caller one SEQ convention and make filters, simulate and docs follow it ([#1010](https://github.com/fulcrumgenomics/fgumi/pull/1010))
+  - methylation::query_to_ref_positions takes the CIGAR as aligned (with its clips) and no longer takes the simplified CIGAR.  * fix(consensus)!: emit observed bases from simplex methylation consensus  Simplex EM-seq/TAPs consensus rewrote converted bases in the source reads (T->C / A->G at reference cytosines) before calling, so the emitted SEQ reported every site as unconverted. SEQ-based methylation callers and bisulfite-aware aligners read methylation from SEQ and saw every cytosine as methylated. The rewrite also hid real disagreements: all reads of a single-strand family copy one converted strand, so a C/T split is an error (or a UMI collision) and must lower quality like any other.  Consensus is now always called on the observed bases, and simplex emits them as they are, with the evidence in cu/ct. MM/ML are no longer emitted for simplex: MM can only describe bases present in SEQ, and a converted cytosine is not one. A simplex consensus also cannot tell a converted cytosine from a C>T mutation, so restoring it would assert a base the molecule may not have.  The shared MM builder now writes the SAM-spec '?' flag (unlisted bases are unknown), takes the conversion pattern from the read type (R1 C->T, R2 G->A) instead of the alignment strand, encodes each ML probability p as floor(256 p) capped at 255 (the SAM spec's [N/256, (N+1)/256) bins; it used floor(255 p), which put 1/2 and 3/4 in the bin below), and MN is available as a tag constant.
+- [**breaking**] Reverse the methylation counts with the Consensus tag set ([#1011](https://github.com/fulcrumgenomics/fgumi/pull/1011))
+  - zipper --tags-to-reverse Consensus now also reverses cu, ct, au, at, bu and bt, and fgumi_umi::TagSets::CONSENSUS_REVERSE lists those six tags after fgbio's eight; a pipeline that reverses with both zipper Consensus and filter --reverse-per-base-tags now reverses those counts twice as well, so reverse in only one of the two.
+- Keep MM/ML in step with hard-clipped and unmapped reads ([#1012](https://github.com/fulcrumgenomics/fgumi/pull/1012))
+- Label paired strands by read orientation in the parallel assigner ([#1013](https://github.com/fulcrumgenomics/fgumi/pull/1013))
+- Bound the mimalloc purge delay instead of never purging ([#1017](https://github.com/fulcrumgenomics/fgumi/pull/1017))
+- Never auto-clip RG, MI and other non-per-base tags ([#1019](https://github.com/fulcrumgenomics/fgumi/pull/1019))
+- Classify dovetail FR pairs with coincident 5' ends as FR ([#1022](https://github.com/fulcrumgenomics/fgumi/pull/1022))
+- Add one @PG per command instead of one per chain leaf ([#1023](https://github.com/fulcrumgenomics/fgumi/pull/1023))
+- Accept empty input and sample an unterminated final FASTQ record ([#1024](https://github.com/fulcrumgenomics/fgumi/pull/1024))
+- Keep dotted output prefixes intact ([#1026](https://github.com/fulcrumgenomics/fgumi/pull/1026))
+- Decide read-level rejection before masking, and short-circuit templates like fgbio ([#1028](https://github.com/fulcrumgenomics/fgumi/pull/1028))
+- Report mixed UMI lengths as an error instead of panicking ([#1030](https://github.com/fulcrumgenomics/fgumi/pull/1030))
+- Pair duplex UMI halves by /A,/B strand family ([#1031](https://github.com/fulcrumgenomics/fgumi/pull/1031))
+- Validate UMI lengths before reading input ([#1035](https://github.com/fulcrumgenomics/fgumi/pull/1035))
+- Truncate read names at any whitespace and validate UMI field count ([#1040](https://github.com/fulcrumgenomics/fgumi/pull/1040))
+- Trim read-through bases when the mate cigar tag is missing ([#1041](https://github.com/fulcrumgenomics/fgumi/pull/1041))
+- Write only variant-overlapping reads to the grouped BAM ([#1027](https://github.com/fulcrumgenomics/fgumi/pull/1027))
+- Handle empty-sequence records ([#1043](https://github.com/fulcrumgenomics/fgumi/pull/1043))
+- Sync and check close of output files ([#1047](https://github.com/fulcrumgenomics/fgumi/pull/1047))
+- Count UMIs for MIs without an /A,/B suffix ([#1032](https://github.com/fulcrumgenomics/fgumi/pull/1032))
+- Error on reads with bases but no base qualities ([#1044](https://github.com/fulcrumgenomics/fgumi/pull/1044))
+- Rename a conflicting unmapped @PG instead of dropping it ([#1045](https://github.com/fulcrumgenomics/fgumi/pull/1045))
+- Rename conflicting @RG/@PG IDs per input and rewrite read tags ([#1050](https://github.com/fulcrumgenomics/fgumi/pull/1050))
+- [**breaking**] Honour --sort-threads/--merge-threads as phase caps within --threads ([#1048](https://github.com/fulcrumgenomics/fgumi/pull/1048))
+  - the sort's memory budget now follows the effective sort-phase count. `--memory-per-thread` multiplies `--max-memory` by `min(--sort-threads, pool)` (by `--threads` when `--sort-threads` is unset) instead of `max(--threads, --sort-threads)`. For standalone `fgumi sort` the pool is `--threads`: a `--sort-threads` below it shrinks the record buffer proportionally and spills sooner, one above it no longer enlarges the buffer (it warns and is clamped), and `--sort-threads 0` gives a 1x budget. In runall the pool is the chain's: an explicit `--sort::sort-threads` up to it (at least 4 with a zipper or subprocess aligner) sizes the budget, and unset keeps it at `--threads`. `--sort-threads` / `--merge-threads` above the pool now warn and are clamped instead of being honoured. A run that relied on `--sort-threads` above `--threads` to enlarge the buffer should raise `--threads` or `--max-memory` instead.
+- Stop in-process bwa-mem3 alignment crashing on x86 CPUs without AVX-512 ([#1063](https://github.com/fulcrumgenomics/fgumi/pull/1063))
+
+### Documentation
+
+- Add NanoSeq (Duplex-Seq) pipeline guide ([#910](https://github.com/fulcrumgenomics/fgumi/pull/910))
+- Remove in-tree design docs and gitignore docs/design/ ([#934](https://github.com/fulcrumgenomics/fgumi/pull/934))
+- Document fgumi runall and add Reference guide pages ([#938](https://github.com/fulcrumgenomics/fgumi/pull/938))
+- Stop calling the duplication ladder a saturation curve ([#980](https://github.com/fulcrumgenomics/fgumi/pull/980))
+- Leave CHANGELOG.md to release-plz ([#1003](https://github.com/fulcrumgenomics/fgumi/pull/1003))
+
+### Features
+
+- Add --threads and route through the unified pipeline ([#871](https://github.com/fulcrumgenomics/fgumi/pull/871))
+- Accept interleaved FASTQ input via --interleaved ([#874](https://github.com/fulcrumgenomics/fgumi/pull/874))
+- Typed-step pipeline foundation ([#870](https://github.com/fulcrumgenomics/fgumi/pull/870))
+- Warn when an explicit memory budget crowds the host ([#867](https://github.com/fulcrumgenomics/fgumi/pull/867))
+- Declarative chain-builder layer + group --threads pilot ([#872](https://github.com/fulcrumgenomics/fgumi/pull/872))
+- Wire dedup --threads onto the declarative chain builder ([#876](https://github.com/fulcrumgenomics/fgumi/pull/876))
+- Add command to copy the read-name UMI into the RX tag ([#873](https://github.com/fulcrumgenomics/fgumi/pull/873))
+- Inline BAI indexer on the arena sink ([#883](https://github.com/fulcrumgenomics/fgumi/pull/883))
+- Route the sort command onto the declarative chain builder ([#885](https://github.com/fulcrumgenomics/fgumi/pull/885))
+- Restore --read-streams on the arena chain via a concurrent scatter reader ([#889](https://github.com/fulcrumgenomics/fgumi/pull/889))
+- Route the correct command onto the declarative chain builder ([#893](https://github.com/fulcrumgenomics/fgumi/pull/893))
+- Route the filter command onto the declarative chain builder ([#892](https://github.com/fulcrumgenomics/fgumi/pull/892))
+- Route the simplex command onto the declarative chain builder ([#894](https://github.com/fulcrumgenomics/fgumi/pull/894))
+- Route the clip command onto the declarative chain builder ([#897](https://github.com/fulcrumgenomics/fgumi/pull/897))
+- Route the codec command onto the declarative chain builder ([#895](https://github.com/fulcrumgenomics/fgumi/pull/895))
+- Route the duplex command onto the declarative chain builder ([#896](https://github.com/fulcrumgenomics/fgumi/pull/896))
+- Route the retag command onto the declarative chain builder ([#898](https://github.com/fulcrumgenomics/fgumi/pull/898))
+- Route the copy-umi command onto the declarative chain builder ([#899](https://github.com/fulcrumgenomics/fgumi/pull/899))
+- Route the extract command onto the declarative chain builder ([#900](https://github.com/fulcrumgenomics/fgumi/pull/900))
+- Add opt-in --verify for strict template-coordinate order ([#909](https://github.com/fulcrumgenomics/fgumi/pull/909))
+- Thread --sort-stats diagnostics through the chain ([#913](https://github.com/fulcrumgenomics/fgumi/pull/913))
+- Give stage option structs a clap::Args surface for runall (PR A) ([#907](https://github.com/fulcrumgenomics/fgumi/pull/907))
+- Fused multi-stage `fgumi runall` command ([#911](https://github.com/fulcrumgenomics/fgumi/pull/911))
+- Produce --metrics on the multi-threaded chain path ([#915](https://github.com/fulcrumgenomics/fgumi/pull/915))
+- Add --check-crc / --no-check-crc with the file-vs-stdin default ([#933](https://github.com/fulcrumgenomics/fgumi/pull/933))
+- Add the aligner replay subcommand ([#935](https://github.com/fulcrumgenomics/fgumi/pull/935))
+- Add the bam-roundtrip subcommand ([#936](https://github.com/fulcrumgenomics/fgumi/pull/936))
+- Wire --pipeline-trace through the chain builder ([#937](https://github.com/fulcrumgenomics/fgumi/pull/937))
+- Add hidden --pool-scheduler override for A/B benchmarking ([#942](https://github.com/fulcrumgenomics/fgumi/pull/942))
+- Run BAM→FASTQ on the typed-step chain and add paired split output ([#939](https://github.com/fulcrumgenomics/fgumi/pull/939))
+- Expose --block-batch and --file-granularity as hidden flags ([#943](https://github.com/fulcrumgenomics/fgumi/pull/943))
+- Compute consensus QC metrics inline in fused runall and standalone consensus ([#948](https://github.com/fulcrumgenomics/fgumi/pull/948))
+- Thread-utilization and per-step bandwidth telemetry for the chain-builder engine ([#951](https://github.com/fulcrumgenomics/fgumi/pull/951))
+- Park idle pool workers to fix the thread-oversubscription cliff ([#955](https://github.com/fulcrumgenomics/fgumi/pull/955))
+- Add --threads to simplex-metrics and duplex-metrics ([#968](https://github.com/fulcrumgenomics/fgumi/pull/968))
+- [**breaking**] Publish metric column manifest; headered filter --stats ([#979](https://github.com/fulcrumgenomics/fgumi/pull/979))
+  - `fgumi filter --stats` now writes a headered fgbio-Metric TSV (a total_reads/passed_reads/failed_reads/pass_rate header row plus one data row) instead of the previous headerless two-column key/value layout. Column names and semantics are unchanged; downstream parsers of the old vertical format must be updated.  * test(metrics): round-trip conformance tests for all emitters  * feat(metrics): publish metric column manifest with contract tests  Adds crates/fgumi-metrics/metric_columns.json, the ordered column contract for every metric file fgumi emits, keyed <namespace>.<file> because group, simplex, duplex and dedup each write a differently shaped *.family_sizes.txt. tests/integration/test_metric_contract.rs parses the workspace with syn and fails in three cases: the manifest drifts from the live structs; a struct deriving serde's Serialize is neither listed nor explicitly allowlisted; or a serialized f64 field lacks the fgbio float encoding (Infinity/NaN rather than inf).  downsample's --histogram-kept/--histogram-rejected were hand-formatted with writeln!. They now serialize a DownsampleHistogramMetric through the shared writer, so they are covered by the contract. The output is byte-identical.  * fix(metrics): write headers for empty group and dedup histogram outputs  group (--family-size-histogram, and the --metrics family- and position-group-size histograms) and dedup (--metrics, --family-size-histogram, --duplication-ladder) wrote through a bare DelimFile, which emits the header lazily. An empty histogram or ladder was therefore a 0-byte file that fgbio's Metric.read rejects ("No header found"). Route them through the shared write_metrics, which always writes the header.  * docs(changelog): note filter --stats format break and metrics fixes  * fix(metrics): honor .gz, special-file and symlink destinations in write_metrics  write_metrics wrote rows to an extension-less temp file and renamed it into place. That had three problems. A .gz destination received plain text under a .gz name, which the metrics reader then failed to decompress. A non-regular destination such as /dev/stdout, a FIFO or a >(...) process substitution failed at rename time, after the whole run. A symlinked destination was replaced by a regular file.  The temp file now carries the destination's extension so compression follows it. Non-regular destinations are written in place. Symlinks are resolved before the atomic rename. Empty outputs derive their header from a plain scratch file, so the gzip path keeps its header too.
+- [**breaking**] Add pair op to build a paired UMI from own/mate tags ([#985](https://github.com/fulcrumgenomics/fgumi/pull/985))
+  - `RetagOp` gains a `Pair` variant, and its public `src()` accessor is replaced by a crate-private `sources()`.
+- Add the aligner-bwa-mem3 feature, cohort math and the AlignEngine abstraction ([#989](https://github.com/fulcrumgenomics/fgumi/pull/989))
+- Align in process with bwa-mem3 (--aligner::preset bwa-mem3-inproc) ([#990](https://github.com/fulcrumgenomics/fgumi/pull/990))
+- Align EM-seq bisulfite-aware under --methylation-mode; bump bwa-mem3-rs to 0.4.2 ([#1016](https://github.com/fulcrumgenomics/fgumi/pull/1016))
+- [**breaking**] Template key context/batch extraction and reader-excluding pool placement ([#1055](https://github.com/fulcrumgenomics/fgumi/pull/1055))
+  - `ErasedStep` gains a required `pool_placement()` method with no default, so an external implementor must add it (the in-tree `TypedStep`, `TypedStep2` and `TypedStepK` adapters forward `Step::pool_placement`, which defaults to `PoolPlacement::AllWorkers`).
+
+### Miscellaneous Tasks
+
+- Mark the BGZF CRC verification policy as intentional ([#932](https://github.com/fulcrumgenomics/fgumi/pull/932))
+- Publish only when a push bumps the workspace version ([#983](https://github.com/fulcrumgenomics/fgumi/pull/983))
+- Bump codecov/codecov-action to v7.1.1 ([#1020](https://github.com/fulcrumgenomics/fgumi/pull/1020))
+
+### Performance
+
+- Use fixed-seed ahash on hot per-item maps to remove RandomState global-counter contention ([#865](https://github.com/fulcrumgenomics/fgumi/pull/865))
+- Skip per-record group-key computation for key-agnostic groupers ([#875](https://github.com/fulcrumgenomics/fgumi/pull/875))
+- Build the merge tag bitsets once per batch, not per template ([#917](https://github.com/fulcrumgenomics/fgumi/pull/917))
+- Skip the discarded group key on the chain filter path ([#916](https://github.com/fulcrumgenomics/fgumi/pull/916))
+- Use DrainFirstScheduler for terminal grouping chains ([#941](https://github.com/fulcrumgenomics/fgumi/pull/941))
+- Single-pass aux-tag rebuild (RawTagsEditor::rebuild_with) for zipper merge and NM/UQ/MD strip ([#962](https://github.com/fulcrumgenomics/fgumi/pull/962))
+- Parallel queryname grouping for the correct/align/filter chains ([#957](https://github.com/fulcrumgenomics/fgumi/pull/957))
+- Resolve the template UMI from the primary read ([#958](https://github.com/fulcrumgenomics/fgumi/pull/958))
+- Fold per-record PG/AS/XS aux scans into single-pass walks ([#964](https://github.com/fulcrumgenomics/fgumi/pull/964))
+- Drop the discarded decode key and add skippable input CRC ([#960](https://github.com/fulcrumgenomics/fgumi/pull/960))
+- Decode-free BAM fast path for single-record filter ([#961](https://github.com/fulcrumgenomics/fgumi/pull/961))
+- Decode-free BAM fast path for copy-umi ([#963](https://github.com/fulcrumgenomics/fgumi/pull/963))
+- Parallel gather for the in-memory sort fast path ([#966](https://github.com/fulcrumgenomics/fgumi/pull/966))
+- Reduce per-record allocation (zero-copy segment views + reused Phred scratch) ([#967](https://github.com/fulcrumgenomics/fgumi/pull/967))
+- Decode-free BAM fast path for retag ([#965](https://github.com/fulcrumgenomics/fgumi/pull/965))
+- Single-pass scalar consensus-tag extraction ([#969](https://github.com/fulcrumgenomics/fgumi/pull/969))
+- Reduce serial-merge CPU and allocations at 1-2 threads ([#971](https://github.com/fulcrumgenomics/fgumi/pull/971))
+- Gated multi-base fast path for simplex consensus ([#973](https://github.com/fulcrumgenomics/fgumi/pull/973))
+- Scale the per-template merge past ~4.5 cores at 4+ threads ([#975](https://github.com/fulcrumgenomics/fgumi/pull/975))
+- Fold UMI-position cache into the group-key aux scan ([#976](https://github.com/fulcrumgenomics/fgumi/pull/976))
+- Stop fdatasync-ing output files on close ([#1054](https://github.com/fulcrumgenomics/fgumi/pull/1054))
+- [**breaking**] Directed wakes and parked cap refusals ([#1053](https://github.com/fulcrumgenomics/fgumi/pull/1053))
+  - `PoolEventCount::notify_one` and `notify_all` return `NotifyOutcome` instead of `()`. `WaitOutcome::Returned` is replaced by `Notified` and `TimedOut` (the enum is exhaustive, so a `match` on it no longer compiles). `StepStats` and `StepStatsSnapshot` gain public counter fields (`notifies_issued`, `notifies_no_waiters`, `notifies_suppressed`, `unparks_issued`, `reverse_wakes`, `direct_fallbacks`, `gated_off`, `holds`, `held_retries`, `held_wait_ns`, `held_wait_max_ns`, `held_wait_hist`), and `StatsSnapshot` gains `worker_waits` and `detached_park_outcomes`, so a struct literal of any of them outside this crate no longer compiles. `ItemQueue` (`try_push_unlatched`, `note_stash_accepted`, `note_rejected_holder`) and `BoundedQueueHandle` (`enable_tracking`) gain required methods that take a crate-private token, so neither trait can be implemented outside this crate any more.  * perf(pipeline-core)!: directed wakes — WakePlan, driver/pinned-worker unpark, held-item reverse wake  Every `Progress` used to `notify_one` the pool whatever the consumer was, and nothing ever unparked a dedicated driver thread (10→500 µs timer). A per-chain `WakePlan`, built in `Pipeline::run` for every chain with a Detached step, routes each output branch to its consumer's thread: pool event-count, driver `unpark`, worker `unpark`, or nobody. Detached producers are push-gated on their direct byte-bounded branches. Every worker and driver registers its own handle before its first pass, so a push either finds the handle or is seen by that pass. `Finished` and cancel unpark every registered thread. `PARK_MAX_US` 500 → 2000 (the timer is self-heal only). Every worker the plan unparks directly idles on its timer: both come from the same per-step pins.  A held item wakes its holder. Every bounded edge the plan tracks (byte-bounded, count-bounded, and the unbounded transport behind a reorder stage) records the refusing thread through one protocol,
+- [**breaking**] Wake the merge when its awaited block lands; request a pool worker while it is starved ([#1056](https://github.com/fulcrumgenomics/fgumi/pull/1056))
+  - `StepCtx`, `StepCtx2`, `StepCtxK` and `ErasedStepCtx` gain the public field `pool`, so a struct literal of any of them outside this crate no longer compiles. `StepStats` and `StepStatsSnapshot` gain the public fields `pool_requests_woken`, `pool_requests_all_awake` and `pool_requests_pending`.  * perf(sort): wake the merge when its awaited block lands (MergeDemand)  The k-way merge sleeps on its driver's park timer whenever the next record's block is not decompressed yet, and nothing ever woke it early: on the template-coordinate t16 cell it parked ~1.23 M times (~195 s). A per-sort `MergeDemand` (fgumi-sort) now records which spill file the merge waits on and the consumer thread; `MergeDemand::await_slot` is the one consumer sequence (declare the slot awaited, then re-check it under the slot mutex), and `SortSpillDecompress` calls `notify_delivered` after every delivery, EOF or failure, which unparks the merge only when that file is the awaited one.
+- [**breaking**] Positional reads and a demand-ordered, budgeted spill supply for the merge ([#1057](https://github.com/fulcrumgenomics/fgumi/pull/1057))
+  - the `fgumi_bam_io::scatter_reader` module is now `fgumi_bam_io::pread`; its items keep their names.  * feat(bam-io)!: positional-read primitives, SliceBufferPool, ReadStreamsPolicy ratchet and the PreadSlices step (no caller)  The positional-read primitives the sort's input and spill paths are built on, with no caller yet.  - `fgumi_bam_io::pread`: `PositionalSource` and `read_at_exact`;   `ReadStreamsPolicy`, a monotone ratchet that starts `--read-streams auto` at   one stream and doubles at a window boundary when the device starved the   framer for more than a quarter of the window's wall (`Fixed(n)` pins it);   `SliceBufferPool`/`SliceLease`, a refcounted read-only buffer returned to   its pool on the last drop, reused only for a slice of exactly its size so a   lease's capacity is its length (the gauges charge capacity and count idle   buffers: `resident_bytes`, `idle_bytes`, `peak_held_bytes`);   `RawFrame::{Borrowed, Owned}` with a checked `RawFrame::borrowed`. - `fgumi_bgzf::BgzfSliceFramer` cuts BGZF blocks out of arbitrary slices as   ranges, carrying a block that straddles slices (including a cut inside the   18-byte header) in one allocation of the block's size; `finish()` on a   partial block is `UnexpectedEof`. - `fgumi_pipeline_io::pread::PreadSlices`, one `Parallel` step type for both   read paths, in a module neither `source` nor `sort` owns: it checks for a   request before taking its phase permit, reads each slice into a pooled   buffer and fails closed on a short read. A spill read carries its   read-ahead class on `ReadTarget::Spill { slot, class }`, so an input request   cannot carry a spill class. A queued slice is charged its buffer capacity.  `ScatterReader`, its per-read scoped threads and the stream-count probe are deleted, and with them the openers' `--read-streams` handling (`decide_reader`, `warn_read_streams_unavailable`, `is_scatter_capable`,
+- Push-gated pool notifies for every producer ([#1058](https://github.com/fulcrumgenomics/fgumi/pull/1058))
+- [**breaking**] Merge keeps partial batches across stalls and emits records borrowed in place ([#1059](https://github.com/fulcrumgenomics/fgumi/pull/1059))
+  - fgumi-sort removes MergeDemandStats::record_partial_flush and the MergeDemandSnapshot::partial_flushes field; MergeDemandSnapshot:: log_lines returns five lines instead of six.  * perf(sort)!: merge emits records borrowed in place — one copy per record  The slot-backed merge copied every record twice: from the decompressed block into a per-leaf scratch buffer, then from the scratch into the output batch. The shared in-memory residual was copied the same way, out of its arena.  A merge source now reports where its current record lives (RecLoc): a range of its current block, an index into the shared residual chunk, or the leaf's scratch, which holds only a record that spans blocks or an owned residual record (swapped in, as before). MergeStep::Produced borrows the winner's bytes from there. No unsafe: the borrow is sound by the existing deferred-refill protocol. A source's block is replaced only by that source's own read (its refill or priming), which runs only on a later try_step, and Produced borrows &mut self, so the caller has consumed the bytes before any read can replace them.  --sort-stats regains a `Merge output:` line, printed only when the merge ran through MergeDriver: `records borrowed B / assembled A`, which sum to the records merged. The in-memory fast path builds no driver and prints no such line. Production spill blocks hold whole records, so on a real sort every slot record is borrowed. The driver counts only assembled records; borrowed is records_merged minus assembled. The --sort-stats help and the performance guide document the line.  The new merge_driver bench (MergeDriver::from_slots over k slots fed through the slot API, 1 M interleaved 450-byte records, each produced record appended to a reused buffer; three interleaved copy/borrow pairs on a shared laptop): k = 2, 47.6 -> 31.7 ns/record (median; borrow faster in every pair); k = 27, 126.0 -> 102.7 ns/record.  Tests, each in both spill-key layouts (a separate key prefix, and a key embedded in the record as every production key is): produced_bytes_are_borrowed_from_the_block (pointer inside the slot's block, scratch never allocated); incremental_feed_merges_identically and its embedded-key twin (proptest: blocks cut mid-record, fed one at a time on each stall; the output equals a stable merge computed in the test, and the borrowed/assembled split equals the one computed from the cuts); memory_sources_borrow_or_swap (shared residual emitted from the arena's own addresses, owned residual via the scratch). Also empty_body_on_the_borrowed_path_is_the_same_error; fast_path_sort_prints_no_merge_output_line; and the integration check that borrowed + assembled is the merge's total and that the fixture's short records are all borrowed.  Docs updated: InMemoryChunk, MemorySources, MemoryShared, slot_try_next_record, SlotMergeSource::try_next_record, PendingRecord,
+- [**breaking**] Phase 1 on a split arena front — pool key extraction, planned spill blocks, borrowed queryname refs ([#1060](https://github.com/fulcrumgenomics/fgumi/pull/1060))
+  - `SortBuffer::from_sorter` and `SortBufferConfig::from_sorter` are removed; build a `SortBufferConfig` directly and call `SortBuffer::new`.  * perf(sort)!: arena-borrowed queryname refs — QnKey window + class table, 40 B per record, no allocation  A queryname run sorted 80-byte owned keys: every record copied its name into an inline `SmallVec` (a heap allocation past 44 bytes), and every comparison walked the whole name — for Illumina names the 22-byte
+- Directed wakes for every chain; unpark only a parked thread ([#1061](https://github.com/fulcrumgenomics/fgumi/pull/1061))
+- Link bwa-mem3 v0.15.0 for faster in-process alignment ([#1066](https://github.com/fulcrumgenomics/fgumi/pull/1066))
+- [**breaking**] Consolidation on the chain, chain-native merge and simulate; delete the v0.7.0 engine ([#1065](https://github.com/fulcrumgenomics/fgumi/pull/1065))
+  - fgumi-sort no longer provides RunMergeProgress, RunMergeSpec, RunMergerDyn or new_run_merger: run consolidation is a chain-native tail of the sort (ConsolidateRuns, WriteConsolidatedRun). SpillWrite takes its limit and its consolidation registry in one with_consolidation(limit, registry) call (with_max_temp_files is gone). fgumi-pipeline-core's Step::phase_cap, cap_label and bound_caps are replaced by the single Step::step_cap hook returning a StepCapRef. SpillKeyKind now lives in spill_block.rs and still resolves as fgumi_sort::SpillKeyKind.  * feat(merge)!: chain-native k-way merge over the spill planner  `fgumi merge` now runs on the sort's phase 2. AnnounceMergeInputs opens each input BAM as a body-keyed merge slot: its BGZF stream read from byte 0 through the spill read planner, its decompressed header skipped, its records keyed from their bodies. A regular BGZF file is read positionally; a pipe, FIFO, process substitution, SAM or plain-gzip input is read once, in order, through a SequentialSource (one read in flight per slot), normalized to BGZF as every other input reader does. SortMerge merges the slots with an input-order check (the unsorted-input error names the input and record) and a per-input record rewrite that renames conflicting RG/PG ids before the key is extracted, as the command did before. Each body-keyed record is held to the BAM layout (the 32-byte core and the variable-length fields it declares) before a key is extracted, so a malformed input record is an error naming the input and the record, not a panic. A regular file is classified (stat, then a full format prefix) by the same open_seekable_bgzf that the sort's native input path now uses, and is opened once. The merge builds its runtime through
+- Restore v0.7.0 single-threaded speed for filter and consensus callers ([#1070](https://github.com/fulcrumgenomics/fgumi/pull/1070))
+
+### Refactor
+
+- Delete the CLI's throwaway sorter construction ([#890](https://github.com/fulcrumgenomics/fgumi/pull/890))
+- Retire the legacy single-threaded path; the chain is the only path ([#920](https://github.com/fulcrumgenomics/fgumi/pull/920))
+- Retire the legacy single-threaded path; the chain is the only path ([#922](https://github.com/fulcrumgenomics/fgumi/pull/922))
+- Retire the legacy single-threaded path; the chain is the only path ([#923](https://github.com/fulcrumgenomics/fgumi/pull/923))
+- Retire the legacy single-threaded path; the chain is the only path ([#924](https://github.com/fulcrumgenomics/fgumi/pull/924))
+- Retire the legacy single-threaded path; the chain is the only path ([#925](https://github.com/fulcrumgenomics/fgumi/pull/925))
+- [**breaking**] Collapse simplex/duplex/codec into a single consensus feature and retire the legacy single-threaded paths ([#926](https://github.com/fulcrumgenomics/fgumi/pull/926))
+- Retire the legacy single-threaded path; the chain is the only path ([#927](https://github.com/fulcrumgenomics/fgumi/pull/927))
+- Retire the legacy single-threaded paths; the chain is the only path ([#928](https://github.com/fulcrumgenomics/fgumi/pull/928))
+- Relocate reusable types out of unified_pipeline (R6a) ([#929](https://github.com/fulcrumgenomics/fgumi/pull/929))
+- [**breaking**] Remove the legacy unified_pipeline engine ([#947](https://github.com/fulcrumgenomics/fgumi/pull/947))
+- Split align+merge into a backend trait and a shared merge ([#987](https://github.com/fulcrumgenomics/fgumi/pull/987))
+- Stop configuring the chain sort through RawExternalSorter ([#999](https://github.com/fulcrumgenomics/fgumi/pull/999))
+
+### Testing
+
+- Speed up the slow-test tail without weakening invariants ([#881](https://github.com/fulcrumgenomics/fgumi/pull/881))
+- Pin TLEN + pair orientation against htsjdk across a broad matrix ([#905](https://github.com/fulcrumgenomics/fgumi/pull/905))
+- Fix inconsistent mate-strand flags in duplicate-group fixtures ([#908](https://github.com/fulcrumgenomics/fgumi/pull/908))
+- Consolidate the byte-identity file-compare idiom into a shared helper ([#950](https://github.com/fulcrumgenomics/fgumi/pull/950))
+- Close --all-metrics and group-metrics integration coverage gaps ([#949](https://github.com/fulcrumgenomics/fgumi/pull/949))
+- Shrink the BGZF no-check-crc fixture below the slow timeout ([#1007](https://github.com/fulcrumgenomics/fgumi/pull/1007))
+- Port missing fgbio SamRecordClipper and ClipBam tests ([#1018](https://github.com/fulcrumgenomics/fgumi/pull/1018))
+- Pin read-order independence of alignment grouping ([#1037](https://github.com/fulcrumgenomics/fgumi/pull/1037))
+- Pin output order on every path ([#1038](https://github.com/fulcrumgenomics/fgumi/pull/1038))
+
+<!-- generated by git-cliff -->
+
 ## [0.7.0] - 2026-08-24
 
 ### Bug Fixes

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-10-18
+
+### Bug Fixes
+
+- Replace deprecated wide swizzle_relaxed with shuffle ([#992](https://github.com/fulcrumgenomics/fgumi/pull/992))
+- [**breaking**] Give each methylation consensus caller one SEQ convention and make filters, simulate and docs follow it ([#1010](https://github.com/fulcrumgenomics/fgumi/pull/1010))
+  - methylation::query_to_ref_positions takes the CIGAR as aligned (with its clips) and no longer takes the simplified CIGAR.  * fix(consensus)!: emit observed bases from simplex methylation consensus  Simplex EM-seq/TAPs consensus rewrote converted bases in the source reads (T->C / A->G at reference cytosines) before calling, so the emitted SEQ reported every site as unconverted. SEQ-based methylation callers and bisulfite-aware aligners read methylation from SEQ and saw every cytosine as methylated. The rewrite also hid real disagreements: all reads of a single-strand family copy one converted strand, so a C/T split is an error (or a UMI collision) and must lower quality like any other.  Consensus is now always called on the observed bases, and simplex emits them as they are, with the evidence in cu/ct. MM/ML are no longer emitted for simplex: MM can only describe bases present in SEQ, and a converted cytosine is not one. A simplex consensus also cannot tell a converted cytosine from a C>T mutation, so restoring it would assert a base the molecule may not have.  The shared MM builder now writes the SAM-spec '?' flag (unlisted bases are unknown), takes the conversion pattern from the read type (R1 C->T, R2 G->A) instead of the alignment strand, encodes each ML probability p as floor(256 p) capped at 255 (the SAM spec's [N/256, (N+1)/256) bins; it used floor(255 p), which put 1/2 and 3/4 in the bin below), and MN is available as a tag constant.
+- Classify dovetail FR pairs with coincident 5' ends as FR ([#1022](https://github.com/fulcrumgenomics/fgumi/pull/1022))
+- Truncate source-read cigars before converting hard clips, like fgbio ([#1042](https://github.com/fulcrumgenomics/fgumi/pull/1042))
+- Trim read-through bases when the mate cigar tag is missing ([#1041](https://github.com/fulcrumgenomics/fgumi/pull/1041))
+- Write only variant-overlapping reads to the grouped BAM ([#1027](https://github.com/fulcrumgenomics/fgumi/pull/1027))
+- Error on reads with bases but no base qualities ([#1044](https://github.com/fulcrumgenomics/fgumi/pull/1044))
+
+### Features
+
+- Typed-step pipeline foundation ([#870](https://github.com/fulcrumgenomics/fgumi/pull/870))
+- Declarative chain-builder layer + group --threads pilot ([#872](https://github.com/fulcrumgenomics/fgumi/pull/872))
+
+### Performance
+
+- Single-pass aux-tag rebuild (RawTagsEditor::rebuild_with) for zipper merge and NM/UQ/MD strip ([#962](https://github.com/fulcrumgenomics/fgumi/pull/962))
+- Fold per-record PG/AS/XS aux scans into single-pass walks ([#964](https://github.com/fulcrumgenomics/fgumi/pull/964))
+- Reduce serial-merge CPU and allocations at 1-2 threads ([#971](https://github.com/fulcrumgenomics/fgumi/pull/971))
+- [**breaking**] Phase 1 on a split arena front — pool key extraction, planned spill blocks, borrowed queryname refs ([#1060](https://github.com/fulcrumgenomics/fgumi/pull/1060))
+  - `SortBuffer::from_sorter` and `SortBufferConfig::from_sorter` are removed; build a `SortBufferConfig` directly and call `SortBuffer::new`.  * perf(sort)!: arena-borrowed queryname refs — QnKey window + class table, 40 B per record, no allocation  A queryname run sorted 80-byte owned keys: every record copied its name into an inline `SmallVec` (a heap allocation past 44 bytes), and every comparison walked the whole name — for Illumina names the 22-byte
+- [**breaking**] Consolidation on the chain, chain-native merge and simulate; delete the v0.7.0 engine ([#1065](https://github.com/fulcrumgenomics/fgumi/pull/1065))
+  - fgumi-sort no longer provides RunMergeProgress, RunMergeSpec, RunMergerDyn or new_run_merger: run consolidation is a chain-native tail of the sort (ConsolidateRuns, WriteConsolidatedRun). SpillWrite takes its limit and its consolidation registry in one with_consolidation(limit, registry) call (with_max_temp_files is gone). fgumi-pipeline-core's Step::phase_cap, cap_label and bound_caps are replaced by the single Step::step_cap hook returning a StepCapRef. SpillKeyKind now lives in spill_block.rs and still resolves as fgumi_sort::SpillKeyKind.  * feat(merge)!: chain-native k-way merge over the spill planner  `fgumi merge` now runs on the sort's phase 2. AnnounceMergeInputs opens each input BAM as a body-keyed merge slot: its BGZF stream read from byte 0 through the spill read planner, its decompressed header skipped, its records keyed from their bodies. A regular BGZF file is read positionally; a pipe, FIFO, process substitution, SAM or plain-gzip input is read once, in order, through a SequentialSource (one read in flight per slot), normalized to BGZF as every other input reader does. SortMerge merges the slots with an input-order check (the unsorted-input error names the input and record) and a per-input record rewrite that renames conflicting RG/PG ids before the key is extracted, as the command did before. Each body-keyed record is held to the BAM layout (the 32-byte core and the variable-length fields it declares) before a key is extracted, so a malformed input record is an error naming the input and the record, not a panic. A regular file is classified (stat, then a full format prefix) by the same open_seekable_bgzf that the sort's native input path now uses, and is opened once. The merge builds its runtime through
+
+<!-- generated by git-cliff -->
+
 ## [0.7.0] - 2026-08-24
 
 ### Bug Fixes
