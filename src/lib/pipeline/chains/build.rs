@@ -144,6 +144,9 @@ pub struct MergeSpec {
     /// overlap output compression even at one thread (see
     /// `merge_pool_threads`).
     pub threads: usize,
+    /// `--deadlock-timeout`: the deadlock watchdog's timeout, in seconds
+    /// (`0` disables it).
+    pub deadlock_timeout_secs: u64,
     /// Filled with the merge's record counts on success.
     pub stats_slot: std::sync::Arc<parking_lot::Mutex<Option<fgumi_sort::SortStats>>>,
 }
@@ -224,6 +227,7 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         output,
         compression,
         threads,
+        deadlock_timeout_secs,
         stats_slot,
     } = spec;
     let threads = threads.max(1);
@@ -284,6 +288,12 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         crate::commands::common::MemoryReserve::Auto,
         true,
     );
+    let scheduler = crate::commands::common::SchedulerOptions {
+        deadlock: crate::commands::common::DeadlockTimeoutOptions {
+            deadlock_timeout: deadlock_timeout_secs,
+        },
+        ..scheduler
+    };
     let (config, _stats) = crate::pipeline::chains::build_helpers::build_pipeline_config_for_chain(
         &pipeline,
         pool_threads,
@@ -342,8 +352,22 @@ mod tests {
             output: dir.join("out.bam"),
             compression: 1,
             threads,
+            deadlock_timeout_secs: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
             stats_slot: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// `fgumi merge --deadlock-timeout` reaches the merge pipeline's watchdog
+    /// (issue #1068: it used to be hardcoded).
+    #[rstest::rstest]
+    #[case::default(crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS)]
+    #[case::raised(120)]
+    #[case::disabled(0)]
+    fn build_merge_honours_the_deadlock_timeout(#[case] secs: u64) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = MergeSpec { deadlock_timeout_secs: secs, ..merge_spec(dir.path(), 2, 2) };
+        let built = build_merge(spec).expect("build_merge");
+        assert_eq!(built.config.deadlock_timeout_secs, secs);
     }
 
     /// The pool runs `--threads` plus one worker per input (at most

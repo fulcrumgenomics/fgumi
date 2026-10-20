@@ -351,6 +351,8 @@ fgumi group --deadlock-timeout 30 --input reads.bam --output grouped.bam
 fgumi group --deadlock-recover --input reads.bam --output grouped.bam
 ```
 
+Every command that runs a multi-threaded pipeline accepts `--deadlock-timeout`, including `sort`, `merge` and `zipper` (whose pipeline runs only at `--threads 4` or more with file inputs; piped input takes a path with no watchdog). Raise it if a healthy run on a heavily loaded machine is reported as a deadlock.
+
 On a multi-threaded run, a monitor watches for progress stalls. When nothing makes progress for the timeout duration while work is still queued, it logs a warning with diagnostic information (queue depths, memory usage, per-queue timestamps), and the run fails if the stall lasts six times the timeout; `0` turns the monitor off. A run on a single thread (most commands at `--threads 1`) has no monitor: it fails, without a prior warning, once nothing has progressed for one timeout, or 60 seconds when the timeout is `0`.
 
 Time a step spends blocked reading or writing a pipe or file outside the process does not count toward either threshold: for example `fgumi fastq` writing to a pipe whose reader (an aligner still loading its index, or a downstream `fgumi sort` spilling to disk) is not reading yet, or a sort spilling to a slow filesystem. A piped command therefore waits for a slow neighbor rather than failing. Such a wait never fails the run, however long it lasts. On a multi-threaded run, once it outlasts the timeout, a warning that the pipeline is waiting on external I/O is logged once per timeout window. The aligner that `fgumi runall` runs as a subprocess is not covered yet: a stall while it loads its index still counts.

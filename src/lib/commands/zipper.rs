@@ -174,6 +174,10 @@ pub struct Zipper {
     #[arg(long, short = 't', default_value = "1")]
     pub threads: usize,
 
+    /// Deadlock watchdog (`--deadlock-timeout`).
+    #[command(flatten)]
+    pub deadlock: crate::commands::common::DeadlockTimeoutOptions,
+
     /// Compression level for output BAM (0-12).
     ///
     /// Defaults are chosen for zipper's place in a pipeline: when the output is
@@ -1203,15 +1207,20 @@ impl Zipper {
     /// Requires regular-file inputs: the `PairedBams` source opens by path, so
     /// stdin/FIFO inputs stay on the streaming `process_raw` path (see `execute`).
     fn execute_chain(&self, command_line: &str) -> Result<()> {
+        crate::pipeline::chains::build_for(self.chain_spec(command_line))?.run()
+    }
+
+    /// The single-stage [`ChainSpec`](crate::pipeline::chains::ChainSpec) that
+    /// [`Self::execute_chain`] runs. Separate so the wiring of each flag into the
+    /// spec is unit-testable without a full run.
+    fn chain_spec(&self, command_line: &str) -> crate::pipeline::chains::ChainSpec {
         use crate::commands::common::{
             CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
             resolve_check_crc,
         };
-        use crate::pipeline::chains::{
-            ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for,
-        };
+        use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag};
 
-        let spec = ChainSpec {
+        ChainSpec {
             stages: vec![Stage::Zipper],
             source: SourceSpec::PairedBams {
                 unmapped: self.unmapped.clone(),
@@ -1228,8 +1237,7 @@ impl Zipper {
             compression: CompressionOptions {
                 compression_level: self.resolved_compression_level(),
             },
-            // Sibling chain commands use a 10s deadlock monitor (Default is off).
-            scheduler: SchedulerOptions { deadlock_timeout: 10, ..Default::default() },
+            scheduler: SchedulerOptions { deadlock: self.deadlock, ..Default::default() },
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
@@ -1238,8 +1246,7 @@ impl Zipper {
             // regular-file inputs, so this resolves to "verify".
             verify_crc: resolve_check_crc(false, false, &self.input),
             command_line: command_line.to_string(),
-        };
-        build_for(spec)?.run()
+        }
     }
 
     /// Process templates using raw-byte merge path with BGZF compression.
@@ -2799,6 +2806,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path.clone(),
             unmapped: unmapped_path.clone(),
             reference: dict_path,
@@ -2843,6 +2853,9 @@ mod tests {
         let missing = dir.path().join("will-create.bam");
 
         let zipper = |output: &std::path::Path, level: Option<u32>| Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: std::path::PathBuf::from("-"),
             unmapped: std::path::PathBuf::from("u.bam"),
             reference: std::path::PathBuf::from("r.dict"),
@@ -3722,6 +3735,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path.clone(),
             unmapped: unmapped_path.clone(),
             reference: dict_path,
@@ -3797,6 +3813,9 @@ mod tests {
         for threads in [0usize, 1, 2, 4, 8] {
             let output_path = dir.path().join(format!("output.t{threads}.bam"));
             let zipper = Zipper {
+                deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                    deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+                },
                 input: mapped_path.clone(),
                 unmapped: unmapped_path.clone(),
                 reference: dict_path.clone(),
@@ -3872,6 +3891,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let make = |threads: usize, output: &Path| Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path.clone(),
             unmapped: unmapped_path.clone(),
             reference: dict_path.clone(),
@@ -4011,6 +4033,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path,
             unmapped: unmapped_path,
             reference: dict_path,
@@ -4524,6 +4549,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path.clone(),
             unmapped: unmapped_path.clone(),
             reference: dict_path,
@@ -4611,6 +4639,9 @@ mod tests {
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: mapped_path,
             unmapped: unmapped_path.clone(),
             reference: dir.path().join("ref.fa"),
@@ -6011,6 +6042,26 @@ mod tests {
     fn test_exclude_missing_reads_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.exclude_missing_reads, expected);
+    }
+
+    /// `--deadlock-timeout` reaches the chain's watchdog; without it zipper keeps
+    /// the shared default (issue #1068: the timeout used to be hardcoded).
+    #[rstest]
+    #[case::default(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], 10)]
+    #[case::raised(
+        &["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--deadlock-timeout", "120"],
+        120
+    )]
+    #[case::disabled(
+        &["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--deadlock-timeout", "0"],
+        0
+    )]
+    fn chain_spec_honours_deadlock_timeout(#[case] args: &[&str], #[case] expected: u64) {
+        let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
+        assert_eq!(
+            cmd.chain_spec("fgumi zipper (test)").scheduler.deadlock_timeout_secs(),
+            expected
+        );
     }
 
     /// The flag is named for the tag it actually controls (`tc`); the former

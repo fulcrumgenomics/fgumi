@@ -479,4 +479,41 @@ mod tests {
             );
         }
     }
+
+    /// Issue #1068: every command that runs a pipeline exposes the deadlock
+    /// watchdog's timeout in its help, with the same default, so a run on a slow
+    /// filesystem or a busy node can be given more patience. `sort`, `zipper`
+    /// and `merge` used to hardcode it, and every other command hid it.
+    #[rstest::rstest]
+    #[case::extract("extract")]
+    #[case::correct("correct")]
+    #[case::fastq("fastq")]
+    #[case::zipper("zipper")]
+    #[case::sort("sort")]
+    #[case::merge("merge")]
+    #[case::group("group")]
+    #[case::dedup("dedup")]
+    #[cfg_attr(feature = "consensus", case::simplex("simplex"))]
+    #[cfg_attr(feature = "consensus", case::duplex("duplex"))]
+    #[cfg_attr(feature = "consensus", case::codec("codec"))]
+    #[case::filter("filter")]
+    #[case::clip("clip")]
+    #[cfg_attr(feature = "consensus", case::duplex_metrics("duplex-metrics"))]
+    #[cfg_attr(feature = "consensus", case::simplex_metrics("simplex-metrics"))]
+    #[case::copy_umi("copy-umi")]
+    #[case::retag("retag")]
+    #[case::runall("runall")]
+    fn deadlock_timeout_is_a_visible_flag(#[case] command: &str) {
+        let cli = Args::command();
+        let sub =
+            cli.find_subcommand(command).unwrap_or_else(|| panic!("no `{command}` subcommand"));
+        let arg = sub
+            .get_arguments()
+            .find(|a| a.get_long() == Some("deadlock-timeout"))
+            .unwrap_or_else(|| panic!("`{command}` does not accept --deadlock-timeout"));
+        assert!(!arg.is_hide_set(), "`{command} --help` hides --deadlock-timeout");
+        let defaults: Vec<_> =
+            arg.get_default_values().iter().map(|v| v.to_string_lossy()).collect();
+        assert_eq!(defaults, ["10"], "`{command}` --deadlock-timeout default");
+    }
 }
