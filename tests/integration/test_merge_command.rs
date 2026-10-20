@@ -108,6 +108,9 @@ fn merge_with_command_line(
     command_line: &str,
 ) -> anyhow::Result<()> {
     Merge {
+        deadlock: fgumi_lib::commands::common::DeadlockTimeoutOptions {
+            deadlock_timeout: fgumi_lib::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+        },
         output: output.to_path_buf(),
         inputs,
         input_list: None,

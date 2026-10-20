@@ -60,7 +60,7 @@ use crate::sort::protocol::{ConsolidationInput, SortPhase1Event, SpillBlockEvent
 use crate::sort::run_stack::{RunStack, SpillRun};
 use crate::sort::spill_block_compress::SpillBufPool;
 use fgumi_pipeline_core::{
-    HeldRetry, Unpushed,
+    HeldRetry, Unpushed, external_wait,
     held::HeldSlot,
     outputs::Single,
     queues::QueueSpec,
@@ -322,9 +322,12 @@ impl SpillWrite {
         // `create_new` fails closed on a duplicate/stale path: a reused `file_id`
         // (or a leftover file) must surface as an error rather than truncate an
         // existing spill and silently corrupt merge input.
-        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, file);
-        writer.write_all(spill_magic(self.codec))?;
+        let writer = external_wait(|| {
+            let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            let mut writer = BufWriter::with_capacity(256 * 1024, file);
+            writer.write_all(spill_magic(self.codec))?;
+            Ok::<_, io::Error>(writer)
+        })?;
         Ok(OpenSpill { file_id, key_kind, path, writer })
     }
 
@@ -370,6 +373,9 @@ impl SpillWrite {
             } => {
                 // Open the file on its first block; otherwise the open file must
                 // match (blocks for one file are contiguous in the ordinal stream).
+                // Spill file I/O blocks on the filesystem — minutes on a busy
+                // parallel filesystem — which is an external wait, not a
+                // wedge (#1068).
                 if self.current.is_none() {
                     self.current = Some(self.open_file(file_id, key_kind)?);
                 }
@@ -388,7 +394,7 @@ impl SpillWrite {
                         open.key_kind
                     )));
                 }
-                open.writer.write_all(&bytes)?;
+                external_wait(|| open.writer.write_all(&bytes))?;
                 self.spill_progress.log_if_needed(bytes.len() as u64);
                 if let Some(pool) = &self.buf_pool {
                     pool.give(bytes);
@@ -471,9 +477,14 @@ impl SpillWrite {
     fn close_run(&mut self, records_ingested_so_far: u64) -> io::Result<()> {
         let OpenSpill { file_id, key_kind, path, mut writer } =
             self.current.take().expect("open file present");
-        writer.write_all(spill_trailer(self.codec))?;
-        writer.flush()?;
-        drop(writer);
+        // Dropping the writer closes the file, which can block on a parallel
+        // filesystem (NFS, Lustre) as long as the writes, so it is bracketed too.
+        external_wait(|| {
+            writer.write_all(spill_trailer(self.codec))?;
+            writer.flush()?;
+            drop(writer);
+            Ok::<_, io::Error>(())
+        })?;
         match self.key_kind {
             None => self.key_kind = Some(key_kind),
             Some(kind) if kind == key_kind => {}
@@ -486,7 +497,7 @@ impl SpillWrite {
         }
         self.runs_closed += 1;
         self.stats.record_run_written();
-        let bytes = std::fs::metadata(&path)?.len();
+        let bytes = external_wait(|| std::fs::metadata(&path))?.len();
         self.runs.push(SpillRun { file_id, path, bytes, records_ingested_so_far });
         self.start_consolidation_if_needed()
     }
@@ -596,12 +607,13 @@ impl SpillWrite {
         let slot_count = u32::try_from(runs.len()).expect("live runs bounded by the run count");
         self.stats.set_merge_sources(runs.len() as u64);
         for SpillRun { file_id, path, records_ingested_so_far, .. } in runs {
-            let slot = fgumi_sort::open_spill_slot(&path, file_id).map_err(|e| {
-                io::Error::other(format!(
-                    "SpillWrite: failed to open spill slot {}: {e:#}",
-                    path.display()
-                ))
-            })?;
+            let slot =
+                external_wait(|| fgumi_sort::open_spill_slot(&path, file_id)).map_err(|e| {
+                    io::Error::other(format!(
+                        "SpillWrite: failed to open spill slot {}: {e:#}",
+                        path.display()
+                    ))
+                })?;
             self.outbox.push_back(SortPhase1Event::SpillReady {
                 slot,
                 path,

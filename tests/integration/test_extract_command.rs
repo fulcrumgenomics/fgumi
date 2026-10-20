@@ -2012,3 +2012,87 @@ fn test_extract_detects_encoding_from_lone_unterminated_record(
         );
     }
 }
+
+/// Issue #1068: a BAM sink blocked writing to a pipe whose reader is slow (an
+/// aligner still loading its index, a downstream sort spilling to a slow
+/// filesystem) is back-pressure from outside the process, not an internal
+/// deadlock. The stall watchdog must not fail the run however long the reader
+/// takes.
+///
+/// The reader waits 8 s before draining, past the 6 s fatal window of
+/// `--deadlock-timeout 1`; the run must still succeed and write every record.
+#[cfg(unix)]
+#[test]
+fn test_extract_survives_a_reader_slower_than_the_deadlock_timeout() {
+    const PAIRS: usize = 20_000;
+    let temp_dir = TempDir::new().unwrap();
+
+    // Pseudo-random bases, so the BAM does not compress into the pipe buffer.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut bases = |n: usize| -> String {
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                b"ACGT"[(state >> 62) as usize] as char
+            })
+            .collect()
+    };
+    let names: Vec<String> = (0..PAIRS).map(|i| format!("read{i}")).collect();
+    let r1_seqs: Vec<String> = (0..PAIRS).map(|_| bases(150)).collect();
+    let r2_seqs: Vec<String> = (0..PAIRS).map(|_| bases(150)).collect();
+    let qual = "I".repeat(150);
+    let r1: Vec<(&str, &str, &str)> =
+        names.iter().zip(&r1_seqs).map(|(n, s)| (n.as_str(), s.as_str(), qual.as_str())).collect();
+    let r2: Vec<(&str, &str, &str)> =
+        names.iter().zip(&r2_seqs).map(|(n, s)| (n.as_str(), s.as_str(), qual.as_str())).collect();
+    let r1_path = create_plain_fastq(&temp_dir, "r1.fq", &r1);
+    let r2_path = create_plain_fastq(&temp_dir, "r2.fq", &r2);
+
+    let fifo = temp_dir.path().join("out.bam");
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed");
+
+    // The reader's open pairs with the command's open of the write end; then it
+    // holds off reading until well past the watchdog's fatal window.
+    let reader_path = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        let file = File::open(&reader_path).expect("open fifo for reading");
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        let mut reader = bam::io::Reader::new(file);
+        let header = reader.read_header().expect("read BAM header from fifo");
+        reader
+            .record_bufs(&header)
+            .map(|r| r.expect("read BAM record").name().expect("named record").to_string())
+            .collect::<Vec<String>>()
+    });
+
+    let cmd = Extract::try_parse_from([
+        "extract",
+        "--inputs",
+        r1_path.to_str().unwrap(),
+        r2_path.to_str().unwrap(),
+        "--output",
+        fifo.to_str().unwrap(),
+        "--read-structures",
+        "+T",
+        "+T",
+        "--sample",
+        "s",
+        "--library",
+        "l",
+        "--compression-level",
+        "1",
+        "--threads",
+        "2",
+        "--deadlock-timeout",
+        "1",
+    ])
+    .unwrap();
+    // Check the result before joining: a command that failed before opening the
+    // FIFO would leave the reader blocked in its open forever.
+    cmd.execute("fgumi extract").expect("a slow reader is back-pressure, not a deadlock");
+    let read_names = reader.join().expect("reader thread");
+
+    let expected: Vec<String> = names.iter().flat_map(|n| [n.clone(), n.clone()]).collect();
+    assert_eq!(read_names, expected, "every record reaches the reader, in order");
+}

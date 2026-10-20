@@ -408,6 +408,10 @@ pub struct Sort {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
+    /// Deadlock watchdog (`--deadlock-timeout`).
+    #[command(flatten)]
+    pub deadlock: crate::commands::common::DeadlockTimeoutOptions,
+
     /// Compression level for temporary chunk files (0-9).
     ///
     /// Applies to the codec selected by `--temp-codec`:
@@ -932,6 +936,7 @@ impl Sort {
             // `SchedulerOptions`) — this is what makes
             // `fgumi sort --pipeline-trace <level>` reach the chain.
             scheduler: SchedulerOptions {
+                deadlock: self.deadlock,
                 pipeline_stats: self.pipeline_stats,
                 pipeline_trace: self.pipeline_trace,
                 pipeline_trace_out: self.pipeline_trace_out.clone(),
@@ -1762,6 +1767,31 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
+    /// `--deadlock-timeout` reaches the chain's watchdog; without it the sort
+    /// keeps the shared default (issue #1068: the timeout used to be hardcoded).
+    #[rstest]
+    #[case::default(None, 10)]
+    #[case::raised(Some("120"), 120)]
+    #[case::disabled(Some("0"), 0)]
+    fn build_sort_chain_spec_honours_deadlock_timeout(
+        #[case] flag: Option<&str>,
+        #[case] expected: u64,
+    ) {
+        let mut args = vec!["sort", "-i", "in.bam", "-o", "out.bam"];
+        if let Some(secs) = flag {
+            args.extend(["--deadlock-timeout", secs]);
+        }
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            resolved_max_temp_files,
+            "fgumi sort (test)",
+        );
+        assert_eq!(spec.scheduler.deadlock_timeout_secs(), expected);
+    }
+
     /// `fgumi sort` does not flatten `SchedulerOptions`, so its `--pipeline-stats`
     /// / `--pipeline-trace` / `--pipeline-trace-out` diagnostic flags must be
     /// forwarded by hand into the chain spec's scheduler. A dropped forward is
@@ -2151,6 +2181,9 @@ mod tests {
     /// Helper to construct a `Sort` struct with a given order.
     fn make_sort(order: SortOrderArg) -> Sort {
         Sort {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             input: PathBuf::from("test.bam"),
             output: None,
             check_crc: false,

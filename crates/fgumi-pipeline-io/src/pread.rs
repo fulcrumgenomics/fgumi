@@ -40,7 +40,7 @@ use fgumi_bam_io::pread::{
 };
 use fgumi_pipeline_core::{
     HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, StepCap, StepCapRef, Unpushed,
-    admit_input,
+    admit_input, external_wait,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -445,8 +445,10 @@ impl PreadSlices {
         }
         let mut last = req.last;
         let mut shortfall = 0u32;
+        // A read from a slow device or a piped input blocks on the outside
+        // world: an external wait, not a wedge (#1068).
         let result = if req.sequential {
-            read_until_eof(&*req.source, &mut buf, req.offset).map(|n| {
+            external_wait(|| read_until_eof(&*req.source, &mut buf, req.offset)).map(|n| {
                 // A short fill is the stream's EOF: the slot's last slice. The
                 // bytes that will never arrive leave the slot's issued count.
                 if n < buf.len() {
@@ -459,7 +461,7 @@ impl PreadSlices {
                 }
             })
         } else {
-            read_at_exact(&*req.source, &mut buf, req.offset)
+            external_wait(|| read_at_exact(&*req.source, &mut buf, req.offset))
         };
         if let Some(h) = &self.hist {
             h.inflight_exit();

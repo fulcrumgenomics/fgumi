@@ -235,7 +235,11 @@ impl Step for ReadFastqBlocks {
                 .reader
                 .as_mut()
                 .expect("ReadFastqBlocks: try_run called after the source reported Finished");
-            read_raw_blocks(reader.as_mut(), BLOCKS_PER_BATCH)?
+            // A read from a slow pipe or filesystem blocks on the outside world
+            // (#1068).
+            crate::pipeline::core::external_wait(|| {
+                read_raw_blocks(reader.as_mut(), BLOCKS_PER_BATCH)
+            })?
         };
 
         if raw_blocks.is_empty() {

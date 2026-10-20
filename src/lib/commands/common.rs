@@ -1226,6 +1226,33 @@ pub enum PoolScheduler {
     ChainOrder,
 }
 
+/// Default `--deadlock-timeout`, in seconds.
+pub const DEFAULT_DEADLOCK_TIMEOUT_SECS: u64 = 10;
+
+/// The deadlock watchdog's `--deadlock-timeout`, shared by every command that
+/// runs a pipeline: through [`SchedulerOptions`], or directly on commands that
+/// do not flatten it (`sort`, `zipper`, `merge`).
+///
+/// `Default` is `0` (the watchdog off), matching `PipelineConfig`'s default for
+/// library callers; the command line defaults to
+/// [`DEFAULT_DEADLOCK_TIMEOUT_SECS`].
+#[derive(Debug, Clone, Copy, Default, Args)]
+pub struct DeadlockTimeoutOptions {
+    /// Seconds without progress before the deadlock watchdog reports a stall.
+    ///
+    /// On a multi-threaded run, when nothing makes progress for this long with
+    /// work still queued, a warning with a per-step snapshot is logged, and the
+    /// run fails if the stall lasts six times this long; 0 disables this. A run
+    /// on a single thread is not monitored: it fails, without a warning, once
+    /// nothing has progressed for this long (60 seconds when 0). Time a step
+    /// spends blocked reading or writing a pipe or file — a slow reader
+    /// downstream, or a slow filesystem — does not count and never fails the
+    /// run. Raise it if a healthy run on a heavily loaded machine is reported as
+    /// a deadlock.
+    #[arg(long = "deadlock-timeout", value_name = "SECONDS", default_value_t = DEFAULT_DEADLOCK_TIMEOUT_SECS)]
+    pub deadlock_timeout: u64,
+}
+
 /// Options backing the legacy, now-inert `--scheduler` flag.
 ///
 /// The chain engine does not consume the scheduler strategy — it no longer
@@ -1285,12 +1312,9 @@ pub struct SchedulerOptions {
     #[arg(long = "pipeline-trace-out", hide = true)]
     pub pipeline_trace_out: Option<std::path::PathBuf>,
 
-    /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
-    ///
-    /// When no progress is made for this duration, a warning is logged with
-    /// diagnostic info (queue depths, memory usage, per-queue timestamps).
-    #[arg(long = "deadlock-timeout", default_value_t = 10, hide = true)]
-    pub deadlock_timeout: u64,
+    /// Deadlock watchdog (`--deadlock-timeout`).
+    #[command(flatten)]
+    pub deadlock: DeadlockTimeoutOptions,
 
     /// Enable automatic deadlock recovery (default: false, detection only).
     ///
@@ -1373,7 +1397,7 @@ impl SchedulerOptions {
     /// Returns the deadlock detection timeout in seconds (0 = disabled).
     #[must_use]
     pub fn deadlock_timeout_secs(&self) -> u64 {
-        self.deadlock_timeout
+        self.deadlock.deadlock_timeout
     }
 
     /// Returns true if automatic deadlock recovery is enabled.
@@ -2115,12 +2139,9 @@ impl Default for QueueMemoryOptions {
     }
 }
 
-/// The deadlock monitor's timeout every sort-chain command runs with.
-pub const SORT_CHAIN_DEADLOCK_TIMEOUT_SECS: u64 = 10;
-
 /// The pipeline runtime options every command running the sort's chain shares
 /// (`fgumi sort`, `fgumi_lib::sort::sort_bam`, `fgumi merge`, `fgumi simulate`):
-/// the deadlock monitor on ([`SORT_CHAIN_DEADLOCK_TIMEOUT_SECS`]), and the
+/// the deadlock monitor on ([`DEFAULT_DEADLOCK_TIMEOUT_SECS`]), and the
 /// inter-stage queue budget derived from the same `--max-memory`,
 /// `--memory-reserve` and `--memory-per-thread` that size the sort buffer, so a
 /// small budget shrinks the queues too. One helper, so the commands cannot
@@ -2133,7 +2154,7 @@ pub fn sort_chain_runtime(
 ) -> (SchedulerOptions, QueueMemoryOptions) {
     (
         SchedulerOptions {
-            deadlock_timeout: SORT_CHAIN_DEADLOCK_TIMEOUT_SECS,
+            deadlock: DeadlockTimeoutOptions { deadlock_timeout: DEFAULT_DEADLOCK_TIMEOUT_SECS },
             ..SchedulerOptions::default()
         },
         QueueMemoryOptions { max_memory, memory_reserve, memory_per_thread },
@@ -3288,7 +3309,7 @@ mod tests {
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
-            deadlock_timeout: 10,
+            deadlock: DeadlockTimeoutOptions { deadlock_timeout: 10 },
             deadlock_recover: false,
             pipeline_telemetry_out: None,
             pipeline_telemetry_interval: None,
@@ -3304,7 +3325,7 @@ mod tests {
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
             pool_scheduler: PoolScheduler::Auto,
-            deadlock_timeout: 10,
+            deadlock: DeadlockTimeoutOptions { deadlock_timeout: 10 },
             deadlock_recover: false,
             pipeline_telemetry_out: None,
             pipeline_telemetry_interval: None,
@@ -3319,7 +3340,7 @@ mod tests {
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
-            deadlock_timeout: 30,
+            deadlock: DeadlockTimeoutOptions { deadlock_timeout: 30 },
             pool_scheduler: PoolScheduler::Auto,
             deadlock_recover: false,
             pipeline_telemetry_out: None,
@@ -3335,7 +3356,7 @@ mod tests {
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
             pipeline_trace_out: None,
-            deadlock_timeout: 10,
+            deadlock: DeadlockTimeoutOptions { deadlock_timeout: 10 },
             deadlock_recover: true,
             pool_scheduler: PoolScheduler::Auto,
             pipeline_telemetry_out: None,

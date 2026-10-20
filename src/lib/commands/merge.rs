@@ -104,6 +104,10 @@ pub struct Merge {
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
+    /// Deadlock watchdog (`--deadlock-timeout`).
+    #[command(flatten)]
+    pub deadlock: crate::commands::common::DeadlockTimeoutOptions,
+
     /// Compression level for output BAM (1-12).
     ///
     /// Level 1 is fastest with larger files.
@@ -230,6 +234,7 @@ impl Command for Merge {
             output: target.path().to_path_buf(),
             compression: self.compression_level,
             threads: self.threads,
+            deadlock_timeout_secs: self.deadlock.deadlock_timeout,
             stats_slot: std::sync::Arc::clone(&stats_slot),
         })?;
         built.run()?;
@@ -1125,6 +1130,9 @@ mod tests {
         let bam = write_bam_with_read_groups(dir.path(), "input", &["RG1"]);
 
         let merge = Merge {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             output: bam.clone(),
             inputs: vec![bam.clone()],
             input_list: None,
@@ -1147,6 +1155,9 @@ mod tests {
         let output = dir.path().join("merged.bam");
 
         let merge = Merge {
+            deadlock: crate::commands::common::DeadlockTimeoutOptions {
+                deadlock_timeout: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
+            },
             output: output.clone(),
             inputs: vec![bam_a, bam_b],
             input_list: None,

@@ -437,17 +437,17 @@ impl Step for ReadFastqInputs {
                     continue;
                 }
 
-                let (data, records_read) =
+                // A read from a slow pipe or filesystem blocks on the outside
+                // world (#1068).
+                let (data, records_read) = crate::pipeline::core::external_wait(|| {
                     read_fastq_raw_bytes_from_bufread(reader.as_mut(), self.batch_record_count)
-                        .map_err(|e| {
-                            // Attach the stream identity a bare parse/truncation
-                            // error lacks, so a malformed R2 in a multi-input run
-                            // names R2 rather than forcing the operator to guess.
-                            io::Error::new(
-                                e.kind(),
-                                format!("R{}: {e}", self.stream_idx_base + idx + 1),
-                            )
-                        })?;
+                })
+                .map_err(|e| {
+                    // Attach the stream identity a bare parse/truncation
+                    // error lacks, so a malformed R2 in a multi-input run
+                    // names R2 rather than forcing the operator to guess.
+                    io::Error::new(e.kind(), format!("R{}: {e}", self.stream_idx_base + idx + 1))
+                })?;
 
                 if records_read == 0 {
                     self.exhausted[idx] = true;
