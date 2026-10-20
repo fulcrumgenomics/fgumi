@@ -740,32 +740,31 @@ fn planner_plans_consolidation_reads_before_any_merge_budget_exists() {
     }
 }
 
-/// Review r2 I1 + Design issue 9: one read in flight per sequential slot, and
-/// the planner stops at EOF. A BGZF stream (a Bgzf-codec spill run: plain BGZF
-/// blocks plus the EOF block) is read through a `Trickle` source; the planner,
-/// `PreadSlices` and one decompressor are pumped by hand, and the merge's side
-/// drains the FIFO so it never caps. Catches: two outstanding reads on a stream
-/// (a `read_at` at the wrong cursor → `InvalidInput`), and requests issued after
-/// EOF.
-#[test]
-fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
-    use crate::pread::{PreadSlices, ReadSlice};
-    use crate::sort::spill_decompress::SortSpillDecompress;
+/// A stream run (a Bgzf-codec spill run: plain BGZF blocks plus the EOF
+/// block) of 3,000 frames: its path, bytes and frames.
+fn stream_run(dir: &std::path::Path) -> (PathBuf, Vec<u8>, Vec<Vec<u8>>) {
     use crate::sort::spill_fixtures::{keyed_frame, template_key, write_frames_run};
-    use fgumi_bam_io::pread::{PositionalSource, SequentialSource, test_sources::Trickle};
-    use fgumi_pipeline_core::step::InputHandle;
-    use fgumi_pipeline_core::testing::StepProbe;
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("stream");
+    let path = dir.join("stream");
     let frames: Vec<Vec<u8>> =
         (0..3_000u64).map(|i| keyed_frame(&template_key(i), &[3u8; 90])).collect();
     write_frames_run(&path, SpillCodec::Bgzf, &frames, 60_000);
     let bytes = std::fs::read(&path).unwrap();
-    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
-        &path,
-        Box::new(Trickle(std::io::Cursor::new(bytes.clone()))),
-    ));
-    let slot = Arc::new(SortMergeSlot::new_sequential(0, Arc::clone(&src), SpillCodec::Bgzf));
+    (path, bytes, frames)
+}
+
+/// Read the stream at `path` from `src` through the planner, `PreadSlices`
+/// and one decompressor, pumped by hand, with the merge's side draining the
+/// slot's FIFO so it never caps; assert one read in flight and nothing issued
+/// after EOF. Returns the requests issued and the decoded bytes.
+fn drive_stream(
+    path: &std::path::Path,
+    src: Arc<dyn fgumi_bam_io::pread::PositionalSource>,
+) -> (u32, Vec<u8>) {
+    use crate::pread::{PreadSlices, ReadSlice};
+    use crate::sort::spill_decompress::SortSpillDecompress;
+    use fgumi_pipeline_core::step::InputHandle;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let slot = Arc::new(SortMergeSlot::new_sequential(0, src, SpillCodec::Bgzf));
     let supply = SpillSupply::new();
     let slices = SliceBufferPool::new(4);
     let mut pl = SpillReadPlanner::new(64 << 20, 2, 2, 1 << 20, &supply, Arc::clone(&slices));
@@ -779,7 +778,7 @@ fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
     );
     plp.push_input(SortPhase1Event::SpillReady {
         slot: Arc::clone(&slot),
-        path: path.clone(),
+        path: path.to_path_buf(),
         records_ingested_so_far: 0,
     });
     plp.push_input(all_announced(1));
@@ -816,12 +815,24 @@ fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
     }
     assert!(reads.pop().is_none(), "no request after EOF");
     assert!(!pl.planned_slot_ids_for_test().contains(&slot.slot_id()));
-    // The smallest fill, so the bound is loose.
-    let fill = ReadAheadBudget::resolve(64 << 20, 1).for_class(SpillClass::Cold).1;
-    assert!(
-        u64::from(issued) <= (bytes.len() as u64).div_ceil(fill) + 1,
-        "at most one extra read: {issued}"
-    );
+    (issued, decoded)
+}
+
+/// Review r2 I1 + Design issue 9: one read in flight per sequential slot, and
+/// the planner stops at EOF, over a real `SequentialSource` (its pump fed by a
+/// `Trickle`). Catches: two outstanding reads on a stream (a `read_at` at the
+/// wrong cursor → `InvalidInput`), and requests issued after EOF.
+#[test]
+fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
+    use fgumi_bam_io::pread::{PositionalSource, SequentialSource, test_sources::Trickle};
+    let dir = tempfile::TempDir::new().unwrap();
+    let (path, bytes, frames) = stream_run(dir.path());
+    let src: Arc<dyn PositionalSource> =
+        Arc::new(SequentialSource::new(&path, Box::new(Trickle(std::io::Cursor::new(bytes)))));
+    let (issued, decoded) = drive_stream(&path, src);
+    // How many reads there are depends on what the pump holds at each; the
+    // last is the zero read that is EOF.
+    assert!(issued >= 2, "at least one read and the EOF read: {issued}");
     assert_eq!(decoded, frames.concat(), "every byte of the stream, in order");
 }
 
@@ -838,6 +849,10 @@ fn sequential_slot_waits_for_its_read_and_stops_at_eof() {
         std::path::Path::new("stream"),
         Box::new(std::io::Cursor::new(Vec::<u8>::new())),
     ));
+    // The planner issues a stream's read only once the stream is ready, and
+    // this one is ready once its pump has seen its EOF: wait for that, so the
+    // passes below are not racing the pump thread.
+    crate::pread::tests::wait_ready(&*src, 0);
     let slot = Arc::new(SortMergeSlot::new_sequential(0, src, SpillCodec::Bgzf));
     let supply = SpillSupply::new();
     let slices = SliceBufferPool::new(4);
@@ -864,4 +879,113 @@ fn sequential_slot_waits_for_its_read_and_stops_at_eof() {
     let mut pool_used = 0;
     assert_eq!(pl.top_up(0, SpillClass::Cold, &budget, &mut pool_used), 0, "no read past EOF");
     assert!(pl.slots[0].eof_issued, "the stream is fully issued");
+}
+
+/// The most bytes one read of a [`Capped`] stream returns: small and odd, so
+/// reads end mid-block and mid-request.
+const READ_CAP: usize = 61;
+
+/// A stream whose every read returns at most [`READ_CAP`] bytes, and that
+/// fails a read anywhere but its cursor.
+struct Capped {
+    data: Vec<u8>,
+    cursor: parking_lot::Mutex<u64>,
+}
+
+impl fgumi_bam_io::pread::PositionalSource for Capped {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let mut cursor = self.cursor.lock();
+        if offset != *cursor {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("read at {offset}; the stream is at {cursor}"),
+            ));
+        }
+        let at = usize::try_from(offset).unwrap();
+        let n = buf.len().min(READ_CAP).min(self.data.len() - at);
+        buf[..n].copy_from_slice(&self.data[at..at + n]);
+        *cursor += n as u64;
+        Ok(n)
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+/// Every short read resumes the stream at the bytes it delivered: with reads
+/// capped at `READ_CAP` bytes, a stream of `n` bytes takes exactly
+/// `ceil(n / READ_CAP)` reads,
+/// each at the cursor, plus the zero read that is EOF. Catches: a resume
+/// offset that skips (a read past the cursor fails `Capped`) or repeats
+/// bytes, and a short read taken as EOF (a truncated stream).
+#[test]
+fn planner_resumes_a_stream_at_the_bytes_each_short_read_delivered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (path, bytes, frames) = stream_run(dir.path());
+    let len = bytes.len();
+    let src = Arc::new(Capped { data: bytes, cursor: parking_lot::Mutex::new(0) });
+    let (issued, decoded) = drive_stream(&path, src);
+    assert_eq!(issued as usize, len.div_ceil(READ_CAP) + 1, "one request per read, plus EOF");
+    assert_eq!(decoded, frames.concat(), "every byte of the stream, in order");
+}
+
+/// A stream whose `ready_at` the test controls; reads serve `data` from any
+/// offset.
+struct Gated {
+    data: Vec<u8>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl fgumi_bam_io::pread::PositionalSource for Gated {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let at = usize::try_from(offset).unwrap().min(self.data.len());
+        let n = buf.len().min(self.data.len() - at);
+        buf[..n].copy_from_slice(&self.data[at..at + n]);
+        Ok(n)
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    fn ready_at(&self, _offset: u64) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A stream's read is issued only once the stream is ready (has bytes, or has
+/// ended), however long the merge has awaited it: the read would otherwise
+/// hold a pool worker until the stream's producer writes, and that producer
+/// may be waiting on another stream whose read needs the worker. Catches: a
+/// stream read issued to the pool before its stream has anything to read.
+#[test]
+fn planner_issues_a_stream_read_only_once_the_stream_is_ready() {
+    use fgumi_bam_io::pread::PositionalSource;
+    let gated = Arc::new(Gated { data: vec![1u8; 4096], ready: false.into() });
+    let src: Arc<dyn PositionalSource> = Arc::clone(&gated) as Arc<dyn PositionalSource>;
+    let slot = Arc::new(SortMergeSlot::new_sequential(0, src, SpillCodec::Bgzf));
+    let supply = SpillSupply::new();
+    let slices = SliceBufferPool::new(4);
+    let mut pl = SpillReadPlanner::new(64 << 20, 2, 2, 1 << 20, &supply, slices);
+    let mut plp = fgumi_pipeline_core::testing::StepProbe::new(&pl);
+    let reads = plp.take_output::<ReadRequest>(0);
+    plp.push_input(SortPhase1Event::SpillReady {
+        slot: Arc::clone(&slot),
+        path: "stream".into(),
+        records_ingested_so_far: 0,
+    });
+    plp.push_input(all_announced(1));
+    for _ in 0..8 {
+        plp.try_run(&mut pl).unwrap();
+    }
+    assert!(
+        fgumi_pipeline_core::step::InputHandle::pop(&reads).is_none(),
+        "a read issued for a stream with nothing to read"
+    );
+    gated.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    plp.try_run(&mut pl).unwrap();
+    let r = fgumi_pipeline_core::step::InputHandle::pop(&reads).expect("a read once ready");
+    assert!(r.sequential);
+    assert_eq!(r.offset, 0);
 }

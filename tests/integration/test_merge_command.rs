@@ -1221,6 +1221,322 @@ fn pipe_input_with_a_slow_producer_completes() {
     assert_eq!(read_raw(&out).1, read_raw(&from_files).1);
 }
 
+/// How a [`coupled_feed`] producer writes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct Coupling {
+    /// Bytes written to each FIFO per turn.
+    chunk: usize,
+    /// Open the FIFOs in the opposite of input order.
+    reversed: bool,
+    /// Once input 0 has been written up to `.0` bytes, write its next `.1`
+    /// bytes in one go before the next turn: one input running ahead.
+    burst: Option<(usize, usize)>,
+}
+
+/// A coupled producer, as `tee` or a demultiplexer is: one writer for every
+/// FIFO in `fifos`. It opens them one at a time (each open blocks until the
+/// merge opens that FIFO for reading), in input order or, if
+/// `coupling.reversed`, in the opposite order, then writes `coupling.chunk`
+/// bytes of each source to its FIFO in turn, round robin (with
+/// `coupling.burst`, if any), so it blocks on whichever pipe the merge is not
+/// draining and feeds none of the others meanwhile. Returns the writer's
+/// handle; a write the merge never reads (it was killed) is an error, not a
+/// panic.
+#[cfg(unix)]
+fn coupled_feed(
+    fifos: &[PathBuf],
+    srcs: &[PathBuf],
+    coupling: Coupling,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    for fifo in fifos {
+        assert!(std::process::Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let fifos = fifos.to_vec();
+    let data: Vec<Vec<u8>> = srcs.iter().map(|s| std::fs::read(s).unwrap()).collect();
+    std::thread::spawn(move || {
+        let mut order: Vec<usize> = (0..fifos.len()).collect();
+        if coupling.reversed {
+            order.reverse();
+        }
+        let mut opened: Vec<Option<std::fs::File>> = (0..fifos.len()).map(|_| None).collect();
+        for i in order {
+            opened[i] = Some(std::fs::OpenOptions::new().write(true).open(&fifos[i])?);
+        }
+        let mut ws: Vec<std::fs::File> = opened.into_iter().map(Option::unwrap).collect();
+        let mut offs = vec![0usize; data.len()];
+        let mut burst = coupling.burst;
+        loop {
+            if let Some((at, len)) = burst
+                && offs[0] >= at
+            {
+                let end = (offs[0] + len).min(data[0].len());
+                ws[0].write_all(&data[0][offs[0]..end])?;
+                offs[0] = end;
+                burst = None;
+            }
+            let mut wrote = false;
+            for ((w, d), off) in ws.iter_mut().zip(&data).zip(offs.iter_mut()) {
+                if *off < d.len() {
+                    let end = (*off + coupling.chunk).min(d.len());
+                    w.write_all(&d[*off..end])?;
+                    *off = end;
+                    wrote = true;
+                }
+            }
+            if !wrote {
+                return Ok(());
+            }
+        }
+    })
+}
+
+/// `fgumi merge` as a subprocess, killed if it has not exited within
+/// `timeout`; returns its exit status, or `None` if it was killed. Its stderr
+/// is in `output` with the extension `log`.
+#[cfg(unix)]
+fn merge_cli_within(
+    inputs: &[PathBuf],
+    output: &Path,
+    threads: usize,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let log = output.with_extension("log");
+    let mut child = std::process::Command::new(FGUMI)
+        .env("RUST_LOG", "info")
+        .args(["merge", "--order", "coordinate", "--threads", &threads.to_string(), "-o"])
+        .arg(output)
+        .args(inputs)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("spawn fgumi merge");
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    None
+}
+
+/// Merge `inputs` from FIFOs fed by one [`coupled_feed`] producer at
+/// `--threads threads` under a 90 s watchdog (under nextest's 120 s kill, so a
+/// hang fails here, with the merge's log, and the merge is killed), and
+/// assert the output is the file merge's, records and header.
+#[cfg(unix)]
+fn assert_coupled_merge_completes(
+    dir: &Path,
+    inputs: &[PathBuf],
+    threads: usize,
+    coupling: Coupling,
+) {
+    let from_files = dir.join("files.bam");
+    merge_cli(inputs, &from_files, "coordinate", threads);
+    let fifos: Vec<PathBuf> = (0..inputs.len()).map(|i| dir.join(format!("fifo{i}"))).collect();
+    let writer = coupled_feed(&fifos, inputs, coupling);
+    let out = dir.join("coupled.bam");
+    let status = merge_cli_within(&fifos, &out, threads, Duration::from_secs(90));
+    let log = fs::read_to_string(out.with_extension("log")).unwrap_or_default();
+    let case = format!("--threads {threads}, {} inputs, {coupling:?}", inputs.len());
+    let status = status.unwrap_or_else(|| panic!("{case}: the merge deadlocked:\n{log}"));
+    assert!(status.success(), "{case}: the merge failed:\n{log}");
+    writer.join().unwrap().unwrap();
+    let (got_header, got) = read_raw(&out);
+    let (want_header, want) = read_raw(&from_files);
+    assert!(!want.is_empty());
+    assert_eq!(got, want, "{case}");
+    assert_eq!(header_text_without_pg(&got_header), header_text_without_pg(&want_header), "{case}");
+}
+
+/// A coupled (tee-like, lockstep) producer feeding every input of a merge
+/// through FIFOs must not deadlock it, whichever order it opens its FIFOs in
+/// and at a pool with fewer workers than inputs (`--threads` 1 over 3 inputs
+/// and 2 over 6: 2 and 4 workers) as well as more (8 over 3): the merge must
+/// open every pipe at once and drain each whatever it is reading next, or the
+/// producer blocks on the pipe (or FIFO open) it is left on and starves the
+/// one the merge waits on. The inputs are past a pipe's buffer and a read
+/// fill, written 4 KiB at a time. Catches: inputs opened or read one after
+/// another (any case), pipe reads that depend on a free pool worker (the
+/// fewer-workers cases), and a header lost or garbled through the pump.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::one_thread_three_inputs(1, 3)]
+#[case::two_threads_six_inputs(2, 6)]
+#[case::eight_threads_three_inputs(8, 3)]
+fn a_coupled_producer_feeding_every_input_does_not_deadlock_the_merge(
+    #[case] threads: usize,
+    #[case] k: usize,
+    #[values(false, true)] reversed: bool,
+) {
+    let dir = TempDir::new().unwrap();
+    let (inputs, _, _) = sorted_inputs(dir.path(), SortOrder::Coordinate, 150_000, k, 17);
+    for i in &inputs {
+        let len = std::fs::metadata(i).unwrap().len();
+        assert!(len > 512 << 10, "{} is {len} bytes: too small to fill the pipes", i.display());
+    }
+    let coupling = Coupling { chunk: 4096, reversed, burst: None };
+    assert_coupled_merge_completes(dir.path(), &inputs, threads, coupling);
+}
+
+/// `k` coordinate-sorted BAMs of `per_input` 150 bp reads each, with
+/// pseudo-random bases and qualities (so they compress little, as reads do),
+/// record `i` of the interleaved whole at position `i + 1` going to input
+/// `i % k`. Large inputs fast: nothing is sorted.
+#[cfg(unix)]
+fn read_like_inputs(dir: &Path, per_input: usize, k: usize) -> Vec<PathBuf> {
+    let header = create_coordinate_sorted_header("chr1", 10_000_000);
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move || {
+        state =
+            state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let mut records: Vec<Vec<RawRecord>> = (0..k).map(|_| Vec::with_capacity(per_input)).collect();
+    for i in 0..per_input * k {
+        let seq: Vec<u8> = (0..150).map(|_| b"ACGT"[(next() % 4) as usize]).collect();
+        let quals: Vec<u8> = (0..150).map(|_| 2 + (next() % 39) as u8).collect();
+        let mut b = SamBuilder::new();
+        b.read_name(format!("r{i}").as_bytes())
+            .ref_id(0)
+            .pos(i32::try_from(i).unwrap())
+            .mapq(60)
+            .cigar_ops(&[150 << 4])
+            .sequence(&seq)
+            .qualities(&quals);
+        records[i % k].push(b.build());
+    }
+    records
+        .iter()
+        .enumerate()
+        .map(|(j, recs)| {
+            let p = dir.join(format!("reads{j}.bam"));
+            write_raw_bam(&p, &header, recs);
+            p
+        })
+        .collect()
+}
+
+/// A coupled producer that runs one input ahead (5 MB of input 0 in one go,
+/// 1 MB in, then lockstep again) at one thread (two pool workers, three
+/// inputs), over read-like inputs. The merge must keep reading the input that
+/// is ahead while the others have nothing: a read issued for a stream with
+/// nothing buffered holds a pool worker until the producer writes to that
+/// stream, which it does only once the input that is ahead is drained, and
+/// with both workers so held nothing drains it. Catches, some of the time (it
+/// is a race the producer must win): a stream read issued before the stream is
+/// ready, which every lockstep case above misses. Without that check this hung
+/// in 1 of 3 runs; `planner_issues_a_stream_read_only_once_the_stream_is_ready`
+/// pins the check itself.
+#[cfg(unix)]
+#[test]
+fn a_coupled_producer_running_one_input_ahead_does_not_deadlock_the_merge() {
+    let dir = TempDir::new().unwrap();
+    let inputs = read_like_inputs(dir.path(), 40_000, 3);
+    let len = std::fs::metadata(&inputs[0]).unwrap().len();
+    assert!(len > 6_500_000, "input 0 is {len} bytes: too small for the burst");
+    let coupling = Coupling { chunk: 4096, reversed: false, burst: Some((1_000_000, 5_000_000)) };
+    assert_coupled_merge_completes(dir.path(), &inputs, 1, coupling);
+}
+
+/// A pipe input that closes before writing anything fails the merge with the
+/// stream's own diagnosis, which names the input and points at the upstream
+/// stage, not a header-parse error, and leaves no output — at once, though an
+/// earlier input's producer has opened its pipe and written nothing yet.
+/// Catches: the diagnosis lost now that the input is classified on its pump
+/// thread, a failed pump that hangs the merge instead of failing it, and a
+/// failure that waits for another input's header first.
+#[cfg(unix)]
+#[test]
+fn an_empty_pipe_input_fails_with_the_upstream_diagnosis() {
+    let dir = TempDir::new().unwrap();
+    let (inputs, _, _) = sorted_inputs(dir.path(), SortOrder::Coordinate, 300, 1, 29);
+    let (stalled, empty) = (dir.path().join("stalled"), dir.path().join("empty"));
+    for fifo in [&stalled, &empty] {
+        assert!(std::process::Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let writers = [
+        // Opens its FIFO and writes nothing until the merge is over.
+        std::thread::spawn({
+            let fifo = stalled.clone();
+            move || {
+                let w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+                let _ = held.recv();
+                drop(w);
+            }
+        }),
+        // Opens its FIFO (once the merge opens it to read) and closes it.
+        std::thread::spawn({
+            let fifo = empty.clone();
+            move || drop(std::fs::OpenOptions::new().write(true).open(fifo).unwrap())
+        }),
+    ];
+    let out = dir.path().join("merged.bam");
+    let inputs = [stalled.clone(), inputs[0].clone(), empty.clone()];
+    let status = merge_cli_within(&inputs, &out, 2, Duration::from_secs(90));
+    drop(release);
+    // The merge can fail before its pump opens a FIFO (`empty` fails it while
+    // `stalled` is still unopened), leaving that writer blocked in `open`. A
+    // non-blocking open for reading never waits, and releases such a writer;
+    // the read ends stay open until the writers are joined, so a writer that
+    // wakes late still finds a reader.
+    let _readers: Vec<_> = [&stalled, &empty]
+        .into_iter()
+        .filter_map(|fifo| {
+            use rustix::fs::{Mode, OFlags};
+            rustix::fs::open(fifo, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).ok()
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    let log = fs::read_to_string(out.with_extension("log")).unwrap();
+    let status = status.unwrap_or_else(|| panic!("the merge hung on an empty pipe:\n{log}"));
+    assert_eq!(status.code(), Some(1), "an error, not a panic or success:\n{log}");
+    assert!(
+        log.contains(&format!("No records read from {}", empty.display())),
+        "the upstream diagnosis, naming the input:\n{log}"
+    );
+    assert!(!log.contains("Failed to read header"), "not a header-parse error:\n{log}");
+    assert!(!out.exists(), "no partial output");
+}
+
+/// Pipes with independent producers and regular files, mixed, at one thread
+/// and at many: the same bytes as the file merge, records and header. Catches:
+/// a pipe input read out of order or short once it is drained ahead of the
+/// merge, at a pool smaller or larger than the input count.
+#[cfg(unix)]
+#[rstest::rstest]
+fn independent_pipes_and_files_merge_like_files(#[values(1usize, 8)] threads: usize) {
+    let dir = TempDir::new().unwrap();
+    let (inputs, _, _) = sorted_inputs(dir.path(), SortOrder::Coordinate, 60_000, 4, 23);
+    let from_files = dir.path().join("files.bam");
+    merge_cli(&inputs, &from_files, "coordinate", threads);
+    let fifos: Vec<PathBuf> = (0..2).map(|i| dir.path().join(format!("fifo{i}"))).collect();
+    // Inputs 0 and 2 arrive through FIFOs, 1 KB a write; 1 and 3 are files.
+    let writers: Vec<_> = fifos
+        .iter()
+        .zip([&inputs[0], &inputs[2]])
+        .map(|(f, i)| fifo_feed(f, i.clone(), 1000, Duration::ZERO))
+        .collect();
+    let mixed = [fifos[0].clone(), inputs[1].clone(), fifos[1].clone(), inputs[3].clone()];
+    let out = dir.path().join("mixed.bam");
+    let log = merge_cli(&mixed, &out, "coordinate", threads);
+    for w in writers {
+        w.join().unwrap();
+    }
+    let (got_header, got) = read_raw(&out);
+    let (want_header, want) = read_raw(&from_files);
+    assert!(!want.is_empty());
+    assert_eq!(got, want, "--threads {threads}:\n{log}");
+    assert_eq!(header_text_without_pg(&got_header), header_text_without_pg(&want_header));
+}
+
 /// A malformed input record fails the merge with an error naming the input and
 /// the record, in every order, never a panic (exit 101): a record shorter than
 /// the 32-byte BAM core, and one whose core declares a read name longer than

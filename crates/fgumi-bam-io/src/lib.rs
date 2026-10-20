@@ -55,3 +55,14 @@ pub use writer::{
     create_raw_bam_writer, extract_alignment_context, open_output_writer, write_bai_index,
     write_bai_sidecar, write_bam_header,
 };
+
+/// The message of a caught panic's `payload` (a `&str` or `String`, as
+/// `panic!` makes), or `default` for any other payload: for a reader thread
+/// that turns a panic into an error its consumer reports.
+pub fn panic_message(payload: &(dyn std::any::Any + Send), default: &str) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| default.to_string())
+}

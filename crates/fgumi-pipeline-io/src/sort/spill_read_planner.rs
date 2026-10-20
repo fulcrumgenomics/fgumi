@@ -97,6 +97,9 @@ struct PlannedSlot {
     next_seq: u32,
     eof_issued: bool,
     budget: BudgetRef,
+    /// The slot's `unissued_total` when the planner last resumed a stream:
+    /// what its short reads withheld up to then.
+    unissued_seen: u64,
 }
 
 /// What one input event forwards.
@@ -356,6 +359,7 @@ impl SpillReadPlanner {
             next_seq: 0,
             eof_issued: empty,
             budget,
+            unissued_seen: 0,
         });
     }
 
@@ -713,7 +717,7 @@ impl SpillReadPlanner {
         if sequential {
             // A stream is read in order, one read in flight: the next read is
             // issued only once the previous one is ingested, and none after a
-            // short read (the stream's EOF).
+            // zero read (the stream's EOF).
             let s = &mut self.slots[i];
             match s.slot.sequential_read_gate(s.next_seq) {
                 fgumi_sort::SequentialReadGate::Eof => {
@@ -722,6 +726,24 @@ impl SpillReadPlanner {
                 }
                 fgumi_sort::SequentialReadGate::InFlight => return 0,
                 fgumi_sort::SequentialReadGate::Due => {}
+            }
+            // A read returns what the stream has, so it may end short of its
+            // fill: resume at the bytes it delivered, which is where the
+            // stream is. Every slice is ingested (above), so the total is
+            // exact.
+            let unissued = s.slot.unissued_total();
+            s.next_offset -= unissued - s.unissued_seen;
+            s.unissued_seen = unissued;
+            // And only once the stream has bytes (or has ended): the read then
+            // takes what is there without waiting, so no pool worker waits on
+            // a producer, which may itself be waiting for another stream's
+            // read to be issued to a worker (a coupled producer, such as
+            // `tee`). A stream with nothing yet is planned again next pass:
+            // its pump wakes no one when bytes arrive, so this relies on the
+            // runtime polling an idle planner (its workers' parks all time
+            // out), as it already does for the merge's demand.
+            if !s.source.ready_at(s.next_offset) {
+                return 0;
             }
         }
         while let Some(fill) = self.next_fill(i, class, budget, *pool_used) {

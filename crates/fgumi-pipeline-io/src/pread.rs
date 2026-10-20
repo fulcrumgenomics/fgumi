@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fgumi_bam_io::pread::{
-    PositionalSource, SliceBufferPool, SliceLease, read_at_exact, read_until_eof,
+    PositionalSource, SliceBufferPool, SliceLease, read_at_exact, read_once,
 };
 use fgumi_pipeline_core::{
     HeapSize, HeldRetry, Ordered, PhaseCap, PoolPlacement, StepCap, StepCapRef, Unpushed,
@@ -119,13 +119,14 @@ pub struct ReadRequest {
     /// Byte offset of the read.
     pub offset: u64,
     /// Bytes to read; the read fails unless exactly this many arrive (a
-    /// sequential read may end short, at the stream's EOF).
+    /// sequential read may end short: it returns what the stream has).
     pub len: u32,
     /// Whether the read covers the stream's final byte.
     pub last: bool,
-    /// The source is a stream ([`fgumi_bam_io::pread::SequentialSource`]): the
-    /// read loops partial reads until `len` bytes or EOF, and a short fill is
-    /// the stream's last slice. File reads fail closed on a short read.
+    /// The source is a stream ([`fgumi_bam_io::pread::SequentialSource`]): one
+    /// read ([`read_once`]), which may return fewer than `len` bytes; only a
+    /// zero read is the stream's EOF, and its slice is the last. File reads
+    /// fail closed on a short read.
     pub sequential: bool,
     /// Where the bytes go.
     pub target: ReadTarget,
@@ -155,13 +156,13 @@ pub struct ReadSlice {
     /// The request's offset.
     pub offset: u64,
     /// Exactly `len` bytes (a short read is an error, never a short slice),
-    /// except for a sequential read, which ends short at the stream's EOF.
+    /// except for a sequential read, which may be short (empty at EOF).
     pub bytes: SliceLease,
     /// Whether the slice covers the stream's final byte.
     pub last: bool,
-    /// Bytes the request asked for that never arrived: `0`, except for a
-    /// sequential read that ended at the stream's EOF. The ledger lands the
-    /// whole request (`bytes.len() + shortfall`), as the planner issued it.
+    /// Bytes the request asked for that never arrived: `0`, except for a short
+    /// sequential read. The ledger lands the whole request
+    /// (`bytes.len() + shortfall`), as the planner issued it.
     pub shortfall: u32,
     /// Where the bytes go.
     pub target: ReadTarget,
@@ -448,11 +449,17 @@ impl PreadSlices {
         // A read from a slow device or a piped input blocks on the outside
         // world: an external wait, not a wedge (#1068).
         let result = if req.sequential {
-            external_wait(|| read_until_eof(&*req.source, &mut buf, req.offset)).map(|n| {
-                // A short fill is the stream's EOF: the slot's last slice. The
-                // bytes that will never arrive leave the slot's issued count.
+            external_wait(|| read_once(&*req.source, &mut buf, req.offset)).map(|n| {
+                // One read: a pool worker never waits on one stream for more
+                // than it has, which could hold the worker another stream's
+                // read needs (the planner issues a stream's read only once the
+                // stream has bytes, so this read does not wait at all). Only a
+                // zero read is the stream's EOF (the slot's last slice). The
+                // bytes this read did not deliver leave the slot's issued
+                // count; the planner resumes the stream after the bytes that
+                // did.
                 if n < buf.len() {
-                    last = true;
+                    last = n == 0;
                     shortfall = u32::try_from(buf.len() - n).expect("a request length fits u32");
                     if let ReadTarget::Spill { slot, .. } = &req.target {
                         slot.bp_note_unissued((buf.len() - n) as u64);
@@ -467,8 +474,12 @@ impl PreadSlices {
             h.inflight_exit();
         }
         result?;
-        if let Some(h) = &self.hist {
-            h.record(req.len);
+        if let Some(h) = &self.hist
+            && !buf.is_empty()
+        {
+            // What was read: a stream's read may be short of its request (and
+            // its EOF read empty, which is not a request size).
+            h.record(u32::try_from(buf.len()).expect("a request length fits u32"));
         }
         if let Some(l) = &self.input_ledger {
             l.landed.fetch_add(u64::from(req.len), Ordering::Relaxed);
@@ -555,4 +566,4 @@ impl Step for PreadSlices {
 pub(crate) static AFTER_READ: crate::test_hook::TestHook<()> = crate::test_hook::TestHook::new();
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
