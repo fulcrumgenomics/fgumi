@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 
 use crate::types::BgzfBlock;
 use fgumi_pipeline_core::{
+    external_wait,
     header::HeaderHandle,
     step::{
         Affinity, CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile,
@@ -325,7 +326,7 @@ impl WriteBgzfFile {
         let mut header_blocks = Vec::new();
         hc.write_blocks_to(&mut header_blocks)?;
         state.coffset += header_blocks.len() as u64;
-        state.out.write_all(&header_blocks)?;
+        external_wait(|| state.out.write_all(&header_blocks))?;
 
         state.pending_header = None;
         Ok(true)
@@ -450,7 +451,9 @@ impl Step for WriteBgzfFile {
                 // — prune explicitly so `block_positions` stays bounded.
                 sink.bai.prune_below(sink.next_block_no);
             }
-            state.out.write_all(&block.bytes)?;
+            // A write to a full pipe or a slow filesystem blocks on the outside
+            // world: an external wait, not a wedge (#1068).
+            external_wait(|| state.out.write_all(&block.bytes))?;
             // One item (one BgzfBlock) per `try_run`, so this is already the
             // batch total for this call — no per-record loop involved.
             ctx.counters.add(BYTES_WRITTEN, block.bytes.len() as u64);
@@ -478,11 +481,15 @@ impl WriteBgzfFile {
     /// sidecar, if any, so an index is only written for a BAM that closed
     /// cleanly.
     fn finish_stream(mut state: WriterState) -> io::Result<()> {
-        state.out.write_all(&BGZF_EOF)?;
-        close_buffered(state.out)?;
+        // Only the writes are external waits; building the index is CPU work.
+        external_wait(|| {
+            state.out.write_all(&BGZF_EOF)?;
+            close_buffered(state.out)
+        })?;
         if let Some(sink) = state.bai {
             let index = sink.bai.build(sink.num_refs).map_err(io::Error::other)?;
-            write_bai_index(&sink.sidecar_path, &index).map_err(io::Error::other)?;
+            external_wait(|| write_bai_index(&sink.sidecar_path, &index))
+                .map_err(io::Error::other)?;
             log::info!("Wrote BAM index: {}", sink.sidecar_path.display());
         }
         Ok(())

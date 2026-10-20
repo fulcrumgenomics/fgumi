@@ -108,7 +108,7 @@ pub fn bam_header_len_of(
             continue;
         }
         let mut buf = vec![0u8; want];
-        let n = source.read_at(&mut buf, offset)?;
+        let n = fgumi_pipeline_core::external_wait(|| source.read_at(&mut buf, offset))?;
         if n == 0 {
             eof = true;
         }

@@ -2424,6 +2424,8 @@ fn ensure_monitor_visible_transports(
 /// On a stall (no advance), it consults [`in_flight_bytes`] to tell a real
 /// wedge from upstream starvation (mirrors legacy `check_deadlock_and_restore`):
 ///   - idle with nothing in flight → starvation, reset the clock, keep watching;
+///   - a step blocked on I/O outside the pipeline ([`crate::liveness::external_wait`])
+///     → an external wait, reset the clock, keep watching;
 ///   - stuck work past `warn_timeout` → `warn` snapshot, once per warn window;
 ///   - stuck work past `fatal_timeout` → record [`crate::signal::PipelineError::TimedOut`] and
 ///     `cancel()`, so workers observe `is_done()` and the run fails fast instead
@@ -2445,6 +2447,7 @@ fn run_deadlock_monitor(
         last_total: liveness.total(),
         stall_start: std::time::Instant::now(),
         last_warn: None,
+        external_since: None,
     };
     while !stop.is_stopped() {
         sleep_until_stop(stop, poll_interval);
@@ -2462,6 +2465,7 @@ fn run_deadlock_monitor(
             warn_timeout.as_secs(),
             fatal_timeout.as_secs(),
             stuck,
+            liveness.external_waits() > 0,
         );
         if apply_stall_verdict(
             verdict,
@@ -2484,6 +2488,10 @@ struct StallMonitorState {
     last_total: u64,
     stall_start: std::time::Instant,
     last_warn: Option<std::time::Instant>,
+    /// When the current run of [`StallVerdict::ExternalWait`] polls began, so a
+    /// long wait on the outside world is reported (never failed); `None` when the
+    /// last poll was not an external wait.
+    external_since: Option<std::time::Instant>,
 }
 
 /// React to one classified [`StallVerdict`], mutating the rolling monitor
@@ -2510,6 +2518,9 @@ fn apply_stall_verdict(
     mon_state: &mut StallMonitorState,
 ) -> bool {
     use super::signal::PipelineError;
+    if verdict != StallVerdict::ExternalWait {
+        mon_state.external_since = None;
+    }
     match verdict {
         StallVerdict::Progressing => {
             mon_state.last_total = now_total;
@@ -2521,6 +2532,29 @@ fn apply_stall_verdict(
             // stall clock so an idle gap never accumulates toward a fatal.
             mon_state.stall_start = now;
             mon_state.last_warn = None;
+        }
+        StallVerdict::ExternalWait => {
+            // Blocked on I/O outside the pipeline (a full output pipe, a slow
+            // filesystem) — not a deadlock, so never fatal. Restart the wedge
+            // clock at every such poll, so a wedge after the wait ends gets a
+            // full window. Time the wait itself separately and report it once
+            // per warn window: a reader or filesystem that hangs for good
+            // would otherwise leave the run idle with nothing in the log.
+            mon_state.stall_start = now;
+            let since = *mon_state.external_since.get_or_insert(now);
+            let waited = now.duration_since(since);
+            if waited >= warn_timeout
+                && mon_state.last_warn.is_none_or(|w| now.duration_since(w) >= warn_timeout)
+            {
+                log::warn!(
+                    "Pipeline waiting on external I/O for {}s with {stuck} bytes in flight: \
+                     a step is blocked reading or writing a pipe or file (a slow reader \
+                     downstream, a slow writer upstream, or a slow filesystem). Not a \
+                     deadlock; the run continues when the I/O completes.",
+                    waited.as_secs()
+                );
+                mon_state.last_warn = Some(now);
+            }
         }
         StallVerdict::Watching => {}
         StallVerdict::Stalled => {
@@ -2649,6 +2683,19 @@ enum StallVerdict {
     /// clock and keep watching. Mirrors legacy `check_deadlock_and_restore`'s
     /// starvation guard (an empty pipeline is never a deadlock).
     Starving,
+    /// No progress with work stuck, but a step is blocked on I/O outside the
+    /// pipeline (see [`crate::liveness::external_wait`]): a full output pipe
+    /// whose reader is slow, or a slow filesystem. The pipeline is waiting on
+    /// the outside world, not wedged, so — like [`Self::Starving`] — reset the
+    /// stall clock and keep watching; a wait that outlasts the warn window is
+    /// reported, never failed.
+    ///
+    /// The gauge is pipeline-wide, not per step: while any step waits
+    /// externally, a wedge elsewhere is not judged. That only defers the
+    /// verdict — the clock restarts when the wait ends — and in practice a
+    /// wedge stops the waits too: a source stops reading once its output is
+    /// full, and a sink only waits while its consumer is not reading.
+    ExternalWait,
     /// No progress with work stuck, but below the warn threshold — no-op.
     Watching,
     /// No progress with work stuck past the warn (but below the fatal)
@@ -2666,6 +2713,8 @@ enum StallVerdict {
 /// - `warn_secs` / `fatal_secs`: the warn and fatal stall thresholds.
 /// - `in_flight_bytes`: bytes currently held across transport queues **and**
 ///   reorder buffers.
+/// - `waiting_externally`: is any step blocked on I/O outside the pipeline
+///   (see [`crate::liveness::external_wait`])?
 ///
 /// The starvation guard (no progress + nothing in flight ⇒ not a deadlock) and
 /// fatal-on-stuck-work behavior mirror the legacy pipeline's
@@ -2680,12 +2729,16 @@ fn classify_stall(
     warn_secs: u64,
     fatal_secs: u64,
     in_flight_bytes: u64,
+    waiting_externally: bool,
 ) -> StallVerdict {
     if progressed {
         return StallVerdict::Progressing;
     }
     if in_flight_bytes == 0 {
         return StallVerdict::Starving;
+    }
+    if waiting_externally {
+        return StallVerdict::ExternalWait;
     }
     if stall_secs >= fatal_secs {
         return StallVerdict::Wedged;
@@ -5719,7 +5772,7 @@ mod tests {
     fn classify_stall_progress_is_healthy() {
         // Any advance in the global progress counter clears the stall,
         // regardless of how long the prior stall was or what is in flight.
-        assert_eq!(classify_stall(true, 999, 10, 60, 1_000_000), StallVerdict::Progressing);
+        assert_eq!(classify_stall(true, 999, 10, 60, 1_000_000, false), StallVerdict::Progressing);
     }
 
     #[test]
@@ -5727,7 +5780,7 @@ mod tests {
         // No progress, but nothing is stuck anywhere: the pipeline is idle
         // waiting on a slow upstream (e.g. a stdin pipe). Never fatal — mirrors
         // legacy `check_deadlock_and_restore`'s starvation guard.
-        assert_eq!(classify_stall(false, 120, 10, 60, 0), StallVerdict::Starving);
+        assert_eq!(classify_stall(false, 120, 10, 60, 0, false), StallVerdict::Starving);
     }
 
     /// The `in_flight_bytes` probe is blind to queued items whose `heap_size()`
@@ -5756,30 +5809,49 @@ mod tests {
         );
         // ...and a wedge stranding exactly those items is unclassifiable.
         assert_eq!(
-            classify_stall(false, 999, 10, 60, q.current_bytes()),
+            classify_stall(false, 999, 10, 60, q.current_bytes(), false),
             StallVerdict::Starving,
             "a wedge holding only zero-heap items cannot reach Wedged"
         );
+    }
+
+    /// Issue #1068: a step blocked on I/O outside the pipeline (a full output
+    /// pipe, a slow filesystem) is never a stall, however long it lasts and
+    /// however much work is queued behind it. Progress and starvation keep
+    /// their own verdicts.
+    #[rstest]
+    #[case::stuck_past_fatal(false, 600, 4096, StallVerdict::ExternalWait)]
+    #[case::stuck_past_warn(false, 15, 4096, StallVerdict::ExternalWait)]
+    #[case::stuck_below_warn(false, 5, 4096, StallVerdict::ExternalWait)]
+    #[case::nothing_in_flight(false, 600, 0, StallVerdict::Starving)]
+    #[case::progressed(true, 600, 4096, StallVerdict::Progressing)]
+    fn classify_stall_external_wait_is_never_a_stall(
+        #[case] progressed: bool,
+        #[case] stall_secs: u64,
+        #[case] in_flight_bytes: u64,
+        #[case] expected: StallVerdict,
+    ) {
+        assert_eq!(classify_stall(progressed, stall_secs, 10, 60, in_flight_bytes, true), expected);
     }
 
     #[test]
     fn classify_stall_stuck_work_below_fatal_only_warns() {
         // No progress with work stuck, but the stall has not persisted long
         // enough to be sure it is a wedge rather than one slow dispatch.
-        assert_eq!(classify_stall(false, 15, 10, 60, 4096), StallVerdict::Stalled);
+        assert_eq!(classify_stall(false, 15, 10, 60, 4096, false), StallVerdict::Stalled);
     }
 
     #[test]
     fn classify_stall_below_warn_threshold_keeps_watching() {
         // Stalled with stuck work but not yet past the warn threshold: no-op.
-        assert_eq!(classify_stall(false, 5, 10, 60, 4096), StallVerdict::Watching);
+        assert_eq!(classify_stall(false, 5, 10, 60, 4096, false), StallVerdict::Watching);
     }
 
     #[test]
     fn classify_stall_stuck_work_past_fatal_is_wedged() {
         // No progress with work stuck for >= the fatal threshold: a genuine
         // wedge — fail fast instead of hanging forever.
-        assert_eq!(classify_stall(false, 60, 10, 60, 4096), StallVerdict::Wedged);
+        assert_eq!(classify_stall(false, 60, 10, 60, 4096, false), StallVerdict::Wedged);
     }
 
     /// L2.4: a Detached step legitimately blocked on EMPTY input (slow upstream)
@@ -5795,9 +5867,9 @@ mod tests {
         // Long stall, well past the fatal threshold, but nothing is stuck on a
         // visible byte-bounded edge (the Detached step is parked on its empty
         // input). Must be Starving, not Wedged.
-        assert_eq!(classify_stall(false, 600, 10, 60, 0), StallVerdict::Starving);
+        assert_eq!(classify_stall(false, 600, 10, 60, 0, false), StallVerdict::Starving);
         // And the instant the slow producer feeds it, global progress advances.
-        assert_eq!(classify_stall(true, 600, 10, 60, 0), StallVerdict::Progressing);
+        assert_eq!(classify_stall(true, 600, 10, 60, 0, false), StallVerdict::Progressing);
     }
 
     /// L2.4 (revision item 10): a *genuine* wedge of the Detached merge still
@@ -5808,7 +5880,7 @@ mod tests {
     /// because the upstream byte edge always reflects it.
     #[test]
     fn monitor_still_trips_on_genuine_detached_wedge() {
-        assert_eq!(classify_stall(false, 60, 10, 60, 1_048_576), StallVerdict::Wedged);
+        assert_eq!(classify_stall(false, 60, 10, 60, 1_048_576, false), StallVerdict::Wedged);
     }
 
     /// A step with a single output branch of the given `QueueSpec`, used to
@@ -5965,13 +6037,126 @@ mod tests {
         );
     }
 
+    /// A heap-carrying item, so items queued behind a blocked sink register as
+    /// in-flight bytes (a bare `u32` has `heap_size` 0 and would read as
+    /// `Starving`, which never fails the run).
+    struct HeapItem(#[allow(dead_code)] Vec<u8>);
+    impl HeapSize for HeapItem {
+        fn heap_size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    /// Serial byte-bounded source emitting `remaining` [`HeapItem`]s.
+    struct HeapItemSource {
+        remaining: u32,
+    }
+    impl Step for HeapItemSource {
+        type Input = ();
+        type Outputs = Single<HeapItem>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "HeapItemSource",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            if self.remaining == 0 {
+                return Ok(StepOutcome::Finished);
+            }
+            if ctx.outputs.push(HeapItem(vec![0; 1024])).is_ok() {
+                self.remaining -= 1;
+                Ok(StepOutcome::Progress)
+            } else {
+                Ok(StepOutcome::NoProgress)
+            }
+        }
+    }
+
+    /// Serial sink whose first write blocks for `block_for` inside
+    /// [`crate::liveness::external_wait`] — a stand-in for a `write(2)` on a
+    /// full pipe whose reader is slow, or a slow parallel filesystem.
+    struct ExternallyBlockedSink {
+        block_for: std::time::Duration,
+        blocked: bool,
+        received: Arc<AtomicU32>,
+    }
+    impl Step for ExternallyBlockedSink {
+        type Input = HeapItem;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ExternallyBlockedSink",
+                kind: StepKind::Serial,
+                sticky: true,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> std::io::Result<StepOutcome> {
+            if let Some(_item) = ctx.input.pop() {
+                if !self.blocked {
+                    self.blocked = true;
+                    crate::liveness::external_wait(|| std::thread::sleep(self.block_for));
+                }
+                self.received.fetch_add(1, AtomicOrd::Relaxed);
+                return Ok(StepOutcome::Progress);
+            }
+            if ctx.input.is_drained() {
+                return Ok(StepOutcome::Finished);
+            }
+            Ok(StepOutcome::NoProgress)
+        }
+    }
+
+    /// Issue #1068: a step blocked on I/O outside the pipeline (a full output
+    /// pipe whose reader is still loading an index, a spill write stuck on a
+    /// slow parallel filesystem) is waiting on the outside world, not wedged.
+    /// The monitor must not fail the run however long the wait lasts, even
+    /// with work queued behind it.
+    ///
+    /// The wait (8 s) outlasts the fatal window (6 × 1 s); before the fix the
+    /// run failed with `TimedOut`.
+    #[test]
+    fn monitor_does_not_fail_a_step_blocked_on_external_io() {
+        const ITEMS: u32 = 64;
+        let received = Arc::new(AtomicU32::new(0));
+        let builder = PipelineBuilder::new();
+        builder
+            .chain(HeapItemSource { remaining: ITEMS })
+            .chain(ExternallyBlockedSink {
+                block_for: std::time::Duration::from_secs(8),
+                blocked: false,
+                received: Arc::clone(&received),
+            })
+            .into_sink_marker();
+        let pipeline = builder.build().unwrap();
+
+        let result = pipeline.run(PipelineConfig {
+            threads: 2,
+            deadlock_timeout_secs: 1,
+            ..Default::default()
+        });
+
+        assert!(result.is_ok(), "an external wait must not fail the run: {:?}", result.err());
+        assert_eq!(received.load(AtomicOrd::Relaxed), ITEMS);
+    }
+
     #[test]
     fn apply_stall_verdict_wedged_records_timeout_and_cancels() {
         use crate::signal::PipelineError;
         let stats = PipelineStats::new(vec![]);
         let signal = PipelineSignal::new();
         let now = std::time::Instant::now();
-        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+        let mut mon_state = StallMonitorState {
+            last_total: 0,
+            stall_start: now,
+            last_warn: None,
+            external_since: None,
+        };
 
         let stop = apply_stall_verdict(
             StallVerdict::Wedged,
@@ -6000,7 +6185,12 @@ mod tests {
         let stats = PipelineStats::new(vec![]);
         let signal = PipelineSignal::new();
         let now = std::time::Instant::now();
-        let mut mon_state = StallMonitorState { last_total: 0, stall_start: now, last_warn: None };
+        let mut mon_state = StallMonitorState {
+            last_total: 0,
+            stall_start: now,
+            last_warn: None,
+            external_since: None,
+        };
         let warn = std::time::Duration::from_secs(10);
 
         // First stall in the window arms the throttle without failing the run.
@@ -6036,14 +6226,96 @@ mod tests {
         assert_eq!(mon_state.last_warn, armed, "must not re-warn within the same window");
     }
 
+    /// Issue #1068: an external wait never fails the run, but one that outlasts
+    /// the warn window is reported (once per window), so a reader or filesystem
+    /// that hangs for good is visible at the default log level rather than
+    /// leaving the run silently idle.
+    #[test]
+    fn apply_stall_verdict_external_wait_warns_after_the_window_but_never_fails() {
+        let signal = PipelineSignal::new();
+        let t0 = std::time::Instant::now();
+        let warn = std::time::Duration::from_secs(10);
+        let mut mon_state = StallMonitorState {
+            last_total: 0,
+            stall_start: t0,
+            last_warn: None,
+            external_since: None,
+        };
+        let poll = |at_secs: u64, mon_state: &mut StallMonitorState| {
+            let at = t0 + std::time::Duration::from_secs(at_secs);
+            let stop = apply_stall_verdict(
+                StallVerdict::ExternalWait,
+                at,
+                0,
+                0,
+                4096,
+                warn,
+                None,
+                &signal,
+                mon_state,
+            );
+            assert!(!stop, "an external wait must never stop the monitor");
+        };
+
+        poll(2, &mut mon_state);
+        assert_eq!(mon_state.external_since, Some(t0 + std::time::Duration::from_secs(2)));
+        assert!(mon_state.last_warn.is_none(), "no report inside the warn window");
+
+        poll(12, &mut mon_state);
+        let first = mon_state.last_warn.expect("a wait past the warn window is reported");
+
+        poll(15, &mut mon_state);
+        assert_eq!(mon_state.last_warn, Some(first), "at most one report per window");
+
+        poll(600, &mut mon_state);
+        assert!(mon_state.last_warn > Some(first), "a long wait keeps being reported");
+        assert!(!signal.is_done(), "however long it lasts, the run is not failed");
+        assert_eq!(
+            mon_state.stall_start,
+            t0 + std::time::Duration::from_secs(600),
+            "the wedge clock restarts at every external-wait poll"
+        );
+    }
+
+    /// When the external wait ends without progress, the next verdict clears
+    /// the wait so a later one is timed afresh.
+    #[test]
+    fn apply_stall_verdict_clears_the_external_wait_on_any_other_verdict() {
+        let signal = PipelineSignal::new();
+        let t0 = std::time::Instant::now();
+        let warn = std::time::Duration::from_secs(10);
+        let mut mon_state = StallMonitorState {
+            last_total: 0,
+            stall_start: t0,
+            last_warn: None,
+            external_since: Some(t0),
+        };
+        apply_stall_verdict(
+            StallVerdict::Watching,
+            t0 + std::time::Duration::from_secs(1),
+            0,
+            1,
+            4096,
+            warn,
+            None,
+            &signal,
+            &mut mon_state,
+        );
+        assert_eq!(mon_state.external_since, None);
+    }
+
     #[test]
     fn apply_stall_verdict_progressing_and_starving_reset_the_clock() {
         let stats = PipelineStats::new(vec![]);
         let signal = PipelineSignal::new();
         let t0 = std::time::Instant::now();
         let warn = std::time::Duration::from_secs(10);
-        let mut mon_state =
-            StallMonitorState { last_total: 0, stall_start: t0, last_warn: Some(t0) };
+        let mut mon_state = StallMonitorState {
+            last_total: 0,
+            stall_start: t0,
+            last_warn: Some(t0),
+            external_since: None,
+        };
 
         // Progress advances the watermark and clears the warn throttle.
         let later = t0 + std::time::Duration::from_secs(5);

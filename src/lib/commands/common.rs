@@ -1287,8 +1287,12 @@ pub struct SchedulerOptions {
 
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
     ///
-    /// When no progress is made for this duration, a warning is logged with
-    /// diagnostic info (queue depths, memory usage, per-queue timestamps).
+    /// When no progress is made for this duration with work still queued, a
+    /// warning is logged with diagnostic info (queue depths, memory usage,
+    /// per-queue timestamps); on a multi-threaded run, the run fails if the
+    /// stall lasts six times this long. Time a step spends blocked reading or
+    /// writing a pipe or file — a slow reader downstream, or a slow
+    /// filesystem — does not count and never fails the run.
     #[arg(long = "deadlock-timeout", default_value_t = 10, hide = true)]
     pub deadlock_timeout: u64,
 

@@ -660,7 +660,9 @@ impl Step for ReadSamChunks {
         let next = {
             let mut guard = self.state.lock();
             let state = guard.as_mut().expect("ReadSamChunks: state missing — was clone() called?");
-            state.read_next_chunk(self.target_chunk_bytes)?
+            // A read from a pipe whose writer is slow (an aligner still loading
+            // its index) blocks on the outside world (#1068).
+            crate::pipeline::core::external_wait(|| state.read_next_chunk(self.target_chunk_bytes))?
         };
 
         let Some((bytes, line_offsets)) = next else {

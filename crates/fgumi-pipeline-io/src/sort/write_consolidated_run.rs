@@ -17,6 +17,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use fgumi_pipeline_core::external_wait;
 use fgumi_pipeline_core::step::{DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 use fgumi_sort::{SpillCodec, spill_magic, spill_trailer};
 
@@ -79,15 +80,20 @@ impl WriteConsolidatedRun {
                     ),
                 )
             })?;
-            let file =
-                OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to create consolidated run {}: {e}", path.display()),
-                    )
-                })?;
-            let mut writer = BufWriter::with_capacity(256 * 1024, file);
-            writer.write_all(spill_magic(self.codec))?;
+            // Run-file I/O blocks on the filesystem — minutes on a busy parallel
+            // filesystem — which is an external wait, not a wedge (#1068).
+            let writer = external_wait(|| {
+                let file =
+                    OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("failed to create consolidated run {}: {e}", path.display()),
+                        )
+                    })?;
+                let mut writer = BufWriter::with_capacity(256 * 1024, file);
+                writer.write_all(spill_magic(self.codec))?;
+                Ok::<_, io::Error>(writer)
+            })?;
             self.current = Some(OpenRun { job_id, path, writer });
         }
         let open = self.current.as_mut().expect("opened above");
@@ -100,17 +106,22 @@ impl WriteConsolidatedRun {
                 ),
             ));
         }
-        open.writer.write_all(&bytes)?;
+        external_wait(|| open.writer.write_all(&bytes))?;
         let written = bytes.len() as u64;
         if let Some(pool) = &self.buf_pool {
             pool.give(bytes);
         }
         if is_last_in_file {
             let OpenRun { job_id, path, mut writer } = self.current.take().expect("open run");
-            writer.write_all(spill_trailer(self.codec))?;
-            writer.flush()?;
-            drop(writer);
-            let len = std::fs::metadata(&path)?.len();
+            // Dropping the writer closes the file, which can block on a parallel
+            // filesystem (NFS, Lustre) as long as the writes, so it is bracketed too.
+            external_wait(|| {
+                writer.write_all(spill_trailer(self.codec))?;
+                writer.flush()?;
+                drop(writer);
+                Ok::<_, io::Error>(())
+            })?;
+            let len = external_wait(|| std::fs::metadata(&path))?.len();
             self.registry.complete(job_id, len);
         }
         Ok(written)

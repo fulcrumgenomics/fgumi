@@ -187,6 +187,14 @@ fn drain_finalize(
         }
     }
 
+    // The always-run hooks above log their summaries — "completed (N records
+    // written)" — even when the run failed, so say plainly that it did not
+    // complete. Logged last so it is the final word before the error, for a
+    // reader of a log from a shell pipeline without `pipefail` (#1068).
+    if let Err(e) = &run_result {
+        log::error!("Run aborted ({e}); its output is incomplete");
+    }
+
     // The pipeline-run error takes precedence over hook errors. Resolve the
     // combined result of the run plus the always-run hooks first.
     run_result.and_then(|()| first_hook_error.map_or(Ok(()), Err))?;
@@ -332,6 +340,47 @@ mod tests {
             0,
             "the second success hook must be short-circuited by the first's failure"
         );
+    }
+
+    /// Issue #1068: the always-run hooks still log their "completed" lines
+    /// (with partial counts) after a failed run, so a pipeline run without
+    /// `pipefail` could read the log as a success. A failed run must end with
+    /// an explicit error saying it was aborted and its output is incomplete —
+    /// logged after the hooks, so it is the last word.
+    #[test]
+    fn drain_finalize_logs_an_abort_after_the_hooks_on_a_failed_run() {
+        use crate::commands::common::test_log_capture::{capture_logs, captured_with_level};
+
+        struct LoggingHook;
+        impl FinalizeHook for LoggingHook {
+            fn finalize(self: Box<Self>) -> Result<()> {
+                log::info!("Stage: completed (3 records written)");
+                Ok(())
+            }
+        }
+
+        let _session = capture_logs();
+        let result = drain_finalize(
+            Err(anyhow::anyhow!("pipeline deadlock")),
+            vec![Box::new(LoggingHook)],
+            vec![],
+        );
+        assert!(result.is_err());
+
+        let logs = captured_with_level();
+        let completed = logs.iter().position(|(_, m)| m.contains("completed (3 records"));
+        // Match this run's own cause: under plain `cargo test`, sibling tests that
+        // drain a failed run log their own abort lines into the shared buffer.
+        let aborted = logs.iter().position(|(level, m)| {
+            *level == log::Level::Error
+                && m.contains("aborted")
+                && m.contains("incomplete")
+                && m.contains("pipeline deadlock")
+        });
+        let (Some(completed), Some(aborted)) = (completed, aborted) else {
+            panic!("expected a hook line and an abort error, got {logs:?}");
+        };
+        assert!(aborted > completed, "the abort must follow the hooks' lines: {logs:?}");
     }
 
     #[test]

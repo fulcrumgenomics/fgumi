@@ -154,6 +154,9 @@ pub(crate) fn run_worker_loop(
     state_slot: usize,
     wake: &WakePlan,
 ) {
+    // Route this thread's `external_wait` calls to this pipeline's monitor, so
+    // a step blocked on a slow pipe or filesystem is not taken for a wedge.
+    let _external_waits = liveness.enter_thread();
     // A pinned worker (the sole eligible dispatcher of an Exclusive/sticky step,
     // or the affinity target of a Serial step) must NOT deep-park on the shared
     // event-count: `notify_one` cannot target a specific worker, so a push meant

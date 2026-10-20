@@ -16,7 +16,7 @@ use noodles::sam::Header;
 
 use crate::types::BgzfBlock;
 use fgumi_pipeline_core::{
-    Unpushed,
+    Unpushed, external_wait,
     held::HeldSlot,
     outputs::OrderedBytesSingle,
     queues::QueueSpec,
@@ -126,7 +126,9 @@ impl Step for ReadBgzfBlocks {
                 .reader
                 .as_mut()
                 .expect("ReadBgzfBlocks: try_run called after the source reported Finished");
-            read_raw_blocks(reader.as_mut(), self.blocks_per_batch)?
+            // A read from a pipe whose writer is slow (an aligner still
+            // loading its index) blocks on the outside world (#1068).
+            external_wait(|| read_raw_blocks(reader.as_mut(), self.blocks_per_batch))?
         };
 
         if raw_blocks.is_empty() {

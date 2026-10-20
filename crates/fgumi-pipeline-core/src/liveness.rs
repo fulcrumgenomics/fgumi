@@ -53,8 +53,28 @@
 //! is fine for the only question asked of it: a torn total still *changes* when
 //! any worker makes progress, and monotonicity per slot means it can never
 //! spuriously appear frozen while work is happening.
+//!
+//! # External waits
+//!
+//! The counter is bumped when a dispatch *returns* with progress, so a step
+//! blocked inside one dispatch on something outside the pipeline — a
+//! `write(2)` to a full pipe whose reader is still loading an index, a spill
+//! write stuck on a slow parallel filesystem — looks exactly like a wedge:
+//! no progress, and work queued behind it. Such a step is waiting on the
+//! outside world, not deadlocked, and no timeout is long enough to tell the
+//! two apart from progress alone (issue #1068).
+//!
+//! Steps therefore bracket every call that may block on an external resource
+//! with [`external_wait`]. While one is in flight, the counter's
+//! [`LivenessCounter::external_waits`] is non-zero and the monitor treats the
+//! stall as a wait rather than a wedge. The bracket finds the running
+//! pipeline's counter through a thread-local the worker loop installs
+//! (`LivenessCounter::enter_thread`), so a step needs no handle to the
+//! runtime; outside a pipeline worker it is a plain call.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::padded::Padded;
 
@@ -70,6 +90,58 @@ pub struct LivenessCounter {
     /// that runs once per productive dispatch, which measured as a double-digit
     /// percentage of dispatch cost.
     mask: usize,
+    /// Calls currently blocked inside [`external_wait`] on this pipeline's
+    /// threads. Shared (rather than inline) so a worker's thread-local can hold
+    /// it without borrowing the counter.
+    external_waits: Arc<AtomicUsize>,
+}
+
+thread_local! {
+    /// The external-wait gauge of the pipeline whose worker loop runs on this
+    /// thread, installed by [`LivenessCounter::enter_thread`].
+    static EXTERNAL_WAITS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+}
+
+/// Run `f`, a call that may block on a resource outside the pipeline — a read
+/// or write on a pipe, file or socket — and count it as an external wait for
+/// as long as it runs, so the deadlock monitor does not mistake a slow reader
+/// or filesystem for a wedge (see the [module docs](self#external-waits)).
+///
+/// Wrap only calls that block on the outside world. A wait on another step of
+/// the same pipeline (a condvar, a channel fed by a sibling step) must not be
+/// wrapped: that wait *can* be part of a wedge, and wrapping it would hide it.
+///
+/// Outside a pipeline worker thread this is just `f()`.
+pub fn external_wait<R>(f: impl FnOnce() -> R) -> R {
+    // Decrement on unwind too, so a panicking call cannot pin the gauge.
+    struct Leave(Arc<AtomicUsize>);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let gauge = EXTERNAL_WAITS.with(|g| g.borrow().clone());
+    let Some(gauge) = gauge else {
+        return f();
+    };
+    gauge.fetch_add(1, Ordering::Relaxed);
+    let _leave = Leave(gauge);
+    f()
+}
+
+/// Installs a pipeline's external-wait gauge on the current thread for its
+/// lifetime and restores the previous one on drop. See
+/// [`LivenessCounter::enter_thread`].
+#[must_use = "the gauge is uninstalled when the scope is dropped"]
+pub(crate) struct ThreadScope {
+    previous: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for ThreadScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        EXTERNAL_WAITS.with(|g| *g.borrow_mut() = previous);
+    }
 }
 
 impl LivenessCounter {
@@ -83,7 +155,28 @@ impl LivenessCounter {
         // dividing. The slack is a few unused cache lines — irrelevant next to
         // removing a division from a per-dispatch path.
         let n = n_workers.max(1).next_power_of_two();
-        Self { slots: (0..n).map(|_| Padded(AtomicU64::new(0))).collect(), mask: n - 1 }
+        Self {
+            slots: (0..n).map(|_| Padded(AtomicU64::new(0))).collect(),
+            mask: n - 1,
+            external_waits: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Route [`external_wait`] calls made on the current thread to this
+    /// counter until the returned scope is dropped. Called once at the top of
+    /// every worker loop; the previous gauge (if any) is restored on drop, so
+    /// the single-worker path, which runs on the caller's thread, leaves it as
+    /// it found it.
+    pub(crate) fn enter_thread(&self) -> ThreadScope {
+        let gauge = Some(Arc::clone(&self.external_waits));
+        ThreadScope { previous: EXTERNAL_WAITS.with(|g| g.replace(gauge)) }
+    }
+
+    /// Number of [`external_wait`] calls currently blocked on this pipeline's
+    /// threads. Read by the monitor once per poll.
+    #[must_use]
+    pub fn external_waits(&self) -> usize {
+        self.external_waits.load(Ordering::Relaxed)
     }
 
     /// Record one unit of progress for `worker`.
@@ -129,6 +222,7 @@ impl std::fmt::Debug for LivenessCounter {
             .field("slots", &self.slots.len())
             .field("mask", &self.mask)
             .field("total", &self.total())
+            .field("external_waits", &self.external_waits())
             .finish()
     }
 }
@@ -188,6 +282,54 @@ mod tests {
             h.join().expect("worker thread joins");
         }
         assert_eq!(counter.total(), WORKERS as u64 * PER_WORKER);
+    }
+
+    /// Inside an entered thread, an external wait is visible to the monitor for
+    /// exactly as long as the call runs.
+    #[test]
+    fn an_external_wait_is_counted_only_while_it_runs() {
+        let counter = LivenessCounter::new(1);
+        let _scope = counter.enter_thread();
+        let during = external_wait(|| counter.external_waits());
+        assert_eq!(during, 1, "the wait is counted while it runs");
+        assert_eq!(counter.external_waits(), 0, "and released when it returns");
+    }
+
+    /// A call that panics must still release the gauge, or the monitor would
+    /// treat every later stall as an external wait.
+    #[test]
+    fn a_panicking_external_wait_releases_the_gauge() {
+        let counter = LivenessCounter::new(1);
+        let _scope = counter.enter_thread();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            external_wait(|| panic!("intentional"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(counter.external_waits(), 0);
+    }
+
+    /// Off a pipeline thread the bracket is a plain call; once a scope is
+    /// dropped the thread no longer reports to that pipeline.
+    #[test]
+    fn external_wait_outside_an_entered_thread_is_a_plain_call() {
+        let counter = LivenessCounter::new(1);
+        drop(counter.enter_thread());
+        assert_eq!(external_wait(|| 7), 7);
+        assert_eq!(counter.external_waits(), 0, "a dropped scope no longer routes waits");
+    }
+
+    /// Scopes nest: the inner pipeline's waits go to the inner counter, and
+    /// dropping the inner scope restores the outer one.
+    #[test]
+    fn nested_scopes_restore_the_outer_gauge() {
+        let outer = LivenessCounter::new(1);
+        let inner = LivenessCounter::new(1);
+        let _outer_scope = outer.enter_thread();
+        {
+            let _inner_scope = inner.enter_thread();
+            assert_eq!(external_wait(|| (outer.external_waits(), inner.external_waits())), (0, 1));
+        }
+        assert_eq!(external_wait(|| (outer.external_waits(), inner.external_waits())), (1, 0));
     }
 
     /// Each slot must sit on its own cache line — the whole reason for sharding.

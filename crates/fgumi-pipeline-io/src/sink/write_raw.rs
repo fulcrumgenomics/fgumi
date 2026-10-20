@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 
 use crate::types::{BgzfBlock, DecompressedBlock};
 use fgumi_pipeline_core::{
+    external_wait,
     item::HeapSize,
     step::{Affinity, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
@@ -103,13 +104,15 @@ impl<B: RawBytesBlock> Step for WriteRawFile<B> {
         };
 
         if let Some(block) = ctx.input.pop() {
-            out.write_all(block.bytes())?;
+            // A write to a full pipe blocks until the reader drains it: an
+            // external wait, not a wedge (#1068).
+            external_wait(|| out.write_all(block.bytes()))?;
             return Ok(StepOutcome::Progress);
         }
 
         if ctx.input.is_drained() {
             let out = guard.take().expect("sink is open: checked above");
-            finish_stream(out, self.trailer)?;
+            external_wait(|| finish_stream(out, self.trailer))?;
             return Ok(StepOutcome::Finished);
         }
         Ok(StepOutcome::NoProgress)

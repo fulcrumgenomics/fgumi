@@ -1356,3 +1356,69 @@ fn test_fastq_check_crc_flags_resolve_the_verify_policy() {
     both.push("--no-check-crc");
     assert!(Fastq::try_parse_from(both).is_err(), "--check-crc and --no-check-crc must conflict");
 }
+
+/// Issue #1068: a reader that is slow to drain stdout (an aligner still loading
+/// its index, or a downstream `sort` spilling to a slow filesystem) blocks the
+/// sink in `write(2)` on a full pipe. That is back-pressure from outside the
+/// process, not an internal deadlock, so the stall watchdog must not fail the
+/// run however long the reader takes.
+///
+/// The reader waits 8 s before draining, past the 6 s fatal window of
+/// `--deadlock-timeout 1`; the run must still succeed and write every record.
+#[cfg(unix)]
+#[test]
+fn test_fastq_survives_a_reader_slower_than_the_deadlock_timeout() {
+    const PAIRS: usize = 20_000;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let fifo = temp_dir.path().join("out.fq");
+
+    let seq = "ACGT".repeat(38);
+    let qual = "I".repeat(seq.len());
+    let names: Vec<String> = (0..PAIRS).map(|i| format!("read{i}")).collect();
+    let read_pairs: Vec<(&str, &str, &str, &str, &str, bool)> = names
+        .iter()
+        .map(|name| {
+            (name.as_str(), seq.as_str(), qual.as_str(), seq.as_str(), qual.as_str(), false)
+        })
+        .collect();
+    create_paired_bam(&input_bam, read_pairs);
+
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed");
+
+    // The reader's open pairs with the command's open of the write end; then it
+    // holds off reading until well past the watchdog's fatal window, and keeps
+    // every header line.
+    let reader_path = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        let file = fs::File::open(&reader_path).expect("open fifo for reading");
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        BufReader::new(file)
+            .lines()
+            .map(|l| l.expect("read fifo"))
+            .step_by(4)
+            .collect::<Vec<String>>()
+    });
+
+    let cmd = Fastq::try_parse_from([
+        "fastq",
+        "-i",
+        input_bam.to_str().unwrap(),
+        "-@",
+        "2",
+        "--deadlock-timeout",
+        "1",
+        "-o",
+        fifo.to_str().unwrap(),
+    ])
+    .expect("failed to parse fastq args");
+    // Check the result before joining: a command that failed before opening the
+    // FIFO would leave the reader blocked in its open forever.
+    cmd.execute("fgumi fastq").expect("a slow reader is back-pressure, not a deadlock");
+    let headers = reader.join().expect("reader thread");
+
+    let expected: Vec<String> =
+        names.iter().flat_map(|n| [format!("@{n}/1"), format!("@{n}/2")]).collect();
+    assert_eq!(headers, expected, "every FASTQ record reaches the reader, in order");
+}

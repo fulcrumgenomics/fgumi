@@ -59,7 +59,7 @@ pub use handles::{
 pub use header::{AlreadySetError, HeaderHandle};
 pub use held::HeldSlot;
 pub use item::{HeapSize, Ordered};
-pub use liveness::LivenessCounter;
+pub use liveness::{LivenessCounter, external_wait};
 pub use outputs::{
     MAX_ARITY, OrderedBytesSingle, OrderedBytesTuple2, OrderedBytesTuple3, Single, StepOutputs,
 };

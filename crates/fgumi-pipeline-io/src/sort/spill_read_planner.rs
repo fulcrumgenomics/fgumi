@@ -398,13 +398,17 @@ impl SpillReadPlanner {
             self.next_slot_id = slot_id.checked_add(1).ok_or_else(|| {
                 io::Error::other("consolidation slot ids exhausted (more than 2^31 inputs)")
             })?;
-            let slot = fgumi_sort::open_spill_slot_as(&input.path, input.file_id, slot_id)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "SpillReadPlanner: failed to open consolidation input {}: {e:#}",
-                        input.path.display()
-                    ))
-                })?;
+            // Opening reads the file's magic: an external wait on the
+            // filesystem (#1068).
+            let slot = fgumi_pipeline_core::external_wait(|| {
+                fgumi_sort::open_spill_slot_as(&input.path, input.file_id, slot_id)
+            })
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "SpillReadPlanner: failed to open consolidation input {}: {e:#}",
+                    input.path.display()
+                ))
+            })?;
             self.register(&slot, BudgetRef::Job(job_id), budget.fifo_cold);
             slots.push(slot);
             input_paths.push(input.path);
