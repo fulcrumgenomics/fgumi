@@ -230,7 +230,7 @@ pub struct SortMergeSlot {
     /// is discovered at EOF.
     len: u64,
     /// The source is a stream (a pipe input of `fgumi merge`): read in order,
-    /// one read at a time, until a short read ([`Self::new_sequential`]).
+    /// one read at a time, until a zero read ([`Self::new_sequential`]).
     sequential: bool,
     /// Decompressed bytes before the first record (a BAM input's header),
     /// skipped by the merge's parser.
@@ -268,6 +268,10 @@ pub struct SortMergeSlot {
     /// Bytes requested from the file but not yet parsed (the read planner adds
     /// on issue, [`Self::bp_ingest_slice`] subtracts on parse).
     pub(crate) issued_bytes: AtomicU64,
+    /// Every byte [`Self::bp_note_unissued`] has withdrawn: what a stream's
+    /// short reads did not deliver, so the planner resumes at the stream's
+    /// real position ([`Self::unissued_total`]).
+    unissued_total: AtomicU64,
     /// Lock-free mirror of `decompressed.len()`, stored under that lock.
     pub(crate) fifo_len_mirror: AtomicU32,
     /// Lock-free mirror of the blocks waiting in `reorder`, stored under that
@@ -366,6 +370,7 @@ impl SortMergeSlot {
             carry_bytes: AtomicU64::new(0),
             stash_len: AtomicU32::new(0),
             issued_bytes: AtomicU64::new(0),
+            unissued_total: AtomicU64::new(0),
             fifo_len_mirror: AtomicU32::new(0),
             reorder_len_mirror: AtomicU32::new(0),
             fifo_cap: AtomicU32::new(mirror(PHASE2_DECOMP_CAP)),
@@ -416,7 +421,7 @@ impl SortMergeSlot {
 
     /// A slot over a stream (`source` serves reads only at its cursor, as a
     /// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource) does): its
-    /// length is unknown (`u64::MAX`) and its EOF is the first short read.
+    /// length is unknown (`u64::MAX`) and its EOF is the first zero read.
     #[must_use]
     pub fn new_sequential(
         file_id: u32,
@@ -640,11 +645,21 @@ impl SortMergeSlot {
     }
 
     /// Withdraw `bytes` of an issued read that will not arrive: a sequential
-    /// read that ended short at the stream's EOF delivers fewer bytes than it
-    /// asked for.
+    /// read returns what the stream has, so it may deliver fewer bytes than it
+    /// asked for (and none at EOF). Called by the reader before the slice is
+    /// handed on, so the slice's ingestion publishes it
+    /// ([`Self::ingested_slices`] is `Release`/`Acquire`).
     pub fn bp_note_unissued(&self, bytes: u64) {
         let prev = self.issued_bytes.fetch_sub(bytes, Ordering::Relaxed);
         debug_assert!(prev >= bytes, "withdrew {bytes} unissued bytes with only {prev} issued");
+        self.unissued_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Every byte [`Self::bp_note_unissued`] has withdrawn. Exact for a reader
+    /// that has seen [`Self::ingested_slices`] cover every slice issued.
+    #[must_use]
+    pub fn unissued_total(&self) -> u64 {
+        self.unissued_total.load(Ordering::Relaxed)
     }
 
     /// Ingest one read slice of this file (slice sequence `seq`; `last` when it

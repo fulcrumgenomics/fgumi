@@ -101,6 +101,12 @@ pub struct Merge {
     /// decompresses the inputs while the output is compressed, so it runs
     /// `--threads` + min(inputs, `--threads`) workers (two at the default) plus
     /// the merge thread. The merge's read-ahead is sized from `--threads`.
+    /// Each input that is not a regular BGZF file (a pipe, FIFO, process
+    /// substitution, SAM or gzip) also gets a thread of its own that drains it
+    /// into a buffer of about 4 MiB as its producer writes, so a producer
+    /// feeding several inputs at once (`tee`) is held back by the merge's
+    /// reading order only once one input runs that far, plus its read-ahead,
+    /// ahead of the others.
     #[arg(short = '@', short_alias = 't', long = "threads", default_value = "1")]
     pub threads: usize,
 
@@ -180,10 +186,72 @@ impl Command for Merge {
         // Open every input once: a file positionally, a stream (pipe, FIFO,
         // process substitution) sequentially, its header parsed through the
         // source so the bytes the parse consumes are replayed to the merge.
-        let mut opened = Vec::with_capacity(input_paths.len());
-        let mut headers = Vec::with_capacity(input_paths.len());
-        for path in &input_paths {
-            let (input, header) = open_merge_input(path)?;
+        // A stream is opened and drained on a thread of its own, and every
+        // stream's header is parsed at once: one producer may feed several
+        // of them (`tee`), opening each FIFO in turn (in its own order, not
+        // ours) and writing to none until all are open, then writing to each
+        // in turn, so no stream's open or header may wait on another's.
+        reject_repeated_streams(&input_paths)?;
+        let pending = input_paths
+            .iter()
+            .map(|path| open_merge_input(path))
+            .collect::<Result<Vec<OpenedInput>>>()?;
+        // Watch the streams from now (their headers can stall too) until the
+        // merge returns, when the guard is dropped.
+        let _stall_watch = CoupledStallWatch::start(
+            input_paths
+                .iter()
+                .zip(&pending)
+                .filter_map(|(path, input)| match input {
+                    OpenedInput::Stream(source) => {
+                        Some((path.clone(), std::sync::Arc::clone(source)))
+                    }
+                    OpenedInput::File(_) => None,
+                })
+                .collect(),
+        );
+        // Each stream's header is parsed on a thread of its own, and the
+        // first failure, from any input, is reported at once rather than after
+        // a header whose producer may never write (that thread is abandoned).
+        let n = input_paths.len();
+        let mut slots: Vec<Option<(fgumi_pipeline_io::sort::MergeInput, Header)>> =
+            (0..n).map(|_| None).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut threads = 0usize;
+        for (i, (path, input)) in input_paths.iter().zip(pending).enumerate() {
+            match input {
+                OpenedInput::File(opened) => slots[i] = Some(*opened),
+                OpenedInput::Stream(source) => {
+                    let (tx, name) = (tx.clone(), path.clone());
+                    std::thread::Builder::new()
+                        .name("fgumi-merge-header".to_string())
+                        .spawn(move || {
+                            let result =
+                                catch_header_panic(&name, || read_stream_header(&name, source));
+                            let _ = tx.send((i, result));
+                        })
+                        .with_context(|| {
+                            format!(
+                                "cannot start a thread to read the header of {}",
+                                path.display()
+                            )
+                        })?;
+                    threads += 1;
+                }
+            }
+        }
+        drop(tx);
+        for _ in 0..threads {
+            // Every thread sends, a panic included (`catch_header_panic`), so
+            // the channel closes early only if a thread died outside it.
+            let (i, result) = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("a header reader exited without a result"))?;
+            slots[i] = Some(result?);
+        }
+        let mut opened = Vec::with_capacity(n);
+        let mut headers = Vec::with_capacity(n);
+        for (input, header) in slots.into_iter().map(|s| s.expect("every header was read")) {
             opened.push(input);
             headers.push(header);
         }
@@ -251,13 +319,67 @@ impl Command for Merge {
     }
 }
 
-/// One merge input, opened once: a regular BGZF file read positionally, or a
-/// stream (pipe, FIFO, process substitution) or SAM / plain-gzip file,
-/// normalized to BGZF and read in order through a
-/// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource), whose header
-/// parse the source replays to the merge. The classification is the one every
-/// positional reader applies ([`fgumi_bam_io::pread::open_seekable_bgzf`]).
-fn open_merge_input(path: &Path) -> Result<(fgumi_pipeline_io::sort::MergeInput, Header)> {
+/// One merge input, opened once: a regular BGZF file read positionally, its
+/// header already parsed, or a stream (pipe, FIFO, process substitution) or
+/// SAM / plain-gzip file, read in order through a
+/// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource) whose pump is
+/// already opening and draining it, its header still to parse
+/// ([`read_stream_header`]).
+enum OpenedInput {
+    /// A regular BGZF file and its header (boxed: a parsed header is large).
+    File(Box<(fgumi_pipeline_io::sort::MergeInput, Header)>),
+    /// A stream, its pump already opening and draining it.
+    Stream(std::sync::Arc<fgumi_bam_io::pread::SequentialSource>),
+}
+
+/// Run one header reader, turning a panic into an error naming its input. Its
+/// thread must always send a result: the merge waits on the channel, and while
+/// another reader's producer stalls that wait would never end.
+fn catch_header_panic<T>(path: &Path, read: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).map_err(|payload| {
+        let cause = fgumi_bam_io::panic_message(payload.as_ref(), "unknown cause");
+        anyhow::anyhow!("the header reader of {} panicked: {cause}", path.display())
+    })?
+}
+
+/// A stream input and its header, parsed through the source, whose prefix the
+/// source then replays to the merge. When the parse fails because the stream
+/// itself failed (it could not be opened, was empty, was neither BAM nor SAM,
+/// or its producer broke it), that error is reported as is: it names the
+/// input and the cause, which a header-parse error would hide.
+fn read_stream_header(
+    path: &Path,
+    source: std::sync::Arc<fgumi_bam_io::pread::SequentialSource>,
+) -> Result<(fgumi_pipeline_io::sort::MergeInput, Header)> {
+    let header = match noodles::bam::io::Reader::new(source.header_reader()).read_header() {
+        Ok(header) => header,
+        Err(parse) => {
+            if let Some(stream) = source.stream_error() {
+                return Err(anyhow::Error::new(stream));
+            }
+            return Err(anyhow::Error::new(parse)
+                .context(format!("Failed to read header from: {}", path.display())));
+        }
+    };
+    let input = fgumi_pipeline_io::sort::MergeInput {
+        path: path.to_path_buf(),
+        prefix_len: Some(source.prefix_len()),
+        source,
+        len: None,
+    };
+    Ok((input, header))
+}
+
+/// Open one merge input. A regular BGZF file is read positionally and its
+/// header parsed now (reading a file waits on no producer). Anything else —
+/// a stream, or a SAM / plain-gzip file — becomes a
+/// [`SequentialSource`](fgumi_bam_io::pread::SequentialSource), whose pump
+/// thread opens it (a FIFO's open waits for its writer), normalizes it to BGZF
+/// (classifying it reads its first bytes) and drains it from then on; this
+/// returns without waiting for any of that. The classification is the one
+/// every positional reader applies ([`fgumi_bam_io::pread::open_seekable_bgzf`]),
+/// and it opens nothing that is not a regular file.
+fn open_merge_input(path: &Path) -> Result<OpenedInput> {
     use fgumi_bam_io::pread::{SeekableInput, SequentialSource, open_seekable_bgzf};
     use std::sync::Arc;
     let opened = open_seekable_bgzf(path)
@@ -274,20 +396,151 @@ fn open_merge_input(path: &Path) -> Result<(fgumi_pipeline_io::sort::MergeInput,
             len: Some(len),
             prefix_len: None,
         };
-        return Ok((input, header));
+        return Ok(OpenedInput::File(Box::new((input, header))));
     }
-    let stream = fgumi_bam_io::open_normalized_input(path)?;
-    let source = Arc::new(SequentialSource::new(path, stream));
-    let header = noodles::bam::io::Reader::new(source.header_reader())
-        .read_header()
-        .with_context(|| format!("Failed to read header from: {}", path.display()))?;
-    let input = fgumi_pipeline_io::sort::MergeInput {
-        path: path.to_path_buf(),
-        prefix_len: Some(source.prefix_len()),
-        source,
-        len: None,
-    };
-    Ok((input, header))
+    let source = SequentialSource::open_normalized(path)
+        .with_context(|| format!("failed to open merge input {}", path.display()))?;
+    Ok(OpenedInput::Stream(Arc::new(source)))
+}
+
+/// Fail if a stream input (anything but a regular file, which is read
+/// positionally and may be listed twice) is listed more than once: a stream
+/// can be read only once, and two readers would split its bytes between them.
+/// The stdin aliases (`-`, `/dev/stdin`) are one stream.
+fn reject_repeated_streams(paths: &[PathBuf]) -> Result<()> {
+    let mut seen: HashMap<PathBuf, &Path> = HashMap::new();
+    for path in paths {
+        let stdin = fgumi_bam_io::is_stdin_path(path);
+        if !stdin && std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let key = if stdin {
+            PathBuf::from("/dev/stdin")
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+        };
+        if let Some(first) = seen.insert(key, path) {
+            bail!(
+                "Merge input {} is listed more than once (as {} and {}): it is a stream, which \
+                 can be read only once",
+                path.display(),
+                first.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How long one stream input must stay backlogged while another is starved
+/// before [`CoupledStallWatch`] warns.
+const COUPLED_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Tracks whether some stream input has stayed backlogged (its buffer full,
+/// so its producer is blocked) while another has stayed starved (nothing to
+/// read), sample after sample, for [`COUPLED_STALL_WARN_AFTER`]. That is the
+/// shape of a coupled producer that has run one input further ahead of the
+/// merge than the merge buffers: it is blocked writing the backlogged input,
+/// so it never writes the starved one the merge is waiting on.
+#[derive(Debug, Default)]
+struct StallWatch {
+    /// The (backlogged, starved) pair seen at every sample since `.1`.
+    current: Option<((usize, usize), std::time::Instant)>,
+    /// A warning was given (once per merge).
+    warned: bool,
+}
+
+impl StallWatch {
+    /// Observe one sample of each stream's `(backlogged, starved)` state at
+    /// `now`; returns the pair to warn about, once, when the same pair has
+    /// held at every sample for `after`.
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        states: &[(bool, bool)],
+        after: std::time::Duration,
+    ) -> Option<(usize, usize)> {
+        let full = states.iter().position(|&(backlogged, _)| backlogged);
+        let empty = states.iter().position(|&(_, starved)| starved);
+        let pair = full.zip(empty);
+        match (pair, self.current) {
+            (None, _) => self.current = None,
+            (Some(p), Some((q, _))) if p == q => {}
+            (Some(p), _) => self.current = Some((p, now)),
+        }
+        match self.current {
+            Some((p, since)) if !self.warned && now.duration_since(since) >= after => {
+                self.warned = true;
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// While alive, samples the stream inputs once a second on a thread of its
+/// own and warns, once, if one stays backlogged while another stays starved
+/// for [`COUPLED_STALL_WARN_AFTER`] ([`StallWatch`]): a merge that has stopped
+/// because a producer writing several of its inputs is blocked on one it is
+/// far ahead on would otherwise wait forever without a word. Advisory only;
+/// nothing is interrupted. Dropping it stops and joins the thread.
+struct CoupledStallWatch {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CoupledStallWatch {
+    /// Watch `streams` (path, source); a no-op for fewer than two, or if the
+    /// thread cannot be started (that only costs the warning).
+    fn start(
+        streams: Vec<(PathBuf, std::sync::Arc<fgumi_bam_io::pread::SequentialSource>)>,
+    ) -> Self {
+        if streams.len() < 2 {
+            return Self { stop: None, thread: None };
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("fgumi-merge-stall-watch".to_string())
+            .spawn(move || {
+                let mut watch = StallWatch::default();
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(std::time::Duration::from_secs(1))
+                {
+                    let states: Vec<(bool, bool)> =
+                        streams.iter().map(|(_, s)| (s.is_backlogged(), s.is_starved())).collect();
+                    if let Some((full, empty)) =
+                        watch.observe(std::time::Instant::now(), &states, COUPLED_STALL_WARN_AFTER)
+                    {
+                        warn!("{}", coupled_stall_warning(&streams[full].0, &streams[empty].0));
+                    }
+                }
+            })
+            .ok();
+        Self { stop: Some(stop), thread }
+    }
+}
+
+impl Drop for CoupledStallWatch {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The warning for a stream input `full` that has been backlogged while
+/// `empty` has been starved for [`COUPLED_STALL_WARN_AFTER`].
+fn coupled_stall_warning(full: &Path, empty: &Path) -> String {
+    format!(
+        "Merge input {} has had a full buffer, and input {} nothing to read, for {} s: if one \
+         producer writes both (tee, a demultiplexer), it is blocked writing the first and the \
+         merge cannot continue. The merge drains each input only about 4 MiB, plus its \
+         read-ahead, ahead of the others in merge order.",
+        full.display(),
+        empty.display(),
+        COUPLED_STALL_WARN_AFTER.as_secs()
+    )
 }
 
 /// The warning for a merge whose inputs exceed the open-file budget.
@@ -775,6 +1028,68 @@ mod tests {
     use noodles::sam::header::record::value::map::ReadGroup;
     use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
     use std::num::NonZeroUsize;
+
+    /// A header reader that panics still yields a result, an error naming its
+    /// input and the panic: its thread must send one, or the merge would wait
+    /// on the channel for as long as another reader's producer stalls.
+    #[test]
+    fn a_panicking_header_reader_yields_an_error_naming_its_input() {
+        let err = catch_header_panic(Path::new("in.fifo"), || -> Result<()> {
+            panic!("bad header");
+        })
+        .expect_err("a panic is an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("in.fifo"), "names the input: {msg}");
+        assert!(msg.contains("bad header"), "carries the panic: {msg}");
+        assert_eq!(catch_header_panic(Path::new("in.fifo"), || Ok(7)).unwrap(), 7);
+    }
+
+    /// The stall watch warns once, only after one pair (a backlogged stream
+    /// and a starved one) has held at every sample for the whole period; a
+    /// sample without such a pair, or with a different one, restarts it.
+    #[test]
+    fn stall_watch_warns_once_after_a_sustained_backlogged_starved_pair() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let after = std::time::Duration::from_secs(30);
+        let stalled = [(true, false), (false, true), (false, false)];
+        let mut w = StallWatch::default();
+        assert_eq!(w.observe(at(0), &stalled, after), None);
+        assert_eq!(w.observe(at(29), &stalled, after), None, "not yet");
+        // A sample where the starved input has bytes again restarts the clock.
+        assert_eq!(
+            w.observe(at(30), &[(true, false), (false, false), (false, false)], after),
+            None
+        );
+        assert_eq!(w.observe(at(31), &stalled, after), None);
+        assert_eq!(w.observe(at(60), &stalled, after), None, "29 s since the restart");
+        // A different pair restarts it too.
+        assert_eq!(w.observe(at(61), &[(true, false), (false, false), (false, true)], after), None);
+        assert_eq!(
+            w.observe(at(91), &[(true, false), (false, false), (false, true)], after),
+            Some((0, 2))
+        );
+        assert_eq!(w.observe(at(200), &stalled, after), None, "once per merge");
+    }
+
+    /// A stream input listed twice (or stdin under two aliases) is an error
+    /// naming it; a regular file listed twice is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_listed_twice_is_rejected_but_a_file_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("in.bam");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(reject_repeated_streams(&[file.clone(), file.clone()]).is_ok());
+        let fifo = dir.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let err = reject_repeated_streams(&[fifo.clone(), file, fifo.clone()]).unwrap_err();
+        assert!(err.to_string().contains("listed more than once"), "{err}");
+        assert!(err.to_string().contains(&fifo.display().to_string()), "{err}");
+        let err = reject_repeated_streams(&[PathBuf::from("-"), PathBuf::from("/dev/stdin")])
+            .unwrap_err();
+        assert!(err.to_string().contains("can be read only once"), "{err}");
+    }
 
     /// Create a BAM with the given read group IDs and return its path.
     fn write_bam_with_read_groups(dir: &std::path::Path, name: &str, rg_ids: &[&str]) -> PathBuf {

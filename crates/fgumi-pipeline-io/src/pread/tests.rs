@@ -308,6 +308,18 @@ fn pread_one(
         Arc::clone(&src),
         fgumi_sort::SpillCodec::Bgzf,
     ));
+    pread_one_into(src, offset, len, sequential, &slot).map(|s| (s.bytes.to_vec(), s.last))
+}
+
+/// [`pread_one`] into `slot`, returning the whole slice.
+fn pread_one_into(
+    src: Arc<dyn PositionalSource>,
+    offset: u64,
+    len: u32,
+    sequential: bool,
+    slot: &Arc<fgumi_sort::SortMergeSlot>,
+) -> io::Result<ReadSlice> {
+    let slot = Arc::clone(slot);
     slot.bp_note_issued(u64::from(len));
     let mut step = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20);
     let mut probe = StepProbe::new(&step);
@@ -324,19 +336,79 @@ fn pread_one(
         target: ReadTarget::Spill { slot, class: SpillClass::Cold },
     });
     probe.try_run(&mut step)?;
-    let s = fgumi_pipeline_core::step::InputHandle::pop(&out).expect("one slice");
-    Ok((s.bytes.to_vec(), s.last))
+    Ok(fgumi_pipeline_core::step::InputHandle::pop(&out).expect("one slice"))
 }
 
-/// Catches: a partial pipe read taken as EOF (truncating every pipe input).
-#[test]
-fn sequential_partial_reads_are_not_eof() {
-    use fgumi_bam_io::pread::{SequentialSource, test_sources::Trickle};
-    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
+/// A stream of `data` that then waits for `release` before its EOF, as a pipe
+/// whose producer has not closed it yet; returned once its pump holds `data`.
+fn stalled_stream(data: Vec<u8>) -> (Arc<dyn PositionalSource>, std::sync::mpsc::Sender<()>) {
+    struct Stalls(std::io::Cursor<Vec<u8>>, std::sync::mpsc::Receiver<()>);
+    impl std::io::Read for Stalls {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            if n == 0 {
+                let _ = self.1.recv();
+            }
+            Ok(n)
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let src: Arc<dyn PositionalSource> = Arc::new(fgumi_bam_io::pread::SequentialSource::new(
         std::path::Path::new("p"),
-        Box::new(Trickle(std::io::Cursor::new(vec![9u8; 100]))),
+        Box::new(Stalls(std::io::Cursor::new(data), rx)),
     ));
-    assert_eq!(pread_one(src, 0, 64, true).unwrap(), (vec![9u8; 64], false));
+    wait_ready(&*src, 0);
+    (src, tx)
+}
+
+/// Spin (up to 10 s) until `src` is ready at `offset`.
+pub(crate) fn wait_ready(src: &dyn PositionalSource, offset: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !src.ready_at(offset) {
+        assert!(std::time::Instant::now() < deadline, "the stream never became ready");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A stream read is one read: what the stream has buffered, which may be
+/// short of the request, and a short slice is not EOF. The bytes it did not
+/// deliver are its shortfall, withdrawn from the slot's issued count and added
+/// to the total the planner resumes the stream by. Catches: a partial read
+/// taken as EOF (truncating every pipe input), and a read that waits to fill
+/// its request (a pool worker held by one stream's producer).
+#[test]
+fn sequential_partial_reads_are_short_slices_not_eof() {
+    let (src, release) = stalled_stream(vec![9u8; 100]);
+    let slot = Arc::new(fgumi_sort::SortMergeSlot::new_sequential(
+        0,
+        Arc::clone(&src),
+        fgumi_sort::SpillCodec::Bgzf,
+    ));
+    let s = pread_one_into(Arc::clone(&src), 0, 64, true, &slot).unwrap();
+    assert_eq!((s.bytes.to_vec(), s.last, s.shortfall), (vec![9u8; 64], false, 0));
+    // The stream is still open (`release` is held), so a read that waits to
+    // fill its request would never return: run it on a thread under a
+    // deadline, so that regression fails here rather than hanging the run.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let (src, slot) = (Arc::clone(&src), Arc::clone(&slot));
+        move || {
+            let _ = tx.send(
+                pread_one_into(src, 64, 64, true, &slot)
+                    .map(|s| (s.bytes.to_vec(), s.last, s.shortfall)),
+            );
+        }
+    });
+    let short = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a stream read waited for more than the stream had")
+        .unwrap();
+    assert_eq!(short, (vec![9u8; 36], false, 28));
+    assert_eq!(slot.unissued_total(), 28);
+    drop(release);
+    wait_ready(&*src, 100);
+    let s = pread_one_into(src, 100, 64, true, &slot).unwrap();
+    assert_eq!((s.bytes.len(), s.last, s.shortfall), (0, true, 64), "a zero read is EOF");
 }
 
 /// Catches: EOF on a stream reported as `UnexpectedEof` (every pipe merge fails
@@ -348,13 +420,14 @@ fn sequential_slot_zero_read_is_eof_not_error() {
         std::path::Path::new("p"),
         Box::new(std::io::Cursor::new(vec![5u8; 100])),
     ));
+    wait_ready(&*src, 0);
     assert_eq!(pread_one(Arc::clone(&src), 0, 64, true).unwrap(), (vec![5u8; 64], false));
-    assert_eq!(pread_one(Arc::clone(&src), 64, 64, true).unwrap(), (vec![5u8; 36], true));
     assert_eq!(
-        pread_one(src, 100, 64, true).unwrap(),
-        (vec![], true),
-        "the tolerated extra read at a boundary"
+        pread_one(Arc::clone(&src), 64, 64, true).unwrap(),
+        (vec![5u8; 36], false),
+        "a short read is not EOF"
     );
+    assert_eq!(pread_one(src, 100, 64, true).unwrap(), (vec![], true), "a zero read is");
 }
 
 /// Files still fail closed. Catches: the sequential relaxation leaking into

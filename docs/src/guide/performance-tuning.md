@@ -466,6 +466,14 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - `--threads` also sizes the merge's read-ahead: 768 MiB per thread, as `fgumi sort`'s default
   budget. `fgumi merge` has no `--max-memory`; its inter-step queues share a small fixed
   budget of 16 MiB per pool worker
+- An input that is not a regular BGZF file (a pipe, FIFO, process substitution, SAM or gzip)
+  gets one more thread of its own, mostly waiting on its producer, that opens it and drains
+  it into a buffer of about 4 MiB as it is written. This is what lets one producer feed
+  several inputs at once (`tee`, a demultiplexer writing each input in turn) at any
+  `--threads`, whatever order it opens its FIFOs in: the merge keeps every pipe drained
+  while it waits for another, until one input runs more than that buffer, plus its share of
+  the read-ahead, ahead of the others in merge order. Past that point the producer blocks,
+  as it would on any bounded reader. It costs at most 5 MiB per such input
 - For template-coordinate merges with single-cell data, the `CB` tag is included automatically
 
 ### Group/Dedup

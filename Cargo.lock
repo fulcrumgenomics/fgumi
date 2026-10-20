@@ -778,6 +778,7 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
+ "rustix",
  "serde",
  "serde_json",
  "statrs",

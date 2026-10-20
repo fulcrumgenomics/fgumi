@@ -77,6 +77,18 @@ pub trait PositionalSource: Send + Sync {
     fn will_need(&self, offset: u64, len: u64) {
         let _ = (offset, len);
     }
+
+    /// Whether a [`Self::read_at`] at `offset` would return without waiting
+    /// for its source to produce bytes: a file always would (the device is
+    /// slow, but it is not waiting on anyone), a stream only once it has bytes
+    /// buffered, has ended or has failed ([`SequentialSource`]). A planner that
+    /// issues a stream's reads to a shared pool asks this first, so no pool
+    /// worker blocks on a producer that may itself be waiting on another of
+    /// the pool's streams. The default is `true`.
+    fn ready_at(&self, offset: u64) -> bool {
+        let _ = offset;
+        true
+    }
 }
 
 #[cfg(unix)]
@@ -128,32 +140,328 @@ pub fn read_at_exact<S: PositionalSource + ?Sized>(
     Ok(())
 }
 
+/// Bytes a [`SequentialSource`]'s pump buffers ahead of its reader before it
+/// stops reading its stream. It reads once more only below this, so it holds
+/// less than this plus one read ([`STREAM_PUMP_READ_BYTES`]).
+///
+/// The pump is what lets a coupled producer (`tee`, a demultiplexer: one
+/// writer feeding several of a merge's inputs, blocking on whichever pipe is
+/// full) make progress: every stream is drained into this buffer whatever the
+/// merge reads next, so the producer is blocked only by a stream that is this
+/// far, plus the merge's own read-ahead of it, ahead of the others in the
+/// merge's order. 4 MiB is the merge's largest read of one stream (its hot
+/// fill), so a read of an awaited stream that has caught up is one read.
+pub(crate) const STREAM_PUMP_BYTES: usize = 4 << 20;
+
+/// The most one `read` of a [`SequentialSource`]'s stream asks for, and the
+/// capacity of each chunk the pump buffers: reads are appended to the last
+/// chunk while it has room, so however small the producer's writes, the
+/// buffer holds at most `STREAM_PUMP_BYTES / STREAM_PUMP_READ_BYTES + 2`
+/// chunks. A pipe returns at most its buffer (64 KiB by default on Linux and
+/// macOS) per read; a decompressing or transcoding stream returns what it has
+/// decoded.
+pub(crate) const STREAM_PUMP_READ_BYTES: usize = 256 << 10;
+
+/// The most a [`SequentialSource`]'s pump allocates: its buffer of
+/// [`STREAM_PUMP_BYTES`] plus one read, the unread part of a partly-read
+/// front chunk and the unfilled part of the last, each under one chunk, and
+/// its read buffer. 5 MiB.
+#[cfg(test)]
+pub(crate) const STREAM_PUMP_MAX_ALLOC_BYTES: usize =
+    STREAM_PUMP_BYTES + 4 * STREAM_PUMP_READ_BYTES;
+
 /// A non-seekable input (pipe, FIFO, process substitution) behind the
-/// positional interface. Reads must arrive at the stream's cursor (the read
-/// planner keeps one read in flight per sequential slot), except reads below
-/// the header prefix, which replay the bytes the header parse consumed through
-/// [`Self::header_reader`] — so a reader of the source sees the stream from
-/// byte 0, as it would a file.
+/// positional interface.
+///
+/// Its stream is read by a pump: a thread of its own (`fgumi-stream-pump`)
+/// that reads the stream as fast as its producer writes it into a buffer of
+/// about 4 MiB (it allocates at most 5 MiB), whatever the reader is doing. So
+/// draining a pipe does not wait for the reader: a producer feeding several of
+/// a merge's inputs in lockstep keeps writing to each while the merge reads
+/// another, until one stream is that buffer ahead of the merge.
+/// [`PositionalSource::ready_at`] reports whether the buffer has bytes (or the
+/// stream has ended or failed), so a reader on a shared pool can avoid waiting
+/// on it. The pump does not wake anyone when bytes arrive: such a reader
+/// finds them when it next polls.
+///
+/// Reads must arrive at the stream's cursor (the read planner keeps one read
+/// in flight per sequential slot), except reads below the header prefix, which
+/// replay the bytes the header parse consumed through [`Self::header_reader`]
+/// — so a reader of the source sees the stream from byte 0, as it would a
+/// file. A read at the cursor returns what the buffer holds (up to the read's
+/// length), waiting only while it holds nothing; `0` is the stream's EOF.
+///
+/// Dropping the source stops the pump once its current read returns: a pump
+/// blocked reading a stream whose producer never writes again or closes keeps
+/// the stream open until the process exits, and is never joined.
 pub struct SequentialSource {
     path: std::path::PathBuf,
     state: parking_lot::Mutex<SeqState>,
+    /// Lock-free mirror of `state.prefix.len()`, for [`PositionalSource::ready_at`],
+    /// which must not wait behind a read holding `state`.
+    prefix_len: AtomicU64,
+    pump: Arc<Pump>,
 }
 
+/// The reader's side of a [`SequentialSource`].
 struct SeqState {
-    reader: Box<dyn io::Read + Send>,
     /// Stream bytes consumed so far (the header prefix included).
     cursor: u64,
     /// The bytes [`SequentialSource::header_reader`] returned, from offset 0.
     prefix: Vec<u8>,
 }
 
+/// The buffer a [`SequentialSource`]'s pump fills and its reader drains.
+struct Pump {
+    buf: parking_lot::Mutex<PumpBuf>,
+    /// Signalled when bytes arrive or the stream ends (the reader waits on it).
+    filled: parking_lot::Condvar,
+    /// Signalled when the reader takes bytes or drops the source (the pump
+    /// waits on it while the buffer is full).
+    drained: parking_lot::Condvar,
+}
+
+/// How a pumped stream ended.
+enum PumpEnd {
+    /// Still being read.
+    Open,
+    /// At EOF.
+    Eof,
+    /// Failed; every later read reports this error (after the bytes before it).
+    Failed(io::Error),
+}
+
+/// [`Pump`]'s state, under its lock.
+struct PumpBuf {
+    /// Bytes read from the stream and not yet taken, in order.
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes of `chunks`' front chunk already taken.
+    head: usize,
+    /// Bytes in `chunks` not yet taken.
+    len: usize,
+    end: PumpEnd,
+    /// The source was dropped: the pump stops.
+    closed: bool,
+}
+
+impl Pump {
+    /// Whether the reader can take bytes (or the stream's end) without waiting.
+    fn ready(&self) -> bool {
+        let b = self.buf.lock();
+        b.len > 0 || !matches!(b.end, PumpEnd::Open)
+    }
+
+    /// Take up to `out.len()` buffered bytes, waiting only while none are
+    /// buffered and the stream is open. `Ok(0)` is EOF.
+    fn take(&self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut b = self.buf.lock();
+        while b.len == 0 && matches!(b.end, PumpEnd::Open) {
+            self.filled.wait(&mut b);
+        }
+        if b.len == 0 {
+            return match &b.end {
+                PumpEnd::Failed(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                PumpEnd::Eof | PumpEnd::Open => Ok(0),
+            };
+        }
+        let mut n = 0;
+        while n < out.len() {
+            let head = b.head;
+            let Some(front) = b.chunks.front() else { break };
+            let k = (front.len() - head).min(out.len() - n);
+            out[n..n + k].copy_from_slice(&front[head..head + k]);
+            n += k;
+            if head + k == front.len() {
+                b.chunks.pop_front();
+                b.head = 0;
+            } else {
+                b.head = head + k;
+            }
+        }
+        b.len -= n;
+        self.drained.notify_one();
+        Ok(n)
+    }
+
+    /// Record how the stream ended and wake the reader.
+    fn finish(&self, end: PumpEnd) {
+        self.buf.lock().end = end;
+        self.filled.notify_all();
+    }
+
+    /// The pump thread: open the stream (`open` runs here, so a stream that is
+    /// classified or decoded as it is opened is not read on the caller's
+    /// thread), then read it into the buffer until EOF, an error, or the
+    /// source is dropped. A panic in the stream is the stream's error.
+    fn run<F>(&self, open: F)
+    where
+        F: FnOnce() -> io::Result<Box<dyn io::Read + Send>>,
+    {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pump(open)));
+        let end = match result {
+            Ok(Ok(true)) => PumpEnd::Eof,
+            Ok(Ok(false)) => return,
+            Ok(Err(e)) => PumpEnd::Failed(e),
+            Err(payload) => PumpEnd::Failed(io::Error::other(crate::panic_message(
+                payload.as_ref(),
+                "the stream's reader panicked",
+            ))),
+        };
+        self.finish(end);
+    }
+
+    /// [`Self::run`]'s loop: `Ok(true)` at EOF, `Ok(false)` once the source is
+    /// dropped.
+    fn pump<F>(&self, open: F) -> io::Result<bool>
+    where
+        F: FnOnce() -> io::Result<Box<dyn io::Read + Send>>,
+    {
+        let mut reader = open()?;
+        let mut scratch = vec![0u8; STREAM_PUMP_READ_BYTES];
+        loop {
+            {
+                let mut b = self.buf.lock();
+                while b.len >= STREAM_PUMP_BYTES && !b.closed {
+                    self.drained.wait(&mut b);
+                }
+                if b.closed {
+                    return Ok(false);
+                }
+            }
+            let n = match reader.read(&mut scratch) {
+                Ok(0) => return Ok(true),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let mut b = self.buf.lock();
+            if b.closed {
+                return Ok(false);
+            }
+            // Append to the last chunk while it has room, so small reads do
+            // not each cost a chunk (see `STREAM_PUMP_READ_BYTES`).
+            match b.chunks.back_mut() {
+                Some(last) if last.capacity() - last.len() >= n => {
+                    last.extend_from_slice(&scratch[..n]);
+                }
+                _ => {
+                    let mut chunk = Vec::with_capacity(STREAM_PUMP_READ_BYTES);
+                    chunk.extend_from_slice(&scratch[..n]);
+                    b.chunks.push_back(chunk);
+                }
+            }
+            b.len += n;
+            drop(b);
+            self.filled.notify_all();
+        }
+    }
+}
+
 impl SequentialSource {
-    /// A source reading `reader`, a stream named `path` (for errors).
+    /// A source reading `reader`, a stream named `path` (for errors), through
+    /// a pump thread started now.
+    ///
+    /// # Panics
+    ///
+    /// The pump thread cannot be spawned (see [`Self::open_normalized`], which
+    /// returns that error).
     #[must_use]
     pub fn new(path: &std::path::Path, reader: Box<dyn io::Read + Send>) -> Self {
-        Self {
+        Self::spawn(path, move || Ok(reader)).expect("failed to spawn a stream pump thread")
+    }
+
+    /// A source over the input at `path` (a pipe, FIFO, process substitution
+    /// or stdin, or a SAM / plain-gzip file), normalized to BGZF as
+    /// [`crate::open_normalized_input`] does. The input is opened, classified
+    /// and decoded on the pump thread, which starts now, so this returns
+    /// without waiting: a caller can open every stream of a producer that
+    /// opens its FIFOs one at a time, in any order, and writes to none until
+    /// all are open. An error opening or classifying the input (no such file,
+    /// an empty or non-BAM/SAM stream) is the stream's error, which
+    /// [`Self::stream_error`] reports and every read past the bytes before it
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// The pump thread cannot be spawned.
+    pub fn open_normalized(path: &std::path::Path) -> io::Result<Self> {
+        let name = path.to_path_buf();
+        Self::spawn(path, move || {
+            crate::reader::open_normalized_input(&name)
+                .map_err(|e| io::Error::other(format!("{e:#}")))
+        })
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{}: cannot start a thread to read it: {e}", path.display()),
+            )
+        })
+    }
+
+    /// A source over the stream `open` returns, called on the pump thread,
+    /// which starts now: whatever `open` reads (or waits for) to open,
+    /// classify or decode the stream is read there, not on the caller's
+    /// thread. An error from `open` is the stream's error.
+    ///
+    /// # Errors
+    ///
+    /// The pump thread cannot be spawned.
+    pub(crate) fn spawn<F>(path: &std::path::Path, open: F) -> io::Result<Self>
+    where
+        F: FnOnce() -> io::Result<Box<dyn io::Read + Send>> + Send + 'static,
+    {
+        let pump = Arc::new(Pump {
+            buf: parking_lot::Mutex::new(PumpBuf {
+                chunks: std::collections::VecDeque::new(),
+                head: 0,
+                len: 0,
+                end: PumpEnd::Open,
+                closed: false,
+            }),
+            filled: parking_lot::Condvar::new(),
+            drained: parking_lot::Condvar::new(),
+        });
+        let theirs = Arc::clone(&pump);
+        std::thread::Builder::new()
+            .name("fgumi-stream-pump".to_string())
+            .spawn(move || theirs.run(open))?;
+        Ok(Self {
             path: path.to_path_buf(),
-            state: parking_lot::Mutex::new(SeqState { reader, cursor: 0, prefix: Vec::new() }),
+            state: parking_lot::Mutex::new(SeqState { cursor: 0, prefix: Vec::new() }),
+            prefix_len: AtomicU64::new(0),
+            pump,
+        })
+    }
+
+    /// Whether the pump's buffer is full and the stream still open: the pump
+    /// has stopped reading, so the stream's producer blocks once the pipe's
+    /// own buffer fills. For diagnosing a stall, not for flow control.
+    #[must_use]
+    pub fn is_backlogged(&self) -> bool {
+        let b = self.pump.buf.lock();
+        b.len >= STREAM_PUMP_BYTES && matches!(b.end, PumpEnd::Open)
+    }
+
+    /// Whether the pump has nothing for the reader and the stream is still
+    /// open: a read at the cursor would wait for the producer.
+    #[must_use]
+    pub fn is_starved(&self) -> bool {
+        !self.pump.ready()
+    }
+
+    /// The stream's error, once its pump has failed (opening, classifying,
+    /// decoding or reading it, or a panic doing so): the error every read past
+    /// the bytes before it returns. `None` while the stream is open or after a
+    /// clean EOF. For a caller whose read failed inside a parser that wraps
+    /// errors (the header parse), so it can report the stream's own error.
+    #[must_use]
+    pub fn stream_error(&self) -> Option<io::Error> {
+        match &self.pump.buf.lock().end {
+            PumpEnd::Failed(e) => Some(io::Error::new(e.kind(), e.to_string())),
+            PumpEnd::Open | PumpEnd::Eof => None,
         }
     }
 
@@ -167,7 +475,16 @@ impl SequentialSource {
     /// Bytes the header parse consumed (the replayed prefix).
     #[must_use]
     pub fn prefix_len(&self) -> u64 {
-        self.state.lock().prefix.len() as u64
+        self.prefix_len.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SequentialSource {
+    /// Stop the pump: it exits once its current read returns (see the type's
+    /// docs), dropping the stream.
+    fn drop(&mut self) {
+        self.pump.buf.lock().closed = true;
+        self.pump.drained.notify_all();
     }
 }
 
@@ -177,17 +494,19 @@ struct HeaderReader<'a>(&'a SequentialSource);
 impl io::Read for HeaderReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut s = self.0.state.lock();
-        let n = s.reader.read(buf)?;
+        let n = self.0.pump.take(buf)?;
         s.prefix.extend_from_slice(&buf[..n]);
         s.cursor += n as u64;
+        self.0.prefix_len.store(s.prefix.len() as u64, Ordering::Release);
         Ok(n)
     }
 }
 
 impl PositionalSource for SequentialSource {
     /// `offset` below the prefix: a copy from it (possibly fewer bytes than
-    /// `buf` holds); `offset` at the cursor: one `read` of the stream (partial
-    /// reads allowed; `0` is EOF); anything else: `InvalidInput` naming the path.
+    /// `buf` holds); `offset` at the cursor: what the pump has buffered, up to
+    /// `buf.len()`, waiting only while it has nothing (`0` is EOF); anything
+    /// else: `InvalidInput` naming the path.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         let mut s = self.state.lock();
         let prefix_len = s.prefix.len() as u64;
@@ -207,12 +526,7 @@ impl PositionalSource for SequentialSource {
                 ),
             ));
         }
-        let n = loop {
-            match s.reader.read(buf) {
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                other => break other?,
-            }
-        };
+        let n = self.pump.take(buf)?;
         s.cursor += n as u64;
         Ok(n)
     }
@@ -223,6 +537,12 @@ impl PositionalSource for SequentialSource {
             io::ErrorKind::Unsupported,
             format!("{} is a stream and has no length", self.path.display()),
         ))
+    }
+
+    /// Below the prefix: always (a copy). Otherwise: whether the pump has
+    /// bytes buffered, or the stream has ended or failed.
+    fn ready_at(&self, offset: u64) -> bool {
+        offset < self.prefix_len() || self.pump.ready()
     }
 }
 
@@ -269,10 +589,17 @@ pub fn open_seekable_bgzf(path: &std::path::Path) -> io::Result<SeekableInput> {
 
 /// Fill `buf` from `offset` by repeated `read_at`, stopping at a zero read
 /// (EOF); `Interrupted` is retried. Returns the bytes read. The sequential twin
-/// of [`read_at_exact`], which treats a short read as `UnexpectedEof`.
+/// of [`read_at_exact`], which treats a short read as `UnexpectedEof`. A reader
+/// sharing a thread pool with other streams should use [`read_once`] instead:
+/// this waits until `buf` is full.
 ///
 /// # Errors
 /// Any I/O error from the source other than `Interrupted`.
+#[deprecated(
+    since = "0.8.1",
+    note = "use `read_once`: a read that waits to fill its buffer can hold a pool worker \
+            that a producer feeding several streams needs"
+)]
 pub fn read_until_eof<S: PositionalSource + ?Sized>(
     source: &S,
     buf: &mut [u8],
@@ -288,6 +615,29 @@ pub fn read_until_eof<S: PositionalSource + ?Sized>(
         }
     }
     Ok(filled)
+}
+
+/// One `read_at` of `buf` from `offset`, retrying only `Interrupted`. Returns
+/// the bytes read, which may be fewer than `buf` holds — a stream returns what
+/// it has buffered — and `0` only at EOF. The sequential twin of
+/// [`read_at_exact`]: it does not wait to fill `buf`, because a reader waiting
+/// for more of one stream holds its thread while the stream's producer may be
+/// waiting on another stream (a producer feeding several inputs blocks on
+/// whichever is full).
+///
+/// # Errors
+/// Any I/O error from the source other than `Interrupted`.
+pub fn read_once<S: PositionalSource + ?Sized>(
+    source: &S,
+    buf: &mut [u8],
+    offset: u64,
+) -> io::Result<usize> {
+    loop {
+        match source.read_at(buf, offset) {
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            r => return r,
+        }
+    }
 }
 
 /// One raise of the [`ReadStreamsPolicy`] ratchet, for `--sort-stats`.
@@ -1302,9 +1652,10 @@ mod tests {
         );
     }
 
-    /// `read_until_eof` (the sequential twin of `read_at_exact`): loops partial
-    /// reads, stops at a zero read, returns the bytes read.
+    /// `read_until_eof`: loops partial reads, stops at a zero read, returns
+    /// the bytes read.
     #[test]
+    #[allow(deprecated)]
     fn read_until_eof_loops_partial_reads_and_stops_at_a_zero_read() {
         use super::test_sources::Trickle;
         let src = SequentialSource::new(
@@ -1315,5 +1666,298 @@ mod tests {
         assert_eq!(read_until_eof(&src, &mut buf, 0).unwrap(), 64);
         assert_eq!(read_until_eof(&src, &mut buf, 64).unwrap(), 36);
         assert_eq!(read_until_eof(&src, &mut buf, 100).unwrap(), 0);
+    }
+
+    /// `read_once` (the sequential twin of `read_at_exact`): one read per
+    /// call, which may be partial, and a zero read only at EOF; `Interrupted`
+    /// is retried.
+    #[test]
+    fn read_once_returns_a_partial_read_and_zero_only_at_eof() {
+        use super::test_sources::Trickle;
+        let data = stream(100);
+        let src = SequentialSource::new(
+            std::path::Path::new("p"),
+            Box::new(Trickle(std::io::Cursor::new(data.clone()))),
+        );
+        let mut buf = vec![0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < data.len() {
+            let n = read_once(&src, &mut buf, got.len() as u64).unwrap();
+            assert!(n > 0, "a zero read before EOF at {}", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, data);
+        assert_eq!(read_once(&src, &mut buf, 100).unwrap(), 0);
+        let src = InterruptOnce {
+            inner: MemSource::new(b"abcdef".to_vec()),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert_eq!(read_once(&src, &mut buf, 1).unwrap(), 5);
+    }
+
+    /// A reader that hands out `data` and then blocks until `release` is
+    /// sent (or dropped), as a pipe whose producer has stalled does.
+    struct Stalls {
+        data: std::io::Cursor<Vec<u8>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for Stalls {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.data.read(buf)?;
+            if n == 0 {
+                let _ = self.release.recv();
+            }
+            Ok(n)
+        }
+    }
+
+    /// A reader that counts the bytes it hands out into its counter.
+    struct Counting(std::io::Cursor<Vec<u8>>, Arc<AtomicU64>);
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    /// A reader that fails where its data ends.
+    struct FailsAfter(std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(io::Error::other("upstream failed")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// A reader that panics.
+    struct Panics;
+
+    impl std::io::Read for Panics {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("decoder bug")
+        }
+    }
+
+    /// A reader that never ends, counting its reads; dropping it stores
+    /// `u64::MAX` in the count.
+    struct Endless(Arc<AtomicU64>);
+
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            buf.fill(7);
+            Ok(buf.len())
+        }
+    }
+
+    impl Drop for Endless {
+        fn drop(&mut self) {
+            self.0.store(u64::MAX, Ordering::Relaxed);
+        }
+    }
+
+    /// Spin (up to 10 s) until `cond` holds.
+    fn eventually(cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "condition never held");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The pump drains the stream with no reader asking: a producer is never
+    /// blocked by a reader that is busy elsewhere, until the buffer is full.
+    /// It stops at `STREAM_PUMP_BYTES` (plus one read), and resumes as the
+    /// reader takes bytes. Catches: a stream read only when its reader asks
+    /// (the coupled-producer deadlock), and an unbounded pump.
+    #[test]
+    fn the_pump_drains_ahead_of_the_reader_up_to_its_bound() {
+        let total = 3 * STREAM_PUMP_BYTES;
+        let data = stream(total);
+        let consumed = Arc::new(AtomicU64::new(0));
+        let src = SequentialSource::new(
+            std::path::Path::new("p"),
+            Box::new(Counting(std::io::Cursor::new(data.clone()), Arc::clone(&consumed))),
+        );
+        let bound = (STREAM_PUMP_BYTES + STREAM_PUMP_READ_BYTES) as u64;
+        // The pump stops once its buffer is full, and stays stopped.
+        eventually(|| src.is_backlogged());
+        let ahead = consumed.load(Ordering::Relaxed);
+        assert!(ahead <= bound, "the pump read {ahead} bytes ahead, past its bound {bound}");
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert_eq!(consumed.load(Ordering::Relaxed), ahead, "the pump read on while full");
+        }
+        let mut got = Vec::with_capacity(total);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = src.read_at(&mut buf, got.len() as u64).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, data);
+    }
+
+    /// `ready_at`: true below the replayed prefix, and at the cursor once the
+    /// pump holds bytes or the stream has ended, but not while the producer
+    /// has written nothing new. A read at the cursor returns what is buffered
+    /// without waiting for the rest of `buf`. Catches: a read issued to a pool
+    /// worker that would block on a stalled producer.
+    #[test]
+    fn ready_at_reports_buffered_bytes_and_eof_and_a_read_takes_only_those() {
+        use std::io::Read;
+        let (release, rx) = std::sync::mpsc::channel();
+        let src = SequentialSource::new(
+            std::path::Path::new("p"),
+            Box::new(Stalls { data: std::io::Cursor::new(stream(100)), release: rx }),
+        );
+        let mut head = [0u8; 10];
+        src.header_reader().read_exact(&mut head).unwrap();
+        assert!(src.ready_at(0), "the prefix is always ready");
+        eventually(|| src.pump.buf.lock().len == 90);
+        assert!(src.ready_at(10));
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(src.read_at(&mut buf, 10).unwrap(), 90, "what is buffered, not a full read");
+        assert_eq!(buf[..90], stream(100)[10..]);
+        assert!(!src.ready_at(100), "nothing buffered and the stream still open");
+        release.send(()).unwrap();
+        eventually(|| src.ready_at(100));
+        assert_eq!(src.read_at(&mut buf, 100).unwrap(), 0, "EOF");
+    }
+
+    /// A stream's error reaches the reader after the bytes before it, on every
+    /// read from then on; an error opening the stream on the pump thread is
+    /// the first read's; a panic in the stream is an error, not a hang.
+    #[test]
+    fn a_stream_error_follows_its_bytes_and_open_errors_and_panics_are_errors() {
+        let src = SequentialSource::new(
+            std::path::Path::new("p"),
+            Box::new(FailsAfter(std::io::Cursor::new(stream(10)))),
+        );
+        let mut buf = [0u8; 64];
+        let mut at = 0u64;
+        let err = loop {
+            match src.read_at(&mut buf, at) {
+                Ok(n) => at += n as u64,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(at, 10, "every byte before the error");
+        assert_eq!(err.to_string(), "upstream failed");
+        assert_eq!(src.read_at(&mut buf, at).unwrap_err().to_string(), "upstream failed");
+        assert!(src.ready_at(at), "a failed stream is ready (to report its error)");
+
+        assert!(src.stream_error().is_some_and(|e| e.to_string() == "upstream failed"));
+
+        let src = SequentialSource::spawn(std::path::Path::new("p"), || {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "not BAM"))
+        })
+        .unwrap();
+        assert_eq!(src.read_at(&mut buf, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(src.stream_error().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        let src = SequentialSource::new(std::path::Path::new("p"), Box::new(Panics));
+        assert_eq!(src.read_at(&mut buf, 0).unwrap_err().to_string(), "decoder bug");
+    }
+
+    /// A producer writing a few bytes at a time does not cost the pump a chunk
+    /// per write: reads are appended to the last chunk, so the buffer's
+    /// allocation stays within `STREAM_PUMP_MAX_ALLOC_BYTES` once full.
+    /// Catches: a byte bound that counts payload but not allocations (a
+    /// million 1-byte `Vec`s for 1 MiB of tiny writes).
+    #[test]
+    fn small_writes_share_chunks_and_the_allocation_stays_bounded() {
+        struct Tiny(u64);
+        impl std::io::Read for Tiny {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0 += 1;
+                let n = buf.len().min(16);
+                buf[..n].fill(3);
+                Ok(n)
+            }
+        }
+        let src = SequentialSource::new(std::path::Path::new("p"), Box::new(Tiny(0)));
+        eventually(|| src.pump.buf.lock().len >= STREAM_PUMP_BYTES);
+        let b = src.pump.buf.lock();
+        assert!(
+            b.chunks.len() <= STREAM_PUMP_BYTES / STREAM_PUMP_READ_BYTES + 2,
+            "{} chunks for {} bytes of 16-byte reads",
+            b.chunks.len(),
+            b.len
+        );
+        let allocated: usize =
+            b.chunks.iter().map(Vec::capacity).sum::<usize>() + STREAM_PUMP_READ_BYTES;
+        assert!(allocated <= STREAM_PUMP_MAX_ALLOC_BYTES, "{allocated} bytes allocated");
+    }
+
+    /// `open_normalized` returns at once, whatever its input: the open (which
+    /// for a FIFO waits for a writer) and the classification run on the pump
+    /// thread, and their errors are the stream's. Catches: an open or format
+    /// sniff on the caller's thread (a FIFO opened out of its producer's
+    /// order deadlocks), and an open error lost or turned into a panic.
+    #[cfg(unix)]
+    #[test]
+    fn open_normalized_opens_on_the_pump_thread_and_reports_open_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        // No writer yet: opening it for reading would block this thread.
+        let src = SequentialSource::open_normalized(&fifo).unwrap();
+        assert!(!src.ready_at(0), "nothing written yet");
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || drop(std::fs::OpenOptions::new().write(true).open(fifo).unwrap())
+        });
+        writer.join().unwrap();
+        eventually(|| src.ready_at(0));
+        let err = src.read_at(&mut [0u8; 16], 0).unwrap_err();
+        assert!(err.to_string().contains("No records read from"), "{err}");
+        assert!(src.stream_error().is_some());
+
+        let missing = dir.path().join("missing.bam");
+        let src = SequentialSource::open_normalized(&missing).unwrap();
+        eventually(|| src.ready_at(0));
+        let err = src.read_at(&mut [0u8; 16], 0).unwrap_err();
+        assert!(err.to_string().contains("missing.bam"), "{err}");
+    }
+
+    /// `is_backlogged` once the pump has filled its buffer from a stream still
+    /// open, `is_starved` while it has nothing and the stream is open; neither
+    /// once the stream has ended.
+    #[test]
+    fn backlogged_and_starved_report_the_pump_state() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let full =
+            SequentialSource::new(std::path::Path::new("p"), Box::new(Endless(Arc::clone(&reads))));
+        eventually(|| full.is_backlogged());
+        assert!(!full.is_starved());
+        let (release, rx) = std::sync::mpsc::channel();
+        let empty = SequentialSource::new(
+            std::path::Path::new("q"),
+            Box::new(Stalls { data: std::io::Cursor::new(Vec::new()), release: rx }),
+        );
+        assert!(empty.is_starved() && !empty.is_backlogged());
+        drop(release);
+        eventually(|| !empty.is_starved());
+        assert!(!empty.is_backlogged(), "an ended stream is not backlogged");
+    }
+
+    /// Dropping the source stops a pump waiting for room. Catches: a pump
+    /// thread (and its stream) kept alive by a full buffer forever.
+    #[test]
+    fn dropping_the_source_stops_a_full_pump() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let src =
+            SequentialSource::new(std::path::Path::new("p"), Box::new(Endless(Arc::clone(&reads))));
+        eventually(|| src.pump.buf.lock().len >= STREAM_PUMP_BYTES);
+        drop(src);
+        eventually(|| reads.load(Ordering::Relaxed) == u64::MAX);
     }
 }

@@ -243,13 +243,7 @@ fn producer_main<R: Read>(
         producer_loop(inner, chunk_size, hint_fd, tx);
     }));
     if let Err(payload) = result {
-        let msg = match payload.downcast_ref::<&'static str>() {
-            Some(s) => (*s).to_string(),
-            None => match payload.downcast_ref::<String>() {
-                Some(s) => s.clone(),
-                None => "fgumi-prefetch producer thread panicked".to_string(),
-            },
-        };
+        let msg = crate::panic_message(payload.as_ref(), "fgumi-prefetch producer thread panicked");
         let _ = tx_for_panic.send(Err(io::Error::other(msg)));
     }
 }

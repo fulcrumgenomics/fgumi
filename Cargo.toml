@@ -265,6 +265,12 @@ fgumi-pipeline-io = { workspace = true, features = ["test-utils"] }
 # when the decompressed content is identical.
 noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 
+# `fs` gives test_merge_command.rs a non-blocking FIFO open, which releases a
+# writer still blocked opening its FIFO after a merge that failed early. Already
+# compiled with `fs` (via `tempfile`), so it costs nothing new.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [[bench]]
 name = "core_functions"
 harness = false

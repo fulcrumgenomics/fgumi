@@ -36,7 +36,7 @@ pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortM
 /// body-keyed slot: its BGZF stream read from byte 0, the `header_len`
 /// decompressed header bytes skipped, keys extracted from the record bodies.
 /// `len` is the file's length, or `None` for a stream (a sequential slot,
-/// whose EOF is its first short read).
+/// whose EOF is its first zero read).
 ///
 /// # Errors
 ///
