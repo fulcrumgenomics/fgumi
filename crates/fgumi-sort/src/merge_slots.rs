@@ -167,6 +167,19 @@ impl SortMergeReader {
     }
 }
 
+/// Whether a sequential slot's next read may be issued
+/// ([`SortMergeSlot::sequential_read_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequentialReadGate {
+    /// Every issued slice is ingested and none was the stream's last: issue
+    /// the next read.
+    Due,
+    /// An issued slice is not yet ingested: wait for it.
+    InFlight,
+    /// The stream's last slice was ingested: never read it again.
+    Eof,
+}
+
 /// What one [`SortMergeSlot::bp_ingest_slice`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestOutcome {
@@ -458,6 +471,29 @@ impl SortMergeSlot {
         self.eof_seen.load(Ordering::Acquire)
     }
 
+    /// Whether a read planner that has issued `issued` slices of this
+    /// sequential slot may issue the next one. A stream is read in order with
+    /// one read in flight, and none after its EOF (the first short read).
+    ///
+    /// The count is loaded before the EOF flag, pairing with
+    /// [`Self::bp_ingest_slice`], which stores the flag before it bumps the
+    /// count: seeing the last slice counted guarantees seeing that it was the
+    /// last. Checked the other way round, a gate could see the flag unset, then
+    /// the count already bumped, and issue a read past the stream's EOF — at an
+    /// offset the stream never reaches, failing the merge with an out-of-order
+    /// read.
+    #[must_use]
+    pub fn sequential_read_gate(&self, issued: u32) -> SequentialReadGate {
+        let ingested = self.ingested_slices();
+        if self.eof_seen() {
+            SequentialReadGate::Eof
+        } else if ingested == issued {
+            SequentialReadGate::Due
+        } else {
+            SequentialReadGate::InFlight
+        }
+    }
+
     /// Pop one decompressed block (tests: the merge's side of the FIFO).
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
@@ -644,10 +680,13 @@ impl SortMergeSlot {
         r.slices.insert_with_size(u64::from(seq), (lease, last), size);
         let mut frames = Vec::new();
         while let Some((lease, last)) = r.slices.try_pop_next() {
-            self.ingested_slices.fetch_add(1, Ordering::Release);
+            // EOF before the count: the count's `Release` publishes the flag, so
+            // a reader that sees the slice counted also sees whether it was the
+            // last (see `sequential_read_gate`).
             if last {
                 self.eof_seen.store(true, Ordering::Release);
             }
+            self.ingested_slices.fetch_add(1, Ordering::Release);
             let parsed = r
                 .parser
                 .push(&lease, &mut frames)
@@ -1410,6 +1449,31 @@ mod tests {
 
     fn frames(n: u8) -> Vec<Vec<u8>> {
         (0..n).map(|i| vec![i; 100]).collect()
+    }
+
+    /// The sequential read gate across a stream's life: due before any read,
+    /// in flight until the issued slice is ingested, due again after a slice
+    /// that was not the last, and at EOF for good after the last.
+    #[rstest]
+    #[case::nothing_issued(None, 0, SequentialReadGate::Due)]
+    #[case::issued_not_ingested(None, 1, SequentialReadGate::InFlight)]
+    #[case::ingested_not_last(Some(false), 1, SequentialReadGate::Due)]
+    #[case::ingested_last(Some(true), 1, SequentialReadGate::Eof)]
+    fn sequential_read_gate(
+        #[case] ingest_first_slice: Option<bool>,
+        #[case] issued: u32,
+        #[case] expected: SequentialReadGate,
+    ) {
+        let slot = SortMergeSlot::new_sequential(
+            0,
+            Arc::new(tempfile::tempfile().expect("tempfile")),
+            SpillCodec::Bgzf,
+        );
+        if let Some(last) = ingest_first_slice {
+            let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+            slot.bp_ingest_slice(0, pool.lease(Vec::new()), last).expect("an empty slice");
+        }
+        assert_eq!(slot.sequential_read_gate(issued), expected);
     }
 
     /// A head that is not the reorder front is refused while

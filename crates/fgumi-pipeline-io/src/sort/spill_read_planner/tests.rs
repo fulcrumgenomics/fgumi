@@ -824,3 +824,44 @@ fn planner_keeps_one_read_in_flight_and_stops_after_a_sequential_eof() {
     );
     assert_eq!(decoded, frames.concat(), "every byte of the stream, in order");
 }
+
+/// A stream's gate in the planner: while its one read is in flight a pass
+/// issues nothing, and once the stream's last slice is ingested `top_up`
+/// marks it fully issued and never reads it again. (`plan_pass` drops a slot
+/// at EOF before topping it up, so the EOF arm is driven through `top_up`.)
+#[test]
+fn sequential_slot_waits_for_its_read_and_stops_at_eof() {
+    use fgumi_bam_io::pread::{PositionalSource, SequentialSource};
+    use fgumi_pipeline_core::step::InputHandle;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let src: Arc<dyn PositionalSource> = Arc::new(SequentialSource::new(
+        std::path::Path::new("stream"),
+        Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+    ));
+    let slot = Arc::new(SortMergeSlot::new_sequential(0, src, SpillCodec::Bgzf));
+    let supply = SpillSupply::new();
+    let slices = SliceBufferPool::new(4);
+    let mut pl = SpillReadPlanner::new(64 << 20, 2, 2, 1 << 20, &supply, Arc::clone(&slices));
+    let mut plp = StepProbe::new(&pl);
+    let reads = plp.take_output::<ReadRequest>(0);
+    let _events = plp.take_output::<SortPhase2Event>(1);
+    plp.push_input(SortPhase1Event::SpillReady {
+        slot: Arc::clone(&slot),
+        path: "stream".into(),
+        records_ingested_so_far: 0,
+    });
+    plp.push_input(all_announced(1));
+    plp.close_input();
+    for _ in 0..4 {
+        plp.try_run(&mut pl).unwrap();
+    }
+    let first = reads.pop().expect("the stream's first read");
+    assert_eq!((first.seq, first.offset), (0, 0));
+    assert!(reads.pop().is_none(), "one read in flight: nothing more until it is ingested");
+
+    slot.bp_ingest_slice(0, slices.lease(Vec::new()), true).expect("the stream's last slice");
+    let budget = ReadAheadBudget::resolve(64 << 20, 1);
+    let mut pool_used = 0;
+    assert_eq!(pl.top_up(0, SpillClass::Cold, &budget, &mut pool_used), 0, "no read past EOF");
+    assert!(pl.slots[0].eof_issued, "the stream is fully issued");
+}
