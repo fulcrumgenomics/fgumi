@@ -711,11 +711,13 @@ impl SpillReadPlanner {
             // issued only once the previous one is ingested, and none after a
             // short read (the stream's EOF).
             let s = &mut self.slots[i];
-            if s.slot.eof_seen() {
-                s.eof_issued = true;
-            }
-            if s.eof_issued || s.slot.ingested_slices() != s.next_seq {
-                return 0;
+            match s.slot.sequential_read_gate(s.next_seq) {
+                fgumi_sort::SequentialReadGate::Eof => {
+                    s.eof_issued = true;
+                    return 0;
+                }
+                fgumi_sort::SequentialReadGate::InFlight => return 0,
+                fgumi_sort::SequentialReadGate::Due => {}
             }
         }
         while let Some(fill) = self.next_fill(i, class, budget, *pool_used) {

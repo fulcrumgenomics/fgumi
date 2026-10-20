@@ -205,7 +205,8 @@ pub use merge_driver::{
     open_spill_slot_as,
 };
 pub use merge_slots::{
-    CONSOLIDATION_SLOT_IDS_START, ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP, SortMergeSlot,
+    CONSOLIDATION_SLOT_IDS_START, ClaimedBlock, IngestOutcome, PHASE2_DECOMP_CAP,
+    SequentialReadGate, SortMergeSlot,
 };
 pub use output_target::MergeOutputTarget;
 pub use prefetch::KEY_PREFETCH_DISTANCE;

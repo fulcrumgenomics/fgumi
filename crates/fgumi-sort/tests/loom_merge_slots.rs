@@ -659,3 +659,35 @@ fn loom_stash_charge_balances_across_claims_and_ingests() {
         assert_eq!(slot.stash_bytes(), 0, "every charge released exactly once");
     });
 }
+
+/// The read planner issues a stream's next read only once every issued slice
+/// is ingested and none was the stream's last. A planner that sees the last
+/// slice ingested must also see it was the last: otherwise it reads past the
+/// stream's EOF, at an offset the stream never reaches, and the merge fails
+/// with an out-of-order read. The ingest publishes the slice count and the EOF
+/// flag separately, so the gate must not observe one without the other.
+#[test]
+fn loom_sequential_gate_never_reads_past_an_ingested_eof() {
+    check_model(3, || {
+        let slot = Arc::new(SortMergeSlot::new_sequential(
+            0,
+            std::sync::Arc::new(tempfile::tempfile().expect("tempfile")),
+            SpillCodec::Bgzf,
+        ));
+        let s = Arc::clone(&slot);
+        let ingest = loom::thread::spawn(move || {
+            // The stream's first read came back short: its only slice is its
+            // last.
+            let pool = fgumi_bam_io::pread::SliceBufferPool::new(1);
+            s.bp_ingest_slice(0, pool.lease(Vec::new()), true).expect("an empty last slice");
+        });
+        let gate = slot.sequential_read_gate(1);
+        assert_ne!(
+            gate,
+            fgumi_sort::SequentialReadGate::Due,
+            "the planner would issue a read past the stream's EOF"
+        );
+        ingest.join().unwrap();
+        assert_eq!(slot.sequential_read_gate(1), fgumi_sort::SequentialReadGate::Eof);
+    });
+}
