@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::rscript::r_pdf_omits_dates;
 
 /// Creates a paired-end read pair for simplex-metrics testing.
 ///
@@ -295,11 +296,15 @@ fn test_simplex_metrics_min_reads_parameter() {
     assert_eq!(strict_full.ss_consensus_families, 1);
 }
 
-/// Two runs on the same input write byte-identical PDFs; skipped without R, ggplot2 and scales.
+/// Two runs on the same input write byte-identical PDFs; needs R 4.5.0+ with ggplot2 and scales.
 #[test]
 fn test_simplex_metrics_command_pdf_is_byte_identical_across_runs() {
     if !is_r_available() {
         eprintln!("Skipping: R with ggplot2 and scales not available");
+        return;
+    }
+    if !r_pdf_omits_dates() {
+        eprintln!("Skipping: R lacks pdf(timestamp), added in R 4.5.0, so the PDF keeps its dates");
         return;
     }
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
