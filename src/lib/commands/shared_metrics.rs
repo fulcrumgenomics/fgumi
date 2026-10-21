@@ -364,7 +364,8 @@ pub fn is_r_available() -> bool {
 ///
 /// The R script content is written to a temporary file for execution. This ensures
 /// the script is always available regardless of working directory or installation
-/// location.
+/// location. Each call writes into its own temporary directory, so concurrent runs
+/// cannot delete each other's script.
 ///
 /// # Arguments
 ///
@@ -383,9 +384,9 @@ pub fn execute_r_script<S: AsRef<std::ffi::OsStr>>(
 ) -> Result<()> {
     use std::process::Command;
 
-    // Write embedded R script to temp file
-    let temp_dir = std::env::temp_dir();
-    let r_script_path = temp_dir.join(temp_file_name);
+    let temp_dir =
+        tempfile::tempdir().context("Failed to create temp dir for embedded R script")?;
+    let r_script_path = temp_dir.path().join(temp_file_name);
     std::fs::write(&r_script_path, r_script_content)
         .context("Failed to write embedded R script to temp file")?;
 
@@ -396,9 +397,6 @@ pub fn execute_r_script<S: AsRef<std::ffi::OsStr>>(
         .args(args)
         .output()
         .context("Failed to execute Rscript command")?;
-
-    // Clean up temp file (ignore errors)
-    let _ = std::fs::remove_file(&r_script_path);
 
     if output.status.success() {
         Ok(())
