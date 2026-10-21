@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use super::command::Command;
 use super::shared_metrics::{
-    DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, parse_intervals,
+    DOWNSAMPLING_FRACTIONS, execute_r_script, is_r_available, normalize_pdf_dates, parse_intervals,
     process_templates_from_bam, record_simplex_coordinate_group,
 };
 
@@ -305,7 +305,9 @@ impl Command for SimplexMetrics {
                     OsStr::new(description),
                 ],
                 "fgumi_CollectSimplexSeqMetrics.R",
-            ) {
+            )
+            .and_then(|()| normalize_pdf_dates(&pdf_path))
+            {
                 Ok(()) => info!("Generated PDF plots: {}", pdf_path.display()),
                 Err(e) => {
                     log::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");

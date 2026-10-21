@@ -410,6 +410,31 @@ pub fn execute_r_script<S: AsRef<std::ffi::OsStr>>(
     }
 }
 
+/// Overwrites the wall-clock `/CreationDate` and `/ModDate` that R's `pdf()` device writes with a
+/// fixed date of the same length, so reruns on the same inputs write byte-identical PDFs and the
+/// cross-reference offsets stay valid.
+///
+/// # Errors
+///
+/// Returns an error if the PDF cannot be read or written.
+pub fn normalize_pdf_dates(path: &Path) -> Result<()> {
+    const FIXED_DATE: &[u8] = b"19700101000000";
+    let mut pdf =
+        std::fs::read(path).with_context(|| format!("Failed to read PDF {}", path.display()))?;
+    for key in [b"/CreationDate (D:".as_slice(), b"/ModDate (D:".as_slice()] {
+        let Some(at) = pdf.windows(key.len()).position(|window| window == key) else {
+            continue;
+        };
+        let start = at + key.len();
+        if let Some(date) = pdf.get_mut(start..start + FIXED_DATE.len())
+            && date.iter().all(u8::is_ascii_digit)
+        {
+            date.copy_from_slice(FIXED_DATE);
+        }
+    }
+    std::fs::write(path, pdf).with_context(|| format!("Failed to write PDF {}", path.display()))
+}
+
 /// Pre-computes metadata for each template in a coordinate group.
 ///
 /// Parses the MI tag to determine strand assignment and extract the base UMI
@@ -1147,6 +1172,27 @@ pub(crate) mod tests {
     }
 
     use rstest::rstest;
+
+    /// R's two dates are pinned in place, and anything that is not R's 14-digit date is left alone.
+    #[rstest]
+    #[case::dated(
+        "/CreationDate (D:20261021090301)\n/ModDate (D:20261021090301)\n",
+        "/CreationDate (D:19700101000000)\n/ModDate (D:19700101000000)\n"
+    )]
+    #[case::undated("", "")]
+    #[case::not_a_date("/CreationDate (D:2026)\n", "/CreationDate (D:2026)\n")]
+    fn test_normalize_pdf_dates(#[case] dates: &str, #[case] expected: &str) -> Result<()> {
+        let pdf = |dates: &str| {
+            format!("%PDF-1.4\n1 0 obj\n<<\n{dates}/Title (R Graphics Output)\n>>\nendobj\n")
+                .into_bytes()
+        };
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("plots.pdf");
+        std::fs::write(&path, pdf(dates))?;
+        normalize_pdf_dates(&path)?;
+        assert_eq!(std::fs::read(&path)?, pdf(expected));
+        Ok(())
+    }
 
     /// Reference values captured directly from htsjdk `Murmur3(42)
     /// .hashUnencodedChars(s)` against the 3.1.2 `Murmur3.class` on a set of
