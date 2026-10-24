@@ -214,7 +214,7 @@ pub fn num_bases_extending_past_mate_from_mc_raw(bam: &[u8]) -> Option<usize> {
 
     // A malformed MC CIGAR fails closed to 0 (no clip), honoring the doc contract of
     // `num_bases_extending_past_mate_raw` ("Returns 0 ... when the MC tag is absent/invalid").
-    let Some(mate_ops) = parse_mc_cigar_ops(mc_cigar) else {
+    let Some(mate_ops) = parse_cigar_string_ops(mc_cigar) else {
         return Some(0);
     };
     Some(clip_against_valid_mate_cigar(bam, &mate_ops))
@@ -435,7 +435,8 @@ fn alignment_end_1based(pos_1based: i32, cigar_ops: &[u32]) -> i32 {
 /// free-form `Z` string whose operations are never length-checked against a real reference, so
 /// enough of them can overflow the sum. Every boundary this module derives is fail-closed, so
 /// clamping outward is the right answer here.
-fn saturating_reference_length(cigar_ops: &[u32]) -> i32 {
+#[must_use]
+pub fn saturating_reference_length(cigar_ops: &[u32]) -> i32 {
     let mut ref_len = 0i32;
     for &op in cigar_ops {
         if consumes_ref(op & 0xF) {
@@ -470,21 +471,22 @@ fn mate_soft_unclipped_from_ops(mate_pos_1based: i32, mate_ops: &[u32]) -> (i32,
 /// of the packed `u32`. An MC-tag run length beyond it cannot describe a real alignment.
 const MAX_CIGAR_OP_LEN: u32 = (1 << 28) - 1;
 
-/// Parses an MC-tag CIGAR **string** into BAM-packed CIGAR ops (`(len << 4) | op_code`), the same
-/// encoding [`crate::cigar::get_cigar_ops`] yields for a record's own CIGAR, so the MC-tag and
-/// mate-record paths share one set of CIGAR walkers.
+/// Parses a CIGAR **string** (an MC tag's, or an `XA` hit's) into BAM-packed CIGAR ops
+/// (`(len << 4) | op_code`), the same encoding [`crate::cigar::get_cigar_ops`] yields for a
+/// record's own CIGAR, so string CIGARs and record CIGARs share one set of CIGAR walkers.
 ///
 /// Returns `None` for any CIGAR that is not a structurally valid SAM CIGAR for a mapped record,
-/// so malformed MC-tag input fails closed rather than yielding a partial answer. Lexically
+/// so malformed tag input fails closed rather than yielding a partial answer. Lexically
 /// rejected here:
 /// - an unknown operator byte (e.g. the `f`/`o` in `10Mfoo5S`, or a non-ASCII byte);
 /// - an operator with no preceding run-length (a bare `MS`) or a zero run-length (`0M`, `10M0S`);
-/// - a run-length past [`MAX_CIGAR_OP_LEN`], which no BAM CIGAR operation can hold;
+/// - a run-length past `MAX_CIGAR_OP_LEN` (2^28 - 1), which no BAM CIGAR operation can hold;
 /// - a trailing run-length with no operator (`10M5`), or an empty CIGAR.
 ///
-/// The parsed ops are then held to [`is_valid_mapped_cigar`], the structural check shared with a
+/// The parsed ops are then held to `is_valid_mapped_cigar`, the structural check shared with a
 /// mate CIGAR taken from the mate record (misplaced clips, or no reference-consuming operation).
-fn parse_mc_cigar_ops(cigar: &str) -> Option<Vec<u32>> {
+#[must_use]
+pub fn parse_cigar_string_ops(cigar: &str) -> Option<Vec<u32>> {
     // Tokenize and pack into (run_length << 4) | op_code. Accumulate the run-length from digit
     // bytes directly rather than slicing the string by byte offset — slicing on a non-ASCII byte
     // (a malformed CIGAR) would panic on a char boundary.
@@ -521,7 +523,7 @@ fn parse_mc_cigar_ops(cigar: &str) -> Option<Vec<u32>> {
 
 /// Whether BAM-packed CIGAR ops (`(len << 4) | op_code`) are a structurally valid CIGAR for a
 /// mapped record. The single structural check for a mate CIGAR, whether it came from an MC tag
-/// ([`parse_mc_cigar_ops`]) or from the mate record itself
+/// ([`parse_cigar_string_ops`]) or from the mate record itself
 /// ([`num_bases_extending_past_mate_cigar_raw`]), so the two paths cannot drift. Rejected:
 /// - no operations at all (an unmapped record's `*` CIGAR, or a truncated record);
 /// - a zero-length operation, or an operation code that is not a CIGAR operator;
@@ -755,13 +757,13 @@ mod tests {
     }
 
     // ========================================================================
-    // parse_mc_cigar_ops tests
+    // parse_cigar_string_ops tests
     // ========================================================================
 
     /// Summarizes parsed MC ops as `(leading_soft, ref_len, trailing_soft)` — counting only soft
     /// clips (H excluded) — so the case table below reads in the terms the boundary math uses.
     fn mc_summary(cigar: &str) -> Option<(i32, i32, i32)> {
-        parse_mc_cigar_ops(cigar).map(|ops| {
+        parse_cigar_string_ops(cigar).map(|ops| {
             (
                 i32::try_from(leading_soft_clip_from_ops(&ops)).unwrap_or(i32::MAX),
                 saturating_reference_length(&ops),
@@ -804,7 +806,7 @@ mod tests {
     #[case::leading_hard_after_soft_rejected("5S2H10M", None)]
     #[case::no_ref_op_soft_only_rejected("36S", None)]
     #[case::no_ref_op_insertion_only_rejected("5S5I", None)]
-    fn test_parse_mc_cigar_ops(#[case] cigar: &str, #[case] expected: Option<(i32, i32, i32)>) {
+    fn test_parse_cigar_string_ops(#[case] cigar: &str, #[case] expected: Option<(i32, i32, i32)>) {
         assert_eq!(mc_summary(cigar), expected);
     }
 
@@ -815,7 +817,7 @@ mod tests {
     /// are chromosome-bounded), but the MC Z-string is never length-checked.
     #[test]
     fn mate_soft_unclipped_saturates_on_oversized_cigar() {
-        let ops = parse_mc_cigar_ops(&"268435455M".repeat(9))
+        let ops = parse_cigar_string_ops(&"268435455M".repeat(9))
             .expect("well-formed (if oversized) CIGAR parses");
         let (start, end) = mate_soft_unclipped_from_ops(100, &ops);
         assert_eq!(start, 100, "no leading soft clip -> start stays at mate_pos");
@@ -844,7 +846,7 @@ mod tests {
         assert_eq!(end, expected_end);
     }
 
-    /// A malformed MC CIGAR fails closed through the whole MC-tag path: `parse_mc_cigar_ops`
+    /// A malformed MC CIGAR fails closed through the whole MC-tag path: `parse_cigar_string_ops`
     /// returns `None` rather than a partial CIGAR, and the entry point then clips nothing.
     #[rstest]
     #[case::embedded_garbage("10Mfoo5S")]
@@ -855,7 +857,7 @@ mod tests {
     #[case::empty("")]
     #[case::out_of_range_run_length("9999999999M")]
     fn mc_cigar_path_rejects_malformed(#[case] cigar: &str) {
-        assert_eq!(parse_mc_cigar_ops(cigar), None);
+        assert_eq!(parse_cigar_string_ops(cigar), None);
 
         // A read whose mate CIGAR cannot be trusted is not clipped at all.
         let mut aux = Vec::new();
@@ -1381,7 +1383,7 @@ mod tests {
         rev_cigar: &str,
         l_seq: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let ops = |cigar: &str| parse_mc_cigar_ops(cigar).expect("valid test CIGAR");
+        let ops = |cigar: &str| parse_cigar_string_ops(cigar).expect("valid test CIGAR");
         let mc = |cigar: &str| {
             let mut aux = b"MCZ".to_vec();
             aux.extend_from_slice(cigar.as_bytes());
@@ -2500,8 +2502,8 @@ mod tests {
     /// Builds one FR pair at 1-based `s1`/`s2` with the given CIGARs and returns the clip each
     /// read is given by the MC-tag entry point, as `(forward, reverse)`.
     fn clips_for_fr_pair(s1: i32, c1: &str, s2: i32, c2: &str) -> (usize, usize) {
-        let fwd_ops = parse_mc_cigar_ops(c1).expect("valid forward CIGAR");
-        let rev_ops = parse_mc_cigar_ops(c2).expect("valid reverse CIGAR");
+        let fwd_ops = parse_cigar_string_ops(c1).expect("valid forward CIGAR");
+        let rev_ops = parse_cigar_string_ops(c2).expect("valid reverse CIGAR");
         // TLEN spans the forward read's leftmost base to the reverse read's rightmost.
         let tlen = alignment_end_1based(s2, &rev_ops) - s1 + 1;
 

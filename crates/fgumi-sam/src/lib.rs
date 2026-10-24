@@ -35,8 +35,10 @@
 pub mod alignment_tags;
 pub mod builder;
 pub mod clipper;
+pub mod realign_window;
 pub mod record_utils;
 pub mod template_coordinate;
+pub mod xa;
 
 /// Abstraction over reference genome access for alignment tag calculation.
 ///

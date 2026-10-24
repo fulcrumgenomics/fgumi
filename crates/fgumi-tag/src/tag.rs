@@ -101,6 +101,13 @@ impl SamTag {
     /// this deliberately uses lowercase `ob` to signal a local convention
     /// rather than masquerade as a standard tag.
     pub const OB: SamTag = SamTag::new(b'o', b'b');
+    /// Realign window: the genomic window spanned by a consensus read's raw reads.
+    ///
+    /// fgumi-local tag (not SAM-spec): value is `<contig>:<start>-<end>:<strand>`
+    /// (1-based inclusive coordinates, strand `+` or `-`). The SAM spec reserves
+    /// tags containing lowercase letters for local use, so this deliberately
+    /// uses lowercase `rw` to signal a local convention.
+    pub const RW: SamTag = SamTag::new(b'r', b'w');
     /// Original UMI base quality scores, before error correction (SAM spec).
     pub const BZ: SamTag = SamTag::new(b'B', b'Z');
     /// Read group (SAM spec).
@@ -187,6 +194,17 @@ impl SamTag {
     /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the
     /// forward/top strand, `Z:r` for the reverse/bottom strand.
     pub const YD: SamTag = SamTag::new(b'Y', b'D');
+    /// Bismark genome conversion of an alignment, `XG:Z:CT` or `XG:Z:GA` (written
+    /// by Bismark and `bwa-mem3 mem --meth`); it depends on the alignment's strand.
+    pub const XG: SamTag = SamTag::new(b'X', b'G');
+    /// Bismark per-base methylation call string, `XM:Z` (written by Bismark and
+    /// `bwa-mem3 mem --meth`), computed from the reference at the aligned locus.
+    pub const XM: SamTag = SamTag::new(b'X', b'M');
+    /// Bismark read conversion, `XR:Z:CT` or `XR:Z:GA` (written by Bismark and
+    /// `bwa-mem3 mem --meth`); it describes the read, not its alignment.
+    pub const XR: SamTag = SamTag::new(b'X', b'R');
+    /// bwa-mem3's per-alignment primary-to-alternative score ratio, `pa:f`.
+    pub const PA: SamTag = SamTag::new(b'p', b'a');
     /// Base modification calls, e.g. `MM:Z:C+m,5,12,0;` (SAM spec, "Base modifications").
     pub const MM: SamTag = SamTag::new(b'M', b'M');
     /// Per-base modification probabilities, paired with `MM` (SAM spec).
@@ -672,5 +690,11 @@ mod tests {
         // fgumi-local "original barcode" tag: SAM reserves lowercase tags for local use.
         assert_eq!(SamTag::OB.to_string(), "ob");
         assert!(SamTag::is_valid_tag_bytes(b'o', b'b'));
+    }
+
+    #[test]
+    fn rw_tag_is_lowercase_and_valid() {
+        assert_eq!(SamTag::RW.to_string(), "rw");
+        assert!(SamTag::is_valid_tag_bytes(b'r', b'w'));
     }
 }
