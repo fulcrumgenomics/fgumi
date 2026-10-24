@@ -34,7 +34,7 @@ use fgumi_cli_macros::multi_options;
 use fgumi_consensus::MethylationMode;
 
 mod scoring;
-pub(crate) use scoring::BwaScoring;
+pub(crate) use scoring::{BwaScoring, command_passes_meth};
 use scoring::{mem_option_words, mem_word_end};
 
 // ============================================================================

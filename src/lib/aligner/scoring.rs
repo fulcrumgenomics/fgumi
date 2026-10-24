@@ -205,6 +205,12 @@ pub(crate) fn mem_option_words(command: &str) -> impl Iterator<Item = &str> {
     command[start..].split_whitespace().take_while(|w| !matches!(*w, "|" | ";" | "&&" | "||"))
 }
 
+/// Whether `command` passes bwa-mem3's `--meth` (`--meth` or `--meth=<chemistry>`)
+/// among its [`mem_option_words`], as [`BwaScoring::from_command`] reads it.
+pub(crate) fn command_passes_meth(command: &str) -> bool {
+    mem_option_words(command).any(|w| w == "--meth" || w.starts_with("--meth="))
+}
+
 /// The byte offset just past the first `mem` word of `command` — `mem` with
 /// whitespace (or the start of the command) before it and whitespace (or the end)
 /// after it — or `None` when there is none. The one rule both reading a
@@ -330,5 +336,18 @@ mod tests {
     #[case::none("minimap2 -ax sr ref.fa -", None)]
     fn mem_word_end_cases(#[case] command: &str, #[case] expected: Option<usize>) {
         assert_eq!(mem_word_end(command), expected);
+    }
+
+    /// `--meth` is read from the same words as the scoring options: after `mem`,
+    /// and only up to the first shell separator.
+    #[rstest]
+    #[case::flag("bwa-mem3 mem --meth -p ref.fa -", true)]
+    #[case::chemistry("bwa-mem3 mem --meth=taps -p ref.fa -", true)]
+    #[case::absent("bwa-mem3 mem -p ref.fa -", false)]
+    #[case::before_mem("env --meth bwa-mem3 mem -p ref.fa -", false)]
+    #[case::after_pipe("bwa-mem3 mem -p ref.fa - | tool --meth", false)]
+    #[case::after_and("bwa-mem3 mem -p ref.fa - && tool --meth", false)]
+    fn command_passes_meth_cases(#[case] command: &str, #[case] expected: bool) {
+        assert_eq!(command_passes_meth(command), expected);
     }
 }

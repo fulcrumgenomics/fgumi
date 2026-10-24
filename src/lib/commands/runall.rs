@@ -333,6 +333,134 @@ fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Resu
     Ok(())
 }
 
+/// The `--sort::order` a `runall` command line gave, `None` when it was left at
+/// its default ([`MultiSortOptions`](crate::commands::sort::MultiSortOptions)'
+/// `order` then holds the default, which the help shows).
+///
+/// The sort options are shared with standalone `fgumi sort` through one
+/// generated struct whose `order` is not an `Option`, so this reads where the
+/// value came from instead: a flattened group with no arguments of its own,
+/// which clap hands the same matches as the sort options, so any clap parse of
+/// `RunAll` fills it in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SortOrderGiven(pub Option<crate::commands::sort::SortOrderArg>);
+
+impl SortOrderGiven {
+    /// The id clap gives `--sort::order` in [`crate::commands::sort::MultiSortOptions`].
+    const ID: &'static str = "sort_order";
+}
+
+impl clap::FromArgMatches for SortOrderGiven {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let given = matches.value_source(Self::ID) == Some(clap::parser::ValueSource::CommandLine);
+        let order = matches.get_one::<crate::commands::sort::SortOrderArg>(Self::ID);
+        Ok(Self(order.copied().filter(|_| given)))
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        let given = Self::from_arg_matches(matches)?;
+        if given.0.is_some() {
+            *self = given;
+        }
+        Ok(())
+    }
+}
+
+impl clap::Args for SortOrderGiven {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        cmd
+    }
+}
+
+/// The `--group::realign-window` a `runall` command line gave, `None` when it
+/// was left at its default, read the same way as [`SortOrderGiven`]: the group
+/// options are shared with standalone `fgumi group`, whose `--realign-window` is
+/// a plain `bool`, so an explicit `false` is told apart from omission by where
+/// clap's value came from. `--realign` turns an omitted flag on and rejects an
+/// explicit `false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealignWindowGiven(pub Option<bool>);
+
+impl RealignWindowGiven {
+    /// The id clap gives `--group::realign-window` in
+    /// [`crate::commands::group::MultiGroupOptions`].
+    const ID: &'static str = "group_realign_window";
+}
+
+impl clap::FromArgMatches for RealignWindowGiven {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let given = matches.value_source(Self::ID) == Some(clap::parser::ValueSource::CommandLine);
+        let value = matches.get_one::<bool>(Self::ID);
+        Ok(Self(value.copied().filter(|_| given)))
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        let given = Self::from_arg_matches(matches)?;
+        if given.0.is_some() {
+            *self = given;
+        }
+        Ok(())
+    }
+}
+
+impl clap::Args for RealignWindowGiven {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        cmd
+    }
+}
+
+/// The warning for a `--sort::order` that `stages`' sorts override, or `None`
+/// when every sort in the chain runs in `order`, or when the user did not pass
+/// `--sort::order` (`explicit` false: runall chooses every sort's order itself,
+/// so its default is not the user's to be told about). The raw-read sort (any
+/// `Sort` before `Realign`, or the only one without it) is template-coordinate;
+/// the trailing sort after `Realign` is coordinate.
+fn sort_order_override_warning(
+    stages: &[crate::pipeline::chains::Stage],
+    order: crate::commands::sort::SortOrderArg,
+    explicit: bool,
+) -> Option<String> {
+    use crate::commands::sort::SortOrderArg;
+    use crate::pipeline::chains::Stage;
+    if !explicit {
+        return None;
+    }
+    let realign_at = stages.iter().position(|s| *s == Stage::Realign);
+    let raw_sort = stages
+        .iter()
+        .enumerate()
+        .any(|(i, s)| *s == Stage::Sort && realign_at.is_none_or(|r| i < r));
+    let trailing_sort = realign_at.is_some_and(|r| stages[r..].contains(&Stage::Sort));
+    let raw_ok = !raw_sort || order == SortOrderArg::TemplateCoordinate;
+    let trailing_ok = !trailing_sort || order == SortOrderArg::Coordinate;
+    if raw_ok && trailing_ok {
+        return None;
+    }
+    Some(match (raw_sort, trailing_sort) {
+        (true, true) => format!(
+            "--sort::order {order:?} is ignored; runall sorts the raw reads in \
+             template-coordinate order and, with --realign, the re-aligned consensus reads by \
+             coordinate"
+        ),
+        (false, true) => format!(
+            "--sort::order {order:?} is ignored; with --realign runall sorts the re-aligned \
+             consensus reads by coordinate"
+        ),
+        _ => format!(
+            "--sort::order {order:?} is ignored; runall forces template-coordinate sort order \
+             for its sort step"
+        ),
+    })
+}
+
 /// Derive the ordered [`Stage`](crate::pipeline::chains::Stage) list for a
 /// given `(start_from, stop_after)` pair.
 ///
@@ -621,6 +749,7 @@ has lost every original tag, so the earliest stop after `--start-from align` is 
 `zipper`. The validator checks the requested stage range but cannot verify that \
 the on-disk input actually matches `--start-from` — make sure it does."
 )]
+#[allow(clippy::struct_excessive_bools)] // CLI flags: each bool is a distinct user-facing option
 pub struct RunAll {
     /// Input BAM/SAM file. Optional because runall's input contract is
     /// stage-dependent, unlike the standard single-required-BAM commands
@@ -765,6 +894,13 @@ pub struct RunAll {
     pub zipper_opts: crate::commands::zipper::MultiZipperOptions,
 
     // ───────── group-side options ─────────
+    /// The `--group::realign-window` given on the command line, or `None` when
+    /// it was left at its default (see [`RealignWindowGiven`]). Like
+    /// `sort_order_given`, it must come before `group_opts`, which takes the
+    /// value out of the parsed matches.
+    #[command(flatten)]
+    pub realign_window_given: RealignWindowGiven,
+
     /// Per-stage group tuning, exposed as `--group::strategy`,
     /// `--group::edits`, `--group::min-map-q`, etc. via the
     /// `MultiGroupOptions` companion struct (generated by
@@ -867,11 +1003,24 @@ pub struct RunAll {
     /// Consensus algorithm to run at the consensus stage: `simplex`,
     /// `duplex`, or `codec`. Required whenever the chain reaches the
     /// consensus stage (`--stop-after consensus`, or `--start-from
-    /// consensus`); ignored otherwise. `duplex` requires
+    /// consensus`). With `--start-from filter --realign` it names the input's
+    /// consensus type: `duplex` re-aligns with the plain preset under
+    /// `--methylation-mode em-seq`, and `simplex` or `codec` (single-strand input)
+    /// rejects filter's methylation options, which check nothing on unaligned
+    /// single-strand reads; ignored otherwise. `duplex` requires
     /// `--strategy paired`. Selects which standalone caller's output the
     /// run reproduces (`fgumi simplex` / `duplex` / `codec`).
     #[arg(long = "consensus", value_enum, ignore_case = true)]
     pub consensus_mode: Option<RunAllMode>,
+
+    /// The `--sort::order` given on the command line, or `None` when it was
+    /// left at its default: runall chooses its sorts' orders itself and warns
+    /// only about an order the user asked for. Read from runall's own parse
+    /// (see [`SortOrderGiven`]), so every clap construction of `RunAll` agrees.
+    /// It must come before `sort_opts`: clap fills fields in order, and
+    /// `sort_opts` takes the value out of the parsed matches.
+    #[command(flatten)]
+    pub sort_order_given: SortOrderGiven,
 
     /// Per-stage sort tuning, exposed as `--sort::max-memory`,
     /// `--sort::tmp-dir`, etc. Consumed only when `--start-from sort`
@@ -891,6 +1040,58 @@ pub struct RunAll {
     /// `commands::filter` for the field list.
     #[command(flatten)]
     pub filter_opts: crate::commands::filter::MultiFilterOptions,
+
+    /// Re-align the consensus reads at the end of the run, preferring each
+    /// molecule's raw-read window: appends `realign` and a coordinate `sort`
+    /// after the last stage. Valid only when the run ends at consensus or
+    /// filter (`--stop-after consensus|filter`); with filter, filter runs
+    /// first, on the unaligned consensus reads, and keeps, rejects and counts
+    /// reads as it does without `--realign`. The group stage records each
+    /// molecule's window (`--group::realign-window` is implied, and an explicit
+    /// `--group::realign-window false` is an error); with
+    /// `--start-from consensus|filter` the input reads must already carry it
+    /// (`rw`). Realign uses the same `--aligner::*` selection, `--aligner-bin`
+    /// and `--ref` as the align stage, and needs them even when the run does
+    /// not align raw reads. Under `--methylation-mode em-seq`, duplex consensus
+    /// reads are re-aligned with the plain preset (their sequence is the
+    /// molecule's own), simplex ones bisulfite-aware; with `--start-from filter`,
+    /// pass `--consensus duplex` for duplex input. An `--aligner::command` runs as
+    /// written, so do not put `--meth` in it for duplex input. See `fgumi realign`.
+    #[arg(long = "realign", default_value_t = false)]
+    pub realign: bool,
+
+    /// bwa's `-h <primary>,<alt>` for the `--realign` stage only: the most
+    /// alternative hits reported in `XA` (a single `<n>` sets both; `0` reports
+    /// none). Only `XA` hits can be promoted to an in-window primary, so widening
+    /// it widens the candidate set; bwa omits `XA` entirely when more than this
+    /// many hits score near the best, so the most repetitive reads get no
+    /// candidates. Requires `--realign`. Unset, the aligner keeps its default
+    /// (bwa's `5,200`) and `--aligner::command` is left untouched. Set, `-h` goes
+    /// right after the command's first `mem` word, or at its end (with a
+    /// warning) when it has none; a command that already passes `-h` keeps its
+    /// own (with a warning).
+    #[arg(
+        long = "realign::xa-max-hits",
+        value_name = "PRIMARY[,ALT]",
+        allow_hyphen_values = true,
+        requires = "realign",
+        help_heading = "Realign Options"
+    )]
+    pub realign_xa_max_hits: Option<crate::commands::realign::XaMaxHits>,
+
+    /// Hold the whole `--ref` FASTA in memory for the `--realign` stage instead
+    /// of reading it on demand. Realign reads the reference only to rescore the
+    /// alignments it promotes, which are few, so by default it reads just those
+    /// regions through the FASTA's `.fai` index instead of holding the whole
+    /// FASTA (on hg38 the default measured about 3.3 GB lower peak memory, with
+    /// identical output). A compressed (gzip or BGZF) FASTA, or one without a
+    /// `.fai` (`samtools faidx`), cannot be read on demand: realign then loads it
+    /// into memory (decompressing a compressed one) with a warning. When a
+    /// methylation-aware consensus caller already holds the same `--ref` in
+    /// memory, realign shares that copy either way. Output is identical either
+    /// way. Requires `--realign`. See `fgumi realign --in-memory-reference`.
+    #[arg(long = "realign::in-memory-reference", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, help_heading = "Realign Options")]
+    pub realign_in_memory_reference: bool,
 
     /// Convenience: fills in every applicable metrics-output option (group's
     /// `--metrics` prefix, correct's metrics, filter's stats, and each
@@ -998,12 +1199,59 @@ impl RunAll {
     ///
     /// Returns `Err` under the same conditions as [`derive_stages_for`].
     pub(crate) fn derive_stages(&self) -> Result<Vec<crate::pipeline::chains::Stage>> {
-        derive_stages_for(
+        use crate::pipeline::chains::Stage;
+        let mut stages = derive_stages_for(
             self.start_from,
             self.stop_after_stage(),
             self.extract_chain_wants_correct(),
             self.consensus_mode,
-        )
+        )?;
+        // Checked here rather than with clap's `requires`, which would reject the
+        // bare boolean flag on its own (every boolean must parse alone as `true`).
+        if self.realign_in_memory_reference && !self.realign {
+            bail!(
+                "--realign::in-memory-reference applies to the --realign stage, so it requires \
+                 --realign"
+            );
+        }
+        if self.realign {
+            // `--realign` re-aligns consensus reads, filtered or not, so the run
+            // must end at consensus or filter; it then appends realign and the
+            // coordinate sort of the re-aligned reads.
+            let ends_at_consensus_or_filter =
+                stages.last().is_some_and(|s| s.is_consensus() || *s == Stage::Filter);
+            if !ends_at_consensus_or_filter {
+                bail!(
+                    "--realign re-aligns consensus reads, so it requires a run that ends at \
+                     consensus or filter (--stop-after consensus|filter); got --stop-after {}",
+                    self.stop_after_stage()
+                );
+            }
+            stages.extend([Stage::Realign, Stage::Sort]);
+        }
+        Ok(stages)
+    }
+
+    /// The align-like stages' aligner: the `--aligner::*` selection (with
+    /// `--methylation-mode`), `--ref` and `--aligner-bin`. The raw-read align
+    /// stage and the `--realign` stage share it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `--ref` is not set or the `--aligner::*` options
+    /// fail validation.
+    fn align_options(&self) -> Result<crate::pipeline::chains::options_bag::AlignOptions> {
+        let reference = self.reference.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "a runall chain that includes align or --realign requires --ref (the aligner \
+                 reference FASTA with its index files alongside)"
+            )
+        })?;
+        Ok(crate::pipeline::chains::options_bag::AlignOptions {
+            aligner: self.aligner_options()?,
+            reference,
+            aligner_bin: self.aligner_bin.clone(),
+        })
     }
 
     /// Build the [`SourceSpec`](crate::pipeline::chains::SourceSpec) for the
@@ -1116,6 +1364,37 @@ impl RunAll {
         Ok(crate::pipeline::chains::SinkSpec::Bam(self.output.clone()))
     }
 
+    /// Whether the `--realign` stage re-aligns duplex consensus reads: the chain
+    /// calls duplex consensus, or it starts after consensus (`--start-from
+    /// filter`) and `--consensus duplex` says what its input is.
+    fn realign_input_is_duplex(&self, stages: &[crate::pipeline::chains::Stage]) -> bool {
+        use crate::pipeline::chains::Stage;
+        stages.contains(&Stage::Duplex)
+            || (!stages.iter().any(|s| s.is_consensus())
+                && self.consensus_mode == Some(RunAllMode::Duplex))
+    }
+
+    /// The `--realign` stage's aligner: [`Self::align_options`], except that
+    /// duplex consensus reads align with the plain (non-`--meth`) preset whatever
+    /// `--methylation-mode` is. A duplex read's SEQ is the molecule's sequence
+    /// (its methylation is carried by `MM`/`ML`), so, as the methylation guide
+    /// prescribes, it aligns with a standard aligner; simplex EM-seq consensus
+    /// keeps `--meth`. The raw-read align stage is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::align_options`].
+    fn realign_align_options(
+        &self,
+        stages: &[crate::pipeline::chains::Stage],
+    ) -> Result<crate::pipeline::chains::options_bag::AlignOptions> {
+        let mut options = self.align_options()?;
+        if self.realign_input_is_duplex(stages) {
+            options.aligner.methylation_mode = fgumi_consensus::MethylationMode::Disabled;
+        }
+        Ok(options)
+    }
+
     /// Validate the align-stage CLI surface without executing the chain.
     /// Runs the same [`crate::aligner::AlignerOptions::resolve`] path the
     /// eventual align step uses, so a misconfigured invocation fails before
@@ -1135,10 +1414,14 @@ impl RunAll {
     ///   `--methylation-mode em-seq` with the `bwa` preset or without the
     ///   `bwa-mem3 index --meth` files (delegated to
     ///   [`crate::aligner::AlignerOptions::resolve`]).
-    pub(crate) fn validate_align_and_merge(&self) -> Result<()> {
+    pub(crate) fn validate_align_and_merge(
+        &self,
+        stages: &[crate::pipeline::chains::Stage],
+    ) -> Result<()> {
+        use crate::pipeline::chains::Stage;
         let reference = self.reference.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "a runall chain that includes align requires --ref (the aligner \
+                "a runall chain that includes align or --realign requires --ref (the aligner \
                  reference FASTA with its index files alongside)"
             )
         })?;
@@ -1151,16 +1434,28 @@ impl RunAll {
                 "no sequence-dictionary file found next to --ref {} \
                  (expected `<ref>.dict` or `<ref-without-extension>.dict`). \
                  Generate one with `samtools dict {} -o <ref>.dict` before running \
-                 a runall chain that includes align.",
+                 a runall chain that includes align or --realign.",
                 reference.display(),
                 reference.display(),
             );
         }
         let top_threads = self.threading.num_threads();
-        // `resolve` consumes the options struct; we clone so the validator
-        // can be called multiple times if needed.
-        let _resolved =
-            self.aligner_options()?.resolve(reference, top_threads, self.aligner_bin.as_deref())?;
+        // Resolve each align-like stage's aligner as the stage bag will: the
+        // raw-read align stage's, and the realign stage's (plain for duplex).
+        if stages.contains(&Stage::Align) {
+            let _resolved = self.aligner_options()?.resolve(
+                reference,
+                top_threads,
+                self.aligner_bin.as_deref(),
+            )?;
+        }
+        if stages.contains(&Stage::Realign) {
+            let _resolved = self.realign_align_options(stages)?.aligner.resolve(
+                reference,
+                top_threads,
+                self.aligner_bin.as_deref(),
+            )?;
+        }
         Ok(())
     }
 
@@ -1356,8 +1651,9 @@ impl RunAll {
     /// * **Zipper** — validates `MultiZipperOptions`. No `#[arg(skip)]` fields.
     ///
     /// * **Sort** — validates `MultiSortOptions`, forces
-    ///   `order = TemplateCoordinate` (runall's sort step always feeds
-    ///   downstream group; coordinate order is not applicable), resolves
+    ///   `order = TemplateCoordinate` (runall's raw-read sort always feeds
+    ///   downstream group; the trailing sort `--realign` adds is switched to
+    ///   coordinate order by the chain builder), resolves
     ///   `tmp_dirs` against `FGUMI_TMP_DIRS`, and — when sort is fused with
     ///   another stage — overrides an explicit `--sort::max-memory auto` to
     ///   the standalone 768 MiB default (auto-detection is not supported in a
@@ -1407,7 +1703,6 @@ impl RunAll {
     ) -> Result<crate::pipeline::chains::StageOptionsBag> {
         use crate::commands::common::MemoryLimit;
         use crate::commands::sort::{SortOrderArg, TMP_DIRS_ENV, resolve_tmp_dirs};
-        use crate::pipeline::chains::options_bag::AlignOptions;
         use crate::pipeline::chains::{Stage, StageOptionsBag};
 
         let mut bag = StageOptionsBag::default();
@@ -1424,18 +1719,7 @@ impl RunAll {
                 }
 
                 Stage::Align => {
-                    let reference = self.reference.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "a runall chain that includes align requires --ref (the aligner \
-                             reference FASTA with its index files alongside)"
-                        )
-                    })?;
-                    let aligner = self.aligner_options()?;
-                    bag.aligner = Some(AlignOptions {
-                        aligner,
-                        reference,
-                        aligner_bin: self.aligner_bin.clone(),
-                    });
+                    bag.aligner = Some(self.align_options()?);
                     // The fused align-and-merge runs the same per-template
                     // merge as `--start-from zipper`, so the `--zipper::*`
                     // merge rules apply to it too; Align and Zipper never share
@@ -1450,17 +1734,26 @@ impl RunAll {
                 }
 
                 Stage::Sort => {
+                    // A `--realign` chain may hold two sorts (the raw-read sort and
+                    // the trailing coordinate sort of the re-aligned reads); both
+                    // read the one `bag.sort` (the chain builder sorts the one after
+                    // realign by coordinate), so resolve and warn only once.
+                    if bag.sort.is_some() {
+                        continue;
+                    }
                     let mut sort_opts = self.sort_opts.clone().validate()?;
-                    // Runall's sort step always produces template-coordinate
-                    // output — the only order compatible with downstream Group.
-                    // Warn before overriding a user-supplied order so the
-                    // override is not silent (mirrors the max-memory warn below).
-                    if sort_opts.order != SortOrderArg::TemplateCoordinate {
-                        log::warn!(
-                            "--sort::order {:?} is ignored; runall forces template-coordinate \
-                             sort order for its sort step",
-                            sort_opts.order
-                        );
+                    // Runall's raw-read sort always produces template-coordinate
+                    // output — the only order compatible with downstream Group —
+                    // and the trailing `--realign` sort always sorts by coordinate.
+                    // Warn before overriding a user-supplied order so the override
+                    // is not silent (mirrors the max-memory warn below); the
+                    // default order is runall's own choice and is not warned about.
+                    if let Some(warning) = sort_order_override_warning(
+                        stages,
+                        sort_opts.order,
+                        self.sort_order_given.0.is_some(),
+                    ) {
+                        log::warn!("{warning}");
                     }
                     sort_opts.order = SortOrderArg::TemplateCoordinate;
                     sort_opts.tmp_dirs = resolve_tmp_dirs(
@@ -1486,12 +1779,19 @@ impl RunAll {
                     // aligner floor (`chain_worker_floor`, the prediction
                     // `add_sort` debug-asserts against the built pool). Warn here
                     // (once per run, naming the `--sort::` flags) — the chain
-                    // builder only logs the effective split at debug. `bag.aligner`
-                    // is already set: Align precedes Sort in `stages`.
+                    // builder only logs the effective split at debug.
                     let threads = self.threading.num_threads();
+                    // The aligner the floor is predicted from: the align stage's,
+                    // or the realign stage's (the same `--aligner::*` selection),
+                    // which may come after this sort in `stages`.
+                    let chain_aligner = stages
+                        .iter()
+                        .any(|s| matches!(s, Stage::Align | Stage::Realign))
+                        .then(|| self.align_options())
+                        .transpose()?;
                     let pool = threads.max(crate::pipeline::chains::builder::chain_worker_floor(
                         stages,
-                        bag.aligner.as_ref(),
+                        chain_aligner.as_ref(),
                     ));
                     crate::commands::common::PhaseThreads::resolve_in_pool(
                         threads,
@@ -1552,6 +1852,23 @@ impl RunAll {
                     // this only decides what `--all-metrics` derives.
                     if group_opts.metrics_prefix.is_none() {
                         group_opts.metrics_prefix = self.derived_metrics_prefix("group")?;
+                    }
+                    // `--realign` chooses each consensus read's primary inside its
+                    // molecule's raw-read window, which group records (`rw`).
+                    // An omitted flag is turned on; an explicit `false` contradicts
+                    // `--realign` and is rejected rather than silently overridden.
+                    if self.realign {
+                        match self.realign_window_given.0 {
+                            Some(false) => bail!(
+                                "--realign requires the realign window; drop \
+                                 --group::realign-window false"
+                            ),
+                            Some(true) => {}
+                            None => {
+                                log::info!("--realign implies --group::realign-window");
+                                group_opts.realign_window = true;
+                            }
+                        }
                     }
                     bag.group = Some(group_opts);
                 }
@@ -1694,6 +2011,15 @@ impl RunAll {
                     bag.filter = Some(filter_opts);
                 }
 
+                Stage::Realign => {
+                    bag.realign = Some(crate::commands::realign::RealignOptions {
+                        align: self.realign_align_options(stages)?,
+                        xa_max_hits: self.realign_xa_max_hits,
+                        xa_max_hits_option: "--realign::xa-max-hits",
+                        in_memory_reference: self.realign_in_memory_reference,
+                    });
+                }
+
                 // Stages runall never derives — a programming error if they appear.
                 Stage::Clip
                 | Stage::Dedup
@@ -1701,7 +2027,6 @@ impl RunAll {
                 | Stage::Fastq
                 | Stage::CopyUmi
                 | Stage::Metrics
-                | Stage::Realign
                 | Stage::Retag => bail!(
                     "internal error: build_stage_options_bag encountered unexpected \
                      stage {stage:?} in a runall chain; this is a bug in derive_stages"
@@ -1759,8 +2084,9 @@ impl Command for RunAll {
         // derived chain — not the start stage — so a fused `extract`/`correct →
         // … → align` run is exempted while a non-aligning chain (e.g.
         // `correct → correct`) is not. This must run after `derive_stages()`.
-        let ref_is_consumed_without_methylation =
-            self.start_from == RunAllStage::Zipper || stages.contains(&Stage::Align);
+        let ref_is_consumed_without_methylation = self.start_from == RunAllStage::Zipper
+            || stages.contains(&Stage::Align)
+            || stages.contains(&Stage::Realign);
         if !ref_is_consumed_without_methylation
             && self.reference.is_some()
             && self.methylation_mode.is_none()
@@ -1779,7 +2105,10 @@ impl Command for RunAll {
         // consensus) it is dead — silently ignored — so reject it rather than
         // mislead.
         let chain_reaches_consensus = stages.iter().any(|s| s.is_consensus());
-        let chain_includes_align = stages.contains(&Stage::Align);
+        // The raw-read align stage or the `--realign` stage: both align with the
+        // `--aligner::*` selection, need `--ref`, and are validated alike.
+        let chain_includes_align =
+            stages.iter().any(|s| matches!(s, Stage::Align | Stage::Realign));
         // `--methylation-mode` on a simplex/duplex chain requires `--ref`: the
         // consensus stage consumes the FASTA (via `methylation_reference()`), and
         // the standalone contract (`--methylation-mode` doc, "requires --ref")
@@ -1845,10 +2174,46 @@ impl Command for RunAll {
                  reads, then run `runall --start-from filter` or `fgumi filter` on the aligned BAM"
             );
         }
+        // `--start-from filter --realign`: filter still runs before realign, on the
+        // unaligned consensus reads. `--consensus` names the input's consensus type there:
+        // on single-strand input (`--consensus simplex` or `codec`) the reference-based
+        // methylation options check nothing (filter counts those reads as unaligned), so
+        // they are rejected as after a simplex stage. Without `--consensus` runall cannot
+        // see the input's type, so it warns instead.
+        if filter_consumes_methylation
+            && self.realign
+            && !chain_reaches_consensus
+            && self.consensus_mode.is_some_and(|mode| mode != RunAllMode::Duplex)
+        {
+            bail!(
+                "filter's methylation options (--filter::min-conversion-fraction, \
+                 --filter::min-methylation-depth, --filter::require-strand-methylation-agreement) \
+                 need single-strand consensus records aligned to the reference, but with \
+                 --start-from filter --realign filter runs before realign, on the unaligned \
+                 consensus reads; run `fgumi filter` after `fgumi realign` instead"
+            );
+        }
+        if filter_consumes_methylation
+            && self.realign
+            && !chain_reaches_consensus
+            && self.consensus_mode.is_none()
+        {
+            log::warn!(
+                "with --start-from filter --realign, filter runs on the unaligned consensus \
+                 reads before realign: for single-strand (simplex) consensus input its \
+                 methylation options check nothing (the reads have no reference placement); \
+                 run `fgumi filter` after `fgumi realign` instead, or pass --consensus duplex if \
+                 the input is duplex consensus"
+            );
+        }
         // A preset align consumes EM-seq too: it aligns bisulfite-aware
         // (bwa-mem3 --meth). TAPS aligns plain, and `--aligner::command` runs
-        // its own command with its own flags, so neither consumes it.
-        let align_consumes_methylation = chain_includes_align
+        // its own command with its own flags, so neither consumes it. The
+        // `--realign` stage aligns duplex consensus plain whatever the mode (see
+        // `realign_align_options`), so it consumes EM-seq only for other input.
+        let aligns_with_methylation = stages.contains(&Stage::Align)
+            || (stages.contains(&Stage::Realign) && !self.realign_input_is_duplex(&stages));
+        let align_consumes_methylation = aligns_with_methylation
             && self.aligner_opts.aligner_preset.is_some()
             && matches!(
                 self.methylation_mode,
@@ -1889,11 +2254,79 @@ impl Command for RunAll {
             }
         }
 
+        // The realign stage merges with zipper's `Consensus` reverse/revcomp sets
+        // whatever `--zipper::tags-to-*` say: its primary selection relies on the
+        // per-base consensus tags being reversed on the reverse strand. Those
+        // options apply only to the raw-read merge (the align or zipper stage).
+        if self.realign {
+            let zipper = self.zipper_opts.clone().validate()?;
+            if !zipper.tags_to_reverse.is_empty() || !zipper.tags_to_revcomp.is_empty() {
+                let effect = if stages.iter().any(|s| matches!(s, Stage::Align | Stage::Zipper)) {
+                    "they apply only to the raw-read align/zipper stage's merge"
+                } else {
+                    "this run does not align raw reads, so they have no effect"
+                };
+                log::warn!(
+                    "--zipper::tags-to-reverse / --zipper::tags-to-revcomp do not change the \
+                     --realign stage, which always reverses and reverse-complements the per-base \
+                     consensus tags (zipper's Consensus sets) of reverse-strand reads; {effect}"
+                );
+            }
+        }
+
+        // `--start-from filter --realign` cannot see whether its consensus input is
+        // simplex or duplex; under EM-seq it re-aligns bisulfite-aware unless
+        // `--consensus duplex` says the input is duplex.
+        if self.realign
+            && !chain_reaches_consensus
+            && self.consensus_mode.is_none()
+            && matches!(
+                self.methylation_mode,
+                Some(crate::commands::common::MethylationModeArg::EmSeq)
+            )
+        {
+            log::warn!(
+                "--realign with --start-from filter and --methylation-mode em-seq re-aligns the \
+                 consensus reads bisulfite-aware, which suits simplex consensus; if the input is \
+                 duplex consensus, pass --consensus duplex so it aligns with the plain preset"
+            );
+        }
+
+        // Duplex consensus re-aligns with the plain preset, but an `--aligner::command`
+        // runs as written: if it passes bwa-mem3's `--meth`, realign aligns the duplex
+        // reads bisulfite-aware anyway. The command is read as `BwaScoring::from_command`
+        // reads it (the words after `mem`, up to a `|`, `;`, `&&` or `||`, without
+        // interpreting shell quoting, which `fgumi realign --help` documents).
+        if self.realign
+            && self.realign_input_is_duplex(&stages)
+            && self
+                .aligner_opts
+                .aligner_command
+                .as_deref()
+                .is_some_and(crate::aligner::command_passes_meth)
+        {
+            log::warn!(
+                "--realign re-aligns duplex consensus reads with --aligner::command as written, \
+                 and that command passes --meth: duplex reads (whose sequence is the molecule's \
+                 own) should align with a standard aligner, so use a command without --meth or \
+                 a preset"
+            );
+        }
+
         // Align-stage pre-flight: run `validate_align_and_merge` so that
         // aligner option conflicts (preset vs command, missing --ref,
         // --methylation-mode with AAM) are caught before the pipeline starts.
-        if stages.contains(&Stage::Align) {
-            self.validate_align_and_merge()?;
+        if chain_includes_align {
+            self.validate_align_and_merge(&stages).map_err(|e| {
+                if self.realign {
+                    e.context(
+                        "the --realign stage aligns the consensus reads with the same \
+                         --aligner::* selection, --aligner-bin and --ref as the align stage",
+                    )
+                } else {
+                    e
+                }
+            })?;
         }
 
         // Cross-stage validation: when Group feeds a consensus stage, the
@@ -3491,5 +3924,752 @@ mod tests {
     fn validate_with_rejects_start_after_stop() {
         assert!(RunAllStage::Group.validate_with(RunAllStage::Sort).is_err());
         assert!(RunAllStage::Sort.validate_with(RunAllStage::Group).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod realign_tests {
+    use super::*;
+    use crate::commands::sort::SortOrderArg;
+    use crate::pipeline::chains::Stage;
+    use clap::Parser;
+    use fgumi_consensus::MethylationMode;
+    use rstest::rstest;
+
+    fn parse(args: &[&str]) -> RunAll {
+        RunAll::try_parse_from(std::iter::once("runall").chain(args.iter().copied())).unwrap()
+    }
+
+    /// `runall <args> -i in.bam -o out.bam`.
+    fn parse_io(args: &[&str]) -> RunAll {
+        let mut all = args.to_vec();
+        all.extend_from_slice(&["-i", "in.bam", "-o", "out.bam"]);
+        parse(&all)
+    }
+
+    #[rstest]
+    #[case::consensus_self_pair(
+        &["--start-from", "consensus", "--stop-after", "consensus", "--consensus", "simplex"],
+        vec![Stage::Simplex, Stage::Realign, Stage::Sort]
+    )]
+    #[case::group_to_consensus(
+        &["--start-from", "group", "--stop-after", "consensus", "--consensus", "duplex"],
+        vec![Stage::Group, Stage::Duplex, Stage::Realign, Stage::Sort]
+    )]
+    #[case::sort_to_consensus(
+        &["--start-from", "sort", "--stop-after", "consensus", "--consensus", "codec"],
+        vec![Stage::Sort, Stage::Group, Stage::Codec, Stage::Realign, Stage::Sort]
+    )]
+    fn realign_after_consensus_chain(#[case] args: &[&str], #[case] expected: Vec<Stage>) {
+        let mut args = args.to_vec();
+        args.push("--realign");
+        assert_eq!(parse_io(&args).derive_stages().unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::filter_self_pair(
+        &["--start-from", "filter", "--stop-after", "filter"],
+        vec![Stage::Filter, Stage::Realign, Stage::Sort]
+    )]
+    #[case::consensus_to_filter(
+        &["--start-from", "consensus", "--stop-after", "filter", "--consensus", "simplex"],
+        vec![Stage::Simplex, Stage::Filter, Stage::Realign, Stage::Sort]
+    )]
+    #[case::group_to_filter(
+        &["--start-from", "group", "--stop-after", "filter", "--consensus", "simplex"],
+        vec![Stage::Group, Stage::Simplex, Stage::Filter, Stage::Realign, Stage::Sort]
+    )]
+    fn realign_after_filter_chain(#[case] args: &[&str], #[case] expected: Vec<Stage>) {
+        let mut args = args.to_vec();
+        args.push("--realign");
+        assert_eq!(parse_io(&args).derive_stages().unwrap(), expected);
+    }
+
+    /// `--realign` re-aligns consensus reads, so a run that stops before
+    /// consensus is rejected.
+    #[rstest]
+    #[case::group("group", "group")]
+    #[case::sort("sort", "sort")]
+    #[case::sort_to_group("sort", "group")]
+    #[case::correct("correct", "correct")]
+    fn realign_rejected_when_run_ends_before_consensus(#[case] start: &str, #[case] stop: &str) {
+        let r = parse_io(&["--start-from", start, "--stop-after", stop, "--realign"]);
+        let err = r.derive_stages().unwrap_err().to_string();
+        assert!(err.contains("--realign"), "got: {err}");
+        assert!(err.contains("consensus or filter"), "got: {err}");
+    }
+
+    /// With `--realign`, filter's methylation filters follow the same rule as without it:
+    /// accepted after duplex consensus (its sites are in its own SEQ), rejected after
+    /// simplex (its sites come from the reference, which unaligned reads lack).
+    #[rstest]
+    #[case::duplex_agreement("duplex", &["--filter::require-strand-methylation-agreement"], None)]
+    #[case::duplex_conversion("duplex", &["--filter::min-conversion-fraction", "0.5"], None)]
+    #[case::simplex_agreement(
+        "simplex",
+        &["--filter::require-strand-methylation-agreement"],
+        Some("aligned to the reference")
+    )]
+    #[case::simplex_conversion(
+        "simplex",
+        &["--filter::min-conversion-fraction", "0.5"],
+        Some("aligned to the reference")
+    )]
+    fn realign_methylation_filters_follow_non_realign_rule(
+        #[case] consensus: &str,
+        #[case] option: &[&str],
+        #[case] expected_err: Option<&str>,
+    ) {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "filter",
+            "--consensus",
+            consensus,
+            "--group::strategy",
+            if consensus == "duplex" { "paired" } else { "adjacency" },
+            "--filter::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+        ];
+        args.extend_from_slice(option);
+        let result = RunAll::try_parse_from(args).unwrap().execute("runall test");
+        let err = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        // Accepted: validation of the methylation options passes, and the run
+        // fails later, on the missing sequence dictionary of the absent `--ref`.
+        let msg = expected_err.unwrap_or("no sequence-dictionary file found next to --ref");
+        assert!(err.contains(msg), "got: {err}");
+    }
+
+    #[rstest]
+    #[case::with_realign(true)]
+    #[case::without_realign(false)]
+    fn realign_enables_group_window(#[case] realign: bool) {
+        let mut args = vec![
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+        ];
+        if realign {
+            args.push("--realign");
+        }
+        let r = parse_io(&args);
+        let stages = r.derive_stages().unwrap();
+        let bag = r.build_stage_options_bag(&stages).unwrap();
+        assert_eq!(bag.group.unwrap().realign_window, realign);
+        assert_eq!(bag.realign.is_some(), realign);
+    }
+
+    /// `--realign` needs group's window: an omitted `--group::realign-window` is
+    /// turned on, an explicit `true` stays on, and an explicit `false` is an error
+    /// rather than silently overridden. Without `--realign` the flag is used as given.
+    #[rstest]
+    #[case::realign_omitted(true, None, Ok(true))]
+    #[case::realign_explicit_true(true, Some("true"), Ok(true))]
+    #[case::realign_explicit_false(true, Some("false"), Err("drop --group::realign-window false"))]
+    #[case::no_realign_omitted(false, None, Ok(false))]
+    #[case::no_realign_explicit_true(false, Some("true"), Ok(true))]
+    #[case::no_realign_explicit_false(false, Some("false"), Ok(false))]
+    fn realign_resolves_explicit_group_window(
+        #[case] realign: bool,
+        #[case] window: Option<&str>,
+        #[case] expected: Result<bool, &str>,
+    ) {
+        let mut args = vec![
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+        ];
+        if realign {
+            args.push("--realign");
+        }
+        if let Some(value) = window {
+            args.extend_from_slice(&["--group::realign-window", value]);
+        }
+        let r = parse_io(&args);
+        assert_eq!(r.realign_window_given, RealignWindowGiven(window.map(|v| v == "true")));
+        let stages = r.derive_stages().unwrap();
+        let got = r.build_stage_options_bag(&stages).map(|bag| bag.group.unwrap().realign_window);
+        match (got, expected) {
+            (Ok(on), Ok(want)) => assert_eq!(on, want),
+            (Err(e), Err(needle)) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains(needle), "{msg}");
+                assert!(msg.contains("--realign requires the realign window"), "{msg}");
+            }
+            (got, want) => panic!("got {got:?}, want {want:?}"),
+        }
+    }
+
+    /// The realign stage reuses the `--aligner::*` selection, `--ref` and
+    /// `--aligner-bin`, and takes `--realign::xa-max-hits`.
+    #[test]
+    fn realign_bag_carries_aligner_and_xa_max_hits() {
+        let r = parse_io(&[
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--aligner-bin",
+            "/opt/bwa-mem3",
+            "--realign",
+            "--realign::xa-max-hits",
+            "20,300",
+        ]);
+        let stages = r.derive_stages().unwrap();
+        let realign = r.build_stage_options_bag(&stages).unwrap().realign.unwrap();
+        assert_eq!(realign.align.reference, PathBuf::from("ref.fa"));
+        assert_eq!(realign.align.aligner_bin, Some(PathBuf::from("/opt/bwa-mem3")));
+        assert_eq!(realign.align.aligner.preset, Some(crate::aligner::AlignerPreset::BwaMem3));
+        assert_eq!(
+            realign.xa_max_hits,
+            Some(crate::commands::realign::XaMaxHits { primary: 20, alt: 300 })
+        );
+        assert_eq!(realign.xa_max_hits_option, "--realign::xa-max-hits");
+    }
+
+    /// An `--aligner::command` runs as written, so one passing `--meth` would
+    /// re-align duplex consensus bisulfite-aware: runall warns; a command
+    /// without it, or simplex input, does not.
+    #[rstest]
+    #[case::duplex_meth("duplex", "bwa-mem3 mem --meth -p {ref} /dev/stdin", true)]
+    #[case::duplex_meth_chemistry("duplex", "bwa-mem3 mem --meth=emseq -p {ref} /dev/stdin", true)]
+    #[case::duplex_plain("duplex", "bwa-mem3 mem -p {ref} /dev/stdin", false)]
+    #[case::simplex_meth("simplex", "bwa-mem3 mem --meth -p {ref} /dev/stdin", false)]
+    fn realign_warns_on_duplex_meth_command(
+        #[case] consensus: &str,
+        #[case] command: &str,
+        #[case] warns: bool,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let (strategy, min_reads) = if consensus == "duplex" {
+            ("paired", "--duplex::min-reads")
+        } else {
+            ("adjacency", "--simplex::min-reads")
+        };
+        let r = parse_io(&[
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            consensus,
+            "--group::strategy",
+            strategy,
+            min_reads,
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::command",
+            command,
+            "--realign",
+        ]);
+        let _session = capture_logs();
+        // Fails later, past the warning, on the missing reference.
+        let err = format!("{:#}", r.execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(PAST_VALIDATION), "{err}");
+        let warned = captured().iter().any(|line| line.contains("and that command passes --meth"));
+        assert_eq!(warned, warns);
+    }
+
+    /// Under `--methylation-mode em-seq`, the realign stage aligns duplex
+    /// consensus reads with the plain preset (their SEQ is the molecule's
+    /// sequence) and simplex consensus reads bisulfite-aware; the raw-read align
+    /// stage keeps EM-seq either way. With `--start-from filter`, `--consensus`
+    /// says what the input consensus is.
+    #[rstest]
+    #[case::simplex(&[
+        "--start-from", "group", "--stop-after", "consensus", "--consensus", "simplex",
+        "--group::strategy", "adjacency", "--simplex::min-reads", "1",
+    ], MethylationMode::EmSeq, None)]
+    #[case::duplex(&[
+        "--start-from", "group", "--stop-after", "consensus", "--consensus", "duplex",
+        "--group::strategy", "paired", "--duplex::min-reads", "1",
+    ], MethylationMode::Disabled, None)]
+    #[case::duplex_with_raw_align(&[
+        "--start-from", "align", "--stop-after", "consensus", "--consensus", "duplex",
+        "--group::strategy", "paired", "--duplex::min-reads", "1",
+    ], MethylationMode::Disabled, Some(MethylationMode::EmSeq))]
+    #[case::simplex_with_raw_align(&[
+        "--start-from", "align", "--stop-after", "consensus", "--consensus", "simplex",
+        "--group::strategy", "adjacency", "--simplex::min-reads", "1",
+    ], MethylationMode::EmSeq, Some(MethylationMode::EmSeq))]
+    #[case::filter_duplex(&[
+        "--start-from", "filter", "--stop-after", "filter", "--consensus", "duplex",
+        "--filter::min-reads", "1",
+    ], MethylationMode::Disabled, None)]
+    #[case::filter_unspecified(&[
+        "--start-from", "filter", "--stop-after", "filter", "--filter::min-reads", "1",
+    ], MethylationMode::EmSeq, None)]
+    fn realign_aligns_duplex_consensus_without_meth(
+        #[case] args: &[&str],
+        #[case] realign_mode: MethylationMode,
+        #[case] align_mode: Option<MethylationMode>,
+    ) {
+        let mut args = args.to_vec();
+        args.extend_from_slice(&[
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+        ]);
+        let r = parse_io(&args);
+        let stages = r.derive_stages().unwrap();
+        let bag = r.build_stage_options_bag(&stages).unwrap();
+        assert_eq!(bag.realign.unwrap().align.aligner.methylation_mode, realign_mode);
+        assert_eq!(bag.aligner.map(|a| a.aligner.methylation_mode), align_mode);
+    }
+
+    /// A `--sort::order` the user passed that the chain's sorts override is
+    /// warned about, naming the order each sort actually uses; one that every
+    /// sort uses is not, and neither is the default order (not passed), which
+    /// runall overrides on every `--realign` chain.
+    #[rstest]
+    #[case::raw_sort_only(&[Stage::Sort, Stage::Group, Stage::Simplex], SortOrderArg::Coordinate,
+        true, Some("runall forces template-coordinate sort order for its sort step"))]
+    #[case::raw_sort_matches(
+        &[Stage::Sort, Stage::Group], SortOrderArg::TemplateCoordinate, true, None
+    )]
+    #[case::trailing_sort_only(&[Stage::Simplex, Stage::Realign, Stage::Sort],
+        SortOrderArg::Queryname, true,
+        Some("with --realign runall sorts the re-aligned consensus reads by coordinate"))]
+    #[case::trailing_sort_matches(
+        &[Stage::Filter, Stage::Realign, Stage::Sort], SortOrderArg::Coordinate, true, None
+    )]
+    #[case::both_sorts(
+        &[Stage::Sort, Stage::Group, Stage::Simplex, Stage::Realign, Stage::Sort],
+        SortOrderArg::Coordinate,
+        true,
+        Some("sorts the raw reads in template-coordinate order and, with --realign, the \
+              re-aligned consensus reads by coordinate")
+    )]
+    #[case::default_trailing_sort_only(
+        &[Stage::Simplex, Stage::Realign, Stage::Sort], SortOrderArg::TemplateCoordinate, false,
+        None
+    )]
+    #[case::default_both_sorts(
+        &[Stage::Sort, Stage::Group, Stage::Simplex, Stage::Realign, Stage::Sort],
+        SortOrderArg::TemplateCoordinate,
+        false,
+        None
+    )]
+    #[case::default_raw_sort_only(
+        &[Stage::Sort, Stage::Group], SortOrderArg::TemplateCoordinate, false, None
+    )]
+    fn sort_order_override_warning_names_the_orders_used(
+        #[case] stages: &[Stage],
+        #[case] order: SortOrderArg,
+        #[case] explicit: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        let got = sort_order_override_warning(stages, order, explicit);
+        match expected {
+            Some(needle) => assert!(got.as_deref().is_some_and(|w| w.contains(needle)), "{got:?}"),
+            None => assert_eq!(got, None),
+        }
+    }
+
+    /// Parsing records a `--sort::order` the user passed, even one equal to
+    /// the default, and none when it was left at its default, whether `RunAll`
+    /// is parsed directly or as a subcommand.
+    #[rstest]
+    #[case::default(&[], None)]
+    #[case::explicit_default_value(
+        &["--sort::order", "template-coordinate"],
+        Some(SortOrderArg::TemplateCoordinate)
+    )]
+    #[case::explicit_other(&["--sort::order", "coordinate"], Some(SortOrderArg::Coordinate))]
+    fn parsing_records_an_explicit_sort_order(
+        #[case] extra: &[&str],
+        #[case] expected: Option<SortOrderArg>,
+    ) {
+        let mut args =
+            vec!["--start-from", "group", "--stop-after", "group", "-i", "in.bam", "-o", "out.bam"];
+        args.extend_from_slice(extra);
+        assert_eq!(parse(&args).sort_order_given, SortOrderGiven(expected));
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Sub,
+        }
+        #[derive(clap::Subcommand)]
+        enum Sub {
+            #[command(name = "runall")]
+            RunAll(Box<RunAll>),
+        }
+        let mut nested = vec!["fgumi", "runall"];
+        nested.extend_from_slice(&args);
+        let Sub::RunAll(r) = Cli::try_parse_from(nested).expect("valid args").command;
+        assert_eq!(r.sort_order_given, SortOrderGiven(expected));
+    }
+
+    /// The error a runall `--realign` test run reaches once validation has
+    /// passed: `ref.fa` does not exist, so its sequence dictionary is missing.
+    const PAST_VALIDATION: &str = "no sequence-dictionary file found next to --ref";
+
+    /// `--start-from filter --realign` with filter's methylation options: with
+    /// `--consensus simplex` (or `codec`) the input is single-strand, on whose
+    /// unaligned reads they check nothing, so they are rejected; without
+    /// `--consensus` runall cannot tell and warns; `--consensus duplex` accepts
+    /// them. Runs that pass validation fail later, on the missing `ref.fa`.
+    #[rstest]
+    #[case::unspecified(&[], true, PAST_VALIDATION)]
+    #[case::duplex(&["--consensus", "duplex"], false, PAST_VALIDATION)]
+    #[case::simplex(
+        &["--consensus", "simplex"],
+        false,
+        "with --start-from filter --realign filter runs before realign"
+    )]
+    #[case::codec(
+        &["--consensus", "codec"],
+        false,
+        "with --start-from filter --realign filter runs before realign"
+    )]
+    fn start_from_filter_realign_warns_on_methylation_masks(
+        #[case] extra: &[&str],
+        #[case] warns: bool,
+        #[case] error: &str,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let mut args = vec![
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "--filter::min-reads",
+            "1",
+            "--filter::min-methylation-depth",
+            "2",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+        ];
+        args.extend_from_slice(extra);
+        let r = parse_io(&args);
+        let _session = capture_logs();
+        let err = format!("{:#}", r.execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(error), "{err}");
+        let warned =
+            captured().iter().any(|line| line.contains("its methylation options check nothing"));
+        assert_eq!(warned, warns);
+    }
+
+    /// The `--realign` stage aligns duplex consensus plain, so on a
+    /// `--start-from filter` chain whose filter has no methylation options,
+    /// `--methylation-mode em-seq` with `--consensus duplex` reaches no stage and
+    /// is rejected as dead; without `--consensus` realign aligns bisulfite-aware
+    /// and consumes it.
+    #[rstest]
+    #[case::duplex(&["--consensus", "duplex"], "--methylation-mode is consumed only by")]
+    #[case::unspecified(&[], PAST_VALIDATION)]
+    fn start_from_filter_realign_methylation_mode_dead_on_duplex(
+        #[case] extra: &[&str],
+        #[case] error: &str,
+    ) {
+        let mut args = vec![
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "--filter::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+        ];
+        args.extend_from_slice(extra);
+        let err = format!("{:#}", parse_io(&args).execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(error), "{err}");
+    }
+
+    /// `--zipper::tags-to-*` do not reach the realign stage's merge (it always
+    /// uses zipper's `Consensus` sets), so runall says so when they are set.
+    #[rstest]
+    #[case::no_zipper_tags("group", &[], None)]
+    #[case::realign_only("group", &["--zipper::tags-to-reverse", "cd"], Some("have no effect"))]
+    #[case::with_raw_align(
+        "align",
+        &["--zipper::tags-to-revcomp", "ac"],
+        Some("apply only to the raw-read align/zipper stage's merge")
+    )]
+    #[case::with_zipper(
+        "zipper",
+        &["--zipper::tags-to-reverse", "cd"],
+        Some("apply only to the raw-read align/zipper stage's merge")
+    )]
+    fn realign_warns_on_zipper_tag_options(
+        #[case] start_from: &str,
+        #[case] zipper: &[&str],
+        #[case] expected: Option<&str>,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let mut args = vec![
+            "--start-from",
+            start_from,
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+        ];
+        args.extend_from_slice(zipper);
+        let r = parse_io(&args);
+        let _session = capture_logs();
+        // Fails later, past the warning, on the missing reference.
+        let err = format!("{:#}", r.execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(PAST_VALIDATION), "{err}");
+        let warnings: Vec<String> = captured()
+            .into_iter()
+            .filter(|line| line.contains("--zipper::tags-to-reverse / --zipper::tags-to-revcomp"))
+            .collect();
+        match expected {
+            Some(needle) => {
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(warnings[0].contains(needle), "{warnings:?}");
+            }
+            None => assert!(warnings.is_empty(), "{warnings:?}"),
+        }
+    }
+
+    /// `--start-from consensus --realign` needs `--ref` and the `--aligner::*`
+    /// selection just as an align stage does (`{ref}` names a FASTA with a
+    /// `.dict` beside it).
+    /// The error says the aligner is needed for `--realign`, not only which flag.
+    #[rstest]
+    #[case::no_ref(
+        &["--aligner::preset", "bwa-mem3"],
+        &["requires --ref (the aligner reference FASTA", "the --realign stage aligns the consensus"]
+    )]
+    #[case::no_aligner(
+        &["--ref", "{ref}"],
+        &["aligning requires one of `--aligner::preset`", "the --realign stage aligns the consensus"]
+    )]
+    fn realign_requires_aligner_options(#[case] extra: &[&str], #[case] needles: &[&str]) {
+        let tmp = tempfile::tempdir().unwrap();
+        let fasta = tmp.path().join("ref.fa");
+        std::fs::write(&fasta, ">chr1\nACGT\n").unwrap();
+        std::fs::write(tmp.path().join("ref.dict"), "@SQ\tSN:chr1\tLN:4\n").unwrap();
+        let fasta = fasta.to_str().unwrap().to_string();
+        let extra: Vec<&str> =
+            extra.iter().map(|a| if *a == "{ref}" { fasta.as_str() } else { a }).collect();
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--realign",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+        ];
+        args.extend_from_slice(&extra);
+        let err = RunAll::try_parse_from(args).unwrap().execute("runall test").unwrap_err();
+        let err = format!("{err:#}");
+        for needle in needles {
+            assert!(err.contains(needle), "missing {needle}: {err}");
+        }
+    }
+
+    /// A negative `--realign::xa-max-hits` given as its own word reaches the
+    /// value's own message (clap would otherwise read `-1,5` as an unknown
+    /// option), prefixed with the flag.
+    #[test]
+    fn realign_xa_max_hits_rejects_a_negative_value() {
+        let err = RunAll::try_parse_from([
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--realign",
+            "--realign::xa-max-hits",
+            "-1,5",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+        ])
+        .expect_err("negative value");
+        let rendered = err.to_string();
+        assert!(rendered.contains("--realign::xa-max-hits"), "{rendered}");
+        assert!(rendered.contains("'-1' is not a non-negative integer"), "{rendered}");
+    }
+
+    /// `--realign::xa-max-hits` is a `--realign` option: given alone it is a
+    /// usage error rather than silently ignored.
+    #[rstest]
+    #[case::without_realign(&[], false)]
+    #[case::with_realign(&["--realign"], true)]
+    fn realign_xa_max_hits_requires_realign(#[case] extra: &[&str], #[case] ok: bool) {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+            "--realign::xa-max-hits",
+            "3,3",
+        ];
+        args.extend_from_slice(extra);
+        let parsed = RunAll::try_parse_from(args);
+        assert_eq!(parsed.is_ok(), ok, "{:?}", parsed.as_ref().err());
+        if let Err(e) = parsed {
+            assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument, "got: {e}");
+        }
+    }
+
+    /// `--realign::in-memory-reference` reaches the realign stage's options (off
+    /// by default), and like the other `--realign::*` options needs `--realign`
+    /// (checked when the stages are derived, so the bare flag still parses).
+    #[rstest]
+    #[case::unset(&["--realign"], Some(false))]
+    #[case::bare(&["--realign", "--realign::in-memory-reference"], Some(true))]
+    #[case::explicit_false(
+        &["--realign", "--realign::in-memory-reference", "false"],
+        Some(false)
+    )]
+    #[case::without_realign(&["--realign::in-memory-reference"], None)]
+    fn realign_in_memory_reference_reaches_the_stage(
+        #[case] extra: &[&str],
+        #[case] expected: Option<bool>,
+    ) {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+        ];
+        args.extend_from_slice(extra);
+        let r = RunAll::try_parse_from(args).expect("parse");
+        let Some(expected) = expected else {
+            let err = r.derive_stages().expect_err("needs --realign").to_string();
+            assert!(err.contains("requires --realign"), "{err}");
+            return;
+        };
+        let stages = r.derive_stages().unwrap();
+        let realign = r.build_stage_options_bag(&stages).unwrap().realign.unwrap();
+        assert_eq!(realign.in_memory_reference, expected);
+    }
+
+    /// Without `--realign` the derived chain and its options are exactly as before.
+    #[rstest]
+    #[case::consensus(
+        &["--start-from", "group", "--stop-after", "consensus", "--consensus", "simplex"],
+        &[Stage::Group, Stage::Simplex],
+    )]
+    #[case::filter(
+        &["--start-from", "group", "--stop-after", "filter", "--consensus", "simplex"],
+        &[Stage::Group, Stage::Simplex, Stage::Filter],
+    )]
+    #[case::sort_to_filter(
+        &["--start-from", "sort", "--stop-after", "filter", "--consensus", "simplex"],
+        &[Stage::Sort, Stage::Group, Stage::Simplex, Stage::Filter],
+    )]
+    fn no_realign_chain_unchanged(#[case] args: &[&str], #[case] expected: &[Stage]) {
+        let mut args = args.to_vec();
+        args.extend_from_slice(&[
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+            "--filter::min-reads",
+            "1",
+        ]);
+        let r = parse_io(&args);
+        let stages = r.derive_stages().unwrap();
+        assert_eq!(stages, expected);
+        let bag = r.build_stage_options_bag(&stages).unwrap();
+        assert!(bag.realign.is_none());
+        assert!(!bag.group.unwrap().realign_window);
     }
 }

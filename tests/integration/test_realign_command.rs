@@ -1,10 +1,16 @@
 //! Integration tests for `fgumi realign`.
 //!
 //! Most tests need no real aligner: an `awk` command stands in for it, reporting
-//! every read unmapped (the `rw` input check, the per-end counts), placing a pair
-//! at fixed positions (per-base tag orientation, the duplex chain), or listing an
-//! in-window `XA` alternative (a swap through the whole pipeline). These run in
-//! every CI job.
+//! every read unmapped (the `rw` input check, the per-end counts, the intermediate
+//! filter), placing a pair at fixed positions (per-base tag orientation, the duplex
+//! chain), or listing an in-window `XA` alternative (a swap through the whole
+//! pipeline). These run in every CI job.
+//!
+//! `runall_matches_standalone_chain` runs the same input through
+//! `runall --realign` and through that standalone chain and compares the
+//! records; `runall_from_extract_realigns_with_the_aligned_header` runs
+//! `runall --start-from extract --realign`, where group reads its contig names
+//! from the align stage's header. Both are gated like the standalone e2e.
 //!
 //! `standalone_chain_aligns_consensus` runs the standalone chain
 //! `simulate mapped-reads → group --realign-window → simplex → realign → sort`
@@ -13,9 +19,9 @@
 //! `FGUMI_BWA_MEM3_REQUIRE_TOOLS` set (as CI's e2e-parity job does) a missing
 //! `bwa-mem3` fails instead. The
 //! in-process case additionally needs the `aligner-bwa-mem3` feature. Its input
-//! includes mate-unmapped molecules (carried through group and consensus), and
-//! it removes `rw` from some consensus R2s, which realign must align and count
-//! as without a window.
+//! and the parity test's include mate-unmapped molecules (carried through group
+//! and consensus), and it removes `rw` from some consensus R2s, which realign
+//! must align and count as without a window.
 
 use std::path::Path;
 use std::process::Command;
@@ -699,11 +705,18 @@ fn argv_recording_aligner(dir: &Path) -> String {
 }
 
 /// bwa's `-h` reaches the realign stage's aligner command only when the user
-/// sets it with `--xa-max-hits`; unset, the command is run as written.
+/// sets it, for `fgumi realign --xa-max-hits` and `runall
+/// --realign::xa-max-hits`; unset, the command is run as written.
 #[rstest::rstest]
-#[case::unset(&[], "mem {ref}")]
-#[case::set(&["--xa-max-hits", "7,9"], "mem -h 7,9 {ref}")]
-fn xa_max_hits_reaches_the_aligner(#[case] extra: &[&str], #[case] expected_argv: &str) {
+#[case::realign_unset(false, &[], "mem {ref}")]
+#[case::realign_set(false, &["--xa-max-hits", "7,9"], "mem -h 7,9 {ref}")]
+#[case::runall_unset(true, &[], "mem {ref}")]
+#[case::runall_set(true, &["--realign::xa-max-hits", "7,9"], "mem -h 7,9 {ref}")]
+fn xa_max_hits_reaches_the_aligner(
+    #[case] runall: bool,
+    #[case] extra: &[&str],
+    #[case] expected_argv: &str,
+) {
     let tmp = TempDir::new().expect("tempdir");
     let dir = tmp.path();
     let input = write_consensus(dir, 3, |_| (Some("chr1:1-100:+"), Some("chr1:1-100:-")));
@@ -711,8 +724,14 @@ fn xa_max_hits_reaches_the_aligner(#[case] extra: &[&str], #[case] expected_argv
     let output = dir.join("out.bam");
     let argv = dir.join("argv.txt");
     let aligner = argv_recording_aligner(dir);
-    let result = fgumi()
-        .args(["realign", "-r", p(&reference)])
+    let mut cmd = fgumi();
+    if runall {
+        cmd.args(["runall", "--start-from", "filter", "--stop-after", "filter", "--realign"])
+            .args(["--filter::min-reads", "1", "--ref", p(&reference)]);
+    } else {
+        cmd.args(["realign", "-r", p(&reference)]);
+    }
+    let result = cmd
         .args(["-i", p(&input), "-o", p(&output), "--aligner::command", &aligner])
         .args(extra)
         .env("FGUMI_TEST_ARGV", &argv)
@@ -723,20 +742,37 @@ fn xa_max_hits_reaches_the_aligner(#[case] extra: &[&str], #[case] expected_argv
     assert_eq!(recorded.trim_end(), expected_argv.replace("{ref}", p(&reference)));
 }
 
-/// A `--xa-max-hits` left without a value before an option that takes one is
-/// reported against the flag, not as clap's "unexpected argument" for the
-/// option's value; a negative value given as its own word still reaches the
-/// non-negative-integer check.
+/// A `--xa-max-hits` (or runall's `--realign::xa-max-hits`) left without a value
+/// before an option that takes one is reported against the flag, not as clap's
+/// "unexpected argument" for the option's value; a negative value given as its
+/// own word still reaches the non-negative-integer check.
 #[rstest::rstest]
-#[case::realign_missing("--xa-max-hits", &["--threads", "4"], "a value is required for '--xa-max-hits")]
-#[case::realign_negative("--xa-max-hits", &["-1,5"], "'-1' is not a non-negative integer")]
+#[case::realign_missing(false, "--xa-max-hits", &["--threads", "4"], "a value is required for '--xa-max-hits")]
+#[case::realign_negative(false, "--xa-max-hits", &["-1,5"], "'-1' is not a non-negative integer")]
+#[case::runall_missing(
+    true,
+    "--realign::xa-max-hits",
+    &["--threads", "4"],
+    "a value is required for '--realign::xa-max-hits"
+)]
+#[case::runall_negative(
+    true,
+    "--realign::xa-max-hits",
+    &["-1,5"],
+    "'-1' is not a non-negative integer"
+)]
 fn xa_max_hits_bad_value_names_the_flag(
+    #[case] runall: bool,
     #[case] flag: &str,
     #[case] rest: &[&str],
     #[case] message: &str,
 ) {
     let mut cmd = fgumi();
-    cmd.args(["realign", "-r", "ref.fa"]);
+    if runall {
+        cmd.args(["runall", "--start-from", "filter", "--stop-after", "filter", "--realign"]);
+    } else {
+        cmd.args(["realign", "-r", "ref.fa"]);
+    }
     let result =
         cmd.args(["-i", "in.bam", "-o", "out.bam", flag]).args(rest).output().expect("spawn");
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -1707,6 +1743,8 @@ mod chain {
 
     /// The inputs of the reference-mode parity tests.
     struct ReferenceModeInputs {
+        /// The simulated molecules after `group --realign-window`.
+        grouped: PathBuf,
         /// The simulated molecules after `group --realign-window` and `simplex
         /// --min-reads 1`.
         consensus: PathBuf,
@@ -1736,7 +1774,7 @@ mod chain {
         ]);
         run_ok(&["simplex", "-i", p(&grouped), "-o", p(&consensus), "--min-reads", "1"]);
         let reference = soft_masked_wrapped_copy(&reference, &dir.join("masked"));
-        ReferenceModeInputs { consensus, reference }
+        ReferenceModeInputs { grouped, consensus, reference }
     }
 
     /// By default realign reads the reference regions it needs through the
@@ -1792,4 +1830,908 @@ mod chain {
             assert_eq!(a, e, "record {i} differs between the indexed and in-memory reference");
         }
     }
+
+    fn preset(backend: Backend) -> &'static str {
+        match backend {
+            Backend::Subprocess => "bwa-mem3",
+            Backend::InProcess => "bwa-mem3-inproc",
+        }
+    }
+
+    /// The decoded records of a BAM (no header, so `@PG` is not compared).
+    fn records(path: &Path) -> Vec<noodles::sam::alignment::RecordBuf> {
+        crate::helpers::read_bam_output(path).1
+    }
+
+    /// The same simulated grouped-input through `runall --start-from group
+    /// --stop-after consensus --realign` and through the standalone chain
+    /// `group --realign-window → simplex → realign → sort --order coordinate`
+    /// gives identical records (`@PG` aside: one runall `@PG` vs one per
+    /// command).
+    #[rstest]
+    #[case::subprocess(Backend::Subprocess)]
+    #[cfg_attr(feature = "aligner-bwa-mem3", case::inproc(Backend::InProcess))]
+    fn runall_matches_standalone_chain(#[case] backend: Backend) {
+        if !bwa_mem3_or_skip(&format!("runall_matches_standalone_chain ({backend:?})")) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let reference = write_reference(dir);
+        build_aligner_index(&reference, "bwa-mem3");
+        let mapped = simulate_with_unmapped_mates(dir, &reference, 7);
+
+        // Standalone chain.
+        let grouped = dir.join("grouped.bam");
+        let consensus = dir.join("consensus.bam");
+        let realigned = dir.join("realigned.bam");
+        let standalone = dir.join("standalone.bam");
+        run_ok(&[
+            "group",
+            "-i",
+            p(&mapped),
+            "-o",
+            p(&grouped),
+            "--strategy",
+            "adjacency",
+            "--edits",
+            "1",
+            "--realign-window",
+        ]);
+        run_ok(&["simplex", "-i", p(&grouped), "-o", p(&consensus), "--min-reads", "1"]);
+        run_ok(&[
+            "realign",
+            "-i",
+            p(&consensus),
+            "-o",
+            p(&realigned),
+            "-r",
+            p(&reference),
+            "--aligner::preset",
+            preset(backend),
+            "--threads",
+            "4",
+        ]);
+        run_ok(&["sort", "-i", p(&realigned), "-o", p(&standalone), "--order", "coordinate"]);
+
+        // runall.
+        let fused = dir.join("runall.bam");
+        run_ok(&[
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&mapped),
+            "-o",
+            p(&fused),
+            "--group::strategy",
+            "adjacency",
+            "--group::edits",
+            "1",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            p(&reference),
+            "--aligner::preset",
+            preset(backend),
+            "--realign",
+            "--threads",
+            "4",
+        ]);
+
+        let expected = records(&standalone);
+        assert!(!expected.is_empty(), "the standalone chain produced no records");
+        let actual = records(&fused);
+        assert_eq!(actual.len(), expected.len(), "record counts differ");
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                a, e,
+                "record {i} differs between runall --realign and the standalone chain"
+            );
+        }
+        let (header, _) = crate::helpers::read_bam_output(&fused);
+        let sort_order = header
+            .header()
+            .and_then(|hd| {
+                hd.other_fields()
+                    .get(&noodles::sam::header::record::value::map::header::tag::SORT_ORDER)
+            })
+            .map(ToString::to_string);
+        assert_eq!(sort_order.as_deref(), Some("coordinate"));
+    }
+
+    /// `runall --start-from consensus --realign`, from the grouped reads, writes
+    /// the same records by default, when the realign stage reads the reference
+    /// through its `.fai` index (no other stage of this chain holds it), as with
+    /// `--realign::in-memory-reference`.
+    #[rstest]
+    #[case::subprocess(Backend::Subprocess)]
+    #[cfg_attr(feature = "aligner-bwa-mem3", case::inproc(Backend::InProcess))]
+    fn runall_indexed_reference_matches_in_memory(#[case] backend: Backend) {
+        if !bwa_mem3_or_skip(&format!("runall_indexed_reference_matches_in_memory ({backend:?})")) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let ReferenceModeInputs { grouped, reference, .. } = reference_mode_inputs(dir);
+        let run = |in_memory: &str| {
+            let out = dir.join(format!("runall.in-memory-{in_memory}.bam"));
+            let stderr = run_args_and_capture_logs(
+                &[
+                    "runall",
+                    "--start-from",
+                    "consensus",
+                    "--stop-after",
+                    "consensus",
+                    "--consensus",
+                    "simplex",
+                    "--simplex::min-reads",
+                    "1",
+                    "-i",
+                    p(&grouped),
+                    "-o",
+                    p(&out),
+                    "--ref",
+                    p(&reference),
+                    "--aligner::preset",
+                    preset(backend),
+                    "--realign",
+                    "--realign::in-memory-reference",
+                    in_memory,
+                    "--threads",
+                    "4",
+                ]
+                .map(std::ffi::OsStr::new),
+            );
+            (records(&out), stderr)
+        };
+        let (expected, _) = run("true");
+        let (actual, stderr) = run("false");
+        assert!(stderr.contains("on demand through its .fai index"), "{stderr}");
+        assert!(
+            realign_count(&stderr, "Primary swapped to an in-window XA hit:") > 0,
+            "no end was promoted, so the reference was never read"
+        );
+        assert!(!expected.is_empty(), "runall --realign produced no records");
+        assert_eq!(actual.len(), expected.len(), "record counts differ");
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a, e, "record {i} differs between the indexed and in-memory reference");
+        }
+    }
+
+    /// `runall --start-from extract … --realign`: group runs on the align
+    /// stage's output, so its `rw` contig names must come from the aligned
+    /// header. Checked twice: with `--stop-after group
+    /// --group::realign-window` every raw primary's window names its own
+    /// contig, and with `--realign` every consensus primary bwa placed in its
+    /// window is counted as kept or swapped by realign (a wrong contig name
+    /// would put no window on any contig). The in-process case also runs the
+    /// raw-read align and the realign against one shared index.
+    #[rstest]
+    #[case::subprocess(Backend::Subprocess)]
+    #[cfg_attr(feature = "aligner-bwa-mem3", case::inproc(Backend::InProcess))]
+    fn runall_from_extract_realigns_with_the_aligned_header(#[case] backend: Backend) {
+        if !bwa_mem3_or_skip(&format!(
+            "runall_from_extract_realigns_with_the_aligned_header ({backend:?})"
+        )) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let reference = write_reference(dir);
+        build_aligner_index(&reference, "bwa-mem3");
+        let (r1, r2) = (dir.join("r1.fq.gz"), dir.join("r2.fq.gz"));
+        run_ok(&[
+            "simulate",
+            "fastq-reads",
+            "-1",
+            p(&r1),
+            "-2",
+            p(&r2),
+            "--truth",
+            p(&dir.join("truth.tsv")),
+            "-r",
+            p(&reference),
+            "--num-molecules",
+            "200",
+            "--read-length",
+            "100",
+            "--seed",
+            "11",
+        ]);
+        let common = |stop: &str, out: &Path| -> Vec<String> {
+            [
+                "runall",
+                "--start-from",
+                "extract",
+                "--stop-after",
+                stop,
+                "--extract::inputs",
+                p(&r1),
+                p(&r2),
+                "--extract::read-structures",
+                "8M+T",
+                "+T",
+                "--extract::sample",
+                "s1",
+                "--extract::library",
+                "lib1",
+                "--ref",
+                p(&reference),
+                "--aligner::preset",
+                preset(backend),
+                "--group::strategy",
+                "adjacency",
+                "--group::edits",
+                "1",
+                "--threads",
+                "4",
+                "-o",
+                p(out),
+            ]
+            .map(String::from)
+            .to_vec()
+        };
+
+        // 1. Group's windows name the contig each raw primary is on.
+        let grouped = dir.join("grouped.bam");
+        let mut args = common("group", &grouped);
+        args.push("--group::realign-window".to_string());
+        run_ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&grouped).expect("open");
+        let header = reader.read_header().expect("header");
+        assert!(!header.reference_sequences().is_empty(), "grouped output has no @SQ");
+        let mut windows: HashMap<(String, bool), String> = HashMap::new();
+        let mut stamped = 0usize;
+        for record in reader.records() {
+            let record = record.expect("record");
+            let f = record.flags();
+            if f.is_unmapped() || f.is_secondary() || f.is_supplementary() {
+                continue;
+            }
+            let rw = string_tag(&record, SamTag::RW).expect("raw primaries carry rw");
+            let id = record.reference_sequence_id().expect("tid").expect("tid");
+            let (contig, _) = header.reference_sequences().get_index(id).expect("contig");
+            assert_eq!(
+                parse_window(&rw).contig.as_bytes(),
+                contig.as_slice(),
+                "rw {rw} does not name the record's contig"
+            );
+            let mi = string_tag(&record, SamTag::MI).expect("MI");
+            windows.entry((mi, f.is_first_segment())).or_insert(rw);
+            stamped += 1;
+        }
+        assert!(stamped > 0, "no raw primary carried rw");
+
+        // 2. The full run re-aligns the consensus reads against those windows.
+        let realigned = dir.join("realigned.bam");
+        let mut args = common("consensus", &realigned);
+        args.extend(
+            ["--consensus", "simplex", "--simplex::min-reads", "1", "--realign"].map(String::from),
+        );
+        let stderr =
+            run_args_and_capture_logs(&args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+        if matches!(backend, Backend::InProcess) {
+            assert_eq!(
+                stderr.matches("in-process bwa-mem3: loaded index").count(),
+                1,
+                "the align and realign stages must load the index once:\n{stderr}"
+            );
+            assert!(stderr.contains("reusing the index"), "{stderr}");
+        }
+        let mut reader =
+            noodles::bam::io::reader::Builder.build_from_path(&realigned).expect("open");
+        let header = reader.read_header().expect("header");
+        let (mut primaries, mut in_window, mut outside, mut unmapped) = (0u64, 0u64, 0u64, 0u64);
+        let mut last_pos: Option<(usize, usize)> = None;
+        for record in reader.records() {
+            let record = record.expect("record");
+            assert!(string_tag(&record, SamTag::RW).is_none(), "rw must be stripped");
+            let f = record.flags();
+            if let (Some(Ok(id)), Some(Ok(pos))) =
+                (record.reference_sequence_id(), record.alignment_start())
+            {
+                let key = (id, pos.get());
+                assert!(last_pos.is_none_or(|last| last <= key), "output is not coordinate sorted");
+                last_pos = Some(key);
+            }
+            if f.is_secondary() || f.is_supplementary() {
+                continue;
+            }
+            primaries += 1;
+            if f.is_unmapped() {
+                unmapped += 1;
+                continue;
+            }
+            let mi = string_tag(&record, SamTag::MI).expect("consensus MI");
+            let Some(rw) = windows.get(&(mi.clone(), f.is_first_segment())) else {
+                panic!("no raw window for consensus MI {mi}");
+            };
+            let window = parse_window(rw);
+            let id = record.reference_sequence_id().expect("tid").expect("tid");
+            let (contig, _) = header.reference_sequences().get_index(id).expect("contig");
+            let start = record.alignment_start().expect("pos").expect("pos").get();
+            let span = record.cigar().alignment_span().expect("cigar");
+            let end = start + span.max(1) - 1;
+            let inside = contig.as_slice() == window.contig.as_bytes()
+                && f.is_reverse_complemented() == window.reverse
+                && start <= window.end
+                && end >= window.start;
+            if inside { in_window += 1 } else { outside += 1 }
+        }
+        assert!(primaries > 0, "no consensus reads");
+        assert_eq!(realign_count(&stderr, "Consensus reads realigned:"), primaries);
+        assert_eq!(realign_count(&stderr, "Unmapped:"), unmapped);
+        let kept = realign_count(&stderr, "Primary already in window:");
+        let swapped = realign_count(&stderr, "Primary swapped to an in-window XA hit:");
+        let swapped_supplementary =
+            realign_count(&stderr, "Primary swapped to an in-window supplementary piece:");
+        assert_eq!(
+            kept + swapped + swapped_supplementary,
+            in_window,
+            "in-window primaries are kept or swapped"
+        );
+        let kept_proper_pair = realign_count(
+            &stderr,
+            "Primary kept outside window (proper pair with an in-window mate):",
+        );
+        assert_eq!(
+            realign_count(
+                &stderr,
+                "Primary outside window (no in-window XA hit or supplementary piece):"
+            ) + kept_proper_pair,
+            outside,
+            "out-of-window primaries are outside or kept by the proper-pair guard"
+        );
+        assert!(
+            in_window * 10 >= (primaries - unmapped) * 9,
+            "{in_window} of {} mapped consensus primaries in their window",
+            primaries - unmapped
+        );
+    }
+
+    /// [`super::UNMAPPED_ALIGNER`] with the `@SQ` lines of [`write_reference`]'s
+    /// contigs: reports every read unmapped, so the realign stage after an
+    /// intermediate filter passes the filtered records through without a real
+    /// aligner.
+    const UNMAPPED_ALIGNER_TWO_CONTIGS: &str = "awk 'BEGIN { OFS = \"\\t\"; \
+        print \"@HD\", \"VN:1.6\"; print \"@SQ\", \"SN:chr1\", \"LN:20000\"; \
+        print \"@SQ\", \"SN:chr2\", \"LN:10000\" } \
+        NR % 4 == 1 { name = substr($1, 2) } NR % 4 == 2 { seq = $0 } \
+        NR % 4 == 0 { n++; print name, (n % 2 ? 77 : 141), \"*\", 0, 0, \"*\", \"*\", 0, 0, seq, $0 }' \
+        # {ref}";
+
+    /// How the intermediate filter is reached: the run starts at filter (its
+    /// input is a consensus BAM), or it calls consensus and continues to filter.
+    #[derive(Debug, Clone, Copy)]
+    enum FilterForm {
+        StartFromFilter,
+        StopAfterFilter,
+    }
+
+    /// The filter options both sides of a filter comparison use (without the
+    /// `--filter::` prefix): enough `--min-reads` to reject some molecules.
+    const FILTER_ARGS: [&str; 2] = ["min-reads", "3"];
+
+    /// The window-grouped simplex consensus of `mapped` (`group --realign-window
+    /// → simplex --min-reads 1`), written to `dir/consensus.bam`.
+    fn window_consensus(dir: &Path, mapped: &Path) -> PathBuf {
+        let grouped = dir.join("grouped.bam");
+        let consensus = dir.join("consensus.bam");
+        run_ok(&[
+            "group",
+            "-i",
+            p(mapped),
+            "-o",
+            p(&grouped),
+            "--strategy",
+            "adjacency",
+            "--edits",
+            "1",
+            "--realign-window",
+        ]);
+        run_ok(&["simplex", "-i", p(&grouped), "-o", p(&consensus), "--min-reads", "1"]);
+        consensus
+    }
+
+    /// `runall` arguments that run `form` up to and including filter (kept reads
+    /// to `out`, rejects to `rejects`, stats to `stats`); with `realign`,
+    /// `--realign` and its aligner (`aligner_args`) are added.
+    #[allow(clippy::too_many_arguments)]
+    fn runall_filter_args(
+        form: FilterForm,
+        mapped: &Path,
+        consensus: &Path,
+        out: &Path,
+        rejects: &Path,
+        stats: &Path,
+        by_template: bool,
+        realign: Option<&[&str]>,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = match form {
+            FilterForm::StartFromFilter => {
+                vec![
+                    "runall",
+                    "--start-from",
+                    "filter",
+                    "--stop-after",
+                    "filter",
+                    "-i",
+                    p(consensus),
+                ]
+            }
+            FilterForm::StopAfterFilter => vec![
+                "runall",
+                "--start-from",
+                "group",
+                "--stop-after",
+                "filter",
+                "--consensus",
+                "simplex",
+                "-i",
+                p(mapped),
+                "--group::strategy",
+                "adjacency",
+                "--group::edits",
+                "1",
+                "--group::realign-window",
+                "--simplex::min-reads",
+                "1",
+            ],
+        }
+        .into_iter()
+        .map(String::from)
+        .collect();
+        args.extend(
+            ["-o", p(out), "--filter::rejects", p(rejects), "--filter::stats", p(stats)]
+                .map(String::from),
+        );
+        args.push(format!("--filter::{}", FILTER_ARGS[0]));
+        args.push(FILTER_ARGS[1].to_string());
+        args.push("--filter::filter-by-template".to_string());
+        args.push(by_template.to_string());
+        if let Some(aligner) = realign {
+            args.push("--realign".to_string());
+            args.extend(aligner.iter().map(|a| (*a).to_string()));
+        }
+        args
+    }
+
+    /// A record as filter leaves it: name, flags, bases, qualities and tags,
+    /// minus `rw` (realign strips it). The alignment fields are left out: the
+    /// realign stage's aligner sets them.
+    type FilteredRecord = (String, u16, Vec<u8>, Vec<u8>, Vec<(String, String)>);
+
+    fn filtered_record(record: &noodles::sam::alignment::RecordBuf) -> FilteredRecord {
+        let rw = SamTag::RW.to_noodles_tag();
+        let mut tags: Vec<(String, String)> = record
+            .data()
+            .iter()
+            .filter(|(tag, _)| *tag != rw)
+            .map(|(tag, value)| {
+                (String::from_utf8_lossy(tag.as_ref()).into_owned(), format!("{value:?}"))
+            })
+            .collect();
+        tags.sort();
+        (
+            record.name().map(ToString::to_string).unwrap_or_default(),
+            record.flags().bits(),
+            record.sequence().as_ref().to_vec(),
+            record.quality_scores().as_ref().to_vec(),
+            tags,
+        )
+    }
+
+    /// The records of `path` as [`filtered_record`]s, sorted (the realigned
+    /// output is coordinate sorted, filter's is in input order).
+    fn filtered_records(path: &Path) -> Vec<FilteredRecord> {
+        let mut records: Vec<_> = records(path).iter().map(filtered_record).collect();
+        records.sort();
+        records
+    }
+
+    /// The intermediate filter keeps exactly the records the terminal filter
+    /// keeps, writes the same rejects and the same stats, for both ways of
+    /// reaching it and both filter modes. The intermediate filter's output is
+    /// observed through the realign stage after it, with an aligner that
+    /// reports every read unmapped: realign then hands each filtered record
+    /// through (it strips `rw` and takes alignment fields from the aligner),
+    /// so the kept records' names, flags, bases, qualities (masking) and tags
+    /// are the intermediate filter's. Rejects and stats are written by the
+    /// filter stage itself and are compared exactly. The terminal side is
+    /// `fgumi filter` on the same consensus input (`--start-from filter`) or
+    /// `runall --stop-after filter` without `--realign` (`--stop-after filter`,
+    /// with `--group::realign-window` so the consensus reads match). Needs no
+    /// real aligner.
+    #[rstest]
+    fn intermediate_filter_matches_terminal_filter(
+        #[values(FilterForm::StartFromFilter, FilterForm::StopAfterFilter)] form: FilterForm,
+        #[values(true, false)] by_template: bool,
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let reference = write_reference(dir);
+        let mapped = simulate_with_unmapped_mates(dir, &reference, 7);
+        let consensus = window_consensus(dir, &mapped);
+
+        let (kept, rejects, stats) =
+            (dir.join("terminal.bam"), dir.join("terminal.rej.bam"), dir.join("terminal.stats"));
+        match form {
+            FilterForm::StartFromFilter => run_ok(&[
+                "filter",
+                "-i",
+                p(&consensus),
+                "-o",
+                p(&kept),
+                "--rejects",
+                p(&rejects),
+                "--stats",
+                p(&stats),
+                &format!("--{}", FILTER_ARGS[0]),
+                FILTER_ARGS[1],
+                "--filter-by-template",
+                &by_template.to_string(),
+            ]),
+            FilterForm::StopAfterFilter => {
+                let args = runall_filter_args(
+                    form,
+                    &mapped,
+                    &consensus,
+                    &kept,
+                    &rejects,
+                    &stats,
+                    by_template,
+                    None,
+                );
+                run_ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            }
+        }
+
+        let (out, out_rejects, out_stats) =
+            (dir.join("realign.bam"), dir.join("realign.rej.bam"), dir.join("realign.stats"));
+        let aligner = ["--ref", p(&reference), "--aligner::command", UNMAPPED_ALIGNER_TWO_CONTIGS];
+        let args = runall_filter_args(
+            form,
+            &mapped,
+            &consensus,
+            &out,
+            &out_rejects,
+            &out_stats,
+            by_template,
+            Some(&aligner),
+        );
+        run_ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+
+        // The realign stage's trailing sort sorts by coordinate.
+        let (header, _) = crate::helpers::read_bam_output(&out);
+        let so = header
+            .header()
+            .and_then(|hd| {
+                hd.other_fields()
+                    .get(&noodles::sam::header::record::value::map::header::tag::SORT_ORDER)
+            })
+            .map(ToString::to_string);
+        assert_eq!(so.as_deref(), Some("coordinate"), "the --realign output is coordinate sorted");
+
+        let expected = filtered_records(&kept);
+        assert!(!expected.is_empty(), "the terminal filter kept nothing");
+        let expected_rejects = records(&rejects);
+        assert!(!expected_rejects.is_empty(), "the terminal filter rejected nothing");
+        assert_eq!(filtered_records(&out), expected, "kept records differ");
+        assert_eq!(records(&out_rejects), expected_rejects, "rejects differ");
+        assert_eq!(
+            std::fs::read_to_string(&out_stats).expect("stats"),
+            std::fs::read_to_string(&stats).expect("stats"),
+            "filter stats differ"
+        );
+    }
+
+    /// `runall … filter --realign` runs end to end with a real aligner and
+    /// matches the standalone chain `group --realign-window → simplex → filter
+    /// → realign → sort --order coordinate` (records identical, `@PG` aside),
+    /// for both ways of reaching filter: `--stop-after filter` from the raw
+    /// reads, and `--start-from filter` on the standalone chain's consensus.
+    /// The output is coordinate sorted, carries no `rw`, every consensus
+    /// primary is counted by realign, and the filter's rejects match the
+    /// standalone filter's.
+    #[rstest]
+    #[case::stop_after_filter_subprocess(FilterForm::StopAfterFilter, Backend::Subprocess)]
+    #[case::start_from_filter_subprocess(FilterForm::StartFromFilter, Backend::Subprocess)]
+    #[cfg_attr(
+        feature = "aligner-bwa-mem3",
+        case::stop_after_filter_inproc(FilterForm::StopAfterFilter, Backend::InProcess)
+    )]
+    #[cfg_attr(
+        feature = "aligner-bwa-mem3",
+        case::start_from_filter_inproc(FilterForm::StartFromFilter, Backend::InProcess)
+    )]
+    fn runall_filter_realign_matches_standalone_chain(
+        #[case] form: FilterForm,
+        #[case] backend: Backend,
+    ) {
+        if !bwa_mem3_or_skip(&format!(
+            "runall_filter_realign_matches_standalone_chain ({form:?}, {backend:?})"
+        )) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let reference = write_reference(dir);
+        build_aligner_index(&reference, "bwa-mem3");
+        let mapped = simulate_with_unmapped_mates(dir, &reference, 7);
+
+        // Standalone chain.
+        let consensus = window_consensus(dir, &mapped);
+        let (filtered, rejects, stats) =
+            (dir.join("filtered.bam"), dir.join("filter.rej.bam"), dir.join("filter.stats"));
+        run_ok(&[
+            "filter",
+            "-i",
+            p(&consensus),
+            "-o",
+            p(&filtered),
+            "--rejects",
+            p(&rejects),
+            "--stats",
+            p(&stats),
+            &format!("--{}", FILTER_ARGS[0]),
+            FILTER_ARGS[1],
+        ]);
+        let realigned = dir.join("realigned.bam");
+        let standalone = dir.join("standalone.bam");
+        run_ok(&[
+            "realign",
+            "-i",
+            p(&filtered),
+            "-o",
+            p(&realigned),
+            "-r",
+            p(&reference),
+            "--aligner::preset",
+            preset(backend),
+            "--threads",
+            "4",
+        ]);
+        run_ok(&["sort", "-i", p(&realigned), "-o", p(&standalone), "--order", "coordinate"]);
+
+        // runall.
+        let (fused, fused_rejects, fused_stats) =
+            (dir.join("runall.bam"), dir.join("runall.rej.bam"), dir.join("runall.stats"));
+        let aligner =
+            ["--ref", p(&reference), "--aligner::preset", preset(backend), "--threads", "4"];
+        let args = runall_filter_args(
+            form,
+            &mapped,
+            &consensus,
+            &fused,
+            &fused_rejects,
+            &fused_stats,
+            true,
+            Some(&aligner),
+        );
+        let stderr =
+            run_args_and_capture_logs(&args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+
+        let expected = records(&standalone);
+        assert!(!expected.is_empty(), "the standalone chain produced no records");
+        let actual = records(&fused);
+        assert_eq!(actual.len(), expected.len(), "record counts differ");
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a, e, "record {i} differs between runall and the standalone chain");
+        }
+        let expected_rejects = records(&rejects);
+        assert!(!expected_rejects.is_empty(), "the filter rejected nothing");
+        assert_eq!(records(&fused_rejects), expected_rejects, "rejects differ");
+        assert_eq!(
+            std::fs::read_to_string(&fused_stats).expect("stats"),
+            std::fs::read_to_string(&stats).expect("stats"),
+            "filter stats differ"
+        );
+
+        let (header, _) = crate::helpers::read_bam_output(&fused);
+        let sort_order = header
+            .header()
+            .and_then(|hd| {
+                hd.other_fields()
+                    .get(&noodles::sam::header::record::value::map::header::tag::SORT_ORDER)
+            })
+            .map(ToString::to_string);
+        assert_eq!(sort_order.as_deref(), Some("coordinate"));
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&fused).expect("open");
+        reader.read_header().expect("header");
+        let mut primaries = 0u64;
+        let mut last_pos: Option<(usize, usize)> = None;
+        for record in reader.records() {
+            let record = record.expect("record");
+            assert!(string_tag(&record, SamTag::RW).is_none(), "rw must be stripped");
+            if let (Some(Ok(id)), Some(Ok(pos))) =
+                (record.reference_sequence_id(), record.alignment_start())
+            {
+                let key = (id, pos.get());
+                assert!(last_pos.is_none_or(|last| last <= key), "output is not coordinate sorted");
+                last_pos = Some(key);
+            }
+            let f = record.flags();
+            if !(f.is_secondary() || f.is_supplementary()) {
+                primaries += 1;
+            }
+        }
+        assert_eq!(realign_count(&stderr, "Consensus reads realigned:"), primaries);
+        let counted = [
+            "Primary already in window:",
+            "Primary swapped to an in-window XA hit:",
+            "Primary swapped to an in-window supplementary piece:",
+            "Primary kept outside window (proper pair with an in-window mate):",
+            "Primary outside window (no in-window XA hit or supplementary piece):",
+            "Unmapped:",
+            "Without a window:",
+        ]
+        .into_iter()
+        .map(|label| realign_count(&stderr, label))
+        .sum::<u64>();
+        assert_eq!(counted, primaries, "every consensus primary is in its window or counted");
+    }
+
+    /// The fused `group → simplex` chain carries each segment's raw-read window
+    /// onto the consensus reads exactly as the standalone `group
+    /// --realign-window → simplex` does: `runall --realign` reads `rw` off the
+    /// consensus reads it calls itself. Needs no aligner.
+    #[test]
+    fn fused_group_to_consensus_carries_rw() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let reference = write_reference(dir);
+        let mapped = dir.join("mapped.bam");
+        run_ok(&[
+            "simulate",
+            "mapped-reads",
+            "-r",
+            p(&reference),
+            "-o",
+            p(&mapped),
+            "--truth",
+            p(&dir.join("truth.tsv")),
+            "--num-molecules",
+            "100",
+            "--read-length",
+            "100",
+            "--seed",
+            "3",
+        ]);
+        let grouped = dir.join("grouped.bam");
+        let standalone = dir.join("standalone.bam");
+        run_ok(&[
+            "group",
+            "-i",
+            p(&mapped),
+            "-o",
+            p(&grouped),
+            "--strategy",
+            "adjacency",
+            "--realign-window",
+        ]);
+        run_ok(&["simplex", "-i", p(&grouped), "-o", p(&standalone), "--min-reads", "1"]);
+        let fused = dir.join("fused.bam");
+        run_ok(&[
+            "runall",
+            "--start-from",
+            "group",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "-i",
+            p(&mapped),
+            "-o",
+            p(&fused),
+            "--group::strategy",
+            "adjacency",
+            "--group::realign-window",
+            "--simplex::min-reads",
+            "1",
+        ]);
+        let expected = records(&standalone);
+        assert!(!expected.is_empty(), "simplex produced no consensus reads");
+        let rw = SamTag::RW.to_noodles_tag();
+        assert!(expected.iter().all(|r| r.data().get(&rw).is_some()), "standalone lacks rw");
+        assert_eq!(records(&fused), expected);
+    }
+}
+
+/// `runall --realign` sorts the re-aligned reads by coordinate whatever
+/// `--sort::order` says. It warns that the order is ignored only when the user
+/// passed one, never on a default run.
+#[rstest::rstest]
+#[case::default_order(&[], false)]
+#[case::explicit_order(&["--sort::order", "queryname"], true)]
+fn runall_realign_warns_only_about_an_explicit_sort_order(
+    #[case] extra: &[&str],
+    #[case] warns: bool,
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = write_consensus(dir, 2, |_| (Some("chr1:1-100:+"), Some("chr1:1-100:-")));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let result = fgumi()
+        .args(["runall", "--start-from", "filter", "--stop-after", "filter", "--realign"])
+        .args(["--filter::min-reads", "1", "--ref", p(&reference)])
+        .args(["-i", p(&input), "-o", p(&output), "--aligner::command", UNMAPPED_ALIGNER])
+        .args(extra)
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("spawn fgumi");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(realign_count(&stderr, "Consensus reads realigned:"), 4, "the chain ran");
+    assert_eq!(stderr.contains("--sort::order"), warns, "{stderr}");
+}
+
+/// In `runall --consensus simplex --methylation-mode em-seq --realign`, the
+/// methylation-aware consensus caller loads `--ref` into memory, and realign
+/// shares that copy rather than reading the (indexed) FASTA on demand or
+/// loading a second copy.
+#[test]
+fn runall_realign_shares_the_methylation_callers_reference() {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let read = |name: &str, seg: u16, pos: i32, mate_pos: i32, reverse: bool| {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(
+                flags::PAIRED
+                    | flags::PROPER_PAIR
+                    | seg
+                    | if reverse { flags::REVERSE } else { flags::MATE_REVERSE },
+            )
+            .ref_id(0)
+            .pos(pos - 1)
+            .mapq(60)
+            .cigar_ops(&[16 << 4])
+            .mate_ref_id(0)
+            .mate_pos(mate_pos - 1)
+            .template_length(if reverse { -116 } else { 116 })
+            .sequence(b"ACGTACGTACGTACGT")
+            .qualities(&[40; 16]);
+        b.add_string_tag(SamTag::RX, b"AAAA").add_string_tag(SamTag::MC, b"16M");
+        b.build()
+    };
+    let records: Vec<_> = (0..3)
+        .flat_map(|i| {
+            let name = format!("a{i}");
+            [
+                read(&name, flags::FIRST_SEGMENT, 101, 201, false),
+                read(&name, flags::LAST_SEGMENT, 201, 101, true),
+            ]
+        })
+        .collect();
+    let raw = dir.join("raw.bam");
+    write_bam(&raw, &create_minimal_header("chr1", 10_000), &records);
+    let reference = create_test_reference(dir);
+    let (sorted, output) = (dir.join("sorted.bam"), dir.join("out.bam"));
+    let sort = fgumi()
+        .args(["sort", "-i", p(&raw), "-o", p(&sorted), "--order", "template-coordinate"])
+        .output()
+        .expect("spawn fgumi sort");
+    assert!(sort.status.success(), "{}", String::from_utf8_lossy(&sort.stderr));
+    let result = fgumi()
+        .args(["runall", "--start-from", "group", "--stop-after", "consensus", "--realign"])
+        .args(["--consensus", "simplex", "--methylation-mode", "em-seq", "--ref", p(&reference)])
+        .args(["--group::strategy", "adjacency", "--simplex::min-reads", "1"])
+        .args(["-i", p(&sorted), "-o", p(&output), "--aligner::command", UNMAPPED_ALIGNER])
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("spawn fgumi");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(realign_count(&stderr, "Consensus reads realigned:"), 2, "the chain ran");
+    assert!(stderr.contains("Realign: an earlier stage holds"), "{stderr}");
+    assert!(stderr.contains("realign shares it"), "{stderr}");
+    assert!(!stderr.contains("on demand through"), "{stderr}");
+    assert!(!stderr.contains("in-memory reference requested"), "{stderr}");
 }

@@ -220,9 +220,10 @@ pub(crate) enum ChainTailKind {
         /// Whether every emitted batch is closed under queryname: no queryname
         /// run straddles a batch boundary. Set by the source preamble when the
         /// first stage groups by queryname (the [`BatchCut::Queryname`] cut in
-        /// `FindBamBoundaries` / `ReadSamChunks`), and by an intermediate
+        /// `FindBamBoundaries` / `ReadSamChunks`), by an intermediate
         /// consensus stage (closed by construction: one block per batch, molecule
-        /// names never split). When `true`, the queryname grouper is the parallel
+        /// names never split), and by an intermediate filter whose input was
+        /// closed or which filtered whole templates. When `true`, the queryname grouper is the parallel
         /// `AssembleTemplates` map; when `false`, the serial `GroupByQueryname`.
         ///
         /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
@@ -6663,8 +6664,12 @@ impl<'a> ChainBuilder<'a> {
     ///   Branch 1 is wired here to its own `BgzfCompress → WriteBgzfFile` sink; branch 0
     ///   becomes `current_tail` for `add_sink` to wire the primary output.
     ///
-    /// Only [`StagePosition::Terminal`] is supported; intermediate filter is not needed by
-    /// any Phase 3 runall combination and bails with a clear error.
+    /// [`StagePosition::Terminal`]: branch 0 is the chain's output. An
+    /// [`StagePosition::Intermediate`] filter must be followed by `Realign`
+    /// (`runall … filter --realign`): a `DecodeRecords` step turns the kept bytes
+    /// back into a `DecodedRecordBatch` tail for realign's queryname grouper. The
+    /// filter itself (records kept, rejects, metrics, reference, template mode) is
+    /// the same in both positions.
     ///
     /// Registers a `FilterFinalizeHook` for metrics reduction + summary banner.
     /// The chain-level [`StageTimingFinalizeHook`] is registered by
@@ -6674,7 +6679,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// Returns errors if filter options are missing from the spec bag, if the
     /// rejects path is missing when rejects is enabled, or if `position` is
-    /// `Intermediate` (not yet implemented).
+    /// `Intermediate` and the next stage is not `Realign`.
     #[allow(clippy::too_many_lines)]
     fn add_filter(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
@@ -6689,11 +6694,22 @@ impl<'a> ChainBuilder<'a> {
         use fgumi_bam_io::is_stdin_path;
         use log::info;
 
+        // An intermediate filter feeds only realign (`runall … filter --realign`):
+        // its kept records are decoded back into a record stream, which realign
+        // groups by queryname. No other stage may follow filter.
         if position == StagePosition::Intermediate {
-            bail!(
-                "intermediate filter not implemented; filter is typically terminal \
-                (no Phase 3 runall combination requires it as an intermediate stage)"
-            );
+            let next = self
+                .spec
+                .stages
+                .iter()
+                .position(|s| *s == Stage::Filter)
+                .and_then(|i| self.spec.stages.get(i + 1));
+            if next != Some(&Stage::Realign) {
+                bail!(
+                    "an intermediate filter stage can only be followed by realign \
+                     (`runall … --stop-after filter --realign`); got {next:?} after filter"
+                );
+            }
         }
 
         // Filter consumes a record stream (either a GroupByQueryname step in
@@ -6911,8 +6927,39 @@ impl<'a> ChainBuilder<'a> {
                 self.pipeline.append_step(rejects_writer, rejects_compress_tail);
         }
 
-        // Branch 0 of process_tail (kept) becomes current_tail for add_sink.
-        self.current_tail = Some(process_tail);
+        match position {
+            // Branch 0 of process_tail (kept) becomes current_tail for add_sink.
+            StagePosition::Terminal => self.current_tail = Some(process_tail),
+            // Intermediate (before realign): decode the kept records, which the
+            // step serialized record-aligned, back into a record stream, as an
+            // intermediate consensus stage does (`finish_consensus_tail`). Its
+            // batches are closed under queryname when the filter's were (a
+            // queryname-cut or consensus input), and always in template mode,
+            // where every batch holds whole templates; then realign's queryname
+            // grouper runs as the parallel `AssembleTemplates`. Realign reads only
+            // the queryname hash from the key.
+            StagePosition::Intermediate => {
+                use crate::pipeline::steps::parse::decode::DecodeRecords;
+                let closed = filter_by_template
+                    || matches!(
+                        self.chain_tail_kind,
+                        ChainTailKind::DecodedRecordBatch { closed_under_queryname: true }
+                    );
+                let decoded = self.pipeline.append_step(
+                    DecodeRecords::new(
+                        fgumi_bam_io::GroupKeyConfig::name_hash_only(
+                            fgumi_bam_io::LibraryIndex::default(),
+                        ),
+                        self.tuning.per_step_byte_limit,
+                    )
+                    .with_closed_batches(closed),
+                    process_tail,
+                );
+                self.current_tail = Some(decoded);
+                self.chain_tail_kind =
+                    ChainTailKind::DecodedRecordBatch { closed_under_queryname: closed };
+            }
+        }
 
         // Register the filter finalize hooks. The stats file is written by a
         // success-only hook so a failed/partial run never publishes counts; the
@@ -9267,6 +9314,33 @@ mod tests {
             err.to_string().contains("intermediate copy-umi not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    /// An intermediate filter must be followed by realign (the only stage that
+    /// consumes its decoded kept records). Any other next stage, or none, is
+    /// rejected before the options or the input are read; a following realign
+    /// passes the guard (and here fails later, on the placeholder input path, so
+    /// no step is appended to the placeholder tail).
+    #[rstest::rstest]
+    #[case::realign_next(
+        vec![Stage::Filter, Stage::Realign, Stage::Sort],
+        "Invalid Input BAM file 'in.bam'"
+    )]
+    #[case::sort_next(vec![Stage::Filter, Stage::Sort], "can only be followed by realign")]
+    #[case::nothing_next(vec![Stage::Filter], "can only be followed by realign")]
+    fn add_filter_intermediate_requires_realign_next(
+        #[case] stages: Vec<Stage>,
+        #[case] expected: &str,
+    ) {
+        let mut spec = empty_spec(stages);
+        spec.stage_opts.filter = Some(filter_opts(true));
+        let mut builder = chain_builder_for_stages(&spec);
+        builder.current_tail = Some((StepIdx(0), BranchIdx(0)));
+        let err = builder
+            .add_filter(StagePosition::Intermediate)
+            .expect_err("the placeholder input does not exist");
+        let err = format!("{err:#}");
+        assert!(err.contains(expected), "unexpected error: {err}");
     }
 
     /// `add_copy_umi` refuses a non-record-stream upstream tail: like filter/clip

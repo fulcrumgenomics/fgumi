@@ -3575,7 +3575,7 @@ fn rejects_correct_to_sort_without_ref() {
             "--correct::min-distance",
             "1",
         ],
-        "a runall chain that includes align requires --ref",
+        "a runall chain that includes align or --realign requires --ref",
         "correct->sort without --ref",
     );
 }

@@ -84,7 +84,8 @@ fn looks_like_an_option(word: &str) -> bool {
 }
 
 /// The flags that take an [`XaMaxHits`], with the subcommand each belongs to.
-const XA_MAX_HITS_FLAGS: [(&str, &str); 1] = [("--xa-max-hits", "realign")];
+const XA_MAX_HITS_FLAGS: [(&str, &str); 2] =
+    [("--xa-max-hits", "realign"), ("--realign::xa-max-hits", "runall")];
 
 /// The error for an `XaMaxHits` flag left without a value, as `(subcommand,
 /// message)`, or `None` when every one in `args` has a value.
@@ -521,6 +522,11 @@ mod tests {
     #[case::realign_short_option(&["realign", "--xa-max-hits", "-t", "4"], Some("realign"))]
     #[case::realign_value(&["realign", "--xa-max-hits", "5,200"], None)]
     #[case::realign_negative(&["realign", "--xa-max-hits", "-1,5"], None)]
+    #[case::runall_before_option(
+        &["runall", "--realign::xa-max-hits", "--threads", "4"],
+        Some("runall")
+    )]
+    #[case::runall_negative(&["runall", "--realign::xa-max-hits", "-1,5"], None)]
     #[case::attached(&["realign", "--xa-max-hits=--threads", "4"], None)]
     #[case::absent(&["realign", "--threads", "4"], None)]
     #[case::other_subcommand(&["group", "--xa-max-hits", "--threads", "4"], None)]
