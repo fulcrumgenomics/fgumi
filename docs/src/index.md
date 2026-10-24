@@ -65,6 +65,7 @@ cargo build --release
 | `duplex` | Call duplex consensus reads |
 | `codec` | Call CODEC consensus |
 | `filter` | Filter consensus reads |
+| `realign` | Re-align consensus reads, preferring each molecule's raw-read window (see [Best Practices](guide/best-practices.md#step-2a2-re-alignment)) |
 | `runall` | Fuse two or more pipeline stages into a single streaming pass (see [Running Pipelines](guide/running-pipelines.md)) |
 | `clip` | Clip overlapping read pairs |
 | `duplex-metrics` | Collect duplex metrics |

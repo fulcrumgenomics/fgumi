@@ -344,6 +344,8 @@ The `--metrics PREFIX` flag writes all three metrics files in one step:
 These can also be written to explicit paths with `--family-size-histogram` and
 `--grouping-metrics`.
 
+If the consensus reads will be re-aligned with `fgumi realign` ([Step 2a.2](#step-2a2-re-alignment)), add `--realign-window` to the `fgumi group` command (any of the ones in this step): it records each molecule's raw-read window, and `fgumi realign` rejects input grouped without it.
+
 **For workflows with unmapped templates** (e.g., some cfDNA assays):
 
 ```bash
@@ -423,13 +425,32 @@ Note: `--output-per-base-tags` accepts `true`/`false`, `yes`/`no`, `y`/`n`, or `
 
 ### Step 2a.2: Re-alignment
 
-Consensus reads are unmapped and must be re-aligned:
+Consensus reads are unmapped and must be re-aligned. `fgumi realign` aligns them and, for each end, prefers the alignment inside the region the molecule's raw reads aligned to: where the aligner places a consensus read elsewhere (typically on a paralogous copy) and lists an alternative inside that region in `XA`, the alternative becomes the primary (with MAPQ 0). Failing that, where the aligner split the read (a chimera, such as a consensus read whose low-quality tail collapsed into a homopolymer that aligns elsewhere) and one of its supplementary pieces lies inside that region, that piece and the primary swap roles: the piece becomes the primary, with the full read soft-clipped and its own MAPQ, `NM`, `AS` and `XS`, and the old primary becomes a supplementary record, clipped as the piece was; `SA` is rewritten on every piece. Neither swap is made when the aligner flagged the pair proper and the mate lies in its own window: the mate then agrees with the aligner's placement, so the window of this end is the suspect (for example, raw reads placed on a poly-G artefact), and the end keeps the aligner's primary; the summary counts these ends as "Primary kept outside window (proper pair with an in-window mate)". This needs each molecule's raw-read window, which `fgumi group --realign-window` records in the `rw` tag and the consensus callers copy onto the consensus reads, so add `--realign-window` to the grouping step:
+
+```bash
+fgumi realign \
+  --input consensus.bam \
+  --output consensus.mapped.bam \
+  --ref ref.fa \
+  --aligner::preset bwa-mem3 \
+  --threads 16
+```
+
+`--ref` needs the aligner's index and a `.dict` beside it. The aligner is chosen with the same `--aligner::*` options as `fgumi runall` (`--aligner::preset bwa-mem3|bwa|bwa-mem3-inproc` or `--aligner::command`), and `--methylation-mode em-seq` aligns bisulfite-aware, which suits simplex consensus reads only: do not pass it for duplex consensus reads, whose sequence is the molecule's own and which align with a standard aligner (as in the methylation guide). The output is in input order and carries no `rw` tag. `realign` reverses the per-base consensus tags of reverse-strand reads itself, so do **not** pass `--reverse-per-base-tags` to `fgumi filter` afterwards. Consensus ends without a window (their raw reads never mapped) are aligned and left where the aligner put them; an input grouped without `--realign-window` is an error. A consensus end whose mate was removed (by `fgumi filter --filter-by-template false`) keeps its tags and its R1/R2 flag, with its mate marked unmapped. After a promotion the mate fields are recomputed, and the proper-pair flag is only ever kept or cleared, never set: it stays only if the aligner had set it and the pair is still FR on one contig with an insert no larger than before, since the windows say where each end belongs but not that the molecule's raw reads were a concordant pair.
+
+`realign` reads the `--ref` FASTA only to rescore the alignments it promotes, and few ends are promoted, so by default it reads just those regions through the FASTA's `.fai` index instead of holding the whole FASTA in memory (about 3 GB for a human reference). The disk reads are few and small, and cost little once the FASTA is in the page cache. A compressed (gzip or BGZF) FASTA, one not indexed with `samtools faidx`, or one that is not a regular file (a pipe, such as `<(cat ref.fa)`), cannot be read this way: realign then loads it into memory (decompressing a compressed one) and warns. `--in-memory-reference` (`--realign::in-memory-reference` on `fgumi runall`) loads it into memory regardless; the output is identical either way.
+
+The `rw` tag stays on the consensus reads until `realign` removes it: the consensus callers copy it and `fgumi filter` keeps it, so a pipeline that groups with `--realign-window` but aligns the consensus reads some other way writes `rw` to its final BAM.
+
+Without window-grouped input, align the consensus reads directly:
 
 ```bash
 fgumi fastq --input consensus.bam \
   | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
   | fgumi zipper --unmapped consensus.bam --reference ref.fa --output consensus.mapped.bam
 ```
+
+This keeps the aligner's primary for every read and leaves the per-base tags unreversed, so filter it with `--reverse-per-base-tags` as below.
 
 ### Step 2a.3: Filtering
 
@@ -498,6 +519,20 @@ fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-l
   | fgumi simplex --input /dev/stdin --min-reads 1 --output-per-base-tags true \
     --output consensus.bam --threads 4 --compression-level 1
 ```
+
+Both stages can also run as one `fgumi runall` command with `--realign`, which records the windows at grouping, filters, then re-aligns with `fgumi realign`'s window preference and coordinate-sorts (see [Running Pipelines](running-pipelines.md#re-aligning-consensus-reads-with---realign)):
+
+```bash
+fgumi runall \
+  --start-from group --stop-after filter --consensus simplex \
+  --input aligned.bam --output filtered.bam \
+  --group::strategy adjacency \
+  --simplex::min-reads 1 --filter::min-reads 3 \
+  --ref ref.fa --aligner::preset bwa-mem3 --realign \
+  --threads 16
+```
+
+There filter runs before alignment, on the unaligned consensus reads. With separate commands:
 
 **Stage 2: Align, filter, and sort in a single pipe:**
 
