@@ -1892,6 +1892,14 @@ impl VanillaUmiConsensusCaller {
             }
         }
 
+        // Realign-window tag: copied from the first source read that carries it, once every
+        // source read's `rw` has been checked to parse.
+        if let Some(value) =
+            crate::source_window::first_source_window(original_raws.iter().copied())?
+        {
+            self.bam_builder.append_string_tag(SamTag::RW, value);
+        }
+
         // RX tag — consensus UMI from all reads
         let umis: Vec<String> = original_raws
             .iter()
@@ -7398,5 +7406,86 @@ mod tests {
             rec.quals[0],
             rec.quals[1]
         );
+    }
+
+    /// Appends an `rw` tag to a record.
+    fn with_rw(mut rec: RawRecord, rw: &[u8]) -> RawRecord {
+        fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::RW, rw);
+        rec
+    }
+
+    /// Calls simplex consensus on one read pair, optionally stamping `rw` on each mate.
+    fn simplex_pair_rw(r1_rw: Option<&[u8]>, r2_rw: Option<&[u8]>) -> Vec<ParsedBamRecord> {
+        let bases = vec![b'A'; 20];
+        let quals = vec![60u8; 20];
+        let (r1, r2) = create_paired_reads_with_umi(b"READ1", b"GATTACA", &bases, &quals, 1, 1000);
+        let r1 = r1_rw.map_or(r1.clone(), |w| with_rw(r1, w));
+        let r2 = r2_rw.map_or(r2.clone(), |w| with_rw(r2, w));
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("c".to_string(), "GATTACA".to_string(), options);
+        let output = consensus_reads_from_raw(&mut caller, vec![r1, r2]).expect("consensus");
+        ParsedBamRecord::parse_all(&output.data)
+    }
+
+    #[rstest]
+    #[case::both_mates(Some(b"chr1:100-150:+".as_slice()), Some(b"chr1:900-950:-".as_slice()))]
+    #[case::only_r1(Some(b"chr1:100-150:+".as_slice()), None)]
+    #[case::only_r2(None, Some(b"chr1:900-950:-".as_slice()))]
+    fn simplex_copies_r1_and_r2_windows(
+        #[case] r1_rw: Option<&[u8]>,
+        #[case] r2_rw: Option<&[u8]>,
+    ) {
+        let records = simplex_pair_rw(r1_rw, r2_rw);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].get_string_tag(SamTag::RW).as_deref(), r1_rw);
+        assert_eq!(records[1].get_string_tag(SamTag::RW).as_deref(), r2_rw);
+    }
+
+    /// A malformed `rw` on a source read fails the family, naming the read, as in duplex and
+    /// CODEC, even when another read carries a valid one.
+    #[rstest]
+    #[case::only_value(Some(b"garbage".as_slice()), None)]
+    #[case::after_a_valid_one(Some(b"chr1:100-150:+".as_slice()), Some(b"chr1:150-100:-".as_slice()))]
+    fn simplex_malformed_rw_errors(#[case] r1_rw: Option<&[u8]>, #[case] r2_rw: Option<&[u8]>) {
+        let bases = vec![b'A'; 20];
+        let quals = vec![60u8; 20];
+        let (r1, r2) = create_paired_reads_with_umi(b"READ1", b"GATTACA", &bases, &quals, 1, 1000);
+        let r1 = r1_rw.map_or(r1.clone(), |w| with_rw(r1, w));
+        let r2 = r2_rw.map_or(r2.clone(), |w| with_rw(r2, w));
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("c".to_string(), "GATTACA".to_string(), options);
+        let Err(err) = consensus_reads_from_raw(&mut caller, vec![r1, r2]) else {
+            panic!("malformed rw must error");
+        };
+        assert!(format!("{err:#}").contains("invalid rw tag on read 'READ1'"), "{err:#}");
+    }
+
+    #[test]
+    fn simplex_fragment_copies_window() {
+        let bases = vec![b'A'; 20];
+        let quals = vec![60u8; 20];
+        let frag = with_rw(
+            create_fragment_read_with_umi(b"FRAG", b"GATTACA", &bases, &quals),
+            b"chr2:5-30:+",
+        );
+        let options = VanillaUmiConsensusOptions { min_reads: 1, ..Default::default() };
+        let mut caller =
+            VanillaUmiConsensusCaller::new("c".to_string(), "GATTACA".to_string(), options);
+        let output = consensus_reads_from_raw(&mut caller, vec![frag]).expect("consensus");
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get_string_tag(SamTag::RW).as_deref(),
+            Some(b"chr2:5-30:+".as_slice())
+        );
+    }
+
+    #[test]
+    fn no_rw_in_no_rw_out() {
+        let records = simplex_pair_rw(None, None);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.get_string_tag(SamTag::RW).is_none()));
     }
 }

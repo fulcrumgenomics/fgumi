@@ -1351,6 +1351,15 @@ impl DuplexConsensusCaller {
         // 3. RG tag (string)
         builder.append_string_tag(SamTag::RG, read_group_id.as_bytes());
 
+        // Realign-window tag: copied from the first source read that carries it (the A-R1 and
+        // B-R2 reads feeding one consensus read share a window), falling back to the B strand
+        // when no A read has one, once every source read's `rw` has been checked to parse.
+        if let Some(rw) = crate::source_window::first_source_window(
+            source_reads_a.iter().chain(source_reads_b).map(AsRef::<[u8]>::as_ref),
+        )? {
+            builder.append_string_tag(SamTag::RW, rw);
+        }
+
         // Calculate AB strand metrics
         let ab = &consensus.ab_consensus;
         let ba_opt = consensus.ba_consensus.as_ref();
@@ -8162,6 +8171,93 @@ mod tests {
         assert_eq!(r1.name, r2.name, "both ends should share one consensus read name");
 
         Ok(())
+    }
+
+    /// Calls duplex consensus on one A/B family, stamping `rw` on the A-R1/B-R2 pair (`w1`) and
+    /// on the A-R2/B-R1 pair (`w2`).
+    fn duplex_family_rw(w1: Option<&[u8]>, w2: Option<&[u8]>) -> Vec<ParsedBamRecord> {
+        duplex_family_rw_by_strand((w1, w2), (w1, w2)).expect("consensus")
+    }
+
+    /// Calls duplex consensus on one A/B family, stamping the A strand's `(A-R1, A-R2)` windows
+    /// `a` and the B strand's `(B-R2, B-R1)` windows `b` (each pair in consensus R1, R2 order).
+    fn duplex_family_rw_by_strand(
+        a: (Option<&[u8]>, Option<&[u8]>),
+        b: (Option<&[u8]>, Option<&[u8]>),
+    ) -> anyhow::Result<Vec<ParsedBamRecord>> {
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1],
+            10,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )
+        .expect("caller");
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        fn tag(w: Option<&[u8]>) -> Vec<(SamTag, &[u8])> {
+            w.map(|w| (SamTag::RW, w)).into_iter().collect()
+        }
+        let mut sb = SamBuilder::new();
+        let reads = vec![
+            ab_r1(&mut sb, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &tag(a.0)),
+            ab_r2(&mut sb, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &tag(a.1)),
+            ba_r1(&mut sb, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &tag(b.1)),
+            ba_r2(&mut sb, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &tag(b.0)),
+        ];
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2);
+        Ok(ParsedBamRecord::parse_all(&result.data))
+    }
+
+    /// With no `rw` on the A strand, each consensus read takes its window from the B strand.
+    #[test]
+    fn duplex_falls_back_to_b_strand_window() {
+        let (w1, w2) = (b"chr1:100-150:+".as_slice(), b"chr1:200-250:-".as_slice());
+        let records =
+            duplex_family_rw_by_strand((None, None), (Some(w1), Some(w2))).expect("consensus");
+        assert_eq!(records[0].get_string_tag(SamTag::RW).as_deref(), Some(w1));
+        assert_eq!(records[1].get_string_tag(SamTag::RW).as_deref(), Some(w2));
+    }
+
+    /// A malformed `rw` on any source read fails the family, naming the read, as in simplex
+    /// and CODEC; it is never copied onto a consensus read.
+    #[rstest]
+    #[case::on_a_strand((Some(b"garbage".as_slice()), None), (None, None), "q1")]
+    #[case::on_b_strand_after_valid_a(
+        (Some(b"chr1:100-150:+".as_slice()), None), (Some(b"chr1:0-5:+".as_slice()), None), "q2"
+    )]
+    fn duplex_malformed_rw_errors(
+        #[case] a: (Option<&[u8]>, Option<&[u8]>),
+        #[case] b: (Option<&[u8]>, Option<&[u8]>),
+        #[case] read: &str,
+    ) {
+        let Err(err) = duplex_family_rw_by_strand(a, b) else {
+            panic!("malformed rw must error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("invalid rw tag on read '{read}'")), "{msg}");
+    }
+
+    #[rstest]
+    #[case::both_segments(Some(b"chr1:100-150:+".as_slice()), Some(b"chr1:200-250:-".as_slice()))]
+    #[case::only_first(Some(b"chr1:100-150:+".as_slice()), None)]
+    fn duplex_copies_segment_window(#[case] w1: Option<&[u8]>, #[case] w2: Option<&[u8]>) {
+        let records = duplex_family_rw(w1, w2);
+        assert_eq!(records[0].get_string_tag(SamTag::RW).as_deref(), w1);
+        assert_eq!(records[1].get_string_tag(SamTag::RW).as_deref(), w2);
+    }
+
+    #[test]
+    fn duplex_no_rw_in_no_rw_out() {
+        let records = duplex_family_rw(None, None);
+        assert!(records.iter().all(|r| r.get_string_tag(SamTag::RW).is_none()));
     }
 }
 
