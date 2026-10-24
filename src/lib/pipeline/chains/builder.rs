@@ -292,11 +292,13 @@ pub(crate) enum ChainTailKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Per-worker scratch state for the `templates_to_mi_step` bridge: a reusable
-/// byte buffer and an MI-key string buffer, reset per template.
+/// byte buffer, an MI-key string buffer, and an `rw` value buffer, reset per
+/// template / record.
 #[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
     mi_buf: String,
+    rw_buf: Vec<u8>,
 }
 
 #[cfg(feature = "consensus")]
@@ -359,7 +361,11 @@ fn templates_to_mi_step(
     process_with_worker_state::<BatchedProcessedPositionGroups, BatchedMiGroups, _, FuseState, _>(
         "TemplatesToMiGroups",
         limit_bytes,
-        || FuseState { scratch: Vec::with_capacity(512), mi_buf: String::with_capacity(16) },
+        || FuseState {
+            scratch: Vec::with_capacity(512),
+            mi_buf: String::with_capacity(16),
+            rw_buf: Vec::new(),
+        },
         move |state: &mut FuseState,
               item: BatchedProcessedPositionGroups|
               -> io::Result<BatchedMiGroups> {
@@ -412,6 +418,18 @@ fn templates_to_mi_step(
                             assign_tag_bytes,
                             state.mi_buf.as_bytes(),
                         );
+                        // `--realign-window`: stamp the segment's raw-read window
+                        // (`rw`) through the same `stamp_rw` the terminal
+                        // `SerializeGroups` uses, so the consensus caller copies it
+                        // onto the consensus read on the fused path too.
+                        if let Some(windows) = &processed.windows {
+                            windows.stamp_rw(
+                                template.mi,
+                                raw,
+                                &mut state.scratch,
+                                &mut state.rw_buf,
+                            );
+                        }
                         // Move the tagged bytes into the record instead of
                         // cloning them (no per-record copy of the payload). This
                         // hands the buffer off, so a fresh scratch Vec is
@@ -4655,6 +4673,7 @@ impl<'a> ChainBuilder<'a> {
             consensus_metrics,
             header_arc,
             library_index_arc,
+            group.realign_window.then(|| Arc::new(self.header.clone())),
         );
         let mi_assign_step = build_group_mi_assign_step(self.tuning.per_step_byte_limit);
 

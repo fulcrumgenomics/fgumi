@@ -1782,6 +1782,7 @@ fn processed_group(
         filter_counts: fgumi_metrics::TemplateFilterCounts::default(),
         input_record_count,
         distinct_mi_count: u64::from(mi.id().is_some()),
+        windows: None,
     }
 }
 

@@ -284,7 +284,13 @@ impl MemoryEstimate for ProcessedPositionGroup {
         // filter_counts: TemplateFilterCounts is entirely inline (u64 fields + arrays)
         // Just a small struct overhead
 
-        templates_size + templates_vec_overhead + family_sizes_size
+        // windows: the `--realign-window` segment map (absent without the flag)
+        let windows_size = self
+            .windows
+            .as_ref()
+            .map_or(0, crate::realign::window_group::SegmentWindows::estimate_heap_size);
+
+        templates_size + templates_vec_overhead + family_sizes_size + windows_size
     }
 }
 
@@ -310,6 +316,9 @@ pub struct ProcessedPositionGroup {
     /// template count) ensures the emitted MI tag integers are consecutive
     /// `0..N-1`, matching fgbio's `GroupReadsByUmi`.
     pub distinct_mi_count: u64,
+    /// Per-segment realign windows (`group --realign-window`), keyed by the
+    /// `MoleculeId` ids currently held in `templates`; `None` when the flag is off.
+    pub(crate) windows: Option<crate::realign::window_group::SegmentWindows>,
 }
 
 // ============================================================================
