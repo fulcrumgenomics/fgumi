@@ -58,6 +58,7 @@ mod test_input_source_matrix;
 mod test_merge_command;
 mod test_merge_ported;
 mod test_metric_contract;
+mod test_realign_command;
 mod test_retag_command;
 mod test_retag_cutover_parity;
 mod test_review_command;

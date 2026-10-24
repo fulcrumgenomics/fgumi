@@ -44,6 +44,22 @@ pub(crate) struct MergeConfig {
     /// `ZipperMergeConfig::skip_tc_tags`.
     pub(crate) skip_tc_tags: bool,
 
+    /// Whether the input may hold lone mates: templates holding one end of a
+    /// pair whose mate is absent ([`Template::lone_mate_segment`]), as after
+    /// per-record filtering. Set by the realign stage, whose input may be
+    /// per-record filtered consensus reads; the raw-read align stage's input
+    /// comes from extract and holds whole pairs.
+    ///
+    /// Before the aligner, the realign stage gives each lone mate a placeholder
+    /// mate ([`add_lone_mate_placeholder`]), so the aligner sees only whole
+    /// pairs. bwa cuts its `-K` batches only after an even number of reads, so
+    /// a lone read in its input would let a cut fall between the two ends of a
+    /// real pair, and that pair would be aligned as two unpaired reads. With
+    /// this set, the merge removes the placeholder's end again, and the lone
+    /// mate keeps its tags and its R1/R2 identity, with its mate marked
+    /// unmapped ([`Template::set_lone_mate_info`]).
+    pub(crate) lone_mates: bool,
+
     /// Counter for records emitted downstream. Exposed back to the caller after
     /// `Pipeline::run` returns so summary logging can report a real throughput
     /// number.
@@ -166,6 +182,7 @@ pub(crate) fn merge_zipper_batch(
     // re-allocated per template) — see fgumi #971.
     let mut aux_scratch: Vec<u8> = Vec::new();
     for (mut mapped_template, unmapped_template) in mapped.into_iter().zip(unmapped.templates()) {
+        let placeholder = if cfg.lone_mates { placeholder_end(unmapped_template) } else { None };
         merge_raw_with(
             unmapped_template,
             &mut mapped_template,
@@ -174,6 +191,12 @@ pub(crate) fn merge_zipper_batch(
             &mut aux_scratch,
         )
         .map_err(|e| io::Error::other(format!("align-and-merge: {e:#}")))?;
+        if let Some(first) = placeholder {
+            mapped_template
+                .remove_end(first)
+                .map_err(|e| io::Error::other(format!("align-and-merge: lone mate: {e:#}")))?;
+            mapped_template.set_lone_mate_info();
+        }
 
         total_records += mapped_template.records.len() as u64;
         total_bytes += mapped_template.heap_size();
@@ -182,6 +205,58 @@ pub(crate) fn merge_zipper_batch(
 
     cfg.records_emitted.fetch_add(total_records, Ordering::Relaxed);
     Ok(BamTemplateBatch::from_parts(serial, merged, total_bytes))
+}
+
+/// Gives a lone mate (an unmapped template holding one end of a pair whose
+/// mate is absent, [`Template::lone_mate_segment`]) a placeholder for that
+/// mate, so the aligner is fed a whole pair (see [`MergeConfig::lone_mates`]):
+/// an unmapped record with the same name and the other segment bit, one `N`
+/// base, and the [`SamTag::LP`](crate::sam::SamTag::LP) marker the merge finds
+/// it by. A one-base all-`N` read seeds nothing and its mate rescue finds
+/// nothing, so the aligner aligns the lone mate as it would an unpaired read.
+/// Returns whether a placeholder was added; any other template is left as is.
+///
+/// # Errors
+///
+/// Returns an error if the template cannot be re-indexed.
+pub(crate) fn add_lone_mate_placeholder(template: &mut Template) -> io::Result<bool> {
+    use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, MATE_UNMAPPED, PAIRED, UNMAPPED};
+    let Some(segment) = template.lone_mate_segment() else {
+        return Ok(false);
+    };
+    let other = if segment & FIRST_SEGMENT != 0 { LAST_SEGMENT } else { FIRST_SEGMENT };
+    let mut placeholder = fgumi_raw_bam::SamBuilder::new();
+    placeholder
+        .read_name(template.name())
+        .flags(PAIRED | UNMAPPED | MATE_UNMAPPED | other)
+        .sequence(b"N")
+        .qualities(&[2])
+        .add_int_tag(crate::sam::SamTag::LP, 1);
+    template
+        .push_record(placeholder.build())
+        .map_err(|e| io::Error::other(format!("realign: lone mate placeholder: {e:#}")))?;
+    Ok(true)
+}
+
+/// The end (`true` for R1) of `template` that is a lone-mate placeholder
+/// ([`add_lone_mate_placeholder`]), if it has one.
+fn placeholder_end(template: &Template) -> Option<bool> {
+    let is_placeholder = |end: Option<(usize, usize)>| {
+        end.is_some_and(|(i, _)| {
+            fgumi_raw_bam::find_int_tag(
+                fgumi_raw_bam::aux_data_slice(&template.records()[i]),
+                crate::sam::SamTag::LP,
+            )
+            .is_some()
+        })
+    };
+    if is_placeholder(template.r1) {
+        Some(true)
+    } else if is_placeholder(template.r2) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +268,7 @@ mod tests {
         MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
             skip_tc_tags: true,
+            lone_mates: false,
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 1024 * 1024,
         }
@@ -280,6 +356,171 @@ mod tests {
             Some(&b"ACGT"[..]),
             "the unmapped RX tag must transfer onto the correct mapped record"
         );
+    }
+
+    /// The aligner's records for a lone mate given a placeholder mate: the lone
+    /// mate itself (`real_mapped`: reverse strand at 1-based 101 with a
+    /// supplementary piece at 501; otherwise unmapped) and the unmapped
+    /// placeholder, each flagged as its end of the pair. Without `paired`, the
+    /// lone mate alone as an unpaired read (no placeholder was sent).
+    fn aligned_lone_mate(segment: u16, real_mapped: bool, paired: bool) -> Template {
+        use fgumi_raw_bam::flags::{
+            FIRST_SEGMENT, LAST_SEGMENT, MATE_UNMAPPED, PAIRED, REVERSE, SUPPLEMENTARY, UNMAPPED,
+        };
+        let pairing = if paired { PAIRED | MATE_UNMAPPED | segment } else { 0 };
+        let mut records = Vec::new();
+        let mut primary = fgumi_raw_bam::SamBuilder::new();
+        primary.read_name(b"cons").sequence(b"ACGT").qualities(b"IIII");
+        if real_mapped {
+            primary
+                .flags(pairing | REVERSE)
+                .ref_id(0)
+                .pos(100)
+                .mapq(60)
+                .cigar_ops(&[4 << 4])
+                .mate_ref_id(0)
+                .mate_pos(100)
+                .add_int_tag(crate::sam::SamTag::AS, 4);
+            let mut supplementary = fgumi_raw_bam::SamBuilder::new();
+            supplementary
+                .read_name(b"cons")
+                .flags(pairing | SUPPLEMENTARY)
+                .ref_id(0)
+                .pos(500)
+                .mapq(60)
+                .cigar_ops(&[4 << 4])
+                .sequence(b"ACGT")
+                .qualities(b"IIII");
+            records.push(supplementary.build());
+        } else {
+            primary.flags(pairing | UNMAPPED);
+        }
+        records.insert(0, primary.build());
+        if paired {
+            let other = if segment == FIRST_SEGMENT { LAST_SEGMENT } else { FIRST_SEGMENT };
+            let mut placeholder = fgumi_raw_bam::SamBuilder::new();
+            placeholder
+                .read_name(b"cons")
+                .flags(PAIRED | UNMAPPED | other | if real_mapped { 0 } else { MATE_UNMAPPED })
+                .sequence(b"N")
+                .qualities(&[2]);
+            if real_mapped {
+                placeholder.ref_id(0).pos(100).mate_ref_id(0).mate_pos(100);
+            }
+            records.push(placeholder.build());
+        }
+        Template::from_records(records).expect("mapped template")
+    }
+
+    /// A lone mate (one paired end whose mate is absent) is sent to the aligner
+    /// with a placeholder mate. With `lone_mates` the merge copies its tags,
+    /// removes the placeholder's end, and leaves the lone mate one end of a
+    /// pair whose mate is unmapped, placed at the read itself (or `*`/0 when
+    /// the read is unmapped too), its supplementary piece kept. Without it (the
+    /// raw-read align stage, which sends no placeholder) a lone R2 finds no
+    /// mapped R2 and keeps none of its tags.
+    #[rstest::rstest]
+    #[case::lone_r1(fgumi_raw_bam::flags::FIRST_SEGMENT, true, true)]
+    #[case::lone_r2(fgumi_raw_bam::flags::LAST_SEGMENT, true, true)]
+    #[case::lone_r1_unmapped(fgumi_raw_bam::flags::FIRST_SEGMENT, true, false)]
+    #[case::lone_r2_unmapped(fgumi_raw_bam::flags::LAST_SEGMENT, true, false)]
+    #[case::lone_r2_unhandled(fgumi_raw_bam::flags::LAST_SEGMENT, false, true)]
+    fn merge_zipper_batch_restores_a_lone_mate(
+        #[case] segment: u16,
+        #[case] lone_mates: bool,
+        #[case] real_mapped: bool,
+    ) {
+        use fgumi_raw_bam::flags::{
+            MATE_REVERSE, MATE_UNMAPPED, PAIRED, PROPER_PAIR, SUPPLEMENTARY, UNMAPPED,
+        };
+        let cfg = MergeConfig { lone_mates, skip_tc_tags: false, ..make_test_cfg() };
+        let tags = ZipperTags::from_tag_info(&cfg.tag_info);
+        let mut unmapped = Template::from_records(vec![make_record_with_string_tag(
+            b"cons",
+            PAIRED | UNMAPPED | MATE_UNMAPPED | segment,
+            crate::sam::SamTag::RX,
+            b"ACGT",
+        )])
+        .expect("unmapped template");
+        // Only the realign stage, which sets `lone_mates`, adds the placeholder.
+        assert!(add_lone_mate_placeholder(&mut unmapped).expect("placeholder"));
+        if !lone_mates {
+            unmapped.remove_end(segment != fgumi_raw_bam::flags::FIRST_SEGMENT).expect("remove");
+        }
+        let zb = ZipperBatch {
+            serial: 0,
+            mapped: vec![aligned_lone_mate(segment, real_mapped, lone_mates)],
+            unmapped: BamTemplateBatch::new(0, vec![unmapped]),
+        };
+        let out = merge_zipper_batch(zb, &cfg, &tags).expect("merge ok");
+        let merged = &out.templates()[0];
+        assert_eq!(merged.records.len(), if real_mapped { 2 } else { 1 }, "placeholder removed");
+        for record in &merged.records {
+            let aux = fgumi_raw_bam::fields::aux_data_slice(record);
+            let rx = fgumi_raw_bam::tags::find_string_tag(aux, crate::sam::SamTag::RX);
+            let flags = record.flags();
+            if !lone_mates {
+                assert_eq!(rx, None, "unhandled, a lone R2 keeps no tags");
+                continue;
+            }
+            assert_eq!(rx, Some(&b"ACGT"[..]), "the lone mate's tags transfer");
+            assert!(
+                fgumi_raw_bam::tags::find_int_tag(aux, crate::sam::SamTag::LP).is_none(),
+                "no placeholder marker survives"
+            );
+            assert_eq!(flags & (PAIRED | segment), PAIRED | segment, "flags {flags:#x}");
+            assert_ne!(flags & MATE_UNMAPPED, 0, "mate unmapped, flags {flags:#x}");
+            assert_eq!(flags & (PROPER_PAIR | MATE_REVERSE), 0, "flags {flags:#x}");
+            let mate = (fgumi_raw_bam::mate_ref_id(record), fgumi_raw_bam::mate_pos(record));
+            let want = if real_mapped { (0, 100) } else { (-1, -1) };
+            assert_eq!(mate, want, "RNEXT/PNEXT: the read's own placement, or */0 unmapped");
+            assert_eq!(fgumi_raw_bam::template_length(record), 0, "TLEN");
+            for tag in [crate::sam::SamTag::MC, crate::sam::SamTag::MQ] {
+                assert!(fgumi_raw_bam::find_tag_type(aux, tag).is_none(), "{tag}");
+            }
+        }
+        if lone_mates {
+            let first = segment == fgumi_raw_bam::flags::FIRST_SEGMENT;
+            assert_eq!(merged.r1.is_some(), first, "indexed under its own end");
+            assert_eq!(merged.r2.is_some(), !first, "indexed under its own end");
+            let supplementals =
+                if first { merged.r1_supplementals } else { merged.r2_supplementals };
+            let want = real_mapped.then_some((1, 2));
+            assert_eq!(supplementals, want, "its supplementary stays with it");
+            if real_mapped {
+                assert_ne!(merged.records[1].flags() & SUPPLEMENTARY, 0);
+            }
+        }
+    }
+
+    /// Only a lone mate gets a placeholder: a whole pair and a fragment are
+    /// left as they are.
+    #[rstest::rstest]
+    #[case::pair(&[fgumi_raw_bam::flags::FIRST_SEGMENT, fgumi_raw_bam::flags::LAST_SEGMENT], true)]
+    #[case::fragment(&[], false)]
+    fn add_lone_mate_placeholder_skips_other_templates(
+        #[case] segments: &[u16],
+        #[case] paired: bool,
+    ) {
+        use fgumi_raw_bam::flags::{MATE_UNMAPPED, PAIRED, UNMAPPED};
+        let records: Vec<_> = if paired {
+            segments
+                .iter()
+                .map(|&seg| {
+                    make_record_with_string_tag(
+                        b"cons",
+                        PAIRED | UNMAPPED | MATE_UNMAPPED | seg,
+                        crate::sam::SamTag::RX,
+                        b"ACGT",
+                    )
+                })
+                .collect()
+        } else {
+            vec![make_record_with_string_tag(b"cons", UNMAPPED, crate::sam::SamTag::RX, b"ACGT")]
+        };
+        let mut template = Template::from_records(records.clone()).expect("template");
+        assert!(!add_lone_mate_placeholder(&mut template).expect("ok"));
+        assert_eq!(template.records, records);
     }
 
     /// A pair split across a mid-pair `-K` cut zips each half with the aligner's

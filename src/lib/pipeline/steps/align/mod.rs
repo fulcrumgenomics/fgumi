@@ -40,6 +40,7 @@ use std::sync::Arc;
 use noodles::sam::Header;
 use parking_lot::Mutex;
 
+use crate::aligner::BwaScoring;
 use crate::aligner::{ResolvedAligner, ResolvedBackend};
 use crate::pipeline::core::builder::PipelineBuilder;
 use crate::pipeline::core::header::HeaderHandle;
@@ -245,6 +246,72 @@ impl Ordered for ZipperBatch {
     }
 }
 
+/// One loaded aligner index, shared by every align-like stage of a chain.
+///
+/// A `runall --realign` chain can hold two in-process align stages (the
+/// raw-read `Align` and the consensus `Realign`) against the same index. The
+/// whole chain is one pipeline, so loading the index once per stage would keep
+/// two copies resident for the whole run. The chain builder hands every backend
+/// it wires the same `SharedIndex`, and the in-process backend loads through
+/// [`Self::get_or_load`]: the first stage loads, later stages with the same key
+/// share its `Arc`. A different key (another reference, or the `--meth` seed
+/// index) replaces the cached index, while a backend that already holds the
+/// old `Arc` keeps it: duplex consensus under `--methylation-mode em-seq`, whose
+/// `Align` stage loads the `--meth` dual index and whose `Realign` stage loads
+/// the plain one, holds both for the whole run.
+///
+/// Generic over the index type so the sharing is testable without a real
+/// bwa-mem3 index; only the in-process backend instantiates it.
+#[cfg_attr(not(feature = "aligner-bwa-mem3"), allow(dead_code))]
+pub(crate) struct SharedIndex<T> {
+    /// The loaded index and the key (index prefix, bisulfite-aware) it was loaded for.
+    slot: Mutex<Option<(std::path::PathBuf, bool, Arc<T>)>>,
+    /// How many times an index was actually loaded (for tests and logs).
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg_attr(not(feature = "aligner-bwa-mem3"), allow(dead_code))]
+impl<T> SharedIndex<T> {
+    /// An empty cache.
+    pub(crate) fn new() -> Self {
+        Self { slot: Mutex::new(None), loads: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// The index for `(prefix, meth)`: the cached one when the key matches,
+    /// else `load()`'s, which is then cached. Returns whether it was shared.
+    ///
+    /// # Errors
+    ///
+    /// Returns `load`'s error; nothing is cached then.
+    pub(crate) fn get_or_load<F>(
+        &self,
+        prefix: &std::path::Path,
+        meth: bool,
+        load: F,
+    ) -> anyhow::Result<(Arc<T>, bool)>
+    where
+        F: FnOnce() -> anyhow::Result<T>,
+    {
+        let mut slot = self.slot.lock();
+        if let Some((p, m, idx)) = slot.as_ref()
+            && p == prefix
+            && *m == meth
+        {
+            return Ok((Arc::clone(idx), true));
+        }
+        let idx = Arc::new(load()?);
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *slot = Some((prefix.to_path_buf(), meth, Arc::clone(&idx)));
+        Ok((idx, false))
+    }
+
+    /// How many times an index was loaded through this cache.
+    #[cfg(test)]
+    pub(crate) fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// What `add_align` needs to wire any align backend. Built once by the chain
 /// builder and passed to [`AlignBackend::wire`].
 ///
@@ -273,6 +340,13 @@ pub(crate) struct AlignWiringCtx {
     /// backend runs it in the shared [`merge::MergeAlignedStep`] it appends, the
     /// in-process pair/emit step inline.
     pub(crate) merge: Arc<merge::MergeConfig>,
+    /// The chain's one shared in-process index (see [`SharedIndex`]), so an
+    /// `Align` and a `Realign` stage in one chain load it once when they align
+    /// with the same index. Duplex consensus under `--methylation-mode em-seq` is
+    /// the exception: `Align` loads the `bwa-mem3 index --meth` dual index and
+    /// `Realign` the plain one, so both stay resident for the whole run.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    pub(crate) index: Arc<SharedIndex<inproc::engine::BwaIndex>>,
 }
 
 /// The result of wiring a backend: its tail plus the scheduling facts the chain
@@ -341,6 +415,7 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
             sub_batch_templates,
             dedup_reads,
             methylation,
+            xa_max_hits,
         } => {
             // The index is loaded (once) and the header synthesized/resolved
             // inside `AlignBackend::wire`, not here — this only packages the
@@ -352,6 +427,7 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
                 dedup_reads,
                 chunk_size: resolved.chunk_size,
                 methylation,
+                xa_max_hits,
             })
         }
         #[cfg(not(feature = "aligner-bwa-mem3"))]
@@ -533,6 +609,30 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
     builder.build()
 }
 
+/// The scoring `resolved` aligns with, which the realign stage recomputes a
+/// promoted alignment's `AS` with: for the in-process backend, the `MemOpts` it
+/// builds (with `--meth`'s defaults under EM-seq); for a subprocess backend
+/// (preset or `--aligner::command`), what its command line sets
+/// ([`BwaScoring::from_command`]), which for a preset is bwa-mem3's defaults or,
+/// with `--meth`, its bisulfite defaults.
+///
+/// # Errors
+///
+/// Returns an error if the in-process options cannot be built.
+pub(crate) fn bwa_scoring_for(resolved: &ResolvedAligner) -> anyhow::Result<BwaScoring> {
+    match &resolved.backend {
+        ResolvedBackend::Subprocess { command, .. } => Ok(BwaScoring::from_command(command)),
+        #[cfg(feature = "aligner-bwa-mem3")]
+        ResolvedBackend::InProcessBwaMem3 { methylation, .. } => inproc::bwa_scoring(*methylation),
+        // Without the feature `resolve` rejects the in-process preset before any
+        // chain is built.
+        #[cfg(not(feature = "aligner-bwa-mem3"))]
+        ResolvedBackend::InProcessBwaMem3 { .. } => {
+            anyhow::bail!("the in-process bwa-mem3 backend needs the aligner-bwa-mem3 feature")
+        }
+    }
+}
+
 /// The pool-worker floor of the align backend `opts` selects — the same preset
 /// → backend mapping [`AlignerOptions::resolve`](crate::aligner::AlignerOptions::resolve)
 /// applies, without validating files or building a command: the in-process
@@ -561,6 +661,123 @@ pub(crate) fn min_workers_for(opts: &crate::aligner::AlignerOptions) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved(backend: ResolvedBackend, preset: bool) -> ResolvedAligner {
+        use crate::aligner::{AlignerPreset, ResolvedAlignerMode};
+        ResolvedAligner {
+            backend,
+            chunk_size: 1,
+            threads: None,
+            mode: if preset {
+                ResolvedAlignerMode::Preset(AlignerPreset::BwaMem3)
+            } else {
+                ResolvedAlignerMode::Command
+            },
+        }
+    }
+
+    fn subprocess(command: &str) -> ResolvedBackend {
+        ResolvedBackend::Subprocess { command: command.to_string(), accept_mid_pair_split: true }
+    }
+
+    /// A subprocess preset scores with bwa-mem3's defaults (`--meth`'s under
+    /// EM-seq); `--aligner::command` with the scoring options it passes.
+    #[rstest::rstest]
+    #[case::preset(
+        "bwa-mem3 mem -t 4 -p -K 150000000 -Y ref.fa /dev/stdin -h 5,200",
+        true,
+        BwaScoring::default()
+    )]
+    #[case::preset_meth(
+        "bwa-mem3 mem --meth -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
+        true,
+        BwaScoring { b: 2, ..BwaScoring::default() }
+    )]
+    #[case::command_defaults("bwa mem -p ref.fa /dev/stdin", false, BwaScoring::default())]
+    #[case::command_options(
+        "bwa mem -p -B 6 -O 4,5 ref.fa /dev/stdin",
+        false,
+        BwaScoring { b: 6, o_del: 4, o_ins: 5, ..BwaScoring::default() }
+    )]
+    #[case::command_meth_genomic(
+        "bwa-mem3 mem --meth --meth-scoring genomic -p ref.fa /dev/stdin",
+        false,
+        BwaScoring::default()
+    )]
+    #[case::command_preset_mode(
+        "bwa-mem3 mem -x intractg -p ref.fa /dev/stdin",
+        false,
+        BwaScoring { b: 9, o_del: 16, o_ins: 16, ..BwaScoring::default() }
+    )]
+    fn bwa_scoring_for_subprocess(
+        #[case] command: &str,
+        #[case] preset: bool,
+        #[case] expected: BwaScoring,
+    ) {
+        assert_eq!(bwa_scoring_for(&resolved(subprocess(command), preset)).unwrap(), expected);
+    }
+
+    /// The in-process backend scores with its own `MemOpts`, which under EM-seq
+    /// matches what the subprocess preset's `--meth` gives.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[rstest::rstest]
+    #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
+    #[case::taps(fgumi_consensus::MethylationMode::Taps, BwaScoring::default())]
+    #[case::emseq(
+        fgumi_consensus::MethylationMode::EmSeq,
+        BwaScoring { b: 2, ..BwaScoring::default() }
+    )]
+    fn bwa_scoring_for_inproc(
+        #[case] methylation: fgumi_consensus::MethylationMode,
+        #[case] expected: BwaScoring,
+    ) {
+        let backend = ResolvedBackend::InProcessBwaMem3 {
+            reference: std::path::PathBuf::from("ref.fa"),
+            sub_batch_templates: 1,
+            dedup_reads: true,
+            methylation,
+            xa_max_hits: None,
+        };
+        assert_eq!(bwa_scoring_for(&resolved(backend, true)).unwrap(), expected);
+    }
+
+    /// The second stage asking for the same index shares the first's `Arc`;
+    /// another prefix or the `--meth` seed index loads anew.
+    #[rstest::rstest]
+    #[case::same_key("ref.fa", false, 1, true)]
+    #[case::other_prefix("other.fa", false, 2, false)]
+    #[case::meth_index("ref.fa", true, 2, false)]
+    fn shared_index_loads_once_per_key(
+        #[case] second_prefix: &str,
+        #[case] second_meth: bool,
+        #[case] expected_loads: usize,
+        #[case] expected_shared: bool,
+    ) {
+        let cache = SharedIndex::<String>::new();
+        let (first, shared) = cache
+            .get_or_load(std::path::Path::new("ref.fa"), false, || Ok("ref".to_string()))
+            .unwrap();
+        assert!(!shared);
+        let (second, shared) = cache
+            .get_or_load(std::path::Path::new(second_prefix), second_meth, || {
+                Ok("second".to_string())
+            })
+            .unwrap();
+        assert_eq!(cache.loads(), expected_loads);
+        assert_eq!(shared, expected_shared);
+        assert_eq!(Arc::ptr_eq(&first, &second), expected_shared);
+    }
+
+    /// A failed load caches nothing, so the next stage retries.
+    #[test]
+    fn shared_index_failed_load_is_not_cached() {
+        let cache = SharedIndex::<String>::new();
+        let path = std::path::Path::new("ref.fa");
+        assert!(cache.get_or_load(path, false, || anyhow::bail!("boom")).is_err());
+        let (_, shared) = cache.get_or_load(path, false, || Ok("ref".to_string())).unwrap();
+        assert!(!shared);
+        assert_eq!(cache.loads(), 1);
+    }
 
     /// Only a template of exactly two records is split: any other count is out
     /// of contract and errors, naming the template and its record count.

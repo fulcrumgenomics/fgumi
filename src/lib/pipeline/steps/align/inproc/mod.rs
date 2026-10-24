@@ -81,6 +81,9 @@ pub(crate) struct InProcessBwaMem3Backend {
     /// `bwa-mem3 mem --meth` does; TAPS aligns plain (see
     /// [`bwa_mem3_meth_flag`]).
     pub(crate) methylation: MethylationMode,
+    /// bwa's `-h <primary>,<alt>` (the realign stage's `--xa-max-hits`), or
+    /// `None` for bwa-mem3's default.
+    pub(crate) xa_max_hits: Option<(u32, u32)>,
 }
 
 /// What one `flush` of a `Serial` step's staged output did, so `try_run` can
@@ -163,24 +166,42 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // segment means bwa-mem3 attached to it instead of reading from disk; the
         // probe is best-effort (failure => assume disk). It checks the prefix
         // the FM-index loads from, which under EM-seq is the `.meth` seed index.
+        //
+        // The index comes through the chain's `SharedIndex`, so a chain with both
+        // an in-process `Align` and `Realign` stage holds one copy when both
+        // align with the same index: the second stage reuses the first's `Arc`.
+        // For duplex consensus under EM-seq the `Align` stage loads the `--meth`
+        // dual index and `Realign` (which aligns duplex reads plain) the plain
+        // one; the keys differ, so the second load replaces the cached slot while
+        // the first backend keeps its `Arc`, and both stay resident.
         let prefix = index_prefix(&self.reference, self.methylation);
+        let meth = bwa_mem3_meth_flag(self.methylation).is_some();
         let shm_attached = engine::shm::is_staged(&prefix).unwrap_or(false);
         let load_start = Instant::now();
-        let idx = load_index(&self.reference, self.methylation, ctx.num_threads)?;
-        let idx = Arc::new(idx);
-        log::info!(
-            "in-process bwa-mem3: loaded index '{prefix}' in {elapsed:.2?} \
-             ({source}, {n_contigs} contigs, {threads} load threads)",
-            prefix = prefix.display(),
-            elapsed = load_start.elapsed(),
-            source = if shm_attached { "attached shared-memory segment" } else { "read from disk" },
-            n_contigs = idx.n_contigs(),
-            threads = ctx.num_threads,
-        );
+        let (idx, shared) = ctx.index.get_or_load(&prefix, meth, || {
+            load_index(&self.reference, self.methylation, ctx.num_threads)
+        })?;
+        if shared {
+            log::info!(
+                "in-process bwa-mem3: reusing the index '{prefix}' an earlier stage loaded",
+                prefix = prefix.display(),
+            );
+        } else {
+            log::info!(
+                "in-process bwa-mem3: loaded index '{prefix}' in {elapsed:.2?} \
+                 ({source}, {n_contigs} contigs, {threads} load threads)",
+                prefix = prefix.display(),
+                elapsed = load_start.elapsed(),
+                source =
+                    if shm_attached { "attached shared-memory segment" } else { "read from disk" },
+                n_contigs = idx.n_contigs(),
+                threads = ctx.num_threads,
+            );
+        }
 
         // Build the shared, read-only options once. `set_pe(true)` documents the
         // paired-end intent (the engine sets/clears `MEM_F_PE` per group).
-        let opts = Arc::new(build_opts(self.methylation)?);
+        let opts = Arc::new(build_opts(self.methylation, self.xa_max_hits)?);
 
         // Synthesize the aligner header from the index contigs and resolve the
         // shared output header at WIRE time, following the subprocess order:
@@ -292,14 +313,42 @@ fn load_index(
 /// The options every in-process alignment shares: paired-end, and when
 /// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flag`])
 /// what `bwa-mem3 mem --meth` sets. EM-seq is bwa-mem3's default chemistry, so
-/// there is none to set.
-fn build_opts(methylation: MethylationMode) -> anyhow::Result<MemOpts> {
+/// there is none to set. `xa_max_hits` sets bwa's `-h` when given.
+fn build_opts(
+    methylation: MethylationMode,
+    xa_max_hits: Option<(u32, u32)>,
+) -> anyhow::Result<MemOpts> {
     let mut opts = MemOpts::new()?;
     opts.set_pe(true);
     if bwa_mem3_meth_flag(methylation).is_some() {
         opts.set_meth(true).apply_meth_defaults();
     }
+    if let Some((primary, alt)) = xa_max_hits {
+        opts.set_xa_max_hits(
+            i32::try_from(primary).unwrap_or(i32::MAX),
+            i32::try_from(alt).unwrap_or(i32::MAX),
+        );
+    }
     Ok(opts)
+}
+
+/// The scoring the in-process backend aligns with for `methylation`: `-A`/`-B`
+/// read from the [`build_opts`] options. Gap penalties are bwa-mem3's defaults:
+/// `MemOpts` has no getter for them, and neither fgumi nor `--meth`'s defaults
+/// change them.
+///
+/// # Errors
+///
+/// Returns an error if the options cannot be built.
+pub(crate) fn bwa_scoring(
+    methylation: MethylationMode,
+) -> anyhow::Result<crate::aligner::BwaScoring> {
+    let opts = build_opts(methylation, None)?;
+    Ok(crate::aligner::BwaScoring {
+        a: opts.match_score(),
+        b: opts.mismatch_penalty(),
+        ..crate::aligner::BwaScoring::default()
+    })
 }
 
 #[cfg(test)]
@@ -371,7 +420,7 @@ mod tests {
     #[case::disabled(MethylationMode::Disabled)]
     #[case::taps(MethylationMode::Taps)]
     fn build_opts_is_plain_bwa_mem3_unless_emseq(#[case] methylation: MethylationMode) {
-        let opts = build_opts(methylation).unwrap();
+        let opts = build_opts(methylation, None).unwrap();
         assert!(!opts.meth());
     }
 
@@ -379,7 +428,7 @@ mod tests {
     /// `bwa-mem3 mem --meth` sets, or the two backends would diverge.
     #[test]
     fn build_opts_applies_the_cli_meth_defaults_for_emseq() {
-        let opts = build_opts(MethylationMode::EmSeq).unwrap();
+        let opts = build_opts(MethylationMode::EmSeq, None).unwrap();
         assert!(opts.meth());
         assert_eq!(opts.meth_chem().unwrap(), engine::MethChem::EmSeq);
         assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Collapsed);

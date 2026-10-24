@@ -108,6 +108,12 @@ impl SamTag {
     /// tags containing lowercase letters for local use, so this deliberately
     /// uses lowercase `rw` to signal a local convention.
     pub const RW: SamTag = SamTag::new(b'r', b'w');
+    /// Lone-mate placeholder: marks the unmapped stand-in record fgumi gives a
+    /// consensus read whose mate is absent, so its aligner input stays paired.
+    ///
+    /// fgumi-internal and never written: the record carrying it is removed
+    /// before output. Lowercase, as the SAM spec reserves for local tags.
+    pub const LP: SamTag = SamTag::new(b'l', b'p');
     /// Original UMI base quality scores, before error correction (SAM spec).
     pub const BZ: SamTag = SamTag::new(b'B', b'Z');
     /// Read group (SAM spec).
