@@ -4,6 +4,7 @@
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_lib::commands::command::Command;
+use fgumi_lib::commands::shared_metrics::is_r_available;
 use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
 use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::metrics::simplex::{SimplexFamilySizeMetric, SimplexYieldMetric};
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::rscript::r_pdf_omits_dates;
 
 /// Creates a paired-end read pair for simplex-metrics testing.
 ///
@@ -292,4 +294,35 @@ fn test_simplex_metrics_min_reads_parameter() {
     // With min-reads=3, only family 1 (size 3) is consensus-eligible
     assert_eq!(default_full.ss_consensus_families, 3);
     assert_eq!(strict_full.ss_consensus_families, 1);
+}
+
+/// Two runs on the same input write byte-identical PDFs; needs R 4.5.0+ with ggplot2 and scales.
+#[test]
+fn test_simplex_metrics_command_pdf_is_byte_identical_across_runs() {
+    if !is_r_available() {
+        eprintln!("Skipping: R with ggplot2 and scales not available");
+        return;
+    }
+    if !r_pdf_omits_dates() {
+        eprintln!("Skipping: R lacks pdf(timestamp), added in R 4.5.0, so the PDF keeps its dates");
+        return;
+    }
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    create_simplex_test_bam(&input_bam, &create_minimal_header("chr1", 10000));
+
+    let render = |run: &str| {
+        let output_prefix = temp_dir.path().join(run);
+        let cmd = SimplexMetrics::try_parse_from([
+            "simplex-metrics",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_prefix.to_str().unwrap(),
+        ])
+        .expect("failed to parse simplex-metrics args");
+        cmd.execute("fgumi simplex-metrics").expect("simplex-metrics command failed");
+        fs::read(format!("{}.simplex_qc.pdf", output_prefix.display())).expect("PDF not created")
+    };
+    assert!(render("first") == render("second"), "PDF bytes differ between identical runs");
 }
