@@ -26,15 +26,19 @@ Run fgumi in the cloud with a point-and-click interface via [Latch.bio](https://
 
 ## Installation
 
-### Pre-built Binaries
-
-Pre-built binaries for common operating systems and architectures are attached to each [release](https://github.com/fulcrumgenomics/fgumi/releases/latest).
-
 ### Cargo
 
 ```bash
 cargo install fgumi
 ```
+
+This builds `fgumi` without the in-process aligner, so it needs no C++ toolchain and no AVX2. To include the aligner, enable the `aligner-bwa-mem3` feature. It needs a C++17 compiler and the zlib headers, and on x86_64 the resulting binary needs a CPU with AVX2:
+
+```bash
+cargo install fgumi --features aligner-bwa-mem3
+```
+
+Building the reference index still needs the `bwa-mem3` command-line tool (`bwa-mem3 index ref.fa`).
 
 ### Bioconda
 

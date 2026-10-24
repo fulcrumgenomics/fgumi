@@ -85,15 +85,19 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 
 ## Installation
 
-### Downloading a pre-built binary
-
-Pre-built binaries for the most common operating systems and CPU architectures are attached to each [release](https://github.com/fulcrumgenomics/fgumi/releases/latest) for this project.
-
 ### Installing with Cargo
 
 ```
 cargo install fgumi
 ```
+
+This builds `fgumi` without the in-process aligner, so it needs no C++ toolchain and no AVX2. To include the aligner, enable the `aligner-bwa-mem3` feature. It needs a C++17 compiler and the zlib headers, and on x86_64 the resulting binary needs a CPU with AVX2:
+
+```
+cargo install fgumi --features aligner-bwa-mem3
+```
+
+Building the reference index still needs the `bwa-mem3` command-line tool (`bwa-mem3 index ref.fa`).
 
 ### Building from source
 
@@ -117,6 +121,7 @@ cargo build --release
 | `compare` | Developer tools for comparing BAMs and metrics |
 | `simulate` | Commands for generating synthetic test data |
 | `profile-adjacency` | Enable profiling output for adjacency UMI assigner |
+| `aligner-bwa-mem3` | In-process bwa-mem3 aligner for `runall` (`--aligner::preset bwa-mem3-inproc`); needs a C++17 compiler and zlib headers, and on x86_64 the binary needs a CPU with AVX2 |
 Enable with: `cargo build --release --features <feature>`
 
 ## Available Tools
