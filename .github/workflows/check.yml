@@ -282,7 +282,18 @@ jobs:
           FGUMI_BWA_MEM3_REQUIRE_TOOLS: "1"
         run: |
           cargo nextest run --features aligner-bwa-mem3 -p fgumi --locked --lib \
-            -E 'test(bwa_mem3_engine_smoke_pair_emit) | test(runall_sort_chains_carry_the_sort_refill_hint)'
+            -E 'test(bwa_mem3_engine_smoke_pair_emit) | test(runall_sort_chains_carry_the_sort_refill_hint) | test(align_and_realign_share_one_inproc_index)'
+      - name: Realign end-to-end tests with a real aligner
+        # The realign integration tests that need bwa-mem3 on PATH (standalone
+        # chain, runall parity, filter -> realign, extract -> ... -> realign). They
+        # build and index their own reference with the bwa-mem3 put on PATH above.
+        # With FGUMI_BWA_MEM3_REQUIRE_TOOLS set, a missing bwa-mem3 fails instead of
+        # skipping. `simulate` builds their simulated inputs.
+        env:
+          FGUMI_BWA_MEM3_REQUIRE_TOOLS: "1"
+        run: |
+          cargo nextest run --features aligner-bwa-mem3,simulate -p fgumi --locked \
+            --test integration -E 'test(/realign/)'
 
   # `merge_slots.rs` and `merge_demand.rs` (fgumi-sort) and `admission.rs`
   # (fgumi-pipeline-core) swap their sync primitives for loom's under
