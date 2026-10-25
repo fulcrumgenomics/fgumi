@@ -930,6 +930,7 @@ mod tests {
         Arc::new(MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
             skip_tc_tags: false,
+            lone_mates: false,
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 4 * 1024 * 1024,
         })

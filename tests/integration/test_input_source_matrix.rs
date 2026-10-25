@@ -175,6 +175,13 @@ const CONTRACTS: &[IoContract] = &[
         output_depends_on_input: Required,
     },
     IoContract {
+        command: "realign",
+        sam: Required,
+        stdin: Required,
+        stdout: Required,
+        output_depends_on_input: Required,
+    },
+    IoContract {
         command: "clip",
         sam: Required,
         stdin: Required,
@@ -384,6 +391,8 @@ enum Shape {
     Codec,
     /// Reads with the UMI in the last `:`-field of the name and no `RX` tag.
     ReadNameUmi,
+    /// Unmapped consensus read pairs carrying the `rw` realign window.
+    WindowedConsensus,
 }
 
 /// The record shape `command` requires.
@@ -412,6 +421,8 @@ fn shape_for(command: &str) -> Shape {
         // `copy-umi` reads the UMI from the read name and rejects names without
         // one, so it needs names carrying a UMI field rather than tagged families.
         "copy-umi" => Shape::ReadNameUmi,
+        // `realign` rejects an input with no `rw` windows at all.
+        "realign" => Shape::WindowedConsensus,
         _ => Shape::Ungrouped,
     }
 }
@@ -458,6 +469,30 @@ fn write_fixture(dir: &Path, command: &str) -> Fixture {
             })
             .collect(),
         Shape::ReadNameUmi => create_read_name_umi_records(),
+        Shape::WindowedConsensus => (0..2)
+            .flat_map(|i| {
+                let name = format!("cons:{i}");
+                [fgumi_raw_bam::flags::FIRST_SEGMENT, fgumi_raw_bam::flags::LAST_SEGMENT].map(
+                    |seg| {
+                        let mut b = fgumi_raw_bam::SamBuilder::new();
+                        b.read_name(name.as_bytes())
+                            .flags(
+                                fgumi_raw_bam::flags::PAIRED
+                                    | fgumi_raw_bam::flags::UNMAPPED
+                                    | fgumi_raw_bam::flags::MATE_UNMAPPED
+                                    | seg,
+                            )
+                            .sequence(b"ACGTACGTAC")
+                            .qualities(&[30; 10]);
+                        b.add_string_tag(fgumi_lib::sam::SamTag::RW, b"chr1:1-100:+")
+                            .add_string_tag(fgumi_lib::sam::SamTag::MI, name.as_bytes())
+                            .add_int_tag(fgumi_lib::sam::SamTag::CD, 5)
+                            .add_float_tag(fgumi_lib::sam::SamTag::CE, 0.0);
+                        b.build()
+                    },
+                )
+            })
+            .collect(),
     };
     write_bam(&bam, &header, &records);
 
@@ -554,6 +589,19 @@ fn invocation(command: &str) -> Option<Vec<&'static str>> {
             ]
         }
         "retag" => vec!["retag", "-i", "{input}", "-o", "{output}", "RX::copy::BX"],
+        // The realign tests' stand-in aligner (no index needed), reporting every
+        // read unmapped under the `@SQ` of `create_test_reference`.
+        "realign" => vec![
+            "realign",
+            "-i",
+            "{input}",
+            "-o",
+            "{output}",
+            "-r",
+            "{reference}",
+            "--aligner::command",
+            crate::test_realign_command::UNMAPPED_ALIGNER,
+        ],
         "copy-umi" => vec!["copy-umi", "-i", "{input}", "-o", "{output}"],
         "duplex-metrics" => vec!["duplex-metrics", "-i", "{input}", "-o", "{output}"],
         "simplex-metrics" => vec!["simplex-metrics", "-i", "{input}", "-o", "{output}"],

@@ -502,6 +502,14 @@ pub struct GroupReadsByUmi {
     /// use `fgumi sort --verify`.
     #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verify: bool,
+    /// Stamp each raw primary mapped read with an `rw` tag giving its molecule's window
+    /// (`<contig>:<start>-<end>:<strand>`, 1-based inclusive, unclipped) for that read's
+    /// segment, so a later re-alignment of the consensus read can prefer the alignment
+    /// inside the window. The consensus callers copy `rw` onto each consensus read and
+    /// `fgumi filter` keeps it; only `fgumi realign` (or `fgumi runall --realign`)
+    /// removes it, so without one of those the tag reaches the final BAM.
+    #[arg(long = "realign-window", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub realign_window: bool,
 
     /// Allow fully unmapped templates (both reads unmapped). Input must be
     /// template-coordinate sorted (`fgumi sort --order template-coordinate`).
@@ -709,6 +717,14 @@ pub struct GroupOptions {
     /// Verify the input is in strict template-coordinate sort order (`--verify`).
     #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verify: bool,
+    /// Stamp each raw primary mapped read with an `rw` tag giving its molecule's window
+    /// (`<contig>:<start>-<end>:<strand>`, 1-based inclusive, unclipped) for that read's
+    /// segment, so a later re-alignment of the consensus read can prefer the alignment
+    /// inside the window. The consensus callers copy `rw` onto each consensus read and
+    /// `fgumi filter` keeps it; only `fgumi realign` (or `fgumi runall --realign`)
+    /// removes it, so without one of those the tag reaches the final BAM.
+    #[arg(long = "realign-window", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub realign_window: bool,
 }
 
 impl Default for GroupOptions {
@@ -732,6 +748,7 @@ impl Default for GroupOptions {
             grouping_metrics: None,
             metrics_prefix: None,
             verify: false,
+            realign_window: false,
         }
     }
 }
@@ -809,6 +826,7 @@ impl GroupReadsByUmi {
             grouping_metrics: self.grouping_metrics.clone(),
             metrics_prefix: self.metrics.clone(),
             verify: self.verify,
+            realign_window: self.realign_window,
         }
     }
 }
@@ -1194,6 +1212,7 @@ mod tests {
             "--include-non-pf-reads=true",
             "--allow-unmapped=true",
             "--verify=true",
+            "--realign-window",
             "--parallel-group-min-templates",
             "500",
         ])
@@ -1205,6 +1224,7 @@ mod tests {
         assert!(opts.include_non_pf_reads);
         assert!(opts.allow_unmapped);
         assert!(opts.verify);
+        assert!(opts.realign_window);
         assert_eq!(opts.strategy, Strategy::Adjacency);
         assert_eq!(opts.edits, 2);
         assert_eq!(opts.min_umi_length, Some(8));
@@ -1249,6 +1269,7 @@ mod tests {
         assert!(!opts.include_non_pf_reads);
         assert!(!opts.allow_unmapped);
         assert!(!opts.verify, "an absent --verify defaults to false");
+        assert!(!opts.realign_window, "an absent --realign-window defaults to false");
         assert_eq!(opts.edits, 1);
         assert_eq!(opts.min_umi_length, None);
         assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(100));
@@ -1306,6 +1327,7 @@ mod tests {
         assert_eq!(multi.grouping_metrics, base.grouping_metrics);
         assert_eq!(multi.metrics_prefix, base.metrics_prefix);
         assert_eq!(multi.verify, base.verify);
+        assert_eq!(multi.realign_window, base.realign_window);
 
         // Divergence: PR A leaves effective_* at the skip defaults. The
         // standalone `to_group_options` resolves them to (Adjacency, 1) for
@@ -1621,6 +1643,7 @@ mod tests {
             min_map_q: None,
             include_non_pf_reads: false,
             verify: false,
+            realign_window: false,
             strategy,
             edits,
             min_umi_length: None,

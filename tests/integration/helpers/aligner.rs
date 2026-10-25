@@ -15,6 +15,38 @@ pub fn aligner_binary() -> Option<&'static str> {
     ["bwa-mem3", "bwa"].into_iter().find(|bin| which::which(bin).is_ok())
 }
 
+/// Whether `bwa-mem3` is on `PATH` for a real-aligner test. Without it the test
+/// skips (returns `false`), unless `FGUMI_BWA_MEM3_REQUIRE_TOOLS` is set (the CI
+/// job that installs bwa-mem3 sets it), which makes a missing binary a failure.
+pub fn bwa_mem3_or_skip(test: &str) -> bool {
+    if which::which("bwa-mem3").is_ok() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
+        "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but no bwa-mem3 is on PATH ({test})"
+    );
+    eprintln!("no bwa-mem3 on PATH: skipping {test}");
+    false
+}
+
+/// The bwa-mem3 indexed reference at `FGUMI_BWA_MEM3_TEST_REF` (the FASTA, with
+/// its index files and `.dict` beside it) for a real-aligner test, or `None` to
+/// skip it. Like [`bwa_mem3_or_skip`], a missing one fails instead when
+/// `FGUMI_BWA_MEM3_REQUIRE_TOOLS` is set (the CI job that builds it).
+pub fn bwa_mem3_test_ref(test: &str) -> Option<std::path::PathBuf> {
+    let reference = std::env::var_os("FGUMI_BWA_MEM3_TEST_REF");
+    if reference.is_none() {
+        assert!(
+            std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
+            "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but FGUMI_BWA_MEM3_TEST_REF (a bwa-mem3 \
+             indexed reference) is not ({test})"
+        );
+        eprintln!("FGUMI_BWA_MEM3_TEST_REF not set: skipping {test}");
+    }
+    reference.map(std::path::PathBuf::from)
+}
+
 /// Runs `<binary> index <reference>`, panicking on failure. Only called after
 /// the caller has confirmed `binary` is on `PATH` via [`aligner_binary`], so a
 /// failure here is a real setup regression, not a skip condition.

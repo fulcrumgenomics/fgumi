@@ -4711,6 +4711,70 @@ mod tests {
     }
 
     #[test]
+    fn filter_passes_rw_through() -> Result<()> {
+        let dir = TempDir::new()?;
+        let ref_path = create_test_reference(&dir);
+        let input_path = dir.path().join("input.bam");
+        let output_path = dir.path().join("output.bam");
+
+        let mut record = create_simplex_consensus_record(
+            "read1",
+            100,
+            b"AAAA",
+            &[30, 30, 30, 30],
+            10,
+            0.01,
+            &[10, 10, 10, 10],
+            &[0, 0, 0, 0],
+        );
+        fgumi_raw_bam::update_string_tag(record.as_mut_vec(), SamTag::RW, b"chr1:90-130:+");
+        write_test_bam(&input_path, vec![record])?;
+
+        let cmd = Filter {
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            reference: Some(ref_path.clone()),
+            min_reads: vec![1],
+            max_read_error_rate: vec![1.0],
+            max_base_error_rate: vec![1.0],
+            min_base_quality: Some(10),
+            min_mean_base_quality: None,
+            max_no_call_fraction: 1.0,
+            reverse_per_base_tags: false,
+
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            filter_by_template: true,
+            rejects: None,
+            stats: None,
+            require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
+            methylation_mode: None,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+        cmd.execute("test")?;
+
+        let records = read_bam_records(&output_path)?;
+        assert_eq!(records.len(), 1);
+        let tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::RW);
+        match records[0].data().get(&tag) {
+            Some(noodles::sam::alignment::record_buf::data::field::Value::String(v)) => {
+                assert_eq!(v.as_slice(), b"chr1:90-130:+");
+            }
+            other => panic!("expected rw string tag, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_filter_execute_reverse_per_base_tags() -> Result<()> {
         let dir = TempDir::new()?;
         let ref_path = create_test_reference(&dir);

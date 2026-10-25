@@ -26,6 +26,12 @@ pub fn run_and_capture_logs(
     run_args_and_capture_logs(&args)
 }
 
+/// `path` as a `&str`, for a command-line argument; panics if it is not
+/// valid UTF-8.
+pub fn utf8_path(path: &std::path::Path) -> &str {
+    path.to_str().expect("test path is valid UTF-8")
+}
+
 /// Spawn `fgumi <args>...` and return its captured stderr, asserting the run
 /// succeeded. For command lines that do not fit [`run_and_capture_logs`]'s
 /// `-i`/`-o` shape (e.g. `fgumi sort --verify`, which takes no output).

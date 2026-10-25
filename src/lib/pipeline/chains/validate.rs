@@ -29,6 +29,8 @@ use crate::pipeline::chains::{ChainSpec, Stage};
 /// - `Filter` = 8 (post-consensus filtering; follows the consensus caller
 ///   in a runall `consensus → filter` chain, so it sorts after the
 ///   consensus bucket)
+/// - `Realign` = 9 (re-aligns consensus reads, filtered or not, so it follows
+///   both the consensus bucket and `Filter`)
 fn stage_ord(stage: Stage) -> usize {
     match stage {
         Stage::Extract => 0,
@@ -48,15 +50,43 @@ fn stage_ord(stage: Stage) -> usize {
         Stage::CopyUmi | Stage::Clip | Stage::Dedup | Stage::Retag | Stage::Downsample => 6,
         Stage::Simplex | Stage::Duplex | Stage::Codec => 7,
         Stage::Filter => 8,
+        Stage::Realign => 9,
         // Terminal BAM→FASTQ export. Only ever appears as the sole stage of a
         // `fgumi fastq` chain, so its rank is nominal; place it last.
-        Stage::Fastq => 9,
+        Stage::Fastq => 10,
         // Terminal QC-metrics collection. Standalone-only (the sole stage of a
         // `simplex-metrics`/`duplex-metrics` chain), so its rank is nominal —
         // `validate_stage_progression` rejects any multi-stage chain containing
         // it before the ordering loop runs. Place it last.
-        Stage::Metrics => 10,
+        Stage::Metrics => 11,
     }
+}
+
+/// `Realign` re-aligns consensus reads, filtered or not: it may follow only a
+/// consensus stage or `Filter` (or start the chain), and be followed only by
+/// one trailing `Sort` (`runall --realign`'s coordinate sort).
+fn validate_realign_placement(stages: &[Stage]) -> Result<()> {
+    // Realign re-aligns the chain's final reads, so at most one trailing Sort
+    // (`runall --realign`'s coordinate sort) may follow it — nothing else,
+    // including a second Realign.
+    if let Some(pos) = stages.iter().position(|s| *s == Stage::Realign) {
+        if let Some(prev) = pos.checked_sub(1).map(|i| stages[i])
+            && !(prev.is_consensus() || prev == Stage::Filter)
+        {
+            bail!(
+                "Stage::Realign re-aligns consensus reads, so it may follow only a consensus \
+                 stage or Stage::Filter (or start the chain); got {prev:?} before it"
+            );
+        }
+        let tail = &stages[pos + 1..];
+        if !(tail.is_empty() || tail == [Stage::Sort]) {
+            bail!(
+                "Stage::Realign may be followed only by a single trailing Stage::Sort; \
+                 got {tail:?} after it"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject illegal stage orderings.
@@ -65,14 +95,18 @@ fn stage_ord(stage: Stage) -> usize {
 /// - At least one stage (empty chain is meaningless).
 /// - `Stage::Retag` and `Stage::CopyUmi` are standalone-only — each must be the
 ///   sole stage of a chain (a multi-stage chain containing either is rejected).
-/// - Each adjacent pair must be non-decreasing in `stage_ord`.
+/// - Each adjacent pair must be non-decreasing in `stage_ord`, except the
+///   trailing `Realign → Sort` of `runall --realign` (that Sort sorts the
+///   re-aligned reads by coordinate; see `ChainBuilder::add_sort`).
+/// - `Realign` may be followed only by a single trailing `Sort`, and preceded
+///   only by a consensus stage or `Filter` (it re-aligns consensus reads,
+///   filtered or not), or be the first stage (a standalone `fgumi realign`).
 /// - At most one `Align` per chain (mutually exclusive with `Zipper`).
 /// - At most one `Zipper` per chain (mutually exclusive with `Align`).
 /// - At most one consensus stage (`Simplex`/`Duplex`/`Codec`).
-/// - If a consensus stage is present, it must be either the last stage
-///   or immediately followed by a single trailing `Filter` (the
-///   `consensus → filter` runall chain) — nothing else may follow
-///   consensus.
+/// - If a consensus stage is present, only an optional `Filter` (the
+///   `consensus → filter` runall chain), then an optional `Realign` with an
+///   optional trailing `Sort` (`runall --realign`), may follow it.
 /// - `Extract` must be first when present.
 ///
 /// # Errors
@@ -137,11 +171,18 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
         bail!("Stage::Extract must be the first stage in the chain (got position {extract_pos})");
     }
 
+    validate_realign_placement(stages)?;
+
     // Non-decreasing ord (allowing equality for stages that share an ord bucket,
-    // e.g. multiple post-group standalone-only stages).
+    // e.g. multiple post-group standalone-only stages). The one exception is the
+    // trailing `Realign → Sort` checked above: that Sort sorts the re-aligned
+    // reads by coordinate.
     for window in stages.windows(2) {
         let a = window[0];
         let b = window[1];
+        if a == Stage::Realign && b == Stage::Sort {
+            continue;
+        }
         if stage_ord(a) > stage_ord(b) {
             bail!(
                 "Stage {a:?} (ord {}) cannot precede stage {b:?} (ord {}); \
@@ -179,17 +220,22 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
         );
     }
     if let Some(&pos) = consensus_positions.first() {
-        let last = stages.len() - 1;
-        // Consensus may be last, or second-to-last followed by a single
-        // trailing Filter (the runall `consensus → filter` chain). Any
-        // other stage after consensus is illegal.
-        let consensus_terminal = pos == last;
-        let consensus_then_filter = pos + 1 == last && stages[last] == Stage::Filter;
-        if !consensus_terminal && !consensus_then_filter {
+        // Consensus may be last, or followed by an optional Filter (the runall
+        // `consensus → filter` chain) and then an optional `Realign` with its
+        // optional trailing `Sort` (`runall --realign`). Any other stage after
+        // consensus is illegal.
+        let mut after = &stages[pos + 1..];
+        if after.first() == Some(&Stage::Filter) {
+            after = &after[1..];
+        }
+        let allowed =
+            after.is_empty() || after == [Stage::Realign] || after == [Stage::Realign, Stage::Sort];
+        if !allowed {
             bail!(
                 "Consensus stage {:?} at position {pos} must be terminal \
-                 (last in the chain) or immediately followed by a single \
-                 trailing Filter; chain has {} stages total",
+                 (last in the chain) or followed only by an optional Filter, \
+                 then an optional Realign with an optional trailing Sort; chain has \
+                 {} stages total",
                 stages[pos],
                 stages.len()
             );
@@ -267,6 +313,7 @@ pub fn validate_stage_opts_present(spec: &ChainSpec) -> Result<()> {
                 bail!("Stage {stage:?} requires building fgumi with the `consensus` feature");
             }
             Stage::Align => bag.aligner.is_some(),
+            Stage::Realign => bag.realign.is_some(),
             Stage::Extract => bag.extract.is_some(),
             Stage::Fastq => bag.fastq.is_some(),
             // Downsample is rejected by the early `bail!` above (no bag slot
@@ -469,7 +516,12 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
         // the build path, so the `None` arm is reachable only when this
         // validator is called in isolation, and skipping it there mirrors how
         // Rule 2 guards on `if let Some(group_opts)`.
+        // A Sort after Realign is switched to coordinate order by the chain
+        // builder whatever the bag says (and such a chain is rejected below).
+        let after_realign =
+            spec.stages.len() >= 2 && spec.stages[spec.stages.len() - 2] == Stage::Realign;
         if let Some(sort_opts) = spec.stage_opts.sort.as_ref()
+            && !after_realign
             && !matches!(sort_opts.order, SortOrderArg::Coordinate)
         {
             bail!(
@@ -502,16 +554,19 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
             );
         }
 
-        // `Stage::Align` defers the output header (it is rewritten once the
-        // aligner has emitted its @SQ lines), and the inline BAI indexer
-        // requires a resolved (non-deferred) header. Mirrors `add_sink`'s
-        // `inline BAI indexing requires a resolved (non-deferred) header`
-        // guard, which fires on `self.pending_header_handle` — set only by
-        // `add_align`.
-        if spec.stages.contains(&Stage::Align) {
+        // The align-like stages (`Stage::Align`, `Stage::Realign`) defer the
+        // output header (it is rewritten once the aligner has emitted its @SQ
+        // lines), and the inline BAI indexer requires a resolved (non-deferred)
+        // header. Mirrors `add_sink`'s `inline BAI indexing requires a resolved
+        // (non-deferred) header` guard, which fires on
+        // `self.pending_header_handle` — set by every align-like stage
+        // (`add_align`, `add_realign`, via `finish_align_like_stage`).
+        if let Some(stage) = spec.stages.iter().find(|s| matches!(s, Stage::Align | Stage::Realign))
+        {
             bail!(
-                "SinkSpec::BamWithIndex is incompatible with Stage::Align: alignment defers the \
-                 output header, but inline BAI indexing requires a resolved (non-deferred) header"
+                "SinkSpec::BamWithIndex is incompatible with Stage::{stage:?}: alignment defers \
+                 the output header, but inline BAI indexing requires a resolved (non-deferred) \
+                 header"
             );
         }
 
@@ -790,6 +845,49 @@ mod tests {
         let spec = empty_spec(vec![Stage::Group, Stage::Sort]);
         let err = validate_stage_progression(&spec).unwrap_err();
         assert!(err.to_string().contains("canonical pipeline order"));
+    }
+
+    /// Realign ranks after Filter, and is not a template producer, so it does not
+    /// count against the one-Align-per-chain rule. A rejected chain names the
+    /// rule that rejects it, so a case cannot pass on some other rule.
+    #[rstest]
+    #[case::realign_alone(vec![Stage::Realign], None)]
+    #[case::filter_then_realign(vec![Stage::Filter, Stage::Realign], None)]
+    #[case::align_then_realign(vec![Stage::Align, Stage::Realign], Some("may follow only a consensus stage"))]
+    #[case::group_then_realign(vec![Stage::Group, Stage::Realign], Some("may follow only a consensus stage"))]
+    #[case::sort_then_realign(vec![Stage::Sort, Stage::Realign], Some("may follow only a consensus stage"))]
+    #[case::realign_then_filter(vec![Stage::Realign, Stage::Filter], Some("may be followed only by a single trailing Stage::Sort"))]
+    // runall `--realign`: consensus → [filter] → realign → sort(coordinate).
+    #[case::consensus_realign(vec![Stage::Simplex, Stage::Realign], None)]
+    #[case::consensus_realign_sort(vec![Stage::Simplex, Stage::Realign, Stage::Sort], None)]
+    #[case::consensus_filter_realign_sort(
+        vec![Stage::Duplex, Stage::Filter, Stage::Realign, Stage::Sort],
+        None
+    )]
+    #[case::realign_sort(vec![Stage::Realign, Stage::Sort], None)]
+    #[case::filter_realign_sort(vec![Stage::Filter, Stage::Realign, Stage::Sort], None)]
+    #[case::full_chain(
+        vec![
+            Stage::Extract, Stage::Align, Stage::Sort, Stage::Group, Stage::Codec,
+            Stage::Realign, Stage::Sort,
+        ],
+        None
+    )]
+    #[case::realign_sort_group(vec![Stage::Realign, Stage::Sort, Stage::Group], Some("may be followed only by a single trailing Stage::Sort"))]
+    #[case::realign_sort_sort(vec![Stage::Realign, Stage::Sort, Stage::Sort], Some("may be followed only by a single trailing Stage::Sort"))]
+    #[case::realign_twice(vec![Stage::Simplex, Stage::Realign, Stage::Realign], Some("may be followed only by a single trailing Stage::Sort"))]
+    #[case::realign_group(vec![Stage::Realign, Stage::Group], Some("may be followed only by a single trailing Stage::Sort"))]
+    #[case::consensus_sort(vec![Stage::Simplex, Stage::Sort], Some("canonical pipeline order"))]
+    #[case::consensus_realign_filter(vec![Stage::Simplex, Stage::Realign, Stage::Filter], Some("may be followed only by a single trailing Stage::Sort"))]
+    fn realign_progression(#[case] stages: Vec<Stage>, #[case] rejected_by: Option<&str>) {
+        let result = validate_stage_progression(&empty_spec(stages));
+        match rejected_by {
+            None => assert!(result.is_ok(), "{result:?}"),
+            Some(rule) => {
+                let err = result.expect_err("rejected").to_string();
+                assert!(err.contains(rule), "rejected by another rule: {err}");
+            }
+        }
     }
 
     #[rstest]
@@ -1114,17 +1212,25 @@ mod tests {
         assert!(msg.contains("stdout"), "expected 'stdout' in error, got: {msg}");
     }
 
-    #[test]
-    fn cross_stage_bam_with_index_rejects_align_stage() {
-        // `Correct → Align → Sort` with an indexed sink. `Stage::Align` defers
-        // the output header, which the inline BAI indexer cannot use;
-        // `add_sink` rejects the deferred header only after `add_correct` has
-        // truncated its rejects file, so validation must reject up front.
-        let mut spec = empty_spec(vec![Stage::Correct, Stage::Align, Stage::Sort]);
+    /// An align-like stage defers the output header, which the inline BAI
+    /// indexer cannot use; `add_sink` rejects the deferred header only after
+    /// earlier stages (e.g. `add_correct`'s rejects file) have run, so
+    /// validation must reject up front. The trailing sort after `Realign` is
+    /// rejected for the deferred header, not for the bag's sort order.
+    #[rstest]
+    #[case::align(vec![Stage::Correct, Stage::Align, Stage::Sort], "Stage::Align")]
+    #[case::realign(vec![Stage::Simplex, Stage::Realign, Stage::Sort], "Stage::Realign")]
+    fn cross_stage_bam_with_index_rejects_align_like_stage(
+        #[case] stages: Vec<Stage>,
+        #[case] stage: &str,
+    ) {
+        let mut spec = empty_spec(stages);
         spec.sink = SinkSpec::BamWithIndex(PathBuf::from("out.bam"));
         let msg = validate_cross_stage_constraints(&spec).unwrap_err().to_string();
-        assert!(msg.contains("BamWithIndex"), "expected BamWithIndex in error, got: {msg}");
-        assert!(msg.contains("Align"), "expected 'Align' in error, got: {msg}");
+        assert!(
+            msg.contains(&format!("SinkSpec::BamWithIndex is incompatible with {stage}")),
+            "got: {msg}"
+        );
     }
 
     #[test]

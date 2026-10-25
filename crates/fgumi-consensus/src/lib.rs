@@ -22,6 +22,7 @@ pub mod overlapping;
 pub mod phred;
 pub mod sequence;
 pub mod simple_umi;
+pub(crate) mod source_window;
 pub mod tags;
 
 #[cfg(feature = "simplex")]

@@ -152,6 +152,7 @@ pub mod pipeline;
 pub use fgumi_consensus::phred;
 pub mod read_info;
 pub mod read_structure;
+pub(crate) mod realign;
 pub mod reference;
 pub use fgumi_metrics::rejection;
 pub mod sam;

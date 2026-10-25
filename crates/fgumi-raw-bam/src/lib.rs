@@ -101,6 +101,7 @@ pub use overlap::{
     bases_extending_past_mate_ops, is_mapped_opposite_strand_pair_raw, is_primary_fr_pair_raw,
     num_bases_extending_past_mate_cigar_raw, num_bases_extending_past_mate_from_mc_raw,
     num_bases_extending_past_mate_raw, num_bases_extending_past_mate_vs_mate_raw,
+    parse_cigar_string_ops, saturating_reference_length,
 };
 
 // -- raw_bam_record --

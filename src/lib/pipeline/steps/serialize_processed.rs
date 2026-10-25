@@ -16,10 +16,9 @@
 //! group` benchmarks vs. the consensus-tap detour the runall path was
 //! using before this builder existed.
 //!
-//! `emit_templates_raw_with_mi` lives in this module because both this
-//! step AND the standalone single-threaded writer in `commands::group`
-//! call it — keeping it pub(crate) at the step-library layer means
-//! both callers can't drift in MI-injection semantics.
+//! `emit_templates_raw_with_mi` is this step's per-template writer. The fused
+//! group → consensus bridge in the chain builder (`templates_to_mi_step`)
+//! stamps `MI` and `rw` the same way inline, so the two must be kept in step.
 
 use std::io;
 use std::sync::Arc;
@@ -30,6 +29,7 @@ use log::info;
 use crate::pipeline::steps::group::position::BatchedProcessedPositionGroups;
 use crate::pipeline::steps::process::{ProcessWithWorkerState, process_with_worker_state};
 use crate::pipeline::steps::types::DecompressedBlock;
+use crate::realign::window_group::SegmentWindows;
 use crate::template::Template;
 
 /// Per-worker scratch state for the serialize step. `scratch` is the
@@ -120,6 +120,7 @@ pub fn build_serialize_processed_groups_step(
                 emit_templates_raw_with_mi(
                     &processed.templates,
                     0, // already mi_assign'd upstream — base offset is 0
+                    processed.windows.as_ref(),
                     assign_tag_bytes,
                     &mut state.scratch,
                     &mut state.mi_buf,
@@ -148,18 +149,22 @@ pub fn build_serialize_processed_groups_step(
 /// 4-byte little-endian `block_size`. `mi_buf` and `scratch` are reused across
 /// templates to amortize allocations.
 ///
-/// Shared by the threaded-pipeline `SerializeGroups` step (this module's
-/// [`build_serialize_processed_groups_step`]) and the single-threaded writer
-/// in [`crate::commands::group`] so they can't drift in MI-injection
-/// semantics.
+/// Called by the `SerializeGroups` step ([`build_serialize_processed_groups_step`]),
+/// which every `fgumi group` run and `runall --stop-after group` write through.
+/// The fused group → consensus bridge (`templates_to_mi_step` in the chain
+/// builder) does not call it but stamps `MI` the same way (a change here must
+/// be mirrored there) and `rw` through the same
+/// [`SegmentWindows::stamp_rw`].
 pub(crate) fn emit_templates_raw_with_mi(
     templates: &[Template],
     base_mi: u64,
+    windows: Option<&SegmentWindows>,
     assign_tag_bytes: [u8; 2],
     scratch: &mut Vec<u8>,
     mi_buf: &mut String,
     mut emit: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut rw_buf: Vec<u8> = Vec::new();
     for template in templates {
         let mi = template.mi;
         let has_mi = mi.is_assigned();
@@ -172,6 +177,11 @@ pub(crate) fn emit_templates_raw_with_mi(
                 scratch.clear();
                 scratch.extend_from_slice(raw);
                 fgumi_raw_bam::update_string_tag(scratch, assign_tag_bytes, mi_buf.as_bytes());
+                // `windows` is keyed by the same `MoleculeId` value the template carries
+                // here (`base_mi` is 0 on the chain path, so no offset skew).
+                if let Some(windows) = windows {
+                    windows.stamp_rw(mi, raw, scratch, &mut rw_buf);
+                }
                 let block_size = u32::try_from(scratch.len()).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,

@@ -978,3 +978,61 @@ fn test_group_verify_accepts_sorted_multi_batch_chain() {
          under multi-worker reordering, and must not change the output",
     );
 }
+
+// ============================================================================
+// `--realign-window`
+// ============================================================================
+
+fn rw_tag() -> noodles::sam::alignment::record::data::field::Tag {
+    fgumi_lib::sam::SamTag::RW.to_noodles_tag()
+}
+
+/// Without the flag no record carries `rw`, and `--realign-window=false` gives the
+/// same decoded records as omitting it; with the flag, the decoded records differ
+/// from the flag-off ones only by the added `rw` tag. (Byte identity of the
+/// flag-off output against the pre-`--realign-window` release was checked against
+/// a build of that commit, not here.)
+#[test]
+fn group_without_flag_has_identical_records() {
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+
+    let default = run_group_records(dir.path(), "default", &input, &[]);
+    let explicit_off = run_group_records(dir.path(), "off", &input, &["--realign-window=false"]);
+    assert_eq!(default, explicit_off);
+    assert!(default.iter().all(|r| r.data().get(&rw_tag()).is_none()), "no rw without the flag");
+
+    let mut on = run_group_records(dir.path(), "on", &input, &["--realign-window"]);
+    for r in &mut on {
+        r.data_mut().remove(&rw_tag());
+    }
+    assert_eq!(default, on, "--realign-window must change nothing but the rw tag");
+}
+
+#[test]
+fn group_with_flag_stamps_rw() {
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("input.bam");
+    create_test_input_bam(&input);
+
+    for extra in [&["--realign-window"][..], &["--realign-window", "--threads", "4"][..]] {
+        let records = run_group_records(dir.path(), "on", &input, extra);
+        assert_eq!(records.len(), 30);
+        for r in &records {
+            let Some(Value::String(v)) = r.data().get(&rw_tag()) else {
+                panic!("mapped primary record is missing rw")
+            };
+            let w = fgumi_sam::realign_window::RealignWindow::parse(v.as_ref()).expect("rw parses");
+            // Every fixture read is an unclipped forward fragment at one position, so
+            // its molecule's window is exactly its own alignment span.
+            let start = r.alignment_start().expect("mapped").get();
+            let end = r.alignment_end().expect("mapped").get();
+            let want = format!("chr1:{start}-{end}:+");
+            assert_eq!(String::from_utf8_lossy(v.as_ref()), want);
+            assert_eq!(w.contig, "chr1");
+            assert!(!w.reverse);
+        }
+    }
+}

@@ -33,6 +33,10 @@ use clap::Args;
 use fgumi_cli_macros::multi_options;
 use fgumi_consensus::MethylationMode;
 
+mod scoring;
+pub(crate) use scoring::{BwaScoring, command_passes_meth};
+use scoring::{mem_option_words, mem_word_end};
+
 // ============================================================================
 // AlignerProcess
 // ============================================================================
@@ -1036,6 +1040,10 @@ pub(crate) enum ResolvedBackend {
         /// The bisulfite chemistry to align for (`--methylation-mode`), or
         /// [`MethylationMode::Disabled`].
         methylation: MethylationMode,
+        /// bwa's `-h <primary>,<alt>` (`MemOpts::set_xa_max_hits`), or `None`
+        /// for bwa-mem3's default. Set only by the realign stage, via
+        /// [`ResolvedAligner::with_xa_max_hits`].
+        xa_max_hits: Option<(u32, u32)>,
     },
 }
 
@@ -1065,6 +1073,79 @@ pub(crate) struct ResolvedAligner {
     /// Which mode produced this — preset (with which preset) or
     /// command. Used in info-logging.
     pub mode: ResolvedAlignerMode,
+}
+
+impl ResolvedAligner {
+    /// Set bwa's `-h <primary>,<alt>`: how many alternative hits are reported
+    /// in `XA` (alternative hits on ALT contigs use `alt`). Used only by the
+    /// realign stage, and only when the user sets it (`option` names the flag
+    /// they used, for messages), so the raw-read align stage and an unset value
+    /// leave the aligner's own default and the command untouched.
+    ///
+    /// The subprocess backend gets `-h <primary>,<alt>` inserted right after the
+    /// command's first `mem` word (so it precedes the positional arguments
+    /// whatever `getopt` the aligner uses), or appended, with a warning, when the
+    /// command has none. A command that already passes `-h` is left as is, with a
+    /// warning that its own `-h` wins. Preset paths are shell-safe (no
+    /// whitespace), so that word is always the subcommand. The in-process backend
+    /// sets it on its `MemOpts`.
+    #[must_use]
+    pub(crate) fn with_xa_max_hits(mut self, primary: u32, alt: u32, option: &str) -> Self {
+        match &mut self.backend {
+            ResolvedBackend::Subprocess { command, .. } => {
+                let flag = format!("-h {primary},{alt}");
+                if command_passes_h(command) {
+                    log::warn!(
+                        "realign: --aligner::command already passes bwa's -h, which wins: \
+                         {option} {primary},{alt} is not applied"
+                    );
+                } else {
+                    *command = insert_after_mem(command, &flag).unwrap_or_else(|| {
+                        log::warn!(
+                            "realign: --aligner::command has no `mem` word to put bwa's `{flag}` \
+                             ({option}) after, so it is appended to the end of the command; \
+                             make sure the aligner still receives it"
+                        );
+                        format!("{command} {flag}")
+                    });
+                }
+            }
+            ResolvedBackend::InProcessBwaMem3 { xa_max_hits, .. } => {
+                *xa_max_hits = Some((primary, alt));
+            }
+        }
+        self
+    }
+}
+
+/// Whether `command` passes bwa's `-h` among the words after its `mem` word (the
+/// whole command when it has none), up to the first `|`, `;`, `&&` or `||`:
+/// as `-h` or with its value attached (`-h3`), and also at the end of a cluster
+/// of bwa-mem3's argument-less short flags (`-Yh`, `-ph5`), as `getopt` reads it.
+/// Words are split on whitespace without interpreting shell quoting (the tree has
+/// no shell-word lexer), so a `-h` inside a quoted argument such as `-R '... -h
+/// ...'` counts; `fgumi realign --help` documents this.
+fn command_passes_h(command: &str) -> bool {
+    /// bwa-mem3 `mem`'s short flags that take no argument, so `-h` may follow
+    /// them in one cluster.
+    const NO_ARG_FLAGS: &str = "aCMYpPSVj5qu";
+    let passes_h = |word: &str| {
+        let Some(cluster) = word.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+            return false;
+        };
+        let flags_end = cluster.find(|c: char| !NO_ARG_FLAGS.contains(c)).unwrap_or(cluster.len());
+        cluster[flags_end..]
+            .strip_prefix('h')
+            .is_some_and(|v| v.is_empty() || v.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    mem_option_words(command).any(passes_h)
+}
+
+/// Insert `flag` after the first `mem` word of `command` ([`mem_word_end`]), or
+/// `None` when there is none.
+fn insert_after_mem(command: &str, flag: &str) -> Option<String> {
+    let end = mem_word_end(command)?;
+    Some(format!("{} {flag}{}", &command[..end], &command[end..]))
 }
 
 /// How a [`ResolvedAligner`] was produced. The AAM chain builder logs the mode
@@ -1186,7 +1267,7 @@ impl AlignerOptions {
         }
         match (self.preset, self.command) {
             (None, None) => bail!(
-                "--start-from align requires one of `--aligner::preset` \
+                "aligning requires one of `--aligner::preset` \
                  (e.g. bwa-mem3, bwa) or `--aligner::command \"...\"`"
             ),
             (Some(_), Some(_)) => bail!(
@@ -1343,6 +1424,7 @@ fn resolve_inproc(
                 sub_batch_templates,
                 dedup_reads: dedup_reads != Some(DedupReads::Off),
                 methylation,
+                xa_max_hits: None,
             },
             chunk_size,
             threads: None,
@@ -2049,6 +2131,88 @@ mod tests {
         };
         assert!(accept_mid_pair_split, "preset mode must accept bwa's mid-pair split");
         assert!(command.starts_with(&bin.display().to_string()), "got: {command}");
+    }
+
+    /// `with_xa_max_hits` puts `-h` right after the `mem` subcommand, ahead of the
+    /// positional arguments, or appends it when the command has no `mem` word.
+    #[rstest]
+    #[case::preset(
+        "bwa-mem3 mem --bam=0 -p -K 10 -t 4 ref.fa /dev/stdin",
+        "bwa-mem3 mem -h 5,200 --bam=0 -p -K 10 -t 4 ref.fa /dev/stdin"
+    )]
+    #[case::mem_last("bwa mem", "bwa mem -h 5,200")]
+    #[case::memory_path_not_mem(
+        "/opt/memx/bwa mem ref.fa /dev/stdin",
+        "/opt/memx/bwa mem -h 5,200 ref.fa /dev/stdin"
+    )]
+    #[case::mem_prefix_word(
+        "tool memo x; bwa mem ref.fa -",
+        "tool memo x; bwa mem -h 5,200 ref.fa -"
+    )]
+    #[case::no_mem("minimap2 -ax sr ref.fa -", "minimap2 -ax sr ref.fa - -h 5,200")]
+    #[case::tab_before_mem("bwa\tmem ref.fa -", "bwa\tmem -h 5,200 ref.fa -")]
+    // The command's own `-h` wins: the command is left unchanged.
+    #[case::user_h("bwa mem -h 10,10 ref.fa -", "bwa mem -h 10,10 ref.fa -")]
+    #[case::user_h_attached("bwa mem -h3 ref.fa -", "bwa mem -h3 ref.fa -")]
+    #[case::user_h_in_cluster("bwa mem -Yh 10 ref.fa -", "bwa mem -Yh 10 ref.fa -")]
+    #[case::user_h_in_cluster_attached("bwa mem -ph5 ref.fa -", "bwa mem -ph5 ref.fa -")]
+    // `-th` would be `-t h` (a value), not `-h`; `--help` is not `-h`.
+    #[case::h_as_value_of_t("bwa mem -th ref.fa -", "bwa mem -h 5,200 -th ref.fa -")]
+    #[case::long_option("bwa mem --hello ref.fa -", "bwa mem -h 5,200 --hello ref.fa -")]
+    #[case::h_after_pipe_ignored(
+        "bwa mem ref.fa - | tool -h 2",
+        "bwa mem -h 5,200 ref.fa - | tool -h 2"
+    )]
+    fn with_xa_max_hits_inserts_after_mem(#[case] command: &str, #[case] expected: &str) {
+        let resolved = ResolvedAligner {
+            backend: ResolvedBackend::Subprocess {
+                command: command.to_string(),
+                accept_mid_pair_split: true,
+            },
+            chunk_size: 10,
+            threads: Some(4),
+            mode: ResolvedAlignerMode::Command,
+        }
+        .with_xa_max_hits(5, 200, "--xa-max-hits");
+        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
+            panic!("backend kind must be unchanged");
+        };
+        assert_eq!(command, expected);
+    }
+
+    /// `insert_after_mem` finds the ` mem` subcommand word, or reports there is
+    /// none (the caller then appends `-h` and warns).
+    #[rstest]
+    #[case::preset("bwa-mem3 mem -p ref.fa -", Some("bwa-mem3 mem -h 1,2 -p ref.fa -"))]
+    #[case::mem_prefix_word("tool memo x", None)]
+    #[case::no_mem("minimap2 -ax sr ref.fa -", None)]
+    fn insert_after_mem_finds_the_subcommand(
+        #[case] command: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(insert_after_mem(command, "-h 1,2").as_deref(), expected);
+    }
+
+    /// The in-process backend records `-h` for its `MemOpts` instead.
+    #[test]
+    fn with_xa_max_hits_sets_inproc_option() {
+        let resolved = ResolvedAligner {
+            backend: ResolvedBackend::InProcessBwaMem3 {
+                reference: PathBuf::from("ref.fa"),
+                sub_batch_templates: 8,
+                dedup_reads: true,
+                methylation: MethylationMode::Disabled,
+                xa_max_hits: None,
+            },
+            chunk_size: 10,
+            threads: None,
+            mode: ResolvedAlignerMode::Preset(AlignerPreset::BwaMem3InProc),
+        }
+        .with_xa_max_hits(20, 300, "--xa-max-hits");
+        let ResolvedBackend::InProcessBwaMem3 { xa_max_hits, .. } = resolved.backend else {
+            panic!("backend kind must be unchanged");
+        };
+        assert_eq!(xa_max_hits, Some((20, 300)));
     }
 
     /// The in-process preset links bwa-mem3, so `validate` never looks for a

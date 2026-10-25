@@ -220,9 +220,10 @@ pub(crate) enum ChainTailKind {
         /// Whether every emitted batch is closed under queryname: no queryname
         /// run straddles a batch boundary. Set by the source preamble when the
         /// first stage groups by queryname (the [`BatchCut::Queryname`] cut in
-        /// `FindBamBoundaries` / `ReadSamChunks`), and by an intermediate
+        /// `FindBamBoundaries` / `ReadSamChunks`), by an intermediate
         /// consensus stage (closed by construction: one block per batch, molecule
-        /// names never split). When `true`, the queryname grouper is the parallel
+        /// names never split), and by an intermediate filter whose input was
+        /// closed or which filtered whole templates. When `true`, the queryname grouper is the parallel
         /// `AssembleTemplates` map; when `false`, the serial `GroupByQueryname`.
         ///
         /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
@@ -292,11 +293,13 @@ pub(crate) enum ChainTailKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Per-worker scratch state for the `templates_to_mi_step` bridge: a reusable
-/// byte buffer and an MI-key string buffer, reset per template.
+/// byte buffer, an MI-key string buffer, and an `rw` value buffer, reset per
+/// template / record.
 #[cfg(feature = "consensus")]
 pub(crate) struct FuseState {
     scratch: Vec<u8>,
     mi_buf: String,
+    rw_buf: Vec<u8>,
 }
 
 #[cfg(feature = "consensus")]
@@ -359,7 +362,11 @@ fn templates_to_mi_step(
     process_with_worker_state::<BatchedProcessedPositionGroups, BatchedMiGroups, _, FuseState, _>(
         "TemplatesToMiGroups",
         limit_bytes,
-        || FuseState { scratch: Vec::with_capacity(512), mi_buf: String::with_capacity(16) },
+        || FuseState {
+            scratch: Vec::with_capacity(512),
+            mi_buf: String::with_capacity(16),
+            rw_buf: Vec::new(),
+        },
         move |state: &mut FuseState,
               item: BatchedProcessedPositionGroups|
               -> io::Result<BatchedMiGroups> {
@@ -412,6 +419,18 @@ fn templates_to_mi_step(
                             assign_tag_bytes,
                             state.mi_buf.as_bytes(),
                         );
+                        // `--realign-window`: stamp the segment's raw-read window
+                        // (`rw`) through the same `stamp_rw` the terminal
+                        // `SerializeGroups` uses, so the consensus caller copies it
+                        // onto the consensus read on the fused path too.
+                        if let Some(windows) = &processed.windows {
+                            windows.stamp_rw(
+                                template.mi,
+                                raw,
+                                &mut state.scratch,
+                                &mut state.rw_buf,
+                            );
+                        }
                         // Move the tagged bytes into the record instead of
                         // cloning them (no per-record copy of the payload). This
                         // hands the buffer off, so a fresh scratch Vec is
@@ -674,6 +693,29 @@ pub struct ChainBuilder<'a> {
     /// discarded. Forwarded to `WriteBgzfFile::new_with_handle` by `add_sink`.
     pending_header_transform: Option<fgumi_pipeline_io::sink::write_bgzf::ResolvedHeaderTransform>,
 
+    /// Set by [`Self::add_realign`]: a `Sort` after it is the `runall --realign`
+    /// trailing sort, which sorts by coordinate (see [`Self::add_sort`]).
+    realign_added: bool,
+
+    /// The reference FASTAs loaded so far, shared by the stages that read the
+    /// same one (a methylation-aware consensus caller, realign, clip).
+    references: crate::reference::ReferenceCache,
+
+    /// The chain's one in-process bwa-mem3 index, shared by every in-process
+    /// align-like stage it wires (`Align` and `Realign`), so a chain holding
+    /// both loads the index once (see [`SharedIndex`]) when both align with the
+    /// same index. For duplex consensus under `--methylation-mode em-seq`, `Align`
+    /// loads the `--meth` dual index and `Realign` the plain one, so both are
+    /// resident for the whole run.
+    ///
+    /// [`SharedIndex`]: crate::pipeline::steps::align::SharedIndex
+    #[cfg(feature = "aligner-bwa-mem3")]
+    align_index: Arc<
+        crate::pipeline::steps::align::SharedIndex<
+            crate::pipeline::steps::align::inproc::engine::BwaIndex,
+        >,
+    >,
+
     /// Tracks the logical output type of the current chain tail. Updated by
     /// `add_source` and each `add_<stage>` method. See [`ChainTailKind`]
     /// for the full enumeration and rationale.
@@ -918,6 +960,10 @@ impl<'a> ChainBuilder<'a> {
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
+            realign_added: false,
+            references: crate::reference::ReferenceCache::default(),
+            #[cfg(feature = "aligner-bwa-mem3")]
+            align_index: Arc::new(crate::pipeline::steps::align::SharedIndex::new()),
             // Initialise to the default; add_source will set the correct kind
             // based on whether sort is the first intermediate stage.
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
@@ -1857,6 +1903,7 @@ impl<'a> ChainBuilder<'a> {
     /// Queryname-cut stages:
     /// - `Correct` — always groups by queryname before the correct step.
     /// - `Align` — always groups by queryname before the align-and-merge step.
+    /// - `Realign` — likewise, before its align backend.
     /// - `Filter` in `--filter-by-template` mode — inserts a `GroupByQueryname`;
     ///   the per-record filter mode does not, so it stays `Record`.
     ///
@@ -1877,7 +1924,7 @@ impl<'a> ChainBuilder<'a> {
     fn source_batch_cut(&self) -> crate::pipeline::steps::boundaries::state::BatchCut {
         use crate::pipeline::steps::boundaries::state::BatchCut;
         match self.spec.stages.first() {
-            Some(Stage::Correct | Stage::Align) => BatchCut::Queryname,
+            Some(Stage::Correct | Stage::Align | Stage::Realign) => BatchCut::Queryname,
             Some(Stage::Filter) => {
                 let by_template =
                     self.spec.stage_opts.filter.as_ref().is_some_and(|f| f.filter_by_template);
@@ -2195,8 +2242,7 @@ impl<'a> ChainBuilder<'a> {
         if self.sort_plan.is_none() {
             let sort = self.spec.stage_opts.sort.as_ref()?;
             let threads = self.spec.threading.num_threads();
-            let pool = threads
-                .max(chain_worker_floor(&self.spec.stages, self.spec.stage_opts.aligner.as_ref()));
+            let pool = threads.max(chain_worker_floor(&self.spec.stages, self.chain_aligner()));
             let phases = crate::commands::common::PhaseThreads::resolve_in_pool(
                 threads,
                 pool,
@@ -2332,6 +2378,7 @@ impl<'a> ChainBuilder<'a> {
             Stage::Correct => self.add_correct(position),
             Stage::Zipper => self.add_zipper(position),
             Stage::Align => self.add_align(position),
+            Stage::Realign => self.add_realign(position),
             Stage::Extract => self.add_extract(position),
             Stage::Fastq => self.add_fastq(position),
             Stage::Metrics => self.add_metrics(position),
@@ -2736,6 +2783,15 @@ impl<'a> ChainBuilder<'a> {
         // Apply per-stage thread override, if set (currently only sort).
         if let Some(t) = self.override_pipeline_threads {
             config.threads = t;
+        }
+        // Every stage is wired, so the sort's predicted pool (`add_sort`'s
+        // `sort_plan`, which runall's warning also predicts) is now the built pool.
+        if let Some(plan) = &self.sort_plan {
+            debug_assert_eq!(
+                plan.pool,
+                self.override_pipeline_threads.map_or(num_threads, |t| t.max(num_threads)),
+                "chain_worker_floor (used by runall's warning) disagrees with the built pool"
+            );
         }
         // Opt drain-bound chains into downstream-first dispatch: a sort source
         // (flag set in add_sort, so the arena front's serial scan overlaps the
@@ -3308,14 +3364,9 @@ impl<'a> ChainBuilder<'a> {
         use std::sync::atomic::AtomicU64;
 
         use crate::commands::zipper::ZipperMergeRules;
-        use crate::commands::zipper::build_output_header;
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::align::AlignFinalizeHook;
-        use crate::pipeline::core::header::HeaderHandle;
         use crate::pipeline::steps::align::merge::MergeConfig;
-        use crate::pipeline::steps::align::{AlignBackend, AlignWiringCtx, backend_for};
-        use crate::pipeline::steps::serialize::SerializeBamRecords;
-        use crate::reference::find_dict_path;
         use crate::sam::check_sort;
         use log::info;
 
@@ -3341,6 +3392,11 @@ impl<'a> ChainBuilder<'a> {
             resolved.mode, resolved.chunk_size, resolved.threads,
         );
 
+        // The floor comes from the same `stage_worker_floor` runall predicts
+        // with; `finish_align_like_stage` checks it against the backend's own.
+        let align_floor = stage_worker_floor(Stage::Align, Some(align_opts));
+        let reference = align_opts.reference.clone();
+
         // Validate the unmapped BAM source has queryname sort order — but only
         // when Align reads directly from the chain source (a file). When an
         // upstream stage already produced `BamTemplateBatch` (extract → align,
@@ -3362,52 +3418,10 @@ impl<'a> ChainBuilder<'a> {
             check_sort(&self.header, &input_path, "unmapped");
         }
 
-        // Build the correct partial output header:
-        //   dict-derived @SQ + unmapped-BAM @HD/@CO/@RG/@PG + fgumi @PG.
-        // `self.header` already has add_pg_record applied, so the fgumi PG
-        // record is present; build_output_header merges the unmapped header's
-        // PG/RG/CO lines with the dict @SQ and leaves the aligner's runtime
-        // contributions to be folded in via HeaderHandle.
-        let dict_path = find_dict_path(&align_opts.reference)
-            .ok_or_else(|| dict_not_found_error(&align_opts.reference))?;
-        let partial_header =
-            build_output_header(&self.header, &noodles::sam::Header::default(), &dict_path)?;
-        let partial_header = std::sync::Arc::new(partial_header);
-
-        // Replace self.header with the dict-corrected partial header so
-        // downstream stages (sort, group) and add_sink see the correct @SQ.
-        self.header = partial_header.as_ref().clone();
-
-        let header_handle = HeaderHandle::new();
+        let partial_header = self.align_partial_header(&reference)?;
         let records_emitted = std::sync::Arc::new(AtomicU64::new(0));
+        let align_input_tail = self.align_input_tail("add_align");
 
-        let tail = self.current_tail.expect("add_align called before add_source");
-
-        // Wire GroupByQueryname before the align backend — but only when the
-        // upstream stage emits DecodedRecordBatch (the normal source preamble
-        // path). When `chain_tail_kind == BamTemplateBatch`, an upstream stage
-        // (e.g. Correct) has already grouped records into BamTemplateBatch, which
-        // is exactly the input type the align backend expects. Skip
-        // GroupByQueryname in that case to avoid a
-        // DecodedRecordBatch→BamTemplateBatch type mismatch.
-        let align_input_tail = if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
-            // Upstream is already BamTemplateBatch — wire the backend directly.
-            tail
-        } else {
-            // Upstream is DecodedRecordBatch (source preamble). Group by queryname
-            // to produce BamTemplateBatch for the align backend — the parallel
-            // `AssembleTemplates` map when the source cut left batches closed
-            // under queryname, else the serial `GroupByQueryname`.
-            self.append_queryname_grouper(tail)
-        };
-
-        // Construct the align backend `resolve` selected (subprocess, or —
-        // behind `aligner-bwa-mem3` — in-process bwa-mem3) behind the
-        // `AlignBackend` trait, wire its steps after the grouped input, and
-        // obtain the merged `BamTemplateBatch` tail plus the scheduling facts to
-        // fold in.
-        let backend: Box<dyn AlignBackend> = backend_for(resolved);
-        info!("AlignAndMerge backend: {}", backend.describe());
         // The zipper merge every aligned template goes through, run by the
         // backend (the subprocess backend's shared `Parallel` merge step, or the
         // in-process pair/emit step).
@@ -3415,72 +3429,26 @@ impl<'a> ChainBuilder<'a> {
         let merge_config = std::sync::Arc::new(MergeConfig {
             tag_info,
             skip_tc_tags,
+            lone_mates: false,
             records_emitted: std::sync::Arc::clone(&records_emitted),
             output_byte_limit: self.tuning.per_step_byte_limit,
         });
-        let wiring_ctx = AlignWiringCtx {
-            partial_output_header: std::sync::Arc::clone(&partial_header),
-            header_handle: header_handle.clone(),
-            per_step_byte_limit: self.tuning.per_step_byte_limit,
-            num_threads,
-            merge: merge_config,
-        };
-        let wired = backend.wire(&self.pipeline, align_input_tail, &wiring_ctx)?;
+        let (wired, header_handle) = self.wire_align_backend(
+            resolved,
+            align_input_tail,
+            &partial_header,
+            merge_config,
+            "AlignAndMerge",
+        )?;
         let aam_tail = wired.tail;
-
-        if position == StagePosition::Terminal {
-            // Terminal: append SerializeBamRecords so the chain tail is
-            // DecompressedBlock ready for BgzfCompress → WriteBgzfFile in add_sink.
-            // This is the --stop-after zipper path: merged BAM written directly.
-            let tail = self
-                .pipeline
-                .append_step(SerializeBamRecords::new(self.tuning.per_step_byte_limit), aam_tail);
-            self.current_tail = Some(tail);
-            // tail is DecompressedBlock (serialized bytes) after SerializeBamRecords
-            // → SerializedBytes.
-            self.chain_tail_kind = ChainTailKind::SerializedBytes;
-        } else {
-            self.current_tail = Some(aam_tail);
-            // AAM output is BamTemplateBatch; downstream stages (Sort, Group,
-            // Consensus) must know this so they can wire the correct preamble.
-            self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
-        }
-
-        // Stash the HeaderHandle for add_sink to pick up. This is a fresh aligner, so any
-        // transform composed for a *previous* align's handle is stale — drop it so it cannot
-        // be re-applied to this aligner's runtime-resolved header at sink time.
-        self.pending_header_transform = None;
-        self.pending_header_handle = Some(header_handle);
-
-        // Raise the pool floor to the backend's `min_workers` (the subprocess
-        // backend needs 4: it spawns two daemon threads + the aligner subprocess,
-        // so 4 framework workers are the floor for steady-state progress; the
-        // in-process bwa-mem3 backend needs only 1, which is what keeps
-        // `--threads 1` eligible for the fused/inline path —
-        // the `n_threads == 1` precondition of fgumi-pipeline-core's
-        // `should_fuse_single_thread`) — and fold its scheduler preference
-        // into the automatic decision. Only ever set the flag true (mirrors the
-        // grouping stages); the subprocess backend leaves it false, preserving
-        // today's behavior. See `fold_align_wired_scheduling`'s doc comment for
-        // the full rationale (it is unit-tested there without needing a real
-        // backend).
-        // The floor comes from the same `stage_worker_floor` runall predicts
-        // with; it must agree with what the backend itself reports.
-        let align_floor = stage_worker_floor(Stage::Align, Some(align_opts));
-        debug_assert_eq!(
-            align_floor, wired.min_workers,
-            "stage_worker_floor disagrees with the align backend's min_workers"
-        );
-        fold_align_wired_scheduling(
-            num_threads,
-            align_floor.max(wired.min_workers),
-            wired.prefers_drain_first,
-            &mut self.override_pipeline_threads,
-            &mut self.use_drain_first_scheduler,
-        );
-        if let Some(hint) = wired.refill {
-            self.add_refill_hint(hint, "align")?;
-        }
+        self.finish_align_like_stage(
+            aam_tail,
+            position,
+            header_handle,
+            align_floor,
+            wired,
+            "align",
+        )?;
 
         let timer = OperationTimer::new("AlignAndMerge");
         // Success-only: the hook logs "pipeline completed successfully" and
@@ -3488,6 +3456,328 @@ impl<'a> ChainBuilder<'a> {
         self.finalize_on_success.push(Box::new(AlignFinalizeHook { records_emitted, timer }));
 
         Ok(())
+    }
+
+    /// Build the align-like stage's partial output header — dict-derived `@SQ` +
+    /// the input BAM's `@HD`/`@CO`/`@RG`/`@PG` + fgumi `@PG` — and make it
+    /// `self.header`, so downstream stages and `add_sink` see the dict's `@SQ`.
+    ///
+    /// `self.header` already has `add_pg_record` applied, so the fgumi `@PG` is
+    /// present; `build_output_header` merges the input header's PG/RG/CO lines
+    /// with the dict `@SQ` and leaves the aligner's runtime contributions to be
+    /// folded in via the backend's `HeaderHandle`.
+    fn align_partial_header(&mut self, reference: &std::path::Path) -> Result<Arc<Header>> {
+        use crate::commands::zipper::build_output_header;
+        use crate::reference::find_dict_path;
+
+        let dict_path = find_dict_path(reference).ok_or_else(|| dict_not_found_error(reference))?;
+        let partial_header = Arc::new(build_output_header(
+            &self.header,
+            &noodles::sam::Header::default(),
+            &dict_path,
+        )?);
+        self.header = partial_header.as_ref().clone();
+        Ok(partial_header)
+    }
+
+    /// The queryname-grouped `BamTemplateBatch` tail an align backend consumes.
+    ///
+    /// When `chain_tail_kind == BamTemplateBatch`, an upstream stage (e.g.
+    /// Correct) has already grouped records into templates, exactly the input
+    /// the backend expects, so the tail is used as is (grouping again would be a
+    /// `DecodedRecordBatch`→`BamTemplateBatch` type mismatch). Otherwise the
+    /// upstream emits `DecodedRecordBatch` (the source preamble, or an
+    /// intermediate consensus/filter) and is grouped by queryname — the parallel
+    /// `AssembleTemplates` map when its batches are closed under queryname, else
+    /// the serial `GroupByQueryname`.
+    fn align_input_tail(&mut self, caller: &str) -> (StepIdx, BranchIdx) {
+        let tail = self.current_tail.unwrap_or_else(|| panic!("{caller} called before add_source"));
+        if self.chain_tail_kind == ChainTailKind::BamTemplateBatch {
+            tail
+        } else {
+            self.append_queryname_grouper(tail)
+        }
+    }
+
+    /// Construct the align backend `resolved` selects (subprocess, or — behind
+    /// `aligner-bwa-mem3` — in-process bwa-mem3) behind the `AlignBackend`
+    /// trait and wire it after `input`, merging with `merge`. Returns the
+    /// backend's wiring result (merged `BamTemplateBatch` tail plus scheduling
+    /// facts) and the `HeaderHandle` it resolves with the merged header.
+    fn wire_align_backend(
+        &mut self,
+        resolved: crate::aligner::ResolvedAligner,
+        input: (StepIdx, BranchIdx),
+        partial_header: &Arc<Header>,
+        merge: Arc<crate::pipeline::steps::align::merge::MergeConfig>,
+        label: &str,
+    ) -> Result<(
+        crate::pipeline::steps::align::AlignWired,
+        crate::pipeline::core::header::HeaderHandle,
+    )> {
+        use crate::pipeline::core::header::HeaderHandle;
+        use crate::pipeline::steps::align::{AlignBackend, AlignWiringCtx, backend_for};
+
+        let backend: Box<dyn AlignBackend> = backend_for(resolved);
+        log::info!("{label} backend: {}", backend.describe());
+        let header_handle = HeaderHandle::new();
+        let wiring_ctx = AlignWiringCtx {
+            partial_output_header: Arc::clone(partial_header),
+            header_handle: header_handle.clone(),
+            per_step_byte_limit: self.tuning.per_step_byte_limit,
+            num_threads: self.spec.threading.num_threads(),
+            merge,
+            #[cfg(feature = "aligner-bwa-mem3")]
+            index: Arc::clone(&self.align_index),
+        };
+        let wired = backend.wire(&self.pipeline, input, &wiring_ctx)?;
+        Ok((wired, header_handle))
+    }
+
+    /// Finish an align-like stage (`Align`, `Realign`) whose merged templates
+    /// end at `tail`:
+    ///
+    /// - **Terminal**: append `SerializeBamRecords` so the chain tail is
+    ///   `DecompressedBlock` ready for `BgzfCompress → WriteBgzfFile` in
+    ///   `add_sink`. **Intermediate**: leave the `BamTemplateBatch` tail for the
+    ///   next stage (Sort, Group, Consensus), which wires its own preamble.
+    /// - Stash `header_handle` for `add_sink`. This is a fresh aligner, so any
+    ///   transform composed for a *previous* aligner's handle is stale — drop it
+    ///   so it cannot be re-applied to this aligner's runtime-resolved header.
+    /// - Raise the pool floor to the backend's `min_workers` (the subprocess
+    ///   backend needs 4: two daemon threads + the aligner subprocess; the
+    ///   in-process backend needs 1, which keeps `--threads 1` eligible for the
+    ///   fused/inline path — the `n_threads == 1` precondition of
+    ///   fgumi-pipeline-core's `should_fuse_single_thread`), fold its scheduler
+    ///   preference in (only ever set true; the subprocess backend leaves it
+    ///   false), and add its refill hint. See `fold_align_wired_scheduling`.
+    ///   `floor` is `stage_worker_floor`'s prediction, which runall also uses;
+    ///   it must agree with what the backend reports.
+    fn finish_align_like_stage(
+        &mut self,
+        tail: (StepIdx, BranchIdx),
+        position: StagePosition,
+        header_handle: crate::pipeline::core::header::HeaderHandle,
+        floor: usize,
+        wired: crate::pipeline::steps::align::AlignWired,
+        owner: &'static str,
+    ) -> Result<()> {
+        use crate::pipeline::steps::serialize::SerializeBamRecords;
+
+        if position == StagePosition::Terminal {
+            let tail = self
+                .pipeline
+                .append_step(SerializeBamRecords::new(self.tuning.per_step_byte_limit), tail);
+            self.current_tail = Some(tail);
+            self.chain_tail_kind = ChainTailKind::SerializedBytes;
+        } else {
+            self.current_tail = Some(tail);
+            self.chain_tail_kind = ChainTailKind::BamTemplateBatch;
+        }
+
+        self.pending_header_transform = None;
+        self.pending_header_handle = Some(header_handle);
+
+        debug_assert_eq!(
+            floor, wired.min_workers,
+            "stage_worker_floor disagrees with the {owner} backend's min_workers"
+        );
+        fold_align_wired_scheduling(
+            self.spec.threading.num_threads(),
+            floor.max(wired.min_workers),
+            wired.prefers_drain_first,
+            &mut self.override_pipeline_threads,
+            &mut self.use_drain_first_scheduler,
+        );
+        if let Some(hint) = wired.refill {
+            self.add_refill_hint(hint, owner)?;
+        }
+        Ok(())
+    }
+
+    /// The aligner options the chain's worker floor is predicted from: the
+    /// align stage's, else the realign stage's (`runall` gives both the same
+    /// `--aligner::*` selection).
+    fn chain_aligner(&self) -> Option<&crate::pipeline::chains::options_bag::AlignOptions> {
+        let bag = &self.spec.stage_opts;
+        bag.aligner.as_ref().or(bag.realign.as_ref().map(|r| &r.align))
+    }
+
+    /// Realign-specific step sequence: re-align the chain's consensus reads and
+    /// choose each end's primary inside the molecule's raw-read window (`rw`).
+    ///
+    /// ```text
+    /// (DecodedRecordBatch tail: source preamble, or an upstream consensus/filter)
+    ///     ↓
+    /// queryname grouper            ← skipped when the tail is already BamTemplateBatch
+    ///     ↓
+    /// RealignWindowProbe           ← fails an input never window-grouped (no `rw`);
+    ///     ↓                          gives each lone mate a placeholder mate
+    /// <AlignBackend::wire steps>   ← a second instance of the align stage's backend,
+    ///     ↓                          with bwa's `-h` set from `--xa-max-hits`
+    /// RealignSelectPrimary         ← `select_primary` per template; strips `rw`
+    ///     ↓
+    /// (Terminal) SerializeBamRecords
+    /// ```
+    ///
+    /// The wiring is the align stage's (`add_align`): the same backend selection
+    /// (`AlignerOptions::resolve` → `backend_for`), the same dict-derived partial
+    /// output header, the same runtime-resolved [`HeaderHandle`] for the sink,
+    /// and the same worker-floor/scheduler folding. Two things differ: the merge
+    /// reverses/reverse-complements the per-base consensus tags on reverse-strand
+    /// records (`zipper --tags-to-reverse Consensus --tags-to-revcomp
+    /// Consensus`), which `select_primary`'s strand flip relies on; and the
+    /// raw-read `--zipper::*` rules, which belong to the align stage, are not
+    /// read. Output is in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors if the realign options are missing, the tail is not
+    /// records or templates, the `.dict` or reference cannot be read, or the
+    /// backend fails to wire (see `add_align`).
+    ///
+    /// [`HeaderHandle`]: crate::pipeline::core::header::HeaderHandle
+    fn add_realign(&mut self, position: StagePosition) -> Result<()> {
+        use crate::logging::OperationTimer;
+        use crate::per_thread_accumulator::PerThreadAccumulator;
+        use crate::pipeline::chains::commands::realign::{
+            RealignFinalizeHook, SelectPrimaryCaptures, WindowProbeStep, build_select_primary_step,
+            resolve_realign_aligner,
+        };
+        use crate::pipeline::steps::align::merge::MergeConfig;
+        use crate::realign::select::RealignCounts;
+        use crate::umi::TagInfo;
+        use log::info;
+        use std::sync::atomic::AtomicU64;
+
+        let realign_opts = self
+            .spec
+            .stage_opts
+            .realign
+            .as_ref()
+            .ok_or_else(|| anyhow!("Stage::Realign options missing from StageOptionsBag"))?;
+        ensure!(
+            matches!(
+                self.chain_tail_kind,
+                ChainTailKind::DecodedRecordBatch { .. } | ChainTailKind::BamTemplateBatch
+            ),
+            "Stage::Realign requires a record or template tail; got {:?}",
+            self.chain_tail_kind
+        );
+        let align_opts = &realign_opts.align;
+        let num_threads = self.spec.threading.num_threads();
+        let resolved = resolve_realign_aligner(realign_opts, num_threads)?;
+        info!(
+            "Realign: mode = {:?}, chunk_size = {}, threads = {:?}, xa-max-hits = {}",
+            resolved.mode,
+            resolved.chunk_size,
+            resolved.threads,
+            realign_opts
+                .xa_max_hits
+                .map_or_else(|| "aligner default".to_string(), |x| x.to_string()),
+        );
+        let scoring = crate::pipeline::steps::align::bwa_scoring_for(&resolved)?;
+        info!("Realign: rescoring promoted alignments with {scoring:?}");
+        let floor = stage_worker_floor(Stage::Realign, Some(align_opts));
+        let reference_path = align_opts.reference.clone();
+
+        let partial_header = self.align_partial_header(&reference_path)?;
+        let reference =
+            self.realign_reference(&reference_path, realign_opts.in_memory_reference)?;
+
+        let grouped = self.align_input_tail("add_realign");
+        let checked = self
+            .pipeline
+            .append_step(WindowProbeStep::new(self.tuning.per_step_byte_limit), grouped);
+
+        // `zipper --tags-to-reverse Consensus --tags-to-revcomp Consensus`:
+        // `select_primary`'s strand flip assumes the per-base consensus tags of a
+        // reverse-strand record are already reversed.
+        let consensus = || vec!["Consensus".to_string()];
+        let merge_config = Arc::new(MergeConfig {
+            tag_info: Arc::new(TagInfo::new(vec![], consensus(), consensus())),
+            skip_tc_tags: false,
+            lone_mates: true,
+            records_emitted: Arc::new(AtomicU64::new(0)),
+            output_byte_limit: self.tuning.per_step_byte_limit,
+        });
+        let (wired, header_handle) =
+            self.wire_align_backend(resolved, checked, &partial_header, merge_config, "Realign")?;
+
+        let counts = PerThreadAccumulator::<RealignCounts>::new(num_threads);
+        let select = build_select_primary_step(
+            self.tuning.per_step_byte_limit,
+            SelectPrimaryCaptures {
+                reference,
+                header: partial_header,
+                scoring,
+                counts: Arc::clone(&counts),
+            },
+        );
+        let selected = self.pipeline.append_step(select, wired.tail);
+        self.finish_align_like_stage(selected, position, header_handle, floor, wired, "realign")?;
+        self.realign_added = true;
+
+        let timer = OperationTimer::new("Realign");
+        self.finalize_on_success.push(Box::new(RealignFinalizeHook { counts, timer }));
+        Ok(())
+    }
+
+    /// The reference realign rescores promoted alignments against.
+    ///
+    /// By default a reader that holds only the `.fai` index and reads each
+    /// region on demand, unless an earlier stage (a methylation-aware consensus
+    /// caller) already holds the FASTA in memory, which realign then shares at no
+    /// extra cost. A FASTA that cannot be read on demand (compressed, or without
+    /// a `.fai`) is loaded into memory instead (a compressed one decompressed),
+    /// with a warning naming why, the cost, and what would avoid it. With
+    /// `in_memory` the FASTA is loaded into memory (or shared from the chain's
+    /// cache) unconditionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the FASTA cannot be opened or loaded.
+    fn realign_reference(
+        &mut self,
+        path: &std::path::Path,
+        in_memory: bool,
+    ) -> Result<crate::reference::ReferenceSource> {
+        use crate::reference::{IndexedReferenceReader, ReferenceSource, Unavailable};
+        if in_memory {
+            log::info!(
+                "Realign: in-memory reference requested: holding {} in memory",
+                path.display()
+            );
+            return Ok(ReferenceSource::InMemory(self.references.load(path)?));
+        }
+        if let Some(shared) = self.references.get(path) {
+            log::info!(
+                "Realign: an earlier stage holds {} in memory; realign shares it",
+                path.display()
+            );
+            return Ok(ReferenceSource::InMemory(shared));
+        }
+        match IndexedReferenceReader::open(path)? {
+            Ok(reader) => {
+                log::info!("Realign: reading {} on demand through its .fai index", path.display());
+                Ok(ReferenceSource::Indexed(reader))
+            }
+            Err(why) => {
+                let loaded = match why {
+                    Unavailable::Compressed(_) => "decompressed and loaded into memory instead",
+                    Unavailable::NotRegular(_) | Unavailable::NoIndex(_) => {
+                        "loaded into memory instead"
+                    }
+                };
+                log::warn!(
+                    "Realign: cannot read the reference on demand ({why}), so the whole FASTA is \
+                     {loaded}, costing about its uncompressed size (some 3 GB for a human \
+                     reference); {} to avoid this",
+                    why.advice()
+                );
+                Ok(ReferenceSource::InMemory(self.references.load(path)?))
+            }
+        }
     }
 
     /// Zipper-specific step sequence (dual-input):
@@ -3690,13 +3980,21 @@ impl<'a> ChainBuilder<'a> {
     fn add_sort(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::{MemoryLimit, resolve_memory_budget};
 
-        let sort = self
+        let mut sort = self
             .spec
             .stage_opts
             .sort
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Sort options missing from StageOptionsBag"))?
             .clone();
+        // The sort after `Realign` (`runall --realign`'s trailing sort) sorts the
+        // re-aligned consensus reads by coordinate, whatever order the bag's sort
+        // options carry for the raw-read sort earlier in the same chain. The
+        // validator allows a `Sort` after `Realign` only as the chain's last stage.
+        let after_realign = self.realign_added;
+        if after_realign {
+            sort.order = crate::commands::sort::SortOrderArg::Coordinate;
+        }
 
         {
             // ── Streaming sort (standalone, Intermediate, OR Terminal-after-upstream) ──
@@ -3777,13 +4075,15 @@ impl<'a> ChainBuilder<'a> {
             let SortPlan { pool, phases, caps } =
                 self.sort_plan().expect("add_sort runs only on a chain with a sort stage");
             // The plan predicts the pool from the spec; the pool this chain
-            // actually runs is `--threads` raised by a preceding zipper /
-            // subprocess-aligner floor (both run before sort, so
-            // `override_pipeline_threads` is final here). They must agree.
-            debug_assert_eq!(
-                pool,
-                self.override_pipeline_threads.map_or(num_threads, |t| t.max(num_threads)),
-                "chain_worker_floor (used by runall's warning) disagrees with the built pool"
+            // actually runs is `--threads` raised by the zipper / subprocess
+            // aligner floors. A floor-raising stage after this sort (the
+            // `Realign` after a `runall --realign` chain's raw-read sort) has
+            // not raised `override_pipeline_threads` yet, so here the plan is
+            // only at least the pool so far; `build` checks they agree once
+            // every stage is wired.
+            debug_assert!(
+                pool >= self.override_pipeline_threads.map_or(num_threads, |t| t.max(num_threads)),
+                "chain_worker_floor (used by runall's warning) is below the built pool"
             );
             if sort.sort_threads.is_some() || sort.merge_threads.is_some() || pool > num_threads {
                 log::debug!(
@@ -4288,7 +4588,7 @@ impl<'a> ChainBuilder<'a> {
             // walk direction, so a `SortBuffer`-fed sort (chain order) flips too.
             self.add_refill_hint(
                 RefillHint::new(merge_demand.starved_signal(), decompress_tail, u64::MAX, false),
-                "sort",
+                if after_realign { "realign-sort" } else { "sort" },
             )?;
 
             if position == StagePosition::Terminal {
@@ -4655,6 +4955,7 @@ impl<'a> ChainBuilder<'a> {
             consensus_metrics,
             header_arc,
             library_index_arc,
+            group.realign_window.then(|| Arc::new(self.header.clone())),
         );
         let mi_assign_step = build_group_mi_assign_step(self.tuning.per_step_byte_limit);
 
@@ -5077,8 +5378,12 @@ impl<'a> ChainBuilder<'a> {
 
         // Resolve methylation mode and load reference if needed.
         let methylation_mode = simplex.methylation_mode;
-        let methylation_ref: MethylationRef =
-            load_methylation_reference(methylation_mode, &simplex.reference, &self.header)?;
+        let methylation_ref: MethylationRef = load_methylation_reference(
+            methylation_mode,
+            simplex.reference.as_ref(),
+            &self.header,
+            &mut self.references,
+        )?;
 
         // create_unmapped_consensus_header already inserts the @PG record via
         // add_pg_to_builder, so no second add_pg_record call is needed here.
@@ -5467,8 +5772,12 @@ impl<'a> ChainBuilder<'a> {
         let tuning = duplex_consensus_tuning(duplex);
 
         // Resolve methylation mode and load reference if needed.
-        let methylation_ref =
-            load_methylation_reference(tuning.methylation_mode, &duplex.reference, &self.header)?;
+        let methylation_ref = load_methylation_reference(
+            tuning.methylation_mode,
+            duplex.reference.as_ref(),
+            &self.header,
+            &mut self.references,
+        )?;
 
         // create_unmapped_consensus_header already inserts the @PG record via
         // add_pg_to_builder, so no second add_pg_record call is needed here.
@@ -6166,7 +6475,7 @@ impl<'a> ChainBuilder<'a> {
         // input), so the chain matches that rather than re-annotating `SO`.
 
         // Load reference (always required for clip).
-        let reference = Arc::new(crate::reference::ReferenceReader::new(&clip.reference)?);
+        let reference = Arc::new(self.references.load(&clip.reference)?);
 
         // Shared atomic metric counters.
         let metrics = Arc::new(ClipAtomicMetrics::default());
@@ -6355,8 +6664,12 @@ impl<'a> ChainBuilder<'a> {
     ///   Branch 1 is wired here to its own `BgzfCompress → WriteBgzfFile` sink; branch 0
     ///   becomes `current_tail` for `add_sink` to wire the primary output.
     ///
-    /// Only [`StagePosition::Terminal`] is supported; intermediate filter is not needed by
-    /// any Phase 3 runall combination and bails with a clear error.
+    /// [`StagePosition::Terminal`]: branch 0 is the chain's output. An
+    /// [`StagePosition::Intermediate`] filter must be followed by `Realign`
+    /// (`runall … filter --realign`): a `DecodeRecords` step turns the kept bytes
+    /// back into a `DecodedRecordBatch` tail for realign's queryname grouper. The
+    /// filter itself (records kept, rejects, metrics, reference, template mode) is
+    /// the same in both positions.
     ///
     /// Registers a `FilterFinalizeHook` for metrics reduction + summary banner.
     /// The chain-level [`StageTimingFinalizeHook`] is registered by
@@ -6366,7 +6679,7 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// Returns errors if filter options are missing from the spec bag, if the
     /// rejects path is missing when rejects is enabled, or if `position` is
-    /// `Intermediate` (not yet implemented).
+    /// `Intermediate` and the next stage is not `Realign`.
     #[allow(clippy::too_many_lines)]
     fn add_filter(&mut self, position: StagePosition) -> Result<()> {
         use crate::commands::common::warn_unwired_pipeline_flags;
@@ -6381,11 +6694,22 @@ impl<'a> ChainBuilder<'a> {
         use fgumi_bam_io::is_stdin_path;
         use log::info;
 
+        // An intermediate filter feeds only realign (`runall … filter --realign`):
+        // its kept records are decoded back into a record stream, which realign
+        // groups by queryname. No other stage may follow filter.
         if position == StagePosition::Intermediate {
-            bail!(
-                "intermediate filter not implemented; filter is typically terminal \
-                (no Phase 3 runall combination requires it as an intermediate stage)"
-            );
+            let next = self
+                .spec
+                .stages
+                .iter()
+                .position(|s| *s == Stage::Filter)
+                .and_then(|i| self.spec.stages.get(i + 1));
+            if next != Some(&Stage::Realign) {
+                bail!(
+                    "an intermediate filter stage can only be followed by realign \
+                     (`runall … --stop-after filter --realign`); got {next:?} after filter"
+                );
+            }
         }
 
         // Filter consumes a record stream (either a GroupByQueryname step in
@@ -6603,8 +6927,39 @@ impl<'a> ChainBuilder<'a> {
                 self.pipeline.append_step(rejects_writer, rejects_compress_tail);
         }
 
-        // Branch 0 of process_tail (kept) becomes current_tail for add_sink.
-        self.current_tail = Some(process_tail);
+        match position {
+            // Branch 0 of process_tail (kept) becomes current_tail for add_sink.
+            StagePosition::Terminal => self.current_tail = Some(process_tail),
+            // Intermediate (before realign): decode the kept records, which the
+            // step serialized record-aligned, back into a record stream, as an
+            // intermediate consensus stage does (`finish_consensus_tail`). Its
+            // batches are closed under queryname when the filter's were (a
+            // queryname-cut or consensus input), and always in template mode,
+            // where every batch holds whole templates; then realign's queryname
+            // grouper runs as the parallel `AssembleTemplates`. Realign reads only
+            // the queryname hash from the key.
+            StagePosition::Intermediate => {
+                use crate::pipeline::steps::parse::decode::DecodeRecords;
+                let closed = filter_by_template
+                    || matches!(
+                        self.chain_tail_kind,
+                        ChainTailKind::DecodedRecordBatch { closed_under_queryname: true }
+                    );
+                let decoded = self.pipeline.append_step(
+                    DecodeRecords::new(
+                        fgumi_bam_io::GroupKeyConfig::name_hash_only(
+                            fgumi_bam_io::LibraryIndex::default(),
+                        ),
+                        self.tuning.per_step_byte_limit,
+                    )
+                    .with_closed_batches(closed),
+                    process_tail,
+                );
+                self.current_tail = Some(decoded);
+                self.chain_tail_kind =
+                    ChainTailKind::DecodedRecordBatch { closed_under_queryname: closed };
+            }
+        }
 
         // Register the filter finalize hooks. The stats file is written by a
         // success-only hook so a failed/partial run never publishes counts; the
@@ -7091,7 +7446,7 @@ pub(crate) fn stage_worker_floor(
 ) -> usize {
     match stage {
         Stage::Zipper => ZIPPER_MIN_WORKERS,
-        Stage::Align => aligner.map_or(
+        Stage::Align | Stage::Realign => aligner.map_or(
             crate::pipeline::steps::align::subprocess::SubprocessBackend::MIN_WORKERS,
             |align| crate::pipeline::steps::align::min_workers_for(&align.aligner),
         ),
@@ -7397,6 +7752,10 @@ mod tests {
             zipper_pg_renames: Arc::default(),
             deferred_outputs: Vec::new(),
             pending_header_transform: None,
+            realign_added: false,
+            references: crate::reference::ReferenceCache::default(),
+            #[cfg(feature = "aligner-bwa-mem3")]
+            align_index: Arc::new(crate::pipeline::steps::align::SharedIndex::new()),
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
             sink_phase_cap: None,
@@ -7407,6 +7766,34 @@ mod tests {
             consensus_metrics_captures: None,
             correct_umi_set: None,
         }
+    }
+
+    /// `realign_reference` shares a FASTA an earlier stage already loaded (a
+    /// methylation-aware consensus caller) instead of reading it on demand,
+    /// though it is indexed; otherwise it reads an indexed FASTA on demand, and
+    /// `in_memory` loads it.
+    #[rstest::rstest]
+    #[case::shared_with_an_earlier_stage(true, false, true)]
+    #[case::read_on_demand(false, false, false)]
+    #[case::in_memory_requested(false, true, true)]
+    fn realign_reference_shares_an_earlier_stages_fasta(
+        #[case] loaded_earlier: bool,
+        #[case] in_memory: bool,
+        #[case] expect_in_memory: bool,
+    ) {
+        use crate::reference::ReferenceSource;
+        let fasta =
+            fgumi_sam::builder::create_test_fasta(&[("chr1", "ACGTACGTAC")]).expect("fasta");
+        let fai = format!("{}.fai", fasta.path().display());
+        std::fs::write(&fai, "chr1\t10\t6\t10\t11\n").expect("fai");
+        let spec = empty_spec(vec![Stage::Realign]);
+        let mut chain = chain_builder_for_stages(&spec);
+        if loaded_earlier {
+            chain.references.load(fasta.path()).expect("earlier stage loads it");
+        }
+        let source = chain.realign_reference(fasta.path(), in_memory).expect("reference");
+        assert_eq!(matches!(source, ReferenceSource::InMemory(_)), expect_in_memory);
+        let _ = std::fs::remove_file(fai);
     }
 
     /// `source_group_key_config` routes a chain-filter first stage to the
@@ -7646,6 +8033,8 @@ mod tests {
     #[case::align_inproc_sort(&[Stage::Align, Stage::Sort], Some(true), 1)]
     #[case::align_subprocess_zipper_sort(&[Stage::Align, Stage::Zipper, Stage::Sort], Some(false), 4)]
     #[case::align_inproc_zipper_sort(&[Stage::Align, Stage::Zipper, Stage::Sort], Some(true), 4)]
+    #[case::realign_subprocess(&[Stage::Realign], Some(false), 4)]
+    #[case::realign_inproc(&[Stage::Realign], Some(true), 1)]
     fn chain_worker_floor_matches_the_stage_floors(
         #[case] stages: &[Stage],
         #[case] align_in_process: Option<bool>,
@@ -7971,6 +8360,24 @@ mod tests {
         assert_sort_refill_source_feeds_decompress(&built);
     }
 
+    /// The bwa-mem3 indexed reference at `FGUMI_BWA_MEM3_TEST_REF` (the FASTA,
+    /// with its index files and `.dict` beside it), or `None` to skip the test;
+    /// a missing one fails instead when `FGUMI_BWA_MEM3_REQUIRE_TOOLS` is set (the
+    /// e2e-parity CI job).
+    #[cfg(feature = "aligner-bwa-mem3")]
+    fn bwa_mem3_test_ref() -> Option<String> {
+        let reference = std::env::var("FGUMI_BWA_MEM3_TEST_REF").ok();
+        if reference.is_none() {
+            assert!(
+                std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
+                "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but FGUMI_BWA_MEM3_TEST_REF (a bwa-mem3 \
+                 indexed reference) is not"
+            );
+            eprintln!("skipping: FGUMI_BWA_MEM3_TEST_REF not set");
+        }
+        reference
+    }
+
     /// A real runall `[Align(inproc), Sort]` chain: the in-process aligner's
     /// `add_align` and the sort's `add_sort` each add their refill hint, and the
     /// installed `refill-drain` carries both (the stand-in-hint case of
@@ -7982,13 +8389,7 @@ mod tests {
     #[cfg(feature = "aligner-bwa-mem3")]
     #[test]
     fn runall_sort_chains_carry_the_sort_refill_hint() {
-        let Ok(reference) = std::env::var("FGUMI_BWA_MEM3_TEST_REF") else {
-            assert!(
-                std::env::var_os("FGUMI_BWA_MEM3_REQUIRE_TOOLS").is_none(),
-                "FGUMI_BWA_MEM3_REQUIRE_TOOLS is set but FGUMI_BWA_MEM3_TEST_REF (a bwa-mem3 \
-                 indexed reference) is not"
-            );
-            eprintln!("skipping: FGUMI_BWA_MEM3_TEST_REF not set");
+        let Some(reference) = bwa_mem3_test_ref() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -8017,6 +8418,67 @@ mod tests {
         let debug = format!("{:?}", built.config.scheduler);
         assert_eq!(debug.matches("RefillSource {").count(), 2, "align + sort hints: {debug}");
         assert_sort_refill_source_feeds_decompress(&built);
+    }
+
+    /// A runall `--realign` chain with BOTH an in-process `Align` and an
+    /// in-process `Realign` stage loads the bwa-mem3 index once: the realign
+    /// backend reuses the align backend's `Arc` through the chain's
+    /// `SharedIndex`, so the run never holds two copies. Gated like
+    /// [`runall_sort_chains_carry_the_sort_refill_hint`] on a prebuilt index at
+    /// `FGUMI_BWA_MEM3_TEST_REF`.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[test]
+    fn align_and_realign_share_one_inproc_index() {
+        let Some(reference) = bwa_mem3_test_ref() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("unmapped.bam");
+        let header: noodles::sam::Header = "@HD\tVN:1.6\tSO:queryname\n".parse().unwrap();
+        fgumi_bam_io::create_raw_bam_writer(&input, &header, 1, 1).unwrap().finish().unwrap();
+        // The shape `runall --start-from align --realign` builds; validated, so the
+        // test cannot drift to a chain production rejects.
+        let stages = vec![
+            Stage::Align,
+            Stage::Sort,
+            Stage::Group,
+            Stage::Simplex,
+            Stage::Realign,
+            Stage::Sort,
+        ];
+        let mut spec = sort_chain_spec(tmp.path(), input, stages.clone());
+        spec.stage_opts.simplex = Some(crate::commands::simplex::SimplexOptions::default());
+        let align = || crate::pipeline::chains::options_bag::AlignOptions {
+            aligner: crate::aligner::AlignerOptions {
+                preset: Some(crate::aligner::AlignerPreset::BwaMem3InProc),
+                ..crate::aligner::AlignerOptions::default()
+            },
+            reference: std::path::PathBuf::from(&reference),
+            aligner_bin: None,
+        };
+        spec.stage_opts.aligner = Some(align());
+        spec.stage_opts.realign = Some(crate::commands::realign::RealignOptions {
+            align: align(),
+            xa_max_hits: None,
+            xa_max_hits_option: "--xa-max-hits",
+            in_memory_reference: false,
+        });
+        crate::pipeline::chains::validate::validate_stage_progression(&spec)
+            .expect("a chain runall builds");
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        let last = stages.len() - 1;
+        for (i, stage) in stages.into_iter().enumerate() {
+            let position =
+                if i == last { StagePosition::Terminal } else { StagePosition::Intermediate };
+            chain.add_stage(stage, position).unwrap();
+            if stage == Stage::Align || stage == Stage::Realign {
+                // Align loads the index; realign must reuse it.
+                assert_eq!(chain.align_index.loads(), 1, "after {stage:?}");
+            }
+        }
+        chain.add_sink().unwrap();
+        chain.build().unwrap();
     }
 
     /// The merge of a queryname sort compares through the sort's own class
@@ -8852,6 +9314,33 @@ mod tests {
             err.to_string().contains("intermediate copy-umi not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    /// An intermediate filter must be followed by realign (the only stage that
+    /// consumes its decoded kept records). Any other next stage, or none, is
+    /// rejected before the options or the input are read; a following realign
+    /// passes the guard (and here fails later, on the placeholder input path, so
+    /// no step is appended to the placeholder tail).
+    #[rstest::rstest]
+    #[case::realign_next(
+        vec![Stage::Filter, Stage::Realign, Stage::Sort],
+        "Invalid Input BAM file 'in.bam'"
+    )]
+    #[case::sort_next(vec![Stage::Filter, Stage::Sort], "can only be followed by realign")]
+    #[case::nothing_next(vec![Stage::Filter], "can only be followed by realign")]
+    fn add_filter_intermediate_requires_realign_next(
+        #[case] stages: Vec<Stage>,
+        #[case] expected: &str,
+    ) {
+        let mut spec = empty_spec(stages);
+        spec.stage_opts.filter = Some(filter_opts(true));
+        let mut builder = chain_builder_for_stages(&spec);
+        builder.current_tail = Some((StepIdx(0), BranchIdx(0)));
+        let err = builder
+            .add_filter(StagePosition::Intermediate)
+            .expect_err("the placeholder input does not exist");
+        let err = format!("{err:#}");
+        assert!(err.contains(expected), "unexpected error: {err}");
     }
 
     /// `add_copy_umi` refuses a non-record-stream upstream tail: like filter/clip

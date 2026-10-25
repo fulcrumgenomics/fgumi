@@ -49,7 +49,7 @@
 use crate::commands::command::Command;
 use crate::logging::OperationTimer;
 use crate::reference::find_dict_path;
-use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
+use crate::sam::{SamTag, check_sort};
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::{validate_file_exists, validate_input_exists};
@@ -522,84 +522,6 @@ pub(crate) fn program_id_renames(unmapped: &Header, mapped: &Header) -> ProgramI
     renames
 }
 
-/// Adds `tc` tags to secondary/supplementary reads.
-fn add_template_coordinate_tags_raw(mapped: &mut Template) {
-    let rr = &mapped.records;
-
-    // Fast path: check if there are any secondary/supplementary reads
-    let has_sec_supp = rr.iter().any(|r| {
-        let f = RawRecordView::new(r).flags();
-        (f & fgumi_raw_bam::flags::SECONDARY) != 0 || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
-    });
-    if !has_sec_supp {
-        return;
-    }
-
-    // Get R1 primary info
-    let r1_info: Option<(i32, i32, bool)> = mapped.r1.and_then(|(i, _)| {
-        let r = &rr[i];
-        let f = RawRecordView::new(r).flags();
-        if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
-            return None;
-        }
-        let ref_id = fgumi_raw_bam::ref_id(r);
-        let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
-        let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
-        Some((ref_id, pos, is_reverse))
-    });
-
-    // Get R2 primary info
-    let r2_info: Option<(i32, i32, bool)> = mapped.r2.and_then(|(i, _)| {
-        let r = &rr[i];
-        let f = RawRecordView::new(r).flags();
-        if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
-            return None;
-        }
-        let ref_id = fgumi_raw_bam::ref_id(r);
-        let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
-        let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
-        Some((ref_id, pos, is_reverse))
-    });
-
-    let tc_info: Option<TemplateCoordinateInfo> = match (r1_info, r2_info) {
-        (Some((t1, p1, n1)), Some((t2, p2, n2))) => {
-            if (t1, p1) <= (t2, p2) {
-                Some(TemplateCoordinateInfo::new(t1, p1, n1, t2, p2, n2))
-            } else {
-                Some(TemplateCoordinateInfo::new(t2, p2, n2, t1, p1, n1))
-            }
-        }
-        (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
-            Some(TemplateCoordinateInfo::new(t, p, n, t, p, n))
-        }
-        (None, None) => None,
-    };
-
-    let Some(tc_info) = tc_info else {
-        return;
-    };
-
-    let tc_tag = SamTag::TC;
-    let tc_values = [
-        tc_info.tid1,
-        tc_info.pos1,
-        i32::from(tc_info.neg1),
-        tc_info.tid2,
-        tc_info.pos2,
-        i32::from(tc_info.neg2),
-    ];
-
-    for record in mapped.records.iter_mut() {
-        let f = RawRecordView::new(record.as_ref()).flags();
-        if (f & fgumi_raw_bam::flags::SECONDARY) != 0
-            || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
-        {
-            fgumi_raw_bam::remove_tag(record.as_mut_vec(), tc_tag);
-            fgumi_raw_bam::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
-        }
-    }
-}
-
 /// Collects the indices of mapped records corresponding to a given segment
 /// (R1 or R2) using the template's pre-computed index fields, avoiding a
 /// full scan of all mapped records.
@@ -922,7 +844,7 @@ pub(crate) fn merge_raw_with(
 
     // Step 6: Add tc (template coordinate) tags
     if !skip_tc_tags {
-        add_template_coordinate_tags_raw(mapped);
+        mapped.add_template_coordinate_tags();
     }
 
     Ok(())
@@ -2612,6 +2534,7 @@ mod tests {
     use super::*;
     use crate::sam::SamTag;
     use crate::sam::TC_TAG;
+    use crate::sam::TemplateCoordinateInfo;
     use crate::sam::builder::{
         MAPPED_PG_ID, REFERENCE_LENGTH, SamBuilder as FgSamBuilder, create_ref_dict,
     };
@@ -4715,8 +4638,8 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
 
-        // Call add_template_coordinate_tags_raw
-        add_template_coordinate_tags_raw(&mut template);
+        // Call Template::add_template_coordinate_tags
+        template.add_template_coordinate_tags();
 
         // Check that supplementary has tc tag
         let supp = template
@@ -4777,7 +4700,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        template.add_template_coordinate_tags();
 
         let secondary =
             template.records().iter().find(|r| r.is_secondary()).expect("Should have secondary");
@@ -4846,7 +4769,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2, supplementary_r2])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        template.add_template_coordinate_tags();
 
         let supp = template
             .records()
@@ -4891,7 +4814,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![supplementary])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        template.add_template_coordinate_tags();
 
         let supp = template
             .records()
@@ -4972,7 +4895,7 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags_raw` returns early when there are no
+    /// Tests that `Template::add_template_coordinate_tags` returns early when there are no
     /// secondary/supplementary reads (the early exit optimization).
     #[test]
     fn test_add_pa_tag_early_exit_no_secondary_supplementary() -> Result<()> {
@@ -5007,8 +4930,8 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2])?;
 
-        // Call add_template_coordinate_tags_raw - should return early
-        add_template_coordinate_tags_raw(&mut template);
+        // Call Template::add_template_coordinate_tags - should return early
+        template.add_template_coordinate_tags();
 
         // Verify no tc tags were added (primaries don't get tc tags)
         for record in template.records() {
@@ -5018,7 +4941,7 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags_raw` only adds tc tag to secondary/supplementary,
+    /// Tests that `Template::add_template_coordinate_tags` only adds tc tag to secondary/supplementary,
     /// not to primary reads, even when secondary/supplementary are present.
     #[test]
     fn test_add_pa_tag_only_to_secondary_supplementary() -> Result<()> {
@@ -5053,7 +4976,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        template.add_template_coordinate_tags();
 
         // Check each record
         for record in template.records() {

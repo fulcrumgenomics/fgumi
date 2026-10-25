@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 
 use anyhow::Result;
-use clap::Parser;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{CommandFactory, Parser};
 
 /// Custom styles for CLI help output
 const STYLES: Styles = Styles::styled()
@@ -32,6 +32,7 @@ use fgumi_lib::commands::fastq::Fastq;
 use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
+use fgumi_lib::commands::realign::Realign;
 use fgumi_lib::commands::retag::Retag;
 use fgumi_lib::commands::review::Review;
 use fgumi_lib::commands::runall::RunAll;
@@ -134,30 +135,32 @@ enum Subcommand {
     #[command(display_order = 12)]
     Filter(Filter),
     #[command(display_order = 13)]
+    Realign(Realign),
+    #[command(display_order = 14)]
     Clip(Clip),
     #[cfg(feature = "consensus")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     DuplexMetrics(DuplexMetrics),
     #[cfg(feature = "consensus")]
-    #[command(display_order = 15)]
-    SimplexMetrics(SimplexMetrics),
     #[command(display_order = 16)]
+    SimplexMetrics(SimplexMetrics),
+    #[command(display_order = 17)]
     Review(Review),
 
     // Utilities
-    #[command(display_order = 17)]
-    Downsample(Downsample),
     #[command(display_order = 18)]
-    CopyUmi(CopyUmi),
+    Downsample(Downsample),
     #[command(display_order = 19)]
+    CopyUmi(CopyUmi),
+    #[command(display_order = 20)]
     Retag(Retag),
-    #[command(name = "runall", display_order = 22)]
+    #[command(name = "runall", display_order = 23)]
     RunAll(RunAll),
     #[cfg(feature = "compare")]
-    #[command(display_order = 20)]
+    #[command(display_order = 21)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 21)]
+    #[command(display_order = 22)]
     Simulate(Simulate),
 }
 
@@ -179,6 +182,7 @@ impl Subcommand {
             #[cfg(feature = "consensus")]
             Self::Codec(cmd) => cmd.execute(command_line),
             Self::Filter(cmd) => cmd.execute(command_line),
+            Self::Realign(cmd) => cmd.execute(command_line),
             Self::Clip(cmd) => cmd.execute(command_line),
             #[cfg(feature = "consensus")]
             Self::DuplexMetrics(cmd) => cmd.execute(command_line),
@@ -218,6 +222,24 @@ fn main() -> Result<()> {
                         );
                         std::process::exit(2);
                     }
+                }
+            }
+            // A `--xa-max-hits` / `--realign::xa-max-hits` left without a value
+            // takes the next option as its value, and clap then reports that
+            // option's own value as unexpected; name the flag instead.
+            if !matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                if let Some((subcommand, message)) =
+                    fgumi_lib::commands::realign::missing_xa_max_hits_value(&argv)
+                {
+                    let mut cmd = Args::command();
+                    // Built so the subcommand's usage line names `fgumi`.
+                    cmd.build();
+                    let cmd = cmd.find_subcommand_mut(subcommand).expect("known subcommand");
+                    cmd.error(clap::error::ErrorKind::InvalidValue, message).exit();
                 }
             }
             e.exit();
@@ -497,6 +519,7 @@ mod tests {
     #[cfg_attr(feature = "consensus", case::duplex("duplex"))]
     #[cfg_attr(feature = "consensus", case::codec("codec"))]
     #[case::filter("filter")]
+    #[case::realign("realign")]
     #[case::clip("clip")]
     #[cfg_attr(feature = "consensus", case::duplex_metrics("duplex-metrics"))]
     #[cfg_attr(feature = "consensus", case::simplex_metrics("simplex-metrics"))]

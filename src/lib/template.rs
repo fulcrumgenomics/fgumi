@@ -33,7 +33,7 @@
 //! }
 //! ```
 
-use crate::sam::SamTag;
+use crate::sam::{SamTag, TemplateCoordinateInfo};
 use anyhow::{Result, bail};
 use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
 use fgumi_raw_bam::{RawRecord, RawRecordView};
@@ -606,98 +606,372 @@ impl Template {
             }
         }
 
-        // Fix mate info for R1 supplementals (mate is primary R2)
-        if let Some((r2_i, _)) = self.r2 {
-            let rr = &self.records;
-            let r2_ref_id = fgumi_raw_bam::ref_id(&rr[r2_i]);
-            let r2_pos = fgumi_raw_bam::pos(&rr[r2_i]);
-            let r2_flags = RawRecordView::new(&rr[r2_i]).flags();
-            let r2_is_reverse = (r2_flags & fgumi_raw_bam::flags::REVERSE) != 0;
-            let r2_is_unmapped = (r2_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-            let r2_end = insert_size_end(&rr[r2_i]);
-            let r2_mapq = fgumi_raw_bam::mapq(&rr[r2_i]);
-            let mut r2_cigar = Vec::new();
-            fgumi_raw_bam::cigar_to_bytes_into(&mut r2_cigar, &rr[r2_i]);
-            let r2_as =
-                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r2_i]), SamTag::AS);
-
-            if let Some((start, end)) = self.r1_supplementals {
-                let rr = &mut self.records;
-                for rec in &mut rr[start..end] {
-                    fgumi_raw_bam::set_mate_ref_id(rec, r2_ref_id);
-                    fgumi_raw_bam::set_mate_pos(rec, r2_pos);
-                    set_mate_flags(rec, r2_is_reverse, r2_is_unmapped);
-                    // TLEN is computed from the supplementary's own alignment against the mate
-                    // primary, not copied from the mate primary's TLEN: a supplementary sits at a
-                    // different locus than its own primary, so the primary's value describes
-                    // coordinates this record does not occupy. See issue #673.
-                    let tlen = compute_insert_size_from_ends(insert_size_end(rec), r2_end);
-                    fgumi_raw_bam::set_template_length(rec, tlen);
-
-                    let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-                    fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
-
-                    if !r2_cigar.is_empty() && r2_cigar.as_slice() != b"*" && !r2_is_unmapped {
-                        fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::MC, &r2_cigar);
-                    } else {
-                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
-                    }
-
-                    if let Some(as_value) = r2_as
-                        && let Ok(v) = i32::try_from(as_value)
-                    {
-                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                        fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
-                    }
-                }
-            }
+        // Supplementals point at the other end's primary as their mate.
+        if let (Some((r2_i, _)), Some(range)) = (self.r2, self.r1_supplementals) {
+            self.set_mate_info_on(range, r2_i);
         }
-
-        // Fix mate info for R2 supplementals (mate is primary R1)
-        if let Some((r1_i, _)) = self.r1 {
-            let rr = &self.records;
-            let r1_ref_id = fgumi_raw_bam::ref_id(&rr[r1_i]);
-            let r1_pos = fgumi_raw_bam::pos(&rr[r1_i]);
-            let r1_flags = RawRecordView::new(&rr[r1_i]).flags();
-            let r1_is_reverse = (r1_flags & fgumi_raw_bam::flags::REVERSE) != 0;
-            let r1_is_unmapped = (r1_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
-            let r1_end = insert_size_end(&rr[r1_i]);
-            let r1_mapq = fgumi_raw_bam::mapq(&rr[r1_i]);
-            let mut r1_cigar = Vec::new();
-            fgumi_raw_bam::cigar_to_bytes_into(&mut r1_cigar, &rr[r1_i]);
-            let r1_as =
-                fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[r1_i]), SamTag::AS);
-
-            if let Some((start, end)) = self.r2_supplementals {
-                let rr = &mut self.records;
-                for rec in &mut rr[start..end] {
-                    fgumi_raw_bam::set_mate_ref_id(rec, r1_ref_id);
-                    fgumi_raw_bam::set_mate_pos(rec, r1_pos);
-                    set_mate_flags(rec, r1_is_reverse, r1_is_unmapped);
-                    // See the R1 supplemental loop above: computed, not copied. Issue #673.
-                    let tlen = compute_insert_size_from_ends(insert_size_end(rec), r1_end);
-                    fgumi_raw_bam::set_template_length(rec, tlen);
-
-                    let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-                    fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
-
-                    if !r1_cigar.is_empty() && r1_cigar.as_slice() != b"*" && !r1_is_unmapped {
-                        fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::MC, &r1_cigar);
-                    } else {
-                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
-                    }
-
-                    if let Some(as_value) = r1_as
-                        && let Ok(v) = i32::try_from(as_value)
-                    {
-                        fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
-                        fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
-                    }
-                }
-            }
+        if let (Some((r1_i, _)), Some(range)) = (self.r1, self.r2_supplementals) {
+            self.set_mate_info_on(range, r1_i);
         }
 
         Ok(())
+    }
+
+    /// Points the records in `start..end` at the primary record `mate_i` as their
+    /// mate: RNEXT/PNEXT, the mate flags, TLEN, `MQ`, `MC` and `ms`.
+    fn set_mate_info_on(&mut self, (start, end): (usize, usize), mate_i: usize) {
+        let rr = &self.records;
+        let mate_ref_id = fgumi_raw_bam::ref_id(&rr[mate_i]);
+        let mate_pos = fgumi_raw_bam::pos(&rr[mate_i]);
+        let mate_flags = RawRecordView::new(&rr[mate_i]).flags();
+        let mate_is_reverse = (mate_flags & fgumi_raw_bam::flags::REVERSE) != 0;
+        let mate_is_unmapped = (mate_flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
+        let mate_end = insert_size_end(&rr[mate_i]);
+        let mate_mapq = fgumi_raw_bam::mapq(&rr[mate_i]);
+        let mut mate_cigar = Vec::new();
+        fgumi_raw_bam::cigar_to_bytes_into(&mut mate_cigar, &rr[mate_i]);
+        let mate_as =
+            fgumi_raw_bam::find_int_tag(fgumi_raw_bam::aux_data_slice(&rr[mate_i]), SamTag::AS);
+
+        for rec in &mut self.records[start..end] {
+            fgumi_raw_bam::set_mate_ref_id(rec, mate_ref_id);
+            fgumi_raw_bam::set_mate_pos(rec, mate_pos);
+            set_mate_flags(rec, mate_is_reverse, mate_is_unmapped);
+            // TLEN is computed from the record's own alignment against the mate
+            // primary, not copied from its own primary's TLEN: a supplementary sits
+            // at a different locus than its own primary, so the primary's value
+            // describes coordinates this record does not occupy. See issue #673.
+            let tlen = compute_insert_size_from_ends(insert_size_end(rec), mate_end);
+            fgumi_raw_bam::set_template_length(rec, tlen);
+
+            let mq_val = if mate_mapq == 255 { 255 } else { i32::from(mate_mapq) };
+            fgumi_raw_bam::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
+
+            if !mate_cigar.is_empty() && mate_cigar.as_slice() != b"*" && !mate_is_unmapped {
+                fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::MC, &mate_cigar);
+            } else {
+                fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MC);
+            }
+
+            if let Some(as_value) = mate_as
+                && let Ok(v) = i32::try_from(as_value)
+            {
+                fgumi_raw_bam::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                fgumi_raw_bam::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
+            }
+        }
+    }
+
+    /// Like the supplementary step of [`Self::fix_mate_info`], for the secondary
+    /// records: each points at the other end's primary as its mate.
+    /// [`Self::fix_mate_info`] leaves secondaries as the aligner wrote them; this is
+    /// for a caller that moved a primary after the aligner set them.
+    pub(crate) fn fix_secondary_mate_info(&mut self) {
+        self.cached_umi_position = None;
+        if let (Some((r2_i, _)), Some(range)) = (self.r2, self.r1_secondaries) {
+            self.set_mate_info_on(range, r2_i);
+        }
+        if let (Some((r1_i, _)), Some(range)) = (self.r1, self.r2_secondaries) {
+            self.set_mate_info_on(range, r1_i);
+        }
+    }
+
+    /// The segment bit (`FIRST_SEGMENT` or `LAST_SEGMENT`) of a lone mate: a
+    /// template whose only primary is one end of a pair (`PAIRED` set) whose mate
+    /// is absent, as after per-record filtering. `None` for anything else.
+    pub(crate) fn lone_mate_segment(&self) -> Option<u16> {
+        let ((Some((i, _)), None) | (None, Some((i, _)))) = (self.r1, self.r2) else {
+            return None;
+        };
+        let f = RawRecordView::new(&self.records[i]).flags();
+        (f & fgumi_raw_bam::flags::PAIRED != 0).then_some(
+            f & (fgumi_raw_bam::flags::FIRST_SEGMENT | fgumi_raw_bam::flags::LAST_SEGMENT),
+        )
+    }
+
+    /// Removes every record of one end (`first`: R1; otherwise R2), its primary,
+    /// supplementary and secondary records, and re-indexes the rest, which keep
+    /// their order. The other end is then a lone mate (see
+    /// [`Self::lone_mate_segment`]); its mate fields are left for the caller
+    /// ([`Self::set_lone_mate_info`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the other end has no records.
+    pub(crate) fn remove_end(&mut self, first: bool) -> Result<()> {
+        let ranges = if first {
+            [self.r1, self.r1_supplementals, self.r1_secondaries]
+        } else {
+            [self.r2, self.r2_supplementals, self.r2_secondaries]
+        };
+        let mut remove = vec![false; self.records.len()];
+        for (start, end) in ranges.into_iter().flatten() {
+            remove[start..end].fill(true);
+        }
+        let mut index = 0;
+        self.records.retain(|_| {
+            index += 1;
+            !remove[index - 1]
+        });
+        if self.records.is_empty() {
+            bail!("removing one end left no records");
+        }
+        self.reindex()
+    }
+
+    /// Adds `record` to this template and re-indexes it; the other records keep
+    /// their order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `record` is a second primary of its end.
+    pub(crate) fn push_record(&mut self, record: RawRecord) -> Result<()> {
+        self.records.push(record);
+        self.reindex()
+    }
+
+    /// Sets the mate fields of a lone mate's records (see
+    /// [`Self::lone_mate_segment`]) the way SAM describes an unplaced mate: the
+    /// mate is unmapped, RNEXT/PNEXT are the read's own primary placement (`*`/0
+    /// when it is unmapped), TLEN is 0, and there is no `MC`, `MQ` or `ms`. The
+    /// proper-pair and mate-reverse flags are cleared.
+    pub(crate) fn set_lone_mate_info(&mut self) {
+        use fgumi_raw_bam::flags::{MATE_REVERSE, MATE_UNMAPPED, PROPER_PAIR, UNMAPPED};
+        self.cached_umi_position = None;
+        let Some((i, _)) = self.r1.or(self.r2) else {
+            return;
+        };
+        let primary = &self.records[i];
+        let (ref_id, pos) = if RawRecordView::new(primary).flags() & UNMAPPED == 0 {
+            (fgumi_raw_bam::ref_id(primary), fgumi_raw_bam::pos(primary))
+        } else {
+            (-1, -1)
+        };
+        for rec in &mut self.records {
+            let f = rec.flags() & !(PROPER_PAIR | MATE_REVERSE);
+            rec.set_flags(f | MATE_UNMAPPED);
+            fgumi_raw_bam::set_mate_ref_id(rec, ref_id);
+            fgumi_raw_bam::set_mate_pos(rec, pos);
+            fgumi_raw_bam::set_template_length(rec, 0);
+            for tag in [SamTag::MC, SamTag::MQ, SamTag::MS] {
+                fgumi_raw_bam::remove_tag(rec.as_mut_vec(), tag);
+            }
+        }
+    }
+
+    /// The indices of one end's split pieces (`first`: R1 or a fragment's read;
+    /// otherwise R2), in record order: its supplementary records, and its
+    /// secondary records that carry `SA`, which are the other pieces of a split
+    /// that an aligner run with `-M` (as `bwa-mem3 mem --meth` is) flags secondary
+    /// instead. Secondary records without `SA` (`-a` alternative alignments) are
+    /// not pieces.
+    pub(crate) fn split_piece_indices(&self, first: bool) -> Vec<usize> {
+        let (supplementals, secondaries) = if first {
+            (self.r1_supplementals, self.r1_secondaries)
+        } else {
+            (self.r2_supplementals, self.r2_secondaries)
+        };
+        let mut pieces: Vec<usize> = supplementals.map_or(Vec::new(), |(s, e)| (s..e).collect());
+        if let Some((start, end)) = secondaries {
+            pieces.extend((start..end).filter(|&i| {
+                fgumi_raw_bam::find_string_tag(
+                    fgumi_raw_bam::aux_data_slice(&self.records[i]),
+                    SamTag::SA,
+                )
+                .is_some()
+            }));
+        }
+        pieces
+    }
+
+    /// Removes the split records of one end (`first`: R1 or a fragment's read;
+    /// otherwise R2): the records [`Self::split_piece_indices`] names. Secondary
+    /// records without `SA` (`-a` alternative alignments) are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remaining records cannot be re-indexed.
+    pub(crate) fn remove_split_records(&mut self, first: bool) -> Result<()> {
+        let pieces = self.split_piece_indices(first);
+        if pieces.is_empty() {
+            return Ok(());
+        }
+        let mut remove = vec![false; self.records.len()];
+        for i in pieces {
+            remove[i] = true;
+        }
+        let mut index = 0;
+        self.records.retain(|_| {
+            index += 1;
+            !remove[index - 1]
+        });
+        self.reindex()
+    }
+
+    /// Swaps the roles of one end's primary record (`first`: R1 or a fragment's
+    /// read; otherwise R2) and its split piece at index `piece` (one of
+    /// [`Self::split_piece_indices`]). The piece's record moves into the primary
+    /// slot and becomes the primary: its supplementary/secondary flag is cleared
+    /// and it takes the old primary's other flags, keeping its own strand. The
+    /// old primary's record moves into the piece's slot and takes the piece's
+    /// supplementary or secondary flag, keeping its own strand and other flags.
+    /// The index ranges therefore describe the records when this returns. Only
+    /// the flags change: SEQ, QUAL, CIGAR and tags are the caller's to adjust.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the end has no primary or `piece` is not one of its
+    /// split pieces.
+    pub(crate) fn swap_primary_with_split_piece(
+        &mut self,
+        first: bool,
+        piece: usize,
+    ) -> Result<()> {
+        use fgumi_raw_bam::flags::{REVERSE, SECONDARY, SUPPLEMENTARY};
+        let primary = if first { self.r1 } else { self.r2 };
+        let Some((primary, _)) = primary else {
+            bail!("cannot swap a split piece into an end without a primary");
+        };
+        if !self.split_piece_indices(first).contains(&piece) {
+            bail!("record {piece} is not a split piece of this end");
+        }
+        let kind = SECONDARY | SUPPLEMENTARY;
+        let old_flags = self.records[primary].flags();
+        let piece_flags = self.records[piece].flags();
+        self.records.swap(primary, piece);
+        self.records[primary].set_flags((old_flags & !(kind | REVERSE)) | (piece_flags & REVERSE));
+        self.records[piece].set_flags((old_flags & !kind) | (piece_flags & kind));
+        self.cached_umi_position = None;
+        Ok(())
+    }
+
+    /// Rebuilds the index ranges from the records' flags, keeping the molecule
+    /// id and the records' current order within each range.
+    ///
+    /// The layout is [`Self::from_records`]'s (R1, R2, then each end's
+    /// supplementary and then secondary records), but unlike `from_records` it
+    /// does not reverse each end's supplementary and secondary records: they
+    /// are already in template order, and reversing them again would make an
+    /// end's piece order (which split piece wins a tie, the order of `SA`
+    /// entries, the emitted record order) depend on whether the template was
+    /// re-indexed. Records are moved by a stable sort on their range.
+    fn reindex(&mut self) -> Result<()> {
+        use fgumi_raw_bam::flags::{FIRST_SEGMENT, PAIRED, SECONDARY, SUPPLEMENTARY};
+        // 0: R1, 1: R2, 2/3: R1/R2 supplementary, 4/5: R1/R2 secondary.
+        let range_of = |record: &RawRecord| {
+            let f = record.flags();
+            let r2 = f & PAIRED != 0 && f & FIRST_SEGMENT == 0;
+            let kind = if f & SECONDARY != 0 { 2 } else { usize::from(f & SUPPLEMENTARY != 0) };
+            kind * 2 + usize::from(r2)
+        };
+        self.records.sort_by_key(range_of);
+        let mut ranges: [Option<(usize, usize)>; 6] = [None; 6];
+        for (i, record) in self.records.iter().enumerate() {
+            let k = range_of(record);
+            ranges[k] = Some(ranges[k].map_or((i, i + 1), |(start, _)| (start, i + 1)));
+        }
+        for (k, end) in [(0, "R1"), (1, "R2")] {
+            if let Some((start, stop)) = ranges[k]
+                && stop - start > 1
+            {
+                bail!(
+                    "Multiple non-secondary, non-supplemental {end} records for read '{:?}'",
+                    fgumi_raw_bam::read_name(&self.records[start])
+                );
+            }
+        }
+        let [r1, r2, r1_supp, r2_supp, r1_sec, r2_sec] = ranges;
+        self.r1 = r1;
+        self.r2 = r2;
+        self.r1_supplementals = r1_supp;
+        self.r2_supplementals = r2_supp;
+        self.r1_secondaries = r1_sec;
+        self.r2_secondaries = r2_sec;
+        self.cached_umi_position = None;
+        Ok(())
+    }
+
+    /// Sets the `tc` (template-coordinate) tag of every secondary and
+    /// supplementary record from the template's primaries, replacing any it
+    /// carries, so a template-coordinate sort keeps them with their primaries.
+    /// Does nothing without a secondary or supplementary record, or when both
+    /// primaries are unself.
+    pub(crate) fn add_template_coordinate_tags(&mut self) {
+        let rr = &self.records;
+
+        // Fast path: check if there are any secondary/supplementary reads
+        let has_sec_supp = rr.iter().any(|r| {
+            let f = RawRecordView::new(r).flags();
+            (f & fgumi_raw_bam::flags::SECONDARY) != 0
+                || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
+        });
+        if !has_sec_supp {
+            return;
+        }
+
+        // Get R1 primary info
+        let r1_info: Option<(i32, i32, bool)> = self.r1.and_then(|(i, _)| {
+            let r = &rr[i];
+            let f = RawRecordView::new(r).flags();
+            if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
+                return None;
+            }
+            let ref_id = fgumi_raw_bam::ref_id(r);
+            let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
+            let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
+            Some((ref_id, pos, is_reverse))
+        });
+
+        // Get R2 primary info
+        let r2_info: Option<(i32, i32, bool)> = self.r2.and_then(|(i, _)| {
+            let r = &rr[i];
+            let f = RawRecordView::new(r).flags();
+            if (f & fgumi_raw_bam::flags::UNMAPPED) != 0 {
+                return None;
+            }
+            let ref_id = fgumi_raw_bam::ref_id(r);
+            let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(r);
+            let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
+            Some((ref_id, pos, is_reverse))
+        });
+
+        let tc_info: Option<TemplateCoordinateInfo> = match (r1_info, r2_info) {
+            (Some((t1, p1, n1)), Some((t2, p2, n2))) => {
+                if (t1, p1) <= (t2, p2) {
+                    Some(TemplateCoordinateInfo::new(t1, p1, n1, t2, p2, n2))
+                } else {
+                    Some(TemplateCoordinateInfo::new(t2, p2, n2, t1, p1, n1))
+                }
+            }
+            (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
+                Some(TemplateCoordinateInfo::new(t, p, n, t, p, n))
+            }
+            (None, None) => None,
+        };
+
+        let Some(tc_info) = tc_info else {
+            return;
+        };
+
+        let tc_tag = SamTag::TC;
+        let tc_values = [
+            tc_info.tid1,
+            tc_info.pos1,
+            i32::from(tc_info.neg1),
+            tc_info.tid2,
+            tc_info.pos2,
+            i32::from(tc_info.neg2),
+        ];
+
+        for record in &mut self.records {
+            let f = RawRecordView::new(record.as_ref()).flags();
+            if (f & fgumi_raw_bam::flags::SECONDARY) != 0
+                || (f & fgumi_raw_bam::flags::SUPPLEMENTARY) != 0
+            {
+                fgumi_raw_bam::remove_tag(record.as_mut_vec(), tc_tag);
+                fgumi_raw_bam::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
+            }
+        }
     }
 
     /// Raw-byte: both reads mapped. Sets mate info, TLEN, MQ, MC.
@@ -1282,6 +1556,113 @@ mod tests {
             b.mate_pos(i32::try_from(mpos).expect("mate_pos fits i32") - 1);
         }
         b.build()
+    }
+
+    /// A split read's records: `R1`, `R2` (each primary), then pieces named by
+    /// `(end, kind, pos)`, where `end` is 1 or 2 and `kind` a supplementary or
+    /// secondary flag. Each piece's position names it in the assertions.
+    fn split_read(pieces: &[(u8, u16, usize)]) -> Vec<RawRecord> {
+        let r1 = FLAG_PAIRED | FLAG_READ1;
+        let r2 = FLAG_PAIRED | FLAG_READ2;
+        let mut records =
+            vec![create_mapped_raw(b"q", r1, 1, 60), create_mapped_raw(b"q", r2, 2, 60)];
+        for &(end, kind, pos) in pieces {
+            let seg = if end == 1 { r1 } else { r2 };
+            let mut record = create_mapped_raw(b"q", seg | kind, pos, 60);
+            if kind == FLAG_SECONDARY {
+                fgumi_raw_bam::update_string_tag(
+                    record.as_mut_vec(),
+                    SamTag::SA,
+                    b"chr1,1,+,100M,60,0;",
+                );
+            }
+            records.push(record);
+        }
+        records
+    }
+
+    /// The 1-based positions of the records in `range`.
+    fn positions(t: &Template, range: Option<(usize, usize)>) -> Vec<i32> {
+        range.map_or(Vec::new(), |(s, e)| {
+            t.records[s..e].iter().map(|r| fgumi_raw_bam::pos(r) + 1).collect()
+        })
+    }
+
+    /// Each index range names records whose flags put them there.
+    fn assert_ranges_match_flags(t: &Template) {
+        let expect = [
+            (t.r1, true, 0),
+            (t.r2, false, 0),
+            (t.r1_supplementals, true, FLAG_SUPPLEMENTARY),
+            (t.r2_supplementals, false, FLAG_SUPPLEMENTARY),
+            (t.r1_secondaries, true, FLAG_SECONDARY),
+            (t.r2_secondaries, false, FLAG_SECONDARY),
+        ];
+        let mut covered = 0;
+        for (range, first, kind) in expect {
+            let Some((start, end)) = range else { continue };
+            covered += end - start;
+            for record in &t.records[start..end] {
+                let f = record.flags();
+                assert_eq!(f & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY), kind, "flags {f:#x}");
+                assert_eq!(f & FLAG_READ2 == 0, first, "flags {f:#x}");
+            }
+        }
+        assert_eq!(covered, t.records.len(), "every record is in one range");
+    }
+
+    /// Re-indexing keeps each end's pieces in template order, so an end's
+    /// piece order does not depend on whether another end's records were
+    /// removed (`from_records` lists them in reverse of their input order).
+    #[rstest]
+    #[case::remove_r2_pieces(false)]
+    #[case::remove_r2_end(true)]
+    fn reindex_keeps_the_piece_order(#[case] whole_end: bool) -> Result<()> {
+        let mut t = Template::from_records(split_read(&[
+            (1, FLAG_SUPPLEMENTARY, 10),
+            (1, FLAG_SUPPLEMENTARY, 20),
+            (1, FLAG_SECONDARY, 30),
+            (1, FLAG_SECONDARY, 40),
+            (2, FLAG_SUPPLEMENTARY, 50),
+        ]))?;
+        let want = (positions(&t, t.r1_supplementals), positions(&t, t.r1_secondaries));
+        assert_eq!(want, (vec![20, 10], vec![40, 30]), "from_records reverses");
+        if whole_end {
+            t.remove_end(false)?;
+            assert!(t.r2.is_none());
+        } else {
+            t.remove_split_records(false)?;
+            assert!(t.r2.is_some());
+        }
+        assert!(t.r2_supplementals.is_none());
+        assert_eq!((positions(&t, t.r1_supplementals), positions(&t, t.r1_secondaries)), want);
+        assert_ranges_match_flags(&t);
+        Ok(())
+    }
+
+    /// Swapping a primary with its split piece swaps the records' roles and
+    /// leaves the index ranges describing them: the piece is the primary with
+    /// its own strand, the old primary the piece with its kind.
+    #[rstest]
+    #[case::supplementary(FLAG_SUPPLEMENTARY)]
+    #[case::secondary(FLAG_SECONDARY)]
+    fn swap_primary_with_split_piece_keeps_the_ranges(#[case] kind: u16) -> Result<()> {
+        let mut records = split_read(&[(1, kind, 10), (2, FLAG_SUPPLEMENTARY, 50)]);
+        let piece_flags = records[2].flags() | FLAG_REVERSE | raw_flags::PROPER_PAIR;
+        records[2].set_flags(piece_flags);
+        let primary_flags = records[0].flags() | raw_flags::PROPER_PAIR;
+        records[0].set_flags(primary_flags);
+        let mut t = Template::from_records(records)?;
+        let piece = t.split_piece_indices(true)[0];
+        t.swap_primary_with_split_piece(true, piece)?;
+        assert_ranges_match_flags(&t);
+        let primary = t.r1.expect("r1").0;
+        assert_eq!(fgumi_raw_bam::pos(&t.records[primary]) + 1, 10, "the piece is primary");
+        assert_eq!(fgumi_raw_bam::pos(&t.records[piece]) + 1, 1, "the old primary is the piece");
+        let (p, d) = (t.records[primary].flags(), t.records[piece].flags());
+        assert_eq!(p, FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE | raw_flags::PROPER_PAIR);
+        assert_eq!(d, FLAG_PAIRED | FLAG_READ1 | kind | raw_flags::PROPER_PAIR);
+        Ok(())
     }
 
     #[test]

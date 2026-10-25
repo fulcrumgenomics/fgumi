@@ -153,6 +153,9 @@ pub(crate) fn build_group_process_step(
     // `None` on the default (metrics-off) path, so nothing is cloned or retained.
     header: Option<Arc<noodles::sam::Header>>,
     library_index: Option<Arc<fgumi_bam_io::LibraryIndex>>,
+    // `Some` exactly when `--realign-window` is set: the header used to name each
+    // segment window's contig. `None` leaves every code path untouched.
+    realign_window_header: Option<Arc<noodles::sam::Header>>,
 ) -> ProcessOrdered<
     BatchedRawPositionGroups,
     BatchedProcessedPositionGroups,
@@ -161,6 +164,9 @@ pub(crate) fn build_group_process_step(
     + Sync
     + 'static,
 > {
+    // Name the contigs once for the whole run, not once per batch.
+    let realign_contigs = realign_window_header
+        .map(|h| Arc::new(crate::realign::window_group::ContigNames::from_header(&h)));
     process_ordered::<BatchedRawPositionGroups, BatchedProcessedPositionGroups, _>(
         "GroupProcess",
         limit_bytes,
@@ -210,6 +216,7 @@ pub(crate) fn build_group_process_step(
                         filter_counts,
                         input_record_count,
                         distinct_mi_count: 0,
+                        windows: None,
                     });
                     continue;
                 }
@@ -265,6 +272,12 @@ pub(crate) fn build_group_process_step(
                     let b_idx = b.mi.to_vec_index();
                     a_idx.cmp(&b_idx).then_with(|| a.name().cmp(b.name()))
                 });
+
+                let windows = realign_contigs
+                    .as_ref()
+                    .map(|c| crate::realign::window_group::compute_segment_windows(&templates, c))
+                    .transpose()
+                    .map_err(io::Error::other)?;
 
                 let mut family_sizes: AHashMap<usize, u64> = AHashMap::with_capacity(50);
                 if !templates.is_empty() {
@@ -322,6 +335,7 @@ pub(crate) fn build_group_process_step(
                     filter_counts,
                     input_record_count,
                     distinct_mi_count,
+                    windows,
                 });
             }
 
@@ -386,6 +400,9 @@ fn assign_mi_offsets(
         for template in &mut processed.templates {
             template.mi = template.mi.with_offset(base);
         }
+        if let Some(windows) = &mut processed.windows {
+            windows.rebase(base);
+        }
     }
     Ok(())
 }
@@ -446,6 +463,7 @@ mod tests {
             filter_counts: TemplateFilterCounts::default(),
             input_record_count: 0,
             distinct_mi_count,
+            windows: None,
         }
     }
 

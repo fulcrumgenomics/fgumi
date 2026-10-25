@@ -139,6 +139,7 @@ Enable with: `cargo build --release --features <feature>`
 | `duplex` | Call duplex consensus reads | `fgbio CallDuplexConsensusReads` |
 | `codec` | Call CODEC consensus | `fgbio CallCodecConsensusReads` |
 | `filter` | Filter consensus reads | `fgbio FilterConsensusReads` |
+| `realign` | Re-align consensus reads, preferring each molecule's raw-read window | — |
 | `clip` | Clip overlapping read pairs | `fgbio ClipBam` |
 | `duplex-metrics` | Collect duplex metrics | `fgbio CollectDuplexSeqMetrics` |
 | `review` | Review consensus variants | `fgbio ReviewConsensusVariants` |

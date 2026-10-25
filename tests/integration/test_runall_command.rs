@@ -38,6 +38,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family_at_pos, write_bam,
 };
+use crate::helpers::cli::utf8_path as p;
 use crate::helpers::cutover::decompressed_records_without_pg;
 use crate::helpers::fastq::{FastqFlavor, write_bgzf_fastq_with_corrupt_last_crc};
 use crate::helpers::read_bam_output;
@@ -90,10 +91,6 @@ where
         stderr.contains(needle),
         "{context}: expected stderr to contain {needle:?}, got:\n{stderr}"
     );
-}
-
-fn p(path: &Path) -> &str {
-    path.to_str().expect("test path is valid UTF-8")
 }
 
 /// Record-stream equivalence: both BAMs are non-empty and their decoded
@@ -3578,7 +3575,7 @@ fn rejects_correct_to_sort_without_ref() {
             "--correct::min-distance",
             "1",
         ],
-        "a runall chain that includes align requires --ref",
+        "a runall chain that includes align or --realign requires --ref",
         "correct->sort without --ref",
     );
 }

@@ -71,6 +71,7 @@ pub mod fastq;
 pub mod filter;
 pub mod group;
 pub mod merge;
+pub mod realign;
 pub mod retag;
 pub mod review;
 pub mod runall;

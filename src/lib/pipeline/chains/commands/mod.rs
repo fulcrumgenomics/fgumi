@@ -20,6 +20,7 @@ pub mod filter;
 pub mod group;
 #[cfg(feature = "consensus")]
 pub(crate) mod output_sizer;
+pub(crate) mod realign;
 pub mod retag;
 #[cfg(feature = "consensus")]
 pub mod simplex;

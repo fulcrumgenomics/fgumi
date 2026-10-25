@@ -27,6 +27,11 @@ pub enum Stage {
     Clip,
     Filter,
     Dedup,
+    /// Re-align consensus reads (a second instance of the align backend) and
+    /// prefer, per end, the alignment inside the molecule's raw-read window
+    /// (`rw`). Not a template producer: it consumes the chain's own consensus
+    /// records, so it does not count against the one-`Align`-per-chain rule.
+    Realign,
     /// Rewrite SAM aux tags (copy/move/delete) — a pure per-record transform,
     /// standalone-only (like `Clip`/`Dedup`/`Downsample`).
     Retag,
@@ -65,7 +70,7 @@ mod tests {
     /// enum rather than a hand-picked subset. A new variant that is not added
     /// here is still forced through the exhaustive `match`es in the
     /// `expected_*` helpers, which fail to compile until it is classified.
-    const ALL_STAGES: [Stage; 17] = [
+    const ALL_STAGES: [Stage; 18] = [
         Stage::Extract,
         Stage::CopyUmi,
         Stage::Correct,
@@ -79,6 +84,7 @@ mod tests {
         Stage::Clip,
         Stage::Filter,
         Stage::Dedup,
+        Stage::Realign,
         Stage::Retag,
         Stage::Downsample,
         Stage::Fastq,
@@ -101,6 +107,7 @@ mod tests {
             | Stage::Clip
             | Stage::Filter
             | Stage::Dedup
+            | Stage::Realign
             | Stage::Retag
             | Stage::Downsample
             | Stage::Fastq
@@ -124,6 +131,7 @@ mod tests {
             | Stage::Clip
             | Stage::Filter
             | Stage::Dedup
+            | Stage::Realign
             | Stage::Retag
             | Stage::Downsample
             | Stage::Fastq

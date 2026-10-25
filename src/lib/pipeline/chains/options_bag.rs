@@ -20,6 +20,7 @@ pub use crate::commands::extract::ExtractOptions;
 pub use crate::commands::fastq::FastqOptions;
 pub use crate::commands::filter::FilterOptions;
 pub use crate::commands::group::GroupOptions;
+pub use crate::commands::realign::RealignOptions;
 pub use crate::commands::retag::RetagOptions;
 #[cfg(feature = "consensus")]
 pub use crate::commands::simplex::SimplexOptions;
@@ -116,6 +117,9 @@ pub struct StageOptionsBag {
     /// Align (`AlignAndMerge`) options. Carries [`AlignerOptions`] +
     /// reference path + optional aligner-binary override.
     pub aligner: Option<AlignOptions>,
+    /// Realign options: the consensus re-alignment's aligner (resolved like
+    /// `aligner`'s) plus bwa's `-h` (`--xa-max-hits`).
+    pub realign: Option<RealignOptions>,
     /// Extract options. Carries header-synthesis fields and behavior knobs
     /// for the FASTQ→unmapped-BAM extract stage (Phase 5 T5.3).
     pub extract: Option<ExtractOptions>,

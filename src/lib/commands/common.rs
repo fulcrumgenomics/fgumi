@@ -117,12 +117,21 @@ pub type MethylationRef = Option<(
 
 /// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
-/// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
+/// The FASTA is loaded through `references`, the chain's shared reference cache,
+/// so stages reading one FASTA hold one copy.
+///
+/// Returns `None` if methylation mode is disabled.
+///
+/// # Errors
+///
+/// Errors if enabled but `reference` is `None`, if the FASTA does not load, or if
+/// it lacks a contig of `header`.
 #[cfg(feature = "consensus")]
-pub fn load_methylation_reference(
+pub(crate) fn load_methylation_reference(
     methylation_mode: fgumi_consensus::MethylationMode,
-    reference: &Option<PathBuf>,
+    reference: Option<&PathBuf>,
     header: &Header,
+    references: &mut crate::reference::ReferenceCache,
 ) -> anyhow::Result<MethylationRef> {
     if !methylation_mode.is_enabled() {
         return Ok(None);
@@ -133,10 +142,9 @@ pub fn load_methylation_reference(
         fgumi_consensus::MethylationMode::Disabled => unreachable!(),
     };
     let ref_path = reference
-        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--ref is required when --methylation-mode is set"))?;
     let ref_timer = OperationTimer::new("Loading reference FASTA");
-    let reference = Arc::new(crate::reference::ReferenceReader::new(ref_path)?);
+    let reference = Arc::new(references.load(ref_path)?);
     ref_timer.log_completion(0);
 
     let ref_names: Vec<String> =

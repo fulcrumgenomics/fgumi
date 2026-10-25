@@ -91,6 +91,7 @@ use fgumi_raw_bam::hash::fgbio_read_name_rank;
 use fgumi_raw_bam::{
     self as bam_fields, RawRecord, RawRecordView, SamTag, UnmappedSamBuilder, flags,
 };
+use fgumi_sam::realign_window::RealignWindow;
 use noodles::sam::alignment::record::data::field::Tag;
 use std::cmp::{max, min};
 use std::collections::HashMap;
@@ -311,6 +312,60 @@ struct DuplexBaseTally {
     bases_emitted: u64,
     /// Duplex disagreements the molecule would contribute to `duplex_disagreement_base_count`.
     disagreement_bases: u64,
+}
+
+/// Unions the `rw` windows carried by `source_raws` into one tag value for the CODEC fragment.
+///
+/// The fragment is in R1's orientation, so R1 windows are used as-is and R2 windows have their
+/// strand flipped; the result's strand is R1's whenever any R1 window is present. Returns
+/// `Ok(None)` when no source read carries `rw`, or when the windows are on different contigs.
+///
+/// A cross-contig family (its windows span two contigs, which one window cannot describe) is
+/// logged at debug level and gets no `rw`, so realign counts its consensus read as without a
+/// window. It is not counted in the CODEC metrics: a new metrics column would change every
+/// CODEC metrics file, including runs without `--realign-window`.
+///
+/// # Errors
+///
+/// Returns an error naming the read if a source read carries an unparseable `rw`.
+fn union_realign_windows(source_raws: &[&[u8]]) -> Result<Option<Vec<u8>>> {
+    let mut r1: Option<Option<RealignWindow<'_>>> = None;
+    let mut r2: Option<Option<RealignWindow<'_>>> = None;
+    for raw in source_raws {
+        let Some((mut window, _)) = crate::source_window::parse_source_window(raw)? else {
+            continue;
+        };
+        let slot = if RawRecordView::new(raw).flags() & flags::FIRST_SEGMENT != 0 {
+            &mut r1
+        } else {
+            window.reverse = !window.reverse;
+            &mut r2
+        };
+        *slot = Some(match slot.take() {
+            None => Some(window),
+            Some(acc) => acc.and_then(|acc| acc.union(&window)),
+        });
+    }
+    let combined = match (r1, r2) {
+        (None, None) => return Ok(None),
+        (Some(w), None) | (None, Some(w)) => w,
+        (Some(a), Some(b)) => a.zip(b).and_then(|(a, b)| a.union(&b)),
+    };
+    if combined.is_none() {
+        log::debug!(
+            "CODEC family of read '{}': its rw windows are on different contigs, so the \
+             consensus read gets no rw",
+            source_raws
+                .first()
+                .map(|raw| String::from_utf8_lossy(fgumi_raw_bam::read_name(raw)))
+                .unwrap_or_default()
+        );
+    }
+    Ok(combined.map(|w| {
+        let mut value = Vec::new();
+        w.write(&mut value);
+        value
+    }))
 }
 
 /// Convert a per-base depth/error array to the `i16` `Array[Short]` form fgbio
@@ -1747,6 +1802,11 @@ impl CodecConsensusCaller {
                     break;
                 }
             }
+        }
+
+        // Realign-window tag: the union of the source reads' windows.
+        if let Some(value) = union_realign_windows(source_raws)? {
+            self.bam_builder.append_string_tag(SamTag::RW, &value);
         }
 
         // RX tag (UmiBases) - extract from ALL records in the MI group and build consensus.
@@ -7087,6 +7147,73 @@ mod tests {
             "TLEN must match between M and =/X CIGARs with identical reference consumption"
         );
         assert_eq!(match_r1_tlen, 100, "Expected TLEN=100 for start1=1, start2=71, ref_len=30");
+    }
+
+    /// Calls a CODEC family built from the dovetailed template, stamping the given `rw` on R1/R2.
+    fn codec_family_rw(
+        r1_rw: Option<&[u8]>,
+        r2_rw: Option<&[u8]>,
+    ) -> fgumi_raw_bam::ParsedBamRecord {
+        let mut records = dovetailed_start_template();
+        for rec in &mut records {
+            let rw = if rec.flags() & flags::FIRST_SEGMENT != 0 { r1_rw } else { r2_rw };
+            if let Some(rw) = rw {
+                fgumi_raw_bam::update_string_tag(rec.as_mut_vec(), SamTag::RW, rw);
+            }
+        }
+        let (_, output) = call_codec_family(records);
+        assert_eq!(output.count, 1);
+        fgumi_raw_bam::ParsedBamRecord::parse_all(&output.data).remove(0)
+    }
+
+    #[rstest]
+    #[case::union_same_contig(
+        Some(b"chr1:201-326:+".as_slice()),
+        Some(b"chr1:200-330:-".as_slice()),
+        Some(b"chr1:200-330:+".as_slice())
+    )]
+    #[case::only_r1(Some(b"chr1:201-326:+".as_slice()), None, Some(b"chr1:201-326:+".as_slice()))]
+    #[case::only_r2(None, Some(b"chr1:200-330:-".as_slice()), Some(b"chr1:200-330:+".as_slice()))]
+    #[case::r1_reverse(
+        Some(b"chr1:201-326:-".as_slice()),
+        Some(b"chr1:200-330:+".as_slice()),
+        Some(b"chr1:200-330:-".as_slice())
+    )]
+    fn codec_unions_windows(
+        #[case] r1_rw: Option<&[u8]>,
+        #[case] r2_rw: Option<&[u8]>,
+        #[case] expected: Option<&[u8]>,
+    ) {
+        let rec = codec_family_rw(r1_rw, r2_rw);
+        assert_eq!(rec.get_string_tag(SamTag::RW).as_deref(), expected);
+    }
+
+    #[test]
+    fn codec_cross_contig_omits_tag() {
+        let rec = codec_family_rw(Some(b"chr1:201-326:+"), Some(b"chr2:200-330:-"));
+        assert_eq!(rec.get_string_tag(SamTag::RW), None);
+    }
+
+    #[test]
+    fn codec_unparseable_rw_errors() {
+        let mut records = dovetailed_start_template();
+        fgumi_raw_bam::update_string_tag(records[0].as_mut_vec(), SamTag::RW, b"garbage");
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            min_duplex_length: 1,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+        let Err(err) = caller.consensus_reads_from_sam_records(records) else {
+            panic!("malformed rw must error");
+        };
+        assert!(format!("{err:#}").contains("invalid rw tag on read 't0'"), "{err:#}");
+    }
+
+    #[test]
+    fn codec_no_rw_in_no_rw_out() {
+        let rec = codec_family_rw(None, None);
+        assert_eq!(rec.get_string_tag(SamTag::RW), None);
     }
 }
 
