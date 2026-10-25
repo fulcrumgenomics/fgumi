@@ -1312,6 +1312,30 @@ mod chain {
         }
     }
 
+    /// Upper bounds on the two proper-pair guard counts, from the output.
+    /// `ends` maps each mapped consensus primary with a window, keyed by its
+    /// template and segment (1 or 2), to whether it is flagged proper and
+    /// whether it lies in its window. A guarded end keeps bwa's placement, flag
+    /// included, outside its window, so it is one of these ends: kept "with an
+    /// in-window mate" only if its mate is in its window, and "whose mate cannot
+    /// move" only if it is not. Returns the two counts in that order.
+    fn guard_bounds<K: Eq + std::hash::Hash + Clone>(
+        ends: &HashMap<(K, u8), (bool, bool)>,
+    ) -> (u64, u64) {
+        let (mut mate_in, mut mate_out) = (0, 0);
+        for ((template, seg), &(proper, inside)) in ends {
+            if !proper || inside {
+                continue;
+            }
+            if ends.get(&(template.clone(), 3 - seg)).is_some_and(|&(_, mate_inside)| mate_inside) {
+                mate_in += 1;
+            } else {
+                mate_out += 1;
+            }
+        }
+        (mate_in, mate_out)
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum Backend {
         Subprocess,
@@ -1636,6 +1660,7 @@ mod chain {
         let header = reader.read_header().expect("header");
         let (mut primaries, mut in_window, mut outside, mut unmapped) = (0u64, 0u64, 0u64, 0u64);
         let mut no_window = 0u64;
+        let mut placed: HashMap<(String, u8), (bool, bool)> = HashMap::new();
         for record in reader.records() {
             let record = record.expect("record");
             assert!(string_tag(&record, SamTag::RW).is_none(), "rw must be stripped");
@@ -1671,15 +1696,24 @@ mod chain {
                 && f.is_reverse_complemented() == window.reverse
                 && start <= window.end
                 && end >= window.start;
+            placed.insert(key, (f.is_properly_segmented(), inside));
             if inside { in_window += 1 } else { outside += 1 }
         }
         assert_eq!(primaries, windows.len() as u64, "one primary per consensus read");
         assert_eq!(realign_count(&stderr, "Consensus reads realigned:"), primaries);
         assert_eq!(realign_count(&stderr, "Unmapped:"), unmapped);
-        let kept_proper_pair = realign_count(
+        let guarded_mate_in = realign_count(
             &stderr,
             "Primary kept outside window (proper pair with an in-window mate):",
         );
+        let guarded_mate_out = realign_count(
+            &stderr,
+            "Primary kept outside window (proper pair whose mate cannot move into its window):",
+        );
+        let (max_mate_in, max_mate_out) = guard_bounds(&placed);
+        assert!(guarded_mate_in <= max_mate_in, "{guarded_mate_in} > {max_mate_in}");
+        assert!(guarded_mate_out <= max_mate_out, "{guarded_mate_out} > {max_mate_out}");
+        let kept_proper_pair = guarded_mate_in + guarded_mate_out;
         assert_eq!(
             realign_count(
                 &stderr,
@@ -2128,6 +2162,7 @@ mod chain {
         let header = reader.read_header().expect("header");
         let (mut primaries, mut in_window, mut outside, mut unmapped) = (0u64, 0u64, 0u64, 0u64);
         let mut last_pos: Option<(usize, usize)> = None;
+        let mut placed: HashMap<(String, u8), (bool, bool)> = HashMap::new();
         for record in reader.records() {
             let record = record.expect("record");
             assert!(string_tag(&record, SamTag::RW).is_none(), "rw must be stripped");
@@ -2161,6 +2196,8 @@ mod chain {
                 && f.is_reverse_complemented() == window.reverse
                 && start <= window.end
                 && end >= window.start;
+            let seg = if f.is_first_segment() { 1 } else { 2 };
+            placed.insert((mi, seg), (f.is_properly_segmented(), inside));
             if inside { in_window += 1 } else { outside += 1 }
         }
         assert!(primaries > 0, "no consensus reads");
@@ -2175,10 +2212,18 @@ mod chain {
             in_window,
             "in-window primaries are kept or swapped"
         );
-        let kept_proper_pair = realign_count(
+        let guarded_mate_in = realign_count(
             &stderr,
             "Primary kept outside window (proper pair with an in-window mate):",
         );
+        let guarded_mate_out = realign_count(
+            &stderr,
+            "Primary kept outside window (proper pair whose mate cannot move into its window):",
+        );
+        let (max_mate_in, max_mate_out) = guard_bounds(&placed);
+        assert!(guarded_mate_in <= max_mate_in, "{guarded_mate_in} > {max_mate_in}");
+        assert!(guarded_mate_out <= max_mate_out, "{guarded_mate_out} > {max_mate_out}");
+        let kept_proper_pair = guarded_mate_in + guarded_mate_out;
         assert_eq!(
             realign_count(
                 &stderr,
@@ -2567,6 +2612,7 @@ mod chain {
             "Primary swapped to an in-window XA hit:",
             "Primary swapped to an in-window supplementary piece:",
             "Primary kept outside window (proper pair with an in-window mate):",
+            "Primary kept outside window (proper pair whose mate cannot move into its window):",
             "Primary outside window (no in-window XA hit or supplementary piece):",
             "Unmapped:",
             "Without a window:",

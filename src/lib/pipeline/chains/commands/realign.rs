@@ -355,6 +355,10 @@ impl FinalizeHook for RealignFinalizeHook {
             totals.kept_proper_pair
         );
         info!(
+            "Primary kept outside window (proper pair whose mate cannot move into its window): {}",
+            totals.kept_proper_pair_mate_stays
+        );
+        info!(
             "Primary outside window (no in-window XA hit or supplementary piece): {}",
             totals.outside_window
         );

@@ -6,9 +6,10 @@
 //! consensus reads are re-aligned, [`select`] prefers, per end, the alignment
 //! that falls inside that window: bwa's primary if it does, else the first `XA`
 //! alternative that does, else an in-window split (`SA`) piece of the same read,
-//! which swaps roles with the primary. Neither swap is made for an end of a
-//! pair bwa flagged proper whose mate's primary lies in the mate's own window
-//! (the proper-pair guard).
+//! which swaps roles with the primary. The two ends of a pair bwa flagged
+//! proper move together or not at all: neither swap is made for one end unless
+//! its mate is also outside its own window with an in-window `XA` hit or split
+//! piece of its own (the proper-pair guard).
 
 pub(crate) mod select;
 pub(crate) mod window_group;

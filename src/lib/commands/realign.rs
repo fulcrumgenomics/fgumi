@@ -174,14 +174,19 @@ read are reversed (and its per-base bases reverse-complemented) here, so do not 
   pieces stay.
 - else bwa's primary is kept and counted as outside the window.
 
-The proper-pair guard: neither swap is made when bwa flagged the pair proper and the
-mate's primary lies in the mate's own window. The mate then agrees with bwa's
-placement, so this end's window is the suspect (for example, raw reads placed on a
-poly-G artefact that the consensus read no longer prefers); the end keeps bwa's
-primary and is counted separately ("Primary kept outside window (proper pair with an
-in-window mate)" in the summary). Both
-ends are judged as bwa left them, before either is swapped. Fragments, and pairs whose
-mate is unmapped, outside its window or without one, are not guarded.
+The proper-pair guard: when bwa flagged the pair proper, its two ends move together
+or not at all. Neither swap is made for an end unless the mate is also outside its
+own window with an in-window `XA` hit or split piece of its own. When the mate's
+primary lies in the mate's own window, the mate agrees with bwa's placement, so this
+end's window is the suspect (for example, raw reads placed on a poly-G artefact that
+the consensus read no longer prefers); the end is counted as "Primary kept outside
+window (proper pair with an in-window mate)" in the summary. When the mate cannot
+move into its window (it is outside it with no candidate, or has no window), moving
+this end alone would split the pair bwa placed together; the end is counted as
+"Primary kept outside window (proper pair whose mate cannot move into its window)".
+Either way the end keeps bwa's primary. Both ends are judged as bwa left them,
+before either is swapped. Fragments, lone mates and improper pairs are not guarded,
+so one end of an improper pair can move alone.
 
 After a swap the mate fields are recomputed (secondary and supplementary records
 included, with their `tc` tags). The proper-pair flag is never set by a swap: it is
