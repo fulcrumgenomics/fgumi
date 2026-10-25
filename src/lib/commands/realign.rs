@@ -159,11 +159,11 @@ read are reversed (and its per-base bases reverse-complemented) here, so do not 
 
 - bwa's primary overlaps the window (same contig and strand): kept as is.
 - else the first `XA` hit that does is promoted: it becomes the primary with MAPQ 0,
-  NM from the `XA` hit, MD regenerated from the reference, AS from the hit (below),
-  the old primary moved into `XA`, `XS` set to the old primary's score, and `SA` and
-  that end's split records dropped: its supplementary records, and the secondary
-  records carrying `SA` that an aligner run with `-M` (as `--meth` is) writes for
-  the pieces of a split. Secondary records without `SA` (`-a`) are kept.
+  NM from the `XA` hit, MD regenerated from the reference (in uppercase), AS from the
+  hit (below), the old primary moved into `XA`, `XS` set to the old primary's score,
+  and `SA` and that end's split records dropped: its supplementary records, and the
+  secondary records carrying `SA` that an aligner run with `-M` (as `--meth` is)
+  writes for the pieces of a split. Secondary records without `SA` (`-a`) are kept.
 - else, if a split piece of the read (a supplementary record, or under `-M` a
   secondary one carrying `SA`) overlaps the window, it swaps roles with the primary;
   of several, the one with the longest reference span, then the first. The piece

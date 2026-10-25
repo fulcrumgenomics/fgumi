@@ -486,6 +486,16 @@ fn promote(
     regenerate_alignment_tags_raw(record, header, reference).with_context(|| {
         format!("regenerating MD of the promoted alignment of {}", read_name(record))
     })?;
+    // The shared regeneration keeps the FASTA's case (fgbio's MD, for filter and
+    // clip), so a hit in soft-masked (lowercase) reference would get lowercase
+    // bases. bwa writes MD from its 2-bit reference, in uppercase, as SAM requires.
+    if let Some(md) =
+        fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::MD)
+        && md.iter().any(u8::is_ascii_lowercase)
+    {
+        let upper = md.to_ascii_uppercase();
+        fgumi_raw_bam::update_string_tag(record, SamTag::MD, &upper);
+    }
     let indel: i64 =
         ops.iter().filter(|&&op| matches!(op & 0xF, 1 | 2)).map(|&op| i64::from(op >> 4)).sum();
     let mismatches = u32::try_from((i64::from(hit.nm) - indel).max(0)).unwrap_or(u32::MAX);
@@ -2283,6 +2293,38 @@ mod tests {
             -fgumi_raw_bam::template_length(&merged.records[r2_i]),
             "TLEN symmetry"
         );
+    }
+
+    /// A promoted hit in soft-masked (lowercase) reference gets an uppercase MD,
+    /// as bwa writes it, and NM still counts only the one real mismatch.
+    #[test]
+    fn promoted_md_is_uppercase_on_soft_masked_reference() {
+        let soft_masked = CHR1.to_ascii_lowercase();
+        let fasta =
+            create_test_fasta(&[("chr1", soft_masked.as_str()), ("chr2", CHR2)]).expect("fasta");
+        let reference = ReferenceReader::new(fasta.path()).expect("reference");
+        let header = fx().header;
+        let r1 = end(
+            Some((1, 51, false, "20M")),
+            2,
+            12,
+            Some("chr2,+181,20M,4;chr1,+101,20M,1;"),
+            Some(RW1),
+        )
+        .with_mismatch(5);
+        let r2 = end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2));
+        let mut merged = build_template(&r1, Some(&r2), false);
+        let got = select_primary(&mut merged, &reference, &header, &BwaScoring::default())
+            .expect("select_primary")
+            .ends;
+        assert_eq!(got, [Selection::Swapped, Selection::Kept]);
+        let promoted = merged.r1().expect("r1");
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux(promoted), SamTag::MD),
+            Some(&b"5T14"[..]),
+            "MD"
+        );
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux(promoted), SamTag::NM), Some(1), "NM");
     }
 
     /// An in-window `XA` hit wins over an in-window split piece: the hit is
