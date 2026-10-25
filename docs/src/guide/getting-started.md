@@ -160,6 +160,11 @@ fgumi codec \
 
 See [Consensus Calling](consensus-calling.md) and [Duplex Consensus Calling](duplex-consensus-calling.md) for details.
 
+Consensus reads are unaligned. To align them, add `--realign-window` to `fgumi group` in step 4
+and run `fgumi realign` on the consensus BAM; it prefers the alignment inside the region each
+molecule's raw reads aligned to. See
+[Best Practices](best-practices.md#step-2a2-re-alignment).
+
 ### 6. (Optional) Collect QC Metrics
 
 Collect QC metrics before filtering to understand your library.

@@ -46,6 +46,7 @@ Definitions of the terms and tags used throughout this guide.
 | `QX` | `extract` | UMI base qualities (optional). |
 | `OX` | `correct` | Original UMI, before correction. |
 | `MI` | `group` | Molecule ID assigning each read to a UMI family; carries `/A`·`/B` suffixes under the `paired` strategy. |
+| `rw` | `group --realign-window` | The molecule's raw-read window for one segment (R1/R2), `<contig>:<start>-<end>:<strand>` (1-based, inclusive, unclipped). Consensus callers copy it onto the consensus reads and `filter` keeps it; `realign` uses it to prefer the alignment inside the window and removes it. See [Best Practices](best-practices.md#step-2a2-re-alignment). |
 | `CB` | upstream | Cell barcode for single-cell data; reads are partitioned by `CB` before grouping, sorting, and deduplication. Not corrected by fgumi. |
 | `tc` | `zipper` | Template-coordinate sort key added to secondary/supplementary reads so they sort and deduplicate correctly. (Releases before 0.2.0 wrote this under the name `pa`, since renamed to avoid a clash with bwa-mem's `pa:f` score tag.) |
 

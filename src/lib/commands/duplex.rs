@@ -53,7 +53,8 @@ error when the read is in a group that passes the --min-reads and strand-orienta
 
 The consensus reads produced are unaligned, due to the difficulty and error-prone nature of inferring the consensus
 alignment. Consensus reads should therefore be aligned after, which should not be too expensive as likely there
-are far fewer consensus reads than input raw reads.
+are far fewer consensus reads than input raw reads. `fgumi realign` aligns them, preferring the region each
+molecule's raw reads aligned to, when the input was grouped with `fgumi group --realign-window`.
 
 Consensus reads have a number of additional optional tags set in the resulting BAM file. The tag names follow
 a pattern where the first letter (a, b or c) denotes that the tag applies to the first single strand consensus (a),

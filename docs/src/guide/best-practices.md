@@ -162,7 +162,7 @@ D-->E["fgumi group"];
 
 ```mermaid
 graph TD;
-A["fgumi simplex/duplex"]-->B["fgumi fastq | bwa mem | fgumi zipper"];
+A["fgumi simplex/duplex"]-->B["fgumi realign (or fgumi fastq | bwa mem | fgumi zipper)"];
 B-->C["fgumi filter | fgumi sort"];
 ```
 
@@ -170,7 +170,8 @@ B-->C["fgumi filter | fgumi sort"];
 
 ```mermaid
 graph TD;
-A["fgumi simplex/duplex"]-->B["fgumi fastq | bwa mem | fgumi zipper | fgumi filter | fgumi sort"];
+A["fgumi group | fgumi simplex/duplex"]-->B["fgumi fastq | bwa mem | fgumi zipper | fgumi filter | fgumi sort"];
+C["fgumi runall --realign (group, consensus, filter, realign, sort)"];
 ```
 
 ---
@@ -540,11 +541,11 @@ There filter runs before alignment, on the unaligned consensus reads. With separ
 fgumi fastq --input consensus.bam \
   | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
   | fgumi zipper --unmapped consensus.bam --reference ref.fa \
-  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 --output - \
+  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 --reverse-per-base-tags --output - \
   | fgumi sort --input /dev/stdin --output filtered.bam --order coordinate --threads 4
 ```
 
-Note: The two stages cannot be combined into a single pipeline because `fgumi zipper --unmapped` needs random access to the consensus BAM. For most use cases, the R&D pipeline with intermediate files provides better debuggability and flexibility.
+Note: These two stages cannot be joined into one shell pipe because `fgumi zipper --unmapped` needs random access to the consensus BAM; `fgumi runall --realign` (above) runs them as one command instead. For most use cases, the R&D pipeline with intermediate files provides better debuggability and flexibility.
 
 ---
 

@@ -79,3 +79,25 @@ Paired strategy cannot be used with --min-umi-length
 **Cause.** The `paired` strategy (for duplex data) is incompatible with `--min-umi-length` and `--no-umi`.
 
 **Fix.** Drop the conflicting flag. Use `paired` only for duplex workflows; use `adjacency` for simplex and CODEC.
+
+## `fgumi realign` rejects the input: no `rw` tag
+
+```text
+realign: none of the first 1000 consensus templates carries an rw tag (the molecule's raw-read window), starting with consensus read '<name>'. realign needs consensus reads called from a BAM grouped with `fgumi group --realign-window` (or `fgumi runall --realign`); an input grouped without it (or by another tool) has no windows to choose alignments with.
+```
+
+**Cause.** `fgumi realign` judges each consensus read's alignment against the `rw` window that `fgumi group --realign-window` records and the consensus callers copy onto the consensus reads. The input was grouped without that flag, by an older fgumi, or by fgbio. A few consensus reads without `rw` are expected (an end whose raw reads never mapped has no window) and are aligned as usual; the error means none of the first 1000 templates (or of a shorter input) has one. `fgumi runall --realign` with `--start-from consensus` or `--start-from filter` fails the same way. The check runs before any read is aligned, so nothing is written.
+
+**Fix.** Re-run `fgumi group` with `--realign-window`, then the consensus caller (and filter). To align consensus reads that were grouped without it, use the `fgumi fastq | bwa-mem3 | fgumi zipper` pipe instead ([Best Practices](best-practices.md#step-2a2-re-alignment)). An error naming a read with an `invalid rw tag` means its `rw` value was damaged or written by another tool.
+
+## Per-base tags misaligned after `fgumi realign`
+
+**Cause.** `fgumi realign` reverses the per-base consensus tags of reverse-strand reads itself (as `fgumi zipper --tags-to-reverse Consensus --tags-to-revcomp Consensus` would). Passing `--reverse-per-base-tags` to a later `fgumi filter` reverses them a second time, so per-base masking (and, for methylation, `cu`/`ct`) reads the wrong positions on every reverse-strand read, and the tags written out stay reversed.
+
+**Fix.** Drop `--reverse-per-base-tags` from `fgumi filter` when its input came from `fgumi realign` or `fgumi runall --realign`. With methylation filters, filter's end-of-run report of reverse-mapped reads checked without it is expected on that route.
+
+## `rw` tags in the final BAM
+
+**Cause.** The consensus reads were grouped with `--realign-window` but aligned with something other than `fgumi realign`. The consensus callers copy `rw` and `fgumi filter` keeps it; only `fgumi realign` removes it.
+
+**Fix.** Re-align with `fgumi realign`, or drop `--realign-window` from `fgumi group` when the consensus reads will be aligned another way. The tag is harmless to downstream tools.

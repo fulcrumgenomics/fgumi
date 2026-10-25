@@ -100,7 +100,8 @@ rule extract_umis:
 
 
 rule align_reads:
-    """Align reads with bwa mem and restore tags with zipper."""
+    """Align reads with `bwa mem`, restore tags with `fgumi zipper`, and sort
+    them into template-coordinate order for `fgumi group`."""
     input:
         unmapped = f"{SAMPLE}.unmapped.bam",
         ref = REFERENCE
@@ -116,7 +117,11 @@ rule align_reads:
             | fgumi zipper \
                 --unmapped {input.unmapped} \
                 --reference {input.ref} \
+                --threads 4 \
+            | fgumi sort \
+                --input /dev/stdin \
                 --output {output.bam} \
+                --order template-coordinate \
                 --threads 4 \
                 --compression-level 1
         """
@@ -144,6 +149,7 @@ rule group_reads:
             --edits 1 \
             --family-size-histogram {output.histogram} \
             --grouping-metrics {output.metrics} \
+            --realign-window \
             --threads {threads} \
             --compression-level 1
         """
@@ -190,7 +196,11 @@ rule call_consensus:
 
 
 rule align_consensus:
-    """Re-align consensus reads."""
+    """Re-align consensus reads with `fgumi realign`, preferring each molecule's
+    raw-read window (the `rw` tag written by `fgumi group --realign-window`).
+    `fgumi realign` reverses the per-base consensus tags itself, so
+    `fgumi filter` does not. `{{ref}}` is a literal `{ref}`, the placeholder
+    `fgumi realign` fills in."""
     input:
         unmapped = f"{SAMPLE}.consensus.unmapped.bam",
         ref = REFERENCE
@@ -201,19 +211,18 @@ rule align_consensus:
         mem_mb = 8000
     shell:
         """
-        fgumi fastq --input {input.unmapped} --threads 2 \
-            | bwa mem -t {threads} -p -K 150000000 -Y {input.ref} - \
-            | fgumi zipper \
-                --unmapped {input.unmapped} \
-                --reference {input.ref} \
-                --output {output.bam} \
-                --threads 2 \
-                --compression-level 1
+        fgumi realign \
+            --input {input.unmapped} \
+            --output {output.bam} \
+            --ref {input.ref} \
+            --aligner::command "bwa mem -t {threads} -p -K 150000000 -Y {{ref}} /dev/stdin" \
+            --threads {threads} \
+            --compression-level 1
         """
 
 
 rule filter_consensus:
-    """Filter consensus reads and sort to coordinate order."""
+    """Filter consensus reads (`index_bam` sorts them to coordinate order)."""
     input:
         bam = f"{SAMPLE}.consensus.aligned.bam",
         ref = REFERENCE
@@ -244,8 +253,6 @@ rule filter_consensus:
                 --max-base-error-rate {params.max_base_error} \
                 --min-base-quality {params.min_base_qual} \
                 --max-no-call-fraction {params.max_no_call} \
-                --reverse-per-base-tags \
-                --sort-order coordinate \
                 --threads {threads} \
                 --compression-level 6 \
                 {extra_args}

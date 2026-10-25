@@ -123,7 +123,9 @@ Consequently each input read pair yields at most one consensus fragment, and the
 comes from comparing R1 against R2 rather than from grouping reads across the file. Prior to running
 this tool, reads must have been grouped with `group`.
 
-The consensus reads produced are unaligned fragments, so they should be aligned afterwards.
+The consensus reads produced are unaligned fragments, so they should be aligned afterwards. `fgumi realign`
+aligns them, preferring the region each molecule's raw reads aligned to, when the input was grouped with
+`fgumi group --realign-window`.
 
 Quality masking
 ---------------
