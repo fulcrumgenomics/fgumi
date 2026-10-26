@@ -45,11 +45,11 @@ umiData        = read.table(args[3], sep="\t", header=T)
 outputFile     = args[4]
 sampleInfo     = paste(args[5:length(args)], collapse=" ")
 
-# Leave out the creation and modification dates (R >= 4.5.0) so reruns write identical bytes
+# Leave out the dates and R version (R >= 4.5.0) so reruns write identical bytes
 if ("timestamp" %in% names(formals(grDevices::pdf))) {
-  pdf(outputFile, width=11, height=8.5, timestamp=FALSE)
+  grDevices::pdf(outputFile, width=11, height=8.5, timestamp=FALSE, producer=FALSE)
 } else {
-  pdf(outputFile, width=11, height=8.5)
+  grDevices::pdf(outputFile, width=11, height=8.5)
 }
 
 # Plot #1 - Family Size Distributions (CS and SS)
