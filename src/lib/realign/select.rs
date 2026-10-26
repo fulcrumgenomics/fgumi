@@ -37,6 +37,11 @@ pub struct RealignCounts {
     /// were not swapped because bwa had flagged the pair proper and the mate's
     /// primary is inside the mate's own window.
     pub kept_proper_pair: u64,
+    /// Ends outside their window with an in-window `XA` hit or split piece that
+    /// were not swapped because bwa had flagged the pair proper and the mate
+    /// cannot move into its own window (it is outside it with no candidate, or
+    /// has no window).
+    pub kept_proper_pair_mate_stays: u64,
     /// Mapped ends with neither the primary, an `XA` hit nor a split piece inside
     /// the window.
     pub outside_window: u64,
@@ -60,6 +65,7 @@ impl RealignCounts {
             swapped,
             swapped_supplementary,
             kept_proper_pair,
+            kept_proper_pair_mate_stays,
             outside_window,
             unmapped,
             no_window,
@@ -71,6 +77,7 @@ impl RealignCounts {
         self.swapped += swapped;
         self.swapped_supplementary += swapped_supplementary;
         self.kept_proper_pair += kept_proper_pair;
+        self.kept_proper_pair_mate_stays += kept_proper_pair_mate_stays;
         self.outside_window += outside_window;
         self.unmapped += unmapped;
         self.no_window += no_window;
@@ -89,6 +96,7 @@ impl RealignCounts {
                 Selection::Swapped => &mut self.swapped,
                 Selection::SwappedSupplementary => &mut self.swapped_supplementary,
                 Selection::KeptProperPair => &mut self.kept_proper_pair,
+                Selection::KeptProperPairMateStays => &mut self.kept_proper_pair_mate_stays,
                 Selection::OutsideWindow => &mut self.outside_window,
                 Selection::Unmapped => &mut self.unmapped,
                 Selection::NoWindow => &mut self.no_window,
@@ -125,6 +133,12 @@ pub(crate) enum Selection {
     /// inside the mate's own window, so the primary is kept (the proper-pair
     /// guard).
     KeptProperPair,
+    /// The primary is outside the window and an `XA` hit or split piece is
+    /// inside it, but bwa had flagged the pair proper and the mate cannot move
+    /// into its own window (it is outside it with no candidate, or has no
+    /// window), so the primary is kept: moving one end alone would split the
+    /// pair bwa placed together.
+    KeptProperPairMateStays,
     /// Neither the primary, an `XA` hit nor a split piece overlaps the window;
     /// the primary is kept.
     OutsideWindow,
@@ -158,16 +172,26 @@ pub(crate) enum Selection {
 ///    reference span is taken, then the first.
 /// 4. else the primary is kept ([`Selection::OutsideWindow`]).
 ///
-/// The proper-pair guard: steps 2 and 3 are skipped, and the primary kept
-/// ([`Selection::KeptProperPair`]), when bwa flagged the pair proper (`0x2` on
-/// both primaries) and the mate's primary overlaps the mate's own window. The
-/// mate then agrees with bwa's placement of this end, so this end's window is
-/// the suspect: for example, the raw reads were placed on a poly-G artefact
-/// that the consensus read, with a cleaner tail, no longer prefers. The guard is
-/// decided from both ends' state before either is changed, so it does not
-/// depend on which end is processed first; the mate's window is read only for
-/// an end that has a candidate to swap in. Fragments, and pairs whose mate is
-/// unmapped, outside its window or without one, are never guarded.
+/// The proper-pair guard: when bwa flagged the pair proper (`0x2` on both
+/// primaries), the two ends move together or not at all. Steps 2 and 3 are
+/// skipped for an end, and its primary kept, unless the mate is also outside its
+/// own window with a candidate of its own:
+///
+/// - the mate's primary overlaps the mate's own window
+///   ([`Selection::KeptProperPair`]). The mate then agrees with bwa's placement
+///   of this end, so this end's window is the suspect: for example, the raw
+///   reads were placed on a poly-G artefact that the consensus read, with a
+///   cleaner tail, no longer prefers.
+/// - the mate cannot move into its own window: it is outside it with no
+///   in-window `XA` hit or split piece, or it has no window
+///   ([`Selection::KeptProperPairMateStays`]). Moving this end alone would split
+///   the pair bwa placed together, and bwa's pairing of the two ends is
+///   evidence one end's window alone does not outweigh.
+///
+/// Both ends are classified before either is changed, so the guard does not
+/// depend on which end is processed first. Fragments, lone mates and
+/// improper pairs are never guarded, so one end of an improper pair can move
+/// alone.
 ///
 /// An `XA` promotion:
 ///
@@ -240,24 +264,35 @@ pub(crate) fn select_primary(
     let mut outcome =
         SelectOutcome { ends: [Selection::Absent; 2], malformed_xa: 0, skipped_xa_hits: 0 };
     let before = PairState::of(merged);
-    // The guard needs both ends as bwa left them. R1's looks at R2's window,
-    // which is unchanged until R2 is selected. R2's looks at R1's, which may
-    // have changed by then; but R1 was in its window, before any change,
-    // exactly when R1 was kept.
-    let proper = PairState::both_proper(merged);
-    if let Some((idx, _)) = merged.r1 {
-        let guard = match merged.r2 {
-            Some((mate, _)) if proper => Guard::MateInWindow(mate),
-            _ => Guard::Off,
-        };
-        outcome.ends[0] =
-            select_end(merged, idx, true, guard, reference, header, scoring, &mut outcome)?;
+    // Both ends are classified as bwa left them, before either is changed, so
+    // the proper-pair guard of each end can read its mate's state. Swapping one
+    // end touches only that end's records, so the other end's candidate stays
+    // valid.
+    let mut states: [Option<(usize, EndState)>; 2] = [None, None];
+    for (slot, first, end) in [(0, true, merged.r1), (1, false, merged.r2)] {
+        if let Some((idx, _)) = end {
+            states[slot] = Some((idx, classify_end(merged, idx, first, header, &mut outcome)?));
+        }
     }
-    if let Some((idx, _)) = merged.r2 {
-        let guard =
-            if proper && outcome.ends[0] == Selection::Kept { Guard::On } else { Guard::Off };
-        outcome.ends[1] =
-            select_end(merged, idx, false, guard, reference, header, scoring, &mut outcome)?;
+    let guards = if PairState::both_proper(merged) {
+        [guard(states[1].as_ref()), guard(states[0].as_ref())]
+    } else {
+        [None, None]
+    };
+    for (slot, first) in [(0, true), (1, false)] {
+        let Some((idx, state)) = states[slot].take() else { continue };
+        outcome.ends[slot] = match (state, guards[slot]) {
+            (EndState::Settled(selection), _) => selection,
+            (EndState::Movable(_), Some(kept)) => kept,
+            (EndState::Movable(Candidate::XaHit(hits, i, ops)), None) => {
+                promote(&mut merged.records[idx], &hits, i, &ops, reference, header, scoring)?;
+                Selection::Swapped
+            }
+            (EndState::Movable(Candidate::SplitPiece(piece)), None) => {
+                swap_with_split_piece(merged, idx, first, piece, reference, header)?;
+                Selection::SwappedSupplementary
+            }
+        };
     }
     let out = outcome.ends;
 
@@ -286,101 +321,60 @@ pub(crate) fn select_primary(
     Ok(outcome)
 }
 
-/// The proper-pair guard of one end (see [`select_primary`]), resolved only
-/// when the end has a candidate to swap in.
-#[derive(Debug, Clone, Copy)]
-enum Guard {
-    /// Not guarded: a fragment or lone mate, or bwa did not flag the pair proper.
-    Off,
-    /// Guarded: the pair is proper and the mate's primary was in its window.
-    On,
-    /// The pair is proper: guarded if the mate's primary, the unchanged record
-    /// at this index, overlaps its window.
-    MateInWindow(usize),
+/// One end's state as bwa left it, before any end is changed.
+enum EndState {
+    /// The end's primary stays whatever the guard says: [`Selection::NoWindow`],
+    /// [`Selection::Unmapped`], [`Selection::Kept`] (in its window) or
+    /// [`Selection::OutsideWindow`] (no candidate).
+    Settled(Selection),
+    /// The end is outside its window with a candidate to swap in.
+    Movable(Candidate),
 }
 
-impl Guard {
-    /// Whether the end is guarded, reading the mate's window if needed.
-    fn holds(self, merged: &Template, header: &Header) -> Result<bool> {
-        match self {
-            Self::Off => Ok(false),
-            Self::On => Ok(true),
-            Self::MateInWindow(mate) => primary_in_window(&merged.records[mate], header),
-        }
+/// The proper-pair guard of an end whose mate is in `mate` (see
+/// [`select_primary`]): the selection to report if the end is kept, or `None` if
+/// it may move, which it may only together with its mate.
+fn guard(mate: Option<&(usize, EndState)>) -> Option<Selection> {
+    match mate.map(|(_, state)| state) {
+        Some(EndState::Movable(_)) => None,
+        Some(EndState::Settled(Selection::Kept)) => Some(Selection::KeptProperPair),
+        _ => Some(Selection::KeptProperPairMateStays),
     }
 }
 
-/// Whether the mapped `record` overlaps its `rw` window; `false` when it is
-/// unmapped or has no window.
-fn primary_in_window(record: &RawRecord, header: &Header) -> Result<bool> {
-    let Some(rw) =
-        fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::RW)
-    else {
-        return Ok(false);
-    };
-    if record.flags() & flags::UNMAPPED != 0 {
-        return Ok(false);
-    }
-    let window = RealignWindow::parse(rw).with_context(|| invalid_tag(record, "rw"))?;
-    let (contig, start, end, reverse) = placement(record, header)?;
-    Ok(window.overlaps(contig, start, end, reverse))
-}
-
-/// Selects the primary of one end (`first`: R1 or a fragment's read), whose
-/// primary record is `merged.records[idx]`: keeps it, promotes an in-window `XA`
-/// hit, or swaps it with an in-window split piece. When `guard` holds (the
-/// proper-pair guard of [`select_primary`]) an end that would be swapped is
-/// kept instead. A malformed `XA` tag or hit CIGAR is counted in `outcome`, not
-/// an error.
-#[allow(clippy::too_many_arguments)]
-fn select_end(
-    merged: &mut Template,
+/// Classifies one end (`first`: R1 or a fragment's read), whose primary record is
+/// `merged.records[idx]`, without changing it: settled (no window, unmapped, in
+/// its window, or outside it with no candidate), or movable to an in-window `XA`
+/// hit, else an in-window split piece. A malformed `XA` tag or hit CIGAR is
+/// counted in `outcome`, not an error.
+fn classify_end(
+    merged: &Template,
     idx: usize,
     first: bool,
-    guard: Guard,
-    reference: &impl ReferenceProvider,
     header: &Header,
-    scoring: &BwaScoring,
     outcome: &mut SelectOutcome,
-) -> Result<Selection> {
-    // The candidates are found while the window borrows the record; the record
-    // is changed only after its last use.
+) -> Result<EndState> {
     let record = &merged.records[idx];
     let Some(rw) =
         fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::RW)
     else {
-        return Ok(Selection::NoWindow);
+        return Ok(EndState::Settled(Selection::NoWindow));
     };
     let window = RealignWindow::parse(rw).with_context(|| invalid_tag(record, "rw"))?;
-
     if RawRecordView::new(record).flags() & flags::UNMAPPED != 0 {
-        return Ok(Selection::Unmapped);
+        return Ok(EndState::Settled(Selection::Unmapped));
     }
     let (contig, start, end, reverse) = placement(record, header)?;
     if window.overlaps(contig, start, end, reverse) {
-        return Ok(Selection::Kept);
+        return Ok(EndState::Settled(Selection::Kept));
     }
-
-    let candidate = match in_window_xa_hit(record, &window, outcome) {
-        Some((hits, i, ops)) => Candidate::XaHit(hits, i, ops),
+    Ok(match in_window_xa_hit(record, &window, outcome) {
+        Some((hits, i, ops)) => EndState::Movable(Candidate::XaHit(hits, i, ops)),
         None => match in_window_split_piece(merged, idx, first, &window, header)? {
-            Some(piece) => Candidate::SplitPiece(piece),
-            None => return Ok(Selection::OutsideWindow),
+            Some(piece) => EndState::Movable(Candidate::SplitPiece(piece)),
+            None => EndState::Settled(Selection::OutsideWindow),
         },
-    };
-    if guard.holds(merged, header)? {
-        return Ok(Selection::KeptProperPair);
-    }
-    match candidate {
-        Candidate::XaHit(hits, i, ops) => {
-            promote(&mut merged.records[idx], &hits, i, &ops, reference, header, scoring)?;
-            Ok(Selection::Swapped)
-        }
-        Candidate::SplitPiece(piece) => {
-            swap_with_split_piece(merged, idx, first, piece, reference, header)?;
-            Ok(Selection::SwappedSupplementary)
-        }
-    }
+    })
 }
 
 /// What an end outside its window could be swapped to.
@@ -486,6 +480,16 @@ fn promote(
     regenerate_alignment_tags_raw(record, header, reference).with_context(|| {
         format!("regenerating MD of the promoted alignment of {}", read_name(record))
     })?;
+    // The shared regeneration keeps the FASTA's case (fgbio's MD, for filter and
+    // clip), so a hit in soft-masked (lowercase) reference would get lowercase
+    // bases. bwa writes MD from its 2-bit reference, in uppercase, as SAM requires.
+    if let Some(md) =
+        fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::MD)
+        && md.iter().any(u8::is_ascii_lowercase)
+    {
+        let upper = md.to_ascii_uppercase();
+        fgumi_raw_bam::update_string_tag(record, SamTag::MD, &upper);
+    }
     let indel: i64 =
         ops.iter().filter(|&&op| matches!(op & 0xF, 1 | 2)).map(|&op| i64::from(op >> 4)).sum();
     let mismatches = u32::try_from((i64::from(hit.nm) - indel).max(0)).unwrap_or(u32::MAX);
@@ -829,6 +833,11 @@ mod tests {
     const RW2: &str = "chr1:150-190:-";
     /// An R2 window its `chr1:161-180:-` placement does not overlap.
     const RW2_ELSEWHERE: &str = "chr1:185-199:-";
+
+    /// An R2 outside its window (forward, `chr1:180-199`, 5' end 180) with an
+    /// in-window `XA` hit at its true placement, `chr1:161-180:-`.
+    const R2_MOVES: EndSpec =
+        end(Some((0, 180, false, "20M")), 0, 20, Some("chr1,-161,20M,0;"), Some(RW2));
 
     struct Fixture {
         _fasta: NamedTempFile,
@@ -1236,30 +1245,63 @@ mod tests {
         Some(true),
         [false, true],
     )]
-    // A proper pair whose mate has no window is not guarded; the swap leaves it
-    // FR on one contig with a smaller insert (170 -> 80), so the flag is kept.
-    #[case::proper_pair_mate_without_window_not_guarded(
+    // A proper pair whose mate has no window is guarded too: the mate cannot
+    // move, so moving R1 alone would split the pair bwa placed together.
+    #[case::proper_pair_mate_without_window_guarded(
         end(Some((0, 11, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
         Some(end(Some((0, 161, true, "20M")), 0, 20, None, None)),
         true,
-        [Selection::Swapped, Selection::NoWindow],
-        expect(0, 101, false, "20M", 0, 0, 20, Some(20), Some("chr1,+11,20M,0;"), "20", 80),
-        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -80)),
+        [Selection::KeptProperPairMateStays, Selection::NoWindow],
+        expect(0, 11, false, "20M", 60, 0, 20, None, Some("chr1,+101,20M,0;"), "20", 170),
+        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -170)),
         Some(true),
         [false, false],
     )]
-    // The windows are no insert-size check: a swap that widens the insert
-    // (40 -> 80) clears bwa's flag. (R2 is outside its window, so the
-    // proper-pair guard does not apply.)
-    #[case::r1_swapped_insert_grows_clears_proper(
-        end(Some((0, 141, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
+    // ...and so is one whose mate is outside its window with no candidate.
+    #[case::proper_pair_mate_cannot_move_guards_r1(
+        end(Some((0, 11, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
         Some(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE))),
         true,
-        [Selection::Swapped, Selection::OutsideWindow],
-        expect(0, 101, false, "20M", 0, 0, 20, Some(20), Some("chr1,+141,20M,0;"), "20", 80),
-        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -80)),
-        Some(false),
+        [Selection::KeptProperPairMateStays, Selection::OutsideWindow],
+        expect(0, 11, false, "20M", 60, 0, 20, None, Some("chr1,+101,20M,0;"), "20", 170),
+        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -170)),
+        Some(true),
         [false, false],
+    )]
+    // The same for R2, whose mate R1 is outside its window with no candidate.
+    #[case::proper_pair_mate_cannot_move_guards_r2(
+        end(Some((0, 11, false, "20M")), 0, 20, None, Some(RW1)),
+        Some(end(Some((0, 191, true, "20M")), 0, 20, Some("chr1,-161,20M,0;"), Some(RW2))),
+        true,
+        [Selection::OutsideWindow, Selection::KeptProperPairMateStays],
+        expect(0, 11, false, "20M", 60, 0, 20, None, None, "20", 200),
+        Some(expect(0, 191, true, "20M", 60, 0, 20, None, Some("chr1,-161,20M,0;"), "20", -200)),
+        Some(true),
+        [false, false],
+    )]
+    // The same when the end without a window is R1: R2 could move, but not
+    // without R1, so it keeps bwa's primary.
+    #[case::proper_pair_r1_without_window_guards_r2(
+        end(Some((0, 11, false, "20M")), 0, 20, None, None),
+        Some(R2_MOVES),
+        true,
+        [Selection::NoWindow, Selection::KeptProperPairMateStays],
+        expect(0, 11, false, "20M", 60, 0, 20, None, None, "20", 170),
+        Some(expect(0, 180, false, "20M", 60, 0, 20, None, Some("chr1,-161,20M,0;"), "20", -170)),
+        Some(true),
+        [false, false],
+    )]
+    // The windows are no insert-size check: when both ends of a proper pair
+    // move, a swap that widens the insert (40 -> 80) clears bwa's flag.
+    #[case::both_swapped_insert_grows_clears_proper(
+        end(Some((0, 141, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
+        Some(R2_MOVES),
+        true,
+        [Selection::Swapped, Selection::Swapped],
+        expect(0, 101, false, "20M", 0, 0, 20, Some(20), Some("chr1,+141,20M,0;"), "20", 80),
+        Some(expect(0, 161, true, "20M", 0, 0, 20, Some(20), Some("chr1,+180,20M,0;"), "20", -80)),
+        Some(false),
+        [false, true],
     )]
     // Both ends swapped (R2 onto the other strand), each with a supplementary:
     // both supplementaries are dropped and the mate fields describe the two
@@ -1302,20 +1344,21 @@ mod tests {
         Some(false),
         [false, false],
     )]
-    // R2 is outside its window, so the proper-pair guard does not apply; bwa
-    // had flagged the pair proper and the swap leaves it FR on one contig with a
-    // smaller insert, so the flag is kept...
-    #[case::r1_swapped_r2_outside_keeps_bwa_proper(
+    // Both ends of a proper pair move into their windows; bwa had flagged the
+    // pair proper and the swaps leave it FR on one contig with a smaller insert
+    // (170 -> 80), so the flag is kept...
+    #[case::both_swapped_keeps_bwa_proper(
         end(Some((0, 11, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
-        Some(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE))),
+        Some(R2_MOVES),
         true,
-        [Selection::Swapped, Selection::OutsideWindow],
+        [Selection::Swapped, Selection::Swapped],
         expect(0, 101, false, "20M", 0, 0, 20, Some(20), Some("chr1,+11,20M,0;"), "20", 80),
-        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -80)),
+        Some(expect(0, 161, true, "20M", 0, 0, 20, Some(20), Some("chr1,+180,20M,0;"), "20", -80)),
         Some(true),
-        [false, false],
+        [false, true],
     )]
-    // ...and an improper pair is left improper.
+    // ...and one end of an improper pair moves alone (R2 is outside its window
+    // with no candidate), leaving the pair improper.
     #[case::r1_swapped_r2_outside_stays_improper(
         end(Some((0, 11, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
         Some(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE))),
@@ -1326,19 +1369,20 @@ mod tests {
         Some(false),
         [false, false],
     )]
-    // (R2 is outside its window, so the proper-pair guard does not apply.)
-    #[case::r1_swapped_moves_pair_off_contig(
+    // Both ends of a proper pair move, R1 onto another contig: the pair is no
+    // longer on one contig, so bwa's flag is cleared.
+    #[case::both_swapped_pair_off_contig_clears_proper(
         end(Some((0, 11, false, "20M")), 0, 20, Some("chr2,+101,20M,16;"), Some("chr2:91-130:+")),
-        Some(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE))),
+        Some(R2_MOVES),
         true,
-        [Selection::Swapped, Selection::OutsideWindow],
+        [Selection::Swapped, Selection::Swapped],
         expect(
             1, 101, false, "20M", 0, 16, 0, Some(20), Some("chr1,+11,20M,0;"),
             "0A0C1A0C0G1G0C0T1A0T0T0C1C0T0T0G0", 0,
         ),
-        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", 0)),
+        Some(expect(0, 161, true, "20M", 0, 0, 20, Some(20), Some("chr1,+180,20M,0;"), "20", 0)),
         Some(false),
-        [false, false],
+        [false, true],
     )]
     #[case::fragment(
         end(Some((1, 51, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1))
@@ -1447,19 +1491,19 @@ mod tests {
         Some(true),
         [false, false],
     )]
-    // A swap that leaves |TLEN| as it was keeps bwa's flag: the bound is
+    // Swaps that leave |TLEN| as it was keep bwa's flag: the bound is
     // inclusive. R1 moves from chr1:82-101 reverse (5' end 101) onto the other
-    // strand at 101, so TLEN stays 80. (R2 is outside its window, so the
-    // proper-pair guard does not apply.)
-    #[case::r1_swapped_equal_insert_keeps_proper(
+    // strand at 101, and R2 from chr1:180-199 forward (5' end 180) onto the
+    // reverse strand at 161-180, so TLEN stays 80.
+    #[case::both_swapped_equal_insert_keeps_proper(
         end(Some((0, 82, true, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1)),
-        Some(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE))),
+        Some(R2_MOVES),
         true,
-        [Selection::Swapped, Selection::OutsideWindow],
+        [Selection::Swapped, Selection::Swapped],
         expect(0, 101, false, "20M", 0, 0, 20, Some(20), Some("chr1,-82,20M,0;"), "20", 80),
-        Some(expect(0, 161, true, "20M", 60, 0, 20, None, None, "20", -80)),
+        Some(expect(0, 161, true, "20M", 0, 0, 20, Some(20), Some("chr1,+180,20M,0;"), "20", -80)),
         Some(true),
-        [true, false],
+        [true, true],
     )]
     fn select_primary_cases(
         fx: Fixture,
@@ -2011,6 +2055,12 @@ mod tests {
         EndInput::Plain(end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2_ELSEWHERE)))
     }
 
+    /// R2 outside its window with an in-window `XA` hit (see [`R2_MOVES`]); its
+    /// 5' end (180) is that of `chr1:161-180:-`, where it moves.
+    fn r2_moves_into_its_window() -> EndInput {
+        EndInput::Plain(R2_MOVES)
+    }
+
     // R1 is chimeric (primary on chr2, a piece in R1's window on chr1) unless
     // stated otherwise; R2 is kept in its window at chr1:161-180 reverse.
     #[rstest]
@@ -2131,13 +2181,14 @@ mod tests {
         false,
     )]
     // A primary on chr1 outside the window, proper with R2 (insert 160), and R2
-    // outside its own window (so the proper-pair guard does not apply): the swap
-    // leaves the pair FR on chr1 with a smaller insert (80), so bwa's flag stays...
+    // outside its own window with an in-window XA hit, so both ends move: the
+    // swaps leave the pair FR on chr1 with a smaller insert (80), so bwa's flag
+    // stays...
     #[case::proper_pair_kept(
         chimeric(&[aln(0, 21, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).supp()], PIECE_RW_FWD),
-        r2_outside_its_window(),
+        r2_moves_into_its_window(),
         true,
-        [Selection::SwappedSupplementary, Selection::OutsideWindow],
+        [Selection::SwappedSupplementary, Selection::Swapped],
         &[
             ("chr1,101,+,12S8M", 30, 0, "chr1,21,+,12M8S,60,0;"),
             ("chr1,21,+,12M8H", 60, SUPPLEMENTARY, "chr1,101,+,12S8M,30,0;"),
@@ -2149,9 +2200,9 @@ mod tests {
     // primary are secondary: every record of the pair keeps the flag...
     #[case::proper_pair_kept_meth_secondary(
         chimeric(&[aln(0, 21, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).sec()], PIECE_RW_FWD),
-        r2_outside_its_window(),
+        r2_moves_into_its_window(),
         true,
-        [Selection::SwappedSupplementary, Selection::OutsideWindow],
+        [Selection::SwappedSupplementary, Selection::Swapped],
         &[
             ("chr1,101,+,12S8M", 30, 0, "chr1,21,+,12M8S,60,0;"),
             ("chr1,21,+,12M8H", 60, SECONDARY, "chr1,101,+,12S8M,30,0;"),
@@ -2159,13 +2210,13 @@ mod tests {
         &[],
         true,
     )]
-    // ...and one that widens the insert (40 -> 80) clears it on every record,
+    // ...and swaps that widen the insert (40 -> 80) clear it on every record,
     // the demoted primary included, whether it is supplementary...
     #[case::proper_pair_cleared(
         chimeric(&[aln(0, 141, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).supp()], PIECE_RW_FWD),
-        r2_outside_its_window(),
+        r2_moves_into_its_window(),
         true,
-        [Selection::SwappedSupplementary, Selection::OutsideWindow],
+        [Selection::SwappedSupplementary, Selection::Swapped],
         &[
             ("chr1,101,+,12S8M", 30, 0, "chr1,141,+,12M8S,60,0;"),
             ("chr1,141,+,12M8H", 60, SUPPLEMENTARY, "chr1,101,+,12S8M,30,0;"),
@@ -2176,15 +2227,30 @@ mod tests {
     // ...or, under `-M`, secondary.
     #[case::proper_pair_cleared_meth_secondary(
         chimeric(&[aln(0, 141, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).sec()], PIECE_RW_FWD),
-        r2_outside_its_window(),
+        r2_moves_into_its_window(),
         true,
-        [Selection::SwappedSupplementary, Selection::OutsideWindow],
+        [Selection::SwappedSupplementary, Selection::Swapped],
         &[
             ("chr1,101,+,12S8M", 30, 0, "chr1,141,+,12M8S,60,0;"),
             ("chr1,141,+,12M8H", 60, SECONDARY, "chr1,101,+,12S8M,30,0;"),
         ],
         &[],
         false,
+    )]
+    // The proper-pair guard when the mate cannot move: R2 is outside its own
+    // window with no candidate, so R1's in-window piece is not swapped in and
+    // every record of R1 stays as it was.
+    #[case::proper_pair_mate_cannot_move_blocks_split_piece_swap(
+        chimeric(&[aln(0, 21, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).supp()], PIECE_RW_FWD),
+        r2_outside_its_window(),
+        true,
+        [Selection::KeptProperPairMateStays, Selection::OutsideWindow],
+        &[
+            ("chr1,21,+,12M8S", 60, 0, "chr1,101,+,12S8M,30,0;"),
+            ("chr1,101,+,12H8M", 30, SUPPLEMENTARY, "chr1,21,+,12M8S,60,0;"),
+        ],
+        &[],
+        true,
     )]
     // The proper-pair guard: bwa flagged the pair proper and R2 is in its
     // window, so R1's in-window piece is not swapped in and every record of R1
@@ -2221,6 +2287,39 @@ mod tests {
         false,
         [Selection::Swapped, Selection::SwappedSupplementary],
         &[],
+        &[
+            ("chr1,161,-,8M12S", 30, 0, "chr2,51,+,12M8S,60,0;"),
+            ("chr2,51,+,12M8H", 60, SUPPLEMENTARY, "chr1,161,-,8M12S,30,0;"),
+        ],
+        false,
+    )]
+    // A proper pair moves when the mate's only candidate is a split piece: R1
+    // promotes an XA hit and R2 swaps in its in-window piece. The swaps widen
+    // the insert, so bwa's flag is cleared.
+    #[case::proper_pair_mate_moves_by_split_piece(
+        EndInput::Plain(end(Some((1, 51, false, "20M")), 0, 20, Some("chr1,+101,20M,0;"), Some(RW1))),
+        chimeric(&[aln(1, 51, false, "12M8S", 60), aln(0, 161, true, "8M12H", 30).supp()], RW2),
+        true,
+        [Selection::Swapped, Selection::SwappedSupplementary],
+        &[],
+        &[
+            ("chr1,161,-,8M12S", 30, 0, "chr2,51,+,12M8S,60,0;"),
+            ("chr2,51,+,12M8H", 60, SUPPLEMENTARY, "chr1,161,-,8M12S,30,0;"),
+        ],
+        false,
+    )]
+    // Both ends of a proper pair move by swapping in a split piece each. The
+    // swaps leave the pair FR on chr1, but bwa had paired the ends across
+    // contigs, so the insert grows and the flag is cleared.
+    #[case::proper_pair_both_by_split_piece(
+        chimeric(&[aln(0, 141, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).supp()], PIECE_RW_FWD),
+        chimeric(&[aln(1, 51, false, "12M8S", 60), aln(0, 161, true, "8M12H", 30).supp()], RW2),
+        true,
+        [Selection::SwappedSupplementary, Selection::SwappedSupplementary],
+        &[
+            ("chr1,101,+,12S8M", 30, 0, "chr1,141,+,12M8S,60,0;"),
+            ("chr1,141,+,12M8H", 60, SUPPLEMENTARY, "chr1,101,+,12S8M,30,0;"),
+        ],
         &[
             ("chr1,161,-,8M12S", 30, 0, "chr2,51,+,12M8S,60,0;"),
             ("chr2,51,+,12M8H", 60, SUPPLEMENTARY, "chr1,161,-,8M12S,30,0;"),
@@ -2283,6 +2382,38 @@ mod tests {
             -fgumi_raw_bam::template_length(&merged.records[r2_i]),
             "TLEN symmetry"
         );
+    }
+
+    /// A promoted hit in soft-masked (lowercase) reference gets an uppercase MD,
+    /// as bwa writes it, and NM still counts only the one real mismatch.
+    #[test]
+    fn promoted_md_is_uppercase_on_soft_masked_reference() {
+        let soft_masked = CHR1.to_ascii_lowercase();
+        let fasta =
+            create_test_fasta(&[("chr1", soft_masked.as_str()), ("chr2", CHR2)]).expect("fasta");
+        let reference = ReferenceReader::new(fasta.path()).expect("reference");
+        let header = fx().header;
+        let r1 = end(
+            Some((1, 51, false, "20M")),
+            2,
+            12,
+            Some("chr2,+181,20M,4;chr1,+101,20M,1;"),
+            Some(RW1),
+        )
+        .with_mismatch(5);
+        let r2 = end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2));
+        let mut merged = build_template(&r1, Some(&r2), false);
+        let got = select_primary(&mut merged, &reference, &header, &BwaScoring::default())
+            .expect("select_primary")
+            .ends;
+        assert_eq!(got, [Selection::Swapped, Selection::Kept]);
+        let promoted = merged.r1().expect("r1");
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux(promoted), SamTag::MD),
+            Some(&b"5T14"[..]),
+            "MD"
+        );
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux(promoted), SamTag::NM), Some(1), "NM");
     }
 
     /// An in-window `XA` hit wins over an in-window split piece: the hit is
@@ -2424,6 +2555,7 @@ mod tests {
             swapped: 3,
             swapped_supplementary: 4,
             kept_proper_pair: 5,
+            kept_proper_pair_mate_stays: 11,
             outside_window: 6,
             unmapped: 7,
             no_window: 8,
@@ -2436,6 +2568,7 @@ mod tests {
             swapped: 300,
             swapped_supplementary: 400,
             kept_proper_pair: 500,
+            kept_proper_pair_mate_stays: 1100,
             outside_window: 600,
             unmapped: 700,
             no_window: 800,
@@ -2452,6 +2585,7 @@ mod tests {
                 swapped: 303,
                 swapped_supplementary: 404,
                 kept_proper_pair: 505,
+                kept_proper_pair_mate_stays: 1111,
                 outside_window: 606,
                 unmapped: 707,
                 no_window: 808,
@@ -2469,6 +2603,15 @@ mod tests {
     #[case::proper_pair_guard(
         [Selection::KeptProperPair, Selection::Kept], 0, 0,
         RealignCounts { reads: 2, kept_proper_pair: 1, in_window: 1, ..RealignCounts::default() },
+    )]
+    #[case::proper_pair_guard_mate_stays(
+        [Selection::KeptProperPairMateStays, Selection::OutsideWindow], 0, 0,
+        RealignCounts {
+            reads: 2,
+            kept_proper_pair_mate_stays: 1,
+            outside_window: 1,
+            ..RealignCounts::default()
+        },
     )]
     #[case::xa_and_split_piece(
         [Selection::Swapped, Selection::SwappedSupplementary], 0, 0,
