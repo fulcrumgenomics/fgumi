@@ -30,6 +30,8 @@ The methylation pipeline has the same structure as the [standard consensus pipel
 | Duplex re-alignment | `bwa-mem3 mem -Y` | `bwa-mem3 mem -Y` |
 | Filter | `--methylation-mode em-seq` | `--methylation-mode taps` |
 
+The re-alignment rows can also run through `fgumi realign` ([Step 6](#step-6-re-alignment)), which runs the same aligner command and prefers the alignment inside each molecule's raw-read window.
+
 For libraries with UMIs on both ends, use paired grouping with `simplex` by default, and `duplex` for per-molecule questions ([Choosing Simplex or Duplex](methylation-concepts.md#choosing-simplex-or-duplex)).
 
 ---
@@ -121,6 +123,8 @@ fgumi group \
   --threads 8
 ```
 
+To re-align the consensus reads with `fgumi realign` in Step 6, add `--realign-window` to either `fgumi group` command: it records each molecule's raw-read window in the `rw` tag, which the consensus callers copy onto the consensus reads, and `fgumi realign` rejects input grouped without it.
+
 ### Step 5: Consensus Calling
 
 `--methylation-mode` and `--ref` enable methylation-aware consensus. Simplex keeps the converted bases ([Simplex Consensus](methylation-concepts.md#simplex-consensus)); duplex writes the molecule's sequence with `MM`/`ML` ([Duplex Consensus](methylation-concepts.md#duplex-consensus)).
@@ -175,9 +179,24 @@ fgumi fastq --input consensus.bam \
 
 Reverse the per-base tags of reverse-strand reads exactly once: either here, with zipper's `--tags-to-reverse Consensus --tags-to-revcomp Consensus`, or in Step 7 with `filter --reverse-per-base-tags`, which handles the same tags, including the methylation counts (`cu`/`ct`/`au`/`at`/`bu`/`bt`). The commands on this page use filter. Do not do both, or every per-base tag is reversed twice and points at the wrong positions. If you reverse in zipper, filter still prints its end-of-run warning about reverse-mapped reads checked without `--reverse-per-base-tags`, because it cannot tell that zipper already reversed them; on that route the warning is expected and can be ignored.
 
+**With `fgumi realign`.** If Step 4 grouped with `--realign-window`, `fgumi realign` can replace the `fastq | bwa-mem3 | zipper` pipe. It aligns the consensus reads and, where the aligner places a read outside the region its raw reads aligned to, prefers an alignment inside that region (see [Best Practices](best-practices.md#step-2a2-re-alignment)). Its presets do not pass `-Y`, so give the aligner as `--aligner::command`, with `--meth` for simplex EM-seq reads only:
+
+```bash
+fgumi realign \
+  --input consensus.bam \
+  --output consensus.mapped.bam \
+  --ref ref.fa \
+  --aligner::command "bwa-mem3 mem --bam=0 --meth -p -Y -K 150000000 -t {threads} {ref} /dev/stdin" \
+  --threads 16
+```
+
+For simplex TAPs reads, and duplex reads of either chemistry, drop `--meth` from the command. `--aligner::preset bwa-mem3 --methylation-mode em-seq` aligns with `--meth` too, but without `-Y`, so the supplementary records it writes are hard-clipped and filter leaves their methylation unchecked; for duplex reads, pass the preset without `--methylation-mode`. `realign` always reverses the per-base tags of reverse-strand reads, methylation counts included, so on this route omit `--reverse-per-base-tags` in Step 7 (filter's end-of-run warning about it is then expected, as for zipper). Its output is in input order, as zipper's is.
+
+`fgumi runall --realign` runs re-alignment in the same command as grouping and consensus calling (see [Running Pipelines](running-pipelines.md#re-aligning-consensus-reads-with---realign)). Under `--methylation-mode em-seq` it aligns simplex consensus reads bisulfite-aware and duplex consensus reads without `--meth`; this applies to its presets, and an `--aligner::command` runs as written. `--realign` re-aligns after filter, so it does not lift the limit on simplex methylation filters (see [Methylation Filters Skip Unmapped Reads](#methylation-filters-skip-unmapped-reads)): end the run at `consensus` and filter the re-aligned BAM with `fgumi filter`. After `duplex`, filter's methylation options work in the same run.
+
 ### Step 7: Filtering
 
-**Simplex** methylation filters find cytosines from the reference, so they need aligned reads: filter after re-alignment, with `--ref` and `--reverse-per-base-tags` (omit it if zipper already reversed the per-base tags in Step 6). An aligned BAM always contains some unmapped reads; the methylation filters leave unmapped simplex reads unchecked and report how many there were at the end of the run. **Duplex** reads carry their cytosines in their own sequence, so the filters work on them aligned or not.
+**Simplex** methylation filters find cytosines from the reference, so they need aligned reads: filter after re-alignment, with `--ref` and `--reverse-per-base-tags` (omit it if zipper or `fgumi realign` already reversed the per-base tags in Step 6). An aligned BAM always contains some unmapped reads; the methylation filters leave unmapped simplex reads unchecked and report how many there were at the end of the run. **Duplex** reads carry their cytosines in their own sequence, so the filters work on them aligned or not.
 
 **Simplex:**
 
@@ -213,6 +232,8 @@ fgumi filter \
   --reverse-per-base-tags \
   --threads 8
 ```
+
+Both commands are for reads whose per-base tags were not reversed in Step 6. After `fgumi realign`, or a zipper run with `--tags-to-reverse Consensus --tags-to-revcomp Consensus`, remove `--reverse-per-base-tags` from them.
 
 With `--ref`, filter also recomputes the `NM`, `UQ` and `MD` alignment tags; see [Alignment Tags](#alignment-tags-nm-uq-md).
 
@@ -372,7 +393,7 @@ With `--ref`, `filter` (and `clip`) recompute `NM`, `UQ` and `MD` from the read'
 
 ### Recommended Parameters
 
-Both run `filter` on the re-aligned consensus reads (Steps 6 and 7). Drop `--reverse-per-base-tags` if zipper already reversed the per-base tags.
+Both run `filter` on the re-aligned consensus reads (Steps 6 and 7). Drop `--reverse-per-base-tags` if zipper or `fgumi realign` already reversed the per-base tags.
 
 **Simplex (moderate stringency):**
 
@@ -431,7 +452,7 @@ Only `duplex` writes `MM`/`ML`. A simplex read keeps the converted bases, so its
 
 On simplex reads the methylation filters find cytosines from the alignment, so they leave unmapped simplex reads unchecked, and filter reports how many it skipped, saying so plainly when it was every read. Run `filter` after re-alignment. Duplex reads need no alignment.
 
-`runall` cannot re-align between the consensus caller and filter, so it rejects filter's methylation options on a chain where filter follows `simplex`: re-align the consensus reads, then run `runall --start-from filter` or `fgumi filter`. After `duplex` the options are accepted. See [Running Pipelines](running-pipelines.md).
+`runall` cannot re-align between the consensus caller and filter (`--realign` re-aligns after filter), so it rejects filter's methylation options on a chain where filter follows `simplex`, with or without `--realign`; with `--start-from filter --realign` it also rejects them for `--consensus simplex` input, and warns when `--consensus` is not given. Re-align the consensus reads first (with `fgumi realign`, `runall --stop-after consensus --realign`, or the `fastq | bwa-mem3 | zipper` pipe), then run `fgumi filter` or `runall --start-from filter` without `--realign` on the aligned BAM. After `duplex` the options are accepted. See [Running Pipelines](running-pipelines.md).
 
 ### Reads Filtered by Conversion Fraction
 

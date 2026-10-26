@@ -489,6 +489,19 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - Memory proportional to family sizes
 - Benefits from balanced threading and memory
 
+### Realign
+- Memory is usually dominated by the aligner index: a subprocess preset (`bwa-mem3`, `bwa`) or
+  `--aligner::command` holds it in the aligner process, and `--aligner::preset bwa-mem3-inproc`
+  loads it into fgumi's own process
+- The reference FASTA is read on demand through its `.fai` (`samtools faidx`), since only
+  promoted alignments are rescored; on hg38 this measured about 3.3 GB lower peak memory than
+  holding the FASTA, with identical output. A compressed FASTA, one without a `.fai`, or a pipe
+  is loaded into memory instead (with a warning); `--in-memory-reference` loads it regardless
+- Output is in input order; pipe it to `fgumi sort --order coordinate`, or use
+  `fgumi runall --realign`, which appends the coordinate sort (see
+  [Running Pipelines](running-pipelines.md#re-aligning-consensus-reads-with---realign) for its
+  memory budget)
+
 ### Filter
 - Streaming operation benefits from pipeline memory
 - Compression affects final output size

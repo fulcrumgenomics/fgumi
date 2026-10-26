@@ -18,6 +18,7 @@ fgumi is the Rust successor to [fgbio](https://github.com/fulcrumgenomics/fgbio)
 | `ClipBam` | `clip` | |
 | `CollectDuplexSeqMetrics` | `duplex-metrics` | |
 | *(no equivalent)* | `simplex-metrics` | New: simplex QC metrics (yield, family sizes, UMI counts) |
+| *(no equivalent)* | `realign` | New: re-aligns consensus reads, preferring each molecule's raw-read window (needs `group --realign-window`) |
 | *(samtools merge)* | `merge` | k-way merge of pre-sorted BAMs; supports all sort orders |
 | `ReviewConsensusVariants` | `review` | |
 

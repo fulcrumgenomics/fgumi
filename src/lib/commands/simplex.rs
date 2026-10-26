@@ -71,7 +71,8 @@ error when the read is in an emitted consensus.
 
 The consensus reads produced are unaligned, due to the difficulty and error-prone nature of inferring the consensus
 alignment. Consensus reads should therefore be aligned after, which should not be too expensive as likely there
-are far fewer consensus reads than input raw reads.
+are far fewer consensus reads than input raw reads. `fgumi realign` aligns them, preferring the region each
+molecule's raw reads aligned to, when the input was grouped with `fgumi group --realign-window`.
 
 Particular attention should be paid to setting the --min-reads parameter as this can have a dramatic effect on
 both results and runtime. For libraries with low duplication rates (e.g. 100-300X exomes libraries) in which it

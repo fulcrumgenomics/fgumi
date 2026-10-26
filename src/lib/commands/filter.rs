@@ -102,7 +102,8 @@ marked as being mapped to the negative strand. This is necessary if the reads ha
 bases/quals reversed but the consensus tags have not. If true, the tags written to the output BAM will be
 reversed where necessary in order to line up with the bases and quals. It reverses the same tags as
 fgumi zipper --tags-to-reverse Consensus --tags-to-revcomp Consensus, so reverse in one of the two only:
-reversing in both restores the original, wrong orientation.
+reversing in both restores the original, wrong orientation. fgumi realign (and fgumi runall --realign)
+always reverses them, so do not pass --reverse-per-base-tags on its output.
 "#
 )]
 #[allow(clippy::struct_excessive_bools)]

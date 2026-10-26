@@ -47,6 +47,15 @@ fgumi group \
   --allow-unmapped
 ```
 
+## Recording Windows for Re-alignment
+
+`--realign-window` stamps each mapped primary read with an `rw` tag: the reference window
+(`<contig>:<start>-<end>:<strand>`, 1-based, inclusive, unclipped) spanned by its molecule's raw
+reads of the same segment (R1 or R2). The consensus callers copy it onto the consensus reads,
+and `fgumi realign` uses it to prefer the alignment inside that window when it re-aligns them,
+then removes it. `fgumi realign` rejects input grouped without the flag. See
+[Best Practices](best-practices.md#step-2a2-re-alignment).
+
 ## Grouping Strategies
 
 Grouping is performed by one of four strategies:
