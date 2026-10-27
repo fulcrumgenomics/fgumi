@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::rscript::assert_pdf_byte_identical_across_runs;
 
 /// Creates a paired-end read pair for duplex-metrics testing.
 ///
@@ -414,5 +415,17 @@ fn test_duplex_metrics_command_min_reads_parameters() {
     assert!(
         default_metrics.len() >= strict_metrics.len(),
         "Strict parameters should result in fewer or equal duplex families"
+    );
+}
+
+/// Two runs on the same input write byte-identical PDFs; needs R 4.5.0+ with ggplot2 and scales.
+#[test]
+fn test_duplex_metrics_command_pdf_is_byte_identical_across_runs() {
+    assert_pdf_byte_identical_across_runs::<DuplexMetrics>(
+        "duplex-metrics",
+        "duplex_qc.pdf",
+        |bam| {
+            create_duplex_test_bam(bam, &create_minimal_header("chr1", 10000));
+        },
     );
 }

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::rscript::assert_pdf_byte_identical_across_runs;
 
 /// Creates a paired-end read pair for simplex-metrics testing.
 ///
@@ -292,4 +293,16 @@ fn test_simplex_metrics_min_reads_parameter() {
     // With min-reads=3, only family 1 (size 3) is consensus-eligible
     assert_eq!(default_full.ss_consensus_families, 3);
     assert_eq!(strict_full.ss_consensus_families, 1);
+}
+
+/// Two runs on the same input write byte-identical PDFs; needs R 4.5.0+ with ggplot2 and scales.
+#[test]
+fn test_simplex_metrics_command_pdf_is_byte_identical_across_runs() {
+    assert_pdf_byte_identical_across_runs::<SimplexMetrics>(
+        "simplex-metrics",
+        "simplex_qc.pdf",
+        |bam| {
+            create_simplex_test_bam(bam, &create_minimal_header("chr1", 10000));
+        },
+    );
 }

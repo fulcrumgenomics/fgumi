@@ -32,6 +32,9 @@ pub const DOWNSAMPLING_FRACTIONS: [f64; 20] = [
 /// Cached R availability check (computed once per process).
 static R_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
+/// Cached check for R's reproducible `pdf()` arguments (computed once per process).
+static R_PDF_REPRODUCIBLE: OnceLock<bool> = OnceLock::new();
+
 /// Genomic interval for filtering, stored as 0-based half-open coordinates.
 #[derive(Clone, Debug)]
 pub struct Interval {
@@ -360,11 +363,28 @@ pub fn is_r_available() -> bool {
     })
 }
 
+/// Checks if R's `pdf()` can leave out the dates and R version, through the `timestamp` and
+/// `producer` arguments R 4.5.0 added, so a rerun writes a byte-identical PDF.
+///
+/// Result is cached for the lifetime of the process to avoid repeated subprocess spawns.
+pub fn is_r_pdf_reproducible() -> bool {
+    use std::process::Command;
+
+    *R_PDF_REPRODUCIBLE.get_or_init(|| {
+        Command::new("Rscript")
+            .args(["-e", r#"stopifnot("timestamp" %in% names(formals(grDevices::pdf)))"#])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
 /// Executes an R script with the given arguments.
 ///
 /// The R script content is written to a temporary file for execution. This ensures
 /// the script is always available regardless of working directory or installation
-/// location.
+/// location. Each call writes into its own temporary directory, so concurrent runs
+/// cannot delete each other's script.
 ///
 /// # Arguments
 ///
@@ -383,22 +403,22 @@ pub fn execute_r_script<S: AsRef<std::ffi::OsStr>>(
 ) -> Result<()> {
     use std::process::Command;
 
-    // Write embedded R script to temp file
-    let temp_dir = std::env::temp_dir();
-    let r_script_path = temp_dir.join(temp_file_name);
+    let temp_dir =
+        tempfile::tempdir().context("Failed to create temp dir for embedded R script")?;
+    let r_script_path = temp_dir.path().join(temp_file_name);
     std::fs::write(&r_script_path, r_script_content)
         .context("Failed to write embedded R script to temp file")?;
 
     info!("Executing R script to generate PDF plots...");
+    if !is_r_pdf_reproducible() {
+        info!("R is older than 4.5.0, so the PDF records its creation date and R version");
+    }
 
     let output = Command::new("Rscript")
         .arg(&r_script_path)
         .args(args)
         .output()
         .context("Failed to execute Rscript command")?;
-
-    // Clean up temp file (ignore errors)
-    let _ = std::fs::remove_file(&r_script_path);
 
     if output.status.success() {
         Ok(())

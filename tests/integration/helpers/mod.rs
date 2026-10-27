@@ -16,6 +16,7 @@ pub mod copy_umi_fixtures;
 pub mod cutover;
 pub mod fastq;
 pub mod merge_fixtures;
+pub mod rscript;
 
 pub use aligner::*;
 pub use assertions::*;
