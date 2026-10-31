@@ -4718,6 +4718,59 @@ mod tests {
         Ok(())
     }
 
+    /// The `tc` tag zipper writes must give a supplementary the same
+    /// template-coordinate sort key as its primary. zipper writes `tc` 1-based
+    /// while the sort keys primaries 0-based; reading `tc` as-is placed the
+    /// supplementary 1 bp right of its template, behind any template starting
+    /// there, so dedup saw it as a template without primaries.
+    #[test]
+    fn test_tc_tag_sorts_supplementary_with_its_primary() -> Result<()> {
+        use crate::template::Template;
+        use fgumi_sort::{LibraryLookup, cb_hasher, extract_template_key_inline};
+
+        let lib_lookup = LibraryLookup::from_header(&noodles::sam::Header::default());
+        let key = |rec: &[u8]| extract_template_key_inline(rec, &lib_lookup, None, &cb_hasher());
+
+        // FR pair with soft clips: R1 forward at 99 (2S8M, unclipped 5' 97),
+        // R2 reverse at 299 (8M2S, unclipped 5' 308), all 0-based.
+        let read = |name: &[u8], flag: u16, pos: i32, mate_pos: i32, cigar: &[u32], mc: &[u8]| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name)
+                .flags(FLAG_PAIRED | flag)
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .mate_ref_id(0)
+                .mate_pos(mate_pos)
+                .cigar_ops(cigar)
+                .sequence(b"ACGTACGTAC")
+                .qualities(&[30u8; 10])
+                .add_string_tag(SamTag::MC, mc);
+            b.build()
+        };
+        let soft_then_match = [encode_op(4, 2), encode_op(0, 8)];
+        let match_then_soft = [encode_op(0, 8), encode_op(4, 2)];
+        let r1_flags = FLAG_READ1 | flags::MATE_REVERSE;
+        let r1 = read(b"q1", r1_flags, 99, 299, &soft_then_match, b"8M2S");
+        let r2 = read(b"q1", FLAG_READ2 | FLAG_REVERSE, 299, 99, &match_then_soft, b"2S8M");
+        let supp = read(b"q1", r1_flags | FLAG_SUPPLEMENTARY, 5000, 299, &soft_then_match, b"8M2S");
+
+        let mut template = Template::from_records(vec![r1.clone(), r2, supp])?;
+        template.add_template_coordinate_tags();
+        let supp = template.records().iter().find(|r| r.is_supplementary()).expect("supp");
+
+        let primary_key = key(r1.as_ref());
+        let supp_key = key(supp.as_ref());
+        assert_eq!(supp_key, primary_key, "supplementary must key exactly as its R1 primary");
+
+        // A different template starting 1 bp to the right must not sort between them.
+        let next = read(b"q2", r1_flags, 98, 150, &[encode_op(0, 10)], b"10M");
+        let next_key = key(next.as_ref());
+        assert!(primary_key < next_key && supp_key < next_key);
+
+        Ok(())
+    }
+
     /// Tests that tc tag contains full template sort key for paired-end data
     #[test]
     fn test_add_pa_tag_paired_end_r2_supplementary() -> Result<()> {

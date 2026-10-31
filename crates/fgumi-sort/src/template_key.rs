@@ -613,6 +613,15 @@ pub fn extract_template_key_inline(
         if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
             fgumi_raw_bam::read_tc_template_coordinate(aux_slice)
         {
+            // `tc` positions are 1-based (zipper computes them with
+            // `unclipped_5prime_from_raw_bam`, and grouping/dedup compare them
+            // against 1-based positions), while this key is 0-based like the
+            // per-record path below. Without the shift every sec/supp read keys
+            // 1 bp right of its primaries and can be separated from them by a
+            // template starting at that position.
+            let pos1 = pos1.saturating_sub(1);
+            let pos2 = pos2.saturating_sub(1);
+
             // `tc` is canonicalized by (tid, pos) only (see zipper's
             // `add_template_coordinate_tags_raw`), whereas the per-record path
             // additionally tiebreaks on strand for equal positions. In the
@@ -1638,8 +1647,8 @@ mod moved_key_tests {
 
         // Sec/supp of a left-anchored R1: the primary is at pos 1000, its mate (R2
         // primary) at 1400, but this alignment is at 9000. The exact template
-        // coordinate (pos1) is 1000, carried in `tc`.
-        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        // coordinate (pos1) is 1000, carried in `tc` 1-based as zipper writes it.
+        let tc = tc_aux(&[0, 1001, 0, 0, 1401, 1]);
         let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &tc);
         let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
 
@@ -1734,8 +1743,9 @@ mod moved_key_tests {
         );
 
         // Sec/supp reads through the tc branch, stamped with the pair's exact
-        // canonical template coordinate, but aligned far away (own pos 9000).
-        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        // canonical template coordinate (1-based, as zipper writes it), but
+        // aligned far away (own pos 9000).
+        let tc = tc_aux(&[0, 1001, 0, 0, 1401, 1]);
         let r1_ss = build_secondary_or_supplementary_bam(
             9000,
             1400,
