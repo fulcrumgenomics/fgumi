@@ -87,4 +87,5 @@ mod test_sort_wake_liveness;
 mod test_sort_write_index;
 mod test_streaming_input;
 mod test_streaming_output;
+mod test_tc_tag_pipeline;
 mod test_zipper_command;

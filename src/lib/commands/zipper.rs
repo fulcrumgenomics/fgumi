@@ -4718,6 +4718,181 @@ mod tests {
         Ok(())
     }
 
+    // ========================================================================
+    // `tc` round trip: zipper's writer against the sort's and grouper's keys
+    // ========================================================================
+
+    /// Which secondary/supplementary record of a template a `tc` round-trip case
+    /// keys: whose segment it belongs to and whether it is secondary or
+    /// supplementary.
+    #[derive(Copy, Clone, Debug)]
+    enum NonPrimary {
+        R1Supplementary,
+        R2Supplementary,
+        R1Secondary,
+        R2Secondary,
+    }
+
+    impl NonPrimary {
+        fn is_r1(self) -> bool {
+            matches!(self, Self::R1Supplementary | Self::R1Secondary)
+        }
+
+        fn kind_flag(self) -> u16 {
+            match self {
+                Self::R1Supplementary | Self::R2Supplementary => FLAG_SUPPLEMENTARY,
+                Self::R1Secondary | Self::R2Secondary => FLAG_SECONDARY,
+            }
+        }
+    }
+
+    /// Builds one mapped, paired record of template `name` (0-based `pos`).
+    fn tc_round_trip_record(
+        name: &[u8],
+        flag: u16,
+        pos: i32,
+        mate_pos: i32,
+        cigar: &[u32],
+    ) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(name)
+            .flags(FLAG_PAIRED | flag)
+            .ref_id(0)
+            .pos(pos)
+            .mapq(60)
+            .mate_ref_id(0)
+            .mate_pos(mate_pos)
+            .cigar_ops(cigar)
+            .sequence(b"ACGTACGTAC")
+            .qualities(&[30u8; 10]);
+        b.build()
+    }
+
+    /// The layout of a mapped pair in the `tc` round-trip tests.
+    #[derive(Copy, Clone, Debug)]
+    enum PairLayout {
+        /// FR pair, R1 the lower end: R1 forward at 0-based 99 (`2S8M`,
+        /// unclipped 5' 97, 0-based), R2 reverse at 299 (`8M2S`, unclipped 5' 308).
+        R1Lower,
+        /// The same pair with the reads swapped, so R2 is the lower end.
+        R2Lower,
+        /// Both primaries at unclipped 5' 97 (0-based) on opposite strands, R1
+        /// reverse (`8M2S` at 88) and R2 forward (`2S8M` at 99): the per-record
+        /// key puts the forward end first, which `tc` must match.
+        SamePositionR1Reverse,
+    }
+
+    /// Builds a soft-clipped pair laid out as `layout` plus one secondary or
+    /// supplementary record far from it, and runs zipper's mate fixing and `tc`
+    /// writer over the template, as zipper does. Returns `(own primary,
+    /// non-primary)`: the non-primary record's own segment's primary, and the
+    /// tagged non-primary record.
+    fn tc_tagged_template(layout: PairLayout, which: NonPrimary) -> Result<(RawRecord, RawRecord)> {
+        use crate::template::Template;
+
+        let soft_then_match = [encode_op(4, 2), encode_op(0, 8)];
+        let match_then_soft = [encode_op(0, 8), encode_op(4, 2)];
+        let lower = |segment: u16| segment | flags::MATE_REVERSE;
+        let upper = |segment: u16| segment | FLAG_REVERSE;
+        let (r1_pos, r2_pos, r1_flags, r2_flags, r1_cigar, r2_cigar) = match layout {
+            PairLayout::R1Lower => {
+                (99, 299, lower(FLAG_READ1), upper(FLAG_READ2), soft_then_match, match_then_soft)
+            }
+            PairLayout::R2Lower => {
+                (299, 99, upper(FLAG_READ1), lower(FLAG_READ2), match_then_soft, soft_then_match)
+            }
+            PairLayout::SamePositionR1Reverse => {
+                (88, 99, upper(FLAG_READ1), lower(FLAG_READ2), match_then_soft, soft_then_match)
+            }
+        };
+
+        let r1 = tc_round_trip_record(b"q1", r1_flags, r1_pos, r2_pos, &r1_cigar);
+        let r2 = tc_round_trip_record(b"q1", r2_flags, r2_pos, r1_pos, &r2_cigar);
+        let (own_flags, mate_pos, cigar) =
+            if which.is_r1() { (r1_flags, r2_pos, r1_cigar) } else { (r2_flags, r1_pos, r2_cigar) };
+        let non_primary =
+            tc_round_trip_record(b"q1", own_flags | which.kind_flag(), 5000, mate_pos, &cigar);
+
+        let mut template = Template::from_records(vec![r1, r2, non_primary])?;
+        template.fix_mate_info()?;
+        template.add_template_coordinate_tags();
+
+        let records = template.records();
+        let is_non_primary = |r: &RawRecord| r.is_secondary() || r.is_supplementary();
+        let tagged = records.iter().find(|r| is_non_primary(r)).expect("non-primary").clone();
+        let own_primary = records
+            .iter()
+            .find(|r| !is_non_primary(r) && r.is_first_segment() == which.is_r1())
+            .expect("own primary")
+            .clone();
+        Ok((own_primary, tagged))
+    }
+
+    /// A secondary or supplementary record tagged by zipper must get the same
+    /// template-coordinate sort key as its own primary, so the sort places it
+    /// with its template (#1088: reading the 1-based `tc` as 0-based keyed it
+    /// 1 bp to the right, behind any template starting there, and `dedup` then
+    /// dropped it as a template without primaries).
+    #[rstest]
+    fn test_tc_tag_sort_key_matches_own_primary(
+        #[values(PairLayout::R1Lower, PairLayout::R2Lower, PairLayout::SamePositionR1Reverse)]
+        layout: PairLayout,
+        #[values(
+            NonPrimary::R1Supplementary,
+            NonPrimary::R2Supplementary,
+            NonPrimary::R1Secondary,
+            NonPrimary::R2Secondary
+        )]
+        which: NonPrimary,
+    ) -> Result<()> {
+        use fgumi_sort::{LibraryLookup, cb_hasher, extract_template_key_inline};
+
+        let (own_primary, tagged) = tc_tagged_template(layout, which)?;
+        let lib_lookup = LibraryLookup::from_header(&noodles::sam::Header::default());
+        let key = |rec: &RawRecord| {
+            extract_template_key_inline(rec.as_ref(), &lib_lookup, None, &cb_hasher())
+        };
+
+        // `core_cmp` covers every positional lane; the last tiebreak (`is_upper`,
+        // after the name hash) only orders a template's own records.
+        assert_eq!(
+            key(&tagged).core_cmp(&key(&own_primary)),
+            std::cmp::Ordering::Equal,
+            "{layout:?} {which:?} must sort at its primary's template coordinate"
+        );
+        Ok(())
+    }
+
+    /// The grouper must put a secondary or supplementary record tagged by zipper
+    /// into the same position group as its own primary.
+    #[rstest]
+    fn test_tc_tag_group_key_matches_own_primary(
+        #[values(PairLayout::R1Lower, PairLayout::R2Lower, PairLayout::SamePositionR1Reverse)]
+        layout: PairLayout,
+        #[values(
+            NonPrimary::R1Supplementary,
+            NonPrimary::R2Supplementary,
+            NonPrimary::R1Secondary,
+            NonPrimary::R2Secondary
+        )]
+        which: NonPrimary,
+    ) -> Result<()> {
+        use fgumi_bam_io::{LibraryIndex, compute_group_key_from_raw};
+
+        let (own_primary, tagged) = tc_tagged_template(layout, which)?;
+        let library_index = LibraryIndex::from_header(&noodles::sam::Header::default())?;
+        let key = |rec: &RawRecord| {
+            compute_group_key_from_raw(rec.as_ref(), &library_index, None).position_key()
+        };
+
+        assert_eq!(
+            key(&tagged),
+            key(&own_primary),
+            "{layout:?} {which:?} must group at its primary's template coordinate"
+        );
+        Ok(())
+    }
+
     /// Tests that tc tag contains full template sort key for paired-end data
     #[test]
     fn test_add_pa_tag_paired_end_r2_supplementary() -> Result<()> {

@@ -657,9 +657,7 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
         // primary. Library/cell are extracted the same way as primaries so the
         // position key matches (they share their template's RG/CB).
         let (aux_offset, aux_data) = aux_slice_with_offset(raw);
-        if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
-            fgumi_raw_bam::read_tc_template_coordinate(aux_data)
-        {
+        if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_aux_data(aux_data) {
             let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
             let aux_tags =
                 fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
@@ -667,14 +665,16 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
                 aux_tags.rg.map_or(0, |rg| library_index.get(LibraryIndex::hash_rg(rg)));
             let cell_hash = aux_tags.cell.map_or(0, |cb| LibraryIndex::hash_cell_barcode(Some(cb)));
             let umi = record_relative_umi(aux_offset, aux_tags.umi_position);
+            // Primaries are keyed 1-based here, the basis `tc` is written in, so
+            // its positions are used unconverted.
             return (
                 GroupKey::paired(
-                    tid1,
-                    pos1,
-                    u8::from(neg1 != 0),
-                    tid2,
-                    pos2,
-                    u8::from(neg2 != 0),
+                    tc.tid1,
+                    tc.pos1,
+                    u8::from(tc.neg1),
+                    tc.tid2,
+                    tc.pos2,
+                    u8::from(tc.neg2),
                     library_idx,
                     cell_hash,
                     name_hash,

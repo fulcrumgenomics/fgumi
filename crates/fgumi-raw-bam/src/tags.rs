@@ -600,6 +600,10 @@ fn parse_array_tag_at(aux_data: &[u8], data_start: usize) -> Option<ArrayTagRef<
 /// reconstruct, since it carries its own and its mate's position but not its own
 /// primary's.
 ///
+/// Returns the raw values, with 1-based positions; prefer
+/// [`TemplateCoordinateTag::from_aux_data`], which names them and converts the
+/// basis for 0-based consumers.
+///
 /// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
 #[must_use]
 pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
@@ -618,6 +622,89 @@ pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
         ]);
     }
     Some(out)
+}
+
+/// The template coordinate decoded from a secondary or supplementary record's
+/// `tc` tag: where its template's primary reads are.
+///
+/// `fgumi zipper` writes the tag (see `Template::add_template_coordinate_tags`),
+/// and the template-coordinate sort and the grouper read it back. Both readers go
+/// through this type so the tag's meaning is defined once.
+///
+/// # Coordinate basis
+///
+/// `pos1`/`pos2` are the primaries' unclipped 5' positions, **1-based**, exactly
+/// as zipper computes them with [`crate::unclipped_5prime_from_raw_bam`]. The
+/// grouper keys primaries 1-based and uses them as-is. The sort keys primaries
+/// 0-based and must convert with [`Self::zero_based_positions`]; reading the positions
+/// unconverted keys every secondary/supplementary read 1 bp to the right of its
+/// primaries.
+///
+/// # Ordering
+///
+/// The two primaries are ordered by `(tid, pos, neg)` with forward before
+/// reverse, the order the template-coordinate sort gives a pair's own primaries:
+/// at equal `(tid, pos)` the reverse-strand end is the upper one.
+/// [`Self::from_primaries`] builds that order and [`Self::from_aux_data`]
+/// restores it for tags whose two primaries share a position (zipper 0.9.0 and
+/// earlier ordered by `(tid, pos)` only, so the strands could be swapped).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateCoordinateTag {
+    /// Reference ID of the lower primary.
+    pub tid1: i32,
+    /// 1-based unclipped 5' position of the lower primary.
+    pub pos1: i32,
+    /// Whether the lower primary is on the reverse strand.
+    pub neg1: bool,
+    /// Reference ID of the upper primary.
+    pub tid2: i32,
+    /// 1-based unclipped 5' position of the upper primary.
+    pub pos2: i32,
+    /// Whether the upper primary is on the reverse strand.
+    pub neg2: bool,
+}
+
+impl TemplateCoordinateTag {
+    /// A position that is not a coordinate, and so is never shifted between
+    /// bases. The sort and the grouper both use `i32::MAX` for "no position"
+    /// in a key's second slot. zipper also writes it for a mapped primary with
+    /// an empty CIGAR (no computable unclipped 5' position), a degenerate
+    /// record that the sort and grouper key differently on its primary.
+    pub const UNKNOWN_POS: i32 = i32::MAX;
+
+    /// The coordinate of a template whose two mapped primaries are `a` and `b`,
+    /// each `(tid, 1-based unclipped 5' position, is_reverse)`, in either order.
+    #[must_use]
+    pub fn from_primaries(a: (i32, i32, bool), b: (i32, i32, bool)) -> Self {
+        let ((tid1, pos1, neg1), (tid2, pos2, neg2)) = if a <= b { (a, b) } else { (b, a) };
+        Self { tid1, pos1, neg1, tid2, pos2, neg2 }
+    }
+
+    /// Decodes the `tc` tag from a record's aux data, in canonical order (see
+    /// the type docs).
+    ///
+    /// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
+    #[must_use]
+    pub fn from_aux_data(aux_data: &[u8]) -> Option<Self> {
+        let [tid1, pos1, neg1, tid2, pos2, neg2] = read_tc_template_coordinate(aux_data)?;
+        Some(Self::from_primaries((tid1, pos1, neg1 != 0), (tid2, pos2, neg2 != 0)))
+    }
+
+    /// The six `B:i` values of the `tc` tag, in the order
+    /// `[tid1, pos1, neg1, tid2, pos2, neg2]`.
+    #[must_use]
+    pub fn to_values(&self) -> [i32; 6] {
+        [self.tid1, self.pos1, i32::from(self.neg1), self.tid2, self.pos2, i32::from(self.neg2)]
+    }
+
+    /// Returns `(pos1, pos2)` converted from 1-based to 0-based, the basis the
+    /// template-coordinate sort keys primaries in, leaving [`Self::UNKNOWN_POS`]
+    /// unchanged.
+    #[must_use]
+    pub fn zero_based_positions(&self) -> (i32, i32) {
+        let shift = |pos: i32| if pos == Self::UNKNOWN_POS { pos } else { pos.saturating_sub(1) };
+        (shift(self.pos1), shift(self.pos2))
+    }
 }
 
 /// Zero-copy typed BAM aux tag value.
@@ -5766,5 +5853,79 @@ mod tests {
             &as_xs(),
             "adds non-int/overflow",
         );
+    }
+
+    // ========================================================================
+    // TemplateCoordinateTag
+    // ========================================================================
+
+    fn tc_aux(values: &[i32]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        append_i32_array_tag(&mut aux, SamTag::TC, values);
+        aux
+    }
+
+    #[rstest]
+    #[case::forward_reverse_pair(
+        [0, 1001, 0, 0, 1401, 1],
+        TemplateCoordinateTag { tid1: 0, pos1: 1001, neg1: false, tid2: 0, pos2: 1401, neg2: true },
+    )]
+    #[case::cross_contig(
+        [2, 50, 1, 7, 9, 0],
+        TemplateCoordinateTag { tid1: 2, pos1: 50, neg1: true, tid2: 7, pos2: 9, neg2: false },
+    )]
+    fn test_template_coordinate_tag_from_aux_data(
+        #[case] values: [i32; 6],
+        #[case] expected: TemplateCoordinateTag,
+    ) {
+        assert_eq!(TemplateCoordinateTag::from_aux_data(&tc_aux(&values)), Some(expected));
+    }
+
+    #[rstest]
+    #[case::absent(Vec::new())]
+    #[case::too_few_elements(tc_aux(&[0, 1001, 0, 0, 1401]))]
+    #[case::too_many_elements(tc_aux(&[0, 1001, 0, 0, 1401, 1, 0]))]
+    fn test_template_coordinate_tag_from_aux_data_rejects(#[case] aux: Vec<u8>) {
+        assert_eq!(TemplateCoordinateTag::from_aux_data(&aux), None);
+    }
+
+    #[rstest]
+    #[case::ordinary(1001, 1401, 1000, 1400)]
+    #[case::first_base(1, 1, 0, 0)]
+    #[case::soft_clipped_before_contig_start(-2, 5, -3, 4)]
+    #[case::unknown_pos_is_not_shifted(1001, i32::MAX, 1000, i32::MAX)]
+    #[case::i32_min_saturates(i32::MIN, 1, i32::MIN, 0)]
+    fn test_template_coordinate_tag_zero_based_positions(
+        #[case] pos1: i32,
+        #[case] pos2: i32,
+        #[case] expected_pos1: i32,
+        #[case] expected_pos2: i32,
+    ) {
+        let tc = TemplateCoordinateTag { tid1: 3, pos1, neg1: true, tid2: 4, pos2, neg2: false };
+        assert_eq!(tc.zero_based_positions(), (expected_pos1, expected_pos2));
+    }
+
+    /// The canonical order is `(tid, pos, neg)`, forward first on a tie, which is
+    /// the order the sort's per-record path gives a pair's own primaries.
+    #[rstest]
+    #[case::already_ordered((0, 100, false), (0, 300, true), [0, 100, 0, 0, 300, 1])]
+    #[case::swapped_positions((0, 300, true), (0, 100, false), [0, 100, 0, 0, 300, 1])]
+    #[case::lower_contig_first((5, 1, false), (2, 900, true), [2, 900, 1, 5, 1, 0])]
+    #[case::same_position_forward_first((0, 100, true), (0, 100, false), [0, 100, 0, 0, 100, 1])]
+    #[case::same_position_same_strand((0, 100, true), (0, 100, true), [0, 100, 1, 0, 100, 1])]
+    fn test_template_coordinate_tag_from_primaries(
+        #[case] a: (i32, i32, bool),
+        #[case] b: (i32, i32, bool),
+        #[case] expected_values: [i32; 6],
+    ) {
+        assert_eq!(TemplateCoordinateTag::from_primaries(a, b).to_values(), expected_values);
+    }
+
+    /// A tag written with a same-position pair's strands swapped (as zipper 0.9.0
+    /// did when the reverse-strand primary was R1) decodes in canonical order.
+    #[test]
+    fn test_template_coordinate_tag_from_aux_data_canonicalizes_same_position_strands() {
+        let tc = TemplateCoordinateTag::from_aux_data(&tc_aux(&[0, 100, 1, 0, 100, 0]));
+        assert_eq!(tc.map(|tc| tc.to_values()), Some([0, 100, 0, 0, 100, 1]));
     }
 }
