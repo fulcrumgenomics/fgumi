@@ -4651,13 +4651,12 @@ mod tests {
         // Parse and verify the tc tag
         let tc_info = tc_info_from_raw(supp).expect("Supplementary should have tc tag");
 
-        // Only R1 mapped, so both positions should be the same
-        assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference");
-        assert_eq!(tc_info.pos1, 100, "pos1 should be R1's position");
-        assert!(!tc_info.neg1, "neg1 should be false (forward strand)");
-        assert_eq!(tc_info.tid2, 0, "tid2 should equal tid1 (single read)");
-        assert_eq!(tc_info.pos2, 100, "pos2 should equal pos1 (single read)");
-        assert!(!tc_info.neg2, "neg2 should equal neg1 (single read)");
+        // Only R1 mapped, so the second slot holds "no mate" (#1089)
+        let (no_tid, no_pos) = (
+            fgumi_raw_bam::TemplateCoordinateTag::UNKNOWN_REF,
+            fgumi_raw_bam::TemplateCoordinateTag::UNKNOWN_POS,
+        );
+        assert_eq!(tc_info, TemplateCoordinateInfo::new(0, 100, false, no_tid, no_pos, false));
 
         // Check that primary does NOT have tc tag
         let primary = template.r1().expect("Should have primary R1");
@@ -4889,6 +4888,151 @@ mod tests {
             key(&tagged),
             key(&own_primary),
             "{layout:?} {which:?} must group at its primary's template coordinate"
+        );
+        Ok(())
+    }
+
+    /// The shape of a template with exactly one mapped primary, for the `tc`
+    /// round-trip tests of #1089.
+    #[derive(Copy, Clone, Debug)]
+    enum OnePrimary {
+        /// A pair whose R1 is mapped and R2 unmapped; the non-primary is R1's.
+        R2Unmapped,
+        /// A pair whose R2 is mapped and R1 unmapped; the non-primary is R2's.
+        R1Unmapped,
+        /// A single-end (unpaired) read.
+        SingleEnd,
+    }
+
+    /// Builds a template of `shape` with one secondary or supplementary record
+    /// (`kind_flag`) of its mapped primary, and runs zipper's mate fixing and
+    /// `tc` writer over it. With `legacy_tag`, the tag is then replaced by the
+    /// one zipper 0.9.0 wrote: the one primary copied into both slots. Returns
+    /// `(mapped primary, non-primary)`.
+    fn tc_tagged_one_primary_template(
+        shape: OnePrimary,
+        kind_flag: u16,
+        legacy_tag: bool,
+    ) -> Result<(RawRecord, RawRecord)> {
+        use crate::template::Template;
+
+        // The mapped primary is reverse-strand and soft-clipped (`8M2S` at
+        // 0-based 299, unclipped 5' 308 0-based, 309 in `tc`), so a strand or
+        // basis slip shows. The non-primary record is aligned far away (0-based
+        // 4999), so its sort and group keys match the primary's only if they
+        // come from `tc`.
+        let cigar = [encode_op(0, 8), encode_op(4, 2)];
+        let mapped_read = |segment: u16, extra: u16| {
+            let pos = if extra == 0 { 299 } else { 4999 };
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(segment | FLAG_REVERSE | extra)
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&cigar)
+                .sequence(b"ACGTACGTAC")
+                .qualities(&[30u8; 10]);
+            if segment & FLAG_PAIRED != 0 {
+                b.mate_ref_id(0).mate_pos(299);
+            }
+            b.build()
+        };
+        let unmapped_mate = |segment: u16| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | segment | flags::UNMAPPED | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(299)
+                .mate_ref_id(0)
+                .mate_pos(299)
+                .sequence(b"ACGTACGTAC")
+                .qualities(&[30u8; 10]);
+            b.build()
+        };
+
+        let records = match shape {
+            OnePrimary::R2Unmapped => {
+                let segment = FLAG_PAIRED | FLAG_READ1 | flags::MATE_UNMAPPED;
+                vec![
+                    mapped_read(segment, 0),
+                    unmapped_mate(FLAG_READ2),
+                    mapped_read(segment, kind_flag),
+                ]
+            }
+            OnePrimary::R1Unmapped => {
+                let segment = FLAG_PAIRED | FLAG_READ2 | flags::MATE_UNMAPPED;
+                vec![
+                    unmapped_mate(FLAG_READ1),
+                    mapped_read(segment, 0),
+                    mapped_read(segment, kind_flag),
+                ]
+            }
+            OnePrimary::SingleEnd => vec![mapped_read(0, 0), mapped_read(0, kind_flag)],
+        };
+
+        let mut template = Template::from_records(records)?;
+        template.fix_mate_info()?;
+        template.add_template_coordinate_tags();
+
+        let is_non_primary = |r: &RawRecord| r.is_secondary() || r.is_supplementary();
+        let mut tagged =
+            template.records().iter().find(|r| is_non_primary(r)).expect("non-primary").clone();
+        let primary = template
+            .records()
+            .iter()
+            .find(|r| !is_non_primary(r) && !r.is_unmapped())
+            .expect("mapped primary")
+            .clone();
+
+        if legacy_tag {
+            let tc = tc_info_from_raw(&tagged).expect("tc tag");
+            let legacy =
+                [tc.tid1, tc.pos1, i32::from(tc.neg1), tc.tid1, tc.pos1, i32::from(tc.neg1)];
+            fgumi_raw_bam::remove_tag(tagged.as_mut_vec(), SamTag::TC);
+            fgumi_raw_bam::append_i32_array_tag(tagged.as_mut_vec(), SamTag::TC, &legacy);
+        }
+        Ok((primary, tagged))
+    }
+
+    /// A secondary or supplementary record of a template with one mapped
+    /// primary must sort and group with that primary (#1089: `tc` copied the
+    /// primary into both slots while the primary is keyed with "no mate", so the
+    /// record sorted among all pairs on its contig and `dedup` dropped it). Tags
+    /// written by zipper 0.9.0 (`legacy_tag`) must too, so existing BAMs only
+    /// need re-sorting.
+    #[rstest]
+    fn test_tc_tag_one_primary_keys_match_primary(
+        #[values(OnePrimary::R2Unmapped, OnePrimary::R1Unmapped, OnePrimary::SingleEnd)]
+        shape: OnePrimary,
+        #[values(FLAG_SUPPLEMENTARY, FLAG_SECONDARY)] kind_flag: u16,
+        #[values(false, true)] legacy_tag: bool,
+    ) -> Result<()> {
+        use fgumi_bam_io::{LibraryIndex, compute_group_key_from_raw};
+        use fgumi_sort::{LibraryLookup, cb_hasher, extract_template_key_inline};
+
+        let (primary, tagged) = tc_tagged_one_primary_template(shape, kind_flag, legacy_tag)?;
+
+        let lib_lookup = LibraryLookup::from_header(&noodles::sam::Header::default());
+        let sort_key = |rec: &RawRecord| {
+            extract_template_key_inline(rec.as_ref(), &lib_lookup, None, &cb_hasher())
+        };
+        // The full key, `is_upper` tiebreak included: a one-primary template's
+        // primary is always the lower lane, whichever segment it is.
+        assert_eq!(
+            sort_key(&tagged),
+            sort_key(&primary),
+            "{shape:?} non-primary must sort at its primary's template coordinate"
+        );
+
+        let library_index = LibraryIndex::from_header(&noodles::sam::Header::default())?;
+        let group_key = |rec: &RawRecord| {
+            compute_group_key_from_raw(rec.as_ref(), &library_index, None).position_key()
+        };
+        assert_eq!(
+            group_key(&tagged),
+            group_key(&primary),
+            "{shape:?} non-primary must group at its primary's template coordinate"
         );
         Ok(())
     }

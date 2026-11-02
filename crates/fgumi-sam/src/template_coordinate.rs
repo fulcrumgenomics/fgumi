@@ -47,11 +47,16 @@ pub struct TemplateCoordinateInfo {
     pub pos1: i32,
     /// True if earlier mate is on reverse strand.
     pub neg1: bool,
-    /// Reference ID of the later mate.
+    /// Reference ID of the later mate, or `i32::MAX` when the template has only
+    /// one mapped primary (see `fgumi_raw_bam::TemplateCoordinateTag::one_primary`).
     pub tid2: i32,
-    /// 1-based unclipped 5' position of the later mate.
+    /// 1-based unclipped 5' position of the later mate, or `i32::MAX` when the
+    /// template has only one mapped primary. zipper 0.9.0 and earlier instead
+    /// copied the one primary into this slot; `TemplateCoordinateTag::from_record_aux`
+    /// reads both.
     pub pos2: i32,
-    /// True if later mate is on reverse strand.
+    /// True if later mate is on reverse strand; `false` when the template has
+    /// only one mapped primary.
     pub neg2: bool,
 }
 

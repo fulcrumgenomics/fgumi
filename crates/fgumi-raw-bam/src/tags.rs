@@ -600,9 +600,11 @@ fn parse_array_tag_at(aux_data: &[u8], data_start: usize) -> Option<ArrayTagRef<
 /// reconstruct, since it carries its own and its mate's position but not its own
 /// primary's.
 ///
-/// Returns the raw values, with 1-based positions; prefer
-/// [`TemplateCoordinateTag::from_aux_data`], which names them and converts the
-/// basis for 0-based consumers.
+/// Returns the raw values, with 1-based positions. To key a record, use
+/// [`TemplateCoordinateTag::from_record_aux`] instead: given the record's flags,
+/// it also reads tags written by zipper 0.9.0 and earlier for templates with one
+/// mapped primary, and [`TemplateCoordinateTag::zero_based_positions`] converts
+/// the basis for 0-based consumers.
 ///
 /// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
 #[must_use]
@@ -648,6 +650,16 @@ pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
 /// [`Self::from_primaries`] builds that order and [`Self::from_aux_data`]
 /// restores it for tags whose two primaries share a position (zipper 0.9.0 and
 /// earlier ordered by `(tid, pos)` only, so the strands could be swapped).
+///
+/// # Templates with one mapped primary
+///
+/// When only one primary is mapped (single-end reads, or a pair whose mate is
+/// unmapped), the second slot is `(UNKNOWN_REF, UNKNOWN_POS, forward)`, the
+/// same "no mate" the sort and the grouper key that primary with (see
+/// [`Self::one_primary`]). zipper 0.9.0 and earlier instead copied the one
+/// primary into both slots; readers use [`Self::from_record_aux`], which
+/// recognizes those tags from the record's own flags so existing BAMs need not
+/// be re-run through zipper.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TemplateCoordinateTag {
     /// Reference ID of the lower primary.
@@ -672,6 +684,18 @@ impl TemplateCoordinateTag {
     /// record that the sort and grouper key differently on its primary.
     pub const UNKNOWN_POS: i32 = i32::MAX;
 
+    /// The reference ID of the second slot when the template has only one
+    /// mapped primary; the sort and the grouper use the same value.
+    pub const UNKNOWN_REF: i32 = i32::MAX;
+
+    /// The coordinate of a template whose only mapped primary is `primary`,
+    /// `(tid, 1-based unclipped 5' position, is_reverse)`.
+    #[must_use]
+    pub const fn one_primary(primary: (i32, i32, bool)) -> Self {
+        let (tid1, pos1, neg1) = primary;
+        Self { tid1, pos1, neg1, tid2: Self::UNKNOWN_REF, pos2: Self::UNKNOWN_POS, neg2: false }
+    }
+
     /// The coordinate of a template whose two mapped primaries are `a` and `b`,
     /// each `(tid, 1-based unclipped 5' position, is_reverse)`, in either order.
     #[must_use]
@@ -681,13 +705,50 @@ impl TemplateCoordinateTag {
     }
 
     /// Decodes the `tc` tag from a record's aux data, in canonical order (see
-    /// the type docs).
+    /// the type docs), without the one-primary handling of
+    /// [`Self::from_record_aux`].
     ///
     /// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
     #[must_use]
     pub fn from_aux_data(aux_data: &[u8]) -> Option<Self> {
         let [tid1, pos1, neg1, tid2, pos2, neg2] = read_tc_template_coordinate(aux_data)?;
         Some(Self::from_primaries((tid1, pos1, neg1 != 0), (tid2, pos2, neg2 != 0)))
+    }
+
+    /// Decodes the `tc` tag of a secondary or supplementary record, given the
+    /// record's aux data and flags, into the coordinate its template's primaries
+    /// are keyed at. The sort and the grouper read the tag through this.
+    ///
+    /// A tag written by zipper 0.9.0 or earlier for a template with one mapped
+    /// primary has that primary in both slots. That is indistinguishable from a
+    /// pair whose two primaries share a reference, position and strand, so the
+    /// record's flags decide: when the record is unpaired or its mate is
+    /// unmapped, the template had one mapped primary, and the tag is read as
+    /// [`Self::one_primary`]. zipper sets the mate flags of supplementary
+    /// records from the template's primaries; for secondary records this relies
+    /// on the aligner having set them (zipper leaves secondaries' mate fields as
+    /// the aligner wrote them).
+    ///
+    /// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
+    #[must_use]
+    pub fn from_record_aux(aux_data: &[u8], record_flags: u16) -> Option<Self> {
+        use crate::fields::flags::{MATE_UNMAPPED, PAIRED};
+
+        let tc = Self::from_aux_data(aux_data)?;
+        let has_no_mapped_mate = record_flags & PAIRED == 0 || record_flags & MATE_UNMAPPED != 0;
+        let slots_equal = (tc.tid1, tc.pos1, tc.neg1) == (tc.tid2, tc.pos2, tc.neg2);
+        if has_no_mapped_mate && slots_equal {
+            Some(Self::one_primary((tc.tid1, tc.pos1, tc.neg1)))
+        } else {
+            Some(tc)
+        }
+    }
+
+    /// Whether the template had only one mapped primary (see
+    /// [`Self::one_primary`]).
+    #[must_use]
+    pub const fn has_one_primary(&self) -> bool {
+        self.tid2 == Self::UNKNOWN_REF && self.pos2 == Self::UNKNOWN_POS
     }
 
     /// The six `B:i` values of the `tc` tag, in the order
@@ -5927,5 +5988,53 @@ mod tests {
     fn test_template_coordinate_tag_from_aux_data_canonicalizes_same_position_strands() {
         let tc = TemplateCoordinateTag::from_aux_data(&tc_aux(&[0, 100, 1, 0, 100, 0]));
         assert_eq!(tc.map(|tc| tc.to_values()), Some([0, 100, 0, 0, 100, 1]));
+    }
+
+    use crate::fields::flags;
+
+    /// `from_record_aux` reads a one-primary tag in either encoding as
+    /// `one_primary`, and keeps a real pair whose primaries share a position.
+    #[rstest]
+    #[case::new_encoding_mate_unmapped(
+        [0, 309, 1, i32::MAX, i32::MAX, 0],
+        flags::PAIRED | flags::MATE_UNMAPPED,
+        true
+    )]
+    #[case::legacy_encoding_mate_unmapped(
+        [0, 309, 1, 0, 309, 1],
+        flags::PAIRED | flags::MATE_UNMAPPED,
+        true
+    )]
+    #[case::legacy_encoding_unpaired([0, 309, 1, 0, 309, 1], 0, true)]
+    #[case::same_position_pair_mate_mapped([0, 309, 1, 0, 309, 1], flags::PAIRED, false)]
+    #[case::distinct_pair_mate_unmapped(
+        [0, 100, 0, 0, 309, 1],
+        flags::PAIRED | flags::MATE_UNMAPPED,
+        false
+    )]
+    fn test_template_coordinate_tag_from_record_aux(
+        #[case] values: [i32; 6],
+        #[case] record_flags: u16,
+        #[case] expect_one_primary: bool,
+    ) {
+        let tc = TemplateCoordinateTag::from_record_aux(
+            &tc_aux(&values),
+            record_flags | flags::SUPPLEMENTARY,
+        )
+        .expect("tc tag");
+        let expected = if expect_one_primary {
+            TemplateCoordinateTag::one_primary((values[0], values[1], values[2] != 0))
+        } else {
+            TemplateCoordinateTag::from_aux_data(&tc_aux(&values)).expect("tc tag")
+        };
+        assert_eq!(tc, expected);
+        assert_eq!(tc.has_one_primary(), expect_one_primary);
+    }
+
+    #[test]
+    fn test_template_coordinate_tag_one_primary_values() {
+        let tc = TemplateCoordinateTag::one_primary((2, 309, true));
+        assert_eq!(tc.to_values(), [2, 309, 1, i32::MAX, i32::MAX, 0]);
+        assert_eq!(tc.zero_based_positions(), (308, i32::MAX), "the no-mate slot is not shifted");
     }
 }

@@ -567,7 +567,9 @@ pub fn extract_template_key_inline(
     cb_hasher: &ahash::RandomState,
 ) -> TemplateKey {
     use fgumi_raw_bam;
-    use fgumi_raw_bam::{flags, mate_unclipped_5prime, unclipped_5prime_raw};
+    use fgumi_raw_bam::{
+        TemplateCoordinateTag, flags, mate_unclipped_5prime, unclipped_5prime_raw,
+    };
 
     // Single-pass extraction of all aux tags (MI, RG, cell barcode, MC)
     let aux = fgumi_raw_bam::extract_template_aux_tags(bam_bytes, cell_tag);
@@ -610,11 +612,13 @@ pub fn extract_template_key_inline(
     let is_supplementary = (flag & flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {
         let aux_slice = fgumi_raw_bam::aux_data_slice(bam_bytes);
-        if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_aux_data(aux_slice) {
+        if let Some(tc) = TemplateCoordinateTag::from_record_aux(aux_slice, flag) {
             // `tc` positions are 1-based; this key is 0-based like the per-record
             // path below (#1088). The decoder orders the two primaries as the
             // per-record path does, forward first on an equal (tid, pos), so the
-            // strand lanes match the primaries' too.
+            // strand lanes match the primaries' too. A template with one mapped
+            // primary decodes with the `i32::MAX` second slot that primary is
+            // keyed with below (#1089).
             let (pos1, pos2) = tc.zero_based_positions();
             //
             // `TemplateKey::new`'s final argument is the `is_upper` bit, packed
@@ -633,11 +637,13 @@ pub fn extract_template_key_inline(
             // which asserts the tc-keyed key is byte-identical to the primary's.
             // Any residual disagreement (an exotic pair whose R2 is the lower
             // lane) only reorders same-name records at an identical coordinate,
-            // so it cannot affect co-location or dedup grouping.
-            let is_read2 = (flag & 0x80) != 0;
+            // so it cannot affect co-location or dedup grouping. A template with
+            // one mapped primary has no upper lane: its primary is keyed
+            // `is_upper = false` whichever segment it is, so this read is too.
+            let is_upper = (flag & 0x80) != 0 && !tc.has_one_primary();
             return TemplateKey::new(
                 tc.tid1, pos1, tc.neg1, tc.tid2, pos2, tc.neg2, cb_hash, library, mi, name_hash,
-                is_read2,
+                is_upper,
             );
         }
     }
@@ -653,8 +659,8 @@ pub fn extract_template_key_inline(
                 mate_tid,
                 mate_unclipped,
                 mate_reverse,
-                i32::MAX,
-                i32::MAX,
+                TemplateCoordinateTag::UNKNOWN_REF,
+                TemplateCoordinateTag::UNKNOWN_POS,
                 false,
                 cb_hash,
                 library,
@@ -697,7 +703,9 @@ pub fn extract_template_key_inline(
         }
     } else {
         // Unpaired or mate unmapped - use MAX for tid2/pos2
-        (tid, i32::MAX, this_pos, i32::MAX, is_reverse, false, false)
+        let (no_tid, no_pos) =
+            (TemplateCoordinateTag::UNKNOWN_REF, TemplateCoordinateTag::UNKNOWN_POS);
+        (tid, no_tid, this_pos, no_pos, is_reverse, false, false)
     };
 
     TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, cb_hash, library, mi, name_hash, is_upper)
