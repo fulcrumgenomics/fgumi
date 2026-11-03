@@ -938,8 +938,8 @@ impl Template {
 
         let tc = match (r1_info, r2_info) {
             (Some(r1), Some(r2)) => TemplateCoordinateTag::from_primaries(r1, r2),
-            (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
-                TemplateCoordinateTag::from_primaries((t, p, n), (t, p, n))
+            (Some(primary), None) | (None, Some(primary)) => {
+                TemplateCoordinateTag::one_primary(primary)
             }
             (None, None) => return,
         };

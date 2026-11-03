@@ -121,6 +121,19 @@ fn assert_templates_contiguous(names: &[String]) {
         ("B", 147, 191, 60, "10M", 101),
     ],
 )]
+// #1089: C has one mapped primary (R2 unmapped). Its supplementary's `tc` copied
+// that primary into both slots while the primary is keyed with "no mate", so the
+// supplementary sorted before D and C's primaries after it.
+#[case::mate_unmapped_template(
+    &["C", "D"],
+    &[
+        ("C", 73, 1001, 60, "10M", 1001),
+        ("C", 133, 1001, 0, "*", 1001),
+        ("C", 2121, 2501, 60, "10M", 1001),
+        ("D", 99, 1201, 60, "10M", 1401),
+        ("D", 147, 1401, 60, "10M", 1201),
+    ],
+)]
 fn test_tc_tagged_record_sorts_with_its_template_and_survives_dedup(
     #[case] template_names: &[&str],
     #[case] alignments: &[(&str, u16, u32, u8, &str, u32)],

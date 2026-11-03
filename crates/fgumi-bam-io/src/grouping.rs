@@ -59,10 +59,12 @@ pub struct GroupKey {
 }
 
 impl GroupKey {
-    /// Sentinel value for unknown reference ID (unpaired reads).
-    pub const UNKNOWN_REF: i32 = i32::MAX;
-    /// Sentinel value for unknown position (unpaired reads).
-    pub const UNKNOWN_POS: i32 = i32::MAX;
+    /// Sentinel value for unknown reference ID (unpaired reads). The same value
+    /// `tc` carries for a template with one mapped primary.
+    pub const UNKNOWN_REF: i32 = fgumi_raw_bam::TemplateCoordinateTag::UNKNOWN_REF;
+    /// Sentinel value for unknown position (unpaired reads). The same value `tc`
+    /// carries for a template with one mapped primary.
+    pub const UNKNOWN_POS: i32 = fgumi_raw_bam::TemplateCoordinateTag::UNKNOWN_POS;
     /// Sentinel value for unknown strand (unpaired reads).
     pub const UNKNOWN_STRAND: u8 = u8::MAX;
 
@@ -657,7 +659,7 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
         // primary. Library/cell are extracted the same way as primaries so the
         // position key matches (they share their template's RG/CB).
         let (aux_offset, aux_data) = aux_slice_with_offset(raw);
-        if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_aux_data(aux_data) {
+        if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_record_aux(aux_data, flg) {
             let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
             let aux_tags =
                 fgumi_raw_bam::extract_aux_string_tags(aux_data, cell_tag_bytes, umi_tag);
@@ -666,8 +668,18 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
             let cell_hash = aux_tags.cell.map_or(0, |cb| LibraryIndex::hash_cell_barcode(Some(cb)));
             let umi = record_relative_umi(aux_offset, aux_tags.umi_position);
             // Primaries are keyed 1-based here, the basis `tc` is written in, so
-            // its positions are used unconverted.
-            return (
+            // its positions are used unconverted. A template with one mapped
+            // primary is keyed `single`, as that primary is below (#1089).
+            let key = if tc.has_one_primary() {
+                GroupKey::single(
+                    tc.tid1,
+                    tc.pos1,
+                    u8::from(tc.neg1),
+                    library_idx,
+                    cell_hash,
+                    name_hash,
+                )
+            } else {
                 GroupKey::paired(
                     tc.tid1,
                     tc.pos1,
@@ -678,9 +690,9 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
                     library_idx,
                     cell_hash,
                     name_hash,
-                ),
-                umi,
-            );
+                )
+            };
+            return (key, umi);
         }
         return (GroupKey { name_hash, ..GroupKey::default() }, None);
     }
