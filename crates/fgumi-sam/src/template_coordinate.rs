@@ -33,19 +33,23 @@ pub const TC_TAG: Tag = SamTag::TC.to_noodles_tag();
 /// `[tid1, pos1, neg1, tid2, pos2, neg2]`
 /// where `neg1`/`neg2` are 0 for forward, 1 for reverse strand.
 ///
+/// `pos1`/`pos2` are **1-based** unclipped 5' positions. zipper writes the tag,
+/// and the sort and grouper read it, through `fgumi_raw_bam::TemplateCoordinateTag`,
+/// which defines its basis and ordering; this type is the noodles-side view.
+///
 /// This format is faster to parse than a string representation and ensures
 /// supplementary reads get the exact same sort key as their primary reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemplateCoordinateInfo {
     /// Reference ID of the earlier mate (lower position).
     pub tid1: i32,
-    /// Unclipped 5' position of the earlier mate.
+    /// 1-based unclipped 5' position of the earlier mate.
     pub pos1: i32,
     /// True if earlier mate is on reverse strand.
     pub neg1: bool,
     /// Reference ID of the later mate.
     pub tid2: i32,
-    /// Unclipped 5' position of the later mate.
+    /// 1-based unclipped 5' position of the later mate.
     pub pos2: i32,
     /// True if later mate is on reverse strand.
     pub neg2: bool,

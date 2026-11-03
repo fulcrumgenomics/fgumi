@@ -610,26 +610,20 @@ pub fn extract_template_key_inline(
     let is_supplementary = (flag & flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {
         let aux_slice = fgumi_raw_bam::aux_data_slice(bam_bytes);
-        if let Some([tid1, pos1, neg1, tid2, pos2, neg2]) =
-            fgumi_raw_bam::read_tc_template_coordinate(aux_slice)
-        {
-            // `tc` is canonicalized by (tid, pos) only (see zipper's
-            // `add_template_coordinate_tags_raw`), whereas the per-record path
-            // additionally tiebreaks on strand for equal positions. In the
-            // degenerate case where both primaries share an identical tid and
-            // unclipped-5' position but differ in strand, the supplementary's
-            // secondary-lane strand order can differ from its primaries'. This is
-            // harmless: the primary lane (tid1, tid2, pos1) still matches, so the
-            // read co-locates with its template; only a same-coordinate tiebreak
-            // differs.
+        if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_aux_data(aux_slice) {
+            // `tc` positions are 1-based; this key is 0-based like the per-record
+            // path below (#1088). The decoder orders the two primaries as the
+            // per-record path does, forward first on an equal (tid, pos), so the
+            // strand lanes match the primaries' too.
+            let (pos1, pos2) = tc.zero_based_positions();
             //
             // `TemplateKey::new`'s final argument is the `is_upper` bit, packed
             // into `name_hash_upper` as the *last* tiebreak (after position,
             // strand, CB, library, MI, and name). For a mapped read it answers
             // "is this read's own primary the upper (lane-2) end?", derived from
             // this read's position vs. its mate. A secondary/supplementary read
-            // cannot recover that: `tc` is canonicalized by (tid, pos) and does
-            // not record which segment (R1/R2) landed on which lane, and the
+            // cannot recover that: `tc` does not record which segment (R1/R2)
+            // landed on which lane, and the
             // read's own alignment position is exactly the misleading coordinate
             // this branch exists to avoid. We use `is_read2` because it mirrors
             // the primary's `is_upper` for the standard FR pair (R1 is the lower
@@ -642,16 +636,7 @@ pub fn extract_template_key_inline(
             // so it cannot affect co-location or dedup grouping.
             let is_read2 = (flag & 0x80) != 0;
             return TemplateKey::new(
-                tid1,
-                pos1,
-                neg1 != 0,
-                tid2,
-                pos2,
-                neg2 != 0,
-                cb_hash,
-                library,
-                mi,
-                name_hash,
+                tc.tid1, pos1, tc.neg1, tc.tid2, pos2, tc.neg2, cb_hash, library, mi, name_hash,
                 is_read2,
             );
         }
@@ -1564,13 +1549,7 @@ mod moved_key_tests {
     /// onto secondary/supplementary reads.
     fn tc_aux(vals: &[i32; 6]) -> Vec<u8> {
         let mut aux = Vec::new();
-        aux.extend_from_slice(b"tcB"); // tag "tc", array type 'B'
-        aux.push(b'i'); // subtype: int32
-        #[allow(clippy::cast_possible_truncation)]
-        aux.extend_from_slice(&(vals.len() as u32).to_le_bytes());
-        for v in vals {
-            aux.extend_from_slice(&v.to_le_bytes());
-        }
+        fgumi_raw_bam::append_i32_array_tag(&mut aux, SamTag::TC, vals);
         aux
     }
 
@@ -1638,8 +1617,8 @@ mod moved_key_tests {
 
         // Sec/supp of a left-anchored R1: the primary is at pos 1000, its mate (R2
         // primary) at 1400, but this alignment is at 9000. The exact template
-        // coordinate (pos1) is 1000, carried in `tc`.
-        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        // coordinate (pos1) is 1000, carried in `tc` 1-based as zipper writes it.
+        let tc = tc_aux(&[0, 1001, 0, 0, 1401, 1]);
         let supp = build_secondary_or_supplementary_bam(9000, 1400, sec_supp_flag, b"tmpl", &tc);
         let supp_key = extract_template_key_inline(&supp, &lib_lookup, None, &test_cb_hasher());
 
@@ -1734,8 +1713,9 @@ mod moved_key_tests {
         );
 
         // Sec/supp reads through the tc branch, stamped with the pair's exact
-        // canonical template coordinate, but aligned far away (own pos 9000).
-        let tc = tc_aux(&[0, 1000, 0, 0, 1400, 1]);
+        // canonical template coordinate (1-based, as zipper writes it), but
+        // aligned far away (own pos 9000).
+        let tc = tc_aux(&[0, 1001, 0, 0, 1401, 1]);
         let r1_ss = build_secondary_or_supplementary_bam(
             9000,
             1400,

@@ -126,10 +126,10 @@ pub use fgumi_tag::{AsTagBytes, SamTag};
 // -- tags --
 pub use tags::{
     ArrayTagRef, AuxStringTags, AuxTagsIter, RawTagsEditor, RawTagsMut, RawTagsView, TagBitset,
-    TagEntry, TagKeySet, TagValue, TemplateAuxTags, append_i32_array_tag, append_raw_tag,
-    append_signed_int_tag, array_tag_element_u16, array_tag_to_vec_u16, decode_int_value,
-    extract_aux_string_tags, extract_int_value, extract_template_aux_tags, find_array_tag,
-    find_float_tag, find_int_tag, find_mc_tag_in_record, find_string_tag,
+    TagEntry, TagKeySet, TagValue, TemplateAuxTags, TemplateCoordinateTag, append_i32_array_tag,
+    append_raw_tag, append_signed_int_tag, array_tag_element_u16, array_tag_to_vec_u16,
+    decode_int_value, extract_aux_string_tags, extract_int_value, extract_template_aux_tags,
+    find_array_tag, find_float_tag, find_int_tag, find_mc_tag_in_record, find_string_tag,
     find_string_tag_in_record, find_string_tag_position, find_tag_type,
     find_two_string_tags_in_record, find_uint8_tag, normalize_int_tag_to_smallest_signed,
     read_tc_template_coordinate, remove_tag, reverse_array_tag_in_place,

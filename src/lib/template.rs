@@ -33,9 +33,10 @@
 //! }
 //! ```
 
-use crate::sam::{SamTag, TemplateCoordinateInfo};
+use crate::sam::SamTag;
 use anyhow::{Result, bail};
 use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
+use fgumi_raw_bam::TemplateCoordinateTag;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 // Re-export PairOrientation from sam module for backwards compatibility
@@ -935,33 +936,15 @@ impl Template {
             Some((ref_id, pos, is_reverse))
         });
 
-        let tc_info: Option<TemplateCoordinateInfo> = match (r1_info, r2_info) {
-            (Some((t1, p1, n1)), Some((t2, p2, n2))) => {
-                if (t1, p1) <= (t2, p2) {
-                    Some(TemplateCoordinateInfo::new(t1, p1, n1, t2, p2, n2))
-                } else {
-                    Some(TemplateCoordinateInfo::new(t2, p2, n2, t1, p1, n1))
-                }
-            }
+        let tc = match (r1_info, r2_info) {
+            (Some(r1), Some(r2)) => TemplateCoordinateTag::from_primaries(r1, r2),
             (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
-                Some(TemplateCoordinateInfo::new(t, p, n, t, p, n))
+                TemplateCoordinateTag::from_primaries((t, p, n), (t, p, n))
             }
-            (None, None) => None,
+            (None, None) => return,
         };
-
-        let Some(tc_info) = tc_info else {
-            return;
-        };
-
         let tc_tag = SamTag::TC;
-        let tc_values = [
-            tc_info.tid1,
-            tc_info.pos1,
-            i32::from(tc_info.neg1),
-            tc_info.tid2,
-            tc_info.pos2,
-            i32::from(tc_info.neg2),
-        ];
+        let tc_values = tc.to_values();
 
         for record in &mut self.records {
             let f = RawRecordView::new(record.as_ref()).flags();
