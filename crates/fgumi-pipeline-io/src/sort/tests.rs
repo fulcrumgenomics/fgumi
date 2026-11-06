@@ -5428,11 +5428,11 @@ fn residual_count(out: &ArenaFrontOutput) -> usize {
 /// When the sort spilled, the final in-memory run is sealed as `sort_threads`
 /// pre-sorted pieces (contiguous input ranges), each its own `Residual`; the
 /// merge of the spills and the pieces is the reference stable sort, equal keys
-/// in input order. Every order, at two and four sort threads.
+/// in input order. Every order that splits its final run, at two and four sort
+/// threads (coordinate keeps one residual: `coordinate_final_run_is_one_residual`).
 #[rstest]
 fn residual_pieces_merge_to_the_reference(
     #[values(
-        SortOrder::Coordinate,
         SortOrder::TemplateCoordinate,
         SortOrder::Queryname(QuerynameComparator::Lexicographic),
         SortOrder::Queryname(QuerynameComparator::Natural)
@@ -5492,6 +5492,46 @@ fn residual_pieces_merge_to_the_reference(
         &buffer.records,
         &expected,
     );
+}
+
+/// A coordinate sort that spilled seals its final run as one residual at any
+/// sort thread count (its whole-run radix is already parallel), and the merge
+/// of the spills and that residual is the reference stable sort, equal keys in
+/// input order, on both fronts.
+#[rstest]
+fn coordinate_final_run_is_one_residual(#[values(1usize, 2, 4)] sort_threads: usize) {
+    let order = SortOrder::Coordinate;
+    let (header, records) = tie_heavy_records(6_000, 61);
+    let n_ref = u32::try_from(header.reference_sequences().len()).unwrap();
+    let config = buffer_config(order, 96 * 1024, sort_threads);
+    let blocks = || bgzf_blocks_for(&records, n_ref, 4096);
+    let out = drive_arena_chunks(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        sort_threads,
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    assert!(out.slot_count >= 1, "t{sort_threads}: the fixture spills");
+    assert_eq!(residual_count(&out), 1, "t{sort_threads}: one residual");
+    let run = drive_arena_chain(
+        ArenaFront::Split,
+        config,
+        &header,
+        blocks(),
+        4 * 1024 * 1024,
+        sort_threads,
+        MergeSink::Batches(StepKind::Serial),
+        &ChainCaps::default(),
+    )
+    .unwrap();
+    let expected = reference_sort(order, &header, &records, None);
+    assert_record_parity(&format!("t{sort_threads}"), &run.records, &expected);
+    assert_input_order_within_equal_keys(order, &header, &run.records);
+    let buffer = drive_front(Front::SortBuffer, config, &header, &records, sort_threads).unwrap();
+    assert_record_parity(&format!("t{sort_threads} SortBuffer"), &buffer.records, &expected);
 }
 
 /// A sort that never spills keeps its single in-memory chunk, at any thread

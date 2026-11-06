@@ -226,11 +226,13 @@ pub enum SortChunkEvent {
     /// spilled seals its one run as one residual (the merge's single-chunk fast
     /// path); a sort that spilled seals its final run as one residual per
     /// pre-sorted piece (contiguous input ranges, emitted in input order, so
-    /// the merge keeps ties stable).
+    /// the merge keeps ties stable) when its order splits the final run, and
+    /// as one residual otherwise (coordinate).
     Residual { chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// Terminal sentinel carrying the final counts (number of `Spill` chunks =
     /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`: one
-    /// without spills, the final run's piece count with them).
+    /// without spills, the final run's piece count with them for an order that
+    /// splits it).
     /// Forwarded verbatim to `SortPhase1Event::AllAnnounced`.
     AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
 }
