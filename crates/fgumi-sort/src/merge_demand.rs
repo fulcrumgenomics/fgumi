@@ -136,9 +136,9 @@ impl MergeDemandStats {
         self.parking_registrations.fetch_add(1, Relaxed);
     }
 
-    /// A source switch scored the prediction the previous switch published:
-    /// `hit` when the merge switched to the source it named (a spill file, or
-    /// `None` for a memory source).
+    /// The source switch after a published prediction scored it: `hit` when
+    /// the merge switched to the source it named (a spill file, or `None` for
+    /// a memory source).
     pub fn record_prediction(&self, hit: bool) {
         self.predictions.fetch_add(1, Relaxed);
         if hit {
@@ -205,8 +205,10 @@ pub struct MergeDemandSnapshot {
     /// Stall episodes whose awaited slot had blocks being decompressed (a
     /// stash the merge could not serve at the stall has its front in flight).
     pub awaited_decompressing: u64,
-    /// Predictions a later source switch scored (every switch but the first
-    /// publishes one; the last is never scored).
+    /// Published predictions that a later source switch scored. The merge
+    /// publishes on its first switch, after a source drains, and every
+    /// `DEFAULT_PREDICTION_INTERVAL`-th switch, so this counts predictions,
+    /// not switches; the last published one may go unscored.
     pub predictions: u64,
     /// Scored predictions that named the source the merge switched to.
     pub prediction_hits: u64,
@@ -340,7 +342,7 @@ pub struct MergeDemand {
     starved: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The merge's scan-order hints, on their own cache line: decompress
     /// workers read them on every planning pass, and the merge writes the
-    /// stats beside them on every source switch.
+    /// stats beside them on source switches.
     hints: CachePadded<ScanHints>,
     stats: MergeDemandStats,
 }
@@ -521,8 +523,8 @@ impl MergeDemand {
 
     /// Publish the file the merge will need next (`None`: no spill file —
     /// the next source is in memory, or none remains). Stores only on a
-    /// change: the merge publishes on every source switch, often the same
-    /// file again, and every worker reads this line.
+    /// change: the merge republishes periodically, often the same file again,
+    /// and every worker reads this line.
     pub fn set_predicted(&self, slot_id: Option<u32>) {
         let v = encode(slot_id);
         if self.hints.predicted.load(Relaxed) != v {

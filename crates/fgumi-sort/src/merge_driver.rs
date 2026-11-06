@@ -718,6 +718,17 @@ pub trait MergeDriverDyn: Send {
     fn set_record_rewrite(&mut self, rewrite: &RecordRewrite);
 }
 
+/// Source switches between published read-ahead predictions (the first
+/// switch, and the first after a source drains, always publish one).
+///
+/// Measured on a 780M-record WGS coordinate merge (`-@ 32`, 18 sources) with
+/// spills on a 125 MB/s disk: predicting on every switch, 234 s of merge-thread
+/// time and 17.8 s of stalls; never predicting, 216 s and 40.2 s; every 64th
+/// switch, 219 s and 22.1 s, the fastest wall time of the three. The planner
+/// reads 1-4 MiB per fill, many thousands of records, so a prediction a few
+/// dozen switches old still steers it.
+pub(crate) const DEFAULT_PREDICTION_INTERVAL: u32 = 64;
+
 /// Internal phase of the [`MergeDriver`] non-blocking state machine.
 enum MergePhase<K> {
     /// Lazily priming the loser tree: each source's first record is pulled one
@@ -774,8 +785,19 @@ pub struct MergeDriver<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K> 
     slot_drained: Vec<bool>,
     /// `sources` index of the last record's source (a change is a switch).
     last_src: Option<usize>,
-    /// The file the last switch predicted, scored on the next switch.
+    /// The file the last published prediction named, scored on the next switch.
     last_predicted: Option<u32>,
+    /// Whether the next switch scores `last_predicted` (each published
+    /// prediction is scored once, against the switch right after it).
+    score_next_switch: bool,
+    /// Source switches since the last published prediction.
+    switches_since_prediction: u32,
+    /// Publish a prediction on every this-many-th source switch (and the
+    /// first); see [`DEFAULT_PREDICTION_INTERVAL`].
+    prediction_interval: u32,
+    /// Predictions published so far (tests).
+    #[cfg(test)]
+    predictions_published: u64,
     /// The key's merge-wide context for rebuilding slot keys (see
     /// [`RawSortKey::MergeCtx`]).
     ctx: K::MergeCtx,
@@ -893,6 +915,11 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
             slot_drained,
             last_src: None,
             last_predicted: None,
+            score_next_switch: false,
+            switches_since_prediction: 0,
+            prediction_interval: DEFAULT_PREDICTION_INTERVAL,
+            #[cfg(test)]
+            predictions_published: 0,
             ctx,
             #[cfg(test)]
             kind_for_test: None,
@@ -944,6 +971,21 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         Some(anyhow::anyhow!(input_order_violation(name, order, self.pulled[src])))
     }
 
+    /// Predictions this driver has published (tests).
+    #[cfg(test)]
+    pub(crate) fn predictions_published(&self) -> u64 {
+        self.predictions_published
+    }
+
+    /// Publish a prediction on every `interval`-th source switch instead of
+    /// [`DEFAULT_PREDICTION_INTERVAL`] (tests: 1 predicts on every switch).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_prediction_interval(mut self, interval: u32) -> Self {
+        self.prediction_interval = interval.max(1);
+        self
+    }
+
     /// The sort's merge-wide demand; the driver publishes predictions and the
     /// frontier through it. Publishes the initial frontier (the lowest slot's
     /// file) at once, so a reader never sees "every file drained" before the
@@ -964,25 +1006,47 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriver<K, R>
         }
     }
 
-    /// On a source switch publish the runner-up's file (a memory source is
-    /// never predicted — it has no file to read — so it publishes `None`) and
-    /// score the previous switch's prediction: a hit when the new winner is
-    /// the source it named, a memory source included. The first record's
-    /// switch has no earlier prediction to score. This runs on every switch,
-    /// which in an interleaved merge is most records: the caller's
-    /// `runner_up` walk (O(log k) key compares), one or two relaxed stat
-    /// increments, and a store only when the prediction changes.
-    fn on_source_switch(&mut self, runner_up_src: Option<usize>, src: usize) {
+    /// On a source switch, score the last published prediction if it has not
+    /// been scored yet (a hit when the new winner is the source it named, a
+    /// memory source included), and report whether this switch publishes a
+    /// new one: the first switch, the first after a source drains, and every
+    /// `prediction_interval`-th after the last one published.
+    ///
+    /// In an interleaved merge most records are a switch, and the runner-up
+    /// walk is O(log k) key compares, so computing it on every switch was a
+    /// large share of the single merge thread's time. The planner acts on the
+    /// prediction at fill granularity (1-4 MiB reads); see
+    /// [`DEFAULT_PREDICTION_INTERVAL`] for the measured trade-off.
+    fn on_source_switch(&mut self, src: usize) -> bool {
         let first = self.last_src.is_none();
         self.last_src = Some(src);
-        let Some(d) = &self.demand else { return };
-        let now = self.source_slot_id[src];
-        if !first {
-            d.stats().record_prediction(now == self.last_predicted);
+        let Some(d) = &self.demand else { return false };
+        if self.score_next_switch {
+            d.stats().record_prediction(self.source_slot_id[src] == self.last_predicted);
+            self.score_next_switch = false;
         }
+        self.switches_since_prediction += 1;
+        if first || self.switches_since_prediction >= self.prediction_interval {
+            self.switches_since_prediction = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Publish `runner_up_src`'s file as the prediction (a memory source is
+    /// never predicted — it has no file to read — so it publishes `None`), to
+    /// be scored on the next switch.
+    fn publish_prediction(&mut self, runner_up_src: Option<usize>) {
+        let Some(d) = &self.demand else { return };
         let next = runner_up_src.and_then(|s| self.source_slot_id[s]);
         self.last_predicted = next;
+        self.score_next_switch = true;
         d.set_predicted(next);
+        #[cfg(test)]
+        {
+            self.predictions_published += 1;
+        }
     }
 
     /// The current record bytes of loser-tree `leaf`. Valid until that leaf's
@@ -1107,6 +1171,10 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                             TryRead::Ready(None) => {
                                 tree.remove_winner();
                                 self.on_source_end(src);
+                                // A drain changes the runner-up, and a run
+                                // transition is where the merge starves for the
+                                // next file: predict again on the next switch.
+                                self.switches_since_prediction = self.prediction_interval;
                             }
                         }
                     }
@@ -1115,9 +1183,9 @@ impl<K: RawSortKey + Default + Send + 'static, R: ChunkRef<K>> MergeDriverDyn
                     }
                     let winner = tree.winner();
                     let src = self.source_map[winner];
-                    if self.last_src != Some(src) {
+                    if self.last_src != Some(src) && self.on_source_switch(src) {
                         let runner_up = tree.runner_up().map(|leaf| self.source_map[leaf]);
-                        self.on_source_switch(runner_up, src);
+                        self.publish_prediction(runner_up);
                     }
                     self.records_merged += 1;
                     self.progress.log_if_needed(1);
