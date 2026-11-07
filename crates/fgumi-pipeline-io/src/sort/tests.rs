@@ -2917,20 +2917,73 @@ fn merge_with_work<O: crate::sort::merge::MergeOutput>(
     merge.with_pooled_gather(fanout_width, cap)
 }
 
+/// Sum of the per-tick deltas of counter `counter` of step `step`, read from the
+/// telemetry TSVs a run wrote at `stem`.
+fn telemetry_counter_total(path_stem: &std::path::Path, step_name: &str, counter: &str) -> u64 {
+    let read = |suffix: &str| {
+        std::fs::read_to_string(fgumi_pipeline_core::runtime::telemetry::ticks_path(
+            path_stem, suffix,
+        ))
+        .unwrap()
+    };
+    let step_idx = read("steps")
+        .lines()
+        .skip(1)
+        .find_map(|l| {
+            l.split_once('\t').filter(|(_, n)| *n == step_name).map(|(i, _)| i.to_owned())
+        })
+        .unwrap_or_else(|| panic!("no step row for {step_name}"));
+    let counter_idx = read("counter_names")
+        .lines()
+        .skip(1)
+        .find_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0] == step_idx && f[2] == counter).then(|| f[1].to_owned())
+        })
+        .unwrap_or_else(|| panic!("no counter row for {step_name}.{counter}"));
+    read("counters")
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[2] == step_idx && f[3] == counter_idx).then(|| f[4].parse::<u64>().unwrap())
+        })
+        .sum()
+}
+
+/// A `PipelineConfig` that writes telemetry at `dir/run`, so a test can read the
+/// `MergeWork` counters back with [`telemetry_counter_total`].
+fn telemetry_config(dir: &std::path::Path, threads: usize) -> PipelineConfig {
+    PipelineConfig { threads, ..Default::default() }.with_telemetry(
+        fgumi_pipeline_core::runtime::telemetry::TelemetryConfig {
+            stem: dir.join("run"),
+            interval: std::time::Duration::from_millis(2),
+        },
+    )
+}
+
+/// What a gather run produced: the emitted blocks' `(batch_serial, framed
+/// bytes)` and the number of jobs `MergeWork` ran (0 when the serial gather
+/// ran, the planned block count when the pooled gather did).
+struct GatherRun {
+    blocks: Vec<(u64, Vec<u8>)>,
+    jobs: u64,
+}
+
 /// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`
 /// fast path with an explicit fan-out width and a lowered parallel gate
-/// (`min_records`), with `MergeWork` on the merge's job branch, returning each
-/// emitted block's `(batch_serial, framed bytes)` so a test can assert the
-/// pooled gather is byte-for-byte identical to the serial one. `fanout_width ==
-/// 1` (or a `min_records` above the record count) takes the serial gather;
-/// `fanout_width > 1` with a low `min_records` takes the pooled gather.
+/// (`min_records`), with `MergeWork` on the merge's job branch on a pool of
+/// `pool_threads`. `fanout_width == 1` (or a `min_records` above the record
+/// count) takes the serial gather; `fanout_width > 1` with a low `min_records`
+/// takes the pooled gather. The run's `jobs` tell which one ran.
 fn collect_fastpath_blocks(
     events: Vec<crate::sort::protocol::SortPhase2Event>,
     output_byte_limit: u64,
     target_batch_count: usize,
     fanout_width: usize,
+    pool_threads: usize,
     min_records: usize,
-) -> Result<Vec<(u64, Vec<u8>)>> {
+) -> Result<GatherRun> {
     use crate::sort::merge::BlockOutput;
     use crate::types::DecompressedBlock;
 
@@ -2950,10 +3003,198 @@ fn collect_fastpath_blocks(
     fan.b0.chain(sink).into_sink_marker();
     fan.b1.chain(work).into_sink_marker();
     let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
+    let dir = tempfile::tempdir()?;
+    pipeline.run(telemetry_config(dir.path(), pool_threads))?;
+    let jobs = telemetry_counter_total(&dir.path().join("run"), "MergeWork", "jobs");
 
     let blocks = std::mem::take(&mut *received.lock());
-    Ok(blocks.into_iter().map(|b| (b.batch_serial, b.bytes)).collect())
+    Ok(GatherRun { blocks: blocks.into_iter().map(|b| (b.batch_serial, b.bytes)).collect(), jobs })
+}
+
+/// `events` for a single coordinate in-memory chunk of `records`.
+fn single_chunk_events(records: &[RawRecord]) -> Vec<crate::sort::protocol::SortPhase2Event> {
+    vec![
+        coordinate_memory_chunk_event(records.to_vec()),
+        crate::sort::protocol::SortPhase2Event::AllAnnounced {
+            slot_count: 0,
+            memory_chunk_count: 1,
+            total_records: records.len() as u64,
+        },
+    ]
+}
+
+/// The pooled gather (`MergeWork` on `pool_threads` threads, `fanout_width`
+/// wide) emits the same blocks as the serial gather, byte for byte, and
+/// `MergeWork` ran exactly one job per planned block (so gather mode, not the
+/// serial gather, produced the output). A plan of a single block has nothing
+/// to fan out, so `single_huge_record` pins that it takes the serial gather.
+#[rstest]
+#[case::small_records(400, 120, 64, 1 << 30, true)] // count-capped blocks of small records
+#[case::byte_cap_blocks(1200, 8 * 1024, 1 << 20, 4 << 20, true)] // records > 4 KiB: the 4 MiB cap cuts
+#[case::huge_records(3, 5 << 20, 64, 4 << 20, true)] // each record alone exceeds the 4 MiB cap
+#[case::single_huge_record(1, 5 << 20, 64, 4 << 20, false)] // one block: serial fall-through
+fn fast_path_gather_matches_serial(
+    #[case] n_records: usize,
+    #[case] rec_size: usize,
+    #[case] target_batch_count: usize,
+    #[case] byte_limit: u64,
+    #[case] fans_out: bool,
+    #[values(1, 2, 4)] threads: usize,
+) {
+    let (_header, records) = synthesize_sized_records(n_records, 0x5EED, rec_size);
+    let serial = collect_fastpath_blocks(
+        single_chunk_events(&records),
+        byte_limit,
+        target_batch_count,
+        1,
+        1,
+        0,
+    )
+    .expect("serial gather");
+    let pooled = collect_fastpath_blocks(
+        single_chunk_events(&records),
+        byte_limit,
+        target_batch_count,
+        threads,
+        threads,
+        0,
+    )
+    .expect("pooled gather");
+
+    assert_eq!(serial.jobs, 0, "the serial gather posts no jobs");
+    assert!(!serial.blocks.is_empty());
+    assert_eq!(pooled.blocks, serial.blocks, "pooled gather output differs from the serial gather");
+    for (i, (ordinal, _)) in pooled.blocks.iter().enumerate() {
+        assert_eq!(*ordinal, i as u64, "ordinals are dense");
+    }
+    if threads > 1 && fans_out {
+        assert_eq!(pooled.jobs, pooled.blocks.len() as u64, "one MergeWork job per planned block");
+        assert!(pooled.jobs > 0);
+    } else {
+        assert_eq!(pooled.jobs, 0, "this plan gathers serially");
+    }
+}
+
+/// `-@ 1` with a parallel-eligible chunk: a fan-out 4 wide on a one-thread
+/// pool still takes the pooled gather (one `MergeWork` job per planned block)
+/// and emits the serial gather's blocks byte for byte.
+#[rstest]
+#[case::small_records(400, 120, 64, 1 << 30)]
+#[case::byte_cap_blocks(1200, 8 * 1024, 1 << 20, 4 << 20)]
+#[case::huge_records(3, 5 << 20, 64, 4 << 20)]
+fn fast_path_gather_wide_fanout_on_one_thread(
+    #[case] n_records: usize,
+    #[case] rec_size: usize,
+    #[case] target_batch_count: usize,
+    #[case] byte_limit: u64,
+) {
+    let (_header, records) = synthesize_sized_records(n_records, 0x5EED, rec_size);
+    let serial = collect_fastpath_blocks(
+        single_chunk_events(&records),
+        byte_limit,
+        target_batch_count,
+        1,
+        1,
+        0,
+    )
+    .expect("serial gather");
+    let pooled = collect_fastpath_blocks(
+        single_chunk_events(&records),
+        byte_limit,
+        target_batch_count,
+        4,
+        1,
+        0,
+    )
+    .expect("pooled gather");
+
+    assert!(serial.blocks.len() > 1, "fixture must plan several blocks");
+    assert_eq!(pooled.blocks, serial.blocks, "pooled gather output differs from the serial gather");
+    assert_eq!(pooled.jobs, serial.blocks.len() as u64, "one MergeWork job per planned block");
+}
+
+/// A `RecordBatchOutput` whose builder fails on its third record, to inject a
+/// gather error.
+struct FailingOutput;
+
+struct FailingBuilder {
+    inner: crate::types::RecordBatchBuilder,
+    pushed: usize,
+}
+
+impl crate::sort::merge::MergeBatchBuilder for FailingBuilder {
+    type Item = RecordBatch;
+    const FRAME_OVERHEAD_PER_RECORD: usize = 0;
+
+    fn with_capacity(batch_serial: u64, bytes_cap: usize, records_cap: usize) -> Self {
+        Self {
+            inner: crate::types::RecordBatchBuilder::with_capacity(
+                batch_serial,
+                bytes_cap,
+                records_cap,
+            ),
+            pushed: 0,
+        }
+    }
+
+    fn push_record_bytes(&mut self, body: &[u8]) -> io::Result<()> {
+        self.pushed += 1;
+        if self.pushed == 3 {
+            return Err(io::Error::other("injected gather failure"));
+        }
+        self.inner.push_record_bytes(body);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.inner.total_bytes()
+    }
+
+    fn build(self) -> RecordBatch {
+        self.inner.build()
+    }
+}
+
+impl crate::sort::merge::MergeOutput for FailingOutput {
+    type Item = RecordBatch;
+    type Builder = FailingBuilder;
+}
+
+/// A gather job that fails fails the run, and the error names `MergeWork`.
+#[test]
+fn gather_error_propagates() {
+    use fgumi_pipeline_core::PipelineError;
+
+    let (_header, records) = synthesize_sized_records(200, 7, 100);
+    let (merge, work) = merge_with_work::<FailingOutput>(1 << 30, 32, 4, 0, None);
+    let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink { received, kind: StepKind::Serial, progress: None };
+    let builder = Pipeline::builder();
+    let fan = builder
+        .chain(Phase2EventSource::new(single_chunk_events(&records), 1 << 30))
+        .chain(merge)
+        .into_multi();
+    fan.b0.chain(sink).into_sink_marker();
+    fan.b1.chain(work).into_sink_marker();
+    let result = builder
+        .build()
+        .expect("build")
+        .run(PipelineConfig { threads: 4, ..Default::default() }.with_deadlock_timeout(10));
+    match result {
+        Err(PipelineError::Io { step, source }) => {
+            assert_eq!(step, "MergeWork");
+            assert!(source.to_string().contains("injected gather failure"), "{source}");
+        }
+        other => panic!("expected an Io error from MergeWork, got {other:?}"),
+    }
 }
 
 /// The terminal fast-path parallel gather must emit byte-for-byte the same
@@ -2997,11 +3238,15 @@ fn test_fastpath_parallel_matches_serial(
     };
 
     // Serial gather: threads=1.
-    let serial = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 1, 0)
+    let serial = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 1, 4, 0)
         .expect("serial fast path");
     // Parallel gather: threads=4, min_records=0 forces the parallel path.
-    let parallel = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 4, 0)
+    let parallel = collect_fastpath_blocks(make_events(), byte_limit, target_batch_count, 4, 4, 0)
         .expect("parallel fast path");
+    assert_eq!(serial.jobs, 0, "the serial gather posts no jobs");
+    assert_eq!(parallel.jobs, parallel.blocks.len() as u64, "gather mode ran: one job per block");
+    assert!(parallel.jobs > 0);
+    let (serial, parallel) = (serial.blocks, parallel.blocks);
 
     assert_eq!(
         serial.len(),
@@ -3068,49 +3313,54 @@ impl Step for CappedBlockPassThrough {
     }
 }
 
-/// The capped pooled fast-path gather runs `MergeWork` under the phase-2 cap
-/// beside a capped pool step sharing that cap, completes, and is
-/// byte-identical to the uncapped serial gather. The merge itself takes no
-/// permit, and each pool dispatch takes at most one, so with 2 pool workers
-/// the cap never holds more than 2 of its 4 permits (the old private-pool
-/// gather took the whole cap per burst).
-#[test]
-fn capped_pooled_fast_path_gather_runs_under_the_phase2_cap() {
+/// The capped pooled fast-path gather runs `MergeWork` under the phase-2 cap,
+/// completes, and is byte-identical to the uncapped serial gather. The merge
+/// itself takes no permit, and each pool dispatch takes at most one.
+///
+/// `shared` runs a capped pass-through beside `MergeWork` on a 4-permit cap
+/// (the standalone sort's `BgzfCompress` role); with 2 pool workers the cap
+/// never holds more than 2 permits. `sole_taker` gives `MergeWork` a 1-permit
+/// cap alone, so any permit the cap ever held was `MergeWork`'s: `peak == 1`
+/// proves the cap gated it (a 4-wide gather on 2 workers would otherwise hold 2).
+#[rstest]
+#[case::shared(4, true)]
+#[case::sole_taker(1, false)]
+fn capped_pooled_fast_path_gather_runs_under_the_phase2_cap(
+    #[case] cap_size: usize,
+    #[case] with_pass_through: bool,
+) {
     use crate::sort::merge::BlockOutput;
     use fgumi_pipeline_core::PhaseCap;
 
     const GATHER_THREADS: usize = 4;
     const POOL_THREADS: usize = 2;
     let (_header, records) = synthesize_sized_records(4000, 0x0FA5_7CA9, 120);
-    let events = || {
-        vec![
-            coordinate_memory_chunk_event(records.clone()),
-            crate::sort::protocol::SortPhase2Event::AllAnnounced {
-                slot_count: 0,
-                memory_chunk_count: 1,
-                total_records: records.len() as u64,
-            },
-        ]
-    };
-    let serial =
-        collect_fastpath_blocks(events(), 1 << 30, 128, 1, 0).expect("uncapped serial gather");
+    let events = || single_chunk_events(&records);
+    let serial = collect_fastpath_blocks(events(), 1 << 30, 128, 1, 1, 0)
+        .expect("uncapped serial gather")
+        .blocks;
 
-    let cap = PhaseCap::new("sort-phase2", GATHER_THREADS);
+    let cap = PhaseCap::new("sort-phase2", cap_size);
     let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
         Arc::new(Mutex::new(Vec::new()));
     let (merge, work) =
         merge_with_work::<BlockOutput>(1 << 30, 128, GATHER_THREADS, 0, Some(Arc::clone(&cap)));
     let builder = Pipeline::builder();
     let fan = builder.chain(Phase2EventSource::new(events(), 1 << 30)).chain(merge).into_multi();
-    fan.b0
-        .chain(CappedBlockPassThrough { cap: Arc::clone(&cap) })
-        .chain(BlockSink { received: Arc::clone(&received), kind: StepKind::Serial })
-        .into_sink_marker();
+    let sink = BlockSink { received: Arc::clone(&received), kind: StepKind::Serial };
+    if with_pass_through {
+        fan.b0
+            .chain(CappedBlockPassThrough { cap: Arc::clone(&cap) })
+            .chain(sink)
+            .into_sink_marker();
+    } else {
+        fan.b0.chain(sink).into_sink_marker();
+    }
     fan.b1.chain(work).into_sink_marker();
-    builder
-        .build()
-        .expect("build")
-        .run(PipelineConfig { threads: POOL_THREADS, ..Default::default() })
+    let pipeline = builder.build().expect("build");
+    let dir = tempfile::tempdir().unwrap();
+    pipeline
+        .run(telemetry_config(dir.path(), POOL_THREADS))
         .expect("the capped gather completes beside the capped pool step");
 
     let mut capped: Vec<(u64, Vec<u8>)> = std::mem::take(&mut *received.lock())
@@ -3120,10 +3370,71 @@ fn capped_pooled_fast_path_gather_runs_under_the_phase2_cap() {
     capped.sort_by_key(|(ordinal, _)| *ordinal);
     assert!(serial.len() > 1, "fixture must plan several blocks");
     assert_eq!(capped, serial, "the capped pooled gather is byte-identical");
-    assert!(cap.peak() >= 1, "the gather and the pass-through ran under the cap");
-    assert!(cap.peak() <= POOL_THREADS, "one permit per pool dispatch, none for the merge");
+    let jobs = telemetry_counter_total(&dir.path().join("run"), "MergeWork", "jobs");
+    assert_eq!(jobs, serial.len() as u64, "MergeWork gathered every planned block");
+    // Neither bound below attributes permits to `MergeWork` in the shared case
+    // (the pass-through takes permits of the same cap, and two pool workers
+    // bound the peak by construction); only `sole_taker` pins the gating.
+    assert!(cap.peak() >= 1, "some step took permits of the cap");
+    assert!(cap.peak() <= cap_size.min(POOL_THREADS), "the peak stays within the cap and pool");
+    if !with_pass_through {
+        assert_eq!(cap.peak(), 1, "MergeWork alone filled the 1-permit cap");
+    }
     assert_eq!(cap.active(), 0, "every permit released");
 }
+
+/// Gather mode on a pool whose every park timer is 10 s: `MergeWork`'s results
+/// must wake the `sort-coord` driver through the inbox, so the run finishes
+/// within the 5 s watchdog (the planner twin of this test is
+/// `planner_tops_up_after_input_drains_with_long_timers`). A Detached sink
+/// keeps the merge's own output from waking anything.
+#[test]
+fn gather_inbox_wakes_the_driver_with_long_timers() {
+    use crate::sort::merge::BlockOutput;
+    use fgumi_pipeline_core::runtime::{TestBackoff, TestBackoffTarget};
+
+    let (_header, records) = synthesize_sized_records(4000, 0x10C6, 120);
+    let serial = collect_fastpath_blocks(single_chunk_events(&records), 1 << 30, 64, 1, 1, 0)
+        .expect("serial gather")
+        .blocks;
+    let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let (merge, work) = merge_with_work::<BlockOutput>(1 << 30, 64, 4, 0, None);
+    let sink = BlockSink { received: Arc::clone(&received), kind: StepKind::Detached };
+    let builder = Pipeline::builder();
+    let fan = builder
+        .chain(Phase2EventSource::new(single_chunk_events(&records), 1 << 30))
+        .chain(merge)
+        .into_multi();
+    fan.b0.chain(sink).into_sink_marker();
+    fan.b1.chain(work).into_sink_marker();
+    let pipeline = builder.build().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = telemetry_config(dir.path(), 2);
+    config.test_backoff = vec![
+        TestBackoff { target: TestBackoffTarget::AllDrivers, us: 10_000_000 },
+        TestBackoff { target: TestBackoffTarget::AllWorkers, us: 10_000_000 },
+    ];
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(pipeline.run(config));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("WEDGED: the inbox did not wake the sort-coord driver")
+        .unwrap();
+    let jobs = telemetry_counter_total(&dir.path().join("run"), "MergeWork", "jobs");
+    assert_eq!(jobs, serial.len() as u64, "gather mode ran");
+    // The sink is Detached (single producer, no reorder), so blocks must
+    // arrive in ordinal order without sorting.
+    let got: Vec<(u64, Vec<u8>)> = std::mem::take(&mut *received.lock())
+        .into_iter()
+        .map(|b| (b.batch_serial, b.bytes))
+        .collect();
+    assert_eq!(got, serial);
+}
+
+/// Each batch's `(batch_serial, per-record bodies)`.
+type BatchBodies = Vec<(u64, Vec<Vec<u8>>)>;
 
 /// Like [`collect_fastpath_blocks`] but for the default `SortMerge<RecordBatchOutput>`
 /// (the intermediate-sort output feeding group/consensus), whose byte-cap plan
@@ -3138,7 +3449,7 @@ fn collect_fastpath_batches(
     target_batch_count: usize,
     fanout_width: usize,
     min_records: usize,
-) -> Result<Vec<(u64, Vec<Vec<u8>>)>> {
+) -> Result<(BatchBodies, u64)> {
     let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let source = Phase2EventSource::new(events, output_byte_limit);
     let (merge, work) = merge_with_work::<RecordBatchOutput>(
@@ -3155,13 +3466,18 @@ fn collect_fastpath_batches(
     fan.b0.chain(sink).into_sink_marker();
     fan.b1.chain(work).into_sink_marker();
     let pipeline = builder.build()?;
-    pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
+    let dir = tempfile::tempdir()?;
+    pipeline.run(telemetry_config(dir.path(), 4))?;
+    let jobs = telemetry_counter_total(&dir.path().join("run"), "MergeWork", "jobs");
 
     let batches = std::mem::take(&mut *received.lock());
-    Ok(batches
-        .into_iter()
-        .map(|b| (b.batch_serial(), b.iter_record_bytes().map(<[u8]>::to_vec).collect()))
-        .collect())
+    Ok((
+        batches
+            .into_iter()
+            .map(|b| (b.batch_serial(), b.iter_record_bytes().map(<[u8]>::to_vec).collect()))
+            .collect(),
+        jobs,
+    ))
 }
 
 /// Same parity contract as [`test_fastpath_parallel_matches_serial`] but for the
@@ -3194,11 +3510,16 @@ fn test_fastpath_parallel_matches_serial_record_batches(
     };
 
     // Serial gather: threads=1.
-    let serial = collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 1, 0)
-        .expect("serial fast path");
+    let (serial, serial_jobs) =
+        collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 1, 0)
+            .expect("serial fast path");
     // Parallel gather: threads=4, min_records=0 forces the parallel path.
-    let parallel = collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 4, 0)
-        .expect("parallel fast path");
+    let (parallel, parallel_jobs) =
+        collect_fastpath_batches(make_events(), byte_limit, target_batch_count, 4, 0)
+            .expect("parallel fast path");
+    assert_eq!(serial_jobs, 0, "the serial gather posts no jobs");
+    assert_eq!(parallel_jobs, parallel.len() as u64, "gather mode ran: one job per batch");
+    assert!(parallel_jobs > 0);
 
     assert_eq!(
         serial.len(),

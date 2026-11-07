@@ -3819,7 +3819,7 @@ mod tests {
     }
 
     /// Step names of [`native_input_sort_topology`], in `StepIdx` order.
-    const NATIVE_INPUT_SORT_NAMES: [&str; 20] = [
+    const NATIVE_INPUT_SORT_NAMES: [&str; 21] = [
         "PlanInputReads",
         "PreadInputSlices",
         "FrameBgzfBlocks",
@@ -3838,12 +3838,13 @@ mod tests {
         "SpillBlockCompressConsolidation",
         "WriteConsolidatedRun",
         "SortMerge",
+        "MergeWork",
         "BgzfCompress",
         "WriteBgzfFile",
     ];
 
     /// A hand-written model of `fgumi sort`'s template-coordinate chain with
-    /// native input, at t16: 20 steps, two driver groups (coord, io), the
+    /// native input, at t16: 21 steps, two driver groups (coord, io), the
     /// planner and framer pinned to the reader worker, every edge
     /// byte-bounded. Its step names, kinds, branch counts and per-branch
     /// gating mirror the table fgumi's `sort_chain_gating_matches_the_table`
@@ -3852,8 +3853,8 @@ mod tests {
     /// checked by nothing but the tests below.
     pub(super) fn native_input_sort_topology() -> Topology {
         use StepKind::{Detached as D, Parallel as P, Serial as S};
-        let kinds = vec![S, P, S, D, P, D, P, D, D, P, D, S, P, P, D, P, D, D, P, D];
-        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 1, 1, 0];
+        let kinds = vec![S, P, S, D, P, D, P, D, D, P, D, S, P, P, D, P, D, D, P, P, D];
+        let branches = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 2, 0, 1, 0];
         let mut g = ChainGraph::new();
         let idx: Vec<StepIdx> = NATIVE_INPUT_SORT_NAMES
             .iter()
@@ -3869,18 +3870,28 @@ mod tests {
         g.wire(idx[14], BranchIdx(0), idx[15]);
         g.wire(idx[15], BranchIdx(0), idx[16]);
         g.wire(idx[11], BranchIdx(1), idx[17]);
-        g.wire(idx[17], BranchIdx(0), idx[18]);
-        g.wire(idx[18], BranchIdx(0), idx[19]);
+        g.wire(idx[17], BranchIdx(0), idx[19]);
+        g.wire(idx[17], BranchIdx(1), idx[18]);
+        g.wire(idx[19], BranchIdx(0), idx[20]);
         let (coord, io) = (Some(DriverIdx(0)), Some(DriverIdx(1)));
         let driver_of = vec![
             None, None, None, coord, None, coord, None, coord, coord, None, io, None, None, None,
-            io, None, io, coord, None, io,
+            io, None, io, coord, None, None, io,
         ];
-        let mut pinned = vec![None; 20];
+        let mut pinned = vec![None; 21];
         pinned[0] = Some(0);
         pinned[2] = Some(0);
         let mut queues: Vec<_> = (0..=11).map(|s| q(s, 0)).collect();
-        queues.extend([q(11, 1), q(11, 2), q(12, 0), q(14, 0), q(15, 0), q(17, 0), q(18, 0)]);
+        queues.extend([
+            q(11, 1),
+            q(11, 2),
+            q(12, 0),
+            q(14, 0),
+            q(15, 0),
+            q(17, 0),
+            q(17, 1),
+            q(19, 0),
+        ]);
         (g, kinds, pinned, driver_of, queues)
     }
 
@@ -3901,7 +3912,7 @@ mod tests {
         );
         // Every branch of a step with outputs is gated; `SortSpillDecompress`
         // (a zero-output Parallel step) and the `WriteBgzfFile` sink have none.
-        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 1, 1, 0];
+        let want = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 0, 1, 1, 0, 2, 0, 1, 0];
         for (i, want) in want.iter().enumerate() {
             assert_eq!(
                 plan.gated_branches(StepIdx(i)),

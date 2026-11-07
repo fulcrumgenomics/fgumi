@@ -9231,6 +9231,56 @@ mod tests {
         assert!(at("SortSpillDecompress") < at("SortMerge"));
     }
 
+    /// A terminal sort chain wires `SortMerge` branch 1 to `MergeWork`, which
+    /// carries the phase-2 cap when `--merge-threads` is set and gets one clone
+    /// per pool worker.
+    #[rstest::rstest]
+    #[case::capped(8, Some(4), Some("cap=sort-phase2(4)"))]
+    #[case::uncapped(8, None, None)]
+    fn sort_chain_dag_has_merge_work(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+        #[case] cap: Option<&str>,
+    ) {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        });
+        let dag = built.pipeline.dag_at(threads);
+        let lines: Vec<&str> = dag.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with('[') && l.contains("] SortMerge "))
+            .unwrap_or_else(|| panic!("no SortMerge step:\n{dag}"));
+        let merge: Vec<&&str> = lines[start..]
+            .iter()
+            .take_while(|l| l.contains("] SortMerge ") || !l.trim_start().starts_with('['))
+            .collect();
+        let merge = merge.iter().map(|l| **l).collect::<Vec<_>>().join("\n");
+        assert!(merge.contains("branches=2"), "{merge}");
+        let job_edge = merge
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with(".1: "))
+            .unwrap_or_else(|| panic!("no branch .1 line:\n{merge}"));
+        assert!(
+            job_edge.starts_with(".1: FixedByteBounded") && job_edge.ends_with("→ MergeWork"),
+            "{job_edge}"
+        );
+        let work = lines
+            .iter()
+            .find(|l| l.contains("] MergeWork "))
+            .unwrap_or_else(|| panic!("no MergeWork step:\n{dag}"));
+        assert!(work.contains("Parallel"), "{work}");
+        match cap {
+            Some(cap) => assert!(work.contains(cap), "{work}"),
+            None => assert!(!work.contains("cap="), "{work}"),
+        }
+        let planned = built.pipeline.planned_clone_counts(threads);
+        let clones = planned.iter().find(|(n, _)| *n == "MergeWork").map(|&(_, c)| c);
+        assert_eq!(clones, Some(threads), "one MergeWork clone per worker: {planned:?}");
+    }
+
     /// `PreadSpillSlices` holds the SAME phase-2 cap as `SortSpillDecompress`
     /// (pointer identity) when `--merge-threads` is given.
     #[test]
