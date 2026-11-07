@@ -409,9 +409,8 @@ fn attach_spill_and_merge(
         )
         .into_sink_marker();
     match sink {
-        MergeSink::Batches(kind) => fan
-            .b1
-            .chain(
+        MergeSink::Batches(kind) => crate::sort::merge_job::serial_merge_output(
+            fan.b1.chain(
                 SortMerge::<RecordBatchOutput>::with_target_batch_count(
                     sort_order,
                     output_byte_limit,
@@ -420,12 +419,12 @@ fn attach_spill_and_merge(
                 .with_stats_slot(Arc::clone(&merge_stats))
                 .with_merge_demand(demand)
                 .with_class_table(Arc::clone(class_table)),
-            )
-            .chain(VecSink { received: Arc::clone(&batches), kind, progress: None })
-            .into_sink_marker(),
-        MergeSink::Blocks(kind) => fan
-            .b1
-            .chain(
+            ),
+        )
+        .chain(VecSink { received: Arc::clone(&batches), kind, progress: None })
+        .into_sink_marker(),
+        MergeSink::Blocks(kind) => crate::sort::merge_job::serial_merge_output(
+            fan.b1.chain(
                 SortMerge::<BlockOutput>::with_target_batch_count(
                     sort_order,
                     output_byte_limit,
@@ -434,9 +433,10 @@ fn attach_spill_and_merge(
                 .with_stats_slot(Arc::clone(&merge_stats))
                 .with_merge_demand(demand)
                 .with_class_table(Arc::clone(class_table)),
-            )
-            .chain(BlockSink { received: Arc::clone(&blocks), kind })
-            .into_sink_marker(),
+            ),
+        )
+        .chain(BlockSink { received: Arc::clone(&blocks), kind })
+        .into_sink_marker(),
     }
     Ok(ChainTaps {
         class_table: Arc::clone(class_table),
@@ -2122,7 +2122,7 @@ fn collect_merge_batches_with(
         Some(feeder) => chain.chain(feeder).chain(merge),
         None => chain.chain(merge),
     };
-    chain.chain(sink).into_sink_marker();
+    crate::sort::merge_job::serial_merge_output(chain).chain(sink).into_sink_marker();
     let pipeline = builder.build()?;
     let stats = pipeline.stats();
     pipeline.run(PipelineConfig {
@@ -2897,18 +2897,38 @@ fn self_serve_decompress_error_fails_closed() {
     assert!(slots[1].has_error(), "the slot is marked failed");
 }
 
+/// A `SortMerge` fanning its fast-path gather across `fanout_width` workers,
+/// with the parallel gate lowered to `min_records`, paired with the `MergeWork`
+/// step that runs its gather jobs (capped by `cap`, if any). Wire the merge's
+/// branch 1 to the returned worker.
+fn merge_with_work<O: crate::sort::merge::MergeOutput>(
+    output_byte_limit: u64,
+    target_batch_count: usize,
+    fanout_width: usize,
+    min_records: usize,
+    cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+) -> (SortMerge<O>, fgumi_pipeline_core::FanoutWorker<crate::sort::merge_job::MergeJob<O>>) {
+    let merge = SortMerge::<O>::with_target_batch_count(
+        SortOrder::Coordinate,
+        output_byte_limit,
+        target_batch_count,
+    )
+    .with_fast_path_min_records(min_records);
+    merge.with_pooled_gather(fanout_width, cap)
+}
+
 /// Like [`collect_merge_batches`] but drives the terminal `SortMerge<BlockOutput>`
-/// fast path with an explicit `fast_path_threads` and a lowered parallel gate
-/// (`min_records`), returning each emitted block's `(batch_serial, framed bytes)`
-/// so a test can assert the parallel gather is byte-for-byte identical to the
-/// serial one. `threads == 1` (or a `min_records` above the record count) takes
-/// the serial gather; `threads > 1` with a low `min_records` takes the parallel
-/// gather.
+/// fast path with an explicit fan-out width and a lowered parallel gate
+/// (`min_records`), with `MergeWork` on the merge's job branch, returning each
+/// emitted block's `(batch_serial, framed bytes)` so a test can assert the
+/// pooled gather is byte-for-byte identical to the serial one. `fanout_width ==
+/// 1` (or a `min_records` above the record count) takes the serial gather;
+/// `fanout_width > 1` with a low `min_records` takes the pooled gather.
 fn collect_fastpath_blocks(
     events: Vec<crate::sort::protocol::SortPhase2Event>,
     output_byte_limit: u64,
     target_batch_count: usize,
-    fast_path_threads: usize,
+    fanout_width: usize,
     min_records: usize,
 ) -> Result<Vec<(u64, Vec<u8>)>> {
     use crate::sort::merge::BlockOutput;
@@ -2916,17 +2936,19 @@ fn collect_fastpath_blocks(
 
     let received: Arc<Mutex<Vec<DecompressedBlock>>> = Arc::new(Mutex::new(Vec::new()));
     let source = Phase2EventSource::new(events, output_byte_limit);
-    let merge = SortMerge::<BlockOutput>::with_target_batch_count(
-        SortOrder::Coordinate,
+    let (merge, work) = merge_with_work::<BlockOutput>(
         output_byte_limit,
         target_batch_count,
-    )
-    .with_fast_path_threads(fast_path_threads)
-    .with_fast_path_min_records(min_records);
+        fanout_width,
+        min_records,
+        None,
+    );
     let sink = BlockSink { received: Arc::clone(&received), kind: StepKind::Serial };
 
     let builder = Pipeline::builder();
-    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let fan = builder.chain(source).chain(merge).into_multi();
+    fan.b0.chain(sink).into_sink_marker();
+    fan.b1.chain(work).into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
 
@@ -2940,14 +2962,14 @@ fn collect_fastpath_blocks(
 /// change. Exercised across the two block-closing regimes (count-cap and
 /// byte-cap) and a boundary case where the last block is partial.
 ///
-/// The `backpressure` case deliberately drives `emit_fast_batches_parallel`'s
+/// The `backpressure` case deliberately drives `emit_gather_mode`'s
 /// reject/resume path: `SortMerge` wires `output_byte_limit` as BOTH the output
 /// queue's `ByteBounded` limit AND the block-closing byte cap, so a small
 /// `byte_limit` makes the queue fill after ~1 block while a full
-/// `fast_path_threads * FAST_PATH_BLOCKS_PER_WORKER_WINDOW`-block window is
-/// mid-drain — forcing `ctx.outputs.push` to reject deterministically and the
-/// `held` + `fast_pending` resume to carry the remainder to the next dispatch,
-/// across many windows. If the byte-identical / dense-ordinal assertions still
+/// `fanout_width * FAST_PATH_BLOCKS_PER_WORKER_WINDOW`-block window of results
+/// waits in the inbox — forcing the branch-0 push to reject deterministically
+/// and the `held` slot to carry the block to the next dispatch, across many
+/// windows. If the byte-identical / dense-ordinal assertions still
 /// hold under sustained mid-window rejection, the resume path preserves order.
 /// (`byte_capped` also trips this incidentally; `backpressure` pins it.)
 #[rstest]
@@ -3046,14 +3068,14 @@ impl Step for CappedBlockPassThrough {
     }
 }
 
-/// The capped parallel fast-path gather takes the WHOLE phase-2 cap for each
-/// burst, completes beside a capped pool step sharing that cap, and is
-/// byte-identical to the uncapped serial gather. The pool has 2 workers, so
-/// pool steps alone can never hold more than 2 of the cap's 4 permits: a
-/// high-water mark of 4 is reachable only through `acquire_whole`, so dropping
-/// it from the gather fails this test.
+/// The capped pooled fast-path gather runs `MergeWork` under the phase-2 cap
+/// beside a capped pool step sharing that cap, completes, and is
+/// byte-identical to the uncapped serial gather. The merge itself takes no
+/// permit, and each pool dispatch takes at most one, so with 2 pool workers
+/// the cap never holds more than 2 of its 4 permits (the old private-pool
+/// gather took the whole cap per burst).
 #[test]
-fn capped_parallel_fast_path_gather_holds_the_whole_phase2_cap() {
+fn capped_pooled_fast_path_gather_runs_under_the_phase2_cap() {
     use crate::sort::merge::BlockOutput;
     use fgumi_pipeline_core::PhaseCap;
 
@@ -3076,18 +3098,15 @@ fn capped_parallel_fast_path_gather_holds_the_whole_phase2_cap() {
     let cap = PhaseCap::new("sort-phase2", GATHER_THREADS);
     let received: Arc<Mutex<Vec<crate::types::DecompressedBlock>>> =
         Arc::new(Mutex::new(Vec::new()));
-    let merge =
-        SortMerge::<BlockOutput>::with_target_batch_count(SortOrder::Coordinate, 1 << 30, 128)
-            .with_fast_path_threads(GATHER_THREADS)
-            .with_fast_path_min_records(0)
-            .with_fast_path_cap(Some(Arc::clone(&cap)));
+    let (merge, work) =
+        merge_with_work::<BlockOutput>(1 << 30, 128, GATHER_THREADS, 0, Some(Arc::clone(&cap)));
     let builder = Pipeline::builder();
-    builder
-        .chain(Phase2EventSource::new(events(), 1 << 30))
-        .chain(merge)
+    let fan = builder.chain(Phase2EventSource::new(events(), 1 << 30)).chain(merge).into_multi();
+    fan.b0
         .chain(CappedBlockPassThrough { cap: Arc::clone(&cap) })
         .chain(BlockSink { received: Arc::clone(&received), kind: StepKind::Serial })
         .into_sink_marker();
+    fan.b1.chain(work).into_sink_marker();
     builder
         .build()
         .expect("build")
@@ -3100,9 +3119,9 @@ fn capped_parallel_fast_path_gather_holds_the_whole_phase2_cap() {
         .collect();
     capped.sort_by_key(|(ordinal, _)| *ordinal);
     assert!(serial.len() > 1, "fixture must plan several blocks");
-    assert_eq!(capped, serial, "the capped parallel gather is byte-identical");
-    assert_eq!(cap.peak(), GATHER_THREADS, "only the whole-cap gather reaches the full cap");
-    assert!(cap.peak() > POOL_THREADS);
+    assert_eq!(capped, serial, "the capped pooled gather is byte-identical");
+    assert!(cap.peak() >= 1, "the gather and the pass-through ran under the cap");
+    assert!(cap.peak() <= POOL_THREADS, "one permit per pool dispatch, none for the merge");
     assert_eq!(cap.active(), 0, "every permit released");
 }
 
@@ -3110,29 +3129,31 @@ fn capped_parallel_fast_path_gather_holds_the_whole_phase2_cap() {
 /// (the intermediate-sort output feeding group/consensus), whose byte-cap plan
 /// relies on `FRAME_OVERHEAD_PER_RECORD = 0` rather than `BlockOutput`'s `4`.
 /// Returns each emitted batch's `(batch_serial, per-record bodies)` so a test
-/// can assert the parallel gather is byte-for-byte identical to the serial one —
+/// can assert the pooled gather is byte-for-byte identical to the serial one —
 /// pinning both the dense ordinal and every block boundary (via the per-record
 /// body vector, not just the concatenated bytes).
 fn collect_fastpath_batches(
     events: Vec<crate::sort::protocol::SortPhase2Event>,
     output_byte_limit: u64,
     target_batch_count: usize,
-    fast_path_threads: usize,
+    fanout_width: usize,
     min_records: usize,
 ) -> Result<Vec<(u64, Vec<Vec<u8>>)>> {
     let received: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
     let source = Phase2EventSource::new(events, output_byte_limit);
-    let merge = SortMerge::<RecordBatchOutput>::with_target_batch_count(
-        SortOrder::Coordinate,
+    let (merge, work) = merge_with_work::<RecordBatchOutput>(
         output_byte_limit,
         target_batch_count,
-    )
-    .with_fast_path_threads(fast_path_threads)
-    .with_fast_path_min_records(min_records);
+        fanout_width,
+        min_records,
+        None,
+    );
     let sink = VecSink { received: Arc::clone(&received), kind: StepKind::Serial, progress: None };
 
     let builder = Pipeline::builder();
-    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    let fan = builder.chain(source).chain(merge).into_multi();
+    fan.b0.chain(sink).into_sink_marker();
+    fan.b1.chain(work).into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads: 4, ..Default::default() })?;
 
@@ -3966,7 +3987,9 @@ fn arena_split_pipeline_bumps_read_blocks_boundaries_spill_and_merge_counters() 
         .chain(planner)
         .into_multi();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge.with_merge_demand(demand)).chain(sink).into_sink_marker();
+    crate::sort::merge_job::serial_merge_output(fan.b1.chain(merge.with_merge_demand(demand)))
+        .chain(sink)
+        .into_sink_marker();
     fan.b2.chain(crate::sort::NoConsolidation).into_sink_marker();
     let pipeline = builder.build().expect("pipeline builds");
     pipeline
@@ -4153,7 +4176,7 @@ fn planner_tops_up_after_input_drains_with_long_timers() {
     let fan = builder.chain(source).chain(planner).into_multi();
     fan.b2.chain(crate::sort::NoConsolidation).into_sink_marker();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge).chain(sink).into_sink_marker();
+    crate::sort::merge_job::serial_merge_output(fan.b1.chain(merge)).chain(sink).into_sink_marker();
     let pipeline = builder.build().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -4223,7 +4246,9 @@ fn collect_merge_blocks_with(
     let sink =
         BlockSink { received: Arc::clone(&received), kind: sink_kind.unwrap_or(StepKind::Serial) };
     let builder = Pipeline::builder();
-    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    crate::sort::merge_job::serial_merge_output(builder.chain(source).chain(merge))
+        .chain(sink)
+        .into_sink_marker();
     let pipeline = builder.build()?;
     pipeline.run(PipelineConfig { threads: threads.max(1), test_backoff, ..Default::default() })?;
     let blocks = std::mem::take(&mut *received.lock());
@@ -4664,7 +4689,9 @@ fn full_batches_under_backpressure_are_delivered_once() {
         1024,
     );
     let builder = Pipeline::builder();
-    builder.chain(source).chain(merge).chain(sink).into_sink_marker();
+    crate::sort::merge_job::serial_merge_output(builder.chain(source).chain(merge))
+        .chain(sink)
+        .into_sink_marker();
     let pipeline = builder.build().unwrap();
     let stats = pipeline.stats();
     let run_stats = Arc::clone(&stats);

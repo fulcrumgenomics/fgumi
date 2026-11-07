@@ -947,7 +947,6 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.10.3",
- "rayon",
  "rstest",
  "tempfile",
 ]

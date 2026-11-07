@@ -488,13 +488,13 @@ pub trait Step: Send + Sized + 'static {
     /// same cap, or the DAG would advertise a limit the step never applies:
     ///
     /// - **Pool steps** (the sort's ingest, inflate, spill compress and spill
-    ///   decompress steps, and the output compressor) take one permit per item
+    ///   decompress steps, `MergeWork` for the in-memory fast-path gather, and
+    ///   the output compressor) take one permit per item
     ///   through [`crate::admission::admit_input`] (or
     ///   [`PhaseCap::try_acquire`](crate::admission::PhaseCap::try_acquire)
     ///   around a narrower section), passing [`StepCapRef::active`].
     /// - **Serial / Detached steps with off-pool parallel work** (`SortBuffer`
-    ///   and the split front's `Sort*Run` for the per-run sort, `SortMerge` for the
-    ///   in-memory fast-path gather) take the whole cap for that work through
+    ///   and the split front's `Sort*Run` for the per-run sort) take the whole cap for that work through
     ///   [`PhaseCap::acquire_whole`](crate::admission::PhaseCap::acquire_whole),
     ///   which may park the step until the cap's pool holders finish their
     ///   current items. Their serial part (one worker or driver thread) is not

@@ -23,6 +23,7 @@ pub mod arena_split;
 pub mod consolidate_runs;
 pub mod consolidation;
 pub mod merge;
+pub mod merge_job;
 pub mod protocol;
 pub(crate) mod read_ahead_budget;
 pub mod run_ledger;
@@ -55,6 +56,7 @@ pub use consolidation::ConsolidationRegistry;
 pub use merge::{
     BlockOutput, MergeBatchBuilder, MergeInputs, MergeOutput, RecordBatchOutput, SortMerge,
 };
+pub use merge_job::serial_merge_output;
 pub use run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, RunPrior, run_cap_for};
 pub use run_stack::consolidation_can_trigger;
 pub use sort_buffer::{SortBuffer, SortBufferConfig};

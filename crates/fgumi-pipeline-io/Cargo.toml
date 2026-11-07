@@ -20,7 +20,6 @@ noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
 parking_lot = "0.12"
 # The seeded fixture generator of the `test-utils` sort oracle (`sort::testing`).
 rand = { workspace = true, optional = true }
-rayon = "1.10"
 tempfile = "3.4"
 
 [features]
