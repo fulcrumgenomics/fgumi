@@ -267,11 +267,12 @@ impl ChunkSorter {
 
     /// Take the final residual. Without spills it is zero or one chunk (one
     /// globally-sorted chunk keeps the merge's single-chunk fast path). After a
-    /// spill, at more than one sort thread, the run seals as `sort_threads`
-    /// pre-sorted pieces over contiguous input ranges: the k-way merge that
-    /// follows anyway does the final interleave, and the pieces sort in
-    /// parallel. Ties stay stable: the merge orders memory pieces after the
-    /// spills and in push order.
+    /// spill, at more than one sort thread, an order that splits its final run
+    /// (`ArenaSortStrategy::SPLITS_FINAL_RUN`; every order but coordinate) seals
+    /// it as `sort_threads` pre-sorted pieces over contiguous input ranges: the
+    /// k-way merge that follows anyway does the final interleave, and the
+    /// pieces sort in parallel. Ties stay stable: the merge orders memory
+    /// pieces after the spills and in push order.
     ///
     /// An empty residual is normally dropped. The one EXCEPTION is
     /// template-coordinate when there were prior spills: the empty chunk still
@@ -284,7 +285,7 @@ impl ChunkSorter {
     /// disambiguate, so the fast path (single non-empty chunk) is preserved.
     fn take_residual_chunks(&mut self, had_spills: bool) -> io::Result<Vec<MemoryChunkErased>> {
         let pieces = self.sort_threads();
-        if !had_spills || pieces <= 1 {
+        if !had_spills || pieces <= 1 || !self.splits_final_run() {
             return Ok(residual_chunks_for(self.take_sorted_chunk()?, had_spills));
         }
         let mut chunks = match self {
@@ -298,6 +299,16 @@ impl ChunkSorter {
             return Ok(residual_chunks_for(chunk, had_spills));
         }
         Ok(chunks)
+    }
+
+    /// Whether this order seals the final run of a spilled sort as pieces.
+    fn splits_final_run(&self) -> bool {
+        match self {
+            Self::Coordinate(_) => CoordinateStrategy::SPLITS_FINAL_RUN,
+            Self::Template(_) => TemplateStrategy::SPLITS_FINAL_RUN,
+            Self::QuerynameLex(_) => QuerynameStrategy::<QnLex>::SPLITS_FINAL_RUN,
+            Self::QuerynameNatural(_) => QuerynameStrategy::<QnNatural>::SPLITS_FINAL_RUN,
+        }
     }
 
     /// The phase-1 width the sorter seals at.
@@ -726,19 +737,25 @@ mod tests {
     }
 
     /// After a spill, the record-input front seals its final run as
-    /// `sort_threads` pieces; without one it keeps a single chunk (the merge's
-    /// fast path), and at one sort thread it never splits.
+    /// `sort_threads` pieces for an order that splits it; without one it keeps
+    /// a single chunk (the merge's fast path), at one sort thread it never
+    /// splits, and coordinate (whose whole-run radix is already parallel)
+    /// never splits.
     #[rstest]
-    #[case::spilled_t4(4, true, 4)]
-    #[case::unspilled_t4(4, false, 1)]
-    #[case::spilled_t1(1, true, 1)]
+    #[case::queryname_spilled_t4(SortOrder::Queryname(QuerynameComparator::Natural), 4, true, 4)]
+    #[case::queryname_unspilled_t4(SortOrder::Queryname(QuerynameComparator::Natural), 4, false, 1)]
+    #[case::queryname_spilled_t1(SortOrder::Queryname(QuerynameComparator::Natural), 1, true, 1)]
+    #[case::template_spilled_t4(SortOrder::TemplateCoordinate, 4, true, 4)]
+    #[case::coordinate_spilled_t4(SortOrder::Coordinate, 4, true, 1)]
+    #[case::coordinate_unspilled_t4(SortOrder::Coordinate, 4, false, 1)]
     fn residual_pieces_follow_the_spill_rule(
+        #[case] sort_order: SortOrder,
         #[case] sort_threads: usize,
         #[case] had_spills: bool,
         #[case] pieces: usize,
     ) {
         let config = SortBufferConfig {
-            sort_order: SortOrder::Coordinate,
+            sort_order,
             memory_limit: 1 << 30,
             sort_threads,
             cell_tag: None,

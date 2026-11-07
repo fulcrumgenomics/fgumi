@@ -1055,6 +1055,12 @@ impl Step for InflateToArena {
 /// block-input front extracts in batches instead
 /// ([`ArenaKeyExtractor`](super::arena_split::ArenaKeyExtractor)).
 pub trait ArenaSortStrategy: Send + 'static {
+    /// Whether the final run of a sort that spilled seals as `sort_threads`
+    /// pieces ([`Self::seal_pieces`]) rather than one chunk ([`Self::seal`]).
+    /// The same per-order rule as the block-input front's
+    /// [`ArenaKeyExtractor::SPLITS_FINAL_RUN`](super::arena_split::ArenaKeyExtractor::SPLITS_FINAL_RUN).
+    const SPLITS_FINAL_RUN: bool = true;
+
     /// Extract the sort key from `body` (the record's BAM body, `block_size`
     /// prefix excluded) and accumulate a ref pointing at `(body_off, len)` in the
     /// shared inflate arena. Called once per record on the boundary scan hot path.
@@ -1173,8 +1179,9 @@ pub struct CoordinateStrategy {
     /// Coordinate-key refs accumulated across the current run's blocks; the seal
     /// clears them in place, keeping the buffer for the next run.
     refs: Vec<RecordRef>,
-    /// Bounded pool the final run's pieces sort on (the radix spawns its own
-    /// threads for a whole-run seal).
+    /// Bounded pool `seal_pieces` sorts on (the radix spawns its own threads
+    /// for a whole-run seal). Coordinate does not split its final run
+    /// (`SPLITS_FINAL_RUN`), so `SortBuffer` never calls `seal_pieces` for it.
     pieces_pool: BoundedSortPool,
 }
 
@@ -1187,6 +1194,10 @@ impl CoordinateStrategy {
 }
 
 impl ArenaSortStrategy for CoordinateStrategy {
+    /// The coordinate radix sorts a whole run in parallel, so the final run
+    /// stays one merge source.
+    const SPLITS_FINAL_RUN: bool = false;
+
     #[inline]
     fn push_record(&mut self, body: &[u8], body_off: u64, len: u32) -> io::Result<()> {
         let sort_key = extract_coordinate_key_inline(body, self.n_ref);
@@ -1208,6 +1219,9 @@ impl ArenaSortStrategy for CoordinateStrategy {
         sort_threads: usize,
         pieces: usize,
     ) -> Vec<MemoryChunkErased> {
+        // Not reached by `SortBuffer` (`SPLITS_FINAL_RUN` is false for this
+        // order); kept so the trait is total, and pinned by
+        // `coordinate_seal_pieces_split_the_run_in_order`.
         if self.refs.is_empty() {
             return vec![self.seal(arena, sort_threads)];
         }

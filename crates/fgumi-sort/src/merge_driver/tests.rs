@@ -293,6 +293,7 @@ mod from_slots_merge_tests {
             crate::inline::InMemoryChunk::from_owned_records(vec![(TestKey(5), b"mem".to_vec())]);
         let demand = StdArc::new(crate::MergeDemand::new());
         let mut d = MergeDriver::<TestKey>::from_slots(vec![s0, s1], vec![mem], 5, ())
+            .with_prediction_interval(1)
             .with_demand(StdArc::clone(&demand));
         let mut seen: Vec<(Vec<u8>, Option<u32>)> = Vec::new();
         loop {
@@ -317,6 +318,94 @@ mod from_slots_merge_tests {
         // s0→s1 was predicted (Some(1)), and so was the switch to memory
         // (None: a memory source).
         assert_eq!(s.prediction_hits, 2);
+    }
+
+    /// Drive `d` to completion, returning (records, source switches).
+    fn drain_counting_switches(d: &mut MergeDriver<TestKey>) -> (u64, u64) {
+        let (mut records, mut switches) = (0u64, 0u64);
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            match d.try_step().unwrap() {
+                MergeStep::Produced(b) => {
+                    records += 1;
+                    if last.as_deref() != Some(b) {
+                        switches += 1;
+                    }
+                    last = Some(b.to_vec());
+                }
+                MergeStep::Done => return (records, switches),
+                MergeStep::Stalled => unreachable!("pre-populated EOF slots never stall"),
+            }
+        }
+    }
+
+    /// A populated slot `id` of `n` records whose keys interleave with its
+    /// siblings' (`j * stride + id`), each record's body naming its slot.
+    fn interleaved_slot(id: u32, n: u64, stride: u64) -> StdArc<SortMergeSlot> {
+        let records: Vec<(TestKey, Vec<u8>)> = (0..n)
+            .map(|j| (TestKey(j * stride + u64::from(id)), vec![u8::try_from(id).unwrap()]))
+            .collect();
+        populated_slot(id, &records, 1)
+    }
+
+    /// The first switch and then every `interval`-th publish a prediction, and
+    /// each published prediction is scored once, by the switch after it. Two
+    /// interleaved slots of 50 records switch on every record. Slot 0 drains
+    /// before the last record, which forces one extra publish that no later
+    /// switch scores (except at interval 1, where that switch publishes anyway).
+    #[rstest::rstest]
+    #[case::every_switch(1, 100, 99)]
+    #[case::every_fourth(4, 26, 25)]
+    #[case::longer_than_the_merge(1000, 2, 1)]
+    fn predictions_follow_the_interval(
+        #[case] interval: u32,
+        #[case] published: u64,
+        #[case] scored: u64,
+    ) {
+        let demand = StdArc::new(crate::MergeDemand::new());
+        let mut d = MergeDriver::<TestKey>::from_slots(
+            vec![interleaved_slot(0, 50, 2), interleaved_slot(1, 50, 2)],
+            vec![],
+            100,
+            (),
+        )
+        .with_prediction_interval(interval)
+        .with_demand(StdArc::clone(&demand));
+        let (records, switches) = drain_counting_switches(&mut d);
+        assert_eq!((records, switches), (100, 100), "interleaved keys switch on every record");
+        assert_eq!(d.predictions_published(), published, "interval {interval}");
+        let s = demand.snapshot();
+        assert_eq!(s.predictions, scored, "interval {interval}");
+        // With two sources the runner-up is always the next winner, so a
+        // prediction scored against the switch right after it always hits; one
+        // scored against any later switch would miss half the time.
+        assert_eq!(s.prediction_hits, scored, "interval {interval}: every scored prediction hits");
+    }
+
+    /// A drain forces a prediction on the next switch, whatever the interval:
+    /// the run transition is where the merge starves for the next file. Slot 0
+    /// (5 records) drains while slots 1 and 2 (20 each) continue.
+    #[test]
+    fn a_drain_publishes_a_prediction_on_the_next_switch() {
+        let demand = StdArc::new(crate::MergeDemand::new());
+        let short: Vec<(TestKey, Vec<u8>)> = (0..5u64).map(|j| (TestKey(j * 3), vec![0])).collect();
+        let mut d = MergeDriver::<TestKey>::from_slots(
+            vec![
+                populated_slot(0, &short, 1),
+                interleaved_slot(1, 20, 3),
+                interleaved_slot(2, 20, 3),
+            ],
+            vec![],
+            45,
+            (),
+        )
+        .with_prediction_interval(1000)
+        .with_demand(StdArc::clone(&demand));
+        let (records, _) = drain_counting_switches(&mut d);
+        assert_eq!(records, 45);
+        // The first switch, then one after each of the three drains (the
+        // last drain's is never reached: no switch follows the final record).
+        assert_eq!(d.predictions_published(), 3, "first switch + one per drain with a successor");
     }
 
     /// The frontier is the lowest undrained slot's file id: published when the

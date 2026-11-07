@@ -610,10 +610,11 @@ fn merge_predictions(stderr: &str) -> Option<(u64, f64)> {
     Some((n, hit))
 }
 
-/// On a sort that merges at least two sources, every source switch after the
-/// first scores the prediction the previous switch published, so a merge
-/// that switches at all reports predictions. The runner-up is the next
-/// winner exactly (a memory source predicted as "no file"), so every one
+/// On a sort that merges at least two sources, the merge publishes a
+/// prediction on its first source switch (then after each drain and every
+/// 64th switch), and the switch right after each one scores it, so a merge
+/// that switches more than once reports predictions. The runner-up is the
+/// next winner exactly (a memory source predicted as "no file"), so every one
 /// hits. (The exact count is pinned by the unit test
 /// `predictions_skip_memory_sources_and_track_switches`.)
 #[rstest]

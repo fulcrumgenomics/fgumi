@@ -149,9 +149,10 @@ impl<K: Ord> LoserTree<K> {
     /// runner-up is source 2 (key 30).
     ///
     /// It is read *predictively*: the merge publishes the runner-up's spill file
-    /// on each source switch, so the supply can get that file's blocks ready
-    /// before the merge arrives at it (the merge starves at run transitions,
-    /// when the next file's read has not started yet).
+    /// on source switches (periodically, and after a drain), so the supply can
+    /// get that file's blocks ready before the merge arrives at it (the merge
+    /// starves at run transitions, when the next file's read has not started
+    /// yet).
     #[must_use]
     pub fn runner_up(&self) -> Option<usize> {
         if self.num_active < 2 {

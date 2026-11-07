@@ -878,6 +878,134 @@ fn coordinate_run_matches_the_copy_based_sorter(#[values(1usize, 3)] sort_thread
     assert!(got == want, "t{sort_threads}: the sealed run differs from the copy-based sorter");
 }
 
+/// Production never splits a coordinate run (`SPLITS_FINAL_RUN` is false), but
+/// both coordinate `seal_pieces` impls stay on their traits. Each must still
+/// cut its refs into contiguous input-order ranges (`ceil(n / pieces)` refs
+/// each), sort every range, and keep every record: the pieces, merged by
+/// (key, piece), are the whole-run seal. An empty run seals one empty chunk.
+#[rstest::rstest]
+#[case::split_front_four(Front::Split, 300, 4, 4)]
+#[case::split_front_uneven(Front::Split, 5, 4, 3)]
+#[case::split_front_empty(Front::Split, 0, 4, 1)]
+#[case::record_front_four(Front::Record, 300, 4, 4)]
+#[case::record_front_uneven(Front::Record, 5, 4, 3)]
+#[case::record_front_empty(Front::Record, 0, 4, 1)]
+fn coordinate_seal_pieces_split_the_run_in_order(
+    #[case] front: Front,
+    #[case] n: usize,
+    #[case] pieces: usize,
+    #[case] chunks_expected: usize,
+) {
+    use crate::sort::CoordinateStrategy;
+    use fgumi_sort::CoordinateChunkSorter;
+    let n_ref = 4u32;
+    let bodies: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let tid = if i % 11 == 0 { -1 } else { i32::try_from(i * 7 % 4).unwrap() };
+            let pos = if tid < 0 { -1 } else { i32::try_from(i * 31 % 50).unwrap() };
+            coord_body(i, tid, pos)
+        })
+        .collect();
+    let (arena, at) = arena_with(16, &frames(&bodies));
+    let chunks = match front {
+        Front::Split => {
+            let ctx = CoordinateKeys::provision(&n_ref, bodies.first().map_or(&[][..], |b| b));
+            let mut acc = CoordinateKeys::accum_for(&ctx);
+            if n > 0 {
+                let bytes: u64 = bodies.iter().map(|r| 4 + r.len() as u64).sum();
+                let (refs, _) = CoordinateKeys::extract_batch(
+                    &ctx,
+                    &mut (),
+                    &arena,
+                    at,
+                    at + bytes,
+                    u32::try_from(n).unwrap(),
+                    0,
+                )
+                .unwrap();
+                CoordinateKeys::append(&mut acc, refs);
+            }
+            let pool = BoundedSortPool::new(CoordinateKeys::pool_name());
+            let chunks = CoordinateKeys::seal_pieces(&mut acc, &ctx, arena, 2, &pool, pieces);
+            assert!(acc.is_empty(), "the seal leaves the accumulator empty");
+            chunks
+        }
+        Front::Record => {
+            let mut strategy = CoordinateStrategy::new(n_ref);
+            let mut off = at;
+            for b in &bodies {
+                strategy.push_record(b, off + 4, u32::try_from(b.len()).unwrap()).unwrap();
+                off += 4 + b.len() as u64;
+            }
+            strategy.seal_pieces(arena, 2, pieces)
+        }
+    };
+    assert_eq!(chunks.len(), chunks_expected, "{front:?} n={n}");
+    let piece_len = n.div_ceil(pieces).max(1);
+    let mut merged: Vec<(u64, usize, Vec<u8>)> = Vec::new();
+    for (p, chunk) in chunks.iter().enumerate() {
+        let MemoryChunkErased::Coordinate(c) = chunk else {
+            panic!("a coordinate run seals coordinate chunks");
+        };
+        let want_len = piece_len.min(n.saturating_sub(p * piece_len));
+        assert_eq!(c.len(), want_len, "{front:?}: piece {p} is one contiguous input range");
+        let keys: Vec<u64> = (0..c.len()).map(|i| c.key_at(i).sort_key).collect();
+        assert!(keys.is_sorted(), "{front:?}: piece {p} is sorted");
+        merged.extend((0..c.len()).map(|i| (keys[i], p, c.record_bytes(i).to_vec())));
+    }
+    merged.sort_by_key(|(k, p, _)| (*k, *p));
+    let mut oracle = CoordinateChunkSorter::for_test(usize::MAX, n_ref);
+    for r in &bodies {
+        let _ = oracle.push(r).unwrap();
+    }
+    let oc = oracle.take_sorted_chunk();
+    let got: Vec<&[u8]> = merged.iter().map(|(_, _, b)| b.as_slice()).collect();
+    let want: Vec<&[u8]> = (0..oc.len()).map(|i| oc.record_bytes(i)).collect();
+    assert!(got == want, "{front:?} n={n}: merged pieces differ from the whole-run sort");
+}
+
+/// The block-input and record-input fronts must agree, per order, on whether
+/// a spilled sort's final run splits: the same input then reaches the merge
+/// with the same sources whichever front ingests it. Coordinate keeps one
+/// residual; template and queryname split.
+#[rstest::rstest]
+#[case::coordinate(
+    CoordinateKeys::SPLITS_FINAL_RUN,
+    crate::sort::CoordinateStrategy::SPLITS_FINAL_RUN,
+    false
+)]
+#[case::template(
+    TemplateKeys::SPLITS_FINAL_RUN,
+    crate::sort::TemplateStrategy::SPLITS_FINAL_RUN,
+    true
+)]
+#[case::queryname_lex(
+    QuerynameKeys::<fgumi_sort::QnLex>::SPLITS_FINAL_RUN,
+    QuerynameStrategy::<fgumi_sort::QnLex>::SPLITS_FINAL_RUN,
+    true
+)]
+#[case::queryname_natural(
+    QuerynameKeys::<fgumi_sort::QnNatural>::SPLITS_FINAL_RUN,
+    QuerynameStrategy::<fgumi_sort::QnNatural>::SPLITS_FINAL_RUN,
+    true
+)]
+fn both_fronts_split_the_final_run_alike(
+    #[case] split_front: bool,
+    #[case] record_front: bool,
+    #[case] expected: bool,
+) {
+    assert_eq!((split_front, record_front), (expected, expected));
+}
+
+/// Which front's coordinate `seal_pieces` a case drives.
+#[derive(Debug, Clone, Copy)]
+enum Front {
+    /// `CoordinateKeys` (`ArenaKeyExtractor`, the block-input split front).
+    Split,
+    /// `CoordinateStrategy` (`ArenaSortStrategy`, the record-input `SortBuffer`).
+    Record,
+}
+
 /// A run whose input drains before `ReadBlocks` marked its last block is sealed
 /// by `finalize` as the residual: one terminal batch carrying a non-spilling
 /// `RunEnd`, and a second `finalize` cuts nothing. (Twin of the deleted

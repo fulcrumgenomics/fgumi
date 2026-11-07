@@ -707,9 +707,12 @@ budgets.
 Coordinate (`FindCoordinateBoundaries` → `ExtractCoordinateKeys` →
 `SortCoordinateRun`) extracts 24-byte `RecordRef`s and radix-sorts each run;
 the radix spawns its own `sort_threads` threads, so a whole-run seal leaves the
-bounded pool the trait hands it unused; the final run's pieces after a spill
-(`seal_pieces`) sort on it. The single-step front these replace is gone; SAM and fused
-inputs still sort through `SortBuffer` and its per-order `ArenaSortStrategy`.
+bounded pool the trait hands it unused. Unlike template and queryname order,
+coordinate does not split the final run of a spilled sort into pieces
+(`SPLITS_FINAL_RUN = false`): its whole-run radix is already parallel, and each
+piece would be one more source on the single-threaded k-way merge. The
+single-step front these replace is gone; SAM and fused inputs still sort through
+`SortBuffer` and its per-order `ArenaSortStrategy`.
 
 ### `fgumi compare bams` performance (issue #686, 2026-08-01)
 

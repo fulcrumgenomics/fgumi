@@ -73,6 +73,16 @@ pub const KEY_BATCH_RECORDS: usize = 4 * 1024;
 pub trait ArenaKeyExtractor: Send + Sync + 'static {
     /// Names of the three steps, in chain order: boundaries, extraction, run sort.
     const STEP_NAMES: [&'static str; 3];
+    /// Whether the final run of a sort that spilled seals as `sort_threads`
+    /// pieces ([`Self::seal_pieces`]) rather than one chunk ([`Self::seal`]).
+    ///
+    /// Each piece is its own source in the k-way merge, so pieces deepen the
+    /// merge's loser tree on its single thread. Template and queryname keep
+    /// them: template's whole-run seal ends in a serial heap merge of its
+    /// sorted runs, which pieces hand to the k-way merge instead, and splitting
+    /// was measured to help both when it was introduced (#1060). Coordinate's
+    /// whole-run parallel radix has no such serial step, so it opts out.
+    const SPLITS_FINAL_RUN: bool = true;
     /// Per-sort configuration known before the first record.
     type Seed: Clone + Send + 'static;
     /// Per-sort extraction context, provisioned from the sort's first record.
@@ -1052,11 +1062,16 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
             ledger.publish_seal(end.run_bytes, records);
         }
         // The final run of a sort that spilled is sealed as `sort_threads`
-        // pieces: the k-way merge interleaves them with the spills anyway, and
-        // the pieces sort in parallel. The piece count is the configured width,
-        // so the split is deterministic. A sort that never spilled keeps one
-        // chunk (the merge's single-chunk fast path).
-        let pieces = if !end.seals_to_spill && self.spilled_run_count > 0 && self.sort_threads > 1 {
+        // pieces when the order splits it (`SPLITS_FINAL_RUN`): the k-way merge
+        // interleaves them with the spills anyway, and the pieces sort in
+        // parallel. The piece count is the configured width, so the split is
+        // deterministic. A sort that never spilled keeps one chunk (the merge's
+        // single-chunk fast path).
+        let pieces = if X::SPLITS_FINAL_RUN
+            && !end.seals_to_spill
+            && self.spilled_run_count > 0
+            && self.sort_threads > 1
+        {
             self.sort_threads
         } else {
             1
@@ -1400,12 +1415,17 @@ pub struct CoordinateCtx {
 ///
 /// The radix spawns exactly `sort_threads` threads itself, so the bounded pool
 /// the trait hands `seal` is unused for coordinate order (the trait stays
-/// uniform across orders); `seal_pieces` sorts the final run's pieces on it.
+/// uniform across orders). Coordinate does not split its final run
+/// (`SPLITS_FINAL_RUN`), so `SortRun` never calls `seal_pieces` for it.
 pub struct CoordinateKeys;
 
 impl ArenaKeyExtractor for CoordinateKeys {
     const STEP_NAMES: [&'static str; 3] =
         ["FindCoordinateBoundaries", "ExtractCoordinateKeys", "SortCoordinateRun"];
+    /// The coordinate radix sorts a whole run on `sort_threads` threads, so
+    /// splitting the final run buys no sort parallelism and only adds merge
+    /// sources (at `-@ 32`, 32 memory sources beside the spills).
+    const SPLITS_FINAL_RUN: bool = false;
     /// The header's reference count.
     type Seed = u32;
     type Ctx = CoordinateCtx;
@@ -1489,6 +1509,9 @@ impl ArenaKeyExtractor for CoordinateKeys {
         pool: &BoundedSortPool,
         pieces: usize,
     ) -> Vec<MemoryChunkErased> {
+        // Not reached by `SortRun` (`SPLITS_FINAL_RUN` is false for this
+        // order); kept so the trait is total, and pinned by
+        // `coordinate_seal_pieces_split_the_run_in_order`.
         if acc.is_empty() {
             return vec![Self::seal(acc, ctx, arena, sort_threads, pool)];
         }
