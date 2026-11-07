@@ -118,6 +118,12 @@ pub struct StepStats {
     /// `PoolHandle::request_worker` calls from this step suppressed because an
     /// earlier event-count request was still unacknowledged.
     pub pool_requests_pending: AtomicU64,
+    /// `StepWaker::wake` calls for this step that unparked a parked host or
+    /// notified the pool.
+    pub side_wakes_delivered: AtomicU64,
+    /// `StepWaker::wake` calls for this step that found the host running (it
+    /// re-polls on its own) or no pool waiter to wake.
+    pub side_wakes_running: AtomicU64,
     /// Items this step held and later pushed: a push into one of its
     /// byte-bounded output edges was refused back to the step, and a later
     /// successful push into that edge (or a reorder stash insert that accepted
@@ -194,6 +200,8 @@ impl Default for StepStats {
             pool_requests_woken: AtomicU64::new(0),
             pool_requests_all_awake: AtomicU64::new(0),
             pool_requests_pending: AtomicU64::new(0),
+            side_wakes_delivered: AtomicU64::new(0),
+            side_wakes_running: AtomicU64::new(0),
             holds: AtomicU64::new(0),
             held_retries: AtomicU64::new(0),
             held_wait_ns: AtomicU64::new(0),
@@ -226,6 +234,8 @@ impl StepStats {
             pool_requests_woken: self.pool_requests_woken.load(Ordering::Relaxed),
             pool_requests_all_awake: self.pool_requests_all_awake.load(Ordering::Relaxed),
             pool_requests_pending: self.pool_requests_pending.load(Ordering::Relaxed),
+            side_wakes_delivered: self.side_wakes_delivered.load(Ordering::Relaxed),
+            side_wakes_running: self.side_wakes_running.load(Ordering::Relaxed),
             holds: self.holds.load(Ordering::Relaxed),
             held_retries: self.held_retries.load(Ordering::Relaxed),
             held_wait_ns: self.held_wait_ns.load(Ordering::Relaxed),
@@ -435,6 +445,20 @@ impl PipelineStats {
             PoolRequest::AllAwake => &s.pool_requests_all_awake,
             PoolRequest::Pending => &s.pool_requests_pending,
             PoolRequest::Unavailable => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one `StepWaker::wake` outcome for `step` (`Unavailable` is not
+    /// counted).
+    #[inline]
+    pub(crate) fn record_side_wake(&self, step: StepIdx, outcome: crate::runtime::wake::SideWake) {
+        use crate::runtime::wake::SideWake;
+        let Some(s) = self.steps.get(step.0) else { return };
+        let c = match outcome {
+            SideWake::Delivered => &s.side_wakes_delivered,
+            SideWake::Running => &s.side_wakes_running,
+            SideWake::Unavailable => return,
         };
         c.fetch_add(1, Ordering::Relaxed);
     }
@@ -961,6 +985,10 @@ pub struct StepStatsSnapshot {
     pub pool_requests_all_awake: u64,
     /// See [`StepStats::pool_requests_pending`].
     pub pool_requests_pending: u64,
+    /// See [`StepStats::side_wakes_delivered`].
+    pub side_wakes_delivered: u64,
+    /// See [`StepStats::side_wakes_running`].
+    pub side_wakes_running: u64,
     /// See [`StepStats::holds`].
     pub holds: u64,
     /// See [`StepStats::held_retries`].
@@ -1280,6 +1308,8 @@ impl StatsSnapshot {
                 | s.pool_requests_woken
                 | s.pool_requests_all_awake
                 | s.pool_requests_pending
+                | s.side_wakes_delivered
+                | s.side_wakes_running
                 | s.holds
                 | s.held_retries
                 != 0
@@ -1289,7 +1319,7 @@ impl StatsSnapshot {
         }
         writeln!(
             f,
-            "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12}",
+            "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>10} {:>10} {:>8} {:>8} {:>12} {:>12} {:>12}",
             "wake",
             "notify",
             "nowait",
@@ -1301,6 +1331,8 @@ impl StatsSnapshot {
             "req_woken",
             "req_awake",
             "req_pending",
+            "side_deliv",
+            "side_run",
             "holds",
             "retries",
             "held_p50_ms",
@@ -1312,7 +1344,7 @@ impl StatsSnapshot {
         for (name, s) in &self.steps {
             writeln!(
                 f,
-                "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>8} {:>8} {:>12.3} {:>12.3} {:>12.3}",
+                "  {:<28} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10} {:>10} {:>12} {:>10} {:>10} {:>8} {:>8} {:>12.3} {:>12.3} {:>12.3}",
                 name,
                 s.notifies_issued,
                 s.notifies_no_waiters,
@@ -1324,6 +1356,8 @@ impl StatsSnapshot {
                 s.pool_requests_woken,
                 s.pool_requests_all_awake,
                 s.pool_requests_pending,
+                s.side_wakes_delivered,
+                s.side_wakes_running,
                 s.holds,
                 s.held_retries,
                 ms(s.held_wait_quantile_ns(0.50)),
@@ -2135,8 +2169,14 @@ mod tests {
         stats.record_hold(StepIdx(1), 500_000);
         stats.record_held_retry(StepIdx(1));
 
+        stats.record_side_wake(StepIdx(1), crate::runtime::wake::SideWake::Delivered);
+        stats.record_side_wake(StepIdx(1), crate::runtime::wake::SideWake::Delivered);
+        stats.record_side_wake(StepIdx(1), crate::runtime::wake::SideWake::Running);
+        stats.record_side_wake(StepIdx(1), crate::runtime::wake::SideWake::Unavailable);
+
         let snap = stats.snapshot();
         let b = snap.steps[1].1;
+        assert_eq!((b.side_wakes_delivered, b.side_wakes_running), (2, 1), "Unavailable skipped");
         assert_eq!(b.notifies_issued, 6, "notified 2 + no_waiters 1 + suppressed 2 + notified 1");
         assert_eq!(b.notifies_no_waiters, 1);
         assert_eq!(b.notifies_suppressed, 2);
@@ -2162,13 +2202,13 @@ mod tests {
             .unwrap_or_else(|| panic!("wake row for B missing:\n{text}"));
         let cols: Vec<&str> = row.split_whitespace().collect();
         // B notify nowait suppressed unpark reverse fallback gated_off req_woken req_awake
-        // req_pending holds retries p50 p99 max
+        // req_pending side_deliv side_run holds retries p50 p99 max
         assert_eq!(
-            &cols[..13],
-            &["B", "6", "1", "2", "3", "1", "1", "4", "1", "1", "1", "2", "1"],
+            &cols[..15],
+            &["B", "6", "1", "2", "3", "1", "1", "4", "1", "1", "1", "2", "1", "2", "1"],
             "{row}"
         );
-        assert_eq!(cols[15], "1.500", "max column: {row}");
+        assert_eq!(cols[17], "1.500", "max column: {row}");
     }
 
     /// The histogram's quantiles come from the bucket boundaries (an upper bound

@@ -154,6 +154,23 @@ struct StepWake {
     own: WakeTarget,
 }
 
+/// Where a step runs, for [`StepWaker`].
+struct StepHost {
+    /// What `thread_of` computes for the step.
+    target: WakeTarget,
+    /// For a `Pool` host with clones on only some workers
+    /// (`ParallelHosts::workers`): the workers the direct-park and cap-parked
+    /// fallbacks may claim.
+    mask: Option<Box<[u64]>>,
+}
+
+impl StepHost {
+    /// A host at `target`; the fallback `mask` applies to a `Pool` host only.
+    fn of(target: WakeTarget, mask: Option<Box<[u64]>>) -> Self {
+        Self { target, mask: mask.filter(|_| target == WakeTarget::Pool) }
+    }
+}
+
 /// The bounded edges a plan may track, by kind.
 #[derive(Clone, Copy, Default)]
 pub struct WakeEdges<'a> {
@@ -247,7 +264,7 @@ pub enum PoolRequest {
 #[derive(Clone, Copy)]
 pub struct PoolHandle<'a> {
     plan: &'a WakePlan,
-    stats: Option<&'a crate::runtime::stats::PipelineStats>,
+    stats: Option<&'a Arc<crate::runtime::stats::PipelineStats>>,
     step: StepIdx,
 }
 
@@ -256,7 +273,7 @@ impl<'a> PoolHandle<'a> {
     #[must_use]
     pub(crate) fn new(
         plan: &'a WakePlan,
-        stats: Option<&'a crate::runtime::stats::PipelineStats>,
+        stats: Option<&'a Arc<crate::runtime::stats::PipelineStats>>,
         step: StepIdx,
     ) -> Self {
         Self { plan, stats, step }
@@ -285,10 +302,77 @@ impl<'a> PoolHandle<'a> {
     pub fn parked_workers(&self) -> usize {
         self.plan.pool.as_ref().map_or(0, |p| p.waiters())
     }
+
+    /// This step's [`StepWaker`]: wakes whichever thread hosts the step, from
+    /// any thread, for work that reaches it off any queue edge. Valid for the
+    /// run; it holds the plan and the stats weakly, so a stale waker reports
+    /// [`SideWake::Unavailable`].
+    #[must_use]
+    pub fn waker(&self) -> StepWaker {
+        StepWaker {
+            plan: self.plan.me.clone(),
+            step: self.step,
+            stats: self.stats.map_or_else(std::sync::Weak::new, Arc::downgrade),
+        }
+    }
+}
+
+/// What a [`StepWaker::wake`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideWake {
+    /// A parked host was unparked, or the pool was notified.
+    Delivered,
+    /// The host is running (its parking bit is clear) or no pool waiter
+    /// exists: it re-polls on its own.
+    Running,
+    /// The standalone plan (a step probe), or the run has ended.
+    Unavailable,
+}
+
+/// Wakes the thread(s) that host a step, for work that reaches it off any
+/// queue edge. Obtained from [`PoolHandle::waker`]; `Send + Sync + Clone`.
+/// Holds the plan and the stats weakly.
+#[derive(Clone)]
+pub struct StepWaker {
+    plan: std::sync::Weak<WakePlan>,
+    step: StepIdx,
+    stats: std::sync::Weak<crate::runtime::stats::PipelineStats>,
+}
+
+impl StepWaker {
+    /// Publish-then-wake: call after the side-channel write. Fences, then
+    /// delivers to the host recorded at build: a driver or a pinned worker is
+    /// unparked if it is armed for a timer park; a `Pool` host gets a
+    /// `notify_one` with the direct-parked and cap-parked fallbacks, masked to
+    /// the step's host workers and gated on its cap exactly as a forward
+    /// `Pool` wake is. [`SideWake::Unavailable`] once the run's plan is gone
+    /// or for the standalone plan.
+    #[must_use = "the outcome says whether a host was woken"]
+    pub fn wake(&self) -> SideWake {
+        let Some(plan) = self.plan.upgrade() else { return SideWake::Unavailable };
+        let Some(host) = plan.hosts.get(self.step.0) else { return SideWake::Unavailable };
+        delivery_fence();
+        let mut r = WakeCounts::default();
+        plan.deliver(host.target, Some(self.step), host.mask.as_deref(), &mut r);
+        let out = if r.notified > 0 || r.unparked > 0 || r.fallback > 0 {
+            SideWake::Delivered
+        } else {
+            SideWake::Running
+        };
+        if let Some(stats) = self.stats.upgrade() {
+            stats.record_side_wake(self.step, out);
+        }
+        out
+    }
 }
 
 /// The per-chain wake routing table. See the module docs.
 pub struct WakePlan {
+    /// This plan, weakly: what [`PoolHandle::waker`] hands out.
+    me: std::sync::Weak<WakePlan>,
+    /// By `StepIdx`: where each step runs, for every step (not only those
+    /// with a same-thread branch); empty in the standalone plan.
+    hosts: Box<[StepHost]>,
     /// By `StepIdx`; empty in the standalone plan.
     steps: Box<[StepWake]>,
     /// By `DriverIdx`.
@@ -387,7 +471,9 @@ impl WakePlan {
     /// A fresh `Arc` per run; it holds nothing.
     #[must_use]
     pub fn standalone() -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            hosts: Box::new([]),
             steps: Box::new([]),
             drivers: ThreadSlots::new(0),
             workers: ThreadSlots::new(0),
@@ -577,7 +663,12 @@ impl WakePlan {
         let caps: Box<[Option<StepCap>]> = (0..n).map(|i| caps.get(i).cloned().flatten()).collect();
         let distinct_caps = index_caps(&caps);
 
-        Arc::new(Self {
+        let hosts = (0..n).map(|i| StepHost::of(thread_of(StepIdx(i)), mask_of(StepIdx(i))));
+        let hosts: Box<[StepHost]> = hosts.collect();
+
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            hosts,
             steps,
             drivers: ThreadSlots::new(n_drivers),
             workers: ThreadSlots::new(n_threads),
@@ -2284,6 +2375,186 @@ mod tests {
         assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
     }
 
+    /// Where the step under test runs.
+    #[derive(Clone, Copy, Debug)]
+    enum Host {
+        Detached,
+        Worker(usize),
+        Pool,
+        Standalone,
+    }
+
+    /// Whether the host thread is armed for a timer park.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Armed {
+        Yes,
+        No,
+    }
+
+    /// `Src (Parallel) → Host`, two workers and a pool event-count; the
+    /// host is step 1.
+    fn host_plan(host: Host, pool: &Arc<PoolEventCount>) -> Arc<WakePlan> {
+        let mut g = ChainGraph::new();
+        let a = g.register_step("Src", 1);
+        let b = g.register_step("Host", 0);
+        g.wire(a, BranchIdx(0), b);
+        let (kind, pinned, driver) = match host {
+            Host::Detached => (StepKind::Detached, None, Some(DriverIdx(0))),
+            Host::Worker(w) => (StepKind::Serial, Some(w), None),
+            Host::Pool | Host::Standalone => (StepKind::Parallel, None, None),
+        };
+        if matches!(host, Host::Standalone) {
+            return WakePlan::standalone();
+        }
+        WakePlan::build(
+            &g,
+            &[StepKind::Parallel, kind],
+            &[None, pinned],
+            &[None, driver],
+            &[],
+            WakeEdges::NONE,
+            Some(Arc::clone(pool)),
+            2,
+        )
+    }
+
+    /// Run the host thread of `host` on its own OS thread: register, arm when
+    /// `armed`, signal readiness, park for `park`. Returns how long it parked.
+    fn parked_host(
+        plan: &Arc<WakePlan>,
+        host: Host,
+        armed: Armed,
+        park: Duration,
+    ) -> std::thread::JoinHandle<Duration> {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let p = Arc::clone(plan);
+        let h = std::thread::spawn(move || {
+            match host {
+                Host::Detached => {
+                    p.register_driver(DriverIdx(0), std::thread::current());
+                    if armed == Armed::Yes {
+                        assert!(p.arm_driver(DriverIdx(0)));
+                    }
+                }
+                Host::Worker(w) => {
+                    p.register_worker(w, std::thread::current());
+                    if armed == Armed::Yes {
+                        assert!(p.arm_direct(w));
+                    }
+                }
+                Host::Pool | Host::Standalone => unreachable!("not a thread-hosted case"),
+            }
+            tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            std::thread::park_timeout(park);
+            t0.elapsed()
+        });
+        rx.recv().unwrap();
+        // Let it reach the park; a token delivered earlier is still caught.
+        std::thread::sleep(Duration::from_millis(20));
+        h
+    }
+
+    /// `StepWaker::wake` reaches the host a step runs on, by host kind, and
+    /// reports a running host as `Running`.
+    #[rstest]
+    #[case::driver_parked(Host::Detached, Armed::Yes, SideWake::Delivered)]
+    #[case::driver_running(Host::Detached, Armed::No, SideWake::Running)]
+    #[case::pinned_worker(Host::Worker(1), Armed::Yes, SideWake::Delivered)]
+    #[case::pool_hosted(Host::Pool, Armed::Yes, SideWake::Delivered)]
+    #[case::standalone_probe(Host::Standalone, Armed::Yes, SideWake::Unavailable)]
+    fn step_waker_semantics(#[case] host: Host, #[case] armed: Armed, #[case] expected: SideWake) {
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = host_plan(host, &pool);
+        let waker = PoolHandle::new(&plan, None, StepIdx(1)).waker();
+        let (thread, waiter) = match host {
+            Host::Detached | Host::Worker(_) => {
+                (Some(parked_host(&plan, host, armed, Duration::from_millis(400))), None)
+            }
+            Host::Pool => (None, Some(armed_pool_waiter(&pool))),
+            Host::Standalone => (None, None),
+        };
+        assert_eq!(waker.wake(), expected);
+        if let Some(t) = thread {
+            let parked = t.join().unwrap();
+            // Only a delivered wake is timed: `park_timeout` may return early
+            // on its own, so a lower bound on a running host's park would
+            // flake, and the returned `SideWake::Running` already shows the
+            // wake did not unpark it.
+            if expected == SideWake::Delivered {
+                assert!(parked < Duration::from_millis(300), "host not unparked: {parked:?}");
+            }
+        }
+        if let Some(w) = waiter {
+            assert!(matches!(w.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+        }
+    }
+
+    /// A waker outlives neither the plan nor the run: a dropped plan reports
+    /// `Unavailable`.
+    #[test]
+    fn step_waker_after_the_plan_is_dropped_is_unavailable() {
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = host_plan(Host::Pool, &pool);
+        let waker = PoolHandle::new(&plan, None, StepIdx(1)).waker();
+        drop(plan);
+        assert_eq!(waker.wake(), SideWake::Unavailable);
+    }
+
+    /// A `Pool`-hosted step whose cap has no free permit does not claim a
+    /// cap-parked worker (the release that frees a permit wakes it); with room
+    /// the same wake claims it.
+    #[rstest]
+    #[case::full_cap(true, SideWake::Running, false)]
+    #[case::cap_with_room(false, SideWake::Delivered, true)]
+    fn step_waker_respects_full_cap(
+        #[case] full: bool,
+        #[case] expected: SideWake,
+        #[case] claimed: bool,
+    ) {
+        let mut g = ChainGraph::new();
+        let a = g.register_step("Src", 1);
+        let b = g.register_step("Host", 0);
+        g.wire(a, BranchIdx(0), b);
+        let cap = crate::PhaseCap::new("t", 1);
+        let held = full.then(|| cap.try_acquire_as(9));
+        let plan = WakePlan::build(
+            &g,
+            &[StepKind::Parallel, StepKind::Parallel],
+            &[None, None],
+            &[None, None],
+            &[None, Some(Arc::clone(&cap))],
+            WakeEdges::NONE,
+            Some(Arc::new(PoolEventCount::new(2))),
+            2,
+        );
+        plan.register_worker(1, std::thread::current());
+        assert!(plan.arm_cap_parked(1));
+        let waker = PoolHandle::new(&plan, None, StepIdx(1)).waker();
+        assert_eq!(waker.wake(), expected);
+        assert_eq!(plan.cap_parked.is_empty(), claimed, "cap-parked worker claimed?");
+        drop(held);
+        plan.disarm_cap_parked(1);
+        std::thread::park_timeout(Duration::ZERO); // consume any token
+    }
+
+    /// Every `wake()` lands in the step's counters.
+    #[test]
+    fn step_waker_counts_stats() {
+        let stats = Arc::new(crate::runtime::stats::PipelineStats::new(vec!["Src", "Host"]));
+        let pool = Arc::new(PoolEventCount::new(2));
+        let plan = host_plan(Host::Pool, &pool);
+        let waker = PoolHandle::new(&plan, Some(&stats), StepIdx(1)).waker();
+        let waiter = armed_pool_waiter(&pool);
+        assert_eq!(waker.wake(), SideWake::Delivered);
+        assert!(matches!(waiter.join().unwrap(), WaitOutcome::Woken | WaitOutcome::Notified));
+        assert_eq!(waker.wake(), SideWake::Running, "nobody left to wake");
+        let s = stats.snapshot().steps[1].1;
+        assert_eq!(s.side_wakes_delivered + s.side_wakes_running, 2);
+        assert_eq!((s.side_wakes_delivered, s.side_wakes_running), (1, 1));
+        assert_eq!(stats.snapshot().steps[0].1.side_wakes_delivered, 0);
+    }
+
     /// One worker: no pool, worker 0 registered → the request
     /// unparks it and reports Woken; unregistered → Unavailable.
     #[test]
@@ -2382,7 +2653,7 @@ mod tests {
     /// Stats-on: each outcome lands in its per-step counter.
     #[test]
     fn request_worker_records_per_step_outcomes() {
-        let stats = crate::runtime::stats::PipelineStats::new(vec!["A", "B"]);
+        let stats = Arc::new(crate::runtime::stats::PipelineStats::new(vec!["A", "B"]));
         let standalone = WakePlan::standalone();
         let h = PoolHandle::new(&standalone, Some(&stats), StepIdx(1));
         assert_eq!(h.request_worker(), PoolRequest::Unavailable);

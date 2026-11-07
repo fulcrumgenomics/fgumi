@@ -975,7 +975,7 @@ fn dispatch_one_step(
         outputs: outputs_any,
         signal,
         counters: &contexts.step_counters[step_idx.0],
-        pool: PoolHandle::new(wake, stats.map(|s| &**s), step_idx),
+        pool: PoolHandle::new(wake, stats, step_idx),
     };
 
     // Time the dispatch only when stats collection is on; gating on
