@@ -975,7 +975,7 @@ fn dispatch_one_step(
         outputs: outputs_any,
         signal,
         counters: &contexts.step_counters[step_idx.0],
-        pool: PoolHandle::new(wake, stats.map(|s| &**s), step_idx),
+        pool: PoolHandle::new(wake, stats, step_idx),
     };
 
     // Time the dispatch only when stats collection is on; gating on
@@ -1368,6 +1368,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
@@ -1408,6 +1409,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let mut worker = WorkerCore::new(0, None, BackoffPolicy::ParkedSleep);

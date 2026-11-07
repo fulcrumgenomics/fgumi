@@ -178,10 +178,40 @@ pub enum QueueSpec {
     /// the running byte counter past `limit_bytes`. Requires `T: HeapSize`.
     /// Best for variable-size BAM batches and FASTQ batches.
     ByteBounded { limit_bytes: u64 },
+    /// A [`Self::ByteBounded`] transport whose limit is fixed: the run's
+    /// `queue_memory_total` budget neither resizes it nor counts it when
+    /// splitting the total over the other byte-bounded queues, and the queue
+    /// rebalancer leaves it alone. The deadlock monitor and the wake plan treat
+    /// it as any byte-bounded edge.
+    ///
+    /// For a small edge whose bound is a property of the protocol rather than
+    /// a share of memory, such as a fan-out job edge carrying a window of
+    /// job descriptors: an even share would take budget from the data edges
+    /// and grow the descriptor edge far past its window.
+    FixedByteBounded { limit_bytes: u64 },
     /// No backpressure. `try_push` always succeeds. Use only when the
     /// branch is naturally rate-limited upstream (e.g., a header-once
     /// emit on pipeline start).
     Unbounded,
+}
+
+impl QueueSpec {
+    /// The transport this spec builds: [`Self::FixedByteBounded`] builds the
+    /// same queue as [`Self::ByteBounded`]; every other spec is itself.
+    #[must_use]
+    pub(crate) const fn transport(self) -> Self {
+        match self {
+            Self::FixedByteBounded { limit_bytes } => Self::ByteBounded { limit_bytes },
+            other => other,
+        }
+    }
+
+    /// Whether a run's `queue_memory_total` budget sizes this queue (false
+    /// only for [`Self::FixedByteBounded`]).
+    #[must_use]
+    pub const fn is_budgeted(self) -> bool {
+        !matches!(self, Self::FixedByteBounded { .. })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

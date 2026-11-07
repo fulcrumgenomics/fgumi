@@ -10,12 +10,12 @@ use fgumi_sort::{
     TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
 
+use crate::sort::merge_job::{GatherSizing, MergeJob, MergeResult};
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
 use crate::types::{DecompressedBlock, RecordBatch, RecordBatchBuilder};
 use fgumi_pipeline_core::{
-    HeapSize, HeldRetry, Ordered, PhaseCap, Unpushed,
+    HeapSize, Ordered, OrderedInbox, SideChannel, Unpushed,
     held::HeldSlot,
-    outputs::OrderedBytesSingle,
     queues::QueueSpec,
     reorder::BranchOrdering,
     step::{CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
@@ -28,17 +28,16 @@ pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1024;
 const MAX_DRAIN_BATCHES_PER_LOCK: usize = 8;
 
 /// Minimum record count for the fast path to fan its gather across the pool.
-/// Below this the serial gather is faster: the rayon pool build, block plan, and
-/// per-window join overhead would dominate a small chunk (which the serial path
+/// Below this the serial gather is faster: the block plan and the per-block job
+/// round trip would dominate a small chunk (which the serial path
 /// clears in well under a millisecond). ~1 output block per worker at the
 /// default 1024-record batch, so the fan-out always has real work to spread.
 const FAST_PATH_PARALLEL_MIN_RECORDS: usize = 64 * 1024;
 
-/// Output blocks gathered per parallel window per worker. The parallel fast path
-/// gathers `fast_path_threads * this` blocks per burst, pushes them in order,
-/// then repeats — bounding peak extra memory to that many uncompressed blocks
-/// (vs. materialising the whole output) while keeping every worker fed and the
-/// `try_run` body cooperative.
+/// Gather jobs in flight per worker. Gather mode keeps at most
+/// `fanout_width * this` jobs posted but not yet taken back, bounding peak
+/// extra memory to that many uncompressed blocks (vs. materialising the whole
+/// output) while keeping every worker fed.
 const FAST_PATH_BLOCKS_PER_WORKER_WINDOW: usize = 4;
 
 /// Every record ingested must come out of the merge: a slot that finalized a
@@ -700,7 +699,7 @@ fn plan_fast_path_blocks<O: MergeOutput>(
 /// Byte-identical to the serial `next_fast_batch` for the same record range: the
 /// builder frames records the same way and the block boundaries were planned to
 /// match (see [`plan_fast_path_blocks`]).
-fn gather_fast_block<O: MergeOutput>(
+pub(crate) fn gather_fast_block<O: MergeOutput>(
     chunk: &MemoryChunkErased,
     block: FastBlock,
     ordinal: u64,
@@ -748,33 +747,37 @@ enum SortMergeState<B> {
         builder: B,
         next_ordinal: u64,
     },
-    /// Parallel single-source fast path: same precondition as [`SortMergeState::FastPath`], but
-    /// the gather is fanned across a bounded rayon pool. The output-block
-    /// boundaries are precomputed up front (`blocks`) from the per-record
-    /// lengths ALONE — reproducing the serial [`SortMergeState::FastPath`] count/byte-cap split
-    /// byte-for-byte — so each block can be gathered independently and the
-    /// emitted stream is identical to the serial path (same records, same block
-    /// boundaries, same dense ordinals). The step wraps `chunk` in an `Arc` so
-    /// the rayon closures can share it (`MemoryChunkErased` is `Send + Sync` and
+    /// Pooled single-source fast path: same precondition as
+    /// [`SortMergeState::FastPath`], but each output block is gathered by a
+    /// `MergeWork` pool worker. The block boundaries are precomputed (`blocks`)
+    /// from the per-record lengths ALONE — reproducing the serial
+    /// [`SortMergeState::FastPath`] count/byte-cap split byte-for-byte — so each
+    /// block is gathered independently and the emitted stream is identical to
+    /// the serial path (same records, same block boundaries, same dense
+    /// ordinals). The merge posts one [`MergeJob::Gather`] per block on its
+    /// second branch and takes the results back from its inbox in ordinal order
+    /// (the detached output edge has no reorder stage). `chunk` is shared with
+    /// the jobs through an `Arc` (`MemoryChunkErased` is `Send + Sync` and
     /// `record_bytes` is a read-only arena slice).
-    FastPathParallel {
+    GatherMode {
         chunk: Arc<MemoryChunkErased>,
         /// Precomputed output-block record ranges `[start, end)`, contiguous and
         /// covering `0..total`; block `i` emits with ordinal `i` (dense).
         blocks: Vec<FastBlock>,
-        /// Index of the next block to gather+emit (in ascending, i.e. ordinal,
-        /// order — the detached output edge has no reorder stage).
-        next_block: usize,
+        /// Index of the next block to post as a job.
+        next_to_post: usize,
+        /// Ordinal of the next result to take from the inbox and emit.
+        next_to_take: u64,
     },
     Done,
 }
 
-/// One planned output block for the parallel fast path: the half-open record
+/// One planned output block for the pooled fast path: the half-open record
 /// range `[start, end)` into the sorted chunk. The block's ordinal is its index
 /// in the plan vector (dense, `0..blocks.len()`), matching what the serial
-/// [`SortMergeState::FastPath`] mints via `next_ordinal`.
+/// `SortMergeState::FastPath` mints via `next_ordinal`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FastBlock {
+pub struct FastBlock {
     start: usize,
     end: usize,
 }
@@ -897,41 +900,35 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// never `new_worker_copy`'d), so plain `&mut self` counters are sound — no
     /// atomics needed.
     dbg: MergeDiag,
-    /// Worker budget for the in-memory fast-path parallel gather (see
-    /// [`Self::fast_path_pool`]). `1` (the default) keeps the historical
-    /// single-threaded serial gather; `> 1` fans the gather across a bounded,
-    /// step-owned rayon pool. Wired from the sort chain's phase-2 (`merge`)
-    /// thread budget in `add_sort`.
+    /// Pool workers the in-memory fast path fans its gather across (see
+    /// [`Self::with_fanout_width`]); sets the gather window. `1` (the default)
+    /// keeps the serial gather; `> 1` (with an inbox) posts gather jobs to
+    /// `MergeWork`. Wired from the sort chain's phase-2 (`merge`) thread budget
+    /// in `add_sort`.
     ///
     /// This affects ONLY the fast path (single already-sorted in-memory chunk).
     /// The k-way merge path is untouched — it is a genuinely serial loser-tree
     /// walk whose winner order cannot be produced out of order.
-    fast_path_threads: usize,
+    fanout_width: usize,
     /// Minimum record count for the fast path to fan across the pool
     /// ([`FAST_PATH_PARALLEL_MIN_RECORDS`] in production). A field, not the bare
     /// const, only so tests can force the parallel path on a small chunk to
     /// assert byte-for-byte parity with the serial gather without materialising
     /// 64 Ki records.
     fast_path_min_records: usize,
-    /// Bounded rayon pool for the fast-path parallel gather, built once on first
-    /// use and sized to [`fast_path_threads`](Self::fast_path_threads).
-    ///
-    /// Owned by the step (not the pipeline work-stealing pool, which is not
-    /// reachable from a step body) and bounded to the sort's thread budget so
-    /// the gather never oversubscribes past `--threads` — the same discipline
-    /// the chunk-sort front uses (`CoordinateChunkSorter::rayon_pool`). Only
-    /// built when `fast_path_threads > 1`, and only for a fast-path run.
-    fast_path_pool: Option<rayon::ThreadPool>,
-    /// Blocks gathered by `emit_fast_batches_parallel` but not yet pushed
-    /// downstream (the queue rejected a push mid-window). Drained IN ORDER — with
-    /// the `held` slot holding at most the single most-recently-rejected item —
-    /// at the top of the next `try_run` before any new gather, preserving the
-    /// dense ascending-ordinal emission the detached output edge requires.
-    fast_pending: std::collections::VecDeque<O::Item>,
-    /// Phase-2 cap the parallel fast-path gather takes whole (`None` =
-    /// uncapped). The gather runs beside the output compressor that shares
-    /// this cap, so it holds every permit while it runs.
-    fast_path_cap: Option<Arc<PhaseCap>>,
+    /// The inbox `MergeWork` delivers gather results to (see
+    /// [`Self::with_inbox`]). `None` keeps the fast path serial whatever the
+    /// fan-out width: nothing would run the posted jobs.
+    inbox: Option<Arc<OrderedInbox<MergeResult<O>>>>,
+    /// The inbox's owner waker was bound (on the first dispatch, which is the
+    /// first time this step sees its pool handle).
+    inbox_bound: bool,
+    /// A gather job the job branch refused, re-posted before any new one.
+    held_job: HeldSlot<Unpushed<MergeJob<O>>>,
+    /// Test-only override of [`Self::job_edge_limit`], so a test can make the
+    /// job branch refuse a post within the window.
+    #[cfg(test)]
+    job_edge_limit_override: Option<u64>,
     /// The sort's merge-wide demand, shared with `SortSpillDecompress`: on a
     /// stall the merge declares the slot it waits on, and the delivery to that
     /// slot unparks this step's driver thread. `None` when the merge runs
@@ -1119,11 +1116,13 @@ impl<O: MergeOutput> SortMerge<O> {
             processed: 0,
             chunk_count: 0,
             dbg: MergeDiag::default(),
-            fast_path_threads: 1,
+            fanout_width: 1,
             fast_path_min_records: FAST_PATH_PARALLEL_MIN_RECORDS,
-            fast_path_pool: None,
-            fast_pending: std::collections::VecDeque::new(),
-            fast_path_cap: None,
+            inbox: None,
+            inbox_bound: false,
+            held_job: HeldSlot::new(),
+            #[cfg(test)]
+            job_edge_limit_override: None,
             demand: None,
             awaiting: false,
             class_table: None,
@@ -1180,31 +1179,74 @@ impl<O: MergeOutput> SortMerge<O> {
         self
     }
 
-    /// Make the parallel fast-path gather take its threads from the phase-2
-    /// cap (`--merge-threads`, whose count is the fast-path thread count)
-    /// shared with spill decompression and output compression: each gather
-    /// burst takes the whole cap ([`PhaseCap::acquire_whole`]) and runs on the
-    /// full fast-path pool, so gather + output compression stay within the
-    /// cap. `None` leaves the gather uncapped. Output is identical.
+    /// Fan the in-memory fast-path gather across `width` pool workers, and
+    /// return this merge together with the `MergeWork` step that must be wired
+    /// on its branch 1 (`(merge_tail.0, BranchIdx(1))`). The helper creates the
+    /// inbox and hands both ends their half, so a merge built through it and the
+    /// `MergeWork` it returns share one inbox. That pairing holds only while the
+    /// caller wires this `MergeWork` (not another, such as the idle one
+    /// [`serial_merge_output`](crate::sort::merge_job::serial_merge_output)
+    /// adds) on branch 1. `cap` is the phase-2 cap the `MergeWork` step admits
+    /// under (`None` leaves it uncapped). See `Self::with_fanout_width`.
     #[must_use]
-    pub fn with_fast_path_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
-        self.fast_path_cap = cap;
+    pub fn with_pooled_gather(
+        self,
+        width: usize,
+        cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    ) -> (Self, fgumi_pipeline_core::FanoutWorker<MergeJob<O>>) {
+        let inbox = OrderedInbox::new(true);
+        let work = crate::sort::merge_job::merge_work(Arc::clone(&inbox))
+            .with_step_cap(cap.map(fgumi_pipeline_core::StepCap::Fixed));
+        (self.with_inbox(inbox).with_fanout_width(width), work)
+    }
+
+    /// Take pooled gather results from `inbox`. Crate-private: the caller must
+    /// wire a `MergeWork` step (a [`fgumi_pipeline_core::FanoutWorker`] over
+    /// [`MergeJob`] delivering to this same inbox) on this step's branch 1, and
+    /// a mismatch strands every gather result in an orphan inbox. Production
+    /// wiring goes through [`Self::with_pooled_gather`], which returns the
+    /// merge and the matching `MergeWork` together; the pairing is guaranteed
+    /// only through it. With an inbox and a fan-out width above 1, a large
+    /// single-chunk fast path posts its gather jobs there and waits for their
+    /// results.
+    #[must_use]
+    pub(crate) fn with_inbox(mut self, inbox: Arc<OrderedInbox<MergeResult<O>>>) -> Self {
+        self.inbox = Some(inbox);
         self
     }
 
-    /// Set the worker budget for the in-memory fast-path parallel gather.
+    /// Set how many pool workers the in-memory fast-path gather fans across.
     ///
-    /// `1` (the default) preserves the single-threaded serial gather. `> 1` fans
-    /// the gather of the single already-sorted in-memory chunk across a bounded
-    /// step-owned rayon pool (built lazily, capped at `threads`), which removes
-    /// the flat ~serial gather cost that otherwise floors the in-memory sort's
-    /// wall clock while the pipeline pool sits idle. Clamped to `>= 1`.
+    /// `1` (the default) preserves the single-threaded serial gather. `> 1`
+    /// (with [`Self::with_inbox`]) gathers the single already-sorted in-memory
+    /// chunk's blocks on the pipeline pool, at most `width *
+    /// FAST_PATH_BLOCKS_PER_WORKER_WINDOW` jobs ahead of the blocks emitted,
+    /// which removes the flat ~serial gather cost that otherwise floors the
+    /// in-memory sort's wall clock. Clamped to `>= 1`.
     ///
     /// Only the fast path is affected; the k-way merge path is untouched.
+    /// Crate-private: a width does nothing without the inbox, so callers
+    /// outside the crate set both through [`Self::with_pooled_gather`].
     #[must_use]
-    pub fn with_fast_path_threads(mut self, threads: usize) -> Self {
-        self.fast_path_threads = threads.max(1);
+    pub(crate) fn with_fanout_width(mut self, width: usize) -> Self {
+        self.fanout_width = width.max(1);
         self
+    }
+
+    /// Gather jobs kept in flight (posted, not yet taken) in gather mode.
+    fn gather_window(&self) -> usize {
+        self.fanout_width.saturating_mul(FAST_PATH_BLOCKS_PER_WORKER_WINDOW).max(1)
+    }
+
+    /// The byte bound of the job branch: room for twice the window of job
+    /// descriptors, so a post within the window is never refused.
+    fn job_edge_limit(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = self.job_edge_limit_override {
+            return limit;
+        }
+        let jobs = self.gather_window().saturating_mul(2);
+        (jobs.saturating_mul(std::mem::size_of::<MergeJob<O>>())) as u64
     }
 
     /// Test-only: lower the record-count threshold that gates the parallel
@@ -1215,6 +1257,15 @@ impl<O: MergeOutput> SortMerge<O> {
     #[must_use]
     pub(crate) fn with_fast_path_min_records(mut self, min: usize) -> Self {
         self.fast_path_min_records = min;
+        self
+    }
+
+    /// Test-only: shrink the job branch's byte bound to `limit`, so a post
+    /// within the gather window is refused and the held-job path runs.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_job_edge_limit(mut self, limit: u64) -> Self {
+        self.job_edge_limit_override = Some(limit);
         self
     }
 
@@ -1281,9 +1332,18 @@ impl<O: MergeOutput> SortMerge<O> {
 
     fn flush_held(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
         // `true` once the slot is clear (was empty, or the held event flushed);
-        // `false` while it's still held under backpressure. Uses the canonical
-        // re-hold helper so the put-back-on-reject invariant lives in one place.
-        !matches!(ctx.outputs.retry_held(&mut self.held), HeldRetry::StillHeld)
+        // `false` while it's still held under backpressure (put back, never
+        // dropped). Branch 0 is the merged output.
+        match self.held.take() {
+            None => true,
+            Some(unpushed) => match ctx.outputs.view().a.retry(unpushed) {
+                Ok(()) => true,
+                Err(again) => {
+                    self.held.put(again);
+                    false
+                }
+            },
+        }
     }
 
     /// Drains every currently-available input event into the setup state and
@@ -1454,7 +1514,7 @@ impl<O: MergeOutput> SortMerge<O> {
         loop {
             match self.next_batch(records_out)? {
                 NextBatch::Batch(batch) => {
-                    if let Err(unpushed) = ctx.outputs.push(batch) {
+                    if let Err(unpushed) = ctx.outputs.view().a.push(batch) {
                         self.dbg.output_full += 1;
                         self.held.put(unpushed);
                         return Ok(StepOutcome::Progress);
@@ -1507,7 +1567,7 @@ impl<O: MergeOutput> SortMerge<O> {
                         None => ensure_all_records_merged(self.processed, merged)?,
                     }
                     if let Some(batch) = partial
-                        && let Err(unpushed) = ctx.outputs.push(batch)
+                        && let Err(unpushed) = ctx.outputs.view().a.push(batch)
                     {
                         self.dbg.output_full += 1;
                         self.held.put(unpushed);
@@ -1647,7 +1707,7 @@ impl<O: MergeOutput> SortMerge<O> {
         loop {
             match self.next_fast_batch(records_out)? {
                 NextBatch::Batch(batch) => {
-                    if let Err(unpushed) = ctx.outputs.push(batch) {
+                    if let Err(unpushed) = ctx.outputs.view().a.push(batch) {
                         self.dbg.output_full += 1;
                         self.held.put(unpushed);
                         return Ok(StepOutcome::Progress);
@@ -1661,7 +1721,7 @@ impl<O: MergeOutput> SortMerge<O> {
                 NextBatch::Stalled => unreachable!("FastPath never stalls (all in memory)"),
                 NextBatch::Done(partial, count) => {
                     if let Some(batch) = partial {
-                        if let Err(unpushed) = ctx.outputs.push(batch) {
+                        if let Err(unpushed) = ctx.outputs.view().a.push(batch) {
                             self.dbg.output_full += 1;
                             self.held.put(unpushed);
                             return Ok(StepOutcome::Progress);
@@ -1681,195 +1741,108 @@ impl<O: MergeOutput> SortMerge<O> {
         }
     }
 
-    /// Build the step-owned bounded rayon pool for the parallel fast-path
-    /// gather, if not already built. Sized to `fast_path_threads` and capped
-    /// so the gather never oversubscribes past `--threads`. Idempotent.
+    /// Cooperative emit loop for the POOLED single-source fast path
+    /// ([`SortMergeState::GatherMode`]). One dispatch:
     ///
-    /// On a `ThreadPoolBuilder` failure this leaves `fast_path_pool` `None`; the
-    /// gather then runs on rayon's global pool via a plain `par_iter` (still
-    /// correct, just not thread-budget-bounded), which never happens in practice
-    /// (the builder only fails on an OS thread-spawn error).
-    fn ensure_fast_path_pool(&mut self) {
-        if self.fast_path_pool.is_some() {
-            return;
-        }
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(self.fast_path_threads)
-            // Name the workers so they are attributable in the repo's profiling
-            // workflow (tricorder / samply), matching the other bounded sort
-            // pools (`build_sort_rayon_pool`, the arena seal pools).
-            .thread_name(|i| format!("fast-path-gather-{i}"))
-            .build()
-        {
-            Ok(pool) => self.fast_path_pool = Some(pool),
-            Err(e) => log::warn!(
-                "SortMerge: failed to build fast-path rayon pool ({e}); \
-                 falling back to the global pool for the parallel gather"
-            ),
-        }
-    }
-
-    /// Cooperative emit loop for the PARALLEL single-source fast path.
+    /// 1. re-posts a job the job branch refused (the output branch's held block
+    ///    was already flushed at the top of `try_run`);
+    /// 2. takes every result that is ready, in ordinal order, and pushes it on
+    ///    branch 0 (a refused push is held and ends the dispatch);
+    /// 3. finishes once the last block was taken;
+    /// 4. posts ONE gather job while fewer than the window are in flight (one
+    ///    per dispatch: each post wakes one more pool worker, and a `Progress`
+    ///    dispatch runs again at once);
+    /// 5. with nothing taken, asks the inbox afresh whether the next result is
+    ///    there (`await_next`), which records the wait; `false` with nothing
+    ///    posted parks the driver (`NoProgress`) until that delivery wakes it.
     ///
-    /// Gathers the next window of up to
-    /// `fast_path_threads * FAST_PATH_BLOCKS_PER_WORKER_WINDOW` planned blocks
-    /// concurrently (each block frames its own record range into a finished
-    /// output item — read-only over the shared `chunk`), then pushes them in
-    /// ascending block/ordinal order through the same held/backpressure idiom as
-    /// the serial path. Blocks MUST leave in order: `SortMerge` is `Detached`, so
-    /// its output edge has no reorder stage (the by-ordinal reassembly is
-    /// downstream at `BgzfCompress`), and the reorder there is a dense
-    /// single-cursor stream.
-    ///
-    /// Emitting a bounded window per burst (rather than the whole plan at once)
-    /// keeps peak extra memory to at most `fast_path_threads *
-    /// FAST_PATH_BLOCKS_PER_WORKER_WINDOW` uncompressed blocks in flight (a
-    /// function of config, not input size — it scales with the thread budget, so
-    /// it is tens of blocks on a high-core box, not "a handful") and preserves
-    /// output backpressure. The gathered-but-not-yet-pushed blocks are stashed in
-    /// `self.held` one at a time via the existing `Unpushed` slot; a full
-    /// downstream queue returns `Progress` and the remaining gathered blocks are
-    /// re-pushed on the next dispatch before any new gather.
+    /// Step 5 runs on every dispatch that took nothing, never trusting an
+    /// earlier dispatch's answer: a delivery clears the owner's waiting flag
+    /// even when its wake was skipped because this thread was running, so only
+    /// a fresh `await_next` re-records the wait before a park.
     ///
     /// `records_out` accumulates one per record emitted this call.
-    fn emit_fast_batches_parallel(
+    fn emit_gather_mode(
         &mut self,
         ctx: &mut StepCtx<'_, Self>,
         records_out: &mut u64,
-    ) -> io::Result<StepOutcome> {
-        // 1. Re-push any blocks gathered on a prior dispatch but rejected under
-        //    backpressure. `flush_held` (called at the top of `try_run`) has
-        //    already cleared the single `held` item; drain the rest in order.
-        if !self.drain_fast_pending(ctx) {
-            return Ok(StepOutcome::Progress); // still backpressured
-        }
+    ) -> StepOutcome {
+        let inbox = Arc::clone(self.inbox.as_ref().expect("gather mode runs only with an inbox"));
+        let window = self.gather_window() as u64;
+        let mut progressed = false;
 
-        let total_blocks = match &self.state {
-            SortMergeState::FastPathParallel { blocks, .. } => blocks.len(),
-            _ => unreachable!("emit_fast_batches_parallel called outside FastPathParallel state"),
-        };
-        let next_block = match &self.state {
-            SortMergeState::FastPathParallel { next_block, .. } => *next_block,
-            _ => unreachable!(),
-        };
-
-        // 2. Nothing left to gather → finalize (this also covers an empty chunk,
-        //    whose plan has zero blocks).
-        if next_block >= total_blocks {
-            let count = match &self.state {
-                SortMergeState::FastPathParallel { blocks, .. } => blocks_total_records(blocks),
-                _ => unreachable!(),
-            };
-            return Ok(self.finish_fast_path(count));
-        }
-
-        // 3. Capped: the parallel gather is phase-2 work beside the output
-        //    compressor, so it takes the whole phase-2 cap for the burst (see
-        //    `with_fast_path_cap`). This state is only entered for a gather that
-        //    really runs in parallel (`fast_path_threads > 1`, at least
-        //    `fast_path_min_records`, more than one block), so a serial gather
-        //    never stalls the pool. A cancelled run gives up before gathering.
-        let cap = self.fast_path_cap.clone();
-        let whole = match cap.as_deref() {
-            None => None,
-            Some(cap) => match cap.acquire_whole() {
-                None => return Ok(StepOutcome::NoProgress),
-                Some(whole) => {
-                    // The step-owned gather pool is sized once, from
-                    // `fast_path_threads`; the builder sets that to the
-                    // phase-2 count the cap was built with.
-                    debug_assert_eq!(
-                        whole.width(),
-                        self.fast_path_threads,
-                        "the phase-2 cap and the fast-path gather pool disagree on width"
-                    );
-                    Some(whole)
-                }
-            },
-        };
-
-        // 4. Gather the next window of blocks in parallel.
-        let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
-        let initial_bytes = INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap);
-        let target = self.target_batch_count;
-        let window =
-            self.fast_path_threads.saturating_mul(FAST_PATH_BLOCKS_PER_WORKER_WINDOW).max(1);
-        let window_end = (next_block + window).min(total_blocks);
-        let base_ordinal = next_block as u64;
-
-        let items: Vec<O::Item> = {
-            use rayon::prelude::*;
-            let (chunk, window_blocks) = match &self.state {
-                SortMergeState::FastPathParallel { chunk, blocks, .. } => {
-                    (Arc::clone(chunk), blocks[next_block..window_end].to_vec())
-                }
-                _ => unreachable!(),
-            };
-            let run = || -> io::Result<Vec<O::Item>> {
-                window_blocks
-                    .par_iter()
-                    .enumerate()
-                    .map(|(offset, &block)| {
-                        gather_fast_block::<O>(
-                            &chunk,
-                            block,
-                            base_ordinal + offset as u64,
-                            initial_bytes,
-                            target,
-                        )
-                    })
-                    .collect()
-            };
-            match &self.fast_path_pool {
-                Some(pool) => pool.install(run)?,
-                None => run()?,
+        // 1. A job the job branch refused goes first, so jobs stay in order.
+        if let Some(unpushed) = self.held_job.take() {
+            match ctx.outputs.view().b.retry(unpushed) {
+                Ok(()) => progressed = true,
+                Err(again) => self.held_job.put(again),
             }
-        };
-        // Release the cap before pushing: the push is the step's own serial
-        // work, and output compression must be admitted to drain it.
-        drop(whole);
-
-        let window_records: u64 = match &self.state {
-            SortMergeState::FastPathParallel { blocks, .. } => {
-                blocks_total_records(&blocks[next_block..window_end])
-            }
-            _ => unreachable!(),
-        };
-        *records_out += window_records;
-
-        // Advance past the gathered window, then push the gathered items in order.
-        if let SortMergeState::FastPathParallel { next_block, .. } = &mut self.state {
-            *next_block = window_end;
-        }
-        self.fast_pending.extend(items);
-        if !self.drain_fast_pending(ctx) {
-            return Ok(StepOutcome::Progress); // downstream full mid-window
         }
 
-        // 5. Window pushed cleanly; finalize if that was the last one.
-        if window_end >= total_blocks {
-            let count = match &self.state {
-                SortMergeState::FastPathParallel { blocks, .. } => blocks_total_records(blocks),
-                _ => unreachable!(),
+        // 2. Take ready results in ordinal order.
+        let mut took = false;
+        while let Some((ordinal, result)) = inbox.try_take_next() {
+            took = true;
+            let SortMergeState::GatherMode { blocks, next_to_take, .. } = &mut self.state else {
+                unreachable!("emit_gather_mode called outside GatherMode")
             };
-            return Ok(self.finish_fast_path(count));
-        }
-        Ok(StepOutcome::Progress)
-    }
-
-    /// Push every buffered `fast_pending` block in order, honouring the held-slot
-    /// backpressure idiom. Returns `true` once the buffer is fully drained,
-    /// `false` if a push was rejected (the offending item is put in `self.held`
-    /// and the remainder stays in `fast_pending` for the next dispatch).
-    fn drain_fast_pending(&mut self, ctx: &mut StepCtx<'_, Self>) -> bool {
-        while let Some(item) = self.fast_pending.pop_front() {
-            if let Err(unpushed) = ctx.outputs.push(item) {
+            debug_assert_eq!(ordinal, *next_to_take, "the inbox yields ordinals in order");
+            let block = blocks[usize::try_from(ordinal).expect("ordinal indexes the plan")];
+            *next_to_take += 1;
+            *records_out += (block.end - block.start) as u64;
+            let MergeResult::Block(item) = result;
+            if let Err(unpushed) = ctx.outputs.view().a.push(item) {
                 self.dbg.output_full += 1;
                 self.held.put(unpushed);
-                return false;
+                return StepOutcome::Progress;
             }
         }
-        true
+
+        let SortMergeState::GatherMode { chunk, blocks, next_to_post, next_to_take } =
+            &mut self.state
+        else {
+            unreachable!("emit_gather_mode called outside GatherMode")
+        };
+
+        // 3. Every block taken and pushed: done.
+        if *next_to_take == blocks.len() as u64 {
+            let count = blocks_total_records(blocks);
+            return self.finish_fast_path(count);
+        }
+
+        // 4. Post one job while below the window.
+        if !self.held_job.is_held()
+            && *next_to_post < blocks.len()
+            && (*next_to_post as u64) < *next_to_take + window
+        {
+            let ordinal = *next_to_post as u64;
+            let bytes_cap = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
+            let sizing = GatherSizing {
+                initial_bytes: INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap),
+                target_batch_count: self.target_batch_count,
+            };
+            // Charge the block's builder reservation until the result lands
+            // (delivery replaces it by the block's real heap size).
+            inbox.reserve(ordinal, sizing.initial_bytes as u64);
+            let job = MergeJob::Gather {
+                chunk: Arc::clone(chunk),
+                block: blocks[*next_to_post],
+                ordinal,
+                sizing,
+                _output: std::marker::PhantomData,
+            };
+            *next_to_post += 1;
+            if let Err(unpushed) = ctx.outputs.view().b.push(job) {
+                self.held_job.put(unpushed);
+            }
+            progressed = true;
+        }
+
+        if took || progressed {
+            return StepOutcome::Progress;
+        }
+        // 5. Nothing taken or posted: re-record the wait on this dispatch.
+        if inbox.await_next() { StepOutcome::Progress } else { StepOutcome::NoProgress }
     }
 
     /// Emit the fast-path completion log + `--sort-stats` diagnostic, populate
@@ -1906,8 +1879,8 @@ impl<O: MergeOutput> SortMerge<O> {
     /// Finalize the fast path (parallel variant): run the shared
     /// [`finalize_fast_path_done`](Self::finalize_fast_path_done) work and return
     /// `Progress`. Unlike the serial arm (which returns `NoProgress` when it
-    /// delivered nothing this call), the parallel path only reaches here after
-    /// its window drained cleanly, so a plain `Progress` is correct.
+    /// delivered nothing this call), the pooled path only reaches here in a
+    /// dispatch that took and pushed the last block, so a plain `Progress` is correct.
     fn finish_fast_path(&mut self, count: u64) -> StepOutcome {
         self.finalize_fast_path_done(count);
         StepOutcome::Progress
@@ -1945,20 +1918,21 @@ impl<O: MergeOutput> SortMerge<O> {
         if slots.is_empty() && memory_chunks.total_len() == 1 {
             let chunk = memory_chunks.into_single();
             let total = chunk.len();
-            // Parallel gather when a worker budget was requested AND there is
-            // enough work to amortise the fan-out (a tiny chunk is faster serial:
-            // the pool build + block-plan + join overhead would dominate). Below
-            // the threshold, or with a single thread, fall through to the serial
+            // Pooled gather when a fan-out width was requested, a `MergeWork`
+            // inbox is wired, AND there is enough work to amortise the fan-out
+            // (a tiny chunk is faster serial: the block plan and the job round
+            // trips would dominate). Otherwise fall through to the serial
             // gather — byte-identical, just cheaper for small inputs.
-            if self.fast_path_threads > 1 && total >= self.fast_path_min_records {
+            if self.inbox.is_some() && self.fanout_width > 1 && total >= self.fast_path_min_records
+            {
                 let blocks = plan_fast_path_blocks::<O>(
                     &chunk,
                     self.target_batch_count,
                     self.output_byte_limit,
                 );
                 // A plan that collapses to a single block (or none) has no
-                // parallelism to exploit, so the pool build + rayon fan-out would
-                // be pure overhead. Fall through to the serial gather, which
+                // parallelism to exploit, so the job round trip would be pure
+                // overhead. Fall through to the serial gather, which
                 // emits byte-identically. (`plan_fast_path_blocks` only borrows
                 // `chunk`, so it is still owned here.) Unreachable under the
                 // production defaults — `target_batch_count` (1024) caps every
@@ -1966,11 +1940,11 @@ impl<O: MergeOutput> SortMerge<O> {
                 // always yields >= 64 blocks — but guards a degenerate plan if
                 // those knobs ever become independently tunable.
                 if blocks.len() > 1 {
-                    self.ensure_fast_path_pool();
-                    self.state = SortMergeState::FastPathParallel {
+                    self.state = SortMergeState::GatherMode {
                         chunk: Arc::new(chunk),
                         blocks,
-                        next_block: 0,
+                        next_to_post: 0,
+                        next_to_take: 0,
                     };
                     return Ok(());
                 }
@@ -2013,7 +1987,10 @@ impl<O: MergeOutput> SortMerge<O> {
 
 impl<O: MergeOutput> Step for SortMerge<O> {
     type Input = SortPhase2Event;
-    type Outputs = OrderedBytesSingle<O::Item>;
+    /// Branch 0: the merged output (declared `ByItemOrdinal`, collapsed to a
+    /// direct edge for this single-producer step). Branch 1: gather jobs for
+    /// the `MergeWork` pool step; empty unless the fast path fans out.
+    type Outputs = (O::Item, MergeJob<O>);
 
     fn profile(&self) -> StepProfile {
         StepProfile {
@@ -2037,8 +2014,13 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             // (with merge inputs); both place it on this detached driver thread.
             kind: StepKind::Detached,
             sticky: false,
-            output_queues: vec![QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit }],
-            branch_ordering: vec![BranchOrdering::ByItemOrdinal],
+            output_queues: vec![
+                QueueSpec::ByteBounded { limit_bytes: self.output_byte_limit },
+                // Fixed: a window of descriptors, not a share of the queue
+                // budget, so the data edges keep their full share.
+                QueueSpec::FixedByteBounded { limit_bytes: self.job_edge_limit() },
+            ],
+            branch_ordering: vec![BranchOrdering::ByItemOrdinal, BranchOrdering::None],
         }
     }
 
@@ -2053,11 +2035,17 @@ impl<O: MergeOutput> Step for SortMerge<O> {
         SPECS
     }
 
-    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
-        self.fast_path_cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        self.inbox.iter().map(|inbox| Arc::clone(inbox) as Arc<dyn SideChannel>).collect()
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if !self.inbox_bound {
+            if let Some(inbox) = &self.inbox {
+                inbox.bind_owner(ctx.pool.waker());
+            }
+            self.inbox_bound = true;
+        }
         if !self.flush_held(ctx) {
             return Ok(StepOutcome::Contention);
         }
@@ -2123,8 +2111,8 @@ impl<O: MergeOutput> Step for SortMerge<O> {
                 self.emit_batches_cooperative(ctx, &mut records_this_call)
             }
             SortMergeState::FastPath { .. } => self.emit_fast_batches(ctx, &mut records_this_call),
-            SortMergeState::FastPathParallel { .. } => {
-                self.emit_fast_batches_parallel(ctx, &mut records_this_call)
+            SortMergeState::GatherMode { .. } => {
+                Ok(self.emit_gather_mode(ctx, &mut records_this_call))
             }
             SortMergeState::Done => Ok(StepOutcome::Finished),
             SortMergeState::WaitingForSetup { .. } => {

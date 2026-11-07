@@ -4148,8 +4148,9 @@ impl<'a> ChainBuilder<'a> {
             // One shared cap per phase, and only for an explicit override: at
             // most `phase1` workers inside ANY phase-1 step at once (likewise
             // phase 2), and the phase's off-pool parallel work — the per-run
-            // sort, the fast-path gather — takes the whole cap while it runs
-            // (see `seal_under_cap`). The phases can overlap —
+            // sort — takes the whole cap while it runs (see `seal_under_cap`);
+            // the fast-path gather runs as `MergeWork` under the phase-2 cap
+            // like `BgzfCompress`. The phases can overlap —
             // `SortSpillDecompress` pre-fills slots of spills already written
             // while phase 1 is still ingesting — and that is fine: the caps are
             // separate counters. An unset flag creates no cap at all: no step is
@@ -4643,21 +4644,23 @@ impl<'a> ChainBuilder<'a> {
                 // the framing is byte-for-byte identical to what that step
                 // produced, but emitted on the already-in-order `Detached` merge
                 // thread, dropping one pool step and one memcpy per record.
-                let mut merge =
+                let (mut merge, merge_work) =
                     SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit)
                         .with_sort_stats(sort.sort_stats)
                         // Fan the in-memory fast-path gather across the phase-2
                         // (merge) thread budget: the single already-sorted chunk
-                        // is gathered into output blocks in parallel instead of
-                        // on the lone detached thread, removing the flat serial
-                        // gather that otherwise floors the in-memory sort's wall
-                        // clock. Bounded to the effective phase-2 count
-                        // (`--merge-threads` within `--threads`).
-                        .with_fast_path_threads(phases.phase2);
+                        // is gathered into output blocks by `MergeWork` on the
+                        // pool instead of on the lone detached thread, removing
+                        // the flat serial gather that otherwise floors the
+                        // in-memory sort's wall clock. The window is sized from
+                        // the effective phase-2 count (`--merge-threads` within
+                        // `--threads`).
+                        // `with_pooled_gather` creates the inbox and returns the
+                        // matching `MergeWork` step, wired on branch 1 below.
+                        .with_pooled_gather(phases.phase2, phase2_cap.clone());
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
-                merge = merge.with_fast_path_cap(phase2_cap.clone());
                 if let Some(spill_stats) = &self.sort_spill_stats {
                     merge = merge.with_spill_stats(Arc::clone(spill_stats));
                 }
@@ -4669,6 +4672,10 @@ impl<'a> ChainBuilder<'a> {
                 self.merge_class_tables
                     .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
+                // Branch 1: the gather jobs, run on the pool under the phase-2
+                // cap (like the output compressor). Appended before the sink's
+                // steps, so the drain-first walk visits compression first.
+                self.pipeline.append_step(merge_work, (merge_tail.0, BranchIdx(1)));
                 self.current_tail = Some(merge_tail);
                 // tail is DecompressedBlock (serialized bytes) directly from
                 // SortMerge → SerializedBytes.
@@ -4721,19 +4728,19 @@ impl<'a> ChainBuilder<'a> {
                 // slot is `None`; no `with_stats_slot` call is needed. The
                 // merge-loop diagnostic still honors `--sort-stats` like the
                 // terminal branch, for a fused pipeline that ever exposes it.
-                let mut merge = SortMerge::<RecordBatchOutput>::new(
+                let (mut merge, merge_work) = SortMerge::<RecordBatchOutput>::new(
                     sort_order,
                     self.tuning.per_step_byte_limit,
                 )
                 .with_sort_stats(sort.sort_stats)
-                // Same parallel fast-path gather as the terminal branch (see
+                // Same pooled fast-path gather as the terminal branch (see
                 // there): a large in-memory intermediate sort feeding
-                // group/consensus gathers its single sorted chunk in parallel
-                // rather than serially on the detached thread. Bounded to the
-                // effective phase-2 count (`--merge-threads` within `--threads`).
-                .with_fast_path_threads(phases.phase2);
+                // group/consensus gathers its single sorted chunk on the pool
+                // rather than serially on the detached thread. Window sized
+                // from the effective phase-2 count (`--merge-threads` within
+                // `--threads`).
+                .with_pooled_gather(phases.phase2, phase2_cap.clone());
                 merge = merge
-                    .with_fast_path_cap(phase2_cap.clone())
                     .with_spill_supply(&supply)
                     .with_supply_diagnostics(supply_diagnostics)
                     .with_class_table(Arc::clone(&qn_keys.table));
@@ -4741,6 +4748,8 @@ impl<'a> ChainBuilder<'a> {
                 self.merge_class_tables
                     .push((Arc::clone(&qn_keys.table), merge.class_table_for_test().cloned()));
                 let merge_tail = self.pipeline.append_step(merge, merge_input);
+                // Branch 1: the gather jobs (see the terminal branch).
+                self.pipeline.append_step(merge_work, (merge_tail.0, BranchIdx(1)));
                 let group_key_config = self.bam_group_key_config()?;
                 let tail = self.pipeline.append_step(
                     DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
@@ -8696,7 +8705,7 @@ mod tests {
     #[test]
     fn sort_chain_gating_matches_the_table() {
         // (name, kind, output branches, gated branches)
-        const TABLE: [(&str, &str, usize, usize); 20] = [
+        const TABLE: [(&str, &str, usize, usize); 21] = [
             ("PlanInputReads", "Serial", 1, 1),
             ("PreadInputSlices", "Parallel", 1, 1),
             ("FrameBgzfBlocks", "Serial", 1, 1),
@@ -8714,7 +8723,8 @@ mod tests {
             ("ConsolidateRuns", "Detached", 1, 1),
             ("SpillBlockCompressConsolidation", "Parallel", 1, 1),
             ("WriteConsolidatedRun", "Detached", 0, 0),
-            ("SortMerge", "Detached", 1, 1),
+            ("SortMerge", "Detached", 2, 2),
+            ("MergeWork", "Parallel", 0, 0),
             ("BgzfCompress", "Parallel", 1, 1),
             ("WriteBgzfFile", "Detached", 0, 0),
         ];
@@ -9219,6 +9229,56 @@ mod tests {
         assert!(at("SpillReadPlanner") < at("PreadSpillSlices"));
         assert!(at("PreadSpillSlices") < at("SortSpillDecompress"));
         assert!(at("SortSpillDecompress") < at("SortMerge"));
+    }
+
+    /// A terminal sort chain wires `SortMerge` branch 1 to `MergeWork`, which
+    /// carries the phase-2 cap when `--merge-threads` is set and gets one clone
+    /// per pool worker.
+    #[rstest::rstest]
+    #[case::capped(8, Some(4), Some("cap=sort-phase2(4)"))]
+    #[case::uncapped(8, None, None)]
+    fn sort_chain_dag_has_merge_work(
+        #[case] threads: usize,
+        #[case] merge_threads: Option<usize>,
+        #[case] cap: Option<&str>,
+    ) {
+        let (_, _, _, built, _tmp) = build_sort_with(false, vec![Stage::Sort], |spec| {
+            spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+            spec.stage_opts.sort.as_mut().unwrap().merge_threads = merge_threads;
+        });
+        let dag = built.pipeline.dag_at(threads);
+        let lines: Vec<&str> = dag.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with('[') && l.contains("] SortMerge "))
+            .unwrap_or_else(|| panic!("no SortMerge step:\n{dag}"));
+        let merge: Vec<&&str> = lines[start..]
+            .iter()
+            .take_while(|l| l.contains("] SortMerge ") || !l.trim_start().starts_with('['))
+            .collect();
+        let merge = merge.iter().map(|l| **l).collect::<Vec<_>>().join("\n");
+        assert!(merge.contains("branches=2"), "{merge}");
+        let job_edge = merge
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with(".1: "))
+            .unwrap_or_else(|| panic!("no branch .1 line:\n{merge}"));
+        assert!(
+            job_edge.starts_with(".1: FixedByteBounded") && job_edge.ends_with("→ MergeWork"),
+            "{job_edge}"
+        );
+        let work = lines
+            .iter()
+            .find(|l| l.contains("] MergeWork "))
+            .unwrap_or_else(|| panic!("no MergeWork step:\n{dag}"));
+        assert!(work.contains("Parallel"), "{work}");
+        match cap {
+            Some(cap) => assert!(work.contains(cap), "{work}"),
+            None => assert!(!work.contains("cap="), "{work}"),
+        }
+        let planned = built.pipeline.planned_clone_counts(threads);
+        let clones = planned.iter().find(|(n, _)| *n == "MergeWork").map(|&(_, c)| c);
+        assert_eq!(clones, Some(threads), "one MergeWork clone per worker: {planned:?}");
     }
 
     /// `PreadSpillSlices` holds the SAME phase-2 cap as `SortSpillDecompress`

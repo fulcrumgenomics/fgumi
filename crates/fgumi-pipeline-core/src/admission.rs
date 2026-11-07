@@ -31,8 +31,7 @@
 //! ## Off-pool parallel work takes the whole cap
 //!
 //! Work that runs off the pool but shares the phase's cores — the per-run sort
-//! of a run and the in-memory fast-path gather — runs at the phase's full width,
-//! so it takes **every** permit of the cap through [`PhaseCap::acquire_whole`]:
+//! of a run (phase 1) — runs at the phase's full width, so it takes **every** permit of the cap through [`PhaseCap::acquire_whole`]:
 //! it registers a pending reservation, which makes [`PhaseCap::try_acquire`]
 //! refuse new pool admissions (counted as refusals, reported `Capped`), parks
 //! until the last pool holder releases (each releases after one item), takes
@@ -42,6 +41,10 @@
 //! `try_run`, never waiting while it holds it. The wait observes the pipeline's
 //! cancel signal (bound by `Pipeline::run`), so a cancelled run does not leave a
 //! sealing driver parked.
+//!
+//! The phase-2 in-memory fast-path gather is not such work: it runs as the pool
+//! step `MergeWork` and takes one permit per slice through [`admit_input`], like
+//! `BgzfCompress`.
 
 use std::sync::{Arc, Weak};
 
@@ -154,9 +157,10 @@ impl Parker {
 /// The whole-cap protocol adds to every admission one `Relaxed` load of
 /// `reserving` (a line written only when a whole-cap caller arrives or
 /// leaves), and to every release one `SeqCst` fence plus that load. Every sort
-/// chain attaches a whole-cap caller to both of its caps (the per-run sort,
-/// the fast-path gather), so there is no cap the protocol could be skipped
-/// for. Measured cost (Apple M2 Max, release build, a `try_acquire` + drop
+/// chain attaches a whole-cap caller to its phase-1 cap (the per-run sort);
+/// the phase-2 cap has none (the fast-path gather is the pool step `MergeWork`,
+/// one permit per slice), but the protocol is kept on both caps so a cap's
+/// behaviour does not depend on which phase it serves. Measured cost (Apple M2 Max, release build, a `try_acquire` + drop
 /// pair, median of 5 runs): 10.7 ns with the protocol vs 10.7 ns with the
 /// fence and both `reserving` loads removed, uncontended (10^8 pairs on one
 /// thread); with 8 threads on one cap of 8, ~1.8-1.9 µs per pair either way,
@@ -916,7 +920,7 @@ impl PhaseCap {
     }
 
     /// Every permit of the cap, for off-pool work that runs at the phase's full
-    /// width (the per-run sort, the fast-path gather). Registers a reservation
+    /// width (the per-run sort). Registers a reservation
     /// so pool steps stop being admitted, parks until the last holder releases,
     /// then takes all `max` permits in one step. Returns `None` only when the
     /// run's cancel signal (bound by `Pipeline::run`) is done: the run is

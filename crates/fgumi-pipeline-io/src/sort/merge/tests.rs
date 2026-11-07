@@ -400,3 +400,286 @@ fn ensure_merge_inputs_read_needs_a_clean_end_on_every_input() {
     clean.set_queue_eof_for_test();
     ensure_merge_inputs_read(&[clean], &names).expect("a clean end");
 }
+
+/// A single in-memory chunk of `n` coordinate records, one per position.
+fn gather_test_chunk(n: usize) -> MemoryChunkErased {
+    MemoryChunkErased::Coordinate(InMemoryChunk::from_owned_records(
+        (0..n)
+            .map(|i| {
+                let pos = i32::try_from(i).expect("small test positions");
+                let record = fgumi_raw_bam::testutil::make_bam_bytes(
+                    0,
+                    pos,
+                    0,
+                    format!("r{i:05}").as_bytes(),
+                    &[],
+                    4,
+                    -1,
+                    -1,
+                    &[],
+                );
+                (RawCoordinateKey { sort_key: i as u64 }, record)
+            })
+            .collect(),
+    ))
+}
+
+/// Run `posted` gather jobs and deliver their results to `inbox` out of order:
+/// the awaited (lowest) ordinal last, with a dispatch in between that must
+/// park and emit nothing ahead of it.
+fn deliver_out_of_order(
+    probe: &fgumi_pipeline_core::testing::StepProbe<SortMerge<BlockOutput>>,
+    step: &mut SortMerge<BlockOutput>,
+    inbox: &fgumi_pipeline_core::OrderedInbox<crate::sort::merge_job::MergeResult<BlockOutput>>,
+    blocks: &fgumi_pipeline_core::BranchInputHandle<DecompressedBlock>,
+    posted: Vec<crate::sort::merge_job::MergeJob<BlockOutput>>,
+) {
+    use crate::sort::merge_job::MERGE_SLICE;
+    use fgumi_pipeline_core::{InputHandle, Job, JobStep};
+
+    let mut done: Vec<_> = posted
+        .into_iter()
+        .map(|mut job| {
+            let ordinal = job.ordinal();
+            match job.run_slice(MERGE_SLICE).expect("gather") {
+                JobStep::Done(out) => (ordinal, out),
+                JobStep::Continue => panic!("a gather is one slice"),
+            }
+        })
+        .collect();
+    done.reverse();
+    let (awaited, last) = done.pop().expect("one result at least");
+    if !done.is_empty() {
+        for (ordinal, out) in done {
+            let _ = inbox.deliver(ordinal, out);
+        }
+        assert_eq!(
+            probe.try_run(step).expect("try_run"),
+            StepOutcome::NoProgress,
+            "the next ordinal is still missing"
+        );
+        assert!(blocks.pop().is_none(), "nothing leaves ahead of the awaited ordinal");
+    }
+    let _ = inbox.deliver(awaited, last);
+}
+
+/// Gather mode posts one `MergeJob::Gather` per planned block on branch 1, with
+/// ordinals `0..k` in order and never more than `window` (`fanout_width * 4`)
+/// ahead of the results taken back; it parks (`NoProgress`) while the next
+/// ordinal is missing, and results delivered out of order leave branch 0 in
+/// ordinal order, byte-identical to gathering `plan_fast_path_blocks`' plan
+/// serially.
+#[test]
+fn gather_mode_posts_jobs_within_window() {
+    use fgumi_pipeline_core::testing::StepProbe;
+    use fgumi_pipeline_core::{InputHandle, Job, OrderedInbox};
+
+    use crate::sort::merge_job::{MergeJob, MergeResult};
+
+    const N: usize = 2000;
+    const TARGET: usize = 64;
+    const LIMIT: u64 = 1 << 20;
+    const WIDTH: usize = 2;
+    let window = (WIDTH * FAST_PATH_BLOCKS_PER_WORKER_WINDOW) as u64;
+
+    let expected: Vec<DecompressedBlock> = {
+        let chunk = gather_test_chunk(N);
+        let plan = plan_fast_path_blocks::<BlockOutput>(&chunk, TARGET, LIMIT);
+        plan.iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                gather_fast_block::<BlockOutput>(
+                    &chunk,
+                    b,
+                    i as u64,
+                    INITIAL_OUTPUT_BUFFER_BYTES,
+                    TARGET,
+                )
+                .unwrap()
+            })
+            .collect()
+    };
+    let k = expected.len() as u64;
+    assert!(k > 2 * window, "fixture must span several windows ({k} blocks)");
+
+    let inbox = OrderedInbox::<MergeResult<BlockOutput>>::new(true);
+    let mut step =
+        SortMerge::<BlockOutput>::with_target_batch_count(SortOrder::Coordinate, LIMIT, TARGET)
+            .with_inbox(Arc::clone(&inbox))
+            .with_fanout_width(WIDTH)
+            .with_fast_path_min_records(0);
+    let mut probe = StepProbe::new(&step);
+    let jobs = probe.take_output::<MergeJob<BlockOutput>>(1);
+    let blocks = probe.take_output::<DecompressedBlock>(0);
+    probe.push_input(SortPhase2Event::MemoryChunk {
+        chunk: Arc::new(gather_test_chunk(N)),
+        records_ingested_so_far: N as u64,
+    });
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 1,
+        total_records: N as u64,
+    });
+    probe.close_input();
+
+    let mut posted: Vec<MergeJob<BlockOutput>> = Vec::new();
+    let mut next_ordinal = 0u64;
+    let mut emitted: Vec<DecompressedBlock> = Vec::new();
+    let mut finished = false;
+    for _ in 0..10_000 {
+        let outcome = probe.try_run(&mut step).expect("try_run");
+        while let Some(job) = jobs.pop() {
+            assert_eq!(job.ordinal(), next_ordinal, "jobs are posted in ordinal order");
+            next_ordinal += 1;
+            posted.push(job);
+        }
+        while let Some(block) = blocks.pop() {
+            emitted.push(block);
+        }
+        let taken = emitted.len() as u64;
+        assert!(
+            next_ordinal <= taken + window,
+            "posted {next_ordinal} with {taken} taken exceeds the window {window}"
+        );
+        if outcome == StepOutcome::Finished {
+            finished = true;
+            break;
+        }
+        if outcome == StepOutcome::NoProgress {
+            assert!(!posted.is_empty(), "it parks only with jobs in flight");
+            deliver_out_of_order(&probe, &mut step, &inbox, &blocks, std::mem::take(&mut posted));
+        }
+    }
+    assert!(finished, "gather mode finished");
+    assert_eq!(next_ordinal, k, "one job per planned block");
+    assert!(jobs.is_empty() && blocks.is_empty());
+    assert_eq!(emitted.len(), expected.len());
+    for (i, (got, want)) in emitted.iter().zip(&expected).enumerate() {
+        assert_eq!(got.batch_serial, i as u64, "block {i} ordinal");
+        assert_eq!(got.bytes, want.bytes, "block {i} bytes");
+    }
+    assert_eq!(inbox.in_flight_bytes(), 0, "every result taken");
+    assert_eq!(probe.counter(RECORDS), N as u64);
+}
+
+/// A gather-mode merge over `N` records at fan-out width `WIDTH`, its input
+/// queued and closed, with the job branch's byte bound optionally shrunk.
+/// Returns the merge, its probe and the job branch.
+fn gather_mode_fixture(
+    job_edge_limit: Option<u64>,
+) -> (
+    SortMerge<BlockOutput>,
+    fgumi_pipeline_core::testing::StepProbe<SortMerge<BlockOutput>>,
+    fgumi_pipeline_core::BranchInputHandle<crate::sort::merge_job::MergeJob<BlockOutput>>,
+) {
+    use fgumi_pipeline_core::OrderedInbox;
+    use fgumi_pipeline_core::testing::StepProbe;
+
+    use crate::sort::merge_job::{MergeJob, MergeResult};
+
+    const N: usize = 2000;
+    const TARGET: usize = 64;
+    const LIMIT: u64 = 1 << 20;
+    const WIDTH: usize = 2;
+
+    let inbox = OrderedInbox::<MergeResult<BlockOutput>>::new(true);
+    let mut step =
+        SortMerge::<BlockOutput>::with_target_batch_count(SortOrder::Coordinate, LIMIT, TARGET)
+            .with_inbox(inbox)
+            .with_fanout_width(WIDTH)
+            .with_fast_path_min_records(0);
+    if let Some(limit) = job_edge_limit {
+        step = step.with_job_edge_limit(limit);
+    }
+    let mut probe = StepProbe::new(&step);
+    let jobs = probe.take_output::<MergeJob<BlockOutput>>(1);
+    probe.push_input(SortPhase2Event::MemoryChunk {
+        chunk: Arc::new(gather_test_chunk(N)),
+        records_ingested_so_far: N as u64,
+    });
+    probe.push_input(SortPhase2Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: 1,
+        total_records: N as u64,
+    });
+    probe.close_input();
+    (step, probe, jobs)
+}
+
+/// Dispatch `step` until it parks (`NoProgress`), failing on any other
+/// outcome or if it never parks.
+fn run_until_parked(
+    probe: &fgumi_pipeline_core::testing::StepProbe<SortMerge<BlockOutput>>,
+    step: &mut SortMerge<BlockOutput>,
+) {
+    for _ in 0..1000 {
+        match probe.try_run(step).expect("try_run") {
+            StepOutcome::NoProgress => return,
+            StepOutcome::Progress => {}
+            other => panic!("unexpected outcome {other:?} before parking"),
+        }
+    }
+    panic!("the merge never parked");
+}
+
+/// With nothing popping the job branch, gather mode posts exactly `window`
+/// jobs (the branch, sized for twice the window, never refuses one) and then
+/// parks waiting on ordinal 0.
+#[test]
+fn gather_mode_posts_full_window_unrefused() {
+    use fgumi_pipeline_core::{InputHandle, Job};
+
+    let (mut step, probe, jobs) = gather_mode_fixture(None);
+    let window = step.gather_window() as u64;
+    run_until_parked(&probe, &mut step);
+    assert!(!step.held_job.is_held(), "no post within the window is refused");
+    let ordinals: Vec<u64> = std::iter::from_fn(|| jobs.pop()).map(|j| j.ordinal()).collect();
+    assert_eq!(ordinals, (0..window).collect::<Vec<_>>(), "exactly the window is queued");
+    assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::NoProgress);
+}
+
+/// A post the job branch refuses is held and re-posted before any new job,
+/// so jobs leave in ordinal order.
+#[test]
+fn gather_mode_reposts_refused_job_first() {
+    use fgumi_pipeline_core::{InputHandle, Job};
+
+    // Room for one job descriptor: the second post is refused.
+    let (mut step, probe, jobs) = gather_mode_fixture(Some(1));
+    run_until_parked(&probe, &mut step);
+    assert!(step.held_job.is_held(), "the second post was refused and held");
+    assert_eq!(jobs.pop().map(|j| j.ordinal()), Some(0));
+    assert!(jobs.pop().is_none(), "the refused job is not on the branch");
+    for expected in 1..4u64 {
+        // The edge has room again: the held job goes first, and the next new
+        // post is refused and held in its place.
+        assert_eq!(probe.try_run(&mut step).expect("try_run"), StepOutcome::Progress);
+        assert_eq!(jobs.pop().map(|j| j.ordinal()), Some(expected), "held job re-posted first");
+        assert!(jobs.pop().is_none());
+        assert!(step.held_job.is_held(), "ordinal {} is held", expected + 1);
+    }
+}
+
+/// The job branch keeps a fixed limit of twice the gather window of
+/// descriptors, outside the queue-memory budget; the output branch is a
+/// budgeted byte-bounded edge.
+#[rstest::rstest]
+#[case::width_one(1)]
+#[case::width_four(4)]
+fn job_branch_is_a_fixed_byte_bound(#[case] width: usize) {
+    let merge = SortMerge::<RecordBatchOutput>::new(SortOrder::Coordinate, 1 << 20)
+        .with_fanout_width(width);
+    let queues = merge.profile().output_queues;
+    let per_job = std::mem::size_of::<crate::sort::merge_job::MergeJob<RecordBatchOutput>>();
+    let expected_limit = (width * FAST_PATH_BLOCKS_PER_WORKER_WINDOW * 2 * per_job) as u64;
+    assert_eq!(merge.job_edge_limit(), expected_limit);
+    assert_eq!(
+        queues,
+        vec![
+            QueueSpec::ByteBounded { limit_bytes: 1 << 20 },
+            QueueSpec::FixedByteBounded { limit_bytes: expected_limit },
+        ]
+    );
+    assert!(queues[0].is_budgeted());
+    assert!(!queues[1].is_budgeted());
+}

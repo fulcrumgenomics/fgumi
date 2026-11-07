@@ -648,6 +648,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: (0..3).map(|_| crate::runtime::StepCounters::disabled()).collect(),
+            side_channels: vec![],
         });
         (det, contexts, Arc::new(producer_outputs_any), det_output_consumer)
     }

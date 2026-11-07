@@ -275,6 +275,7 @@ pub struct OutputsViewAny {
 }
 
 use std::io;
+use std::sync::Arc;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
@@ -311,6 +312,18 @@ impl CounterSpec {
     pub const fn new(name: &'static str, unit: &'static str) -> Self {
         Self { name, unit }
     }
+}
+
+/// A queue-like holder of work that lives outside every queue edge (for
+/// example an inbox that a serial step fills with results returned from pool
+/// tasks). The deadlock monitor sums [`SideChannel::in_flight_bytes`] with the
+/// edge bytes, so work parked here is not mistaken for an idle pipeline.
+pub trait SideChannel: Send + Sync {
+    /// Bytes currently held by this channel.
+    fn in_flight_bytes(&self) -> u64;
+
+    /// A short human-readable description, printed in the stall snapshot.
+    fn describe(&self) -> String;
 }
 
 /// Handle to this step's input queue.
@@ -475,19 +488,26 @@ pub trait Step: Send + Sized + 'static {
     /// same cap, or the DAG would advertise a limit the step never applies:
     ///
     /// - **Pool steps** (the sort's ingest, inflate, spill compress and spill
-    ///   decompress steps, and the output compressor) take one permit per item
+    ///   decompress steps, `MergeWork` for the in-memory fast-path gather, and
+    ///   the output compressor) take one permit per item
     ///   through [`crate::admission::admit_input`] (or
     ///   [`PhaseCap::try_acquire`](crate::admission::PhaseCap::try_acquire)
     ///   around a narrower section), passing [`StepCapRef::active`].
     /// - **Serial / Detached steps with off-pool parallel work** (`SortBuffer`
-    ///   and the split front's `Sort*Run` for the per-run sort, `SortMerge` for the
-    ///   in-memory fast-path gather) take the whole cap for that work through
+    ///   and the split front's `Sort*Run` for the per-run sort) take the whole cap for that work through
     ///   [`PhaseCap::acquire_whole`](crate::admission::PhaseCap::acquire_whole),
     ///   which may park the step until the cap's pool holders finish their
     ///   current items. Their serial part (one worker or driver thread) is not
     ///   counted against the cap.
     fn step_cap(&self) -> Option<StepCapRef<'_>> {
         None
+    }
+
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
@@ -577,6 +597,13 @@ pub trait Step2: Send + Sized + 'static {
     /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
     fn pool_placement(&self) -> PoolPlacement {
         PoolPlacement::AllWorkers
+    }
+
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
@@ -679,6 +706,13 @@ pub trait StepK: Send + Sized + 'static {
     /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
     fn pool_placement(&self) -> PoolPlacement {
         PoolPlacement::AllWorkers
+    }
+
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.

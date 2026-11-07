@@ -254,10 +254,13 @@ impl SortPhase {
             }
             // The merge supply (`SpillReadPlanner → PreadSpillSlices →
             // SortSpillDecompress`): the final merge's read-ahead, and the
-            // consolidation jobs' too.
-            "SpillReadPlanner" | "PreadSpillSlices" | "SortSpillDecompress" | "SortMerge" => {
-                Some(SortPhase::KWayMerge)
-            }
+            // consolidation jobs' too. `MergeWork` runs the merge's pooled
+            // single-chunk gather, which `SortMerge` itself used to run.
+            "SpillReadPlanner"
+            | "PreadSpillSlices"
+            | "SortSpillDecompress"
+            | "SortMerge"
+            | "MergeWork" => Some(SortPhase::KWayMerge),
             "BgzfCompress" | "WriteBgzfFile" => Some(SortPhase::WriteOutput),
             _ => None,
         }
@@ -645,6 +648,7 @@ mod tests {
     #[case::pread_spill_slices("PreadSpillSlices", SortPhase::KWayMerge)]
     #[case::spill_decompress("SortSpillDecompress", SortPhase::KWayMerge)]
     #[case::merge("SortMerge", SortPhase::KWayMerge)]
+    #[case::merge_work("MergeWork", SortPhase::KWayMerge)]
     #[case::bgzf_compress("BgzfCompress", SortPhase::WriteOutput)]
     #[case::write_file("WriteBgzfFile", SortPhase::WriteOutput)]
     fn sort_phase_classifier_covers_known_sort_steps(

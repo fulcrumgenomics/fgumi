@@ -20,6 +20,7 @@
 pub mod admission;
 pub mod builder;
 pub mod erased;
+pub mod fanout;
 pub mod finalize;
 pub mod handles;
 pub mod header;
@@ -33,7 +34,9 @@ pub mod reorder;
 pub mod runtime;
 pub mod signal;
 pub mod step;
-#[cfg(any(test, feature = "test-utils"))]
+// Also under `--cfg loom`: `tests/loom_admission.rs` drives the real
+// `FanoutWorker` through a `StepProbe`.
+#[cfg(any(test, loom, feature = "test-utils"))]
 pub mod testing;
 pub mod topology;
 
@@ -51,6 +54,7 @@ pub use builder::{
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
 };
 pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2, TypedStepK};
+pub use fanout::{FanoutWorker, Job, JobError, JobStep, OrderedInbox, SliceBudget};
 pub use finalize::FinalizeHook;
 pub use handles::{
     BranchInputHandle, HeldRetry, KInputHandles, OutputQueueSet, Tuple2View, Tuple3View,
@@ -65,7 +69,7 @@ pub use outputs::{
 };
 pub use queues::{ByteBoundedQueue, CountBoundedQueue, ItemQueue, QueueSpec, UnboundedQueue};
 pub use reorder::{BranchOrdering, ReorderStage, Sequenced};
-pub use runtime::wake::{PoolHandle, PoolRequest};
+pub use runtime::wake::{PoolHandle, PoolRequest, SideWake, StepWaker};
 // The real wake protocols, for `tests/loom_wake.rs` (`wake_slot` itself stays
 // crate-private).
 #[cfg(loom)]
@@ -77,7 +81,7 @@ pub use runtime::{
 pub use signal::{CancelHandle, PipelineError, PipelineSignal};
 pub use step::{
     Affinity, CounterSpec, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny,
-    PoolPlacement, Step, Step2, StepCtx, StepCtx2, StepCtxK, StepK, StepKind, StepOutcome,
-    StepProfile,
+    PoolPlacement, SideChannel, Step, Step2, StepCtx, StepCtx2, StepCtxK, StepK, StepKind,
+    StepOutcome, StepProfile,
 };
 pub use topology::{BranchIdx, ChainGraph, StepIdx};

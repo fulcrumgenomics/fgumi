@@ -183,6 +183,10 @@ pub struct PipelineConfig {
     ///
     /// Floor of 1 MiB per queue is enforced regardless of the
     /// rebalancer's decisions to prevent pathological starvation.
+    ///
+    /// A `QueueSpec::FixedByteBounded` queue is outside the budget: it keeps
+    /// its declared limit, is not counted in the split, and is never
+    /// rebalanced.
     pub queue_memory_total: Option<u64>,
     /// How much per-edge instrumentation to collect (default `Off` = zero
     /// overhead). Threaded into queue construction (instrumented transports) and
@@ -1545,7 +1549,8 @@ impl Pipeline {
         }
 
         // 2a. If a total queue-memory budget was supplied, evenly
-        // redistribute it across all byte-bounded queues now (before
+        // redistribute it across all budgeted byte-bounded queues (not the
+        // `FixedByteBounded` ones, which keep their size) now (before
         // workers start) so the initial state matches the user's
         // budget instead of the per-step defaults baked into each
         // step's `QueueSpec::ByteBounded { limit_bytes }`. Floor at
@@ -1767,10 +1772,7 @@ impl Pipeline {
                 let stop_clone = Arc::clone(&stop);
                 // Capture handles into a contiguous Vec — the monitor
                 // doesn't need step indices/names beyond debug logging.
-                let handles: Vec<Arc<dyn super::queues::BoundedQueueHandle>> =
-                    contexts.bounded_queues.iter().map(|rq| Arc::clone(&rq.handle)).collect();
-                let names: Vec<&'static str> =
-                    contexts.bounded_queues.iter().map(|rq| rq.producer_step_name).collect();
+                let (handles, names) = rebalanced_queues(&contexts.bounded_queues);
                 let wake_weak = Arc::downgrade(&wake);
                 let handle = thread::Builder::new()
                     .name("fgumi-queue-rebalancer".to_string())
@@ -2365,7 +2367,8 @@ fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
             rq.handle.current_bytes()
                 + rq.reorder_cap.as_ref().map_or(0, |r| r.current_buffer_bytes())
         })
-        .sum()
+        .sum::<u64>()
+        + contexts.side_channels.iter().map(|c| c.in_flight_bytes()).sum::<u64>()
 }
 
 /// Return the first `(step_name, QueueSpec)` whose output transport is invisible
@@ -2391,7 +2394,7 @@ fn first_monitor_blind_transport(
         for branch in 0..graph.branch_count(super::topology::StepIdx(step_idx)) {
             let spec = profile.output_queues.get(branch).copied().unwrap_or(QueueSpec::Unbounded);
             match spec {
-                QueueSpec::ByteBounded { .. } => {}
+                QueueSpec::ByteBounded { .. } | QueueSpec::FixedByteBounded { .. } => {}
                 QueueSpec::CountBounded { .. } | QueueSpec::Unbounded => {
                     return Some((profile.name, spec));
                 }
@@ -2484,12 +2487,39 @@ fn run_deadlock_monitor(
             stuck,
             warn_timeout,
             stats.map(std::convert::AsRef::as_ref),
+            &contexts.side_channels,
             signal,
             &mut mon_state,
         ) {
             break;
         }
     }
+}
+
+/// The lines of a stall report: the per-step stats snapshot (or a note that
+/// none is available), then one line per off-edge side channel naming what it
+/// holds, so a stall on work parked outside every queue edge is attributable.
+fn stall_snapshot_lines(
+    stats: Option<&PipelineStats>,
+    side_channels: &[Arc<dyn crate::SideChannel>],
+) -> Vec<String> {
+    let mut lines: Vec<String> = if let Some(stats) = stats {
+        format!("{}", stats.snapshot()).lines().map(str::to_owned).collect()
+    } else {
+        vec![
+            "(no per-step snapshot: PipelineConfig::stats is not set; \
+             attach a stats handle to see which step is stuck)"
+                .to_owned(),
+        ]
+    };
+    for ch in side_channels {
+        lines.push(format!(
+            "side channel: {} ({} bytes in flight)",
+            ch.describe(),
+            ch.in_flight_bytes()
+        ));
+    }
+    lines
 }
 
 /// Rolling state the deadlock monitor carries across poll iterations.
@@ -2523,6 +2553,7 @@ fn apply_stall_verdict(
     // snapshot. Losing the snapshot is far better than losing the detection,
     // which is what requiring `stats` used to cost.
     stats: Option<&PipelineStats>,
+    side_channels: &[Arc<dyn crate::SideChannel>],
     signal: &PipelineSignal,
     mon_state: &mut StallMonitorState,
 ) -> bool {
@@ -2574,16 +2605,8 @@ fn apply_stall_verdict(
                     "Pipeline stall: no progress for {stall_secs}s with {stuck} bytes \
                      still in flight. Snapshot follows."
                 );
-                if let Some(stats) = stats {
-                    let snapshot = stats.snapshot();
-                    for line in format!("{snapshot}").lines() {
-                        log::warn!("{line}");
-                    }
-                } else {
-                    log::warn!(
-                        "(no per-step snapshot: PipelineConfig::stats is not set; \
-                         attach a stats handle to see which step is stuck)"
-                    );
+                for line in stall_snapshot_lines(stats, side_channels) {
+                    log::warn!("{line}");
                 }
                 mon_state.last_warn = Some(now);
             }
@@ -2593,16 +2616,8 @@ fn apply_stall_verdict(
                 "Pipeline deadlock: no progress for {stall_secs}s with {stuck} bytes \
                  stuck in flight; failing the pipeline. Snapshot follows."
             );
-            if let Some(stats) = stats {
-                let snapshot = stats.snapshot();
-                for line in format!("{snapshot}").lines() {
-                    log::error!("{line}");
-                }
-            } else {
-                log::error!(
-                    "(no per-step snapshot: PipelineConfig::stats is not set; \
-                     attach a stats handle to see which step is stuck)"
-                );
+            for line in stall_snapshot_lines(stats, side_channels) {
+                log::error!("{line}");
             }
             signal.record_error(PipelineError::TimedOut { stalled_secs: stall_secs });
             signal.cancel();
@@ -2782,21 +2797,39 @@ const MIN_REORDER_OVERFLOW_BYTES: u64 = 4 * 1024 * 1024;
 /// prior fixed value, so high thread counts (large `per_queue`) keep today's
 /// reorder headroom — no `--threads N` regression — while low thread counts
 /// (small `per_queue`) get a streaming-sized stash.
+///
+/// Only budgeted queues ([`crate::runtime::contexts::RegisteredQueue::budgeted`])
+/// share `total`; a fixed-limit queue keeps its declared limit and does not
+/// count toward the split.
 pub(crate) fn apply_initial_queue_budget(
     queues: &[crate::runtime::contexts::RegisteredQueue],
     total: u64,
 ) {
-    if queues.is_empty() {
+    let budgeted = queues.iter().filter(|rq| rq.budgeted).count() as u64;
+    if budgeted == 0 {
         return;
     }
-    let per_queue = (total / (queues.len() as u64)).max(MIN_PER_QUEUE_BYTES);
+    let per_queue = (total / budgeted).max(MIN_PER_QUEUE_BYTES);
     let reorder_cap = reorder_cap_for(per_queue);
-    for rq in queues {
+    for rq in queues.iter().filter(|rq| rq.budgeted) {
         rq.handle.set_limit_bytes(per_queue);
         if let Some(reorder) = &rq.reorder_cap {
             reorder.set_max_overflow_bytes(reorder_cap);
         }
     }
+}
+
+/// The queues the rebalancer may resize, with their producers' names: the
+/// budgeted ones. A fixed-limit queue (`QueueSpec::FixedByteBounded`) is not
+/// part of the budget, so the rebalancer never moves bytes to or from it.
+fn rebalanced_queues(
+    queues: &[crate::runtime::contexts::RegisteredQueue],
+) -> (Vec<Arc<dyn super::queues::BoundedQueueHandle>>, Vec<&'static str>) {
+    queues
+        .iter()
+        .filter(|rq| rq.budgeted)
+        .map(|rq| (Arc::clone(&rq.handle), rq.producer_step_name))
+        .unzip()
 }
 
 /// The reorder overflow cap for a branch whose transport budget is
@@ -3144,6 +3177,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: transport_handle,
             reorder_cap: Some(reorder_dyn),
+            budgeted: true,
         }];
 
         // Lean total → per_queue = 8 MiB (1 queue) → reorder clamp = 8 MiB.
@@ -3187,6 +3221,7 @@ mod tests {
                 branch: BranchIdx(0),
                 handle: Arc::clone(h) as Arc<dyn BoundedQueueHandle>,
                 reorder_cap: None,
+                budgeted: true,
             })
             .collect();
 
@@ -5862,6 +5897,323 @@ mod tests {
         assert_eq!(classify_stall(progressed, stall_secs, 10, 60, in_flight_bytes, true), expected);
     }
 
+    /// A fake [`crate::SideChannel`] holding a fixed byte count.
+    struct FakeChannel(u64, &'static str);
+    impl crate::SideChannel for FakeChannel {
+        fn in_flight_bytes(&self) -> u64 {
+            self.0
+        }
+        fn describe(&self) -> String {
+            self.1.to_owned()
+        }
+    }
+
+    /// A `Step` whose clones all report the one shared channel.
+    #[derive(Clone)]
+    struct ChannelStep(Option<Arc<dyn crate::SideChannel>>);
+    impl Step for ChannelStep {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ChannelStep",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn side_channels(&self) -> Vec<Arc<dyn crate::SideChannel>> {
+            self.0.iter().cloned().collect()
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// Distinct channels from `n` steps, `shared` of them reporting the same
+    /// `Arc`, deduplicated by pointer; byte sum counts each once.
+    #[rstest]
+    #[case::two_clones_share_one(vec![0, 0], 4096, 1)]
+    #[case::two_distinct_channels(vec![0, 1], 4096 + 100, 2)]
+    #[case::three_steps_two_shared(vec![0, 1, 0], 4096 + 100, 2)]
+    #[case::no_channels(vec![], 0, 0)]
+    fn side_channels_deduped_by_pointer(
+        #[case] picks: Vec<usize>,
+        #[case] expected_bytes: u64,
+        #[case] expected_count: usize,
+    ) {
+        use crate::runtime::contexts::distinct_side_channels;
+        let pool: [Arc<dyn crate::SideChannel>; 2] =
+            [Arc::new(FakeChannel(4096, "a")), Arc::new(FakeChannel(100, "b"))];
+        let steps: Vec<ChannelStep> =
+            picks.iter().map(|&i| ChannelStep(Some(Arc::clone(&pool[i])))).collect();
+        let distinct = distinct_side_channels(steps.iter().flat_map(Step::side_channels));
+        assert_eq!(distinct.len(), expected_count);
+        assert_eq!(distinct.iter().map(|c| c.in_flight_bytes()).sum::<u64>(), expected_bytes);
+    }
+
+    /// The monitor's in-flight total adds the bytes side channels hold (outside
+    /// every queue edge) to the bytes queued on registered edges.
+    #[rstest]
+    #[case::side_channel_only(0, 4096, 4096)]
+    #[case::empty(0, 0, 0)]
+    #[case::queue_and_side_channel_sum(500, 4096, 4596)]
+    fn in_flight_bytes_includes_side_channels(
+        #[case] queued: usize,
+        #[case] held: u64,
+        #[case] expected: u64,
+    ) {
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        use crate::runtime::contexts::{ChainContexts, RegisteredQueue};
+        use crate::topology::{BranchIdx, StepIdx};
+
+        #[derive(Debug)]
+        struct Bytes(usize);
+        impl HeapSize for Bytes {
+            fn heap_size(&self) -> usize {
+                self.0
+            }
+        }
+
+        let transport = Arc::new(ByteBoundedQueue::<Bytes>::new(10_000));
+        if queued > 0 {
+            transport.try_push(Bytes(queued)).unwrap();
+        }
+        let handle: Arc<dyn BoundedQueueHandle> = transport;
+        let rq = RegisteredQueue {
+            producer_step_name: "test",
+            producer_step: StepIdx(0),
+            branch: BranchIdx(0),
+            handle,
+            reorder_cap: None,
+            budgeted: true,
+        };
+        let contexts = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![rq],
+            holder_only_queues: vec![],
+            edges: vec![],
+            step_counters: vec![],
+            side_channels: vec![Arc::new(FakeChannel(held, "inbox"))],
+        };
+        assert_eq!(in_flight_bytes(&contexts), expected);
+    }
+
+    /// A `u32` sink for the side-channel context tests.
+    #[derive(Clone)]
+    struct U32Sink;
+    impl Step for U32Sink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "U32Sink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// The job edge of a fan-out owner in the budget tests.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum JobEdge {
+        /// No job edge: the owner has only its data branch.
+        Absent,
+        /// A `FixedByteBounded` job edge (the opt-out).
+        Fixed,
+        /// A plain `ByteBounded` job edge (takes an even share).
+        Budgeted,
+    }
+
+    /// A source with a data branch and, per [`JobEdge`], a second branch.
+    #[derive(Clone)]
+    struct OwnerWithJobEdge(JobEdge);
+    impl Step for OwnerWithJobEdge {
+        type Input = ();
+        type Outputs = (u32, u32);
+        fn profile(&self) -> StepProfile {
+            let job = match self.0 {
+                JobEdge::Fixed => QueueSpec::FixedByteBounded { limit_bytes: JOB_EDGE_LIMIT },
+                JobEdge::Absent | JobEdge::Budgeted => {
+                    QueueSpec::ByteBounded { limit_bytes: JOB_EDGE_LIMIT }
+                }
+            };
+            StepProfile {
+                name: "Owner",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }, job],
+                branch_ordering: vec![BranchOrdering::None, BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// The declared limit of the job edge in the budget tests.
+    const JOB_EDGE_LIMIT: u64 = 4096;
+
+    /// `Source → U32Sink` (data edge) and, per `job`, an `Owner` whose data
+    /// branch feeds a sink and whose job branch feeds another. Returns the
+    /// registered byte-bounded queues' `(producer, branch, budgeted, limit)`
+    /// after the `total` budget pass.
+    fn budgeted_limits(job: JobEdge, total: u64) -> Vec<(&'static str, usize, bool, u64)> {
+        use crate::runtime::contexts::build_chain_contexts;
+        use crate::topology::{BranchIdx, ChainGraph};
+
+        let mut graph = ChainGraph::new();
+        let mut steps: Vec<Box<dyn ErasedStep>> = Vec::new();
+        let src = graph.register_step("ChannelStep", 1);
+        steps.push(Box::new(TypedStep::new(ChannelStep(None))));
+        let sink = graph.register_step("U32Sink", 0);
+        steps.push(Box::new(TypedStep::new(U32Sink)));
+        graph.wire(src, BranchIdx(0), sink);
+        if job == JobEdge::Absent {
+            let owner = graph.register_step("ChannelStep", 1);
+            steps.push(Box::new(TypedStep::new(ChannelStep(None))));
+            let data = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            graph.wire(owner, BranchIdx(0), data);
+        } else {
+            let owner = graph.register_step("Owner", 2);
+            steps.push(Box::new(TypedStep::new(OwnerWithJobEdge(job))));
+            let data = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            let worker = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            graph.wire(owner, BranchIdx(0), data);
+            graph.wire(owner, BranchIdx(1), worker);
+        }
+        let contexts = build_chain_contexts(&steps, &graph, InstrumentationLevel::Off, false);
+        apply_initial_queue_budget(&contexts.bounded_queues, total);
+        contexts
+            .bounded_queues
+            .iter()
+            .map(|rq| (rq.producer_step_name, rq.branch.0, rq.budgeted, rq.handle.limit_bytes()))
+            .collect()
+    }
+
+    /// A `FixedByteBounded` job edge keeps its declared limit through the
+    /// budget pass and is left out of the split: the data edges get exactly
+    /// the share they get when the chain has no job edge. A plain
+    /// `ByteBounded` job edge takes an even share instead (the behaviour the
+    /// opt-out exists to avoid). The fixed edge is still registered, so the
+    /// deadlock monitor and the wake plan see it.
+    #[rstest]
+    #[case::fixed_job_edge(JobEdge::Fixed, 48 << 20, JOB_EDGE_LIMIT, false)]
+    #[case::budgeted_job_edge(JobEdge::Budgeted, (96 << 20) / 3, (96 << 20) / 3, true)]
+    fn fixed_queue_is_left_out_of_the_budget(
+        #[case] job: JobEdge,
+        #[case] data_share: u64,
+        #[case] job_limit: u64,
+        #[case] job_budgeted: bool,
+    ) {
+        const TOTAL: u64 = 96 << 20;
+        let without = budgeted_limits(JobEdge::Absent, TOTAL);
+        assert_eq!(
+            without,
+            vec![("ChannelStep", 0, true, TOTAL / 2), ("ChannelStep", 0, true, TOTAL / 2)],
+            "baseline: two data edges split the total"
+        );
+        let with = budgeted_limits(job, TOTAL);
+        assert_eq!(
+            with,
+            vec![
+                ("ChannelStep", 0, true, data_share),
+                ("Owner", 0, true, data_share),
+                ("Owner", 1, job_budgeted, job_limit),
+            ]
+        );
+        if job == JobEdge::Fixed {
+            assert_eq!(data_share, without[0].3, "the data edges keep their no-job-edge share");
+        }
+    }
+
+    /// The rebalancer only ever sees budgeted queues: a fixed queue, however
+    /// full, never gains or gives bytes.
+    #[test]
+    fn rebalancer_skips_fixed_queues() {
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        let handles: Vec<Arc<ByteBoundedQueue<Vec<u8>>>> =
+            (0..2).map(|_| Arc::new(ByteBoundedQueue::new(10 << 20))).collect();
+        handles[0].try_push(vec![0u8; 9 << 20]).unwrap();
+        let fixed = Arc::new(ByteBoundedQueue::<Vec<u8>>::new(JOB_EDGE_LIMIT));
+        let registered: Vec<crate::runtime::contexts::RegisteredQueue> = handles
+            .iter()
+            .map(|h| Arc::clone(h) as Arc<dyn BoundedQueueHandle>)
+            .chain(std::iter::once(Arc::clone(&fixed) as Arc<dyn BoundedQueueHandle>))
+            .enumerate()
+            .map(|(i, handle)| crate::runtime::contexts::RegisteredQueue {
+                producer_step_name: "S",
+                producer_step: crate::topology::StepIdx(i),
+                branch: crate::topology::BranchIdx(0),
+                handle,
+                reorder_cap: None,
+                budgeted: i < 2,
+            })
+            .collect();
+        let (budgeted, names) = rebalanced_queues(&registered);
+        assert_eq!(budgeted.len(), 2, "the fixed queue is not offered to the rebalancer");
+        let raised = rebalance_once(&budgeted, &names);
+        assert_eq!(raised, Some(0), "the full budgeted queue gains");
+        assert_eq!(fixed.limit_bytes(), JOB_EDGE_LIMIT, "the fixed queue is untouched");
+    }
+
+    /// A channel a step reports reaches the contexts the runtime builds, through
+    /// the erased adapter, and the monitor's in-flight probe counts its bytes:
+    /// the probe the stall verdict reads, not a byte count handed to it.
+    #[rstest]
+    #[case::pool_contexts_bytes_held(false, Some(4096), 4096)]
+    #[case::pool_contexts_empty_channel(false, Some(0), 0)]
+    #[case::pool_contexts_no_channel(false, None, 0)]
+    #[case::fused_contexts_bytes_held(true, Some(4096), 4096)]
+    fn side_channels_flow_through_erased_step_into_contexts(
+        #[case] fused: bool,
+        #[case] held: Option<u64>,
+        #[case] expected_bytes: u64,
+    ) {
+        use crate::runtime::contexts::{build_chain_contexts, build_chain_contexts_fused};
+        use crate::topology::{BranchIdx, ChainGraph};
+
+        let ch = held.map(|b| Arc::new(FakeChannel(b, "inbox")) as Arc<dyn crate::SideChannel>);
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("ChannelStep", 1);
+        let sink = graph.register_step("U32Sink", 0);
+        graph.wire(src, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(ChannelStep(ch.clone()))),
+            Box::new(TypedStep::new(U32Sink)),
+        ];
+        let contexts = if fused {
+            build_chain_contexts_fused(&steps, &graph)
+        } else {
+            build_chain_contexts(&steps, &graph, InstrumentationLevel::Off, false)
+        };
+        assert_eq!(contexts.side_channels.len(), usize::from(ch.is_some()));
+        assert_eq!(in_flight_bytes(&contexts), expected_bytes);
+    }
+
+    #[rstest]
+    #[case::with_stats(true)]
+    #[case::without_stats(false)]
+    fn stall_snapshot_names_side_channel(#[case] with_stats: bool) {
+        let stats = PipelineStats::new(vec![]);
+        let channels: Vec<Arc<dyn crate::SideChannel>> =
+            vec![Arc::new(FakeChannel(4096, "fanout inbox of Sort"))];
+        let lines = stall_snapshot_lines(with_stats.then_some(&stats), &channels);
+        let expected = "side channel: fanout inbox of Sort (4096 bytes in flight)";
+        assert!(lines.iter().any(|l| l == expected), "snapshot: {}", lines.join("\n"));
+    }
+
     #[test]
     fn classify_stall_stuck_work_below_fatal_only_warns() {
         // No progress with work stuck, but the stall has not persisted long
@@ -6194,6 +6546,7 @@ mod tests {
             4096,
             std::time::Duration::from_secs(10),
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6230,6 +6583,7 @@ mod tests {
             4096,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6247,6 +6601,7 @@ mod tests {
             4096,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6279,6 +6634,7 @@ mod tests {
                 4096,
                 warn,
                 None,
+                &[],
                 &signal,
                 mon_state,
             );
@@ -6326,6 +6682,7 @@ mod tests {
             4096,
             warn,
             None,
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6355,6 +6712,7 @@ mod tests {
             0,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6375,6 +6733,7 @@ mod tests {
             0,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6426,6 +6785,7 @@ mod tests {
             branch: BranchIdx(0),
             handle,
             reorder_cap: Some(cap),
+            budgeted: true,
         };
         let contexts = ChainContexts {
             inputs: vec![],
@@ -6434,6 +6794,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         };
         // 200 (transport) + 300 (reorder stash).
         assert_eq!(in_flight_bytes(&contexts), 500);
@@ -6446,6 +6807,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         };
         assert_eq!(in_flight_bytes(&empty), 0);
     }

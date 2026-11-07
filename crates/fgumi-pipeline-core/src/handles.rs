@@ -29,14 +29,15 @@
 //! those are framework-managed. Step authors see `outputs.push(item)` and
 //! `input.pop() -> Option<T>`.
 //!
-//! `QueueSpec::ByteBounded` requires `T: HeapSize`. Every build path — `Single<T>`,
+//! `QueueSpec::ByteBounded` and `QueueSpec::FixedByteBounded` require
+//! `T: HeapSize`. Every build path — `Single<T>`,
 //! the tuple fan-outs, and the ordered-bytes shapes — bounds `T: HeapSize` and
 //! routes through `build_branch_byte_aware` (or `build_branch_ordered_bytes`), so
-//! `ByteBounded` is honored on every branch of every shape. Those byte-aware
+//! both byte specs are honored on every branch of every shape. Those byte-aware
 //! entry points delegate every non-byte spec straight back to `build_branch`, so
 //! count/unbounded branches are unaffected.
 //!
-//! `build_branch` itself keeps a `ByteBounded` panic as the guard on that
+//! `build_branch` itself keeps a byte-spec panic as the guard on that
 //! delegation: reaching it with a byte spec means a caller bypassed a byte-aware
 //! entry point. The other two panics are for an item-carried ordinal without the
 //! trait to read it — `ByItemOrdinal` declared without `Ordered`, and
@@ -300,7 +301,7 @@ enum BranchInputInner<T: Send + HeapSize + 'static> {
 impl<T: Send + HeapSize + 'static> BranchInputHandle<T> {
     /// An uninstrumented input handle reading `queue` directly (no reorder
     /// stage). Used by [`crate::testing::StepProbe`] to feed one step by hand.
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(any(test, loom, feature = "test-utils"))]
     pub(crate) fn direct(queue: Arc<dyn ItemQueue<T>>) -> Self {
         Self { inner: BranchInputInner::Direct(queue), metrics: None, record_item_bytes: false }
     }
@@ -440,9 +441,10 @@ fn edge_metrics(
 ///
 /// # Panics
 ///
-/// Panics on `QueueSpec::ByteBounded` (requires `T: HeapSize`; use the
-/// byte-aware build path) or on `BranchOrdering::ByItemOrdinal` (requires
-/// `T: Ordered`; use `build_branch_ordered`).
+/// Panics on `QueueSpec::ByteBounded` or `QueueSpec::FixedByteBounded`
+/// (both require `T: HeapSize`; use the byte-aware build path) or on
+/// `BranchOrdering::ByItemOrdinal` (requires `T: Ordered`; use
+/// `build_branch_ordered`).
 pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
@@ -505,11 +507,11 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
                  read `item.ordinal()` at push time."
             );
         }
-        (QueueSpec::ByteBounded { .. }, _) => {
+        (QueueSpec::ByteBounded { .. } | QueueSpec::FixedByteBounded { .. }, _) => {
             panic!(
-                "QueueSpec::ByteBounded requires `T: HeapSize` — \
-                 use the byte-aware build path (`build_branch_byte_aware` or \
-                 `build_branch_ordered_bytes`)."
+                "QueueSpec::ByteBounded requires `T: HeapSize`, as does \
+                 QueueSpec::FixedByteBounded (got {spec:?}) — use the byte-aware \
+                 build path (`build_branch_byte_aware` or `build_branch_ordered_bytes`)."
             );
         }
     }
@@ -522,8 +524,8 @@ pub(crate) fn build_branch<T: Send + HeapSize + 'static>(
 ///
 /// # Panics
 ///
-/// Panics on `QueueSpec::ByteBounded` (requires `T: HeapSize`; use the
-/// `_ordered_bytes` build path).
+/// Panics on `QueueSpec::ByteBounded` or `QueueSpec::FixedByteBounded`
+/// (both require `T: HeapSize`; use the `_ordered_bytes` build path).
 pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
     spec: QueueSpec,
     ordering: BranchOrdering,
@@ -564,10 +566,11 @@ pub(crate) fn build_branch_ordered<T: Send + HeapSize + Ordered + 'static>(
                 m,
             )
         }
-        (QueueSpec::ByteBounded { .. }, _) => {
+        (QueueSpec::ByteBounded { .. } | QueueSpec::FixedByteBounded { .. }, _) => {
             panic!(
-                "QueueSpec::ByteBounded requires `T: HeapSize` — \
-                 `build_branch_ordered` only bounds `T: Ordered`. Use \
+                "QueueSpec::ByteBounded requires `T: HeapSize`, as does \
+                 QueueSpec::FixedByteBounded (got {spec:?}) — `build_branch_ordered` \
+                 only bounds `T: Ordered`. Use \
                  `build_branch_ordered_bytes::<T: HeapSize + Ordered>` for the \
                  combined case."
             );
@@ -585,6 +588,8 @@ pub(crate) fn build_branch_ordered_bytes<T: Send + HeapSize + Ordered + 'static>
 ) -> Branch<T> {
     use crate::queues::BoundedQueueHandle;
 
+    // A fixed byte bound builds the same queue; only the budget treats it apart.
+    let spec = spec.transport();
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
             let m = edge_metrics(level);
@@ -673,6 +678,8 @@ pub(crate) fn build_branch_byte_aware<T: Send + HeapSize + 'static>(
 ) -> Branch<T> {
     use crate::queues::BoundedQueueHandle;
 
+    // A fixed byte bound builds the same queue; only the budget treats it apart.
+    let spec = spec.transport();
     match (spec, ordering) {
         (QueueSpec::ByteBounded { limit_bytes }, BranchOrdering::None) => {
             let m = edge_metrics(level);
@@ -2104,11 +2111,13 @@ mod handle_tests {
         assert_eq!(ms.popped_items, 1, "the item itself is always counted");
     }
 
-    #[test]
+    #[rstest]
+    #[case::byte_bounded(QueueSpec::ByteBounded { limit_bytes: 1000 })]
+    #[case::fixed_byte_bounded(QueueSpec::FixedByteBounded { limit_bytes: 1000 })]
     #[should_panic(expected = "ByteBounded requires `T: HeapSize`")]
-    fn byte_bounded_panics_in_non_heap_aware_builder() {
+    fn byte_bounded_panics_in_non_heap_aware_builder(#[case] spec: QueueSpec) {
         let _ = build_branch::<u32>(
-            QueueSpec::ByteBounded { limit_bytes: 1000 },
+            spec,
             BranchOrdering::None,
             crate::builder::InstrumentationLevel::Off,
         );

@@ -129,6 +129,11 @@ pub struct ChainContexts {
     /// aggregate into one atomic. Each entry is [`StepCounters::disabled`] when
     /// telemetry is off (no allocation), else `StepCounters::new(step.counters().len())`.
     pub step_counters: Vec<StepCounters>,
+    /// Every distinct off-edge [`SideChannel`](crate::SideChannel) the chain's
+    /// steps report, deduplicated by pointer (parallel clones and a worker
+    /// step sharing its owner's inbox report the same `Arc`). Summed by the
+    /// deadlock monitor beside the edge bytes. Empty for most chains.
+    pub side_channels: Vec<std::sync::Arc<dyn crate::SideChannel>>,
 }
 
 /// One instrumented edge: its shared [`EdgeMetrics`](crate::runtime::metrics::EdgeMetrics)
@@ -178,6 +183,11 @@ pub struct RegisteredQueue {
     /// is sized from the same per-edge budget as `handle`. `None` for a direct
     /// (unordered) byte-bounded branch (no reorder stage).
     pub reorder_cap: Option<std::sync::Arc<dyn crate::reorder::ReorderCapHandle>>,
+    /// Whether the run's `queue_memory_total` budget sizes this queue: `false`
+    /// for a [`crate::queues::QueueSpec::FixedByteBounded`] branch, which
+    /// keeps its declared limit and is left out of the budget split and the
+    /// rebalancer (it stays visible to the deadlock monitor and the wake plan).
+    pub budgeted: bool,
 }
 
 /// One holder-only edge's location in the chain and its tracking handle (see
@@ -197,6 +207,22 @@ impl ChainContexts {
             holder_only: &self.holder_only_queues,
         }
     }
+}
+
+/// Deduplicate side channels by pointer identity, keeping first-seen order.
+/// Compares the data address only, so two `Arc`s of one channel match even if
+/// their vtable pointers differ across codegen units.
+pub(crate) fn distinct_side_channels(
+    channels: impl IntoIterator<Item = std::sync::Arc<dyn crate::SideChannel>>,
+) -> Vec<std::sync::Arc<dyn crate::SideChannel>> {
+    let mut distinct: Vec<std::sync::Arc<dyn crate::SideChannel>> = Vec::new();
+    for ch in channels {
+        let addr = std::sync::Arc::as_ptr(&ch).cast::<()>();
+        if !distinct.iter().any(|d| std::ptr::eq(std::sync::Arc::as_ptr(d).cast::<()>(), addr)) {
+            distinct.push(ch);
+        }
+    }
+    distinct
 }
 
 /// Build the chain's per-step contexts.
@@ -388,12 +414,17 @@ fn build_chain_contexts_inner(
     for (step_idx_usize, set) in output_sets.iter().enumerate() {
         for (branch_idx_usize, entry) in set.branches.iter().enumerate() {
             if let Some(handles) = entry.bounded_queue_handle.as_ref() {
+                let profile = steps[step_idx_usize].profile();
                 bounded_queues.push(RegisteredQueue {
-                    producer_step_name: steps[step_idx_usize].profile().name,
+                    producer_step_name: profile.name,
                     producer_step: StepIdx(step_idx_usize),
                     branch: BranchIdx(branch_idx_usize),
                     handle: std::sync::Arc::clone(&handles.transport),
                     reorder_cap: handles.reorder_cap.clone(),
+                    budgeted: profile
+                        .output_queues
+                        .get(branch_idx_usize)
+                        .is_none_or(|spec| spec.is_budgeted()),
                 });
             }
             if let Some(handle) = entry.holder_only_handle.as_ref() {
@@ -453,7 +484,17 @@ fn build_chain_contexts_inner(
         steps.iter().map(|_| StepCounters::disabled()).collect()
     };
 
-    ChainContexts { inputs, outputs, bounded_queues, holder_only_queues, edges, step_counters }
+    let side_channels = distinct_side_channels(steps.iter().flat_map(|s| s.side_channels()));
+
+    ChainContexts {
+        inputs,
+        outputs,
+        bounded_queues,
+        holder_only_queues,
+        edges,
+        step_counters,
+        side_channels,
+    }
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source

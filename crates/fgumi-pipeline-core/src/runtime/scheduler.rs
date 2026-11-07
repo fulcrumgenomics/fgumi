@@ -411,6 +411,7 @@ mod tests {
             branch: crate::topology::BranchIdx(branch),
             handle: std::sync::Arc::clone(queue) as _,
             reorder_cap: None,
+            budgeted: true,
         }
     }
 

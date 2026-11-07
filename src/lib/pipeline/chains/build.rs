@@ -214,7 +214,7 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
     use crate::pipeline::steps::tuning::BamPipelineTuning;
     use fgumi_pipeline_io::sort::{
         AnnounceMergeInputs, BlockOutput, MergeInputs, NoConsolidation, SortMerge,
-        SortSpillDecompress, SpillReadPlanner, SpillSupply,
+        SortSpillDecompress, SpillReadPlanner, SpillSupply, serial_merge_output,
     };
 
     let MergeSpec {
@@ -277,7 +277,9 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
     let fan =
         builder.chain(AnnounceMergeInputs::new(inputs, byte_limit)).chain(planner).into_multi();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
-    fan.b1.chain(merge).chain(compress).chain(write).into_sink_marker();
+    // `fgumi merge` never takes the single-chunk fast path (its inputs are
+    // slots), so the merge's job branch gets an idle `MergeWork`.
+    serial_merge_output(fan.b1.chain(merge)).chain(compress).chain(write).into_sink_marker();
     fan.b2.chain(NoConsolidation).into_sink_marker();
     let pipeline = builder.build().map_err(|e| anyhow::anyhow!("Pipeline::build: {e}"))?;
     // The runtime every sort-chain command shares (the deadlock monitor on),
