@@ -764,6 +764,7 @@ impl Extract {
             scheduler: self.scheduler_opts.clone(),
             queue_memory: self.queue_memory.clone(),
             async_reader: self.async_reader,
+            read_buffer: 0,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
             // Inert for a FASTQ source: both decode fronts resolve the CRC
             // policy from `stage_opts.extract` (see `ChainSpec::verify_crc`).

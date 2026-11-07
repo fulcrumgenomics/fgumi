@@ -36,7 +36,7 @@ use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, MaxTempFiles, MemoryLimit, MemoryReserve, QueueMemoryOptions,
     SchedulerOptions, ThreadingOptions, log_check_crc, parse_max_temp_files, parse_memory,
-    parse_memory_reserve, resolve_check_crc, resolve_memory_budget,
+    parse_memory_reserve, parse_read_buffer, resolve_check_crc, resolve_memory_budget,
 };
 use crate::pipeline::chains::{ChainSpec, SinkSpec, SourceSpec, Stage, StageOptionsBag, build_for};
 use crate::pipeline::core::builder::InstrumentationLevel;
@@ -297,11 +297,14 @@ pub struct Sort {
     /// until the records plus their refs reach it, the refs estimated from the
     /// previous run's mean record size (a run of much shorter records than the
     /// one before it can exceed the budget). The queue budget is separate from
-    /// it, as is the final merge's spill read-ahead.
+    /// it, as is the final merge's spill read-ahead. For input from a pipe,
+    /// --read-buffer is taken out of the record buffer's budget.
     ///
     /// This bounds two budgets: the in-memory record buffer (the dominant
-    /// consumer, reported on the "Max memory" log line) and the bytes held in the
-    /// queues between pipeline stages (applied, but not separately logged). It is
+    /// consumer) and the bytes held in the queues between pipeline stages
+    /// (applied, but not separately logged). The "Max memory" log line reports
+    /// the total; for streamed input the record buffer is that total less the
+    /// read buffer, both shown on the "Read buffer" line. It is
     /// not a hard cap on total process RSS: ingest decompression/parse buffers add
     /// a few percent, and the final k-way merge's spill read-ahead adds to the
     /// buffer rather than being subtracted from it. The last sorted run is merged
@@ -500,6 +503,32 @@ pub struct Sort {
     /// inputs are read sequentially.
     #[arg(long = "read-streams", default_value_t = fgumi_bam_io::ReadStreams::Auto)]
     pub read_streams: fgumi_bam_io::ReadStreams,
+
+    /// Read-ahead buffer for input that arrives as a stream (stdin, a FIFO or
+    /// process substitution); `0` reads the stream directly.
+    ///
+    /// Each time the sort seals a run -- sorts it, compresses it and writes it
+    /// to a temporary file -- it stops consuming its input for a few seconds. A
+    /// pipe holds very little, so the process writing into it (an aligner or a
+    /// duplicate marker upstream) blocks until the sort reads again. With a
+    /// buffer, a dedicated thread keeps reading the pipe into it in the
+    /// meantime, so the upstream process keeps running.
+    ///
+    /// The buffer is taken out of --max-memory, which stays the total: the
+    /// in-memory sort buffer is smaller by the same amount, so the sort may
+    /// spill once or twice more. It is capped at a quarter of the resolved
+    /// memory budget, so a small budget is not mostly read buffer. The final
+    /// merge starts after the input has been read and the buffer released, so
+    /// its spill read-ahead is sized from the whole budget. The size in force
+    /// is logged at startup ("Read buffer: ..."), and how full it got when the
+    /// input is closed. A regular file (including stdin redirected from one) is
+    /// read without one and keeps the whole budget; so is stdin on non-Unix
+    /// systems, where it cannot be inspected. Sizes are parsed like
+    /// --max-memory ("512M", "2GiB"; a plain number is MiB). The sorted records
+    /// and their order are identical at any size; only the @PG command line
+    /// records the option.
+    #[arg(long = "read-buffer", default_value = "2GiB", value_parser = parse_read_buffer)]
+    pub read_buffer: usize,
 
     /// Emit the sort's performance diagnostics.
     ///
@@ -898,6 +927,7 @@ impl Sort {
         output: &Path,
         resolved_tmp_dirs: Vec<PathBuf>,
         resolved_max_temp_files: usize,
+        read_buffer: usize,
         command_line: &str,
     ) -> ChainSpec {
         let (scheduler, queue_memory) = crate::commands::common::sort_chain_runtime(
@@ -944,6 +974,9 @@ impl Sort {
             },
             queue_memory,
             async_reader: false,
+            // Already sized by `effective_read_buffer` (zero for a regular file);
+            // the chain builder takes it out of the sort's budget.
+            read_buffer,
             // Thread the sort command's --read-streams into the chain's BAM
             // source: anything but Fixed(1) over a regular BGZF file selects the
             // chain-native input reads (Auto ratchets the stream count, Fixed(n)
@@ -1149,6 +1182,53 @@ fn fd_budget_warning(
     ))
 }
 
+/// The read buffer may take at most `1 / READ_BUFFER_BUDGET_DIVISOR` of the
+/// resolved memory budget (a quarter), so a small budget stays mostly sort
+/// buffer.
+const READ_BUFFER_BUDGET_DIVISOR: usize = 4;
+
+/// The read buffer the sort runs with: `requested` (`--read-buffer`), capped at
+/// a quarter of `memory_budget` (the resolved `--max-memory` total, out of
+/// which the buffer is taken), and `0` when the input is not a stream (a
+/// regular file has no writer to block, so it keeps the whole budget).
+fn effective_read_buffer(requested: usize, memory_budget: usize, input_is_stream: bool) -> usize {
+    if input_is_stream { requested.min(memory_budget / READ_BUFFER_BUDGET_DIVISOR) } else { 0 }
+}
+
+/// The startup line naming the read buffer in force and where it came from.
+///
+/// Returned rather than logged so the wording is assertable without a log
+/// capture.
+fn read_buffer_log_line(
+    requested: usize,
+    effective: usize,
+    memory_budget: usize,
+    input_is_stream: bool,
+) -> String {
+    let size = |bytes: usize| ByteSize(bytes as u64);
+    if requested == 0 {
+        "Read buffer: off (--read-buffer 0)".to_string()
+    } else if !input_is_stream {
+        "Read buffer: off (the input is not a pipe, FIFO or other stream)".to_string()
+    } else if effective < requested {
+        format!(
+            "Read buffer: {} (--read-buffer {} capped at a quarter of the {} memory budget; sort \
+             buffer {})",
+            size(effective),
+            size(requested),
+            size(memory_budget),
+            size(memory_budget - effective)
+        )
+    } else {
+        format!(
+            "Read buffer: {} (taken from the {} memory budget; sort buffer {})",
+            size(effective),
+            size(memory_budget),
+            size(memory_budget - effective)
+        )
+    }
+}
+
 impl Sort {
     /// Execute sort mode: read, sort, and write output.
     fn execute_sort(&self, command_line: &str) -> Result<()> {
@@ -1241,6 +1321,13 @@ impl Sort {
         if self.write_index {
             info!("Write index: enabled");
         }
+        let input_is_stream = fgumi_bam_io::is_stream_input(&self.input);
+        let read_buffer =
+            effective_read_buffer(self.read_buffer, effective_memory, input_is_stream);
+        info!(
+            "{}",
+            read_buffer_log_line(self.read_buffer, read_buffer, effective_memory, input_is_stream)
+        );
         let env_value = std::env::var(TMP_DIRS_ENV).ok();
         let resolved_tmp_dirs = resolve_tmp_dirs(&self.tmp_dirs, env_value.as_deref());
         if !resolved_tmp_dirs.is_empty() {
@@ -1279,6 +1366,7 @@ impl Sort {
             staged.path(),
             resolved_tmp_dirs,
             max_temp_files,
+            read_buffer,
             command_line,
         );
         let built = build_for(spec)?;
@@ -1683,6 +1771,7 @@ mod tests {
             Path::new("out.bam"),
             Vec::new(),
             resolved_max_temp_files,
+            0,
             "fgumi sort (test)",
         );
 
@@ -1745,6 +1834,7 @@ mod tests {
             Path::new("out.bam"),
             Vec::new(),
             sort.resolved_max_temp_files(fgumi_sort::soft_nofile()),
+            0,
             "fgumi sort (test)",
         );
         assert_eq!(spec.verify_crc, expected);
@@ -1787,6 +1877,7 @@ mod tests {
             Path::new("out.bam"),
             Vec::new(),
             resolved_max_temp_files,
+            0,
             "fgumi sort (test)",
         );
         assert_eq!(spec.scheduler.deadlock_timeout_secs(), expected);
@@ -1818,6 +1909,7 @@ mod tests {
             Path::new("out.bam"),
             Vec::new(),
             resolved_max_temp_files,
+            0,
             "fgumi sort (test)",
         );
 
@@ -1875,6 +1967,7 @@ mod tests {
             Path::new(output),
             vec![dir.to_path_buf()],
             resolved_max_temp_files,
+            0,
             "fgumi sort (test)",
         )
     }
@@ -2204,6 +2297,7 @@ mod tests {
             max_temp_files: MaxTempFiles::Auto,
             write_index: false,
             read_streams: fgumi_bam_io::ReadStreams::Auto,
+            read_buffer: 0,
             sort_stats: false,
             pipeline_stats: false,
             pipeline_trace: InstrumentationLevel::Off,
@@ -2218,6 +2312,92 @@ mod tests {
     fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<SamTag>) {
         let sort = make_sort(order);
         assert_eq!(sort.parse_cell_tag().expect("parse_cell_tag should succeed"), expected);
+    }
+
+    /// `--read-buffer` parses like `--max-memory` (a plain number is MiB) and
+    /// also takes zero, in any spelling, to turn the buffer off.
+    #[rstest]
+    #[case::zero("0", Ok(0))]
+    #[case::zero_padded("0000", Ok(0))]
+    #[case::zero_with_unit("0GiB", Ok(0))]
+    #[case::plain_mib("2048", Ok(2048 << 20))]
+    #[case::binary("2GiB", Ok(2 << 30))]
+    #[case::decimal("128K", Ok(128_000))]
+    #[case::negative("-1G", Err(()))]
+    #[case::garbage("lots", Err(()))]
+    fn read_buffer_parses_like_max_memory_plus_zero(
+        #[case] value: &str,
+        #[case] expected: Result<usize, ()>,
+    ) {
+        assert_eq!(parse_read_buffer(value).map_err(|_| ()), expected);
+    }
+
+    #[test]
+    fn read_buffer_defaults_to_two_gib() {
+        let sort = Sort::try_parse_from(["sort", "-i", "-", "-o", "out.bam"]).expect("parse");
+        assert_eq!(sort.read_buffer, 2 << 30);
+    }
+
+    /// The buffer is capped at a quarter of the resolved budget and is zero for
+    /// a regular file or when turned off.
+    #[rstest]
+    #[case::fits(2 << 30, 20 << 30, true, 2 << 30)]
+    #[case::capped_at_a_quarter(2 << 30, 4 << 30, true, 1 << 30)]
+    #[case::exactly_a_quarter(1 << 30, 4 << 30, true, 1 << 30)]
+    #[case::off(0, 20 << 30, true, 0)]
+    #[case::regular_file(2 << 30, 20 << 30, false, 0)]
+    fn effective_read_buffer_caps_and_skips_files(
+        #[case] requested: usize,
+        #[case] budget: usize,
+        #[case] input_is_stream: bool,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(effective_read_buffer(requested, budget, input_is_stream), expected);
+    }
+
+    #[rstest]
+    #[case::off(0, 0, true, "Read buffer: off (--read-buffer 0)")]
+    #[case::not_a_stream(
+        2 << 30,
+        0,
+        false,
+        "Read buffer: off (the input is not a pipe, FIFO or other stream)"
+    )]
+    #[case::capped(
+        2 << 30,
+        1 << 30,
+        true,
+        "Read buffer: 1.0 GiB (--read-buffer 2.0 GiB capped at a quarter of the 4.0 GiB memory \
+         budget; sort buffer 3.0 GiB)"
+    )]
+    #[case::fits(
+        1 << 30,
+        1 << 30,
+        true,
+        "Read buffer: 1.0 GiB (taken from the 4.0 GiB memory budget; sort buffer 3.0 GiB)"
+    )]
+    fn read_buffer_log_line_states_size_and_source(
+        #[case] requested: usize,
+        #[case] effective: usize,
+        #[case] input_is_stream: bool,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(read_buffer_log_line(requested, effective, 4 << 30, input_is_stream), expected);
+    }
+
+    /// The effective buffer reaches the chain spec, which takes it out of the
+    /// sort's budget.
+    #[test]
+    fn build_sort_chain_spec_carries_the_read_buffer() {
+        let sort = Sort::try_parse_from(["sort", "-i", "-", "-o", "out.bam"]).expect("parse");
+        let spec = sort.build_sort_chain_spec(
+            Path::new("out.bam"),
+            Vec::new(),
+            sort.resolved_max_temp_files(fgumi_sort::soft_nofile()),
+            12345,
+            "fgumi sort (test)",
+        );
+        assert_eq!(spec.read_buffer, 12345);
     }
 
     #[test]

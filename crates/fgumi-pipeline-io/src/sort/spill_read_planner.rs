@@ -138,7 +138,11 @@ pub struct SpillReadPlanner {
     ledger: Arc<SupplyLedger>,
     /// The spill slice pool: its idle buffers are charged to the budget's pool.
     slices: Arc<SliceBufferPool>,
+    /// The budget consolidation jobs (phase 1) are sized from.
     total_memory: u64,
+    /// The budget the final merge's read-ahead is resolved from at
+    /// `AllAnnounced`; `total_memory` unless [`Self::with_merge_memory`] set it.
+    merge_memory: u64,
     max_inflight_slices: u32,
     cold_inflight_bytes: u64,
     eligible_clones: usize,
@@ -196,6 +200,7 @@ impl SpillReadPlanner {
             ledger: Arc::clone(&supply.ledger),
             slices,
             total_memory,
+            merge_memory: total_memory,
             max_inflight_slices: inflight,
             cold_inflight_bytes: COLD_INFLIGHT_BYTES,
             eligible_clones: eligible_clones.max(1),
@@ -250,6 +255,16 @@ impl SpillReadPlanner {
         if !self.announced {
             self.max_inflight_slices = self.phase1_inflight_slices;
         }
+        self
+    }
+
+    /// Resolve the final merge's read-ahead from `merge_memory` instead of the
+    /// `total_memory` given to [`Self::new`], which still sizes consolidation.
+    /// For memory that is in use only until the input ends (`sort
+    /// --read-buffer`): the merge starts after that, consolidation before.
+    #[must_use]
+    pub fn with_merge_memory(mut self, merge_memory: u64) -> Self {
+        self.merge_memory = merge_memory;
         self
     }
 
@@ -481,7 +496,7 @@ impl SpillReadPlanner {
                     p.switch_to(CapPhase::Two);
                 }
                 self.max_inflight_slices = self.phase2_inflight_slices;
-                let budget = ReadAheadBudget::resolve(self.total_memory, slot_count as usize);
+                let budget = ReadAheadBudget::resolve(self.merge_memory, slot_count as usize);
                 #[cfg(test)]
                 let budget = match self.fills_for_test {
                     Some((hot, cold)) => budget.override_for_test(hot, cold),

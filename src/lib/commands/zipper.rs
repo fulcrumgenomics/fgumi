@@ -1162,6 +1162,7 @@ impl Zipper {
             scheduler: SchedulerOptions { deadlock: self.deadlock, ..Default::default() },
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            read_buffer: 0,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
             // Zipper has no --check-crc flag; use the shared default policy
             // (verify file input, trust stdin). The chain path is gated on

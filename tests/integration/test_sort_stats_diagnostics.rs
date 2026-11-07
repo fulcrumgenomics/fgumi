@@ -819,6 +819,7 @@ fn fused_sort_then_group_chain_exercises_intermediate_add_sort_branch() {
         scheduler: SchedulerOptions::default(),
         queue_memory: QueueMemoryOptions::default(),
         async_reader: false,
+        read_buffer: 0,
         read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         verify_crc: true,
         command_line: "fgumi <fused sort+group test>".to_string(),

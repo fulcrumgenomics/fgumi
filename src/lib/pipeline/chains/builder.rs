@@ -584,6 +584,10 @@ pub struct ChainBuilder<'a> {
     /// in [`Self::new`] by [`Self::native_input_path`]; `None` for every other
     /// source.
     native_input: Option<NativeInput>,
+    /// Bytes of [`ChainSpec::read_buffer`] the source is actually read through
+    /// ([`Self::source_read_buffer`]); `add_sort` takes them out of the sort's
+    /// in-memory budget.
+    read_buffer: usize,
     /// The resolved `--read-streams` policy, created by the first stage that
     /// needs it and shared by the input and spill read planners.
     read_streams_policy: Option<Arc<fgumi_bam_io::pread::ReadStreamsPolicy>>,
@@ -896,7 +900,11 @@ impl<'a> ChainBuilder<'a> {
         // the input itself) is gone: standalone sort now streams through the
         // normal source path, so `@PG` injection applies to it too.
         let native_input = Self::native_input_path(spec);
-        let (raw_header, pending_source) = Self::open_source(spec, native_input.as_ref())?;
+        // One decision whether the source is read through the read buffer: the
+        // bytes `add_sort` takes out of its budget are the bytes the source uses.
+        let read_buffer = Self::source_read_buffer(spec);
+        let (raw_header, pending_source) =
+            Self::open_source(spec, native_input.as_ref(), read_buffer)?;
         // A FASTQ source detects the input quality encoding while opening its
         // readers; pull it out here so `add_extract` can override the placeholder
         // in `ExtractOptions`. Non-FASTQ sources leave this `None`.
@@ -937,6 +945,7 @@ impl<'a> ChainBuilder<'a> {
             paired_tail: None,
             override_pipeline_threads: None,
             native_input,
+            read_buffer,
             read_streams_policy: None,
             input_slice_hist: None,
             #[cfg(test)]
@@ -1026,6 +1035,22 @@ impl<'a> ChainBuilder<'a> {
         }
     }
 
+    /// The read buffer the BAM/SAM source is read through: the spec's
+    /// [`ChainSpec::read_buffer`] when the source is a stream
+    /// ([`fgumi_bam_io::is_stream_input`]: stdin, a FIFO), and `0` for a regular
+    /// file (which the native input path or the sequential file reader reads,
+    /// and which no writer waits on) or any other source.
+    fn source_read_buffer(spec: &ChainSpec) -> usize {
+        match &spec.source {
+            SourceSpec::Bam(path) | SourceSpec::Sam(path)
+                if spec.read_buffer > 0 && fgumi_bam_io::is_stream_input(path) =>
+            {
+                spec.read_buffer
+            }
+            _ => 0,
+        }
+    }
+
     /// Open the input source and extract the header. For `Bam`/`Sam` specs,
     /// opens the file and wraps it in [`PendingSource::Single`]. For
     /// `PairedBams`, opens both inputs, resolves the dict path, builds the
@@ -1038,9 +1063,13 @@ impl<'a> ChainBuilder<'a> {
     /// open file (a duplicate handle; positional reads ignore its offset) and
     /// without the async prefetch thread (`--async-reader` would spawn it only
     /// for it to be dropped).
+    ///
+    /// `read_buffer` ([`Self::source_read_buffer`]): the bytes of read buffer a
+    /// streamed BAM/SAM source is read through; `0` reads it directly.
     fn open_source(
         spec: &ChainSpec,
         native_input: Option<&NativeInput>,
+        read_buffer: usize,
     ) -> Result<(Header, Option<PendingSource>)> {
         use crate::pipeline::steps::source::InputSource;
 
@@ -1058,12 +1087,13 @@ impl<'a> ChainBuilder<'a> {
                     }
                     native.file.try_clone().and_then(|f| InputSource::open_bgzf_file(f, path))
                 } else {
-                    InputSource::open_with_opts(
+                    InputSource::open_with_read_buffer(
                         path,
                         fgumi_bam_io::PipelineReaderOpts {
                             async_reader: spec.async_reader,
                             ..Default::default()
                         },
+                        read_buffer,
                     )
                 };
                 let input = input.map_err(|e| anyhow!("open input: {e}"))?;
@@ -4097,12 +4127,24 @@ impl<'a> ChainBuilder<'a> {
                     phases.memory_budget_threads()
                 );
             }
-            let total_memory = resolve_memory_budget(
+            // The source's read buffer (`sort --read-buffer`, already sized by the
+            // command to a fraction of this budget) comes out of the budget, so
+            // `--max-memory` stays the total.
+            let max_memory = resolve_memory_budget(
                 sort.max_memory,
                 sort.memory_reserve,
                 phases.memory_budget_threads(),
                 sort.memory_per_thread,
             )?;
+            let total_memory = sort_budget_net_of_read_buffer(max_memory, self.read_buffer)?;
+            // The final merge starts after the input has been read to its end,
+            // and from then on the read buffer holds at most the chunk being
+            // served (it frees drained chunks once the stream ends), so the
+            // merge's read-ahead gets the budget back but for one chunk.
+            // Everything sized during phase 1 (the run buffer, consolidation)
+            // keeps the reduced budget: the buffer is live then.
+            let merge_memory = max_memory
+                .saturating_sub(self.read_buffer.min(fgumi_bam_io::read_buffer::MAX_CHUNK_SIZE));
             // One shared cap per phase, and only for an explicit override: at
             // most `phase1` workers inside ANY phase-1 step at once (likewise
             // phase 2), and the phase's off-pool parallel work — the per-run
@@ -4255,6 +4297,7 @@ impl<'a> ChainBuilder<'a> {
                 Arc::clone(&spill_slices),
             )
             .with_read_streams(Arc::clone(&spill_policy))
+            .with_merge_memory(merge_memory as u64)
             .with_sort_stats(sort.sort_stats)
             .with_phase1_threads(phases.phase1);
             let planner = match &consolidation {
@@ -4386,7 +4429,8 @@ impl<'a> ChainBuilder<'a> {
                     let n_ref = u32::try_from(self.header.reference_sequences().len())
                         .map_err(|_| anyhow!("reference sequence count overflows u32"))?;
                     // `total_memory` is the full in-memory budget (--max-memory ×
-                    // the effective sort-phase thread count). ReadBlocks sizes its arena segment to hold one
+                    // the effective sort-phase thread count, less the source's read
+                    // buffer). ReadBlocks sizes its arena segment to hold one
                     // full-budget run, so data that fits the budget sorts entirely
                     // in memory with zero spills — matching legacy.
                     //
@@ -7677,6 +7721,26 @@ fn append_split<X: fgumi_pipeline_io::sort::ArenaKeyExtractor>(
     )
 }
 
+/// The sort's in-memory budget once the source's read buffer
+/// ([`ChainSpec::read_buffer`], as applied by [`ChainBuilder::source_read_buffer`])
+/// is taken out of `max_memory`.
+///
+/// The buffer is sized before the sort's budget is resolved, and it fills to
+/// its full size whatever the sort is left with, so a buffer that takes the
+/// whole budget is rejected: deducting it with a saturating subtraction would
+/// leave the sort no budget while resident memory still exceeded
+/// `--max-memory`. `sort --read-buffer` caps the buffer well below the budget;
+/// this guards other callers that set the field directly.
+fn sort_budget_net_of_read_buffer(max_memory: usize, read_buffer: usize) -> Result<usize> {
+    if read_buffer >= max_memory {
+        bail!(
+            "the read buffer ({read_buffer} bytes) must be smaller than the sort's memory \
+             budget ({max_memory} bytes), out of which it is taken"
+        );
+    }
+    Ok(max_memory - read_buffer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7705,6 +7769,7 @@ mod tests {
             scheduler: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
             async_reader: false,
+            read_buffer: 0,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
             verify_crc: true,
             command_line: String::new(),
@@ -7733,6 +7798,7 @@ mod tests {
             paired_tail: None,
             override_pipeline_threads: None,
             native_input: None,
+            read_buffer: 0,
             read_streams_policy: None,
             input_slice_hist: None,
             input_eligible_clones: None,
@@ -8717,6 +8783,54 @@ mod tests {
         assert_eq!(eligible, Some(want));
     }
 
+    /// The read buffer comes out of the sort's budget only while it leaves some
+    /// of that budget: a buffer as large as the budget (or larger) is rejected
+    /// rather than leaving the sort a zero budget while the buffer still
+    /// allocates its full size.
+    #[rstest::rstest]
+    #[case::no_buffer(64 << 20, 0, Some(64 << 20))]
+    #[case::quarter(64 << 20, 16 << 20, Some(48 << 20))]
+    #[case::one_byte_left(64 << 20, (64 << 20) - 1, Some(1))]
+    #[case::equal_to_budget(64 << 20, 64 << 20, None)]
+    #[case::above_budget(64 << 20, 1 << 40, None)]
+    fn sort_budget_net_of_read_buffer_rejects_a_buffer_that_takes_it_all(
+        #[case] max_memory: usize,
+        #[case] read_buffer: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let got = sort_budget_net_of_read_buffer(max_memory, read_buffer);
+        if let Some(want) = expected {
+            assert_eq!(got.unwrap(), want);
+        } else {
+            let err = got.unwrap_err().to_string();
+            assert!(err.contains("read buffer"), "{err}");
+        }
+    }
+
+    /// Only a streamed BAM/SAM source is read through the read buffer, so only
+    /// then does `add_sort` take it out of the sort's budget: a regular file, a
+    /// buffer of zero and a non-BAM/SAM source all get `0`.
+    #[rstest::rstest]
+    #[case::regular_file(None, 1 << 20, 0)]
+    #[case::stream(Some("/dev/null"), 1 << 20, 1 << 20)]
+    #[case::stream_buffer_off(Some("/dev/null"), 0, 0)]
+    fn source_read_buffer_applies_to_a_streamed_bam_only(
+        #[case] path: Option<&str>,
+        #[case] read_buffer: usize,
+        #[case] expected: usize,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = path.map_or_else(|| header_only_input(tmp.path(), false), Into::into);
+        let mut spec = empty_spec(vec![Stage::Sort]);
+        spec.read_buffer = read_buffer;
+        spec.source = SourceSpec::Bam(input.clone());
+        assert_eq!(ChainBuilder::source_read_buffer(&spec), expected);
+        spec.source = SourceSpec::Sam(input.clone());
+        assert_eq!(ChainBuilder::source_read_buffer(&spec), expected);
+        spec.source = SourceSpec::Fastqs { paths: vec![input], read_structures: Vec::new() };
+        assert_eq!(ChainBuilder::source_read_buffer(&spec), 0, "a FASTQ source is never buffered");
+    }
+
     /// The native input's header comes from the same open file its body is
     /// read from: replacing the path between the native-input decision and
     /// the header parse (an atomic rename by an upstream writer) cannot pair
@@ -8739,7 +8853,7 @@ mod tests {
             .build();
         fgumi_bam_io::create_raw_bam_writer(&other, &header, 1, 1).unwrap().finish().unwrap();
         std::fs::rename(&other, &input).unwrap();
-        let (got, _) = ChainBuilder::open_source(&spec, Some(&native)).unwrap();
+        let (got, _) = ChainBuilder::open_source(&spec, Some(&native), 0).unwrap();
         let names: Vec<_> = got.reference_sequences().keys().cloned().collect();
         assert_eq!(names, vec![bstr::BString::from("chr1")], "the header of the file opened");
     }

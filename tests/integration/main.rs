@@ -81,6 +81,7 @@ mod test_sort_max_temp_files;
 mod test_sort_native_reads;
 mod test_sort_phase_caps;
 mod test_sort_pipeline_trace;
+mod test_sort_read_buffer;
 mod test_sort_stats_diagnostics;
 mod test_sort_thread_logging;
 mod test_sort_wake_liveness;
