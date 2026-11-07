@@ -538,9 +538,10 @@ impl ArenaKeyExtractor for ProbeKeys {
         sort_threads: usize,
         pool: &BoundedSortPool,
     ) -> MemoryChunkErased {
-        let seen = pool.bounded(sort_threads).install(|| SealSeen {
+        let bounded = pool.bounded(sort_threads);
+        let seen = bounded.install(|| SealSeen {
             cap_active: ctx.cap.active(),
-            pool_threads: rayon::current_num_threads(),
+            pool_threads: bounded.current_num_threads(),
         });
         ctx.entered.lock().send(seen).unwrap();
         Self::empty_chunk()

@@ -83,13 +83,14 @@ fn thread_flag_warnings(stderr: &str) -> Vec<&str> {
 /// Standalone sort: with an explicit `--sort-threads`, every phase-1 step —
 /// the pool steps and the per-run sort (`SortCoordinateRun`) — shares
 /// `sort-phase1(min(sort,threads))`; with an explicit `--merge-threads`, every
-/// phase-2 step — the pool steps and the fast-path gather (`SortMerge`) —
-/// shares `sort-phase2(min(merge,threads))`. An unset flag caps nothing in its
-/// phase. Capping an unset phase, or not handing the cap to the per-run sort or
-/// the gather, fails a case here. Whether those two then actually take the
-/// whole cap is pinned by the `fgumi-pipeline-io` unit tests
+/// phase-2 step — the pool steps, including the fast-path gather (`MergeWork`)
+/// — shares `sort-phase2(min(merge,threads))`; the merge itself (`SortMerge`)
+/// takes no cap. An unset flag caps nothing in its phase. Capping an unset
+/// phase, or not handing the cap to the per-run sort or the gather, fails a
+/// case here. How those two then admit under it is pinned by the
+/// `fgumi-pipeline-io` unit tests
 /// (`capped_parallel_seal_holds_the_whole_cap_while_it_sorts`,
-/// `capped_parallel_fast_path_gather_holds_the_whole_phase2_cap`).
+/// `capped_pooled_fast_path_gather_runs_under_the_phase2_cap`).
 #[rstest]
 #[case::defaults(16, None, None, None, None)]
 #[case::sort_below(16, Some(4), None, Some("sort-phase1(4)"), None)]
@@ -123,9 +124,10 @@ fn standalone_sort_caps_every_step_of_an_explicit_phase(
     {
         assert_eq!(cap_of(&dag, step).as_deref(), phase1, "{step}:\n{dag}");
     }
-    for step in ["SortMerge", "BgzfCompress"] {
+    for step in ["MergeWork", "BgzfCompress"] {
         assert_eq!(cap_of(&dag, step).as_deref(), phase2, "{step}:\n{dag}");
     }
+    assert_eq!(cap_of(&dag, "SortMerge"), None, "the merge takes no cap:\n{dag}");
     // The planner-fed supply steps also read and decompress consolidation
     // inputs during phase 1 (the consolidation tail exists on every CLI sort),
     // so they admit through a phased cap: phase 1's until every run is
@@ -144,7 +146,7 @@ fn standalone_sort_caps_every_step_of_an_explicit_phase(
 /// The cap belongs to the phase, not the step: in a built standalone sort every
 /// phase-1 step — including the per-run sort, `SortCoordinateRun` — holds
 /// the SAME counter, as does every phase-2 step including the fast-path gather
-/// in `SortMerge`, and the phases' counters are distinct. Identity is checked
+/// (`MergeWork`), and the phases' counters are distinct. Identity is checked
 /// by address and by behaviour — exhausting the counter through one step's cap
 /// makes the other step's cap refuse.
 #[test]
@@ -186,7 +188,7 @@ fn standalone_sort_steps_of_one_phase_share_one_counter() {
         "key extraction must hold the phase-1 pool steps' counter"
     );
     assert!(
-        std::ptr::eq(cap("SortMerge"), decompress),
+        std::ptr::eq(cap("MergeWork"), decompress),
         "the fast-path gather must hold the phase-2 pool steps' counter"
     );
     assert!(!std::ptr::eq(inflate, decompress), "the phases have separate counters");

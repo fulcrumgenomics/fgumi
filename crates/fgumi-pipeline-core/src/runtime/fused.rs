@@ -294,7 +294,7 @@ pub fn run_fused_single_thread(
                 outputs: outputs_any,
                 signal,
                 counters: &contexts.step_counters[i],
-                pool: PoolHandle::new(&wake, stats.map(|s| &**s), StepIdx(i)),
+                pool: PoolHandle::new(&wake, stats, StepIdx(i)),
             };
 
             // Time the dispatch only when stats collection is on, on the stats'

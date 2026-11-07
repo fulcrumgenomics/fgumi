@@ -29,8 +29,8 @@ use super::outputs::StepOutputs;
 use super::reorder::BranchOrdering;
 use super::signal::PipelineSignal;
 use super::step::{
-    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, PoolPlacement, Step,
-    StepCtx, StepKind, StepOutcome, StepProfile,
+    Affinity, CounterSpec, DetachedGroup, OutputHandles, OutputsViewAny, PoolPlacement,
+    SideChannel, Step, StepCtx, StepKind, StepOutcome, StepProfile,
 };
 use crate::admission::{PhaseCap, StepCapRef};
 use crate::runtime::contexts::StepCounters;
@@ -144,6 +144,13 @@ pub trait ErasedStep: Send + 'static {
     /// are not meant to be overridden.
     fn step_cap(&self) -> Option<StepCapRef<'_>> {
         None
+    }
+
+    /// Forward `Step::side_channels` (and the `Step2`/`StepK` equivalents):
+    /// off-edge holders of in-flight work the deadlock monitor must count.
+    /// Defaults to none; every typed adapter forwards its inner step's.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// The cap admitting now ([`StepCapRef::active`]).
@@ -572,6 +579,10 @@ where
         self.inner.counters()
     }
 
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        self.inner.side_channels()
+    }
+
     fn step_cap(&self) -> Option<StepCapRef<'_>> {
         self.inner.step_cap()
     }
@@ -849,6 +860,10 @@ impl<S: Step2> ErasedStep for TypedStep2<S> {
 
     fn counters(&self) -> &'static [CounterSpec] {
         self.inner.counters()
+    }
+
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        self.inner.side_channels()
     }
 
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
@@ -1148,6 +1163,10 @@ impl<S: StepK> ErasedStep for TypedStepK<S> {
 
     fn counters(&self) -> &'static [CounterSpec] {
         self.inner.counters()
+    }
+
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        self.inner.side_channels()
     }
 
     fn try_run_erased(&mut self, ctx: &mut ErasedStepCtx<'_>) -> io::Result<StepOutcome> {
@@ -1519,6 +1538,78 @@ mod tests {
         assert_eq!(PoolPlacement::default(), PoolPlacement::AllWorkers);
         let default: Box<dyn ErasedStep> = Box::new(TypedStep::new(AddOne));
         assert_eq!(default.pool_placement(), PoolPlacement::AllWorkers, "trait default");
+    }
+
+    /// A fake side channel for the forwarding test.
+    struct FakeChannel;
+    impl SideChannel for FakeChannel {
+        fn in_flight_bytes(&self) -> u64 {
+            64
+        }
+        fn describe(&self) -> String {
+            "fake".to_owned()
+        }
+    }
+
+    /// Two-input step reporting one side channel.
+    #[derive(Clone)]
+    struct ChannelTwo(Arc<dyn SideChannel>);
+    impl Step2 for ChannelTwo {
+        type InputA = u32;
+        type InputB = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            opted_profile("ChannelTwo")
+        }
+        fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+            vec![Arc::clone(&self.0)]
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx2<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// K-input step reporting one side channel.
+    #[derive(Clone)]
+    struct ChannelK(Arc<dyn SideChannel>);
+    impl StepK for ChannelK {
+        type Input = u32;
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            opted_profile("ChannelK")
+        }
+        fn input_count(&self) -> usize {
+            2
+        }
+        fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+            vec![Arc::clone(&self.0)]
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtxK<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+        fn new_worker_copy(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// The two-input and K-input adapters forward `side_channels` verbatim
+    /// (the very `Arc` the step reports), so the deadlock monitor sees a
+    /// multi-input step's off-edge bytes.
+    #[rstest]
+    #[case::step2(2)]
+    #[case::step_k(3)]
+    fn side_channels_forward_through_multi_input_adapters(#[case] arity: usize) {
+        let channel: Arc<dyn SideChannel> = Arc::new(FakeChannel);
+        let step: Box<dyn ErasedStep> = match arity {
+            2 => Box::new(TypedStep2::new(ChannelTwo(Arc::clone(&channel)))),
+            _ => Box::new(TypedStepK::new(ChannelK(Arc::clone(&channel)))),
+        };
+        let channels = step.side_channels();
+        assert_eq!(channels.len(), 1);
+        assert!(Arc::ptr_eq(&channels[0], &channel), "the step's own channel");
     }
 
     #[test]

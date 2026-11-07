@@ -53,7 +53,7 @@ impl<S: Step> StepProbe<S> {
             input,
             outputs: OutputHandles::new(view),
             output_queues,
-            counters: StepCounters::disabled(),
+            counters: StepCounters::new(step.counters().len()),
             wake: WakePlan::standalone(),
         }
     }
@@ -70,6 +70,12 @@ impl<S: Step> StepProbe<S> {
     /// Mark the input drained (upstream finished).
     pub fn close_input(&self) {
         self.input_queue.mark_drained();
+    }
+
+    /// The current value of the step's counter slot `idx` (see [`Step::counters`]).
+    #[must_use]
+    pub fn counter(&self, idx: usize) -> u64 {
+        self.counters.load(idx)
     }
 
     /// Whether the step's input queue is empty (no item left to pop).
