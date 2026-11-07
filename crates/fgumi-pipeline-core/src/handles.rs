@@ -301,7 +301,7 @@ enum BranchInputInner<T: Send + HeapSize + 'static> {
 impl<T: Send + HeapSize + 'static> BranchInputHandle<T> {
     /// An uninstrumented input handle reading `queue` directly (no reorder
     /// stage). Used by [`crate::testing::StepProbe`] to feed one step by hand.
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(any(test, loom, feature = "test-utils"))]
     pub(crate) fn direct(queue: Arc<dyn ItemQueue<T>>) -> Self {
         Self { inner: BranchInputInner::Direct(queue), metrics: None, record_item_bytes: false }
     }

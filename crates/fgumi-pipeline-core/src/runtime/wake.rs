@@ -884,6 +884,15 @@ impl WakePlan {
         let _ = self.on_progress(step, &PushSnapshot::default());
     }
 
+    /// The [`StepWaker`] of `step`, as `PoolHandle::waker` hands it to the step,
+    /// for the loom models in `tests/loom_wake.rs`.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn step_waker_for_test(&self, step: StepIdx) -> StepWaker {
+        PoolHandle::new(self, None, step).waker()
+    }
+
     /// A dispatch of `step` flushed a held item (`BranchOutputHandle::retry`
     /// returned `Ok`) and reported `NoProgress`, `Contention` or `Capped`.
     /// Deliver the forward wakes that push implies, exactly as `on_progress`

@@ -15,14 +15,24 @@
 //! [`OrderedInbox::deliver`] inserts under that mutex and THEN reads
 //! `waiting`. The mutex orders the two critical sections, so either the
 //! owner's re-check sees the item or the deliverer sees `waiting` and wakes
-//! the owner (after releasing the lock).
+//! the owner (after releasing the lock). The loom model `inbox_await_model`
+//! in `tests/loom_wake.rs` drives this pair, so splitting `await_next`'s
+//! check and record into two critical sections fails it.
 
-use std::collections::{BTreeMap, HashMap};
+use ahash::AHashMap;
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+// The inbox's lock and gauge come from `loom` under `--cfg loom`, so
+// `tests/loom_wake.rs` checks the REAL `await_next`/`deliver` pair (the same
+// arrangement as `admission.rs` and `fgumi-sort`'s `merge_demand.rs`).
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(loom))]
 use parking_lot::Mutex;
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::admission::{PhaseCap, StepCap, StepCapRef, admit_input};
 use crate::item::HeapSize;
@@ -30,13 +40,29 @@ use crate::runtime::contexts::StepCounters;
 use crate::runtime::wake::{SideWake, StepWaker};
 use crate::step::{CounterSpec, SideChannel, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
+/// `loom`'s mutex behind `parking_lot`'s `lock()` signature, so the inbox
+/// code is the same under `--cfg loom`.
+#[cfg(loom)]
+struct Mutex<T>(loom::sync::Mutex<T>);
+
+#[cfg(loom)]
+impl<T> Mutex<T> {
+    fn new(value: T) -> Self {
+        Self(loom::sync::Mutex::new(value))
+    }
+
+    fn lock(&self) -> loom::sync::MutexGuard<'_, T> {
+        self.0.lock().expect("inbox lock poisoned")
+    }
+}
+
 struct State<R> {
     /// Delivered results, by ordinal.
     pending: BTreeMap<u64, R>,
     /// Bytes reserved for ordinals not yet delivered.
-    reserved: HashMap<u64, u64>,
+    reserved: AHashMap<u64, u64>,
     /// Bytes held by each delivered result.
-    held: HashMap<u64, u64>,
+    held: AHashMap<u64, u64>,
     /// The next ordinal the owner takes in ordered mode.
     next: u64,
     /// The owner declared (via `await_next`) that it is parked.
@@ -74,8 +100,8 @@ impl<R: HeapSize + Send + 'static> OrderedInbox<R> {
             ordered,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
-                reserved: HashMap::new(),
-                held: HashMap::new(),
+                reserved: AHashMap::new(),
+                held: AHashMap::new(),
                 next: 0,
                 waiting: false,
             }),
@@ -194,6 +220,21 @@ impl<R: HeapSize + Send + 'static> OrderedInbox<R> {
         let ready =
             if self.ordered { s.pending.contains_key(&s.next) } else { !s.pending.is_empty() };
         s.waiting = !ready;
+        ready
+    }
+
+    /// [`Self::await_next`] with its check and its record in two critical
+    /// sections, the check first: the negative control of the loom inbox
+    /// model, which must lose a wake (a delivery between the two sees no
+    /// waiter, and the record then parks the owner for good).
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn await_next_check_before_record(&self) -> bool {
+        let ready = {
+            let s = self.state.lock();
+            if self.ordered { s.pending.contains_key(&s.next) } else { !s.pending.is_empty() }
+        };
+        self.state.lock().waiting = !ready;
         ready
     }
 

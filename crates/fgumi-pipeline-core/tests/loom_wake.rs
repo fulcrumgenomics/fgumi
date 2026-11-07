@@ -16,7 +16,14 @@
 //!   `arm_cap_parked`) and its deliveries (`on_progress`, `deliver_holder` for
 //!   a holder take, `deliver_slot` for a cap release, bound as the cap's waker
 //!   exactly as `Pipeline::run` binds it), raced against the real `PhaseCap`
-//!   release, record, skip and forward.
+//!   release, record, skip and forward;
+//! - side wakes: the real `StepWaker::wake` (its `delivery_fence`, then the
+//!   plan's `deliver` to the step's recorded host) against a driver, pinned
+//!   worker or pool host that arms and re-polls (`side_wake_gated_model`);
+//! - the fan-in inbox: the real `OrderedInbox::await_next` (record and
+//!   re-check under the inbox lock) against `OrderedInbox::deliver` (insert
+//!   under the lock, read `waiting`, wake the bound `StepWaker`), with the
+//!   inbox's lock and gauge loom's under `--cfg loom` (`inbox_await_model`).
 //!
 //! What is not driven is the queues: their `crossbeam_queue` storage is not
 //! loom-instrumented, so the room predicate each producer passes and the work
@@ -53,6 +60,15 @@
 //!                release:  free -> fence(SeqCst) -> claim -> deliver_slot
 //!                          (parking bit set ? unpark : skip); an owed wake is
 //!                          forwarded (fence -> claim -> deliver_slot)
+//! Side wake.     owner:    register -> poll (load slot) -> arm (bit -> fence)
+//!                          -> re-poll -> park
+//!                publisher: slot.store(true) -> StepWaker::wake (fence(SeqCst)
+//!                          -> host's parking bit set ? unpark : skip; a pool
+//!                          host: notify_one -> direct-parked claim -> unpark)
+//! Inbox.         owner:    try_take_next -> await_next (lock: waiting = !ready)
+//!                          -> ready ? take : park
+//!                producer: deliver (lock: insert; wake = waiting && awaited;
+//!                          clear waiting) -> unlock -> wake ? StepWaker::wake
 //! ```
 //!
 //! `unpark`/`park` are modelled by the park token in the single-wake holder
@@ -75,16 +91,21 @@
 //! there the registration is not ordered before the arm at all. The parking
 //! gate also has in-suite controls, each a deadlock: an unfenced arm (worker
 //! and holder), a holder take with no fence between its claim and the bit read,
-//! a cap-refused worker that parks unarmed, and a skipped cap wake that is not
-//! forwarded.
+//! a cap-refused worker that parks unarmed, a skipped cap wake that is not
+//! forwarded, a driver hosting a side-woken step that arms with no fence, and
+//! an inbox owner whose check precedes its `waiting` record in a separate
+//! critical section (`OrderedInbox::await_next_check_before_record`). Deleting
+//! the `delivery_fence` in `StepWaker::wake` fails the driver and pinned-worker
+//! side-wake models (a pool host is covered by `notify_one`'s own fence), and
+//! splitting `await_next`'s check and record fails the inbox model.
 //!
 //! Run: `RUSTFLAGS="--cfg loom" cargo test -p fgumi-pipeline-core --test loom_wake --release`
 #![cfg(loom)]
 
 use fgumi_pipeline_core::runtime::PoolEventCount;
 use fgumi_pipeline_core::{
-    BranchIdx, ChainGraph, DriverIdx, HolderSet, PhaseCap, StepIdx, StepKind, WakeEdges, WakePlan,
-    current_thread, delivery_fence,
+    BranchIdx, ChainGraph, DriverIdx, HolderSet, OrderedInbox, PhaseCap, StepIdx, StepKind,
+    WakeEdges, WakePlan, current_thread, delivery_fence,
 };
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
@@ -947,4 +968,224 @@ fn a_cap_wake_skipped_for_a_running_worker_is_forwarded() {
 #[should_panic(expected = "deadlock")]
 fn a_skipped_cap_wake_without_the_forward_is_lost() {
     forwarded_cap_wake_gated_model(false);
+}
+
+/// Where the owner of a side wake runs: a driver, a pinned worker, or the pool.
+#[derive(Clone, Copy)]
+enum SideHost {
+    Driver,
+    Worker,
+    Pool,
+}
+
+/// The plan for a [`SideHost`]; its step 1 is the owner. Driver: `C` on driver
+/// 0 (`two_step_plan(true)`); Worker: `Ser` pinned to worker 1
+/// (`plain_two_step_plan`); Pool: `C` on the two-worker pool, which worker 1
+/// serves (`two_step_plan(false)`).
+fn side_wake_plan(host: SideHost) -> std::sync::Arc<WakePlan> {
+    match host {
+        SideHost::Driver => two_step_plan(true),
+        SideHost::Worker => plain_two_step_plan(),
+        SideHost::Pool => two_step_plan(false),
+    }
+}
+
+/// The owner step of the side-wake models.
+const OWNER: StepIdx = StepIdx(1);
+
+/// The thread hosting the owner registers itself (`register_driver` /
+/// `register_worker`), as `Pipeline::run`'s thread bodies do.
+fn register_host(plan: &WakePlan, host: SideHost) {
+    match host {
+        SideHost::Driver => plan.register_driver(DriverIdx(0), current_thread()),
+        SideHost::Worker | SideHost::Pool => plan.register_worker(1, current_thread()),
+    }
+}
+
+/// The host arms for its timer park the way its loop does: `arm_driver` for a
+/// driver, `arm_direct` for a worker (pinned or pool). `fenced = false` sets
+/// the parking bit with no fence (`mark_parking_unfenced`; driver 0's slot
+/// follows the plan's two workers).
+fn arm_host(plan: &WakePlan, host: SideHost, fenced: bool) {
+    match (host, fenced) {
+        (SideHost::Driver, true) => assert!(plan.arm_driver(DriverIdx(0)), "a gated plan arms"),
+        (SideHost::Driver, false) => plan.mark_parking_unfenced(2),
+        (SideHost::Worker | SideHost::Pool, true) => {
+            assert!(plan.arm_direct(1), "a gated plan arms");
+        }
+        (SideHost::Worker | SideHost::Pool, false) => plan.mark_parking_unfenced(1),
+    }
+}
+
+fn disarm_host(plan: &WakePlan, host: SideHost) {
+    match host {
+        SideHost::Driver => plan.disarm_driver(DriverIdx(0)),
+        SideHost::Worker | SideHost::Pool => plan.disarm_direct(1),
+    }
+}
+
+/// The side wake (`StepWaker::wake`) through the parking gate. The publisher
+/// writes off any edge (a side-channel slot: a loom flag here) and calls the
+/// owner's real `StepWaker::wake` — `delivery_fence`, then the plan's
+/// `deliver` to the step's recorded host: for a driver or a pinned worker, the
+/// parking bit and an unpark if set; for a pool host, `notify_one` (its fence,
+/// no event-count waiter here) then the direct-parked claim and unpark. The
+/// owner's thread registers, polls (finds nothing), arms for its timer park,
+/// re-polls, and parks (a loom park, no timer) if the re-poll found nothing.
+/// Either the re-poll sees the write or the wake unparks the host; a lost wake
+/// is a loom deadlock. `fenced = false` arms with no fence (driver host only):
+/// the negative control. (`std::sync::Arc`: see `registration_model`.)
+fn side_wake_gated_model(host: SideHost, fenced: bool) {
+    loom::model(move || {
+        let plan = side_wake_plan(host);
+        let waker = plan.step_waker_for_test(OWNER);
+        let slot = std::sync::Arc::new(AtomicBool::new(false));
+        let owner = {
+            let (plan, slot) = (std::sync::Arc::clone(&plan), std::sync::Arc::clone(&slot));
+            thread::spawn(move || {
+                register_host(&plan, host);
+                if !slot.load(Ordering::Relaxed) {
+                    arm_host(&plan, host, fenced);
+                    if !slot.load(Ordering::Relaxed) {
+                        thread::park(); // the re-poll found nothing
+                    }
+                    disarm_host(&plan, host);
+                }
+            })
+        };
+        let publisher = {
+            let slot = std::sync::Arc::clone(&slot);
+            thread::spawn(move || {
+                slot.store(true, Ordering::Relaxed); // the side-channel write
+                let _ = waker.wake();
+            })
+        };
+        publisher.join().unwrap();
+        owner.join().unwrap();
+    });
+}
+
+#[test]
+fn a_side_wake_reaches_an_armed_driver_or_its_re_poll_sees_the_write() {
+    side_wake_gated_model(SideHost::Driver, true);
+}
+
+#[test]
+fn a_side_wake_reaches_an_armed_pinned_worker_or_its_re_poll_sees_the_write() {
+    side_wake_gated_model(SideHost::Worker, true);
+}
+
+#[test]
+fn a_side_wake_reaches_an_armed_pool_worker_or_its_re_poll_sees_the_write() {
+    side_wake_gated_model(SideHost::Pool, true);
+}
+
+/// Negative control: a driver that sets its parking bit with no fence lets the
+/// side wake read the bit clear (and skip the unpark) while the re-poll misses
+/// the write.
+#[test]
+#[should_panic(expected = "deadlock")]
+fn an_unfenced_driver_arm_loses_the_side_wake() {
+    side_wake_gated_model(SideHost::Driver, false);
+}
+
+/// An inbox result: no heap bytes.
+struct Res;
+
+impl fgumi_pipeline_core::HeapSize for Res {}
+
+/// The plan of a one-thread chain: one Serial step on worker 0, no pool. A
+/// one-thread plan neither arms nor gates (`WakePlan::unpark_if_parking`), so
+/// the owner's `StepWaker` unparks the registered thread on every wake: the
+/// inbox's own protocol is all that stands between a delivery and a lost wake.
+fn one_thread_plan() -> std::sync::Arc<WakePlan> {
+    let mut g = ChainGraph::new();
+    let _ = g.register_step("Own", 0);
+    WakePlan::build(&g, &[StepKind::Serial], &[Some(0)], &[None], &[], WakeEdges::NONE, None, 1)
+}
+
+/// The inbox wait (`OrderedInbox::await_next`, store-then-recheck under the
+/// inbox lock) against two deliveries (`OrderedInbox::deliver`: insert under
+/// the lock, then read `waiting`, and wake the owner through its bound
+/// `StepWaker` only for the awaited ordinal). Two producers deliver ordinals 1
+/// and 0 concurrently; the ordered owner takes 0 then 1, as the owner step's
+/// pass does: `try_take_next`, else `await_next`, else park. The owner runs on
+/// a one-thread plan, whose wake unparks it unconditionally, and parks straight
+/// after `await_next` — the inbox protocol alone, the shape of `fgumi-sort`'s
+/// `loom_merge_wake_never_lost`. A lost wake leaves the owner parked: a loom
+/// deadlock. `split = true` is the negative control: the check runs before
+/// the record, in its own critical section, so a delivery between them sees
+/// no waiter.
+///
+/// The parking gate on top (the wake reaching a host only if it is armed, the
+/// host's arm and re-poll) is `side_wake_gated_model`: `deliver` calls the
+/// same `StepWaker::wake` after its insert, which is that model's publish. The
+/// two are not composed in one model because loom's `Thread::unpark` makes a
+/// thread blocked on a loom mutex runnable and its acquire then panics
+/// ("expected to be able to acquire lock"): a gated owner's re-poll locks the
+/// inbox while it is armed, so a delivery's wake can land there. (A `try_lock`
+/// spin in its place exceeds loom's branch limit.)
+///
+/// Preemption-bounded (3), as the cap models are: three threads and two
+/// lock-protected deliveries; the lost-wake interleaving needs one preemption.
+fn inbox_await_model(split: bool) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(move || {
+        let plan = one_thread_plan();
+        let inbox = OrderedInbox::<Res>::new(true);
+        inbox.bind_owner(plan.step_waker_for_test(StepIdx(0)));
+        let owner = {
+            let (plan, inbox) = (std::sync::Arc::clone(&plan), std::sync::Arc::clone(&inbox));
+            thread::spawn(move || {
+                plan.register_worker(0, current_thread());
+                for want in 0..2 {
+                    loop {
+                        if let Some((ordinal, _)) = inbox.try_take_next() {
+                            assert_eq!(ordinal, want, "taken in ordinal order");
+                            break;
+                        }
+                        let ready = if split {
+                            inbox.await_next_check_before_record()
+                        } else {
+                            inbox.await_next()
+                        };
+                        if !ready {
+                            thread::park();
+                        }
+                    }
+                }
+            })
+        };
+        let producers: Vec<_> = [1, 0]
+            .into_iter()
+            .map(|ordinal| {
+                let inbox = std::sync::Arc::clone(&inbox);
+                thread::spawn(move || {
+                    let _ = inbox.deliver(ordinal, Res);
+                })
+            })
+            .collect();
+        for p in producers {
+            p.join().unwrap();
+        }
+        owner.join().unwrap();
+        assert_eq!(inbox.pending(), 0, "both results taken");
+    });
+}
+
+#[test]
+fn an_awaited_inbox_delivery_wakes_the_owner_or_its_recheck_sees_it() {
+    inbox_await_model(false);
+}
+
+/// Negative control: an owner that checks for the next result before it
+/// records that it is waiting, in a separate critical section, loses the
+/// wake: the delivery of ordinal 0 lands between the two, sees no waiter and
+/// wakes nobody; the owner then records and parks, and the delivery of 1 is
+/// not the one it awaits.
+#[test]
+#[should_panic(expected = "deadlock")]
+fn an_inbox_check_before_the_record_loses_the_wake() {
+    inbox_await_model(true);
 }

@@ -34,7 +34,9 @@ pub mod reorder;
 pub mod runtime;
 pub mod signal;
 pub mod step;
-#[cfg(any(test, feature = "test-utils"))]
+// Also under `--cfg loom`: `tests/loom_admission.rs` drives the real
+// `FanoutWorker` through a `StepProbe`.
+#[cfg(any(test, loom, feature = "test-utils"))]
 pub mod testing;
 pub mod topology;
 

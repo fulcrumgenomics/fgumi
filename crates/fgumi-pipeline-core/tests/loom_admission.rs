@@ -43,30 +43,45 @@
 //! lost wake when a worker clears and then polls the cap); it is not a
 //! revert-check of its own, since it passes with or without the clear.
 //!
+//! And the real `FanoutWorker` (through a `StepProbe`): two clones slicing
+//! jobs under a one-permit cap, one permit per slice, with the cap's release
+//! wake (`fanout_cap_slices_model`).
+//!
 //! Exploration is preemption-bounded (3), as in `fgumi-sort`'s `loom_merge_slots`.
 //!
 //! Run: `RUSTFLAGS="--cfg loom" cargo test -p fgumi-pipeline-core --test loom_admission --release`
 #![cfg(loom)]
 
-use fgumi_pipeline_core::PhaseCap;
 use fgumi_pipeline_core::signal::PipelineSignal;
+use fgumi_pipeline_core::testing::StepProbe;
+use fgumi_pipeline_core::{
+    FanoutWorker, HeapSize, Job, JobStep, OrderedInbox, PhaseCap, SliceBudget, Step, StepCap,
+    StepOutcome,
+};
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::thread;
 
 const MAX: usize = 2;
 
-/// Permits seen held at once, to check the cap is never exceeded.
-struct Inside(AtomicUsize);
+/// Permits seen held at once, to check a cap of `max` is never exceeded.
+struct Inside {
+    held: AtomicUsize,
+    max: usize,
+}
 
 impl Inside {
+    fn new(max: usize) -> Self {
+        Self { held: AtomicUsize::new(0), max }
+    }
+
     fn enter(&self, n: usize) {
-        let now = self.0.fetch_add(n, Ordering::SeqCst) + n;
-        assert!(now <= MAX, "{now} permits held in a cap of {MAX}");
+        let now = self.held.fetch_add(n, Ordering::SeqCst) + n;
+        assert!(now <= self.max, "{now} permits held in a cap of {}", self.max);
     }
 
     fn leave(&self, n: usize) {
-        self.0.fetch_sub(n, Ordering::SeqCst);
+        self.held.fetch_sub(n, Ordering::SeqCst);
     }
 }
 
@@ -84,7 +99,7 @@ fn model(cancel: bool) {
         let cap = PhaseCap::new("loom", MAX);
         let signal = PipelineSignal::new();
         cap.bind_signal_for_test(&signal);
-        let inside = Arc::new(Inside(AtomicUsize::new(0)));
+        let inside = Arc::new(Inside::new(MAX));
         let admitters: Vec<_> = (0..2)
             .map(|_| {
                 let cap = std::sync::Arc::clone(&cap);
@@ -460,6 +475,148 @@ fn a_skip_whose_fresh_record_a_release_claims_forwards_the_wake() {
         drop(held);
         zero.join().unwrap();
         one.join().unwrap();
+        assert_eq!(cap.active(), 0, "every permit released");
+    });
+}
+
+/// A job of `slices` slices; each slice runs inside the `Inside` guard and
+/// counts itself in `ran`.
+struct SliceJob {
+    ordinal: u64,
+    left: usize,
+    inside: Arc<Inside>,
+    ran: Arc<AtomicUsize>,
+}
+
+impl HeapSize for SliceJob {
+    fn heap_size(&self) -> usize {
+        64
+    }
+}
+
+/// A job's result.
+struct SliceOut;
+
+impl HeapSize for SliceOut {}
+
+impl Job for SliceJob {
+    type Output = SliceOut;
+
+    fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    fn run_slice(&mut self, _budget: SliceBudget) -> std::io::Result<JobStep<SliceOut>> {
+        self.inside.enter(1);
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        self.inside.leave(1);
+        self.left -= 1;
+        Ok(if self.left == 0 { JobStep::Done(SliceOut) } else { JobStep::Continue })
+    }
+}
+
+/// A waker for threads with no wake slot (`current_slot` is `None` on a loom
+/// thread, so a refusal records the cap's anonymous bit): a `None` wake
+/// unparks every registered thread, as `WakePlan::deliver_anonymous` does.
+fn broadcast_waker() -> (Handles, fgumi_pipeline_core::CapWaker) {
+    let handles: Handles = Arc::new(loom::sync::Mutex::new([None, None]));
+    let h = Arc::clone(&handles);
+    let waker: fgumi_pipeline_core::CapWaker = std::sync::Arc::new(move |slot: Option<usize>| {
+        let threads = h.lock().unwrap();
+        match slot {
+            Some(s) => threads.get(s).cloned().flatten().into_iter().for_each(|t| t.unpark()),
+            None => threads.iter().flatten().for_each(thread::Thread::unpark),
+        }
+    });
+    (handles, waker)
+}
+
+/// Slices per job.
+const SLICES_PER_JOB: usize = 3;
+
+/// Jobs on the edge: one seated on each clone before the race, one left on
+/// the edge.
+const JOBS: u64 = 3;
+
+/// Two clones of the REAL `FanoutWorker` sharing one input edge (a
+/// `StepProbe`) under a one-permit cap with its release wake bound. The edge
+/// holds three jobs of three slices each and is drained. Before the race each
+/// clone runs one dispatch on the model's main thread, which pops a job and
+/// runs its first slice, so each enters the race with a job in progress; the
+/// third job stays on the edge. Then each clone loops on `try_run` the way the
+/// worker loop dispatches it: `Progress` runs again, `Capped` parks (a loom
+/// park, no timer) until a release wakes it, `Finished` returns. A clone with
+/// a job in progress takes a permit directly (`try_acquire`); one without
+/// admits through `admit_input` and pops; either releases its permit when the
+/// slice returns. Checks: never two permits held (the `Inside` guard in every
+/// slice), every slice runs, every result is delivered to the inbox, the cap
+/// ends empty. A release wake lost to a refused clone is a loom deadlock.
+///
+/// The jobs are seated before the race because the edge is a
+/// `crossbeam_queue` (`UnboundedQueue`), which loom does not instrument: its
+/// partial-order reduction treats two pops as independent, so it would never
+/// schedule the second clone's pop while the first holds a job. What it does
+/// explore is every interleaving of the cap's (loom) protocol: per-slice
+/// `try_acquire` with its refusal record, fence and re-check, the release's
+/// fence and claim, and the wake.
+#[test]
+fn fanout_cap_slices_model() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let cap = PhaseCap::new("fanout", 1);
+        let (handles, waker) = broadcast_waker();
+        cap.bind_waker_for_test(waker);
+        let inside = Arc::new(Inside::new(1));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let inbox = OrderedInbox::<SliceOut>::new(true);
+        let budget = SliceBudget { bytes: 1, records: 1 };
+        let worker = FanoutWorker::<SliceJob>::new("fanout", std::sync::Arc::clone(&inbox), budget)
+            .with_step_cap(StepCap::from(std::sync::Arc::clone(&cap)));
+        let probe = std::sync::Arc::new(StepProbe::new(&worker));
+        for ordinal in 0..JOBS {
+            probe.push_input(SliceJob {
+                ordinal,
+                left: SLICES_PER_JOB,
+                inside: Arc::clone(&inside),
+                ran: Arc::clone(&ran),
+            });
+        }
+        probe.close_input();
+        // Seat both clones before either thread starts.
+        let seated: Vec<_> = (0..2)
+            .map(|_| {
+                let mut clone = worker.new_worker_copy();
+                let first = probe.try_run(&mut clone).expect("a slice never fails here");
+                assert_eq!(first, StepOutcome::Progress, "the clone pops a job");
+                clone
+            })
+            .collect();
+        let clones: Vec<_> = seated
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut clone)| {
+                let probe = std::sync::Arc::clone(&probe);
+                let handles = Arc::clone(&handles);
+                thread::spawn(move || {
+                    handles.lock().unwrap()[i] = Some(thread::current());
+                    loop {
+                        match probe.try_run(&mut clone).expect("a slice never fails here") {
+                            StepOutcome::Progress => {}
+                            StepOutcome::Capped => thread::park(),
+                            StepOutcome::Finished => return,
+                            other => panic!("unexpected outcome on a drained edge: {other:?}"),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for c in clones {
+            c.join().unwrap();
+        }
+        let jobs = usize::try_from(JOBS).expect("small");
+        assert_eq!(ran.load(Ordering::SeqCst), jobs * SLICES_PER_JOB, "every slice runs");
+        assert_eq!(inbox.pending(), jobs, "every result delivered");
         assert_eq!(cap.active(), 0, "every permit released");
     });
 }
