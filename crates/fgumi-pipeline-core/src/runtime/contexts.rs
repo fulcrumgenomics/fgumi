@@ -183,6 +183,11 @@ pub struct RegisteredQueue {
     /// is sized from the same per-edge budget as `handle`. `None` for a direct
     /// (unordered) byte-bounded branch (no reorder stage).
     pub reorder_cap: Option<std::sync::Arc<dyn crate::reorder::ReorderCapHandle>>,
+    /// Whether the run's `queue_memory_total` budget sizes this queue: `false`
+    /// for a [`crate::queues::QueueSpec::FixedByteBounded`] branch, which
+    /// keeps its declared limit and is left out of the budget split and the
+    /// rebalancer (it stays visible to the deadlock monitor and the wake plan).
+    pub budgeted: bool,
 }
 
 /// One holder-only edge's location in the chain and its tracking handle (see
@@ -409,12 +414,17 @@ fn build_chain_contexts_inner(
     for (step_idx_usize, set) in output_sets.iter().enumerate() {
         for (branch_idx_usize, entry) in set.branches.iter().enumerate() {
             if let Some(handles) = entry.bounded_queue_handle.as_ref() {
+                let profile = steps[step_idx_usize].profile();
                 bounded_queues.push(RegisteredQueue {
-                    producer_step_name: steps[step_idx_usize].profile().name,
+                    producer_step_name: profile.name,
                     producer_step: StepIdx(step_idx_usize),
                     branch: BranchIdx(branch_idx_usize),
                     handle: std::sync::Arc::clone(&handles.transport),
                     reorder_cap: handles.reorder_cap.clone(),
+                    budgeted: profile
+                        .output_queues
+                        .get(branch_idx_usize)
+                        .is_none_or(|spec| spec.is_budgeted()),
                 });
             }
             if let Some(handle) = entry.holder_only_handle.as_ref() {

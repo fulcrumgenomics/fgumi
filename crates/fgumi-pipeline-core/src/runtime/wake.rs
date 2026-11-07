@@ -1460,6 +1460,7 @@ mod tests {
             branch: BranchIdx(branch),
             handle,
             reorder_cap: None,
+            budgeted: true,
         }
     }
 
@@ -1480,6 +1481,7 @@ mod tests {
             branch: BranchIdx(0),
             handle,
             reorder_cap: None,
+            budgeted: true,
         };
         (rq, typed)
     }
@@ -1843,6 +1845,7 @@ mod tests {
             branch: BranchIdx(0),
             handle,
             reorder_cap: None,
+            budgeted: true,
         };
         let pool = Arc::new(PoolEventCount::new(2));
         let plan = WakePlan::build(
@@ -2847,6 +2850,7 @@ mod tests {
                     branch: BranchIdx(0),
                     handle: Arc::clone(&t) as _,
                     reorder_cap: None,
+                    budgeted: true,
                 };
                 (t, vec![rq], vec![], 3, false)
             }
@@ -3013,6 +3017,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: Arc::clone(&transport) as _,
             reorder_cap,
+            budgeted: true,
         };
         let plan = WakePlan::build(
             &g,
@@ -3095,6 +3100,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: Arc::clone(&typed) as _,
             reorder_cap: None,
+            budgeted: true,
         };
         let registry = if gated { vec![rq] } else { vec![] };
         let plan = WakePlan::build(
@@ -3161,6 +3167,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: Arc::clone(&transport) as _,
             reorder_cap: Some(Arc::clone(&stage) as _),
+            budgeted: true,
         };
         let plan = WakePlan::build(
             &g,
@@ -4071,6 +4078,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: Arc::clone(&transport) as _,
             reorder_cap: Some(Arc::clone(&stage) as _),
+            budgeted: true,
         };
         let pool = Arc::new(PoolEventCount::new(4));
         let plan = WakePlan::build(
@@ -4139,6 +4147,7 @@ mod tests {
                 branch: BranchIdx(0),
                 handle: Arc::clone(&t) as _,
                 reorder_cap: None,
+                budgeted: true,
             });
             typed.push(t);
         }

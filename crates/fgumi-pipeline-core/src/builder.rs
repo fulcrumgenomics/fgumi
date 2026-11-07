@@ -183,6 +183,10 @@ pub struct PipelineConfig {
     ///
     /// Floor of 1 MiB per queue is enforced regardless of the
     /// rebalancer's decisions to prevent pathological starvation.
+    ///
+    /// A `QueueSpec::FixedByteBounded` queue is outside the budget: it keeps
+    /// its declared limit, is not counted in the split, and is never
+    /// rebalanced.
     pub queue_memory_total: Option<u64>,
     /// How much per-edge instrumentation to collect (default `Off` = zero
     /// overhead). Threaded into queue construction (instrumented transports) and
@@ -1545,7 +1549,8 @@ impl Pipeline {
         }
 
         // 2a. If a total queue-memory budget was supplied, evenly
-        // redistribute it across all byte-bounded queues now (before
+        // redistribute it across all budgeted byte-bounded queues (not the
+        // `FixedByteBounded` ones, which keep their size) now (before
         // workers start) so the initial state matches the user's
         // budget instead of the per-step defaults baked into each
         // step's `QueueSpec::ByteBounded { limit_bytes }`. Floor at
@@ -1767,10 +1772,7 @@ impl Pipeline {
                 let stop_clone = Arc::clone(&stop);
                 // Capture handles into a contiguous Vec — the monitor
                 // doesn't need step indices/names beyond debug logging.
-                let handles: Vec<Arc<dyn super::queues::BoundedQueueHandle>> =
-                    contexts.bounded_queues.iter().map(|rq| Arc::clone(&rq.handle)).collect();
-                let names: Vec<&'static str> =
-                    contexts.bounded_queues.iter().map(|rq| rq.producer_step_name).collect();
+                let (handles, names) = rebalanced_queues(&contexts.bounded_queues);
                 let wake_weak = Arc::downgrade(&wake);
                 let handle = thread::Builder::new()
                     .name("fgumi-queue-rebalancer".to_string())
@@ -2392,7 +2394,7 @@ fn first_monitor_blind_transport(
         for branch in 0..graph.branch_count(super::topology::StepIdx(step_idx)) {
             let spec = profile.output_queues.get(branch).copied().unwrap_or(QueueSpec::Unbounded);
             match spec {
-                QueueSpec::ByteBounded { .. } => {}
+                QueueSpec::ByteBounded { .. } | QueueSpec::FixedByteBounded { .. } => {}
                 QueueSpec::CountBounded { .. } | QueueSpec::Unbounded => {
                     return Some((profile.name, spec));
                 }
@@ -2795,21 +2797,39 @@ const MIN_REORDER_OVERFLOW_BYTES: u64 = 4 * 1024 * 1024;
 /// prior fixed value, so high thread counts (large `per_queue`) keep today's
 /// reorder headroom — no `--threads N` regression — while low thread counts
 /// (small `per_queue`) get a streaming-sized stash.
+///
+/// Only budgeted queues ([`crate::runtime::contexts::RegisteredQueue::budgeted`])
+/// share `total`; a fixed-limit queue keeps its declared limit and does not
+/// count toward the split.
 pub(crate) fn apply_initial_queue_budget(
     queues: &[crate::runtime::contexts::RegisteredQueue],
     total: u64,
 ) {
-    if queues.is_empty() {
+    let budgeted = queues.iter().filter(|rq| rq.budgeted).count() as u64;
+    if budgeted == 0 {
         return;
     }
-    let per_queue = (total / (queues.len() as u64)).max(MIN_PER_QUEUE_BYTES);
+    let per_queue = (total / budgeted).max(MIN_PER_QUEUE_BYTES);
     let reorder_cap = reorder_cap_for(per_queue);
-    for rq in queues {
+    for rq in queues.iter().filter(|rq| rq.budgeted) {
         rq.handle.set_limit_bytes(per_queue);
         if let Some(reorder) = &rq.reorder_cap {
             reorder.set_max_overflow_bytes(reorder_cap);
         }
     }
+}
+
+/// The queues the rebalancer may resize, with their producers' names: the
+/// budgeted ones. A fixed-limit queue (`QueueSpec::FixedByteBounded`) is not
+/// part of the budget, so the rebalancer never moves bytes to or from it.
+fn rebalanced_queues(
+    queues: &[crate::runtime::contexts::RegisteredQueue],
+) -> (Vec<Arc<dyn super::queues::BoundedQueueHandle>>, Vec<&'static str>) {
+    queues
+        .iter()
+        .filter(|rq| rq.budgeted)
+        .map(|rq| (Arc::clone(&rq.handle), rq.producer_step_name))
+        .unzip()
 }
 
 /// The reorder overflow cap for a branch whose transport budget is
@@ -3157,6 +3177,7 @@ mod tests {
             branch: BranchIdx(0),
             handle: transport_handle,
             reorder_cap: Some(reorder_dyn),
+            budgeted: true,
         }];
 
         // Lean total → per_queue = 8 MiB (1 queue) → reorder clamp = 8 MiB.
@@ -3200,6 +3221,7 @@ mod tests {
                 branch: BranchIdx(0),
                 handle: Arc::clone(h) as Arc<dyn BoundedQueueHandle>,
                 reorder_cap: None,
+                budgeted: true,
             })
             .collect();
 
@@ -5966,6 +5988,7 @@ mod tests {
             branch: BranchIdx(0),
             handle,
             reorder_cap: None,
+            budgeted: true,
         };
         let contexts = ChainContexts {
             inputs: vec![],
@@ -5997,6 +6020,152 @@ mod tests {
         fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
             Ok(StepOutcome::Finished)
         }
+    }
+
+    /// The job edge of a fan-out owner in the budget tests.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum JobEdge {
+        /// No job edge: the owner has only its data branch.
+        Absent,
+        /// A `FixedByteBounded` job edge (the opt-out).
+        Fixed,
+        /// A plain `ByteBounded` job edge (takes an even share).
+        Budgeted,
+    }
+
+    /// A source with a data branch and, per [`JobEdge`], a second branch.
+    #[derive(Clone)]
+    struct OwnerWithJobEdge(JobEdge);
+    impl Step for OwnerWithJobEdge {
+        type Input = ();
+        type Outputs = (u32, u32);
+        fn profile(&self) -> StepProfile {
+            let job = match self.0 {
+                JobEdge::Fixed => QueueSpec::FixedByteBounded { limit_bytes: JOB_EDGE_LIMIT },
+                JobEdge::Absent | JobEdge::Budgeted => {
+                    QueueSpec::ByteBounded { limit_bytes: JOB_EDGE_LIMIT }
+                }
+            };
+            StepProfile {
+                name: "Owner",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }, job],
+                branch_ordering: vec![BranchOrdering::None, BranchOrdering::None],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// The declared limit of the job edge in the budget tests.
+    const JOB_EDGE_LIMIT: u64 = 4096;
+
+    /// `Source → U32Sink` (data edge) and, per `job`, an `Owner` whose data
+    /// branch feeds a sink and whose job branch feeds another. Returns the
+    /// registered byte-bounded queues' `(producer, branch, budgeted, limit)`
+    /// after the `total` budget pass.
+    fn budgeted_limits(job: JobEdge, total: u64) -> Vec<(&'static str, usize, bool, u64)> {
+        use crate::runtime::contexts::build_chain_contexts;
+        use crate::topology::{BranchIdx, ChainGraph};
+
+        let mut graph = ChainGraph::new();
+        let mut steps: Vec<Box<dyn ErasedStep>> = Vec::new();
+        let src = graph.register_step("ChannelStep", 1);
+        steps.push(Box::new(TypedStep::new(ChannelStep(None))));
+        let sink = graph.register_step("U32Sink", 0);
+        steps.push(Box::new(TypedStep::new(U32Sink)));
+        graph.wire(src, BranchIdx(0), sink);
+        if job == JobEdge::Absent {
+            let owner = graph.register_step("ChannelStep", 1);
+            steps.push(Box::new(TypedStep::new(ChannelStep(None))));
+            let data = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            graph.wire(owner, BranchIdx(0), data);
+        } else {
+            let owner = graph.register_step("Owner", 2);
+            steps.push(Box::new(TypedStep::new(OwnerWithJobEdge(job))));
+            let data = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            let worker = graph.register_step("U32Sink", 0);
+            steps.push(Box::new(TypedStep::new(U32Sink)));
+            graph.wire(owner, BranchIdx(0), data);
+            graph.wire(owner, BranchIdx(1), worker);
+        }
+        let contexts = build_chain_contexts(&steps, &graph, InstrumentationLevel::Off, false);
+        apply_initial_queue_budget(&contexts.bounded_queues, total);
+        contexts
+            .bounded_queues
+            .iter()
+            .map(|rq| (rq.producer_step_name, rq.branch.0, rq.budgeted, rq.handle.limit_bytes()))
+            .collect()
+    }
+
+    /// A `FixedByteBounded` job edge keeps its declared limit through the
+    /// budget pass and is left out of the split: the data edges get exactly
+    /// the share they get when the chain has no job edge. A plain
+    /// `ByteBounded` job edge takes an even share instead (the behaviour the
+    /// opt-out exists to avoid). The fixed edge is still registered, so the
+    /// deadlock monitor and the wake plan see it.
+    #[rstest]
+    #[case::fixed_job_edge(JobEdge::Fixed, 48 << 20, JOB_EDGE_LIMIT, false)]
+    #[case::budgeted_job_edge(JobEdge::Budgeted, (96 << 20) / 3, (96 << 20) / 3, true)]
+    fn fixed_queue_is_left_out_of_the_budget(
+        #[case] job: JobEdge,
+        #[case] data_share: u64,
+        #[case] job_limit: u64,
+        #[case] job_budgeted: bool,
+    ) {
+        const TOTAL: u64 = 96 << 20;
+        let without = budgeted_limits(JobEdge::Absent, TOTAL);
+        assert_eq!(
+            without,
+            vec![("ChannelStep", 0, true, TOTAL / 2), ("ChannelStep", 0, true, TOTAL / 2)],
+            "baseline: two data edges split the total"
+        );
+        let with = budgeted_limits(job, TOTAL);
+        assert_eq!(
+            with,
+            vec![
+                ("ChannelStep", 0, true, data_share),
+                ("Owner", 0, true, data_share),
+                ("Owner", 1, job_budgeted, job_limit),
+            ]
+        );
+        if job == JobEdge::Fixed {
+            assert_eq!(data_share, without[0].3, "the data edges keep their no-job-edge share");
+        }
+    }
+
+    /// The rebalancer only ever sees budgeted queues: a fixed queue, however
+    /// full, never gains or gives bytes.
+    #[test]
+    fn rebalancer_skips_fixed_queues() {
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        let handles: Vec<Arc<ByteBoundedQueue<Vec<u8>>>> =
+            (0..2).map(|_| Arc::new(ByteBoundedQueue::new(10 << 20))).collect();
+        handles[0].try_push(vec![0u8; 9 << 20]).unwrap();
+        let fixed = Arc::new(ByteBoundedQueue::<Vec<u8>>::new(JOB_EDGE_LIMIT));
+        let registered: Vec<crate::runtime::contexts::RegisteredQueue> = handles
+            .iter()
+            .map(|h| Arc::clone(h) as Arc<dyn BoundedQueueHandle>)
+            .chain(std::iter::once(Arc::clone(&fixed) as Arc<dyn BoundedQueueHandle>))
+            .enumerate()
+            .map(|(i, handle)| crate::runtime::contexts::RegisteredQueue {
+                producer_step_name: "S",
+                producer_step: crate::topology::StepIdx(i),
+                branch: crate::topology::BranchIdx(0),
+                handle,
+                reorder_cap: None,
+                budgeted: i < 2,
+            })
+            .collect();
+        let (budgeted, names) = rebalanced_queues(&registered);
+        assert_eq!(budgeted.len(), 2, "the fixed queue is not offered to the rebalancer");
+        let raised = rebalance_once(&budgeted, &names);
+        assert_eq!(raised, Some(0), "the full budgeted queue gains");
+        assert_eq!(fixed.limit_bytes(), JOB_EDGE_LIMIT, "the fixed queue is untouched");
     }
 
     /// A channel a step reports reaches the contexts the runtime builds, through
@@ -6616,6 +6785,7 @@ mod tests {
             branch: BranchIdx(0),
             handle,
             reorder_cap: Some(cap),
+            budgeted: true,
         };
         let contexts = ChainContexts {
             inputs: vec![],

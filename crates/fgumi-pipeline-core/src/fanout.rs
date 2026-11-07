@@ -1,6 +1,13 @@
 //! Fan-out primitives: results of work that pool threads do on behalf of a
 //! serial step return to it through an [`OrderedInbox`].
 //!
+//! A [`FanoutWorker`] runs each [`Job`] in slices and re-contends its phase
+//! cap permit for every slice. The sort's pooled gather finishes in one
+//! slice; the multi-slice consumer is the range-parallel merge's range job
+//! (`MergeJob::Range`, a follow-up), whose run holds a permit for a whole key
+//! range unless each slice gives it back, starving the steps that share the
+//! cap (compression under `--merge-threads`).
+//!
 //! # Lost-wake protocol
 //!
 //! Same argument as `fgumi-sort`'s `MergeDemand`: [`OrderedInbox::await_next`]
@@ -11,14 +18,17 @@
 //! the owner (after releasing the lock).
 
 use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::admission::{PhaseCap, StepCap, StepCapRef, admit_input};
 use crate::item::HeapSize;
+use crate::runtime::contexts::StepCounters;
 use crate::runtime::wake::{SideWake, StepWaker};
-use crate::step::SideChannel;
+use crate::step::{CounterSpec, SideChannel, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
 struct State<R> {
     /// Delivered results, by ordinal.
@@ -226,6 +236,264 @@ impl<R: HeapSize + Send + 'static> SideChannel for OrderedInbox<R> {
     fn describe(&self) -> String {
         let s = self.state.lock();
         format!("inbox(next={}, pending={})", s.next, s.pending.len())
+    }
+}
+
+/// How much work one [`Job::run_slice`] call may do before yielding the thread.
+#[derive(Clone, Copy, Debug)]
+pub struct SliceBudget {
+    /// Soft cap on bytes processed in one slice.
+    pub bytes: u64,
+    /// Soft cap on records processed in one slice.
+    pub records: u64,
+}
+
+/// The result of one [`Job::run_slice`].
+#[derive(Debug)]
+pub enum JobStep<R> {
+    /// The job has more work; run another slice.
+    Continue,
+    /// The job is finished and produced this result.
+    Done(R),
+}
+
+/// A unit of work a serial step posts for pool threads, run in slices so no
+/// single dispatch holds a thread or a cap permit for long.
+///
+/// # Obligations
+///
+/// The deadlock monitor sees fan-out work only through byte counts, so an
+/// implementation must keep it visible:
+///
+/// - A job and its [`Self::Output`] must report a non-zero
+///   [`HeapSize::heap_size`]. A queued job with a zero size is invisible to
+///   the job edge's budget and to the monitor's in-flight probe, and so is a
+///   delivered result to the inbox gauge; a stall on either then classifies as
+///   `Starving` instead of `Stalled`/`Wedged`.
+/// - A blocking read (a `pread`, a file or pipe read) inside
+///   [`Self::run_slice`] must be wrapped in [`crate::liveness::external_wait`],
+///   so a slow device reads as an external wait, not a wedge.
+/// - The owner must [`OrderedInbox::reserve`] each ordinal before posting its
+///   job. A job a worker has popped and is running across several slices is
+///   on no edge; until it delivers, the reservation is the only charge the
+///   monitor can see.
+pub trait Job: Send + HeapSize + 'static {
+    /// The result delivered to the owner's [`OrderedInbox`]. Must report a
+    /// non-zero [`HeapSize::heap_size`] (see the trait's obligations).
+    type Output: Send + HeapSize + 'static;
+
+    /// The job's ordinal: the position of its result in the owner's order.
+    fn ordinal(&self) -> u64;
+
+    /// Runs one slice of work within `budget`.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O or processing error; the runtime fails the pipeline with it.
+    fn run_slice(&mut self, budget: SliceBudget) -> io::Result<JobStep<Self::Output>>;
+}
+
+/// The error a [`FanoutWorker`] fails with when a [`Job::run_slice`] fails:
+/// the job's ordinal around the job's own error. The wrapping [`io::Error`]
+/// keeps the job error's [`io::ErrorKind`]. The display carries the job
+/// error's text (`job N: <error>`), because the pipeline reports a step error
+/// by its display alone; so that a reporter walking the chain does not print
+/// that text twice, [`source`](std::error::Error::source) skips the job
+/// error and returns the job error's own source. The job error itself stays
+/// reachable through [`io::Error::get_ref`] and a downcast to `JobError`. The
+/// step name is not repeated here: the driver already reports which step
+/// failed.
+#[derive(Debug)]
+pub struct JobError {
+    ordinal: u64,
+    source: io::Error,
+}
+
+impl JobError {
+    /// Wraps `source`, the error of the job with ordinal `ordinal`.
+    fn wrap(ordinal: u64, source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), Self { ordinal, source })
+    }
+
+    /// The job's own error.
+    #[must_use]
+    pub fn job_error(&self) -> &io::Error {
+        &self.source
+    }
+
+    /// The ordinal of the job that failed.
+    #[must_use]
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "job {}: {}", self.ordinal, self.source)
+    }
+}
+
+impl std::error::Error for JobError {
+    /// The job error's own source: the display already includes the job
+    /// error's text.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// Step counters. `jobs` counts jobs started (popped), including any that later
+/// fail; `slices` counts completed slices; `output_bytes` the heap bytes of
+/// delivered results.
+const COUNTERS: &[CounterSpec] = &[
+    CounterSpec::new("jobs", "jobs"),
+    CounterSpec::new("slices", "slices"),
+    CounterSpec::new("output_bytes", "bytes"),
+];
+const JOBS: usize = 0;
+const SLICES: usize = 1;
+const OUTPUT_BYTES: usize = 2;
+
+/// A `Parallel` step that runs the [`Job`]s of its input edge, one slice per
+/// dispatch under its phase cap, and delivers each result to an
+/// [`OrderedInbox`]. Each worker instance holds its own in-progress job
+/// between dispatches; a copy made by [`Step::new_worker_copy`] starts with
+/// none.
+///
+/// The worker relies on the [`Job`] obligations: non-zero job and output
+/// heap sizes, blocking reads inside `run_slice` wrapped in
+/// [`crate::liveness::external_wait`], and an owner that reserves each
+/// ordinal on the inbox before posting it, since an in-progress job held by
+/// a worker instance between slices is visible to the deadlock monitor only through
+/// that reservation.
+pub struct FanoutWorker<J: Job> {
+    name: &'static str,
+    inbox: Arc<OrderedInbox<J::Output>>,
+    budget: SliceBudget,
+    cap: Option<StepCap>,
+    current: Option<J>,
+}
+
+impl<J: Job> FanoutWorker<J> {
+    /// A worker named `name` delivering to `inbox`, running slices of `budget`.
+    #[must_use]
+    pub fn new(
+        name: &'static str,
+        inbox: Arc<OrderedInbox<J::Output>>,
+        budget: SliceBudget,
+    ) -> Self {
+        Self { name, inbox, budget, cap: None, current: None }
+    }
+
+    /// Admits slices through `cap` (none by default).
+    #[must_use]
+    pub fn with_step_cap(mut self, cap: impl Into<Option<StepCap>>) -> Self {
+        self.cap = cap.into();
+        self
+    }
+
+    /// Runs one slice of `job`: keeps it for the next dispatch on `Continue`,
+    /// delivers its result on `Done`.
+    fn advance(&mut self, mut job: J, counters: &StepCounters) -> io::Result<()> {
+        let ordinal = job.ordinal();
+        let step = job.run_slice(self.budget).map_err(|e| JobError::wrap(ordinal, e))?;
+        counters.add(SLICES, 1);
+        match step {
+            JobStep::Continue => self.current = Some(job),
+            JobStep::Done(out) => {
+                counters.add(OUTPUT_BYTES, out.heap_size() as u64);
+                let _ = self.inbox.deliver(ordinal, out);
+            }
+        }
+        Ok(())
+    }
+
+    fn admitted(
+        &mut self,
+        ctx: &mut StepCtx<'_, Self>,
+        cap: Option<&PhaseCap>,
+    ) -> io::Result<StepOutcome> {
+        // A job in progress is work already claimed: take a permit directly.
+        // Otherwise admit_input checks the edge before a permit is taken.
+        let (_permit, job, first) = if let Some(job) = self.current.take() {
+            let permit = match cap {
+                Some(cap) => {
+                    let Some(p) = cap.try_acquire() else {
+                        self.current = Some(job);
+                        return Ok(StepOutcome::Capped);
+                    };
+                    Some(p)
+                }
+                None => None,
+            };
+            (permit, job, false)
+        } else {
+            let permit = match admit_input(ctx.input, cap) {
+                Ok(p) => p,
+                Err(outcome) => return Ok(outcome),
+            };
+            match ctx.input.pop() {
+                Some(job) => (permit, job, true),
+                None => {
+                    // Uncapped: admit_input did not look at the edge.
+                    return Ok(if ctx.input.is_drained() {
+                        StepOutcome::Finished
+                    } else {
+                        ctx.input.note_empty_poll();
+                        StepOutcome::NoProgress
+                    });
+                }
+            }
+        };
+        if first {
+            ctx.counters.add(JOBS, 1);
+        }
+        self.advance(job, ctx.counters)?;
+        Ok(StepOutcome::Progress)
+    }
+}
+
+impl<J: Job> Step for FanoutWorker<J> {
+    type Input = J;
+    type Outputs = ();
+
+    fn profile(&self) -> StepProfile {
+        StepProfile {
+            name: self.name,
+            kind: StepKind::Parallel,
+            sticky: false,
+            output_queues: vec![],
+            branch_ordering: vec![],
+        }
+    }
+
+    fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        let cap = self.cap.take();
+        let outcome = self.admitted(ctx, cap.as_ref().and_then(StepCap::active));
+        self.cap = cap;
+        outcome
+    }
+
+    fn new_worker_copy(&self) -> Self {
+        Self {
+            name: self.name,
+            inbox: Arc::clone(&self.inbox),
+            budget: self.budget,
+            cap: self.cap.clone(),
+            current: None,
+        }
+    }
+
+    fn counters(&self) -> &'static [CounterSpec] {
+        COUNTERS
+    }
+
+    fn step_cap(&self) -> Option<StepCapRef<'_>> {
+        self.cap.as_ref().map(StepCap::view)
+    }
+
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        vec![Arc::clone(&self.inbox) as Arc<dyn SideChannel>]
     }
 }
 

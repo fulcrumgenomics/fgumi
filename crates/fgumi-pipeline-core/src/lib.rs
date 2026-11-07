@@ -52,7 +52,7 @@ pub use builder::{
     MultiChain2Ordered, MultiChain3, MultiChain4, Pipeline, PipelineBuilder, PipelineConfig,
 };
 pub use erased::{ErasedStep, ErasedStepCtx, TypedStep, TypedStep2, TypedStepK};
-pub use fanout::OrderedInbox;
+pub use fanout::{FanoutWorker, Job, JobError, JobStep, OrderedInbox, SliceBudget};
 pub use finalize::FinalizeHook;
 pub use handles::{
     BranchInputHandle, HeldRetry, KInputHandles, OutputQueueSet, Tuple2View, Tuple3View,
