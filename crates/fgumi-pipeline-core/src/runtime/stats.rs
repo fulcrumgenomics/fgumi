@@ -45,6 +45,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::runtime::coarse_clock::coarse_now_ns;
 use crate::runtime::event_count::WaitOutcome;
 use crate::step::StepOutcome;
 use crate::topology::StepIdx;
@@ -74,7 +75,9 @@ pub struct StepStats {
     pub first_progress_ns: AtomicU64,
     /// Wall ns from pipeline start to the END of this step's LAST
     /// Progress dispatch. Updated on every Progress (monotonic max).
-    /// `0` if the step never made progress.
+    /// `0` if the step never made progress, but `0` is also a real value on
+    /// the coarse clock (progress inside its first tick): test
+    /// `first_progress_ns == u64::MAX` for "never progressed".
     pub last_progress_ns: AtomicU64,
     /// `notify_one` calls issued on this step's `Progress` or flushed retry
     /// (any outcome).
@@ -247,6 +250,25 @@ pub fn elapsed_ns(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The clock [`PipelineStats`] times step dispatches and worker busy sections
+/// with: one or two reads per dispatch, so its cost scales with the dispatch
+/// rate (hundreds of thousands per second on a busy pool). Idle and park
+/// timing always uses [`Instant`]: a park already reads the clock for its
+/// timeout, and its timed-out/unparked split compares against a sub-ms
+/// deadline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimingResolution {
+    /// [`Instant`]: exact per dispatch. Each read costs a system call where the
+    /// kernel clock source cannot be read from user space (e.g. `hpet`).
+    #[default]
+    Precise,
+    /// `CLOCK_MONOTONIC_COARSE` on Linux (`Instant` elsewhere): never a system
+    /// call, but on Linux it ticks in steps of
+    /// 1 to 10 ms, so per-step and per-worker totals are estimates (accurate in
+    /// aggregate over many dispatches; sub-ms totals are noise).
+    Coarse,
+}
+
 /// Per-step counter container. Sized to match the pipeline's chain length;
 /// callers obtain one via `Pipeline::stats()`.
 #[derive(Debug)]
@@ -288,10 +310,15 @@ pub struct PipelineStats {
     /// Per-step driver park outcomes (attributed like `detached_park_events`).
     detached_park_unparked: Box<[AtomicU64]>,
     detached_park_timed_out: Box<[AtomicU64]>,
-    /// Anchor for first/last-progress timestamps. Set at `PipelineStats`
-    /// construction; all `first_progress_ns` / `last_progress_ns` values
-    /// are wall-ns elapsed from this `Instant`.
+    /// Anchor for first/last-progress timestamps on the precise clock. Set at
+    /// `PipelineStats` construction; all `first_progress_ns` /
+    /// `last_progress_ns` values are wall-ns elapsed from this anchor or from
+    /// `pipeline_start_coarse_ns`, whichever `timing` selects.
     pipeline_start: Instant,
+    /// The same anchor on the coarse clock (`coarse_now_ns` at construction).
+    pipeline_start_coarse_ns: u64,
+    /// Which of the two anchors [`Self::elapsed_ns`] reads.
+    timing: TimingResolution,
 }
 
 impl PipelineStats {
@@ -326,7 +353,23 @@ impl PipelineStats {
             detached_idle_ns: detached_idle_ns.into_boxed_slice(),
             detached_park_events: detached_park_events.into_boxed_slice(),
             pipeline_start: Instant::now(),
+            pipeline_start_coarse_ns: coarse_now_ns(),
+            timing: TimingResolution::Precise,
         }
+    }
+
+    /// Time dispatches and busy sections on the `timing` clock (the default
+    /// is [`TimingResolution::Precise`]).
+    #[must_use]
+    pub fn with_timing(mut self, timing: TimingResolution) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    /// The clock dispatches and busy sections are timed on.
+    #[must_use]
+    pub fn timing(&self) -> TimingResolution {
+        self.timing
     }
 
     /// Accumulate `ns` of `try_run` (busy) time for a `StepKind::Detached`
@@ -469,10 +512,32 @@ impl PipelineStats {
         }
     }
 
-    /// Wall ns elapsed since pipeline start. Used by the driver to stamp
-    /// per-step first/last progress timestamps.
+    /// Wall ns elapsed since pipeline start, on the [`Self::timing`] clock.
+    /// Used by the driver to stamp per-step first/last progress timestamps and
+    /// to time dispatches and busy sections (see [`Self::ns_since`]).
+    #[inline]
     #[must_use]
     pub fn elapsed_ns(&self) -> u64 {
+        match self.timing {
+            TimingResolution::Precise => elapsed_ns(self.pipeline_start),
+            TimingResolution::Coarse => {
+                coarse_now_ns().saturating_sub(self.pipeline_start_coarse_ns)
+            }
+        }
+    }
+
+    /// Wall ns from `start_ns` (an earlier [`Self::elapsed_ns`]) to now.
+    #[inline]
+    #[must_use]
+    pub fn ns_since(&self, start_ns: u64) -> u64 {
+        self.elapsed_ns().saturating_sub(start_ns)
+    }
+
+    /// Wall ns elapsed since pipeline start on the precise clock, whatever
+    /// [`Self::timing`] is. For whole-run rates (the per-edge table), which a
+    /// tick-quantized wall time would skew on a short run.
+    #[must_use]
+    pub fn precise_elapsed_ns(&self) -> u64 {
         elapsed_ns(self.pipeline_start)
     }
 
@@ -488,7 +553,8 @@ impl PipelineStats {
 
     /// Record a successful `try_run_erased` outcome for the given step.
     /// Hot path: relaxed atomics, no allocation, no locking. `start_ns`
-    /// is wall-ns at dispatch start (relative to `pipeline_start`);
+    /// is wall-ns at dispatch start, relative to pipeline start on the
+    /// [`Self::elapsed_ns`] clock;
     /// `elapsed_ns` is the dispatch duration. On `Progress` we stamp
     /// the step's first/last active timestamps.
     ///
@@ -621,6 +687,7 @@ impl PipelineStats {
             edges: Vec::new(),
             worker_waits,
             detached_park_outcomes,
+            timing: self.timing,
         }
     }
 
@@ -702,6 +769,9 @@ pub struct StatsSnapshot {
     /// `(step, unparked, timed_out)` driver-park outcomes per step (attributed
     /// like `detached`'s park count). Filtered to non-zero.
     pub detached_park_outcomes: Vec<(usize, u64, u64)>,
+    /// The clock the busy and progress times were taken on. The report says so
+    /// when it is [`TimingResolution::Coarse`].
+    pub timing: TimingResolution,
 }
 
 /// Occupancy classification refined from the histogram's [`RawOccupancy`](crate::runtime::metrics::RawOccupancy) plus
@@ -868,7 +938,8 @@ pub struct StepStatsSnapshot {
     /// dispatch start. `u64::MAX` if no Progress was ever recorded.
     pub first_progress_ns: u64,
     /// Wall ns (from pipeline start) of this step's last Progress
-    /// dispatch end. `0` if no Progress was ever recorded.
+    /// dispatch end. `0` if no Progress was ever recorded, but also a real value
+    /// on the coarse clock: test `first_progress_ns == u64::MAX` for that.
     pub last_progress_ns: u64,
     /// See [`StepStats::notifies_issued`].
     pub notifies_issued: u64,
@@ -1100,6 +1171,13 @@ pub(crate) fn bottleneck_verdict(snap: &StatsSnapshot) -> Vec<Finding> {
 impl fmt::Display for StatsSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Pipeline stats ({} step{}):", self.steps.len(), pluralize(self.steps.len()))?;
+        if self.timing == TimingResolution::Coarse {
+            writeln!(
+                f,
+                "  (busy and progress times are on the coarse clock: estimates, in kernel \
+                 ticks of 1-10 ms; --pipeline-stats or FGUMI_PIPELINE_STATS=1 gives exact timings)"
+            )?;
+        }
         // Total dispatch time across steps — the denominator for each step's
         // `cpu%` share (the Amdahl ranking: which step to optimize first) and
         // for the headroom line.
@@ -1147,7 +1225,9 @@ impl StatsSnapshot {
                 let ms = (s.first_progress_ns as f64) / 1_000_000.0;
                 format!("{ms:.1}")
             };
-            let last_str = if s.last_progress_ns == 0 {
+            // Not `last_progress_ns == 0`: on the coarse clock a step whose
+            // progress all fell in the first tick ends at 0.
+            let last_str = if s.first_progress_ns == u64::MAX {
                 "-".to_string()
             } else {
                 #[allow(clippy::cast_precision_loss)]
@@ -1263,6 +1343,10 @@ impl StatsSnapshot {
     /// these numbers: the pool idle% is recoverable via better step overlap;
     /// once the pool saturates (no idle left) the only remaining wins are fewer
     /// cycles/item or more cores, and the hottest step is the Amdahl target.
+    ///
+    /// On the coarse clock ([`TimingResolution::Coarse`]) busy is tick-quantized
+    /// while idle is still measured with `Instant`, so busy% and the headroom
+    /// line are estimates (unbiased in aggregate, noisy on short runs).
     fn write_utilization(&self, f: &mut fmt::Formatter<'_>, total_cpu_ns: u64) -> fmt::Result {
         if self.workers.is_empty() {
             // No pool workers recorded activity, but a Detached thread may still
@@ -1442,6 +1526,88 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::default_is_precise(None, TimingResolution::Precise)]
+    #[case::precise(Some(TimingResolution::Precise), TimingResolution::Precise)]
+    #[case::coarse(Some(TimingResolution::Coarse), TimingResolution::Coarse)]
+    fn timing_is_the_configured_clock(
+        #[case] configured: Option<TimingResolution>,
+        #[case] expected: TimingResolution,
+    ) {
+        let stats = PipelineStats::new(vec!["A"]);
+        let stats = match configured {
+            Some(timing) => stats.with_timing(timing),
+            None => stats,
+        };
+        assert_eq!(stats.timing(), expected);
+    }
+
+    #[rstest]
+    fn elapsed_ns_tracks_a_sleep_on_either_clock(
+        #[values(TimingResolution::Precise, TimingResolution::Coarse)] timing: TimingResolution,
+    ) {
+        // A coarse tick is at most 10 ms, so a 50 ms sleep reads as >= 40 ms.
+        let stats = PipelineStats::new(vec!["A"]).with_timing(timing);
+        let start_ns = stats.elapsed_ns();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let slept_ns = stats.ns_since(start_ns);
+        assert!(slept_ns >= 40_000_000, "{timing:?}: {slept_ns} ns after a 50 ms sleep");
+        // A start in the future reads as zero, not a wrapped huge value.
+        assert_eq!(stats.ns_since(u64::MAX), 0);
+    }
+
+    /// On Linux the coarse clock only moves at kernel ticks (1-10 ms), so a
+    /// tight loop of reads must repeat a value, while the precise clock (1 ns
+    /// resolution, at least ~15 ns per read) practically never does. This
+    /// pins `Coarse` to the coarse clock, which macOS cannot tell apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coarse_timing_reads_the_tick_clock() {
+        let stats = PipelineStats::new(vec!["A"]).with_timing(TimingResolution::Coarse);
+        let mut prev = stats.elapsed_ns();
+        let mut repeated = false;
+        for _ in 0..1000 {
+            let next = stats.elapsed_ns();
+            repeated |= next == prev;
+            prev = next;
+        }
+        assert!(repeated, "1000 coarse reads never repeated: not the tick clock");
+    }
+
+    /// A step whose only progress ends at 0 ns (inside the coarse clock's first
+    /// tick) still progressed: the table shows its last-progress time, not `-`.
+    #[test]
+    fn progress_ending_at_zero_is_not_shown_as_never_progressed() {
+        let stats = PipelineStats::new(vec!["Only"]);
+        stats.record(StepIdx(0), StepOutcome::Progress, 0, 0);
+        let out = format!("{}", stats.snapshot());
+        let row = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("Only "))
+            .unwrap_or_else(|| panic!("no row for the step in:\n{out}"));
+        assert!(row.trim_end().ends_with("0.0"), "last_ms should be 0.0: {row:?}");
+    }
+
+    /// The report says when its busy and progress times are coarse estimates,
+    /// and says nothing when they are exact.
+    #[rstest]
+    #[case::coarse_is_labelled(TimingResolution::Coarse, true)]
+    #[case::precise_is_not(TimingResolution::Precise, false)]
+    fn report_labels_the_coarse_clock(#[case] timing: TimingResolution, #[case] labelled: bool) {
+        let snap = PipelineStats::new(vec!["A"]).with_timing(timing).snapshot();
+        assert_eq!(snap.timing, timing);
+        let out = format!("{snap}");
+        assert_eq!(out.contains("on the coarse clock"), labelled, "{out}");
+    }
+
+    #[test]
+    fn precise_elapsed_ns_ignores_the_timing() {
+        let stats = PipelineStats::new(vec!["A"]).with_timing(TimingResolution::Coarse);
+        let start = stats.precise_elapsed_ns();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(stats.precise_elapsed_ns() >= start + 5_000_000);
+    }
 
     #[test]
     fn record_increments_progress_bucket() {
