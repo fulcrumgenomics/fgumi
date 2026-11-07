@@ -17,7 +17,7 @@ anyhow = "1.0.102"
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
 noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # The seeded fixture generator of the `test-utils` sort oracle (`sort::testing`).
 rand = { workspace = true, optional = true }
 rayon = "1.10"
@@ -51,7 +51,7 @@ fgumi-raw-bam = { workspace = true, features = ["noodles", "test-utils"] }
 fgumi-sort = { workspace = true, features = ["test-utils"] }
 fgumi-pipeline-core = { workspace = true, features = ["test-utils"] }
 noodles = { workspace = true, features = ["bam", "sam"] }
-rstest = "0.26"
+rstest = "0.28"
 rand = { workspace = true }
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
