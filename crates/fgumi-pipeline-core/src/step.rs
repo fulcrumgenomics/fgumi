@@ -275,6 +275,7 @@ pub struct OutputsViewAny {
 }
 
 use std::io;
+use std::sync::Arc;
 
 use super::item::HeapSize;
 use super::outputs::StepOutputs;
@@ -311,6 +312,18 @@ impl CounterSpec {
     pub const fn new(name: &'static str, unit: &'static str) -> Self {
         Self { name, unit }
     }
+}
+
+/// A queue-like holder of work that lives outside every queue edge (for
+/// example an inbox that a serial step fills with results returned from pool
+/// tasks). The deadlock monitor sums [`SideChannel::in_flight_bytes`] with the
+/// edge bytes, so work parked here is not mistaken for an idle pipeline.
+pub trait SideChannel: Send + Sync {
+    /// Bytes currently held by this channel.
+    fn in_flight_bytes(&self) -> u64;
+
+    /// A short human-readable description, printed in the stall snapshot.
+    fn describe(&self) -> String;
 }
 
 /// Handle to this step's input queue.
@@ -490,6 +503,13 @@ pub trait Step: Send + Sized + 'static {
         None
     }
 
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
+    }
+
     /// Step body. Pop from `ctx.input`, push to `ctx.outputs`. Returns
     /// `Progress` / `NoProgress` / `Contention` / `Finished`. Errors propagate via `Err`.
     ///
@@ -577,6 +597,13 @@ pub trait Step2: Send + Sized + 'static {
     /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
     fn pool_placement(&self) -> PoolPlacement {
         PoolPlacement::AllWorkers
+    }
+
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.
@@ -679,6 +706,13 @@ pub trait StepK: Send + Sized + 'static {
     /// [`StepKind::Parallel`]. Defaults to [`PoolPlacement::AllWorkers`].
     fn pool_placement(&self) -> PoolPlacement {
         PoolPlacement::AllWorkers
+    }
+
+    /// Off-edge holders of in-flight work this step reports to the deadlock
+    /// monitor. Clones of a step, and different steps, may return the same
+    /// `Arc`; the runtime counts each distinct channel once. Defaults to none.
+    fn side_channels(&self) -> Vec<Arc<dyn SideChannel>> {
+        Vec::new()
     }
 
     /// Same semantics as [`Step::counters`]. Defaults to `&[]`.

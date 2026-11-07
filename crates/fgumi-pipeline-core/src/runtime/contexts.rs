@@ -129,6 +129,11 @@ pub struct ChainContexts {
     /// aggregate into one atomic. Each entry is [`StepCounters::disabled`] when
     /// telemetry is off (no allocation), else `StepCounters::new(step.counters().len())`.
     pub step_counters: Vec<StepCounters>,
+    /// Every distinct off-edge [`SideChannel`](crate::SideChannel) the chain's
+    /// steps report, deduplicated by pointer (parallel clones and a worker
+    /// step sharing its owner's inbox report the same `Arc`). Summed by the
+    /// deadlock monitor beside the edge bytes. Empty for most chains.
+    pub side_channels: Vec<std::sync::Arc<dyn crate::SideChannel>>,
 }
 
 /// One instrumented edge: its shared [`EdgeMetrics`](crate::runtime::metrics::EdgeMetrics)
@@ -197,6 +202,22 @@ impl ChainContexts {
             holder_only: &self.holder_only_queues,
         }
     }
+}
+
+/// Deduplicate side channels by pointer identity, keeping first-seen order.
+/// Compares the data address only, so two `Arc`s of one channel match even if
+/// their vtable pointers differ across codegen units.
+pub(crate) fn distinct_side_channels(
+    channels: impl IntoIterator<Item = std::sync::Arc<dyn crate::SideChannel>>,
+) -> Vec<std::sync::Arc<dyn crate::SideChannel>> {
+    let mut distinct: Vec<std::sync::Arc<dyn crate::SideChannel>> = Vec::new();
+    for ch in channels {
+        let addr = std::sync::Arc::as_ptr(&ch).cast::<()>();
+        if !distinct.iter().any(|d| std::ptr::eq(std::sync::Arc::as_ptr(d).cast::<()>(), addr)) {
+            distinct.push(ch);
+        }
+    }
+    distinct
 }
 
 /// Build the chain's per-step contexts.
@@ -453,7 +474,17 @@ fn build_chain_contexts_inner(
         steps.iter().map(|_| StepCounters::disabled()).collect()
     };
 
-    ChainContexts { inputs, outputs, bounded_queues, holder_only_queues, edges, step_counters }
+    let side_channels = distinct_side_channels(steps.iter().flat_map(|s| s.side_channels()));
+
+    ChainContexts {
+        inputs,
+        outputs,
+        bounded_queues,
+        holder_only_queues,
+        edges,
+        step_counters,
+        side_channels,
+    }
 }
 
 /// Construct a `BranchInputHandle<()>` that's already drained — for source

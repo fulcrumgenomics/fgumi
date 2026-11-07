@@ -77,7 +77,7 @@ pub use runtime::{
 pub use signal::{CancelHandle, PipelineError, PipelineSignal};
 pub use step::{
     Affinity, CounterSpec, DetachedGroup, InputHandle, OutputHandles, OutputsViewAny,
-    PoolPlacement, Step, Step2, StepCtx, StepCtx2, StepCtxK, StepK, StepKind, StepOutcome,
-    StepProfile,
+    PoolPlacement, SideChannel, Step, Step2, StepCtx, StepCtx2, StepCtxK, StepK, StepKind,
+    StepOutcome, StepProfile,
 };
 pub use topology::{BranchIdx, ChainGraph, StepIdx};

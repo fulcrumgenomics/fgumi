@@ -1368,6 +1368,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let _ = ChainGraph::new();
@@ -1408,6 +1409,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         });
         let drain_counters: Vec<Arc<StepDrainCounter>> = vec![];
         let mut worker = WorkerCore::new(0, None, BackoffPolicy::ParkedSleep);

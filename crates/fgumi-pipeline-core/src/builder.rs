@@ -2365,7 +2365,8 @@ fn in_flight_bytes(contexts: &crate::runtime::contexts::ChainContexts) -> u64 {
             rq.handle.current_bytes()
                 + rq.reorder_cap.as_ref().map_or(0, |r| r.current_buffer_bytes())
         })
-        .sum()
+        .sum::<u64>()
+        + contexts.side_channels.iter().map(|c| c.in_flight_bytes()).sum::<u64>()
 }
 
 /// Return the first `(step_name, QueueSpec)` whose output transport is invisible
@@ -2484,12 +2485,39 @@ fn run_deadlock_monitor(
             stuck,
             warn_timeout,
             stats.map(std::convert::AsRef::as_ref),
+            &contexts.side_channels,
             signal,
             &mut mon_state,
         ) {
             break;
         }
     }
+}
+
+/// The lines of a stall report: the per-step stats snapshot (or a note that
+/// none is available), then one line per off-edge side channel naming what it
+/// holds, so a stall on work parked outside every queue edge is attributable.
+fn stall_snapshot_lines(
+    stats: Option<&PipelineStats>,
+    side_channels: &[Arc<dyn crate::SideChannel>],
+) -> Vec<String> {
+    let mut lines: Vec<String> = if let Some(stats) = stats {
+        format!("{}", stats.snapshot()).lines().map(str::to_owned).collect()
+    } else {
+        vec![
+            "(no per-step snapshot: PipelineConfig::stats is not set; \
+             attach a stats handle to see which step is stuck)"
+                .to_owned(),
+        ]
+    };
+    for ch in side_channels {
+        lines.push(format!(
+            "side channel: {} ({} bytes in flight)",
+            ch.describe(),
+            ch.in_flight_bytes()
+        ));
+    }
+    lines
 }
 
 /// Rolling state the deadlock monitor carries across poll iterations.
@@ -2523,6 +2551,7 @@ fn apply_stall_verdict(
     // snapshot. Losing the snapshot is far better than losing the detection,
     // which is what requiring `stats` used to cost.
     stats: Option<&PipelineStats>,
+    side_channels: &[Arc<dyn crate::SideChannel>],
     signal: &PipelineSignal,
     mon_state: &mut StallMonitorState,
 ) -> bool {
@@ -2574,16 +2603,8 @@ fn apply_stall_verdict(
                     "Pipeline stall: no progress for {stall_secs}s with {stuck} bytes \
                      still in flight. Snapshot follows."
                 );
-                if let Some(stats) = stats {
-                    let snapshot = stats.snapshot();
-                    for line in format!("{snapshot}").lines() {
-                        log::warn!("{line}");
-                    }
-                } else {
-                    log::warn!(
-                        "(no per-step snapshot: PipelineConfig::stats is not set; \
-                         attach a stats handle to see which step is stuck)"
-                    );
+                for line in stall_snapshot_lines(stats, side_channels) {
+                    log::warn!("{line}");
                 }
                 mon_state.last_warn = Some(now);
             }
@@ -2593,16 +2614,8 @@ fn apply_stall_verdict(
                 "Pipeline deadlock: no progress for {stall_secs}s with {stuck} bytes \
                  stuck in flight; failing the pipeline. Snapshot follows."
             );
-            if let Some(stats) = stats {
-                let snapshot = stats.snapshot();
-                for line in format!("{snapshot}").lines() {
-                    log::error!("{line}");
-                }
-            } else {
-                log::error!(
-                    "(no per-step snapshot: PipelineConfig::stats is not set; \
-                     attach a stats handle to see which step is stuck)"
-                );
+            for line in stall_snapshot_lines(stats, side_channels) {
+                log::error!("{line}");
             }
             signal.record_error(PipelineError::TimedOut { stalled_secs: stall_secs });
             signal.cancel();
@@ -5862,6 +5875,176 @@ mod tests {
         assert_eq!(classify_stall(progressed, stall_secs, 10, 60, in_flight_bytes, true), expected);
     }
 
+    /// A fake [`crate::SideChannel`] holding a fixed byte count.
+    struct FakeChannel(u64, &'static str);
+    impl crate::SideChannel for FakeChannel {
+        fn in_flight_bytes(&self) -> u64 {
+            self.0
+        }
+        fn describe(&self) -> String {
+            self.1.to_owned()
+        }
+    }
+
+    /// A `Step` whose clones all report the one shared channel.
+    #[derive(Clone)]
+    struct ChannelStep(Option<Arc<dyn crate::SideChannel>>);
+    impl Step for ChannelStep {
+        type Input = ();
+        type Outputs = Single<u32>;
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "ChannelStep",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![QueueSpec::ByteBounded { limit_bytes: 1 << 20 }],
+                branch_ordering: vec![BranchOrdering::None],
+            }
+        }
+        fn side_channels(&self) -> Vec<Arc<dyn crate::SideChannel>> {
+            self.0.iter().cloned().collect()
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// Distinct channels from `n` steps, `shared` of them reporting the same
+    /// `Arc`, deduplicated by pointer; byte sum counts each once.
+    #[rstest]
+    #[case::two_clones_share_one(vec![0, 0], 4096, 1)]
+    #[case::two_distinct_channels(vec![0, 1], 4096 + 100, 2)]
+    #[case::three_steps_two_shared(vec![0, 1, 0], 4096 + 100, 2)]
+    #[case::no_channels(vec![], 0, 0)]
+    fn side_channels_deduped_by_pointer(
+        #[case] picks: Vec<usize>,
+        #[case] expected_bytes: u64,
+        #[case] expected_count: usize,
+    ) {
+        use crate::runtime::contexts::distinct_side_channels;
+        let pool: [Arc<dyn crate::SideChannel>; 2] =
+            [Arc::new(FakeChannel(4096, "a")), Arc::new(FakeChannel(100, "b"))];
+        let steps: Vec<ChannelStep> =
+            picks.iter().map(|&i| ChannelStep(Some(Arc::clone(&pool[i])))).collect();
+        let distinct = distinct_side_channels(steps.iter().flat_map(Step::side_channels));
+        assert_eq!(distinct.len(), expected_count);
+        assert_eq!(distinct.iter().map(|c| c.in_flight_bytes()).sum::<u64>(), expected_bytes);
+    }
+
+    /// The monitor's in-flight total adds the bytes side channels hold (outside
+    /// every queue edge) to the bytes queued on registered edges.
+    #[rstest]
+    #[case::side_channel_only(0, 4096, 4096)]
+    #[case::empty(0, 0, 0)]
+    #[case::queue_and_side_channel_sum(500, 4096, 4596)]
+    fn in_flight_bytes_includes_side_channels(
+        #[case] queued: usize,
+        #[case] held: u64,
+        #[case] expected: u64,
+    ) {
+        use crate::item::HeapSize;
+        use crate::queues::{BoundedQueueHandle, ByteBoundedQueue, ItemQueue};
+        use crate::runtime::contexts::{ChainContexts, RegisteredQueue};
+        use crate::topology::{BranchIdx, StepIdx};
+
+        #[derive(Debug)]
+        struct Bytes(usize);
+        impl HeapSize for Bytes {
+            fn heap_size(&self) -> usize {
+                self.0
+            }
+        }
+
+        let transport = Arc::new(ByteBoundedQueue::<Bytes>::new(10_000));
+        if queued > 0 {
+            transport.try_push(Bytes(queued)).unwrap();
+        }
+        let handle: Arc<dyn BoundedQueueHandle> = transport;
+        let rq = RegisteredQueue {
+            producer_step_name: "test",
+            producer_step: StepIdx(0),
+            branch: BranchIdx(0),
+            handle,
+            reorder_cap: None,
+        };
+        let contexts = ChainContexts {
+            inputs: vec![],
+            outputs: vec![],
+            bounded_queues: vec![rq],
+            holder_only_queues: vec![],
+            edges: vec![],
+            step_counters: vec![],
+            side_channels: vec![Arc::new(FakeChannel(held, "inbox"))],
+        };
+        assert_eq!(in_flight_bytes(&contexts), expected);
+    }
+
+    /// A `u32` sink for the side-channel context tests.
+    #[derive(Clone)]
+    struct U32Sink;
+    impl Step for U32Sink {
+        type Input = u32;
+        type Outputs = ();
+        fn profile(&self) -> StepProfile {
+            StepProfile {
+                name: "U32Sink",
+                kind: StepKind::Serial,
+                sticky: false,
+                output_queues: vec![],
+                branch_ordering: vec![],
+            }
+        }
+        fn try_run(&mut self, _ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+            Ok(StepOutcome::Finished)
+        }
+    }
+
+    /// A channel a step reports reaches the contexts the runtime builds, through
+    /// the erased adapter, and the monitor's in-flight probe counts its bytes:
+    /// the probe the stall verdict reads, not a byte count handed to it.
+    #[rstest]
+    #[case::pool_contexts_bytes_held(false, Some(4096), 4096)]
+    #[case::pool_contexts_empty_channel(false, Some(0), 0)]
+    #[case::pool_contexts_no_channel(false, None, 0)]
+    #[case::fused_contexts_bytes_held(true, Some(4096), 4096)]
+    fn side_channels_flow_through_erased_step_into_contexts(
+        #[case] fused: bool,
+        #[case] held: Option<u64>,
+        #[case] expected_bytes: u64,
+    ) {
+        use crate::runtime::contexts::{build_chain_contexts, build_chain_contexts_fused};
+        use crate::topology::{BranchIdx, ChainGraph};
+
+        let ch = held.map(|b| Arc::new(FakeChannel(b, "inbox")) as Arc<dyn crate::SideChannel>);
+        let mut graph = ChainGraph::new();
+        let src = graph.register_step("ChannelStep", 1);
+        let sink = graph.register_step("U32Sink", 0);
+        graph.wire(src, BranchIdx(0), sink);
+        let steps: Vec<Box<dyn ErasedStep>> = vec![
+            Box::new(TypedStep::new(ChannelStep(ch.clone()))),
+            Box::new(TypedStep::new(U32Sink)),
+        ];
+        let contexts = if fused {
+            build_chain_contexts_fused(&steps, &graph)
+        } else {
+            build_chain_contexts(&steps, &graph, InstrumentationLevel::Off, false)
+        };
+        assert_eq!(contexts.side_channels.len(), usize::from(ch.is_some()));
+        assert_eq!(in_flight_bytes(&contexts), expected_bytes);
+    }
+
+    #[rstest]
+    #[case::with_stats(true)]
+    #[case::without_stats(false)]
+    fn stall_snapshot_names_side_channel(#[case] with_stats: bool) {
+        let stats = PipelineStats::new(vec![]);
+        let channels: Vec<Arc<dyn crate::SideChannel>> =
+            vec![Arc::new(FakeChannel(4096, "fanout inbox of Sort"))];
+        let lines = stall_snapshot_lines(with_stats.then_some(&stats), &channels);
+        let expected = "side channel: fanout inbox of Sort (4096 bytes in flight)";
+        assert!(lines.iter().any(|l| l == expected), "snapshot: {}", lines.join("\n"));
+    }
+
     #[test]
     fn classify_stall_stuck_work_below_fatal_only_warns() {
         // No progress with work stuck, but the stall has not persisted long
@@ -6194,6 +6377,7 @@ mod tests {
             4096,
             std::time::Duration::from_secs(10),
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6230,6 +6414,7 @@ mod tests {
             4096,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6247,6 +6432,7 @@ mod tests {
             4096,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6279,6 +6465,7 @@ mod tests {
                 4096,
                 warn,
                 None,
+                &[],
                 &signal,
                 mon_state,
             );
@@ -6326,6 +6513,7 @@ mod tests {
             4096,
             warn,
             None,
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6355,6 +6543,7 @@ mod tests {
             0,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6375,6 +6564,7 @@ mod tests {
             0,
             warn,
             Some(&stats),
+            &[],
             &signal,
             &mut mon_state,
         );
@@ -6434,6 +6624,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         };
         // 200 (transport) + 300 (reorder stash).
         assert_eq!(in_flight_bytes(&contexts), 500);
@@ -6446,6 +6637,7 @@ mod tests {
             holder_only_queues: vec![],
             edges: vec![],
             step_counters: vec![],
+            side_channels: vec![],
         };
         assert_eq!(in_flight_bytes(&empty), 0);
     }
