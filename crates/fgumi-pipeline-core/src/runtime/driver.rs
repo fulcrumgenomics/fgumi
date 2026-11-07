@@ -231,10 +231,14 @@ pub(crate) fn run_worker_loop(
         wake.start_pass();
 
         // Time the dispatch (busy) section vs the backoff sleep (idle) below,
-        // per worker, only when stats are on (`Instant::now()` is otherwise not
-        // called — the no-stats loop stays zero-cost). It starts before the
-        // resume dispatch, which can run a whole capped item.
-        let work_start = stats.map(|_| Instant::now());
+        // per pool worker, only when stats are on (the clock is otherwise not
+        // read — the no-stats loop stays zero-cost). A driver records its busy
+        // per step in `dispatch_one_step` instead, so it reads nothing here.
+        // Busy is on the stats' clock (`PipelineStats::elapsed_ns`), which may
+        // be coarse: it runs once per pass. It starts before the resume
+        // dispatch, which can run a whole capped item.
+        let work_start =
+            stats.filter(|_| matches!(worker.role(), WorkerRole::Pool)).map(|s| s.elapsed_ns());
 
         // 0. A phase cap refused this thread on its last pass and a release may
         // have woken it for that permit: poll the refusing step first, before
@@ -394,11 +398,8 @@ pub(crate) fn run_worker_loop(
         // inside `dispatch_one_step` (on the off-pool detached line, by step) so a
         // multi-step `Shared` group isn't collapsed onto one name — so nothing to
         // record here for a driver.
-        if let (Some(stats), Some(ws)) = (stats, work_start)
-            && let WorkerRole::Pool = worker.role()
-        {
-            let ns = u64::try_from(ws.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            stats.record_worker_busy(worker.thread_id, ns);
+        if let (Some(stats), Some(ws)) = (stats, work_start) {
+            stats.record_worker_busy(worker.thread_id, stats.ns_since(ws));
         }
 
         // 3. Exponential-backoff sleep on no-progress; reset on progress. The
@@ -462,7 +463,7 @@ pub(crate) fn run_worker_loop(
                 // pre-arm pass before it is skipped, after a wait that timed out.
                 // A productive re-poll is busy time (after a timeout it is the
                 // iteration's only pass); an empty one is neither busy nor idle.
-                let repoll_start = stats.filter(|_| !is_driver).map(|_| Instant::now());
+                let repoll_start = stats.filter(|_| !is_driver).map(|s| s.elapsed_ns());
                 #[cfg(test)]
                 test_hooks::count_pass(hooks.as_deref(), worker.thread_id, is_driver);
                 let recheck = round_robin_dispatch(
@@ -498,8 +499,7 @@ pub(crate) fn run_worker_loop(
                     if recheck.did_work
                         && let (Some(stats), Some(rs)) = (stats, repoll_start)
                     {
-                        let ns = u64::try_from(rs.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        stats.record_worker_busy(worker.thread_id, ns);
+                        stats.record_worker_busy(worker.thread_id, stats.ns_since(rs));
                     }
                     #[cfg(test)]
                     test_hooks::end_iteration(hooks.as_deref(), worker.thread_id, is_driver, None);
@@ -621,7 +621,7 @@ pub(crate) fn run_worker_loop(
                 // thread's next pass.
                 wake.start_pass();
                 // As on the event-count path: a productive re-poll is busy.
-                let repoll_start = stats.filter(|_| !is_driver).map(|_| Instant::now());
+                let repoll_start = stats.filter(|_| !is_driver).map(|s| s.elapsed_ns());
                 #[cfg(test)]
                 test_hooks::count_pass(hooks.as_deref(), worker.thread_id, is_driver);
                 let recheck = round_robin_dispatch(
@@ -651,8 +651,7 @@ pub(crate) fn run_worker_loop(
                     if recheck.did_work
                         && let (Some(stats), Some(rs)) = (stats, repoll_start)
                     {
-                        let ns = u64::try_from(rs.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        stats.record_worker_busy(worker.thread_id, ns);
+                        stats.record_worker_busy(worker.thread_id, stats.ns_since(rs));
                     }
                     worker.reset_backoff();
                     continue;
@@ -979,10 +978,13 @@ fn dispatch_one_step(
         pool: PoolHandle::new(wake, stats.map(|s| &**s), step_idx),
     };
 
-    // Time the dispatch only when stats collection is on. `Instant::now()`
-    // is ~20-50ns on Apple Silicon, ~50-100ns on x86_64; gating on
-    // `stats.is_some()` keeps the no-stats path zero-cost.
-    let start = stats.map(|_| Instant::now());
+    // Time the dispatch only when stats collection is on; gating on
+    // `stats.is_some()` keeps the no-stats path zero-cost. This runs on every
+    // dispatch, including the many that find nothing to do, so it reads the
+    // stats' clock (`PipelineStats::elapsed_ns`, coarse unless precise timing
+    // was asked for): a precise read is a system call on a host whose clock
+    // source user space cannot read.
+    let start_ns = stats.map(|s| s.elapsed_ns());
 
     // Run the step and capture `name` *while still holding the `Shared` guard*
     // (or with direct `&mut` for Owned/Exclusive). On `Finished`, mark outputs
@@ -1124,10 +1126,9 @@ fn dispatch_one_step(
         deliver_flushed_wake(wake, step_idx, &i.result, &snap, stats);
     }
 
-    if let (Some(stats), Some(start)) = (stats, start) {
-        let elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        // Wall ns at dispatch start, relative to pipeline start.
-        let start_ns = stats.elapsed_ns().saturating_sub(elapsed_ns);
+    if let (Some(stats), Some(start_ns)) = (stats, start_ns) {
+        // `start_ns` is the wall ns at dispatch start, relative to pipeline start.
+        let elapsed_ns = stats.ns_since(start_ns);
         // `None` (Skip) attempted no work, so there is nothing to record.
         if let Some(i) = info.as_ref() {
             match &i.result {

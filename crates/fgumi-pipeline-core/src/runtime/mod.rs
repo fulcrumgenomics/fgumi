@@ -1,6 +1,7 @@
 //! Runtime: per-worker step storage, chain contexts, drain coordination,
 //! worker pool, worker loop body. Built on top of Phase 1's trait surface.
 
+pub(crate) mod coarse_clock;
 pub(crate) mod contexts;
 pub(crate) mod detached;
 pub(crate) mod drain;
@@ -36,7 +37,7 @@ pub use scheduler::{
     ChainOrderScheduler, DrainFirstScheduler, RefillDrainScheduler, RefillSource, Scheduler,
     WalkDirection,
 };
-pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot, elapsed_ns};
+pub use stats::{PipelineStats, StatsSnapshot, StepStatsSnapshot, TimingResolution, elapsed_ns};
 pub(crate) use storage::build_worker_storage;
 pub(crate) use worker_core::WorkerCore;
 #[cfg(any(test, feature = "test-utils"))]

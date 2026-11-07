@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::erased::{ErasedStep, TypedStep, TypedStep2, TypedStepK};
 use super::item::HeapSize;
 use super::outputs::{Single, StepOutputs};
-use super::runtime::stats::PipelineStats;
+use super::runtime::stats::{PipelineStats, TimingResolution};
 use super::signal::{CancelHandle, PipelineSignal};
 use super::step::{Step, Step2, StepK};
 use super::topology::{BranchIdx, ChainGraph, StepIdx};
@@ -1131,11 +1131,20 @@ impl Pipeline {
     /// Construct a fresh `PipelineStats` collector sized to this pipeline's
     /// chain. Wrap the returned `Arc` and pass it into `PipelineConfig::stats`
     /// (or via `PipelineConfig::with_stats`) before calling `run`. Counters
-    /// can be read at any time after the run completes.
+    /// can be read at any time after the run completes. Times dispatches on
+    /// the precise clock; see [`Self::stats_with_timing`] for the coarse one.
     #[must_use]
     pub fn stats(&self) -> Arc<PipelineStats> {
+        self.stats_with_timing(TimingResolution::Precise)
+    }
+
+    /// [`Self::stats`], timing dispatches and busy sections on the `timing`
+    /// clock. The per-edge rates of an instrumented run use the precise wall
+    /// time whatever `timing` is.
+    #[must_use]
+    pub fn stats_with_timing(&self, timing: TimingResolution) -> Arc<PipelineStats> {
         let names: Vec<&'static str> = self.steps.iter().map(|s| s.profile().name).collect();
-        Arc::new(PipelineStats::new(names))
+        Arc::new(PipelineStats::new(names).with_timing(timing))
     }
 
     /// Every capped step in chain order, as `(step name, its cap)`. Steps
@@ -2213,7 +2222,7 @@ impl Pipeline {
             // verdict into the snapshot (the edges live in `contexts`, only
             // reachable here inside `run`); otherwise the edge-less snapshot.
             let snapshot = if config.instrumentation.is_on() {
-                stats.snapshot_with_edges(&contexts.edges, stats.elapsed_ns())
+                stats.snapshot_with_edges(&contexts.edges, stats.precise_elapsed_ns())
             } else {
                 stats.snapshot()
             };
@@ -3054,6 +3063,25 @@ mod tests {
     // `FromStr` is case-insensitive (it lowercases before matching), so tokens in
     // any case resolve to the same level — this is the clap value parser, so a CLI
     // `--pipeline-trace Deep` must be accepted the same as `deep`.
+    /// `Pipeline::stats` is the precise clock (explicitly requested stats rely
+    /// on it); `stats_with_timing` carries the clock it is given.
+    #[rstest]
+    #[case::default_stats_are_precise(None, TimingResolution::Precise)]
+    #[case::coarse_when_asked(Some(TimingResolution::Coarse), TimingResolution::Coarse)]
+    fn pipeline_stats_use_the_requested_clock(
+        #[case] timing: Option<TimingResolution>,
+        #[case] expected: TimingResolution,
+    ) {
+        let builder = Pipeline::builder();
+        builder.chain(StubSource).chain(StubSinkU32).into_sink_marker();
+        let pipeline = builder.build().expect("chain builds");
+        let stats = match timing {
+            Some(t) => pipeline.stats_with_timing(t),
+            None => pipeline.stats(),
+        };
+        assert_eq!(stats.timing(), expected);
+    }
+
     #[rstest]
     #[case::upper("OFF", InstrumentationLevel::Off)]
     #[case::mixed("Summary", InstrumentationLevel::Summary)]

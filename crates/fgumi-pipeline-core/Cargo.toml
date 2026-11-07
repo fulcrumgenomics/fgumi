@@ -15,6 +15,12 @@ log = { workspace = true }
 noodles = { workspace = true, features = ["sam"] }
 parking_lot = { workspace = true }
 
+# `CLOCK_MONOTONIC_COARSE` for `runtime::coarse_clock` (a safe wrapper over the
+# vDSO read; the crate root is `#![deny(unsafe_code)]`). Other platforms use
+# `std::time::Instant` and need nothing.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["time"] }
+
 [features]
 # Test-only support (`testing::StepProbe`, `Pipeline::phase_caps`): never part
 # of a normal build. Enabled by dependents' dev-dependencies.

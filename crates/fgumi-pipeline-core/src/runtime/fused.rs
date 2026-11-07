@@ -297,14 +297,13 @@ pub fn run_fused_single_thread(
                 pool: PoolHandle::new(&wake, stats.map(|s| &**s), StepIdx(i)),
             };
 
-            // Time the dispatch only when stats collection is on (mirrors
-            // `dispatch_one_step`): `Instant::now()` is non-trivial on the hot
-            // path, so gate it on `stats.is_some()`.
-            let start = stats.map(|_| Instant::now());
+            // Time the dispatch only when stats collection is on, on the stats'
+            // clock (mirrors `dispatch_one_step`): it runs on every dispatch, so
+            // gate it on `stats.is_some()`.
+            let start_ns = stats.map(|s| s.elapsed_ns());
             let result = steps[i].try_run_erased(&mut ctx);
-            if let (Some(stats), Some(start)) = (stats, start) {
-                let elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                let start_ns = stats.elapsed_ns().saturating_sub(elapsed_ns);
+            if let (Some(stats), Some(start_ns)) = (stats, start_ns) {
+                let elapsed_ns = stats.ns_since(start_ns);
                 match &result {
                     Ok(outcome) => stats.record(StepIdx(i), *outcome, start_ns, elapsed_ns),
                     Err(_) => stats.record_error(StepIdx(i), start_ns, elapsed_ns),

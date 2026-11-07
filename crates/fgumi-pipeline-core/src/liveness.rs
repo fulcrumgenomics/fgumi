@@ -8,8 +8,8 @@
 //!
 //! It used to get that total from `PipelineStats`, which coupled the monitor to
 //! full instrumentation — and full instrumentation is deliberately not free.
-//! `dispatch_one_step` times each dispatch with `Instant::now()` (~20–50 ns on
-//! Apple Silicon, ~50–100 ns on `x86_64`) and gates that on `stats.is_some()`
+//! `dispatch_one_step` timed each dispatch with `Instant::now()` (~20–50 ns on
+//! Apple Silicon, ~50–100 ns on `x86_64`) and gated that on `stats.is_some()`
 //! precisely to keep the uninstrumented path zero-cost. So the monitor could
 //! only be armed by paying a per-dispatch timing cost on every run, which is why
 //! it shipped disarmed by default and every wedge hung silently instead.
