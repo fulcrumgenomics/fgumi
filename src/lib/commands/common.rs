@@ -1701,6 +1701,19 @@ pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
     Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
 }
 
+/// Parse a read-buffer size (e.g. "2GiB", "512M", "0").
+///
+/// Sizes parse exactly as `--max-memory` does (a plain number is MiB), except
+/// that zero is accepted, in any spelling ("0", "0B", "0GiB"), and means no
+/// buffer.
+pub(crate) fn parse_read_buffer(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    if s.parse::<u64>() == Ok(0) || s.parse::<ByteSize>().is_ok_and(|size| size.0 == 0) {
+        return Ok(0);
+    }
+    parse_memory_bytes(s, "Read buffer")
+}
+
 /// Parse a max-temp-files string (e.g. "64", "auto").
 ///
 /// Rejects values below [`MIN_MAX_TEMP_FILES`] at parse time rather than

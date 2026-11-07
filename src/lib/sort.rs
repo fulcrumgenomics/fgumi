@@ -79,6 +79,7 @@ pub fn sort_bam(config: &SortConfig) -> Result<SortStats> {
         scheduler,
         queue_memory,
         async_reader: false,
+        read_buffer: 0,
         read_streams: fgumi_bam_io::ReadStreams::Auto,
         verify_crc: true,
         command_line: "fgumi_lib::sort::sort_bam".to_string(),

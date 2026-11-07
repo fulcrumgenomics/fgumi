@@ -34,6 +34,16 @@ pub struct ChainSpec {
     /// the sort's chain-native input path, which reads positionally on the
     /// pool (see [`Self::read_streams`]).
     pub async_reader: bool,
+    /// Byte budget of the read buffer for a streamed BAM/SAM source (stdin, a
+    /// FIFO; see [`fgumi_bam_io::is_stream_input`]): a dedicated thread keeps
+    /// reading the stream into up to this many bytes while the chain is busy, so
+    /// the process writing it is not blocked
+    /// ([`fgumi_bam_io::read_buffer::ReadBuffer`]). `0` reads the stream
+    /// directly, as every command but `sort` does. Ignored for a regular file.
+    /// When it applies, a sort stage's in-memory budget is reduced by it, so the
+    /// caller sizes it out of that budget (`sort --read-buffer`); a buffer as
+    /// large as that budget fails the chain build.
+    pub read_buffer: usize,
     /// Concurrent positional-read policy for a seekable BGZF file source.
     /// `Fixed(1)` (the default every command but `sort` uses) is the plain
     /// sequential/async reader; `sort` sets this from its `--read-streams` flag,
@@ -97,6 +107,7 @@ impl ChainSpec {
             scheduler: ctx.scheduler.clone(),
             queue_memory: ctx.queue_memory.clone(),
             async_reader: ctx.io.async_reader,
+            read_buffer: 0,
             // Non-sort single-stage commands do not expose a read-stream knob;
             // keep the plain sequential/async reader. Only sort sets this.
             read_streams: ReadStreams::Fixed(1),
@@ -129,6 +140,7 @@ impl ChainSpec {
             scheduler: ctx.scheduler.clone(),
             queue_memory: ctx.queue_memory.clone(),
             async_reader: ctx.io.async_reader,
+            read_buffer: 0,
             read_streams: ReadStreams::Fixed(1),
             verify_crc: ctx.io.effective_check_crc(),
             command_line: ctx.command_line.to_string(),

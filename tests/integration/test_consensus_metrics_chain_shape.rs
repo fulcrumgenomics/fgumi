@@ -84,6 +84,7 @@ fn simplex_chain_dag(metrics: Option<std::path::PathBuf>) -> String {
         scheduler: SchedulerOptions::default(),
         queue_memory: QueueMemoryOptions::default(),
         async_reader: false,
+        read_buffer: 0,
         read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         verify_crc: true,
         command_line: "fgumi simplex".to_string(),

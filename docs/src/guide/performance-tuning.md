@@ -160,6 +160,33 @@ including `sort`. It is most effective when I/O latency is high (network storage
 cold page cache, small OS readahead). On systems where you can already set 4 MB+
 readahead, the additional benefit is modest.
 
+### `fgumi sort --read-buffer` (piped input)
+
+Each time `fgumi sort` seals a run (sorts it, compresses it and writes it to a
+temporary file), it stops consuming input for a few seconds. A pipe holds very
+little, so without a buffer the process writing into it -- an aligner or a
+duplicate marker upstream -- blocks until the sort reads again. `--read-buffer`
+(default `2GiB`) has a dedicated thread keep reading the pipe into a buffer
+meanwhile, so the upstream process keeps running. It applies to streamed input
+only (stdin, a FIFO, process substitution); a regular file (including
+`-i - < in.bam`) is read without one.
+
+The buffer is taken out of `--max-memory`, which stays the total, and is capped
+at a quarter of the resolved budget. The final merge starts after the input has
+been read, so its spill read-ahead is sized from the whole budget. The startup
+log names the size in force (`Read buffer: ...`), and when the input is closed a
+second line says how full the buffer got and how long it was full (`full N times
+for S s`): time during which the upstream process could block. If that is more
+than a few seconds, a larger buffer helps; `--read-buffer 0` turns it off. The
+sorted records and their order are identical at any size; only the `@PG`
+command line records the option. On non-Unix systems stdin cannot be inspected,
+so it is read without a buffer.
+
+```bash
+aligner ... | duplicate-marker ... | fgumi sort -i - -o sorted.bam --order coordinate \
+  -@ 32 --memory-per-thread false -m 20G --read-buffer 2GiB
+```
+
 ### AWS EBS Volume Throughput
 
 On AWS, `gp3` volumes default to 125 MB/s throughput regardless of size. For BAM

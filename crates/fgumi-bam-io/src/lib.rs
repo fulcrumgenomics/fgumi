@@ -23,6 +23,7 @@ pub mod paths;
 pub mod pread;
 pub mod prefetch_reader;
 pub mod progress;
+pub mod read_buffer;
 pub mod reader;
 pub mod reorder;
 pub mod sam_input;
@@ -39,7 +40,7 @@ pub use grouping::{
 pub use library::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 pub use mem_estimate::MemoryEstimate;
 pub use output::{OutputFile, OutputSink, close_buffered, open_output_sink, persist_after_close};
-pub use paths::{is_stdin_path, is_stdout_path};
+pub use paths::{is_stdin_path, is_stdout_path, is_stream_input};
 pub use progress::ProgressTracker;
 pub use reader::{
     BamReaderAuto, BgzfReaderEnum, ChainedReader, FgumiBgzfReader, PipelineReaderOpts,

@@ -2451,6 +2451,7 @@ impl Command for RunAll {
             scheduler: self.scheduler_opts.clone(),
             queue_memory: self.queue_memory.clone(),
             async_reader: self.async_reader,
+            read_buffer: 0,
             read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
             verify_crc,
             command_line: command_line.to_string(),

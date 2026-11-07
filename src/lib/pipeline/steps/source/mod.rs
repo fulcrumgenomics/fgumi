@@ -167,6 +167,26 @@ impl InputSource {
         path: P,
         opts: fgumi_bam_io::PipelineReaderOpts,
     ) -> io::Result<Self> {
+        Self::open_with_read_buffer(path, opts, 0)
+    }
+
+    /// [`InputSource::open_with_opts`] that reads a streamed input (stdin, a
+    /// FIFO, a `/dev/fd/N` from process substitution — see
+    /// [`fgumi_bam_io::is_stream_input`]) through a
+    /// [`fgumi_bam_io::read_buffer::ReadBuffer`] of `read_buffer` bytes, so the
+    /// process writing it is not blocked while the consumer pauses. `0` reads
+    /// it directly. A regular file, including stdin redirected from one,
+    /// ignores `read_buffer`: nothing upstream waits on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from file open, stdin read, header parse, or starting
+    /// the read buffer's thread.
+    pub(crate) fn open_with_read_buffer<P: AsRef<Path>>(
+        path: P,
+        opts: fgumi_bam_io::PipelineReaderOpts,
+        read_buffer: usize,
+    ) -> io::Result<Self> {
         let path = path.as_ref();
         let is_stdin = fgumi_bam_io::is_stdin_path(path);
 
@@ -185,10 +205,19 @@ impl InputSource {
             // The path is just `-`, so there is no suffix to consult and the
             // content decides. `PipelineReaderOpts` is not threaded through here:
             // there is no path to reopen, so there is no async-reader wiring.
-            open_stream_by_content(Box::new(io::stdin()))
-        } else if suffix_is_bam {
+            // Stdin redirected from a regular file has no writer to wait on, so
+            // it is read directly.
+            let read_buffer = if read_buffer > 0 && fgumi_bam_io::is_stream_input(path) {
+                read_buffer
+            } else {
+                0
+            };
+            open_stream_by_content(read_buffered(Box::new(io::stdin()), read_buffer)?, "stdin")
+        } else if suffix_is_bam && !(read_buffer > 0 && fgumi_bam_io::is_stream_input(path)) {
             // BAM file: parse header via the existing helper, which
-            // handles the seek-to-0 + opt.async_reader wiring.
+            // handles the seek-to-0 + opt.async_reader wiring. A FIFO named
+            // `*.bam` that is to be read through the read buffer goes to the
+            // content branch below instead, which buffers non-regular inputs.
             let (reader, header) =
                 fgumi_bam_io::create_bam_reader_for_pipeline_with_opts(path, opts)
                     .map_err(|e| open_bam_error(path, &e))?;
@@ -211,7 +240,10 @@ impl InputSource {
                 // Non-regular: classify in-stream. Same trade-off the stdin branch
                 // makes — no async-reader wiring, because there is no reopenable
                 // path.
-                return open_stream_by_content(Box::new(file));
+                return open_stream_by_content(
+                    read_buffered(Box::new(file), read_buffer)?,
+                    &path.display().to_string(),
+                );
             }
 
             // Regular file: classify here, then choose between keeping the text
@@ -308,7 +340,10 @@ fn take_format_prefix<R: Read + ?Sized>(reader: &mut R) -> io::Result<(Vec<u8>, 
 /// bare `\x1f` check cannot tell BGZF from plain gzip, and answering "BGZF" for
 /// a plain-gzip member hands it to a block reader that rejects it — the
 /// misleading diagnosis that classifier exists to prevent.
-fn open_stream_by_content(reader: Box<dyn Read + Send>) -> io::Result<InputSource> {
+///
+/// `subject` names the stream in a BAM-header error (`stdin`, or the FIFO's
+/// path).
+fn open_stream_by_content(reader: Box<dyn Read + Send>, subject: &str) -> io::Result<InputSource> {
     let mut reader = reader;
     let (prefix, format) = take_format_prefix(&mut reader)?;
     match format {
@@ -317,7 +352,7 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>) -> io::Result<InputSourc
             "input stream is empty (expected BAM or SAM records)",
         )),
         InputFormat::Bgzf => {
-            open_bam_from_stdin_boxed_buf(buffered(ChainedReader::new(prefix, reader)))
+            open_bam_from_boxed_buf(buffered(ChainedReader::new(prefix, reader)), subject)
         }
         InputFormat::Text => open_sam_from_boxed_buf(buffered(ChainedReader::new(prefix, reader))),
         // Plain gzip: one deflate stream, so no block-parallel decode. Decompress
@@ -333,10 +368,10 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>) -> io::Result<InputSourc
                 Box::new(MultiGzDecoder::new(ChainedReader::new(prefix, reader)));
             let (inner_prefix, inner_format) = take_format_prefix(&mut *decoded)?;
             match inner_format {
-                InputFormat::Bgzf => open_bam_from_stdin_boxed_buf(buffered(ChainedReader::new(
-                    inner_prefix,
-                    decoded,
-                ))),
+                InputFormat::Bgzf => open_bam_from_boxed_buf(
+                    buffered(ChainedReader::new(inner_prefix, decoded)),
+                    subject,
+                ),
                 InputFormat::Text => {
                     open_sam_from_boxed_buf(buffered(ChainedReader::new(inner_prefix, decoded)))
                 }
@@ -354,23 +389,31 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>) -> io::Result<InputSourc
     }
 }
 
+/// Read `reader` through a [`fgumi_bam_io::read_buffer::ReadBuffer`] of
+/// `budget` bytes, or directly when `budget` is `0`.
+///
+/// # Errors
+///
+/// Returns the error from starting the read buffer's thread.
+fn read_buffered(reader: Box<dyn Read + Send>, budget: usize) -> io::Result<Box<dyn Read + Send>> {
+    if budget == 0 {
+        Ok(reader)
+    } else {
+        Ok(Box::new(fgumi_bam_io::read_buffer::ReadBuffer::try_new(reader, budget)?))
+    }
+}
+
 /// Box a reader as the buffered stream both openers take.
 fn buffered<R: Read + Send + 'static>(reader: R) -> Box<dyn BufRead + Send> {
     Box::new(BufReader::with_capacity(2 * 1024 * 1024, reader))
 }
 
-/// Wrap an already-buffered stdin-shape BAM reader into a BAM
-/// `InputSource`. The BGZF reader's header-probe goes through a
-/// `TeeReader` so we can replay the consumed header bytes ahead of the
-/// remaining stdin stream via `ChainedReader`. File inputs take the
-/// re-open-at-byte-0 path via `create_bam_reader_for_pipeline_with_opts`
-/// and never reach this function.
-fn open_bam_from_stdin_boxed_buf(buf: Box<dyn BufRead + Send>) -> io::Result<InputSource> {
-    open_bam_from_boxed_buf(buf, "stdin")
-}
-
-/// [`open_bam_from_stdin_boxed_buf`] for any buffered BAM stream; `subject`
-/// names it in the header-parse error.
+/// Wrap an already-buffered BAM stream (stdin, a FIFO, or an open file) into a
+/// BAM `InputSource`; `subject` names it in the header-parse error. The BGZF
+/// reader's header-probe goes through a `TeeReader` so we can replay the
+/// consumed header bytes ahead of the remaining stream via `ChainedReader`.
+/// Reopenable files otherwise take the re-open-at-byte-0 path via
+/// `create_bam_reader_for_pipeline_with_opts`.
 fn open_bam_from_boxed_buf(buf: Box<dyn BufRead + Send>, subject: &str) -> io::Result<InputSource> {
     let tee = TeeReader::new(buf);
     let bgzf = BgzfReader::new(tee);
@@ -692,7 +735,7 @@ read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n";
         let bytes = std::fs::read(write_bam(".bam")).unwrap();
         let buf: Box<dyn BufRead + Send> = Box::new(BufReader::new(io::Cursor::new(bytes.clone())));
 
-        let source = open_bam_from_stdin_boxed_buf(buf).unwrap();
+        let source = open_bam_from_boxed_buf(buf, "stdin").unwrap();
         let InputSource::Bam { mut reader, header } = source else {
             panic!("expected BAM source");
         };

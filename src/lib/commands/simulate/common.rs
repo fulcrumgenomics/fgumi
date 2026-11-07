@@ -730,6 +730,7 @@ where
         scheduler,
         queue_memory,
         async_reader: false,
+        read_buffer: 0,
         read_streams: fgumi_bam_io::ReadStreams::Fixed(1),
         verify_crc: true,
         command_line: String::new(),

@@ -286,6 +286,7 @@ impl Fastq {
             scheduler: self.scheduler.clone(),
             queue_memory: self.resolve_queue_memory(),
             async_reader: false,
+            read_buffer: 0,
             // fastq exposes no read-stream knob; keep the plain sequential reader.
             read_streams: ReadStreams::Fixed(1),
             // Match the default CRC policy every other command uses: verify a file
