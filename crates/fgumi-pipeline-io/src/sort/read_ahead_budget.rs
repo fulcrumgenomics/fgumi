@@ -2,11 +2,12 @@
 //!
 //! The read-ahead target `R` is derived from `--max-memory` (`total / 16`,
 //! clamped to 64 MiB ..= 512 MiB). It is **not** subtracted from the sort
-//! buffer, so it adds to it: the final run is merged from memory (it is never
-//! spilled), so the merge's read-ahead coexists with up to one full sort
-//! buffer. Charging `R` to the buffer instead would force earlier spills —
-//! more runs, more merge work — for every sort, to save at most `R` at the
-//! merge.
+//! buffer, so it adds to it: in the serial merge the final run is merged from
+//! memory (it is never spilled), so the merge's read-ahead coexists with up to
+//! one full sort buffer. Range mode spills the final run and has its own
+//! budget (see `merge_mode`). Charging `R` to the buffer instead would force
+//! earlier spills — more runs, more merge work — for every sort, to save at
+//! most `R` at the merge.
 //!
 //! Every live slot may always hold its **cold terms**: a cold allowance, an
 //! even share of `R` after the hot reserve (`(R − HOT_SLOTS × hot) / k`,
@@ -126,11 +127,19 @@ pub struct ReadAheadBudget {
     pub fifo_cold: u32,
 }
 
+/// The serial merge's read-ahead target `R = clamp(merge_memory / 16, 64 MiB,
+/// 512 MiB)`: what [`ReadAheadBudget::resolve`] splits over the slots, and
+/// the range merge's budget floor.
+#[must_use]
+pub(crate) fn serial_read_ahead(merge_memory: u64) -> u64 {
+    (merge_memory / R_DIVISOR).clamp(R_FLOOR, R_CEIL)
+}
+
 impl ReadAheadBudget {
     /// Split `R` (from `total_memory`) over `k` slots.
     #[must_use]
     pub fn resolve(total_memory: u64, k: usize) -> Self {
-        let r = (total_memory / R_DIVISOR).clamp(R_FLOOR, R_CEIL);
+        let r = serial_read_ahead(total_memory);
         let cold_pool = r.saturating_sub(HOT_SLOTS * HOT_ALLOWANCE_BYTES);
         let cold_allowance =
             (cold_pool / k.max(1) as u64).clamp(COLD_FILL_MIN_BYTES, COLD_ALLOWANCE_MAX_BYTES);

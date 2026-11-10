@@ -17,7 +17,7 @@ fn splitmix64(mut x: u64) -> u64 {
 /// One soak run with `seed`.
 fn soak_once(dir: &std::path::Path, bytes: &[u8], oracle: &[Vec<u8>], seed: u64) {
     let path = dir.join("run.spill");
-    let slot = fgumi_sort::open_spill_slot(&path, 0).unwrap();
+    let slot = fgumi_sort::open_spill_slot(&path, 0, fgumi_sort::FramesEnd::AtEof).unwrap();
     let caps = [1u32, 2, 8];
     slot.set_fifo_cap(caps[usize::try_from(seed % 3).unwrap()]);
     let pool = SliceBufferPool::new(16);

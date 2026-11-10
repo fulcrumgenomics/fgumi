@@ -57,7 +57,7 @@ fn block(
     offset: u64,
     len: usize,
     run_seq: u32,
-    seals_to_spill: bool,
+    seal: RunSeal,
 ) -> InflatedBlock {
     InflatedBlock {
         arena: Arc::clone(arena),
@@ -66,7 +66,8 @@ fn block(
         len: u32::try_from(len).unwrap(),
         is_last_of_run: true,
         run_seq,
-        seals_to_spill,
+        seal,
+        index_stride: 1,
     }
 }
 
@@ -83,11 +84,17 @@ fn ordinals_are_dense_with_every_terminal_batch() {
     let run0: Vec<Vec<u8>> = (0..128).map(body).collect();
     let data0 = [bam_header(), frames(&run0)].concat();
     let (a0, at0) = arena_with(0, &data0);
-    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, true)).unwrap(), 128);
+    assert_eq!(
+        step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, RunSeal::Spill)).unwrap(),
+        128
+    );
     let run1: Vec<Vec<u8>> = (128..198).map(body).collect();
     let data1 = frames(&run1);
     let (a1, at1) = arena_with(FRONT_REGION, &data1);
-    assert_eq!(step.ingest_block(&block(&a1, 1, at1, data1.len(), 1, false)).unwrap(), 70);
+    assert_eq!(
+        step.ingest_block(&block(&a1, 1, at1, data1.len(), 1, RunSeal::Residual)).unwrap(),
+        70
+    );
     let batches: Vec<_> = step.pending.drain(..).collect();
     let got: Vec<(u64, u32, u64, bool)> = batches
         .iter()
@@ -104,9 +111,92 @@ fn ordinals_are_dense_with_every_terminal_batch() {
         ]
     );
     let ends: Vec<RunEnd> = batches.iter().filter_map(|b| b.run_end).collect();
-    assert!(ends[0].seals_to_spill && !ends[1].seals_to_spill);
+    assert_eq!((ends[0].seal, ends[1].seal), (RunSeal::Spill, RunSeal::Residual));
     assert_eq!((ends[0].records_ingested_so_far, ends[1].records_ingested_so_far), (128, 198));
     assert!(step.finalized, "the residual run finishes the scan");
+}
+
+/// Run `step` over one residual run of ten records with `ledger` attached and
+/// return the spill key kind the ledger saw before and after.
+fn published_kind<X: ArenaKeyExtractor>(
+    step: FindRecordBoundaries<X>,
+) -> (Option<fgumi_sort::SpillKeyKind>, Option<fgumi_sort::SpillKeyKind>) {
+    let ledger = RunLedger::new(None);
+    let mut step = step.with_run_ledger(Arc::clone(&ledger));
+    let before = ledger.spill_key_kind();
+    let bodies: Vec<Vec<u8>> = (0..10).map(body).collect();
+    let data = [bam_header(), frames(&bodies)].concat();
+    let (arena, at) = arena_with(0, &data);
+    step.ingest_block(&block(&arena, 0, at, data.len(), 0, RunSeal::Residual)).unwrap();
+    (before, ledger.spill_key_kind())
+}
+
+/// The boundary step publishes the sort's spill key kind to the run ledger
+/// when the first record provisions the key context. Columns: the kind the
+/// ledger holds after one run.
+#[rstest::rstest]
+#[case::coordinate(published_kind(FindCoordinateBoundaries::new(1, 1 << 20)), fgumi_sort::SpillKeyKind::Coordinate)]
+#[case::template_k24(
+    published_kind(FindTemplateBoundaries::new(
+        TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::None),
+        1 << 20,
+    )),
+    fgumi_sort::SpillKeyKind::TemplateK24
+)]
+#[case::template_cb32(
+    published_kind(FindTemplateBoundaries::new(
+        TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::Explicit { cb: true, tertiary: false }),
+        1 << 20,
+    )),
+    fgumi_sort::SpillKeyKind::TemplateCb32
+)]
+#[case::template_tert32(
+    published_kind(FindTemplateBoundaries::new(
+        TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::Explicit { cb: false, tertiary: true }),
+        1 << 20,
+    )),
+    fgumi_sort::SpillKeyKind::TemplateTert32
+)]
+#[case::template_k40(
+    published_kind(FindTemplateBoundaries::new(
+        TemplateKeySeed::from_header(&Header::default(), None, KeyTypesSpec::Full),
+        1 << 20,
+    )),
+    fgumi_sort::SpillKeyKind::TemplateK40
+)]
+fn boundary_step_publishes_the_spill_key_kind(
+    #[case] seen: (Option<fgumi_sort::SpillKeyKind>, Option<fgumi_sort::SpillKeyKind>),
+    #[case] expected: fgumi_sort::SpillKeyKind,
+) {
+    assert_eq!(seen, (None, Some(expected)));
+}
+
+/// The run's index stride rides from its last inflated block onto its
+/// `RunEnd`; an open run sealed at finalize (no block said otherwise) carries
+/// 0. Columns: the last block's stride, expected `RunEnd` strides.
+#[rstest::rstest]
+#[case::dense(1, 1)]
+#[case::sparse(4, 4)]
+#[case::off(0, 0)]
+fn run_end_carries_the_stride(#[case] stride: u32, #[case] expected: u32) {
+    let mut step = FindTemplateBoundaries::new(seed(), 1 << 20).with_batch_records(64);
+    let bodies: Vec<Vec<u8>> = (0..10).map(body).collect();
+    let data = [bam_header(), frames(&bodies)].concat();
+    let (arena, at) = arena_with(0, &data);
+    let mut last = block(&arena, 0, at, data.len(), 0, RunSeal::Spill);
+    last.index_stride = stride;
+    step.ingest_block(&last).unwrap();
+    let ends: Vec<RunEnd> = step.pending.drain(..).filter_map(|b| b.run_end).collect();
+    assert_eq!(ends.iter().map(|e| e.index_stride).collect::<Vec<_>>(), vec![expected]);
+    // A second run left open at EOF is sealed by `finalize` as the residual.
+    let more = frames(&(10..12).map(body).collect::<Vec<_>>());
+    let (arena, at) = arena_with(FRONT_REGION, &more);
+    let mut open = block(&arena, 1, at, more.len(), 1, RunSeal::Residual);
+    open.is_last_of_run = false;
+    step.ingest_block(&open).unwrap();
+    step.finalize().unwrap();
+    let ends: Vec<RunEnd> = step.pending.drain(..).filter_map(|b| b.run_end).collect();
+    assert_eq!(ends.iter().map(|e| e.index_stride).collect::<Vec<_>>(), vec![0]);
 }
 
 /// A run whose bytes end mid-record carries that partial record into the next
@@ -119,9 +209,12 @@ fn a_straddler_is_record_zero_of_the_next_run() {
     let cut = all.len() - 20; // the last record straddles
     let data0 = [bam_header(), all[..cut].to_vec()].concat();
     let (a0, at0) = arena_with(0, &data0);
-    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, true)).unwrap(), 9);
+    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, RunSeal::Spill)).unwrap(), 9);
     let (a1, at1) = arena_with(FRONT_REGION, &all[cut..]);
-    assert_eq!(step.ingest_block(&block(&a1, 1, at1, all.len() - cut, 1, false)).unwrap(), 1);
+    assert_eq!(
+        step.ingest_block(&block(&a1, 1, at1, all.len() - cut, 1, RunSeal::Residual)).unwrap(),
+        1
+    );
     let batches: Vec<_> = step.pending.drain(..).collect();
     let last = batches.last().expect("run 1's batch");
     assert_eq!((last.n_records, last.first_record_index), (1, 0));
@@ -147,9 +240,12 @@ fn run_bytes_count_only_complete_records() {
     header.extend_from_slice(&bam_header()[8..]);
     let data0 = [header, all[..cut].to_vec()].concat();
     let (a0, at0) = arena_with(0, &data0);
-    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, true)).unwrap(), 9);
+    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, RunSeal::Spill)).unwrap(), 9);
     let (a1, at1) = arena_with(FRONT_REGION, &all[cut..]);
-    assert_eq!(step.ingest_block(&block(&a1, 1, at1, all.len() - cut, 1, false)).unwrap(), 1);
+    assert_eq!(
+        step.ingest_block(&block(&a1, 1, at1, all.len() - cut, 1, RunSeal::Residual)).unwrap(),
+        1
+    );
     let ends: Vec<RunEnd> = step.pending.drain(..).filter_map(|b| b.run_end).collect();
     let last = frames(&bodies[9..]).len() as u64;
     assert_eq!(ends[0].run_bytes, all.len() as u64 - last, "run 0: nine whole records");
@@ -166,7 +262,7 @@ fn a_header_larger_than_a_run_says_so() {
     header.extend_from_slice(&[b'@'; 1_000]);
     let (a, at) = arena_with(0, &header);
     let mut spill = FindTemplateBoundaries::new(seed(), 1 << 20);
-    let err = spill.ingest_block(&block(&a, 0, at, header.len(), 0, true)).unwrap_err();
+    let err = spill.ingest_block(&block(&a, 0, at, header.len(), 0, RunSeal::Spill)).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         err.to_string(),
@@ -174,7 +270,7 @@ fn a_header_larger_than_a_run_says_so() {
          bytes read without reaching its end) — raise --max-memory"
     );
     let mut last = FindTemplateBoundaries::new(seed(), 1 << 20);
-    let err = last.ingest_block(&block(&a, 0, at, header.len(), 0, false)).unwrap_err();
+    let err = last.ingest_block(&block(&a, 0, at, header.len(), 0, RunSeal::Residual)).unwrap_err();
     assert_eq!(
         err.to_string(),
         "FindTemplateBoundaries: input too short to contain a valid BAM header"
@@ -202,7 +298,7 @@ fn a_truncated_final_record_is_an_error() {
     let all = frames(&(0..3).map(body).collect::<Vec<_>>());
     let data = [bam_header(), all[..all.len() - 5].to_vec()].concat();
     let (a, at) = arena_with(0, &data);
-    let err = step.ingest_block(&block(&a, 0, at, data.len(), 0, false)).unwrap_err();
+    let err = step.ingest_block(&block(&a, 0, at, data.len(), 0, RunSeal::Residual)).unwrap_err();
     assert_eq!(err.to_string(), "truncated BAM: final record incomplete at end of input");
 }
 
@@ -214,7 +310,7 @@ fn scan_rejects_a_frame_shorter_than_a_bam_record() {
     let mut step = FindTemplateBoundaries::new(seed(), 1 << 20);
     let data = [bam_header(), frames(&[body(0), vec![0u8; 12]])].concat();
     let (a, at) = arena_with(0, &data);
-    let err = step.ingest_block(&block(&a, 0, at, data.len(), 0, false)).unwrap_err();
+    let err = step.ingest_block(&block(&a, 0, at, data.len(), 0, RunSeal::Residual)).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         err.to_string(),
@@ -369,10 +465,12 @@ fn sort_run_reports_the_lowest_indexed_violation_whatever_the_arrival_order() {
     let ctx = seed().provision(&first);
     let (arena, _) = arena_with(0, b"x");
     let end = RunEnd {
-        seals_to_spill: false,
+        seal: RunSeal::Residual,
         records_ingested_so_far: 384,
         run_bytes: 0,
         scan_end: Instant::now(),
+        index_stride: 1,
+        max_record_bytes: 0,
     };
     let mut items = vec![ref_batch(&ctx, &arena, 5, Some(300), Some(end))];
     items.extend((1..5).map(|o| ref_batch(&ctx, &arena, o, None, None)));
@@ -497,6 +595,10 @@ impl ArenaKeyExtractor for ProbeKeys {
         8
     }
 
+    fn spill_key_kind(_ctx: &Self::Ctx) -> fgumi_sort::SpillKeyKind {
+        fgumi_sort::SpillKeyKind::Coordinate
+    }
+
     fn extract_batch(
         _ctx: &Self::Ctx,
         (): &mut (),
@@ -581,10 +683,12 @@ fn probe_batch(shared: &Arc<ProbeShared>) -> RefBatch<ProbeKeys> {
         violation: None,
         keyed_at: now,
         run_end: Some(RunEnd {
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
             records_ingested_so_far: 4,
             run_bytes: 0,
             scan_end: now,
+            index_stride: 1,
+            max_record_bytes: 0,
         }),
     }
 }
@@ -702,10 +806,12 @@ fn census_classifies_batches_against_their_runs_scan_end() {
     let (mut a, mut b) = (out.pop().expect("run 0"), out.pop().expect("run 1"));
     let t0 = Instant::now();
     let end = |ingested, scan_end| RunEnd {
-        seals_to_spill: true,
+        seal: RunSeal::Spill,
         records_ingested_so_far: ingested,
         run_bytes: 0,
         scan_end,
+        index_stride: 1,
+        max_record_bytes: 0,
     };
     (a.keyed_at, a.run_end) = (t0, Some(end(5, t0 + Duration::from_secs(1))));
     (b.keyed_at, b.run_end) =
@@ -1017,14 +1123,14 @@ fn boundaries_finalize_cuts_the_open_run_as_the_residual() {
     let bodies: Vec<Vec<u8>> = (0..10).map(|i| coord_body(i, 0, 10)).collect();
     let data = [bam_header(), frames(&bodies)].concat();
     let (a, at) = arena_with(0, &data);
-    let mut open = block(&a, 0, at, data.len(), 0, false);
+    let mut open = block(&a, 0, at, data.len(), 0, RunSeal::Residual);
     open.is_last_of_run = false;
     assert_eq!(step.ingest_block(&open).unwrap(), 10);
     assert!(step.pending.iter().all(|b| b.run_end.is_none()), "no run end before finalize");
     step.finalize().unwrap();
     let ends: Vec<RunEnd> = step.pending.iter().filter_map(|b| b.run_end).collect();
     assert_eq!(ends.len(), 1);
-    assert!(!ends[0].seals_to_spill && ends[0].records_ingested_so_far == 10);
+    assert!(ends[0].seal == RunSeal::Residual && ends[0].records_ingested_so_far == 10);
     let n = step.pending.len();
     step.finalize().unwrap();
     assert_eq!(step.pending.len(), n, "a second finalize cuts nothing");
@@ -1054,10 +1160,12 @@ fn sort_run_stages_residual_before_all_announced_each_once() {
         violation: None,
         keyed_at: now,
         run_end: Some(RunEnd {
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
             records_ingested_so_far: 5,
             run_bytes: data.len() as u64,
             scan_end: now,
+            index_stride: 1,
+            max_record_bytes: 0,
         }),
     };
     let mut sort = SortCoordinateRun::new(1, 1 << 20);
@@ -1078,7 +1186,12 @@ fn sort_run_stages_residual_before_all_announced_each_once() {
     assert!(matches!(&events[0], SortChunkEvent::Residual { chunk, .. } if chunk.len() == 5));
     assert!(matches!(
         events[1],
-        SortChunkEvent::AllAnnounced { slot_count: 0, memory_chunk_count: 1, total_records: 5 }
+        SortChunkEvent::AllAnnounced {
+            slot_count: 0,
+            memory_chunk_count: 1,
+            total_records: 5,
+            index_stride: 1
+        }
     ));
 }
 
@@ -1114,10 +1227,12 @@ fn sort_run_sizes_the_queryname_pool_to_sort_threads(#[values(1usize, 3)] sort_t
         violation: None,
         keyed_at: now,
         run_end: Some(RunEnd {
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
             records_ingested_so_far: 4,
             run_bytes: data.len() as u64,
             scan_end: now,
+            index_stride: 1,
+            max_record_bytes: 0,
         }),
     };
     let mut sort = SortQuerynameRun::<QnLex>::new(sort_threads, 1 << 20);
@@ -1184,7 +1299,7 @@ fn run_batch<X: ArenaKeyExtractor>(
     bodies: &[Vec<u8>],
     ordinal: u64,
     run_seq: u32,
-    seals_to_spill: bool,
+    seal: RunSeal,
 ) -> RefBatch<X> {
     let data = frames(bodies);
     let (arena, at) = arena_with(16, &data);
@@ -1203,10 +1318,12 @@ fn run_batch<X: ArenaKeyExtractor>(
         violation,
         keyed_at: now,
         run_end: Some(RunEnd {
-            seals_to_spill,
+            seal,
             records_ingested_so_far: u64::from(n),
             run_bytes: data.len() as u64,
             scan_end: now,
+            index_stride: 1,
+            max_record_bytes: 0,
         }),
     }
 }
@@ -1254,13 +1371,16 @@ fn seals_keep_no_ref_buffer(#[values("template", "coordinate", "queryname")] ord
         let mut sort = SortRun::<X>::new(1, 1 << 20);
         let sealed = seal_runs(
             &mut sort,
-            vec![run_batch::<X>(ctx, run1, 0, 0, true), run_batch::<X>(ctx, run2, 1, 1, false)],
+            vec![
+                run_batch::<X>(ctx, run1, 0, 0, RunSeal::Spill),
+                run_batch::<X>(ctx, run2, 1, 1, RunSeal::Residual),
+            ],
         );
         assert_eq!(sealed.len(), 2);
         assert_eq!(sealed[0].1, 0, "the spilled run's refs moved into its chunk");
         assert_eq!(sealed[1].1, 0, "the final run's refs moved into its chunk");
         let mut fresh = SortRun::<X>::new(1, 1 << 20);
-        let alone = seal_runs(&mut fresh, vec![run_batch::<X>(ctx, run2, 0, 0, false)]);
+        let alone = seal_runs(&mut fresh, vec![run_batch::<X>(ctx, run2, 0, 0, RunSeal::Residual)]);
         assert!(sealed[1].0 == alone[0].0, "run 2 seals as on a fresh run sort");
     }
     let run1: Vec<Vec<u8>> = (0..1500).map(body).collect();
@@ -1292,7 +1412,7 @@ fn coordinate_and_template_seals_move_the_refs(#[values(true, false)] template: 
     where
         X::Accum: AccCapacity,
     {
-        let batch = run_batch::<X>(ctx, bodies, 0, 0, false);
+        let batch = run_batch::<X>(ctx, bodies, 0, 0, RunSeal::Residual);
         let mut acc = X::accum_for(ctx);
         X::append(&mut acc, batch.refs.unwrap());
         let ptr = at(&acc);
@@ -1331,7 +1451,7 @@ fn queryname_seal_moves_the_refs_without_copying() {
     use fgumi_sort::{QnLex, QnSortState};
     let bodies: Vec<Vec<u8>> = (0..500).map(body).collect();
     let ctx = QuerynameKeys::<QnLex>::provision(&QnSortState::new(false), &bodies[0]);
-    let batch = run_batch::<QuerynameKeys<QnLex>>(&ctx, &bodies, 0, 0, false);
+    let batch = run_batch::<QuerynameKeys<QnLex>>(&ctx, &bodies, 0, 0, RunSeal::Residual);
     let mut acc = QuerynameKeys::<QnLex>::accum_for(&ctx);
     QuerynameKeys::<QnLex>::append(&mut acc, batch.refs.unwrap());
     let at = acc.as_ptr();
@@ -1344,4 +1464,142 @@ fn queryname_seal_moves_the_refs_without_copying() {
     assert_eq!(chunk.len(), 500);
     assert!(std::ptr::eq(chunk.records_ptr().cast::<u8>(), at.cast::<u8>()), "refs moved");
     assert_eq!(acc.capacity(), 0, "the accumulator gave its buffer to the chunk");
+}
+
+/// A spilled final run (`FinalSpill`) is emitted as one `Spill` chunk, then an
+/// `AllAnnounced` naming every spilled run and no residual chunk. Template
+/// order splits a residual final run into `sort_threads` pieces, so its case
+/// is the one that shows the spilled final run is not split; coordinate never
+/// splits.
+#[rstest::rstest]
+#[case::coordinate(final_spill_events_coordinate())]
+#[case::template(final_spill_events_template())]
+fn final_spill_emits_spill_then_all_announced_with_no_chunks(#[case] events: Vec<SortChunkEvent>) {
+    assert_eq!(events.len(), 3, "two spills and one announcement");
+    assert!(matches!(
+        &events[0],
+        SortChunkEvent::Spill { seq: 0, chunk, index_stride: 1, .. } if chunk.len() == 4
+    ));
+    // One chunk, not `sort_threads` pieces: the final run spills whole.
+    assert!(matches!(
+        &events[1],
+        SortChunkEvent::Spill { seq: 1, chunk, index_stride: 2, .. } if chunk.len() == 3
+    ));
+    assert!(matches!(
+        events[2],
+        SortChunkEvent::AllAnnounced {
+            slot_count: 2,
+            memory_chunk_count: 0,
+            total_records: 7,
+            index_stride: 2
+        }
+    ));
+}
+
+/// Drive a four-thread run sort over a spilled run of `run0` and a spilled
+/// final run of `run1` (stride raised to 2 at EOF); every event it emits.
+fn final_spill_events<X, S>(
+    mut sort: S,
+    ctx: &X::Ctx,
+    run0: &[Vec<u8>],
+    run1: &[Vec<u8>],
+) -> Vec<SortChunkEvent>
+where
+    X: ArenaKeyExtractor,
+    S: Step<Input = RefBatch<X>>,
+{
+    let mut sp = StepProbe::new(&sort);
+    let out = sp.take_output::<SortChunkEvent>(0);
+    sp.push_input(run_batch::<X>(ctx, run0, 0, 0, RunSeal::Spill));
+    let mut final_run = run_batch::<X>(ctx, run1, 1, 1, RunSeal::FinalSpill);
+    // Records scanned through the end of each run are cumulative.
+    final_run.run_end.as_mut().expect("a run end").records_ingested_so_far = 7;
+    // The front raised the final run's stride at EOF: its `Spill` carries it.
+    final_run.run_end.as_mut().expect("a run end").index_stride = 2;
+    sp.push_input(final_run);
+    sp.close_input();
+    let mut last = StepOutcome::Progress;
+    for _ in 0..16 {
+        last = sp.try_run(&mut sort).unwrap();
+        if last == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(last, StepOutcome::Finished);
+    std::iter::from_fn(|| out.pop()).collect()
+}
+
+fn final_spill_events_coordinate() -> Vec<SortChunkEvent> {
+    let ctx = CoordinateKeys::provision(&2, &coord_body(0, 1, 0));
+    let run0: Vec<Vec<u8>> =
+        (0..4).map(|i| coord_body(i, 1, 10 - i32::try_from(i).unwrap())).collect();
+    let run1: Vec<Vec<u8>> =
+        (4..7).map(|i| coord_body(i, 1, 20 - i32::try_from(i).unwrap())).collect();
+    final_spill_events::<CoordinateKeys, _>(SortCoordinateRun::new(4, 1 << 20), &ctx, &run0, &run1)
+}
+
+fn final_spill_events_template() -> Vec<SortChunkEvent> {
+    let ctx = TemplateKeys::provision(&seed(), &body(0));
+    let run0: Vec<Vec<u8>> = (0..4).map(body).collect();
+    let run1: Vec<Vec<u8>> = (4..7).map(body).collect();
+    final_spill_events::<TemplateKeys, _>(SortTemplateRun::new(4, 1 << 20), &ctx, &run0, &run1)
+}
+
+/// A resident final run's stride (the front's last decision, which no
+/// `Spill` carries) rides on `AllAnnounced`. Columns: the run end's stride.
+#[rstest::rstest]
+#[case::still_indexing(1)]
+#[case::indexing_stopped(0)]
+fn all_announced_carries_the_residual_runs_stride(#[case] stride: u32) {
+    let ctx = CoordinateKeys::provision(&2, &coord_body(0, 1, 0));
+    let run0: Vec<Vec<u8>> = (0..4).map(|i| coord_body(i, 1, 10)).collect();
+    let run1: Vec<Vec<u8>> = (4..6).map(|i| coord_body(i, 1, 20)).collect();
+    let mut sort = SortCoordinateRun::new(1, 1 << 20);
+    let mut sp = StepProbe::new(&sort);
+    let out = sp.take_output::<SortChunkEvent>(0);
+    sp.push_input(run_batch::<CoordinateKeys>(&ctx, &run0, 0, 0, RunSeal::Spill));
+    let mut last = run_batch::<CoordinateKeys>(&ctx, &run1, 1, 1, RunSeal::Residual);
+    last.run_end.as_mut().expect("a run end").index_stride = stride;
+    sp.push_input(last);
+    sp.close_input();
+    for _ in 0..16 {
+        if sp.try_run(&mut sort).unwrap() == StepOutcome::Finished {
+            break;
+        }
+    }
+    let events: Vec<SortChunkEvent> = std::iter::from_fn(|| out.pop()).collect();
+    assert!(
+        matches!(
+            events.last(),
+            Some(SortChunkEvent::AllAnnounced { slot_count: 1, index_stride, .. })
+                if *index_stride == stride
+        ),
+        "the announcement carries the residual run's stride"
+    );
+}
+
+/// A spilled final run that ends mid-record is truncated input, exactly as a
+/// residual one is: there is no next run to carry the partial record into.
+#[test]
+fn final_spill_with_a_partial_tail_is_truncated_bam() {
+    let mut step = FindTemplateBoundaries::new(seed(), 1 << 20);
+    let data0 = [bam_header(), frames(&(0..3).map(body).collect::<Vec<_>>())].concat();
+    let (a0, at0) = arena_with(0, &data0);
+    assert_eq!(step.ingest_block(&block(&a0, 0, at0, data0.len(), 0, RunSeal::Spill)).unwrap(), 3);
+    let all = frames(&(3..6).map(body).collect::<Vec<_>>());
+    let data1 = all[..all.len() - 5].to_vec();
+    let (a1, at1) = arena_with(FRONT_REGION, &data1);
+    let err =
+        step.ingest_block(&block(&a1, 1, at1, data1.len(), 1, RunSeal::FinalSpill)).unwrap_err();
+    assert!(err.to_string().contains("truncated BAM"), "{err}");
+}
+
+/// `FinalSpill` and `Residual` end the scan; only `Spill` leaves it open.
+/// Columns: the seal, whether it spills, whether it is the final run.
+#[rstest::rstest]
+#[case::spill(RunSeal::Spill, true, false)]
+#[case::final_spill(RunSeal::FinalSpill, true, true)]
+#[case::residual(RunSeal::Residual, false, true)]
+fn run_seal_predicates(#[case] seal: RunSeal, #[case] spills: bool, #[case] is_final: bool) {
+    assert_eq!((seal.spills(), seal.is_final()), (spills, is_final));
 }

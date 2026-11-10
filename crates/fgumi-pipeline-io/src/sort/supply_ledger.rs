@@ -11,11 +11,12 @@
 //! each is an independent tally, and the bounds they feed tolerate a
 //! momentarily stale value (the planner re-reads on its next pass).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fgumi_sort::MergeDemand;
 
+use super::merge_mode::MergeMode;
 use crate::pread::SpillClass;
 
 /// Shared supply counters (see the module docs).
@@ -287,6 +288,9 @@ pub struct SpillSupply {
     /// registry when it sees the epoch move, so the common case costs it one
     /// load.
     pub retire_epoch: Arc<AtomicU64>,
+    /// The final merge's mode, set once by the read planner at `AllAnnounced`
+    /// (before any merge read is planned); unset until then.
+    pub merge_mode: Arc<OnceLock<MergeMode>>,
 }
 
 impl SpillSupply {
@@ -297,6 +301,7 @@ impl SpillSupply {
             demand: Arc::new(MergeDemand::new()),
             ledger: Arc::new(SupplyLedger::default()),
             retire_epoch: Arc::new(AtomicU64::new(0)),
+            merge_mode: Arc::new(OnceLock::new()),
         }
     }
 }

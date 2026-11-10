@@ -29,7 +29,7 @@ use crate::codec::SpillCodec;
 pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// Size of a zstd spill frame's `u32 LE` length prefix.
-const ZSTD_LEN_PREFIX: usize = 4;
+pub(crate) const ZSTD_LEN_PREFIX: usize = 4;
 
 /// One parsed, not yet decompressed spill frame and its per-slot sequence
 /// number (dense, in file order).
@@ -314,53 +314,15 @@ impl SpillBlockDecompressor {
         Ok(out)
     }
 
-    /// Decompress one zstd frame into the reusable scratch buffer, sizing it up
-    /// first if the output would not fit, and return the decompressed length.
-    ///
-    /// Both read paths funnel through here so the sizing policy cannot drift
-    /// between them — they previously each held their own copy of the
-    /// resize-then-decompress sequence, and only one of the two would have been
-    /// fixed by a change to either.
-    ///
-    /// The size comes from the frame header rather than from retrying on a
-    /// too-small-destination error. `decompress_to_buffer` surfaces zstd's
-    /// `get_error_name` text through `io::Error`, and that wording is not an
-    /// API contract — matching on it means a zstd bump could silently turn
-    /// "size up and succeed" into a hard failure on a spill file this very
-    /// process wrote. Reading the header also allocates exactly once instead of
-    /// doubling into place.
+    /// Decompress one zstd frame into the reusable scratch buffer and return
+    /// the decompressed length ([`decompress_zstd_frame_with`]).
     fn decompress_zstd_frame(&mut self, frame: &[u8]) -> io::Result<usize> {
-        // Both spill writers compress each block in a single
-        // `Compressor::compress` call, which records the content size in the
-        // frame header, so a missing size means the frame did not come from us.
-        let content_size = zstd::zstd_safe::get_frame_content_size(frame)
-            .map_err(|e| io::Error::other(format!("zstd spill frame header: {e}")))?
-            .ok_or_else(|| {
-                io::Error::other("zstd spill frame carries no content size (not written by fgumi)")
-            })?;
-        let needed = usize::try_from(content_size).map_err(|_| {
-            io::Error::other(format!("zstd spill frame content size {content_size} exceeds usize"))
-        })?;
-        if needed > MAX_SCRATCH_CAP {
-            return Err(io::Error::other(format!(
-                "zstd spill frame decompresses to {needed} bytes, over the \
-                 {MAX_SCRATCH_CAP}-byte scratch ceiling (or the frame is corrupt)"
-            )));
-        }
-        // Reuse by CAPACITY, not by length. `decompress_to_buffer` sets the
-        // vector's length to the decompressed byte count, so after any frame
-        // `len` is the size of that frame's output, not the buffer size — a
-        // `resize(want, 0)` guarded on `len` would therefore zero-fill the
-        // difference on essentially every frame, immediately before zstd
-        // overwrites it. `clear` + `reserve` keeps the allocation and zeroes
-        // nothing; `reserve` is a no-op once capacity is high enough, so the
-        // buffer still never shrinks.
-        let want = needed.max(SCRATCH_CAP);
-        self.zstd_buf.clear();
-        self.zstd_buf.reserve(want);
-        self.zstd
-            .decompress_to_buffer(frame, &mut self.zstd_buf)
-            .map_err(|e| io::Error::other(format!("zstd spill frame decompress: {e}")))
+        decompress_zstd_frame_with(
+            &mut self.zstd,
+            frame,
+            &mut self.zstd_buf,
+            OutSizing::AtLeast(SCRATCH_CAP),
+        )
     }
 
     fn read_zstd_frames<R: Read + ?Sized>(
@@ -492,9 +454,112 @@ impl SpillBlockDecompressor {
     }
 }
 
+/// How [`decompress_zstd_frame_with`] grows its output buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutSizing {
+    /// To at least this capacity (one size class across frames: the serial
+    /// readers pass [`SCRATCH_CAP`]); `reserve` may round up.
+    AtLeast(usize),
+    /// To exactly the frame's size (no amortized doubling), so the buffer
+    /// holds the largest frame it has decoded and no more (the range merge).
+    Exact,
+}
+
+/// Decompress one zstd frame into `out` (cleared first), sizing it up first
+/// if the output would not fit (as `sizing` says), and return the
+/// decompressed length.
+///
+/// Every zstd read path funnels through here so the sizing policy cannot drift
+/// between them — they previously each held their own copy of the
+/// resize-then-decompress sequence, and only one of the two would have been
+/// fixed by a change to either.
+///
+/// The size comes from the frame header rather than from retrying on a
+/// too-small-destination error. `decompress_to_buffer` surfaces zstd's
+/// `get_error_name` text through `io::Error`, and that wording is not an
+/// API contract — matching on it means a zstd bump could silently turn
+/// "size up and succeed" into a hard failure on a spill file this very
+/// process wrote. Reading the header also allocates exactly once instead of
+/// doubling into place.
+fn decompress_zstd_frame_with(
+    zstd: &mut ZstdDecompressor<'static>,
+    frame: &[u8],
+    out: &mut Vec<u8>,
+    sizing: OutSizing,
+) -> io::Result<usize> {
+    // Both spill writers compress each block in a single
+    // `Compressor::compress` call, which records the content size in the
+    // frame header, so a missing size means the frame did not come from us.
+    let content_size = zstd::zstd_safe::get_frame_content_size(frame)
+        .map_err(|e| io::Error::other(format!("zstd spill frame header: {e}")))?
+        .ok_or_else(|| {
+            io::Error::other("zstd spill frame carries no content size (not written by fgumi)")
+        })?;
+    let needed = usize::try_from(content_size).map_err(|_| {
+        io::Error::other(format!("zstd spill frame content size {content_size} exceeds usize"))
+    })?;
+    if needed > MAX_SCRATCH_CAP {
+        return Err(io::Error::other(format!(
+            "zstd spill frame decompresses to {needed} bytes, over the \
+             {MAX_SCRATCH_CAP}-byte scratch ceiling (or the frame is corrupt)"
+        )));
+    }
+    // Reuse by CAPACITY, not by length. `decompress_to_buffer` sets the
+    // vector's length to the decompressed byte count, so after any frame
+    // `len` is the size of that frame's output, not the buffer size — a
+    // `resize(want, 0)` guarded on `len` would therefore zero-fill the
+    // difference on essentially every frame, immediately before zstd
+    // overwrites it. `clear` + `reserve` keeps the allocation and zeroes
+    // nothing; `reserve` is a no-op once capacity is high enough, so the
+    // buffer still never shrinks.
+    out.clear();
+    match sizing {
+        // `reserve_exact`, not `reserve`, which may round up to twice the old
+        // capacity.
+        OutSizing::Exact => out.reserve_exact(needed),
+        OutSizing::AtLeast(min_capacity) => out.reserve(needed.max(min_capacity)),
+    }
+    zstd.decompress_to_buffer(frame, out)
+        .map_err(|e| io::Error::other(format!("zstd spill frame decompress: {e}")))
+}
+
 impl Default for SpillBlockDecompressor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A zstd-only spill frame decoder for the range merge: no BGZF state and no
+/// scratch buffer of its own. It decodes into the caller's buffer, grown only
+/// to the frame's exact size (never to [`SCRATCH_CAP`]), so a range cursor's
+/// buffer holds one frame's raw bytes and is reused by capacity across frames.
+pub(crate) struct ZstdFrameDecoder {
+    zstd: ZstdDecompressor<'static>,
+}
+
+impl ZstdFrameDecoder {
+    /// A fresh decoder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the zstd decompressor cannot be created (allocation failure).
+    pub(crate) fn new() -> Self {
+        Self { zstd: ZstdDecompressor::new().expect("zstd decompressor init") }
+    }
+
+    /// Decompress one bare zstd spill frame (the `[u32 LE len]` prefix already
+    /// stripped and checked by the caller) into `out`, replacing its contents.
+    /// `out` grows only when the frame is larger than its capacity, and then
+    /// to exactly the frame's decompressed size.
+    ///
+    /// # Errors
+    ///
+    /// A frame header without a content size, a content size over the
+    /// decompressed-frame ceiling, or a zstd decode failure.
+    pub(crate) fn decode_exact_into(&mut self, frame: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        let n = decompress_zstd_frame_with(&mut self.zstd, frame, out, OutSizing::Exact)?;
+        debug_assert_eq!(n, out.len(), "zstd sets the output length to the decoded size");
+        Ok(())
     }
 }
 

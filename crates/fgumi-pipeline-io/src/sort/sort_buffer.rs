@@ -8,6 +8,9 @@
 //! — **without touching disk**. Mid-stream spill
 //! chunks (`Spill { seq, .. }`) and the final residual (`Residual`) flow to the
 //! spill steps, which compress + write spills and pass the residual through.
+//! When the merge will run in range mode (see
+//! [`SortBuffer::with_range_eligibility`]) the final run is emitted as one
+//! more `Spill` instead, so the merge holds no residual.
 //!
 //! Spill chunks are emitted **as the buffer fills** (not accumulated to the
 //! end), and `try_run` drains the staged-events queue before popping the next
@@ -35,10 +38,11 @@ use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::SamTag;
 use fgumi_sort::{
     KeyTypesSpec, PooledSegmentedBuf, QnLex, QnNatural, QnSortState, QuerynameComparator,
-    SegmentedBuf, SortOrder, TemplateArenaAccumulator,
+    SegmentedBuf, SortOrder, SpillKeyKind, TemplateArenaAccumulator,
 };
 use noodles::sam::Header;
 
+use crate::sort::merge_mode::{RangeEligibility, RunIndexPolicy, SpillEstimate};
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
 use crate::sort::{ArenaSortStrategy, CoordinateStrategy, QuerynameStrategy, TemplateStrategy};
 use crate::types::RecordBatch;
@@ -65,6 +69,8 @@ struct ArenaAccum<S: ArenaSortStrategy> {
     arena: SegmentedBuf,
     memory_limit: usize,
     memory_used: usize,
+    /// The current run's largest record (bytes, no length prefix).
+    run_max_record: usize,
     total_records: u64,
     sort_threads: usize,
     /// Phase-1 cap the per-run sort takes whole (`None` = uncapped);
@@ -79,6 +85,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
             arena: SegmentedBuf::new(),
             memory_limit,
             memory_used: 0,
+            run_max_record: 0,
             total_records: 0,
             sort_threads,
             cap: None,
@@ -86,7 +93,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
     }
 
     /// Copy one record into the arena and accumulate its sort ref. Returns `true`
-    /// once the run's byte budget is reached.
+    /// once the run's byte budget (`memory_limit`) is reached.
     #[allow(clippy::cast_possible_truncation)] // offset/len fit usize on all supported (64-bit) targets
     fn push(&mut self, bam_bytes: &[u8]) -> Result<bool> {
         let len =
@@ -106,6 +113,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
             .ref_width()
             .unwrap_or_else(|| fgumi_sort::TemplateKeyVariant::WIDEST.ref_width());
         self.memory_used += bam_bytes.len() + ref_width;
+        self.run_max_record = self.run_max_record.max(bam_bytes.len());
         self.total_records += 1;
         Ok(self.memory_used >= self.memory_limit)
     }
@@ -121,6 +129,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
     fn take_sorted_chunk(&mut self) -> io::Result<MemoryChunkErased> {
         let arena = std::mem::replace(&mut self.arena, SegmentedBuf::new());
         self.memory_used = 0;
+        self.run_max_record = 0;
         let arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
         crate::sort::arena_ingest::seal_under_cap(
             &mut self.strategy,
@@ -139,6 +148,7 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
     fn take_sorted_pieces(&mut self, pieces: usize) -> io::Result<Vec<MemoryChunkErased>> {
         let arena = std::mem::replace(&mut self.arena, SegmentedBuf::new());
         self.memory_used = 0;
+        self.run_max_record = 0;
         let arc = Arc::new(PooledSegmentedBuf::unpooled(arena));
         crate::sort::arena_ingest::seal_pieces_under_cap(
             &mut self.strategy,
@@ -151,6 +161,16 @@ impl<S: ArenaSortStrategy> ArenaAccum<S> {
 
     fn total_records(&self) -> u64 {
         self.total_records
+    }
+
+    /// Record bytes buffered for the current run.
+    fn run_bytes(&self) -> u64 {
+        self.arena.len() as u64
+    }
+
+    /// The current run's largest record (no length prefix); 0 when empty.
+    fn run_max_record(&self) -> u64 {
+        self.run_max_record as u64
     }
 }
 
@@ -329,6 +349,26 @@ impl ChunkSorter {
             Self::QuerynameNatural(s) => s.total_records(),
         }
     }
+
+    /// Record bytes buffered for the current run.
+    fn run_bytes(&self) -> u64 {
+        match self {
+            Self::Coordinate(s) => s.run_bytes(),
+            Self::Template(s) => s.run_bytes(),
+            Self::QuerynameLex(s) => s.run_bytes(),
+            Self::QuerynameNatural(s) => s.run_bytes(),
+        }
+    }
+
+    /// The current run's largest record (no length prefix); 0 when empty.
+    fn run_max_record(&self) -> u64 {
+        match self {
+            Self::Coordinate(s) => s.run_max_record(),
+            Self::Template(s) => s.run_max_record(),
+            Self::QuerynameLex(s) => s.run_max_record(),
+            Self::QuerynameNatural(s) => s.run_max_record(),
+        }
+    }
 }
 
 /// Decide whether a run's final (residual) chunk is emitted.
@@ -349,9 +389,46 @@ fn residual_chunks_for(chunk: MemoryChunkErased, had_spills: bool) -> Vec<Memory
     if chunk.is_empty() && !keep_empty_for_variant { Vec::new() } else { vec![chunk] }
 }
 
+/// What the mid-stream spills of a [`SortBuffer`] have written so far, counted
+/// as they are sealed (so a function of the input alone): the run-index
+/// policy's inputs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SpilledTotals {
+    /// Record bytes of every spilled run.
+    raw_bytes: u64,
+    /// Records of every spilled run.
+    records: u64,
+    /// The largest record of every spilled run (no length prefix).
+    max_record: u64,
+    /// The spill runs' key kind; `None` before a spill.
+    key_kind: Option<SpillKeyKind>,
+}
+
+impl SpilledTotals {
+    /// These runs plus a run of `bytes` record bytes over `records` records
+    /// whose largest record is `max_record` (bytes without length prefix),
+    /// framed for the spill key kind, every largest record known.
+    fn estimate_with(&self, bytes: u64, records: u64, max_record: u64) -> SpillEstimate {
+        let kind = self.key_kind;
+        let prefix = kind.map_or(0, |k| k.serialized_key_bytes() as u64);
+        let framed = |b: u64, r: u64| SpillEstimate::framed_bytes(kind, b + 4 * r, r);
+        let max = self.max_record.max(max_record);
+        SpillEstimate {
+            framed: framed(self.raw_bytes, self.records) + framed(bytes, records),
+            max_record: (max > 0).then_some(max + 4 + prefix),
+            unbounded: 0,
+        }
+    }
+}
+
 /// Push every record in `batch` into `sorter`, staging a sealed `Spill` chunk
-/// into `pending` (and bumping `next_seq`) each time the arena fills. Returns
-/// the number of records traversed and the first push failure, if any.
+/// into `pending` (and bumping `next_seq` and `spilled`) each time the arena
+/// fills. Each `Spill` carries the run's index stride from `policy`; at each
+/// seal the policy decides the next run's stride (from the spilled runs plus
+/// the next run estimated at the sealed run's size). The sorter's budget is
+/// the serial sort's whatever the stride: the indexes wait in the runs'
+/// footers until the merge. Returns the number of records traversed and the
+/// first push failure, if any.
 ///
 /// The sorter is BORROWED, so a failure cannot leave the caller's sorter slot
 /// empty — a state that would be indistinguishable from "finalized". The error
@@ -366,6 +443,8 @@ fn ingest_batch_records(
     batch: &RecordBatch,
     pending: &mut VecDeque<SortChunkEvent>,
     next_seq: &mut u32,
+    spilled: &mut SpilledTotals,
+    policy: &mut RunIndexPolicy,
 ) -> (u64, Option<io::Error>) {
     let mut batch_records = 0u64;
     for record in batch.iter_record_bytes() {
@@ -387,6 +466,8 @@ fn ingest_batch_records(
             // production a block-bounded `RecordBatch` is far below
             // `memory_limit`, so this fires at most once per batch (see the
             // module docs).
+            let run_bytes = sorter.run_bytes();
+            let run_max = sorter.run_max_record();
             let chunk = match sorter.take_sorted_chunk() {
                 Ok(chunk) => chunk,
                 // Cancelled while the seal waited for the phase cap: the run
@@ -394,12 +475,31 @@ fn ingest_batch_records(
                 Err(e) => return (batch_records, Some(e)),
             };
             if !chunk.is_empty() {
+                let run_records = chunk.len() as u64;
+                spilled.raw_bytes += run_bytes;
+                spilled.records += run_records;
+                spilled.max_record = spilled.max_record.max(run_max);
+                spilled.key_kind = Some(chunk.key_kind());
                 pending.push_back(SortChunkEvent::Spill {
                     seq: *next_seq,
                     chunk,
                     records_ingested_so_far: sorter.total_records(),
+                    index_stride: policy.stride(),
                 });
                 *next_seq += 1;
+                // The next run makes `next_seq + 1` runs, estimated at the size
+                // of the run just sealed, its largest record unknown.
+                let estimate = spilled.estimate_with(0, 0, 0);
+                let next = SpillEstimate::framed_bytes(
+                    spilled.key_kind,
+                    run_bytes + 4 * run_records,
+                    run_records,
+                );
+                policy.at_run(
+                    *next_seq as usize + 1,
+                    spilled.key_kind,
+                    SpillEstimate { unbounded: next, ..estimate },
+                );
             }
         }
     }
@@ -434,6 +534,11 @@ pub struct SortBuffer {
     /// Phase-1 cap the per-run sort takes whole, reported by
     /// `step_cap()` (`None` = uncapped).
     cap: Option<Arc<PhaseCap>>,
+    /// The run-index policy: each run's index stride, and whether the final
+    /// run spills.
+    policy: RunIndexPolicy,
+    /// What the mid-stream spills have written (the policy's inputs).
+    spilled: SpilledTotals,
 }
 
 impl SortBuffer {
@@ -457,6 +562,8 @@ impl SortBuffer {
             affinity: Affinity::None,
             ingest_progress: ProgressTracker::new("Sort ingest records").with_interval(1_000_000),
             cap: None,
+            policy: RunIndexPolicy::new(None),
+            spilled: SpilledTotals::default(),
         })
     }
 
@@ -481,6 +588,37 @@ impl SortBuffer {
             sorter.set_queryname_keys(keys);
         }
         self
+    }
+
+    /// Index the spill runs at the stride the shared run-index policy
+    /// decides (`RunIndexPolicy`, the same rule as
+    /// `ReadBlocks`), and spill the final run when the merge will run in range
+    /// mode over the spilled runs plus it (`Self::final_run_stride`). Without
+    /// an eligibility nothing is indexed and the final run is always the
+    /// residual.
+    #[must_use]
+    pub fn with_range_eligibility(mut self, elig: RangeEligibility) -> Self {
+        self.policy = RunIndexPolicy::new(Some(elig));
+        self
+    }
+
+    /// The final run's index stride when it spills (making `k` runs with a
+    /// run of `run_bytes` record bytes over `run_records` records, the largest
+    /// `run_max_record`), `None`
+    /// when it stays the residual: the shared policy's EOF rule
+    /// ([`RunIndexPolicy::final_stride`]) over the buffer's own tally of the
+    /// spilled runs plus the final run. Every input is counted here as runs
+    /// are sealed, so the decision is a function of the input alone. The
+    /// planner confirms on the exact figures, failing closed to serial.
+    fn final_run_stride(
+        &self,
+        k: u32,
+        run_bytes: u64,
+        run_records: u64,
+        run_max_record: u64,
+    ) -> Option<u32> {
+        let estimate = self.spilled.estimate_with(run_bytes, run_records, run_max_record);
+        self.policy.final_stride(k as usize, self.spilled.key_kind, estimate)
     }
 
     /// Override the affinity hint.
@@ -544,10 +682,17 @@ impl SortBuffer {
         };
         // Borrow the sorter rather than taking it: an error path that left
         // `self.sorter` as `None` would be indistinguishable from "finalized".
-        // `pending` / `next_seq` are passed alongside as disjoint borrows.
+        // `pending` / `next_seq` / `spilled` are passed alongside as disjoint
+        // borrows.
         let sorter = self.sorter.as_mut().expect("ingest_one_batch after finalize");
-        let (batch_records, push_error) =
-            ingest_batch_records(sorter, &batch, &mut self.pending, &mut self.next_seq);
+        let (batch_records, push_error) = ingest_batch_records(
+            sorter,
+            &batch,
+            &mut self.pending,
+            &mut self.next_seq,
+            &mut self.spilled,
+            &mut self.policy,
+        );
         // Log ingest progress (every 1M records) so the read+ingest rate over
         // wall time is visible — a steady rate means the read path is the cost;
         // a bursty/stalling rate means downstream backpressure.
@@ -560,8 +705,11 @@ impl SortBuffer {
     }
 
     /// Take the residual chunk and enqueue it (if non-empty) followed by the
-    /// terminal `AllAnnounced`. Consumes the sorter (`self.sorter` becomes
-    /// `None`), freeing the buffer + rayon pool.
+    /// terminal `AllAnnounced` — or, when the final run spills
+    /// ([`Self::final_run_stride`]), enqueue it as one more `Spill` (none if
+    /// it is empty) and announce every run with no residual chunk. Consumes
+    /// the sorter (`self.sorter` becomes `None`), freeing the buffer + rayon
+    /// pool.
     ///
     /// # Panics
     ///
@@ -575,6 +723,36 @@ impl SortBuffer {
     fn finalize(&mut self) -> io::Result<()> {
         let mut sorter = self.sorter.take().expect("finalize called twice");
         let total_records = sorter.total_records();
+        let run_bytes = sorter.run_bytes();
+        let run_records = total_records.saturating_sub(self.spilled.records);
+        let k = self.next_seq + u32::from(run_bytes > 0);
+        let run_max = sorter.run_max_record();
+        if let Some(index_stride) = self.final_run_stride(k, run_bytes, run_records, run_max) {
+            if run_bytes > 0 {
+                let chunk = match sorter.take_sorted_chunk() {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        // As below: cancelled while the seal waited.
+                        self.failed = Some(e.to_string());
+                        return Err(e);
+                    }
+                };
+                self.pending.push_back(SortChunkEvent::Spill {
+                    seq: self.next_seq,
+                    chunk,
+                    records_ingested_so_far: total_records,
+                    index_stride,
+                });
+                self.next_seq += 1;
+            }
+            self.pending.push_back(SortChunkEvent::AllAnnounced {
+                slot_count: self.next_seq,
+                memory_chunk_count: 0,
+                total_records,
+                index_stride,
+            });
+            return Ok(());
+        }
         // `had_spills` keeps an EMPTY template-coordinate residual alive: it is
         // the only carrier of the `--key-types` narrowed-lane variant, without
         // which `SortMerge` falls back to the full 40-byte key and misreads the
@@ -596,10 +774,14 @@ impl SortBuffer {
                 records_ingested_so_far: total_records,
             });
         }
+        // The policy's last decision (made at the last seal, which no `Spill`
+        // carries when the final run stays resident): `SpillWrite` follows it,
+        // so a decision to stop indexing still drops the spilled runs' indexes.
         self.pending.push_back(SortChunkEvent::AllAnnounced {
             slot_count: self.next_seq,
             memory_chunk_count,
             total_records,
+            index_stride: self.policy.stride(),
         });
         // `sorter` dropped here (releases the buffer + private rayon pool).
         Ok(())
@@ -841,14 +1023,21 @@ mod tests {
         let mut sorter = template_sorter_dropping_mi(256 * 1024 * 1024);
         let mut pending = VecDeque::new();
         let mut next_seq = 0u32;
+        let mut spilled = SpilledTotals::default();
         let records = vec![
             record_with_mi(10, b"r1", 1),
             record_with_mi(20, b"r2", 2), // differing MI — rejected
             record_with_mi(30, b"r3", 1),
         ];
 
-        let (traversed, error) =
-            ingest_batch_records(&mut sorter, &batch_of(&records), &mut pending, &mut next_seq);
+        let (traversed, error) = ingest_batch_records(
+            &mut sorter,
+            &batch_of(&records),
+            &mut pending,
+            &mut next_seq,
+            &mut spilled,
+            &mut RunIndexPolicy::new(None),
+        );
 
         let message =
             error.expect("a differing MI under --key-types none must be rejected").to_string();
@@ -868,15 +1057,34 @@ mod tests {
         let mut sorter = template_sorter_dropping_mi(1);
         let mut pending = VecDeque::new();
         let mut next_seq = 0u32;
+        let mut spilled = SpilledTotals::default();
         let records = vec![record_with_mi(10, b"r1", 1), record_with_mi(20, b"r2", 1)];
 
-        let (traversed, error) =
-            ingest_batch_records(&mut sorter, &batch_of(&records), &mut pending, &mut next_seq);
+        let (traversed, error) = ingest_batch_records(
+            &mut sorter,
+            &batch_of(&records),
+            &mut pending,
+            &mut next_seq,
+            &mut spilled,
+            &mut RunIndexPolicy::new(None),
+        );
 
         assert!(error.is_none(), "constant MI is not a dropped-lane violation");
         assert_eq!(traversed, 2);
         assert_eq!(pending.len(), 2, "one staged spill chunk per seal");
         assert_eq!(next_seq, 2);
+        // Each seal tallies its run's record bytes and records and the
+        // template K24 key kind (`--key-types none` drops every optional lane).
+        let raw = (records[0].len() + records[1].len()) as u64;
+        assert_eq!(
+            spilled,
+            SpilledTotals {
+                raw_bytes: raw,
+                records: 2,
+                max_record: records[0].len().max(records[1].len()) as u64,
+                key_kind: Some(SpillKeyKind::TemplateK24)
+            }
+        );
     }
 
     /// A poisoned step re-raises on every later `try_run` instead of falling
@@ -912,5 +1120,292 @@ mod tests {
                 assert!(err.to_string().contains(expected), "unexpected error: {err}");
             }
         }
+    }
+
+    // ── Final run disposition ───────────────────────────────────────────────
+
+    /// Seven coordinate records, and a buffer that seals every three: two
+    /// spilled runs and a one-record final run.
+    fn three_record_runs() -> (SortBuffer, Vec<Vec<u8>>) {
+        three_record_runs_in(SortOrder::Coordinate, 24)
+    }
+
+    /// [`three_record_runs`] in `sort_order`, whose refs are `ref_width`
+    /// bytes (template order under `--key-types auto` charges the widest).
+    fn three_record_runs_in(sort_order: SortOrder, ref_width: usize) -> (SortBuffer, Vec<Vec<u8>>) {
+        let records: Vec<Vec<u8>> = (0..7)
+            .map(|i| {
+                fgumi_raw_bam::testutil::make_bam_bytes(
+                    0,
+                    100 - i,
+                    0,
+                    // Long names: three records fill the run budget.
+                    format!("rd_{i}_{}", "x".repeat(200)).as_bytes(),
+                    &[],
+                    20,
+                    -1,
+                    -1,
+                    &[],
+                )
+            })
+            .collect();
+        let config = SortBufferConfig {
+            sort_order,
+            memory_limit: 3 * (records[0].len() + ref_width),
+            sort_threads: 4,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        (SortBuffer::new(config, &Header::default(), 1 << 30).expect("SortBuffer"), records)
+    }
+
+    /// An eligibility that fits any tiny test sort.
+    fn eligible() -> crate::sort::RangeEligibility {
+        crate::sort::RangeEligibility::for_test(8, 1 << 30, 64 << 20)
+    }
+
+    /// Run `step` over one batch of `records` to completion; every event.
+    fn drive(step: &mut SortBuffer, records: &[Vec<u8>]) -> Vec<SortChunkEvent> {
+        use fgumi_pipeline_core::step::InputHandle as _;
+        use fgumi_pipeline_core::testing::StepProbe;
+        let mut probe = StepProbe::new(&*step);
+        let out = probe.take_output::<SortChunkEvent>(0);
+        probe.push_input(batch_of(records));
+        probe.close_input();
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let outcome = probe.try_run(step).expect("try_run");
+            events.extend(std::iter::from_fn(|| out.pop()));
+            if outcome == StepOutcome::Finished {
+                return events;
+            }
+        }
+        panic!("SortBuffer never finished");
+    }
+
+    /// `(kind, seq or chunk count, records)` per event, for assertions.
+    fn shape(events: &[SortChunkEvent]) -> Vec<(&'static str, u32, u64)> {
+        events
+            .iter()
+            .map(|e| match e {
+                SortChunkEvent::Spill { seq, chunk, .. } => ("spill", *seq, chunk.len() as u64),
+                SortChunkEvent::Residual { chunk, .. } => ("residual", 0, chunk.len() as u64),
+                SortChunkEvent::AllAnnounced {
+                    slot_count,
+                    memory_chunk_count,
+                    total_records,
+                    ..
+                } => {
+                    assert_eq!(*memory_chunk_count, 0, "no residual chunk");
+                    ("announced", *slot_count, *total_records)
+                }
+            })
+            .collect()
+    }
+
+    /// Eligible for range mode after a spill: the final run is spilled as
+    /// one more `Spill`, then `AllAnnounced` names it with no residual chunk.
+    /// Template order (whose residual final run would be split into pieces)
+    /// spills it whole too; its budget is sized for the widest ref, so its
+    /// first run holds four records. Columns: order, ref width the budget is
+    /// sized for, expected events.
+    #[rstest::rstest]
+    #[case::coordinate(
+        SortOrder::Coordinate,
+        24,
+        vec![("spill", 0, 3), ("spill", 1, 3), ("spill", 2, 1), ("announced", 3, 7)]
+    )]
+    #[case::template_coordinate(
+        SortOrder::TemplateCoordinate,
+        56,
+        vec![("spill", 0, 4), ("spill", 1, 3), ("announced", 2, 7)]
+    )]
+    fn sort_buffer_spills_the_final_run_when_eligible(
+        #[case] order: SortOrder,
+        #[case] ref_width: usize,
+        #[case] expected: Vec<(&'static str, u32, u64)>,
+    ) {
+        let (step, records) = three_record_runs_in(order, ref_width);
+        let mut step = step.with_range_eligibility(eligible());
+        let events = drive(&mut step, &records);
+        assert_eq!(shape(&events), expected);
+    }
+
+    /// Ineligible (here: a forced serial merge), the final run stays the
+    /// in-memory residual.
+    #[test]
+    fn sort_buffer_keeps_the_residual_when_ineligible() {
+        let (step, records) = three_record_runs();
+        let elig = crate::sort::RangeEligibility { force_serial: true, ..eligible() };
+        let mut step = step.with_range_eligibility(elig);
+        let events = drive(&mut step, &records);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], SortChunkEvent::Spill { seq: 0, .. }));
+        assert!(matches!(events[1], SortChunkEvent::Spill { seq: 1, .. }));
+        assert!(matches!(&events[2], SortChunkEvent::Residual { chunk, .. } if chunk.len() == 1));
+        assert!(matches!(
+            events[3],
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 1,
+                total_records: 7,
+                index_stride: 0
+            }
+        ));
+    }
+
+    /// A final run left empty by a seal on the last record adds no run: the
+    /// eligible sort announces its spills with no chunk at all.
+    #[test]
+    fn sort_buffer_announces_no_empty_final_run_when_eligible() {
+        let (step, mut records) = three_record_runs();
+        records.truncate(6);
+        let mut step = step.with_range_eligibility(eligible());
+        let events = drive(&mut step, &records);
+        assert_eq!(shape(&events), vec![("spill", 0, 3), ("spill", 1, 3), ("announced", 2, 6)]);
+    }
+
+    /// The decision is a function of the input alone: the buffer's own tally
+    /// of the spilled runs (record bytes and key width) and the final run,
+    /// the same at every sort thread count. Each case seals runs of three
+    /// records over seven records, with a merge memory chosen around the
+    /// estimate. Columns: sort order, merge memory, whether the final run
+    /// spills.
+    #[rstest]
+    #[case::fits(SortOrder::Coordinate, 1 << 30, true)]
+    // 3 runs at 8 workers need 3 MiB of cursors alone at window 8.
+    #[case::does_not_fit(SortOrder::Coordinate, 2 << 20, false)]
+    // Queryname runs carry no index (no key width): never spilled.
+    #[case::unindexed_order(SortOrder::Queryname(QuerynameComparator::Natural), 1 << 30, false)]
+    fn sort_buffer_final_run_decision_is_deterministic(
+        #[case] sort_order: SortOrder,
+        #[case] merge_memory: u64,
+        #[case] spills: bool,
+    ) {
+        let decide = |sort_threads: usize| {
+            let (_, records) = three_record_runs();
+            let ref_width = if matches!(sort_order, SortOrder::Coordinate) { 24 } else { 40 };
+            let config = SortBufferConfig {
+                sort_order,
+                memory_limit: 3 * (records[0].len() + ref_width),
+                sort_threads,
+                cell_tag: None,
+                key_types: KeyTypesSpec::Auto,
+            };
+            let elig = crate::sort::RangeEligibility {
+                merge_memory,
+                serial_r: merge_memory.min(1 << 20),
+                ..eligible()
+            };
+            let mut step = SortBuffer::new(config, &Header::default(), 1 << 30)
+                .expect("SortBuffer")
+                .with_range_eligibility(elig);
+            let events = drive(&mut step, &records);
+            assert_eq!(step.spilled.raw_bytes, 6 * records[0].len() as u64);
+            match events.last() {
+                Some(SortChunkEvent::AllAnnounced { slot_count, memory_chunk_count, .. }) => {
+                    (*slot_count, *memory_chunk_count)
+                }
+                _ => panic!("the last event is the announcement"),
+            }
+        };
+        let first = decide(1);
+        assert_eq!(first, if spills { (3, 0) } else { (2, 1) });
+        for threads in [2, 4, 8] {
+            assert_eq!(decide(threads), first, "same input at {threads} threads");
+        }
+    }
+
+    /// Coordinate records of one size, `n` of them, in descending position.
+    fn same_size_records(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                let pos = i32::try_from(1_000_000 - i).unwrap();
+                fgumi_raw_bam::testutil::make_bam_bytes(0, pos, 0, b"rd", &[], 20, -1, -1, &[])
+            })
+            .collect()
+    }
+
+    /// The `Spill` events' `(records, index_stride)`.
+    fn spills(events: &[SortChunkEvent]) -> Vec<(usize, u32)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SortChunkEvent::Spill { chunk, index_stride, .. } => {
+                    Some((chunk.len(), *index_stride))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `SortBuffer` seals every run at its budget whatever the run-index
+    /// policy decides: the indexes live in the runs' footers, not in the
+    /// buffer. 65-byte records charge 89 bytes each (their 24-byte ref)
+    /// against a 356,000-byte budget, so every run holds 4,000 records, at
+    /// stride 1 when the sort can merge by range and 0 without a policy.
+    /// Columns: eligibility, expected `(records, stride)` of the first runs.
+    #[rstest]
+    #[case::indexed(Some(eligible()), vec![(4_000, 1), (4_000, 1)])]
+    #[case::without_a_policy(None, vec![(4_000, 0), (4_000, 0)])]
+    fn sort_buffer_seals_at_the_budget_whatever_the_policy(
+        #[case] elig: Option<crate::sort::RangeEligibility>,
+        #[case] expected: Vec<(usize, u32)>,
+    ) {
+        let records = same_size_records(20_000);
+        assert_eq!(records[0].len(), 65);
+        let config = SortBufferConfig {
+            sort_order: SortOrder::Coordinate,
+            memory_limit: 356_000,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let step = SortBuffer::new(config, &Header::default(), 1 << 30).expect("SortBuffer");
+        let mut step = match elig {
+            Some(elig) => step.with_range_eligibility(elig),
+            None => step,
+        };
+        let events = drive(&mut step, &records);
+        assert_eq!(spills(&events)[..2], expected[..]);
+    }
+
+    /// Every `Spill` carries the policy's stride and `AllAnnounced` carries
+    /// its last decision, which no `Spill` carries when the final run stays
+    /// resident: a fit that first fails at the final run (three runs at 8
+    /// workers need about 31.5 MiB at the bound, two about 29 MiB, of a 30
+    /// MiB budget) announces stride 0, so the writer drops the spilled runs'
+    /// indexes. Seven records seal runs of three; six leave an empty final
+    /// run after the last seal turned indexing off. Columns: records,
+    /// eligibility, expected `(records, stride)` per spill, expected
+    /// announced `(slots, residual chunks, stride)`.
+    #[rstest]
+    #[case::fits(7, eligible(), vec![(3, 1), (3, 1), (1, 1)], (3, 0, 1))]
+    #[case::fit_fails_at_the_final_run(7, budget(30 << 20), vec![(3, 1), (3, 1)], (2, 1, 0))]
+    #[case::fit_fails_at_the_last_seal(6, budget(30 << 20), vec![(3, 1), (3, 1)], (2, 0, 0))]
+    #[case::forced_serial(7, crate::sort::RangeEligibility { force_serial: true, ..eligible() }, vec![(3, 0), (3, 0)], (2, 1, 0))]
+    fn sort_buffer_announces_the_last_stride(
+        #[case] n: usize,
+        #[case] elig: crate::sort::RangeEligibility,
+        #[case] expected_spills: Vec<(usize, u32)>,
+        #[case] expected_announced: (u32, u32, u32),
+    ) {
+        let (step, mut records) = three_record_runs();
+        records.truncate(n);
+        let mut step = step.with_range_eligibility(elig);
+        let events = drive(&mut step, &records);
+        assert_eq!(spills(&events), expected_spills);
+        let Some(SortChunkEvent::AllAnnounced {
+            slot_count, memory_chunk_count, index_stride, ..
+        }) = events.last()
+        else {
+            panic!("the last event is the announcement");
+        };
+        assert_eq!((*slot_count, *memory_chunk_count, *index_stride), expected_announced);
+    }
+
+    /// [`eligible`] with a merge memory of `bytes` and a 1 MiB `R` floor.
+    fn budget(bytes: u64) -> crate::sort::RangeEligibility {
+        crate::sort::RangeEligibility { merge_memory: bytes, serial_r: 1 << 20, ..eligible() }
     }
 }

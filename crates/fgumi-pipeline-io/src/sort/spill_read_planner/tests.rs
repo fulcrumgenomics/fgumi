@@ -677,6 +677,7 @@ fn all_announced_with_a_job_in_flight_is_an_error() {
         job_id: 9,
         inputs,
         key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+        index_stride: 1,
     });
     probe.push_input(SortPhase1Event::AllAnnounced {
         slot_count: 0,
@@ -692,6 +693,74 @@ fn all_announced_with_a_job_in_flight_is_an_error() {
     };
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(err.to_string(), "AllAnnounced arrived with consolidation job 9 in flight");
+}
+
+/// A second `AllAnnounced` is a protocol violation like the others: an
+/// `InvalidData` error, not a panic, and the first announcement's merge mode
+/// and budget stand.
+#[test]
+fn a_second_all_announced_is_an_error() {
+    use fgumi_pipeline_core::step::StepOutcome;
+    use fgumi_pipeline_core::testing::StepProbe;
+    let mut pl = planner(TOTAL, 4, 4, &SpillSupply::new());
+    let probe = StepProbe::new(&pl);
+    probe.push_input(all_announced(0));
+    probe.push_input(all_announced(5));
+    let err = loop {
+        match probe.try_run(&mut pl) {
+            Ok(StepOutcome::Finished) => panic!("finished without the error"),
+            Ok(_) => {}
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "AllAnnounced arrived twice");
+    assert_eq!(pl.budget_for_test(), Some(ReadAheadBudget::resolve(TOTAL, 0)));
+}
+
+/// A consolidation input opens at the frame end its writer recorded
+/// (`ConsolidationInput::len`): a run with an index footer opens at its
+/// frames, and a recorded length that disagrees with the file (one byte
+/// short of the frames, or past them into the footer) fails the job's start
+/// with `InvalidData`, so a footer is never read as records. Columns: the
+/// recorded length's offset from the frames' end (in bytes), a needle of
+/// the error (empty: the job starts).
+#[rstest::rstest]
+#[case::at_the_frames(0, "")]
+#[case::one_byte_short(-1, "trailer naming")]
+#[case::into_the_footer(1, "trailer naming")]
+fn consolidation_input_opens_at_its_written_frame_end(#[case] offset: i64, #[case] needle: &str) {
+    use crate::sort::protocol::ConsolidationInput;
+    use crate::sort::spill_fixtures::write_run_file;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("r0");
+    let frames_end = write_run_file(&path, SpillCodec::Zstd, 0, 0..5);
+    let mut index = fgumi_sort::RunIndex::new(40);
+    index.push_frame(u32::try_from(frames_end - 4).unwrap(), 1000, 5, &[0u8; 40]);
+    index.rebase(4);
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    index.write_footer(&mut file).unwrap();
+    drop(file);
+    let len = frames_end.checked_add_signed(offset).unwrap();
+    let supply = SpillSupply::new();
+    let mut pl = planner(64 << 20, 2, 2, &supply).with_consolidation(
+        Arc::new(MergeDemand::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    );
+    let inputs = vec![ConsolidationInput { file_id: 0, path, len }];
+    match pl.start_job(1, inputs, fgumi_sort::SpillKeyKind::TemplateK40, 1) {
+        Ok(job) => {
+            assert!(needle.is_empty(), "expected an error naming {needle:?}");
+            assert_eq!(job.slots[0].len(), frames_end);
+            assert!(job.slots[0].has_index_footer());
+        }
+        Err(err) => {
+            assert!(!needle.is_empty(), "unexpected error: {err}");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+    }
 }
 
 /// Review I4 (r1): consolidation slots plan under their job budget before the
@@ -723,6 +792,7 @@ fn planner_plans_consolidation_reads_before_any_merge_budget_exists() {
         job_id: 1,
         inputs,
         key_kind: fgumi_sort::SpillKeyKind::TemplateK40,
+        index_stride: 1,
     });
     for _ in 0..4 {
         probe.try_run(&mut pl).unwrap();
@@ -988,4 +1058,268 @@ fn planner_issues_a_stream_read_only_once_the_stream_is_ready() {
     let r = fgumi_pipeline_core::step::InputHandle::pop(&reads).expect("a read once ready");
     assert!(r.sequential);
     assert_eq!(r.offset, 0);
+}
+
+/// The range eligibility the planner tests use: indexed runs, phase 2 and
+/// the pool `threads` wide, over `merge_memory` with its serial `R`.
+fn eligibility(threads: usize, merge_memory: u64) -> crate::sort::RangeEligibility {
+    crate::sort::RangeEligibility::for_test(
+        threads,
+        merge_memory,
+        crate::sort::read_ahead_budget::serial_read_ahead(merge_memory),
+    )
+}
+
+/// A planner with a range eligibility over three registered slots, every one
+/// indexed unless `unindexed` names one, announced.
+fn range_fixture(unindexed: Option<u32>) -> (SpillReadPlanner, SpillSupply, SortPhase2Event) {
+    let supply = SpillSupply::new();
+    let mut p = planner(TOTAL, 8, 16, &supply).with_range_eligibility(eligibility(8, TOTAL));
+    for id in 0..3 {
+        let s = slot(id, 8 * MIB);
+        if unindexed != Some(id) {
+            s.attach_run_index(Arc::new(fgumi_sort::RunIndex::new(8)));
+        }
+        let _ = p.on_event_for_test(spill_ready(&s));
+    }
+    let fwd = p.on_event_for_test(all_announced(3));
+    (p, supply, fwd)
+}
+
+/// In range mode the planner drops the merge slots at `AllAnnounced`: nothing
+/// is planned, and the event still reaches the merge.
+#[test]
+fn planner_range_mode_reads_nothing() {
+    let (mut p, supply, fwd) = range_fixture(None);
+    let Some(crate::sort::MergeMode::Range { budget, fit, .. }) = supply.merge_mode.get() else {
+        panic!("range mode: {:?}", supply.merge_mode.get());
+    };
+    // No residual: the whole 12 GiB merge memory is the budget.
+    assert_eq!(budget.bytes, TOTAL);
+    // 3 runs, 8 workers: two ranges per worker at the 1.05 target.
+    assert_eq!((fit.window, fit.target_range_bytes), (16, 20 * 3 * (64 << 10)));
+    assert!(p.planned_slot_ids_for_test().is_empty());
+    assert!(p.plan_pass_for_test().is_empty());
+    assert!(matches!(fwd, SortPhase2Event::AllAnnounced { slot_count: 3, .. }));
+}
+
+/// The decision is computed from the merge slots' exact figures: their
+/// count, covered frames, index raw bytes and file lengths.
+#[test]
+fn planner_decides_from_exact_slot_figures() {
+    let supply = SpillSupply::new();
+    let merge_memory = 256 * MIB;
+    let elig = eligibility(8, merge_memory);
+    let mut p =
+        planner(TOTAL, 8, 16, &supply).with_merge_memory(merge_memory).with_range_eligibility(elig);
+    let lens = [100_000, 150_000, 200_000];
+    let mut index_bytes = 0u64;
+    for (id, &len) in (0u32..).zip(&lens) {
+        let mut index = fgumi_sort::RunIndex::new(8);
+        for f in 0..=id {
+            index.push_frame(1000, 60_000 + f, 10, &[u8::try_from(f).unwrap(); 8]);
+        }
+        index_bytes += index.heap_bytes() as u64;
+        let s = slot(id, len);
+        s.attach_run_index(Arc::new(index));
+        let _ = p.on_event_for_test(spill_ready(&s));
+    }
+    let _ = p.on_event_for_test(all_announced(3));
+    let inputs = crate::sort::FitInputs {
+        k: 3,
+        frames: 6,
+        key_width: 8,
+        raw_bytes: 60_000 + (60_000 + 60_001) + (60_000 + 60_001 + 60_002),
+        comp_bytes: 450_000,
+        max_frame_raw: 60_002,
+    };
+    assert_eq!(
+        supply.merge_mode.get(),
+        Some(&crate::sort::MergeMode::Range {
+            budget: elig.budget(),
+            inputs,
+            fit: crate::sort::range_fit(&elig, &inputs).expect("a fit"),
+            index_bytes,
+        })
+    );
+}
+
+/// A slot without a run index keeps the serial merge, read as before.
+#[test]
+fn planner_serial_mode_unchanged() {
+    let (mut p, supply, fwd) = range_fixture(Some(2));
+    assert_eq!(
+        supply.merge_mode.get(),
+        Some(&crate::sort::MergeMode::Serial(crate::sort::SerialReason::SlotNotIndexed {
+            file_id: 2
+        }))
+    );
+    assert_eq!(p.planned_slot_ids_for_test(), vec![0, 1, 2]);
+    assert!(!p.plan_pass_for_test().is_empty());
+    assert!(matches!(fwd, SortPhase2Event::AllAnnounced { slot_count: 3, .. }));
+}
+
+/// Without a policy (e.g. `fgumi merge`) the planner still publishes a mode.
+#[test]
+fn planner_without_policy_publishes_serial_no_policy() {
+    let supply = SpillSupply::new();
+    let mut p = planner(TOTAL, 8, 16, &supply);
+    let s = slot(0, 8 * MIB);
+    s.attach_run_index(Arc::new(fgumi_sort::RunIndex::new(8)));
+    let _ = p.on_event_for_test(spill_ready(&s));
+    let _ = p.on_event_for_test(all_announced(1));
+    assert_eq!(
+        supply.merge_mode.get(),
+        Some(&crate::sort::MergeMode::Serial(crate::sort::SerialReason::NoPolicy))
+    );
+    assert_eq!(p.planned_slot_ids_for_test(), vec![0]);
+}
+
+/// A residual chunk of `records` 64 KiB records (its own arena).
+fn residual(records: usize) -> Arc<crate::sort::protocol::MemoryChunkErased> {
+    let chunk = fgumi_sort::InMemoryChunk::from_owned_records(
+        (0..records)
+            .map(|_| (fgumi_sort::RawCoordinateKey::default(), vec![0u8; 64 << 10]))
+            .collect(),
+    );
+    Arc::new(crate::sort::protocol::MemoryChunkErased::Coordinate(chunk))
+}
+
+/// A residual chunk in memory fails closed to the serial merge: the range
+/// merge needs the final run spilled. 15 runs at 32 workers fit a 4 GiB
+/// merge memory without one; with one, the merge stays serial, the merge
+/// slots are not dropped, and the serial merge's reads are planned.
+/// Columns: residual chunks, the expected serial reason (`None`: range mode).
+#[rstest::rstest]
+#[case::no_residual_fits(0, None)]
+#[case::residual_fails_closed(1, Some(crate::sort::SerialReason::ResidualInMemory { chunks: 1 }))]
+fn planner_fails_closed_on_a_residual_chunk(
+    #[case] chunks: usize,
+    #[case] expected: Option<crate::sort::SerialReason>,
+) {
+    let supply = SpillSupply::new();
+    let merge_memory = 4096 * MIB;
+    let elig = eligibility(32, merge_memory);
+    let mut p = planner(TOTAL, 32, 16, &supply)
+        .with_merge_memory(merge_memory)
+        .with_range_eligibility(elig);
+    for id in 0..15 {
+        let s = slot(id, 8 * MIB);
+        s.attach_run_index(Arc::new(fgumi_sort::RunIndex::new(8)));
+        let _ = p.on_event_for_test(spill_ready(&s));
+    }
+    for _ in 0..chunks {
+        let _ = p.on_event_for_test(SortPhase1Event::MemoryChunk {
+            chunk: residual(16),
+            records_ingested_so_far: 0,
+        });
+    }
+    let _ = p.on_event_for_test(SortPhase1Event::AllAnnounced {
+        slot_count: 15,
+        memory_chunk_count: u32::try_from(chunks).unwrap(),
+        total_records: 7,
+    });
+    match (supply.merge_mode.get().expect("a decided mode"), expected) {
+        (crate::sort::MergeMode::Range { budget, .. }, None) => {
+            assert_eq!(*budget, elig.budget());
+            assert!(p.planned_slot_ids_for_test().is_empty());
+        }
+        (crate::sort::MergeMode::Serial(reason), Some(expected)) => {
+            assert_eq!(*reason, expected);
+            assert_eq!(p.planned_slot_ids_for_test(), (0..15).collect::<Vec<u32>>());
+            assert!(!p.plan_pass_for_test().is_empty(), "the serial merge is fed");
+        }
+        (mode, expected) => panic!("mode {mode:?}, expected {expected:?}"),
+    }
+}
+
+/// An announcement whose residual chunk count differs from the chunks that
+/// arrived is a protocol error, not a count to trust. Columns: chunks sent,
+/// chunks announced.
+#[rstest::rstest]
+#[case::announced_more(0, 1)]
+#[case::announced_fewer(2, 1)]
+fn all_announced_with_a_chunk_count_mismatch_is_an_error(
+    #[case] sent: usize,
+    #[case] announced: u32,
+) {
+    let supply = SpillSupply::new();
+    let mut p = planner(TOTAL, 32, 16, &supply);
+    for _ in 0..sent {
+        let _ = p.on_event_for_test(SortPhase1Event::MemoryChunk {
+            chunk: residual(16),
+            records_ingested_so_far: 0,
+        });
+    }
+    let Err(err) = p.on_event(SortPhase1Event::AllAnnounced {
+        slot_count: 0,
+        memory_chunk_count: announced,
+        total_records: 0,
+    }) else {
+        panic!("a mismatched announcement is an error");
+    };
+    assert_eq!(
+        err.to_string(),
+        format!("AllAnnounced names {announced} residual chunk(s) but {sent} arrived")
+    );
+}
+
+/// The front spills the final run on an estimate; the planner confirms on
+/// the exact figures. When they disagree, the `k + 1` runs (the last one the
+/// spilled final run) merge serially with no residual chunk: 15 runs at 32
+/// workers do not fit a 64 MiB budget (60 MiB of cursors alone at window 32).
+#[test]
+fn planner_runs_serial_over_k_plus_one_slots_when_fit_disagrees() {
+    let supply = SpillSupply::new();
+    let merge_memory = 64 * MIB;
+    let elig = eligibility(32, merge_memory);
+    let mut p = planner(TOTAL, 32, 16, &supply)
+        .with_merge_memory(merge_memory)
+        .with_range_eligibility(elig);
+    for id in 0..15 {
+        let s = slot(id, 8 * MIB);
+        s.attach_run_index(Arc::new(fgumi_sort::RunIndex::new(8)));
+        let _ = p.on_event_for_test(spill_ready(&s));
+    }
+    let fwd = p.on_event_for_test(all_announced(15));
+    assert_eq!(
+        supply.merge_mode.get(),
+        Some(&crate::sort::MergeMode::Serial(crate::sort::SerialReason::RangeDoesNotFit {
+            k: 15,
+            budget: elig.budget(),
+        }))
+    );
+    assert_eq!(p.planned_slot_ids_for_test(), (0..15).collect::<Vec<u32>>());
+    assert!(!p.plan_pass_for_test().is_empty(), "the serial merge is fed");
+    assert!(matches!(
+        fwd,
+        SortPhase2Event::AllAnnounced { slot_count: 15, memory_chunk_count: 0, .. }
+    ));
+}
+
+/// When the phase-1 index policy dropped every index (after the front spilled
+/// the final run), the planner keeps the serial merge over the spilled runs
+/// alone and feeds it: no residual chunk, every merge slot planned.
+#[test]
+fn planner_runs_serial_when_the_indexes_were_dropped() {
+    let supply = SpillSupply::new();
+    let elig = eligibility(8, TOTAL);
+    let mut p = planner(TOTAL, 8, 16, &supply).with_range_eligibility(elig);
+    for id in 0..3 {
+        let _ = p.on_event_for_test(spill_ready(&slot(id, 8 * MIB)));
+    }
+    let fwd = p.on_event_for_test(all_announced(3));
+    assert_eq!(
+        supply.merge_mode.get(),
+        Some(&crate::sort::MergeMode::Serial(crate::sort::SerialReason::IndexesDropped {
+            k: 3,
+            budget: elig.budget(),
+        }))
+    );
+    assert_eq!(p.planned_slot_ids_for_test(), vec![0, 1, 2]);
+    assert!(!p.plan_pass_for_test().is_empty(), "the serial merge is fed");
+    assert!(matches!(
+        fwd,
+        SortPhase2Event::AllAnnounced { slot_count: 3, memory_chunk_count: 0, .. }
+    ));
 }

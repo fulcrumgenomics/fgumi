@@ -107,6 +107,8 @@ use fgumi_bam_io::pread::{PositionalSource, SliceLease};
 use fgumi_bam_io::reorder::ReorderBuffer;
 
 use crate::codec::SpillCodec;
+use crate::run_index::RunIndex;
+use crate::spill_block::SpillKeyKind;
 use crate::spill_block_reader::{RawBlock, SpillFrameParser};
 
 /// Upper bound of every slot's decompressed-block queue cap. With the read
@@ -217,6 +219,21 @@ pub struct SortMergeSlot {
     /// it on its next pass, releasing the file. A std atomic even under loom:
     /// it is retirement bookkeeping, not the slot protocol the model checks.
     retired: std::sync::atomic::AtomicBool,
+    /// Index of the slot's spill run (one entry per `stride` frames),
+    /// attached by `SpillWrite` when the run was indexed as it was written or
+    /// consolidated (zstd coordinate and template-coordinate runs; a
+    /// consolidated run is indexed by `SpillBlockCompressConsolidation` and
+    /// lacks one only when the phase-1 policy turned indexing off). Its
+    /// offsets are absolute file offsets: the first entry starts at
+    /// `body_start` and the entries tile the body. A std
+    /// `OnceLock` even under loom: set once before the slot is shared, not
+    /// part of the slot protocol the model checks.
+    run_index: std::sync::OnceLock<Arc<RunIndex>>,
+    /// Key kind of the slot's spill run, attached by `SpillWrite` when it
+    /// announces the run. Lets the merge identify the template-coordinate key
+    /// lane from the slots when no residual chunk is in memory. A std
+    /// `OnceLock` even under loom, like `run_index`.
+    key_kind: std::sync::OnceLock<SpillKeyKind>,
     /// Spill codec of this chunk's file, detected from the file magic when the
     /// slot is opened (`open_spill_slot`). The `SortSpillDecompress` step
     /// reads it to decompress BGZF blocks or zstd frames.
@@ -226,9 +243,13 @@ pub struct SortMergeSlot {
     source: Arc<dyn PositionalSource>,
     /// Offset of the first frame (past any codec file magic).
     body_start: u64,
-    /// File length in bytes; `u64::MAX` for a sequential slot, whose length
-    /// is discovered at EOF.
+    /// End of the frame bytes: the file length, or where a run-index footer
+    /// starts when the run carries one; `u64::MAX` for a sequential slot,
+    /// whose length is discovered at EOF.
     len: u64,
+    /// `(offset, length)` of the run-index footer block past the frames
+    /// ([`Self::read_run_index`]), when the run file carries one.
+    index_span: Option<(u64, u64)>,
     /// The source is a stream (a pipe input of `fgumi merge`): read in order,
     /// one read at a time, until a zero read ([`Self::new_sequential`]).
     sequential: bool,
@@ -355,10 +376,13 @@ impl SortMergeSlot {
             file_id,
             slot_id: file_id,
             retired: std::sync::atomic::AtomicBool::new(false),
+            run_index: std::sync::OnceLock::new(),
+            key_kind: std::sync::OnceLock::new(),
             codec,
             source,
             body_start,
             len,
+            index_span: None,
             sequential: false,
             skip_bytes: 0,
             body_keyed: false,
@@ -393,6 +417,36 @@ impl SortMergeSlot {
         Self::new(file_id, Arc::new(tempfile::tempfile().expect("tempfile")), 0, 0, codec)
     }
 
+    /// This slot with a run-index footer block of `len` bytes at `offset`,
+    /// past its frames (set before the slot is shared; the opener locates
+    /// and checks the block).
+    #[must_use]
+    pub(crate) fn with_index_span(mut self, offset: u64, len: u64) -> Self {
+        self.index_span = Some((offset, len));
+        self
+    }
+
+    /// Whether the slot's run file carries a run-index footer.
+    #[must_use]
+    pub fn has_index_footer(&self) -> bool {
+        self.index_span.is_some()
+    }
+
+    /// Read the run's index back from its file's footer, `None` when the file
+    /// has none. Positional reads of the footer block through the slot's
+    /// source, decoded into an exactly sized index; the index is validated
+    /// against the slot's frame bytes (`[body_start, len)`).
+    ///
+    /// # Errors
+    ///
+    /// A failed read, or a footer that does not decode or does not tile the
+    /// frames (`InvalidData`).
+    pub fn read_run_index(&self) -> std::io::Result<Option<RunIndex>> {
+        let Some((offset, len)) = self.index_span else { return Ok(None) };
+        crate::run_index::read_footer(self.source.as_ref(), offset, len, self.body_start, self.len)
+            .map(Some)
+    }
+
     /// This slot with supply identity `slot_id` (set before the slot is
     /// shared).
     #[must_use]
@@ -417,6 +471,46 @@ impl SortMergeSlot {
     #[must_use]
     pub fn is_retired(&self) -> bool {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Attach the index of this slot's spill run.
+    ///
+    /// # Panics
+    ///
+    /// If an index is already attached: an index describes one file.
+    pub fn attach_run_index(&self, index: Arc<RunIndex>) {
+        assert!(
+            self.run_index.set(index).is_ok(),
+            "spill slot {} already has a run index",
+            self.slot_id
+        );
+    }
+
+    /// Record the key kind of this slot's spill run. Attaching the same kind
+    /// again is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// If a different kind is already attached: a run has one key kind.
+    pub fn attach_key_kind(&self, kind: SpillKeyKind) {
+        let have = *self.key_kind.get_or_init(|| kind);
+        assert!(
+            have == kind,
+            "spill slot {} is keyed {have:?} but was re-attached as {kind:?}",
+            self.slot_id
+        );
+    }
+
+    /// The key kind of this slot's spill run, if one was attached.
+    #[must_use]
+    pub fn key_kind(&self) -> Option<SpillKeyKind> {
+        self.key_kind.get().copied()
+    }
+
+    /// The index of this slot's spill run, if it was indexed.
+    #[must_use]
+    pub fn run_index(&self) -> Option<&Arc<RunIndex>> {
+        self.run_index.get()
     }
 
     /// A slot over a stream (`source` serves reads only at its cursor, as a
@@ -518,7 +612,7 @@ impl SortMergeSlot {
         self.body_start
     }
 
-    /// File length in bytes.
+    /// End of the frame bytes: the file length, less any run-index footer.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.len
@@ -1464,6 +1558,44 @@ mod tests {
 
     fn frames(n: u8) -> Vec<Vec<u8>> {
         (0..n).map(|i| vec![i; 100]).collect()
+    }
+
+    /// A slot has no run index until one is attached, then returns that one.
+    #[test]
+    fn run_index_is_absent_until_attached() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Zstd);
+        assert!(slot.run_index().is_none());
+        let mut index = crate::RunIndex::new(8);
+        index.push_frame(12, 100, 3, &[7u8; 8]);
+        let index = Arc::new(index);
+        slot.attach_run_index(Arc::clone(&index));
+        assert!(Arc::ptr_eq(slot.run_index().expect("attached"), &index));
+    }
+
+    #[test]
+    fn key_kind_is_absent_until_attached() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Zstd);
+        assert_eq!(slot.key_kind(), None);
+        slot.attach_key_kind(SpillKeyKind::TemplateCb32);
+        slot.attach_key_kind(SpillKeyKind::TemplateCb32);
+        assert_eq!(slot.key_kind(), Some(SpillKeyKind::TemplateCb32));
+    }
+
+    #[test]
+    #[should_panic(expected = "re-attached")]
+    fn attaching_a_different_kind_panics() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Zstd);
+        slot.attach_key_kind(SpillKeyKind::TemplateK24);
+        slot.attach_key_kind(SpillKeyKind::TemplateK40);
+    }
+
+    /// An index describes one file: attaching a second is a bug.
+    #[test]
+    #[should_panic(expected = "already has a run index")]
+    fn attaching_a_second_run_index_panics() {
+        let slot = SortMergeSlot::for_test(0, SpillCodec::Zstd);
+        slot.attach_run_index(Arc::new(crate::RunIndex::new(8)));
+        slot.attach_run_index(Arc::new(crate::RunIndex::new(8)));
     }
 
     /// The sequential read gate across a stream's life: due before any read,

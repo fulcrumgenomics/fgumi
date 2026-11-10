@@ -58,10 +58,16 @@ pub(crate) struct SpillRun {
     pub(crate) file_id: u32,
     /// The run's file.
     pub(crate) path: PathBuf,
-    /// The run's size on disk; the cost of reading it into a consolidation.
+    /// Where the run's frames end (its file length less any index footer):
+    /// what a consolidation or the merge reads, and the cost of reading it.
     pub(crate) bytes: u64,
     /// Records ingested when the run's last chunk was spilled (progress only).
     pub(crate) records_ingested_so_far: u64,
+    /// Whether the run's file ends in a run-index footer (written when the
+    /// run was indexed as it was written or consolidated; read back at
+    /// `AllAnnounced`). A consolidated run has none when its job ran with
+    /// indexing off.
+    pub(crate) index_footer: bool,
 }
 
 /// The live spill runs, in run order, plus the consolidation policy over them.
@@ -145,7 +151,8 @@ impl RunStack {
     }
 
     /// Replace the runs in `range` with the run merged from them — written to
-    /// `merged_path`, `merged_bytes` long — and return the absorbed runs so their
+    /// `merged_path`, its frames `merged_bytes` long, with an index footer
+    /// when `index_footer` — and return the absorbed runs so their
     /// files can be removed.
     ///
     /// The merged run takes the range's lowest `file_id` — the position of the
@@ -159,6 +166,7 @@ impl RunStack {
         range: Range<usize>,
         merged_path: PathBuf,
         merged_bytes: u64,
+        index_footer: bool,
     ) -> Vec<SpillRun> {
         assert!(!range.is_empty(), "cannot merge an empty range of runs");
         let start = range.start;
@@ -172,6 +180,7 @@ impl RunStack {
                 .map(|r| r.records_ingested_so_far)
                 .max()
                 .expect("non-empty"),
+            index_footer,
         };
         self.runs.insert(start, merged);
         absorbed

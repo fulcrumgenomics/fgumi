@@ -288,6 +288,7 @@ use crate::admission::StepCapRef;
 // `runtime`.
 use crate::runtime::contexts::StepCounters;
 use crate::runtime::wake::PoolHandle;
+use crate::signal::PipelineSignal;
 
 /// Static description of one domain counter a step declares.
 ///
@@ -557,6 +558,11 @@ pub struct StepCtx<'a, S: Step> {
     /// via `ctx.counters.add(slot, n)`; a no-op (one load + branch) when
     /// telemetry is off, so bumping unconditionally stays zero-cost off-path.
     pub counters: &'a StepCounters,
+    /// The pipeline's error/cancel signal, for a step that runs long work
+    /// inside one dispatch to poll [`PipelineSignal::is_done`] between pieces
+    /// of it (the runtime checks it between dispatches). The single-step
+    /// test harness passes its own (`StepProbe::cancel_handle` cancels it).
+    pub signal: &'a PipelineSignal,
 }
 
 /// Two-input variant of [`Step`]. Used by merge steps (zipper,

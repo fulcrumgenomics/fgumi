@@ -99,7 +99,13 @@ fn write_bam_fixture(path: &Path, families: usize) {
     write_bam(path, &header, &records);
 }
 
-/// Runs `fgumi sort` at info verbosity and returns its stderr.
+/// The diagnostics pinned here are the serial k-way merge's (`Merge
+/// sources:`, the demand and prediction lines, `Sort merge diag:`); a
+/// spilled sort at any thread count may merge by key range instead, so every
+/// sort in this file forces the serial merge.
+const SERIAL_MERGE: (&str, &str) = ("FGUMI_SORT_SERIAL_MERGE", "1");
+
+/// Runs `fgumi sort` (serial merge) at info verbosity and returns its stderr.
 fn sort_and_capture_logs(families: usize, max_memory: &str, extra_args: &[&str]) -> String {
     let tmp = TempDir::new().expect("tempdir");
     let input: PathBuf = tmp.path().join("unsorted.bam");
@@ -108,6 +114,7 @@ fn sort_and_capture_logs(families: usize, max_memory: &str, extra_args: &[&str])
 
     let result = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .env("RUST_LOG", "info")
+        .env(SERIAL_MERGE.0, SERIAL_MERGE.1)
         .args(["sort", "-i"])
         .arg(&input)
         .arg("-o")
@@ -230,7 +237,7 @@ fn sort_shuffled(
     write_shuffled_bam_fixture(&input, families, 0x5EED);
     let output = tmp.path().join("sorted.bam");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fgumi"));
-    cmd.env("RUST_LOG", "info");
+    cmd.env("RUST_LOG", "info").env(SERIAL_MERGE.0, SERIAL_MERGE.1);
     if with_stats {
         cmd.env("FGUMI_PIPELINE_STATS", "1");
     }

@@ -72,6 +72,8 @@ pub(crate) fn keyed_run(codec: SpillCodec, file_id: u32, keys: Range<u64>) -> Sp
         is_last_in_file: true,
         records_ingested_so_far: u64::from(file_id) + 1,
         bytes: compress(codec, &framed_template_records_of(file_id, keys)),
+        frames: None,
+        index_stride: 1,
     }
 }
 
@@ -115,11 +117,28 @@ pub(crate) fn write_run_file(
     std::fs::metadata(path).unwrap().len()
 }
 
-/// Every `(key bytes, body)` in a run file, in file order (40-byte `TemplateK40`
-/// key, u32 length, body — the layout `keyed_run` frames).
-pub(crate) fn read_run_records(path: &Path, codec: SpillCodec) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let bytes = std::fs::read(path).unwrap();
-    let body = &bytes[fgumi_sort::spill_magic(codec).len()..];
+/// A run file's frame bytes: past the codec magic, up to where its writer
+/// ended the frames (`frames_end`; any run-index footer follows them).
+pub(crate) fn run_frame_bytes(
+    path: &Path,
+    codec: SpillCodec,
+    frames_end: fgumi_sort::FramesEnd,
+) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    let end = fgumi_sort::open_spill_slot(path, 0, frames_end).unwrap().len();
+    bytes.truncate(usize::try_from(end).unwrap());
+    bytes.split_off(fgumi_sort::spill_magic(codec).len())
+}
+
+/// Every `(key bytes, body)` in a run file whose frames end at `frames_end`,
+/// in file order (40-byte `TemplateK40` key, u32 length, body — the layout
+/// `keyed_run` frames).
+pub(crate) fn read_run_records(
+    path: &Path,
+    codec: SpillCodec,
+    frames_end: fgumi_sort::FramesEnd,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let body = run_frame_bytes(path, codec, frames_end);
     let raw: Vec<u8> = fgumi_sort::SpillBlockDecompressor::new()
         .read_blocks(&mut &body[..], codec, 4096)
         .unwrap()
@@ -276,12 +295,18 @@ pub(crate) fn embedded_frame(body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A run file's frames, re-cut from the decompressed stream: `key_len` key
-/// bytes (0 for embedded kinds), a u32 length, the body.
-pub(crate) fn read_frames(path: &Path, codec: SpillCodec, key_len: usize) -> Vec<Vec<u8>> {
-    let bytes = std::fs::read(path).unwrap();
+/// A run file's frames (ending at `frames_end`), re-cut from the
+/// decompressed stream: `key_len` key bytes (0 for embedded kinds), a u32
+/// length, the body.
+pub(crate) fn read_frames(
+    path: &Path,
+    codec: SpillCodec,
+    key_len: usize,
+    frames_end: fgumi_sort::FramesEnd,
+) -> Vec<Vec<u8>> {
+    let body = run_frame_bytes(path, codec, frames_end);
     let raw: Vec<u8> = fgumi_sort::SpillBlockDecompressor::new()
-        .read_blocks(&mut &bytes[fgumi_sort::spill_magic(codec).len()..], codec, 4096)
+        .read_blocks(&mut &body[..], codec, 4096)
         .unwrap()
         .concat();
     let (mut out, mut at) = (Vec::new(), 0);
@@ -320,9 +345,10 @@ impl Default for KOpts {
     }
 }
 
-/// A recorded job: `(job_id, slot ids, input paths, a clone of each slot's file)`.
+/// A recorded job: `(job_id, slot ids, input paths, a clone of each slot's
+/// file, each slot's frame end)`.
 pub(crate) type RecordedJob =
-    (u32, Vec<u32>, Vec<PathBuf>, Vec<Arc<dyn fgumi_bam_io::pread::PositionalSource>>);
+    (u32, Vec<u32>, Vec<PathBuf>, Vec<Arc<dyn fgumi_bam_io::pread::PositionalSource>>, Vec<u64>);
 
 /// `SpillWrite → SpillReadPlanner ⇒ (.0 PreadSpillSlices → 2 × SortSpillDecompress)
 /// (.1 collected phase-2 events) (.2 ConsolidateRuns → SpillBlockCompress →
@@ -394,6 +420,7 @@ impl KChain {
             .with_per_call(per_call.0, per_call.1);
         let sb = SpillBlockCompress::new(codec, 1, 1 << 20)
             .named("SpillBlockCompressConsolidation")
+            .with_run_index(true)
             .with_step_cap(cap);
         let wr = WriteConsolidatedRun::new(codec, Arc::clone(&registry));
         let mut swp = StepProbe::new(&sw);
@@ -465,7 +492,12 @@ impl KChain {
                 len: std::fs::metadata(p).unwrap().len(),
             })
             .collect();
-        self.pl.1.push_input(SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind });
+        self.pl.1.push_input(SortPhase1Event::ConsolidationStart {
+            job_id,
+            inputs,
+            key_kind,
+            index_stride: 1,
+        });
     }
 
     /// Live runs in `SpillWrite`'s stack.
@@ -509,6 +541,7 @@ impl KChain {
                 job.slots.iter().map(|s| s.slot_id()).collect(),
                 job.input_paths.clone(),
                 job.slots.iter().map(|s| Arc::clone(s.source())).collect(),
+                job.slots.iter().map(|s| s.len()).collect(),
             ));
             if let Some(f) = &mut self.on_job {
                 f(&job);
@@ -566,8 +599,8 @@ impl KChain {
         self.phase2
             .iter()
             .filter_map(|e| match e {
-                SortPhase2Event::SpillReady { path, .. } => {
-                    Some(read_run_records(path, self.codec))
+                SortPhase2Event::SpillReady { path, slot, .. } => {
+                    Some(read_run_records(path, self.codec, fgumi_sort::FramesEnd::At(slot.len())))
                 }
                 _ => None,
             })

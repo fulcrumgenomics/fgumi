@@ -12,6 +12,14 @@
 //! reorder hands `SpillWrite` a dense, in-order stream regardless of which worker
 //! compressed which block — exactly the output path's `BgzfCompress` idiom.
 //!
+//! With [`SpillBlockCompress::with_run_index`] (a zstd coordinate or
+//! template-coordinate sort that can merge by range, on the main spill path
+//! and the consolidation tail alike), each output `Block` of a run the phase-1
+//! front still indexes (`index_stride > 0`) also carries a dense [`RunIndex`]
+//! entry per frame — its compressed span, raw length, record count and first
+//! key — which `SpillWrite` (or `WriteConsolidatedRun`) gathers into the run's
+//! index.
+//!
 //! Each `Parallel` worker holds its own [`SpillBlockCompressor`], built lazily on
 //! the first block (the zstd compressor's construction is fallible, so it is
 //! surfaced through `try_run`'s `io::Result` rather than the infallible
@@ -21,7 +29,9 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{SpillBlockCompressor, SpillCodec};
+use fgumi_sort::{
+    RunIndex, SpillBlockCompressor, SpillCodec, SpillKeyKind, frame_meta, spill_key_width,
+};
 
 use crate::sort::protocol::SpillBlockEvent;
 use fgumi_pipeline_core::{
@@ -102,6 +112,10 @@ pub struct SpillBlockCompress {
     cap: Option<StepCap>,
     /// Where compressed-block buffers come from (shared with `SpillWrite`).
     buf_pool: Option<Arc<SpillBufPool>>,
+    /// Index each compressed block's frames ([`Self::with_run_index`]).
+    run_index: bool,
+    /// Per-worker scratch for a frame's first key while indexing.
+    key_scratch: Vec<u8>,
 }
 
 impl SpillBlockCompress {
@@ -120,6 +134,8 @@ impl SpillBlockCompress {
             output_byte_limit,
             cap: None,
             buf_pool: None,
+            run_index: false,
+            key_scratch: Vec::new(),
         }
     }
 
@@ -150,6 +166,65 @@ impl SpillBlockCompress {
     pub fn with_buf_pool(mut self, pool: Arc<SpillBufPool>) -> Self {
         self.buf_pool = Some(pool);
         self
+    }
+
+    /// Index the frames of every block this step compresses (`frames` on each
+    /// output `Block`) when `enabled`, the codec is zstd and the block's key
+    /// kind is indexed ([`spill_key_width`]), for every block whose run the
+    /// phase-1 front stamped a non-zero stride. Both the main spill path and
+    /// the consolidation compressor enable it for a sort that can range.
+    #[must_use]
+    pub fn with_run_index(mut self, enabled: bool) -> Self {
+        self.run_index = enabled;
+        self
+    }
+
+    /// The key width of the index this step builds for a block keyed `kind`
+    /// whose run the phase-1 front stamped `index_stride`, or `None` when
+    /// that block is not indexed: indexing is on, the codec is zstd, the kind
+    /// is indexed and the front still indexes the run (`index_stride > 0`).
+    /// The index is always dense; `SpillWrite` applies the stride.
+    fn index_width(&self, kind: SpillKeyKind, index_stride: u32) -> Option<u16> {
+        if !self.run_index || self.codec != SpillCodec::Zstd || index_stride == 0 {
+            return None;
+        }
+        spill_key_width(kind)
+    }
+
+    /// An empty index for a block keyed `kind` at `index_stride`, or `None`
+    /// when this block's frames are not indexed ([`Self::index_width`]).
+    fn new_index(&self, kind: SpillKeyKind, index_stride: u32) -> Option<RunIndex> {
+        self.index_width(kind, index_stride).map(RunIndex::new)
+    }
+
+    /// Compress `raw`'s frames — each ending at the next of `frame_ends` — into
+    /// one block buffer, indexing them when this block is indexed
+    /// ([`Self::new_index`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates compressor-init, compression and frame-parse errors.
+    fn compress_frames(
+        &mut self,
+        raw: &[u8],
+        frame_ends: &[usize],
+        key_kind: SpillKeyKind,
+        index_stride: u32,
+    ) -> io::Result<(Vec<u8>, Option<RunIndex>)> {
+        let mut frames = self.new_index(key_kind, index_stride);
+        let mut out = self.out_buf();
+        let mut key_scratch = std::mem::take(&mut self.key_scratch);
+        let compressed = self.compressor().and_then(|c| {
+            let mut at = 0;
+            for &frame_end in frame_ends {
+                let frame = &raw[at..frame_end];
+                compress_frame(c, frame, &mut out, key_kind, frames.as_mut(), &mut key_scratch)?;
+                at = frame_end;
+            }
+            Ok(())
+        });
+        self.key_scratch = key_scratch;
+        compressed.map(|()| (out, frames))
     }
 
     /// A buffer for one compressed block.
@@ -225,6 +300,7 @@ impl SpillBlockCompress {
                 end,
                 framed_bytes,
                 frame_bytes,
+                index_stride,
             } => {
                 // `SpillGather` plans `start <= end <= chunk.len()`, and its cut
                 // rule and the framing agree on the bytes. Both are checked in
@@ -271,24 +347,15 @@ impl SpillBlockCompress {
                         self.raw.len()
                     )));
                 }
-                // The framed bytes are all this needs from the chunk: release it
-                // now, so the last range of a run returns the arena before the
-                // compression, not after.
+                // Release the chunk (and with it, possibly, the run's arena)
+                // before compressing.
                 drop(chunk);
                 let raw = std::mem::take(&mut self.raw);
                 let frame_ends = std::mem::take(&mut self.frame_ends);
-                let mut out = self.out_buf();
-                let compressed = self.compressor().and_then(|c| {
-                    let mut at = 0;
-                    for &frame_end in &frame_ends {
-                        c.compress_block_into(&raw[at..frame_end], &mut out)?;
-                        at = frame_end;
-                    }
-                    Ok(())
-                });
+                let compressed = self.compress_frames(&raw, &frame_ends, key_kind, index_stride);
                 self.raw = raw;
                 self.frame_ends = frame_ends;
-                compressed?;
+                let (out, frames) = compressed?;
                 Ok(SpillBlockEvent::Block {
                     ordinal,
                     file_id,
@@ -296,6 +363,8 @@ impl SpillBlockCompress {
                     is_last_in_file,
                     records_ingested_so_far,
                     bytes: out,
+                    frames,
+                    index_stride,
                 })
             }
             SpillBlockEvent::Block {
@@ -305,9 +374,11 @@ impl SpillBlockCompress {
                 is_last_in_file,
                 records_ingested_so_far,
                 bytes,
+                frames: _,
+                index_stride,
             } => {
-                let mut compressed = self.out_buf();
-                self.compressor()?.compress_block_into(&bytes, &mut compressed)?;
+                let (compressed, frames) =
+                    self.compress_frames(&bytes, &[bytes.len()], key_kind, index_stride)?;
                 // The raw block is done with: recycle it for the producer that
                 // draws its blocks from the same pool (`ConsolidateRuns`).
                 if let Some(pool) = &self.buf_pool {
@@ -320,6 +391,8 @@ impl SpillBlockCompress {
                     is_last_in_file,
                     records_ingested_so_far,
                     bytes: compressed,
+                    frames,
+                    index_stride,
                 })
             }
             // Passthrough variants carry no compressible payload.
@@ -328,6 +401,37 @@ impl SpillBlockCompress {
             }
         }
     }
+}
+
+/// Compress one raw frame onto `out` and, when `index` is given, record it:
+/// the bytes it added to `out` (its `u32` length prefix included), its raw
+/// length, record count and first key. An empty frame writes nothing and is
+/// not recorded.
+///
+/// # Errors
+///
+/// Propagates compression errors, and a frame whose records do not parse.
+fn compress_frame(
+    compressor: &mut SpillBlockCompressor,
+    raw: &[u8],
+    out: &mut Vec<u8>,
+    key_kind: SpillKeyKind,
+    index: Option<&mut RunIndex>,
+    key_scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    let before = out.len();
+    compressor.compress_block_into(raw, out)?;
+    let Some(index) = index else { return Ok(()) };
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let records = frame_meta(key_kind, raw, key_scratch)?;
+    let comp_len = u32::try_from(out.len() - before)
+        .map_err(|_| io::Error::other("SpillBlockCompress: a compressed frame exceeds 4 GiB"))?;
+    let raw_len = u32::try_from(raw.len())
+        .map_err(|_| io::Error::other("SpillBlockCompress: a raw frame exceeds 4 GiB"))?;
+    index.push_frame(comp_len, raw_len, records, key_scratch);
+    Ok(())
 }
 
 impl Clone for SpillBlockCompress {
@@ -344,6 +448,8 @@ impl Clone for SpillBlockCompress {
             output_byte_limit: self.output_byte_limit,
             cap: self.cap.clone(),
             buf_pool: self.buf_pool.clone(),
+            run_index: self.run_index,
+            key_scratch: Vec::new(),
         }
     }
 }

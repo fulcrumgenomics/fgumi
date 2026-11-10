@@ -91,7 +91,10 @@ fn open_slots(paths: &[PathBuf]) -> Vec<Arc<SortMergeSlot>> {
     paths
         .iter()
         .enumerate()
-        .map(|(f, p)| fgumi_sort::open_spill_slot(p, u32::try_from(f).unwrap()).unwrap())
+        .map(|(f, p)| {
+            fgumi_sort::open_spill_slot(p, u32::try_from(f).unwrap(), fgumi_sort::FramesEnd::AtEof)
+                .unwrap()
+        })
         .collect()
 }
 
@@ -275,6 +278,7 @@ fn run_supply(slots: &[Arc<SortMergeSlot>]) -> SupplyRun {
         demand: Arc::clone(&demand),
         ledger: Arc::clone(&ledger),
         retire_epoch: Arc::default(),
+        merge_mode: Arc::default(),
     };
     let slices = SliceBufferPool::new(2 * THREADS + 8);
     let planner =

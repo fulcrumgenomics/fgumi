@@ -43,6 +43,10 @@ pub(crate) mod merge_slots;
 pub mod prefetch;
 pub(crate) mod queryname_ref;
 pub(crate) mod radix;
+// Range-parallel final merge: key-range plan over indexed spill runs (range
+// mode spills the final run, so there is no residual). Surfaced via the
+// re-export below.
+pub(crate) mod range_merge;
 pub(crate) mod read_ahead;
 pub(crate) mod reader;
 pub mod ref_sort;
@@ -52,6 +56,9 @@ pub(crate) mod output_target;
 // Per-order run boundary key for the arena spill run-former (extend-vs-new-run
 // decision). Surfaced via the re-export below.
 pub(crate) mod run_bound;
+// Index of a spill run: one entry per frame or per `stride` frames (sizes,
+// record counts, first keys).
+pub(crate) mod run_index;
 pub mod segmented_buf;
 pub mod sort_pool;
 pub mod template_arena;
@@ -64,6 +71,11 @@ pub(crate) mod spill_block_reader;
 pub(crate) mod tmp_dir_alloc;
 pub(crate) mod verify;
 
+/// Force mimalloc to collect the calling thread's freed pages and purge the
+/// arenas' pending decommits. Re-exported for the range merge, which runs on
+/// the sort's coordination thread (the phase-1 arena's allocator) and returns
+/// the retired arena's pages before it builds its plan.
+pub use memory_probe::force_mi_collect;
 /// Print mimalloc allocator statistics to stderr.
 ///
 /// This is a thin re-export of the internal FFI call, exposed for the main
@@ -200,8 +212,8 @@ pub use merge_demand::{
     MergePoolRequest,
 };
 pub use merge_driver::{
-    MergeCtxErased, MergeDriver, MergeDriverDyn, MergeStep, MergeStepFramed, RecordRewrite,
-    input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
+    FramesEnd, MergeCtxErased, MergeDriver, MergeDriverDyn, MergeStep, MergeStepFramed,
+    RecordRewrite, input_order_violation, merge_driver_for_kind, open_bam_slot, open_spill_slot,
     open_spill_slot_as,
 };
 pub use merge_slots::{
@@ -215,6 +227,13 @@ pub use queryname_ref::{
     QnKey, QnLex, QnMergeKey, QnNatural, QnRef, QnRefBuilder, QnSortState, cmp_qn_refs,
     queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs,
 };
+/// Test helpers for range merges: indexed spill runs and the serial oracle.
+#[cfg(any(test, feature = "test-utils"))]
+pub use range_merge::test_support as range_merge_test_support;
+pub use range_merge::{
+    MAX_RANGES, RangeBound, RangeMerge, RangeOut, RangePlan, RangeSizing, RangeStats, RangeTask,
+    RecordSink,
+};
 pub use reader::{
     OwnedRawBamRecordReader, RawBamRecordReader, open_raw_bam_record_reader,
     open_raw_bam_record_reader_with_header,
@@ -224,11 +243,12 @@ pub use ref_sort::{
     radix_sorts_in_parallel,
 };
 pub use run_bound::{RunBound, format_run_formation};
+pub use run_index::{RunIndex, frame_meta, spill_key_width};
 pub use segmented_buf::SegmentedBuf;
 pub use sort_pool::BoundedSortPool;
 pub use spill_block::{
-    SpillBlockCompressor, SpillKeyKind, frame_embedded_record_into, frame_keyed_record_into,
-    spill_magic, spill_trailer,
+    RECORD_LEN_BYTES, SpillBlockCompressor, SpillKeyKind, frame_embedded_record_into,
+    frame_keyed_record_into, spill_magic, spill_trailer,
 };
 pub use spill_block_reader::{RawBlock, SpillBlockDecompressor};
 pub use template_arena::{

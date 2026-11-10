@@ -244,15 +244,22 @@ pub(crate) enum ChainTailKind {
 
     /// The chain tail produces serialized BGZF-ready bytes
     /// ([`DecompressedBlock`]) after a Terminal serialize step
-    /// (`SerializeBamRecords` / `SerializeGroups`, the terminal
-    /// `SortMerge<BlockOutput>` for sort, or the record-aligned block emitted by
-    /// a terminal consensus stage). No
-    /// stage downstream of a Terminal stage reads `chain_tail_kind`, so this is
-    /// a terminal-only marker; it exists so the kind is never a lie. `add_sink`
-    /// wires `BgzfCompress → WriteBgzfFile` regardless of this value.
+    /// (`SerializeBamRecords` / `SerializeGroups`, or the record-aligned block
+    /// emitted by a terminal consensus stage). No stage downstream of a
+    /// Terminal stage reads `chain_tail_kind`, so this is a terminal-only
+    /// marker; it exists so the kind is never a lie. `add_sink` wires
+    /// `BgzfCompress → WriteBgzfFile` for it.
     ///
     /// [`DecompressedBlock`]: crate::pipeline::steps::types::DecompressedBlock
     SerializedBytes,
+
+    /// The chain tail produces [`OutputBlock`]s: the terminal
+    /// `SortMerge<CompressibleBlockOutput>` of a standalone sort, whose range
+    /// merge may compress blocks itself. `add_sink` wires
+    /// `BgzfCompress<OutputBlock>`, which passes those through.
+    ///
+    /// [`OutputBlock`]: fgumi_pipeline_io::output_compress::OutputBlock
+    SortOutputBlocks,
 
     /// The chain tail produces [`BamTemplateBatch`]. Set by `add_align`
     /// (Intermediate) and `add_correct` (Intermediate).
@@ -608,6 +615,10 @@ pub struct ChainBuilder<'a> {
     /// (test support).
     #[cfg(test)]
     spill_eligible_clones: Option<usize>,
+    /// Whether the sort indexes its spill runs: the main compressor, its
+    /// spill runs and the consolidation compressor (test support).
+    #[cfg(test)]
+    spill_run_index: Option<bool>,
 
     /// Set for a chain whose drain-bound shape benefits from downstream-first
     /// dispatch. [`Self::build`] reads it to select the
@@ -739,6 +750,17 @@ pub struct ChainBuilder<'a> {
     ///   (`GroupByMi` for `DecodedRecordBatch`, `TemplatesToMiGroups` for
     ///   `BatchedProcessedPositionGroups`).
     chain_tail_kind: ChainTailKind,
+
+    /// The output compression the terminal sort's merge was given (`add_sort`),
+    /// which `add_sink`'s `BgzfCompress<OutputBlock>` must match: the merge's
+    /// pre-compressed blocks pass through it unchanged.
+    sort_output_compression: Option<fgumi_pipeline_io::sort::OutputCompression>,
+
+    /// Compression's queue depth on the terminal sort's output edge: the
+    /// merge counts its pushes (`add_sort`), `add_sink`'s
+    /// `BgzfCompress<OutputBlock>` its pops, and the range merge gates the
+    /// pool's merge-side claims on the difference.
+    sink_output_depth: Option<Arc<fgumi_pipeline_io::output_compress::OutputDepth>>,
 
     /// Lever 2: run the terminal `WriteBgzfFile` on its own dedicated
     /// `StepKind::Detached` thread instead of as a pool-scheduled
@@ -956,6 +978,8 @@ impl<'a> ChainBuilder<'a> {
             spill_inflight_slices: None,
             #[cfg(test)]
             spill_eligible_clones: None,
+            #[cfg(test)]
+            spill_run_index: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             #[cfg(test)]
@@ -979,6 +1003,8 @@ impl<'a> ChainBuilder<'a> {
             // Pool-scheduled writer by default; add_sort opts the standalone
             // sort terminal into a Detached writer (lever 2).
             detached_writer: false,
+            sort_output_compression: None,
+            sink_output_depth: None,
             sink_phase_cap: None,
             sort_plan: None,
             sort_spill_stats: None,
@@ -2537,6 +2563,7 @@ impl<'a> ChainBuilder<'a> {
     pub fn add_sink(&mut self) -> Result<()> {
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+        use fgumi_pipeline_io::output_compress::OutputBlock;
 
         // FASTQ sinks write raw bytes (no BAM header, no BGZF EOF) via a
         // dedicated writer, optionally through `BgzfCompress` for `.gz`/`.bgz`.
@@ -2604,15 +2631,25 @@ impl<'a> ChainBuilder<'a> {
             );
         }
 
-        let compress_step = BgzfCompress::new(
-            self.tuning.compression_level,
-            self.tuning.per_step_byte_limit,
-            want_index,
-        );
         // Standalone-sort terminal: the output compressor shares the merge
         // phase's cap. `sink_phase_cap` is `None` for every other chain.
-        let compress_step = compress_step.with_phase_cap(self.sink_phase_cap.take());
-        let tail = self.pipeline.append_step(compress_step, tail);
+        let cap = self.sink_phase_cap.take();
+        let (level, limit) = (self.tuning.compression_level, self.tuning.per_step_byte_limit);
+        let tail = if self.chain_tail_kind == ChainTailKind::SortOutputBlocks {
+            // The terminal sort's merge may hand blocks it compressed itself:
+            // build this compressor from the settings `add_sort` gave the
+            // merge, so the two match by construction, and pass those through.
+            let Some(settings) = self.sort_output_compression.take() else {
+                bail!("a terminal sort's output reached add_sink without its compression settings");
+            };
+            let step =
+                BgzfCompress::<OutputBlock>::for_input(settings.level, limit, settings.index_bam)
+                    .with_output_depth(self.sink_output_depth.take());
+            self.pipeline.append_step(step.with_phase_cap(cap), tail)
+        } else {
+            let step = BgzfCompress::new(level, limit, want_index);
+            self.pipeline.append_step(step.with_phase_cap(cap), tail)
+        };
 
         // When Stage::Align is in the chain, the merged output header is
         // resolved at pipeline-run time (the aligner contributes @PG/@RG/@CO
@@ -3989,7 +4026,7 @@ impl<'a> ChainBuilder<'a> {
     /// SortPhase1Event
     ///     ↓ SortSpillDecompress (Parallel)
     /// SortPhase2Event
-    ///     ↓ [Terminal]     SortMerge<BlockOutput> (Serial) → DecompressedBlock
+    ///     ↓ [Terminal]     SortMerge<CompressibleBlockOutput> (Serial) → OutputBlock
     ///     ↓ [Intermediate] SortMerge (Serial) → RecordBatch → DecodeFromRecords
     /// ```
     ///
@@ -4050,16 +4087,17 @@ impl<'a> ChainBuilder<'a> {
             //   SortSpillDecompress (Parallel)
             //       ↓ SortPhase2Event
             //   SortMerge<RecordBatchOutput> (Serial) → RecordBatch      [Intermediate]
-            //   SortMerge<BlockOutput>       (Serial) → DecompressedBlock [Terminal]
+            //   SortMerge<CompressibleBlockOutput> (Serial) → OutputBlock [Terminal]
             //       ↓
             //   [Intermediate] DecodeFromRecords (Parallel) → DecodedRecordBatch
-            //   [Terminal]     (none — SortMerge<BlockOutput> emits DecompressedBlock directly)
+            //   [Terminal]     (none — SortMerge<CompressibleBlockOutput> emits OutputBlock directly)
             //
             // For Intermediate: chain_tail_kind = DecodedRecordBatch;
             // add_group / add_simplex / etc. can proceed normally.
             //
-            // For Terminal: chain_tail_kind = SerializedBytes (DecompressedBlock
-            // bytes ready for sink) — add_sink appends BgzfCompress → WriteBgzfFile.
+            // For Terminal: chain_tail_kind = SortOutputBlocks (`OutputBlock`s,
+            // raw or already compressed by the range merge's thread) — add_sink
+            // appends BgzfCompress<OutputBlock> → WriteBgzfFile.
             //
             // `Auto` memory is honored only for a sole-`[Sort]` chain (see
             // `is_standalone_sort` below), where sort owns the whole budget. In a
@@ -4068,9 +4106,9 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::core::step::Affinity;
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
-                BlockOutput, RecordBatchOutput, SortBuffer, SortMerge, SortSpillDecompress,
-                SpillBlockCompress, SpillGather, SpillReadPlanner, SpillRunStats, SpillSupply,
-                SpillWrite, SupplyDiagnostics,
+                CompressibleBlockOutput, OutputCompression, RecordBatchOutput, SortBuffer,
+                SortMerge, SortSpillDecompress, SpillBlockCompress, SpillGather, SpillReadPlanner,
+                SpillRunStats, SpillSupply, SpillWrite, SupplyDiagnostics,
             };
             use fgumi_sort::SortOrder;
 
@@ -4289,6 +4327,28 @@ impl<'a> ChainBuilder<'a> {
                 hist: Arc::clone(hist),
                 policy: Arc::clone(&spill_policy),
             });
+            // Index each zstd coordinate / template-coordinate run's frames as
+            // it is written or consolidated (the merge partitions runs by them),
+            // at the stride the phase-1 front stamps on the run. The policy
+            // (which orders and codecs index, and the budget floor) is
+            // `fgumi-pipeline-io`'s; every indexing step follows its
+            // `can_range()`.
+            let range_eligibility = fgumi_pipeline_io::sort::RangeEligibility::for_sort(
+                sort_order,
+                sort.temp_codec,
+                phases.phase2,
+                // `MergeWork` runs one clone per pool worker
+                // (`AllWorkers`, pinned by `sort_chain_dag_has_merge_work`),
+                // and each clone keeps at most one range job in progress.
+                pool,
+                serial_merge_from_env(std::env::var("FGUMI_SORT_SERIAL_MERGE").ok().as_deref()),
+                merge_memory as u64,
+            );
+            // Who may claim range mode's jobs: the hidden A/B diagnostic,
+            // resolved here like `FGUMI_SORT_SERIAL_MERGE` above.
+            let claim_policy = fgumi_pipeline_io::sort::ClaimPolicy::from_env_value(
+                std::env::var("FGUMI_SORT_RANGE_CLAIM").ok().as_deref(),
+            );
             let planner = SpillReadPlanner::new(
                 total_memory as u64,
                 phases.phase2,
@@ -4300,7 +4360,8 @@ impl<'a> ChainBuilder<'a> {
             .with_read_streams(Arc::clone(&spill_policy))
             .with_merge_memory(merge_memory as u64)
             .with_sort_stats(sort.sort_stats)
-            .with_phase1_threads(phases.phase1);
+            .with_phase1_threads(phases.phase1)
+            .with_range_eligibility(range_eligibility);
             let planner = match &consolidation {
                 Some(tail) => planner.with_consolidation(
                     Arc::clone(&tail.demand),
@@ -4346,7 +4407,7 @@ impl<'a> ChainBuilder<'a> {
             // `SortMerge` is constructed inside the Terminal/Intermediate branch
             // below, because its output-framing strategy differs by position:
             //
-            // - Terminal: `SortMerge<BlockOutput>` frames each merged record as
+            // - Terminal: `SortMerge<CompressibleBlockOutput>` frames each merged record as
             //   `[u32 LE block_size][body]` directly into a `DecompressedBlock`,
             //   wired straight to `BgzfCompress` — the former
             //   `SortMerge → SerializeRecordBatch → BgzfCompress` triple folded to
@@ -4456,9 +4517,12 @@ impl<'a> ChainBuilder<'a> {
                         }
                     };
                     let ledger = RunLedger::new(known_width);
+                    // The final run spills (and the arena is freed) when the merge
+                    // will run in range mode.
                     let read_blocks =
                         ReadBlocks::new(total_memory, byte_limit, Arc::clone(&ledger))
-                            .with_sort_stats(sort.sort_stats);
+                            .with_sort_stats(sort.sort_stats)
+                            .with_range_eligibility(range_eligibility);
                     // The arena front is the only decode path standalone sort
                     // takes, so the chain's CRC policy has to reach it here --
                     // `BgzfDecompress` (which also honors `spec.verify_crc`) is
@@ -4531,7 +4595,9 @@ impl<'a> ChainBuilder<'a> {
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
                         .with_affinity(affinity)
                         .with_queryname_keys(qn_keys.clone());
-                    sort_buffer = sort_buffer.with_phase_cap(phase1_cap.clone());
+                    sort_buffer = sort_buffer
+                        .with_phase_cap(phase1_cap.clone())
+                        .with_range_eligibility(range_eligibility);
                     self.pipeline.append_step(sort_buffer, tail)
                 };
                 // `SpillGather` runs on the off-pool coordination driver
@@ -4542,9 +4608,20 @@ impl<'a> ChainBuilder<'a> {
                 // Compressed spill-block buffers circulate compress -> write ->
                 // compress instead of being allocated per block.
                 let spill_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();
+                // Index the runs the range merge can read (see
+                // `range_eligibility`). Only a sort that can merge by range
+                // indexes its runs: a forced-serial or too-few-threads sort
+                // builds no frames and writes no index footers, so its runs
+                // match the unindexed configuration.
+                let indexable = range_eligibility.can_range();
                 let compress = SpillBlockCompress::new(temp_codec, temp_compression, byte_limit)
                     .with_step_cap(phase1_cap.clone().map(fgumi_pipeline_core::StepCap::from))
-                    .with_buf_pool(Arc::clone(&spill_bufs));
+                    .with_buf_pool(Arc::clone(&spill_bufs))
+                    .with_run_index(indexable);
+                #[cfg(test)]
+                {
+                    self.spill_run_index = Some(indexable);
+                }
                 // `--max-temp-files` bounds the live spill runs: `SpillWrite`
                 // consolidates runs (at the spill compression level) whenever the
                 // limit would be exceeded, so the merge never opens more files than
@@ -4553,6 +4630,9 @@ impl<'a> ChainBuilder<'a> {
                 if is_standalone_sort {
                     self.sort_spill_stats = Some(Arc::clone(&spill_stats));
                 }
+                // The phase-1 front (`ReadBlocks` / `SortBuffer`) owns the index
+                // policy: the writer sparsifies or drops the runs' indexes as the
+                // stride the front stamps on each run's blocks says.
                 let write = SpillWrite::new(alloc, temp_codec, byte_limit, temp_dirs)
                     .with_stats(spill_stats)
                     .with_buf_pool(spill_bufs);
@@ -4607,7 +4687,13 @@ impl<'a> ChainBuilder<'a> {
                     let mut compress =
                         SpillBlockCompress::new(sort.temp_codec, sort.temp_compression, byte_limit)
                             .named("SpillBlockCompressConsolidation")
-                            .with_buf_pool(Arc::clone(&tail_bufs));
+                            .with_buf_pool(Arc::clone(&tail_bufs))
+                            // Index the merged runs too, so consolidation keeps
+                            // the range merge. The merged run's index replaces
+                            // its inputs' indexes, which the phase-1 front
+                            // already charged; the merge decision counts it in
+                            // its `index_bytes`.
+                            .with_run_index(range_eligibility.can_range());
                     if let Some(p) = &tail.phased {
                         compress = compress
                             .with_step_cap(fgumi_pipeline_core::StepCap::Phased(Arc::clone(p)));
@@ -4637,27 +4723,38 @@ impl<'a> ChainBuilder<'a> {
             )?;
 
             if position == StagePosition::Terminal {
-                // Terminal sort: `SortMerge<BlockOutput>` frames merged records
-                // directly into `DecompressedBlock`s (lever 1), wired straight to
-                // `BgzfCompress → WriteBgzfFile` in add_sink. No
+                // Terminal sort: `SortMerge<CompressibleBlockOutput>` frames merged
+                // records directly into `OutputBlock::Raw` blocks (lever 1), wired
+                // straight to `BgzfCompress<OutputBlock> → WriteBgzfFile` in add_sink. No
                 // `SerializeRecordBatch` step (and so no extra reorder stage) —
                 // the framing is byte-for-byte identical to what that step
                 // produced, but emitted on the already-in-order `Detached` merge
                 // thread, dropping one pool step and one memcpy per record.
-                let (mut merge, merge_work) =
-                    SortMerge::<BlockOutput>::new(sort_order, self.tuning.per_step_byte_limit)
-                        .with_sort_stats(sort.sort_stats)
-                        // Fan the in-memory fast-path gather across the phase-2
-                        // (merge) thread budget: the single already-sorted chunk
-                        // is gathered into output blocks by `MergeWork` on the
-                        // pool instead of on the lone detached thread, removing
-                        // the flat serial gather that otherwise floors the
-                        // in-memory sort's wall clock. The window is sized from
-                        // the effective phase-2 count (`--merge-threads` within
-                        // `--threads`).
-                        // `with_pooled_gather` creates the inbox and returns the
-                        // matching `MergeWork` step, wired on branch 1 below.
-                        .with_pooled_gather(phases.phase2, phase2_cap.clone());
+                let (mut merge, merge_work) = SortMerge::<CompressibleBlockOutput>::new(
+                    sort_order,
+                    self.tuning.per_step_byte_limit,
+                )
+                .with_sort_stats(sort.sort_stats)
+                .with_claim_policy(claim_policy)
+                // The range merge's thread may compress the blocks its output
+                // refuses, with the settings `add_sink` builds the sink
+                // compressor from, for `BgzfCompress` to pass through.
+                .with_output_depth(Arc::clone(self.sink_output_depth.insert(Arc::default())))
+                .with_output_compression(*self.sort_output_compression.insert(OutputCompression {
+                    level: self.tuning.compression_level,
+                    index_bam: matches!(self.spec.sink, SinkSpec::BamWithIndex(_)),
+                }))
+                // Fan the in-memory fast-path gather across the phase-2
+                // (merge) thread budget: the single already-sorted chunk
+                // is gathered into output blocks by `MergeWork` on the
+                // pool instead of on the lone detached thread, removing
+                // the flat serial gather that otherwise floors the
+                // in-memory sort's wall clock. The window is sized from
+                // the effective phase-2 count (`--merge-threads` within
+                // `--threads`).
+                // `with_pooled_gather` creates the inbox and returns the
+                // matching `MergeWork` step, wired on branch 1 below.
+                .with_pooled_gather(phases.phase2, phase2_cap.clone());
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
@@ -4677,9 +4774,9 @@ impl<'a> ChainBuilder<'a> {
                 // steps, so the drain-first walk visits compression first.
                 self.pipeline.append_step(merge_work, (merge_tail.0, BranchIdx(1)));
                 self.current_tail = Some(merge_tail);
-                // tail is DecompressedBlock (serialized bytes) directly from
-                // SortMerge → SerializedBytes.
-                self.chain_tail_kind = ChainTailKind::SerializedBytes;
+                // tail is OutputBlock (serialized bytes, some compressed by the
+                // merge) directly from SortMerge → SortOutputBlocks.
+                self.chain_tail_kind = ChainTailKind::SortOutputBlocks;
 
                 // Standalone sort: log the `=== Summary ===` block from the
                 // SortMerge stats slot. Success-gated (`finalize_on_success`), NOT
@@ -4733,6 +4830,7 @@ impl<'a> ChainBuilder<'a> {
                     self.tuning.per_step_byte_limit,
                 )
                 .with_sort_stats(sort.sort_stats)
+                .with_claim_policy(claim_policy)
                 // Same pooled fast-path gather as the terminal branch (see
                 // there): a large in-memory intermediate sort feeding
                 // group/consensus gathers its single sorted chunk on the pool
@@ -7681,6 +7779,24 @@ fn extract_placement_from_env(value: Option<&str>) -> fgumi_pipeline_core::PoolP
     }
 }
 
+/// Whether the sort's final merge is forced serial, from the diagnostic
+/// `FGUMI_SORT_SERIAL_MERGE` value: `"1"` forces it; unset lets the planner
+/// choose; any other value (`true`, `0`, empty) also lets the planner choose,
+/// with a warning that it was ignored.
+fn serial_merge_from_env(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some("1") => true,
+        Some(other) => {
+            log::warn!(
+                "FGUMI_SORT_SERIAL_MERGE={other:?} is ignored: set it to 1 to force the serial \
+                 merge"
+            );
+            false
+        }
+    }
+}
+
 /// The configuration of a split arena front (see [`append_split`]).
 struct SplitFront {
     /// The resolved phase-1 width (`PhaseThreads::phase1`): sizes the run sort.
@@ -7814,6 +7930,7 @@ mod tests {
             spill_read_streams: None,
             spill_inflight_slices: None,
             spill_eligible_clones: None,
+            spill_run_index: None,
             use_drain_first_scheduler: false,
             refill_hints: Vec::new(),
             #[cfg(test)]
@@ -7833,6 +7950,8 @@ mod tests {
             align_index: Arc::new(crate::pipeline::steps::align::SharedIndex::new()),
             chain_tail_kind: ChainTailKind::DecodedRecordBatch { closed_under_queryname: false },
             detached_writer: false,
+            sort_output_compression: None,
+            sink_output_depth: None,
             sink_phase_cap: None,
             sort_plan: None,
             sort_spill_stats: None,
@@ -8928,6 +9047,34 @@ mod tests {
         assert_eq!(eligible, clones.min(merge_threads.unwrap_or(clones)), "{planned:?}");
     }
 
+    /// Only a sort that can merge by range indexes its spill runs (and so
+    /// writes index footers): with an unindexable spill codec the main and
+    /// the consolidation compressors index nothing (both follow the one
+    /// gate, `RangeEligibility::can_range`), so the runs are those of the
+    /// unindexed configuration. Any phase-2 width can range. (Forced serial shares the gate; the
+    /// environment variable cannot be set safely in a unit test.)
+    /// Columns: threads, spill codec, expected flag.
+    #[rstest::rstest]
+    #[case::eligible(8, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::one_thread(1, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::two_threads(2, fgumi_sort::SpillCodec::Zstd, true)]
+    #[case::bgzf(8, fgumi_sort::SpillCodec::Bgzf, false)]
+    fn spill_runs_are_indexed_only_when_the_merge_can_range(
+        #[case] threads: usize,
+        #[case] codec: fgumi_sort::SpillCodec,
+        #[case] expected: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = header_only_input(tmp.path(), false);
+        let mut spec = sort_chain_spec(tmp.path(), input, vec![Stage::Sort]);
+        spec.threading = crate::commands::common::ThreadingOptions { threads: Some(threads) };
+        spec.stage_opts.sort.as_mut().unwrap().temp_codec = codec;
+        let mut chain = ChainBuilder::new(&spec).unwrap();
+        chain.add_source().unwrap();
+        chain.add_stage(Stage::Sort, StagePosition::Terminal).unwrap();
+        assert_eq!(chain.spill_run_index, Some(expected));
+    }
+
     /// A BAM template-coordinate sort runs on the split arena front at every
     /// thread count: exactly the three split steps sit between `InflateToArena`
     /// and `SpillGather`.
@@ -9113,6 +9260,16 @@ mod tests {
             ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"],
             "{dag}"
         );
+    }
+
+    /// `FGUMI_SORT_SERIAL_MERGE` forces the serial merge only when set to `"1"`.
+    #[rstest::rstest]
+    #[case::one(Some("1"), true)]
+    #[case::zero(Some("0"), false)]
+    #[case::other(Some("yes"), false)]
+    #[case::unset(None, false)]
+    fn serial_merge_override(#[case] value: Option<&str>, #[case] expected: bool) {
+        assert_eq!(serial_merge_from_env(value), expected);
     }
 
     /// `FGUMI_SORT_EXTRACT_ALL_WORKERS=1` puts key extraction on every worker,

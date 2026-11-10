@@ -58,8 +58,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fgumi_bam_io::pread::{PositionalSource, ReadStreamsPolicy, SliceBufferPool, slice_ranges};
 use fgumi_pipeline_core::{
@@ -70,6 +70,7 @@ use fgumi_pipeline_core::{
 };
 use fgumi_sort::{MergeDemand, SortMergeSlot};
 
+use super::merge_mode::{MergeMode, RangeEligibility, SerialReason, decide_merge_mode};
 use super::protocol::{ConsolidationJob, SortPhase1Event, SortPhase2Event};
 use super::read_ahead_budget::{COLD_INFLIGHT_BYTES, ReadAheadBudget, fifo_charge};
 use super::supply_ledger::{SpillSupply, SupplyLedger};
@@ -147,6 +148,15 @@ pub struct SpillReadPlanner {
     cold_inflight_bytes: u64,
     eligible_clones: usize,
     budget: Option<ReadAheadBudget>,
+    /// What the range merge needs to decide whether it may run (`None`:
+    /// always the serial merge).
+    range_eligibility: Option<RangeEligibility>,
+    /// Residual chunks forwarded so far (every one arrives before
+    /// `AllAnnounced`).
+    memory_chunks_seen: u32,
+    /// Where the merge-mode decision is published (shared through
+    /// [`SpillSupply`]).
+    merge_mode: Arc<OnceLock<MergeMode>>,
     /// The hot set of the previous pass, demoted to the cold FIFO cap when
     /// it leaves the set.
     hot_prev: Vec<usize>,
@@ -205,6 +215,9 @@ impl SpillReadPlanner {
             cold_inflight_bytes: COLD_INFLIGHT_BYTES,
             eligible_clones: eligible_clones.max(1),
             budget: None,
+            range_eligibility: None,
+            memory_chunks_seen: 0,
+            merge_mode: Arc::clone(&supply.merge_mode),
             hot_prev: Vec::new(),
             cursor: 0,
             next_ordinal: 0,
@@ -258,13 +271,24 @@ impl SpillReadPlanner {
         self
     }
 
-    /// Resolve the final merge's read-ahead from `merge_memory` instead of the
-    /// `total_memory` given to [`Self::new`], which still sizes consolidation.
+    /// Resolve the final merge's read-ahead from `merge_memory` instead of
+    /// the `total_memory` given to [`Self::new`], which still sizes
+    /// consolidation (the range merge's budget comes from
+    /// [`RangeEligibility::merge_memory`]).
     /// For memory that is in use only until the input ends (`sort
     /// --read-buffer`): the merge starts after that, consolidation before.
     #[must_use]
     pub fn with_merge_memory(mut self, merge_memory: u64) -> Self {
         self.merge_memory = merge_memory;
+        self
+    }
+
+    /// Let the final merge run as key ranges when `elig` and the spill runs
+    /// allow it (see `decide_merge_mode`). Without an eligibility the merge
+    /// is always serial.
+    #[must_use]
+    pub fn with_range_eligibility(mut self, elig: RangeEligibility) -> Self {
+        self.range_eligibility = Some(elig);
         self
     }
 
@@ -401,6 +425,7 @@ impl SpillReadPlanner {
         job_id: u32,
         inputs: Vec<super::protocol::ConsolidationInput>,
         key_kind: fgumi_sort::SpillKeyKind,
+        index_stride: u32,
     ) -> io::Result<ConsolidationJob> {
         if self.announced {
             return Err(io::Error::new(
@@ -418,15 +443,23 @@ impl SpillReadPlanner {
                 io::Error::other("consolidation slot ids exhausted (more than 2^31 inputs)")
             })?;
             // Opening reads the file's magic: an external wait on the
-            // filesystem (#1068).
+            // filesystem (#1068). The run's frames end where its writer said
+            // (`input.len`), so a footer is never read as records, and bytes
+            // after the frames that are not one footer fail the open.
+            let frames_end = fgumi_sort::FramesEnd::At(input.len);
             let slot = fgumi_pipeline_core::external_wait(|| {
-                fgumi_sort::open_spill_slot_as(&input.path, input.file_id, slot_id)
+                fgumi_sort::open_spill_slot_as(&input.path, input.file_id, slot_id, frames_end)
             })
             .map_err(|e| {
-                io::Error::other(format!(
-                    "SpillReadPlanner: failed to open consolidation input {}: {e:#}",
-                    input.path.display()
-                ))
+                let kind =
+                    e.downcast_ref::<io::Error>().map_or(io::ErrorKind::Other, io::Error::kind);
+                io::Error::new(
+                    kind,
+                    format!(
+                        "SpillReadPlanner: failed to open consolidation input {}: {e:#}",
+                        input.path.display()
+                    ),
+                )
             })?;
             self.register(&slot, BudgetRef::Job(job_id), budget.fifo_cold);
             slots.push(slot);
@@ -434,7 +467,7 @@ impl SpillReadPlanner {
         }
         let ids = slots.iter().map(|s| s.slot_id()).collect();
         self.jobs.insert(job_id, (budget, ids));
-        Ok(ConsolidationJob { job_id, slots, key_kind, input_paths })
+        Ok(ConsolidationJob { job_id, slots, key_kind, index_stride, input_paths })
     }
 
     /// Retire a completed job's slots: mark them, drop them here, make the
@@ -466,6 +499,55 @@ impl SpillReadPlanner {
         Ok(())
     }
 
+    /// Decide the final merge's mode over the merge's exact slot figures (in
+    /// `file_id` order) and the residual chunks seen, and log why an
+    /// eligibility-configured merge stays serial.
+    fn decide_merge_mode(&self) -> MergeMode {
+        let mut merge_slots: Vec<Arc<SortMergeSlot>> = self
+            .slots
+            .iter()
+            .filter(|s| s.budget == BudgetRef::Merge)
+            .map(|s| Arc::clone(&s.slot))
+            .collect();
+        merge_slots.sort_by_key(|s| s.file_id);
+        let mode = decide_merge_mode(
+            self.range_eligibility.as_ref(),
+            &merge_slots,
+            self.memory_chunks_seen,
+        );
+        match &mode {
+            MergeMode::Serial(SerialReason::ForcedByEnv) => {
+                log::info!("range merge disabled: {}", SerialReason::ForcedByEnv);
+            }
+            MergeMode::Serial(SerialReason::SlotNotIndexed { file_id }) => {
+                log::debug!(
+                    "range merge disabled: spill slot {file_id} has no run index (BGZF spills, a \
+                     queryname sort, or an index dropped by the phase-1 policy)"
+                );
+            }
+            MergeMode::Serial(
+                reason @ (SerialReason::RangeDoesNotFit { .. }
+                | SerialReason::IndexesDropped { .. }
+                | SerialReason::IndexStridesDiffer { .. }
+                | SerialReason::ResidualInMemory { .. }),
+            ) => {
+                log::debug!("range merge disabled: {reason}");
+            }
+            _ => {}
+        }
+        mode
+    }
+
+    /// Drop every merge slot from the table without retiring it: the range
+    /// merge reads their files itself, so the planner must never plan them.
+    fn drop_merge_slots(&mut self) {
+        self.slots.retain(|s| s.budget != BudgetRef::Merge);
+        self.by_slot_id =
+            self.slots.iter().enumerate().map(|(i, s)| (s.slot.slot_id(), i)).collect();
+        self.hot_prev.clear();
+        self.cursor = 0;
+    }
+
     fn on_event(&mut self, e: SortPhase1Event) -> io::Result<Forward> {
         Ok(match e {
             SortPhase1Event::SpillReady { slot, path, records_ingested_so_far } => {
@@ -473,20 +555,44 @@ impl SpillReadPlanner {
                 Forward::Phase2(SortPhase2Event::SpillReady { slot, path, records_ingested_so_far })
             }
             SortPhase1Event::MemoryChunk { chunk, records_ingested_so_far } => {
+                // Every residual reaches here before `AllAnnounced`: the
+                // spill writer queues them in order ahead of it.
+                self.memory_chunks_seen = self.memory_chunks_seen.saturating_add(1);
                 Forward::Phase2(SortPhase2Event::MemoryChunk { chunk, records_ingested_so_far })
             }
-            SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind } => {
-                Forward::Job(self.start_job(job_id, inputs, key_kind)?)
+            SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind, index_stride } => {
+                Forward::Job(self.start_job(job_id, inputs, key_kind, index_stride)?)
             }
             SortPhase1Event::ConsolidationRetire { job_id } => {
                 self.retire_job(job_id)?;
                 Forward::None
             }
             SortPhase1Event::AllAnnounced { slot_count, memory_chunk_count, total_records } => {
+                // Checked before any side effect, so the first announcement's
+                // mode, budget and cap phase stand.
+                if self.announced {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AllAnnounced arrived twice",
+                    ));
+                }
                 if let Some(&id) = self.jobs.keys().min() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("AllAnnounced arrived with consolidation job {id} in flight"),
+                    ));
+                }
+                // The decision counts the residual chunks that arrived; the
+                // announcement names how many were sent. Fail closed on a
+                // protocol drift rather than trust either side.
+                if memory_chunk_count != self.memory_chunks_seen {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "AllAnnounced names {memory_chunk_count} residual chunk(s) but {} \
+                             arrived",
+                            self.memory_chunks_seen
+                        ),
                     ));
                 }
                 // Before the first merge read is planned: every phase-2 read,
@@ -510,6 +616,21 @@ impl SpillReadPlanner {
                 if self.sort_stats {
                     log::info!("{}", budget.budget_line());
                 }
+                // Decide the merge's mode before any merge slot has a budget
+                // (`budget_of` is `None` until `self.budget` is set below, so no
+                // merge read can have been planned). Range mode drops the merge
+                // slots and never spends `R`; its data is charged to the range
+                // budget (`decide_merge_mode`).
+                let mode = self.decide_merge_mode();
+                if matches!(mode, MergeMode::Range { .. }) {
+                    self.drop_merge_slots();
+                }
+                self.merge_mode.set(mode).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AllAnnounced found the merge mode already published",
+                    )
+                })?;
                 self.budget = Some(budget);
                 self.announced = true;
                 Forward::Phase2(SortPhase2Event::AllAnnounced {

@@ -64,6 +64,7 @@ libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
 mach2 = "0.6"
 memchr = "2"
+mimalloc = { version = "0.1.52", default-features = false }
 # Built on every Unix target: `fgumi-bam-io` needs `unistd::close`, the only safe
 # checked close (std's `File` drop discards the error), to surface errors the OS
 # reports only when an output file is closed. Other members still scope it to
@@ -131,7 +132,7 @@ log = { workspace = true }
 thiserror = { workspace = true }
 noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { workspace = true }
-mimalloc = { version = "0.1.52", default-features = false }
+mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"

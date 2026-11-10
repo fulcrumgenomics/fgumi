@@ -211,7 +211,7 @@ pub fn bench_frame_blocks(chunk: &MemoryChunkErased, block_size: usize) -> io::R
 /// ranges via [`SpillGather::plan_ranges`] and frames them on the pool).
 /// Returns one `Vec<u8>` per block; an empty chunk yields no blocks.
 #[cfg(test)]
-fn frame_chunk_into_blocks(
+pub(crate) fn frame_chunk_into_blocks(
     chunk: &MemoryChunkErased,
     block_size: usize,
 ) -> io::Result<Vec<Vec<u8>>> {
@@ -240,6 +240,8 @@ struct ActiveSpill {
     /// the chunk's own spill `seq` when it starts a new run.
     file_id: u32,
     records_ingested_so_far: u64,
+    /// The run's index stride from the chunk's `Spill` event.
+    index_stride: u32,
 }
 
 /// A run's most-recently-framed block, withheld until we know whether it is the
@@ -251,6 +253,7 @@ struct HeldBlock {
     file_id: u32,
     key_kind: SpillKeyKind,
     records_ingested_so_far: u64,
+    index_stride: u32,
 }
 
 /// `Detached` step that plans sorted spill chunks into block ranges for
@@ -351,6 +354,8 @@ impl SpillGather {
             is_last_in_file: is_last,
             records_ingested_so_far: hb.records_ingested_so_far,
             bytes: hb.bytes,
+            frames: None,
+            index_stride: hb.index_stride,
         });
     }
 
@@ -362,7 +367,7 @@ impl SpillGather {
     /// guarantees `active` is `None` (the previous chunk fully framed).
     fn stage_event(&mut self, event: SortChunkEvent) {
         match event {
-            SortChunkEvent::Spill { seq, chunk, records_ingested_so_far } => {
+            SortChunkEvent::Spill { seq, chunk, records_ingested_so_far, index_stride } => {
                 // `SortBuffer` only emits `Spill` for a non-empty buffer; skip an
                 // (unexpected) empty chunk rather than open a zero-block file with
                 // no `is_last_in_file` terminator. An empty chunk is a pure no-op:
@@ -394,6 +399,7 @@ impl SpillGather {
                     next_idx: 0,
                     file_id,
                     records_ingested_so_far,
+                    index_stride,
                 });
             }
             SortChunkEvent::Residual { chunk, records_ingested_so_far } => {
@@ -407,7 +413,12 @@ impl SpillGather {
                     records_ingested_so_far,
                 });
             }
-            SortChunkEvent::AllAnnounced { memory_chunk_count, total_records, .. } => {
+            SortChunkEvent::AllAnnounced {
+                memory_chunk_count,
+                total_records,
+                index_stride,
+                ..
+            } => {
                 // Terminal: close the final run, then announce the RUN count as the
                 // slot count (the merge gates on `slots.len() == slot_count`, and
                 // with coalescing #SpillReady = #runs, not #chunks).
@@ -419,6 +430,7 @@ impl SpillGather {
                     slot_count: self.runs_written,
                     memory_chunk_count,
                     total_records,
+                    index_stride,
                 });
             }
         }
@@ -443,8 +455,8 @@ impl SpillGather {
             let Some(active) = self.active.as_ref() else { return Ok(()) };
             let start = active.next_idx;
             let (end, framed_bytes) = plan_next_block(&active.chunk, start, block_size);
-            let (file_id, records_ingested_so_far) =
-                (active.file_id, active.records_ingested_so_far);
+            let (file_id, records_ingested_so_far, index_stride) =
+                (active.file_id, active.records_ingested_so_far, active.index_stride);
             let key_kind = active.chunk.key_kind();
             if end >= active.chunk.len() {
                 // Frame and withhold the run's final block: it is closed lazily
@@ -466,6 +478,7 @@ impl SpillGather {
                     file_id,
                     key_kind,
                     records_ingested_so_far,
+                    index_stride,
                 });
                 self.active = None;
                 return Ok(());
@@ -494,6 +507,7 @@ impl SpillGather {
                 end: end as u64,
                 framed_bytes,
                 frame_bytes: u32::try_from(block_size).expect("a frame size fits u32"),
+                index_stride,
             });
             self.active.as_mut().expect("active present (not last)").next_idx = end;
         }
@@ -517,6 +531,37 @@ impl SpillGather {
             emitted += 1;
         }
         if emitted > 0 { StepOutcome::Progress } else { StepOutcome::NoProgress }
+    }
+}
+
+/// Test drivers: a smaller frame size, and the `try_run` sequence without a
+/// `StepCtx`.
+#[cfg(test)]
+impl SpillGather {
+    /// This gather, cutting frames of `block_size` raw bytes.
+    pub(crate) fn with_block_size_for_test(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    /// Stage each event, then plan any active chunk to completion before
+    /// staging the next (the dense-ordinal order `try_run` keeps), and return
+    /// every emitted event in order. After the last event the withheld
+    /// run-final block, if any, is flushed as its file's last block, as the
+    /// drained path does.
+    pub(crate) fn drive_for_test(&mut self, events: Vec<SortChunkEvent>) -> Vec<SpillBlockEvent> {
+        let mut out = Vec::new();
+        for event in events {
+            self.stage_event(event);
+            while self.active.is_some() {
+                self.plan_ranges().unwrap();
+                out.extend(self.pending.drain(..));
+            }
+            out.extend(self.pending.drain(..));
+        }
+        self.flush_held_block(true);
+        out.extend(self.pending.drain(..));
+        out
     }
 }
 

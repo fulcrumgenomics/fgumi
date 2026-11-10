@@ -60,6 +60,9 @@ const BYTES_PER_CALL: usize = 8 * 1024 * 1024;
 struct Running {
     job_id: u32,
     key_kind: SpillKeyKind,
+    /// The live runs' index stride when the job started, stamped on the
+    /// merged run's blocks (`0`: not indexed).
+    index_stride: u32,
     driver: Box<dyn MergeDriverDyn + Send>,
     /// The job's slots, to name a failed input by its path.
     slots: Vec<Arc<fgumi_sort::SortMergeSlot>>,
@@ -178,7 +181,8 @@ impl ConsolidateRuns {
     }
 
     /// Queue a block of the running job.
-    fn emit(&mut self, job_id: u32, key_kind: SpillKeyKind, bytes: Vec<u8>, last: bool) {
+    fn emit(&mut self, run: (u32, SpillKeyKind, u32), bytes: Vec<u8>, last: bool) {
+        let (job_id, key_kind, index_stride) = run;
         self.outbox.push_back(SpillBlockEvent::Block {
             ordinal: self.next_ordinal,
             file_id: job_id,
@@ -186,13 +190,20 @@ impl ConsolidateRuns {
             is_last_in_file: last,
             records_ingested_so_far: 0,
             bytes,
+            frames: None,
+            // The live runs' stride when the job started: the consolidated
+            // run is indexed at it (`WriteConsolidatedRun` folds its frames
+            // block by block, and `SpillWrite` brings its footer to the final
+            // stride at `AllAnnounced`), and not at all once the front turned
+            // indexing off (0).
+            index_stride,
         });
         self.next_ordinal += 1;
     }
 
     /// Start `job`'s merge.
     fn start(&mut self, job: ConsolidationJob) {
-        let ConsolidationJob { job_id, slots, key_kind, input_paths } = job;
+        let ConsolidationJob { job_id, slots, key_kind, index_stride, input_paths } = job;
         let ctx = match (&self.class_table, key_kind) {
             (Some(t), SpillKeyKind::QuerynameLex | SpillKeyKind::QuerynameNatural) => {
                 MergeCtxErased::Queryname(Arc::clone(t))
@@ -205,8 +216,15 @@ impl ConsolidateRuns {
             ctx,
             Arc::clone(&self.demand),
         );
-        self.running =
-            Some(Running { job_id, key_kind, driver, slots, input_paths, raw: self.fresh_block() });
+        self.running = Some(Running {
+            job_id,
+            key_kind,
+            index_stride,
+            driver,
+            slots,
+            input_paths,
+            raw: self.fresh_block(),
+        });
     }
 
     /// Map a merge error to the step's error: a truncated input names its path.
@@ -250,11 +268,11 @@ impl ConsolidateRuns {
                         next.extend_from_slice(&run.raw[before..]);
                         run.raw.truncate(before);
                         let block = std::mem::replace(&mut run.raw, next);
-                        self.emit(run.job_id, run.key_kind, block, false);
+                        self.emit((run.job_id, run.key_kind, run.index_stride), block, false);
                     }
                     if run.raw.len() >= self.block_size {
                         let block = std::mem::replace(&mut run.raw, self.fresh_block());
-                        self.emit(run.job_id, run.key_kind, block, false);
+                        self.emit((run.job_id, run.key_kind, run.index_stride), block, false);
                     }
                 }
                 Ok(MergeStepFramed::Stalled) => {
@@ -290,7 +308,7 @@ impl ConsolidateRuns {
                     // The final block, empty when the job ended on a full block
                     // or had no records, so the writer always closes the file.
                     let block = std::mem::take(&mut run.raw);
-                    self.emit(run.job_id, run.key_kind, block, true);
+                    self.emit((run.job_id, run.key_kind, run.index_stride), block, true);
                     self.records_merged += records as u64;
                     return Ok(StepOutcome::Progress);
                 }

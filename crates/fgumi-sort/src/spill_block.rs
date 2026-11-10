@@ -90,6 +90,10 @@ impl SpillKeyKind {
     }
 }
 
+/// Bytes of the `u32 LE` length prefix ahead of every spill record's body
+/// (after its key, when the key is not embedded in the record).
+pub const RECORD_LEN_BYTES: usize = size_of::<u32>();
+
 /// Append one keyed record to `block` in the spill record framing:
 /// `[key bytes if !K::EMBEDDED_IN_RECORD][u32 LE record-len][record body]`.
 ///

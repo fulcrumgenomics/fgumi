@@ -1927,14 +1927,14 @@ fn three_step_chain_empty_input_drains_cleanly() {
 /// `Exclusive` source that drains a `Vec<SortPhase2Event>` one event per
 /// `try_run`, feeding `SortMerge` directly. Used to drive the merge into a
 /// drained-but-incomplete-setup state without standing up the spill machinery.
-struct Phase2EventSource {
+pub(crate) struct Phase2EventSource {
     events: Vec<crate::sort::protocol::SortPhase2Event>,
     held: HeldSlot<Unpushed<crate::sort::protocol::SortPhase2Event>>,
     output_byte_limit: u64,
 }
 
 impl Phase2EventSource {
-    fn new(
+    pub(crate) fn new(
         mut events: Vec<crate::sort::protocol::SortPhase2Event>,
         output_byte_limit: u64,
     ) -> Self {
@@ -2101,6 +2101,7 @@ fn collect_merge_batches_with(
                 demand,
                 ledger,
                 retire_epoch: Arc::default(),
+                merge_mode: Arc::default(),
             });
         }
         (Some(demand), None) => merge = merge.with_merge_demand(demand),
@@ -2740,8 +2741,12 @@ fn stashed_two_slots(
             }
             file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
             drop(file);
-            let slot = fgumi_sort::open_spill_slot(&path, u32::try_from(id).unwrap())
-                .expect("open spill slot");
+            let slot = fgumi_sort::open_spill_slot(
+                &path,
+                u32::try_from(id).unwrap(),
+                fgumi_sort::FramesEnd::AtEof,
+            )
+            .expect("open spill slot");
             let start = slot.body_start();
             let mut body = vec![0u8; usize::try_from(slot.len() - start).unwrap()];
             fgumi_bam_io::pread::read_at_exact(&**slot.source(), &mut body, start).unwrap();
@@ -2907,7 +2912,7 @@ fn merge_with_work<O: crate::sort::merge::MergeOutput>(
     fanout_width: usize,
     min_records: usize,
     cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
-) -> (SortMerge<O>, fgumi_pipeline_core::FanoutWorker<crate::sort::merge_job::MergeJob<O>>) {
+) -> (SortMerge<O>, fgumi_pipeline_core::FanoutWorker<crate::sort::merge_job::MergeTicket<O>>) {
     let merge = SortMerge::<O>::with_target_batch_count(
         SortOrder::Coordinate,
         output_byte_limit,
@@ -4444,7 +4449,7 @@ fn interleaved_spill(
     }
     file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
     drop(file);
-    fgumi_sort::open_spill_slot(&path, file_id).unwrap()
+    fgumi_sort::open_spill_slot(&path, file_id, fgumi_sort::FramesEnd::AtEof).unwrap()
 }
 
 /// Liveness of the planner after its input drains: once every phase event

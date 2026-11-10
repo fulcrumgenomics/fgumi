@@ -27,11 +27,17 @@ use parking_lot::Mutex;
 #[cfg(test)]
 type RegisterHook = Box<dyn FnOnce(&ConsolidationRegistry) + Send>;
 
+/// A finished job: its id, where the merged run's frames end (its file
+/// length less any index footer), and whether the run ends in an index
+/// footer.
+pub type CompletedJob = (u32, u64, bool);
+
 /// Completion side channel with a direct wake (see the module docs).
 #[derive(Default)]
 pub struct ConsolidationRegistry {
-    /// Finished jobs, `(job_id, bytes on disk)`, in completion order.
-    done: Mutex<VecDeque<(u32, u64)>>,
+    /// Finished jobs, `(job_id, frame bytes, index footer)`, in completion
+    /// order.
+    done: Mutex<VecDeque<CompletedJob>>,
     /// The thread to unpark on `complete` (the last one to register).
     waiter: Mutex<Option<Thread>>,
     /// Each started job's output path, until its first block is written.
@@ -57,9 +63,9 @@ impl ConsolidationRegistry {
 
     /// Record a finished job and unpark the registered waiter. The completion
     /// is pushed first, so a waiter that re-checks after registering finds it.
-    pub fn complete(&self, job_id: u32, bytes: u64) {
+    pub fn complete(&self, job_id: u32, bytes: u64, index_footer: bool) {
         self.outputs.lock().remove(&job_id);
-        self.done.lock().push_back((job_id, bytes));
+        self.done.lock().push_back((job_id, bytes, index_footer));
         if let Some(t) = self.waiter.lock().as_ref() {
             t.unpark();
         }
@@ -67,7 +73,7 @@ impl ConsolidationRegistry {
 
     /// Pop one completion, if any.
     #[must_use]
-    pub fn take_completed(&self) -> Option<(u32, u64)> {
+    pub fn take_completed(&self) -> Option<CompletedJob> {
         self.done.lock().pop_front()
     }
 

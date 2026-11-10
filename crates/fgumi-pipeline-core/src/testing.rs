@@ -14,6 +14,7 @@ use crate::outputs::StepOutputs;
 use crate::queues::{ItemQueue, UnboundedQueue};
 use crate::runtime::contexts::StepCounters;
 use crate::runtime::wake::{PoolHandle, WakePlan};
+use crate::signal::{CancelHandle, PipelineSignal};
 use crate::step::{InputHandle, OutputHandles, Step, StepCtx, StepOutcome};
 use crate::topology::StepIdx;
 
@@ -28,6 +29,9 @@ pub struct StepProbe<S: Step> {
     counters: StepCounters,
     /// No pool: a probed step's `request_worker` reports `Unavailable`.
     wake: Arc<WakePlan>,
+    /// The signal handed to the step as [`StepCtx::signal`]; a test cancels
+    /// it through [`Self::cancel_handle`].
+    signal: Arc<PipelineSignal>,
 }
 
 impl<S: Step> StepProbe<S> {
@@ -55,7 +59,15 @@ impl<S: Step> StepProbe<S> {
             output_queues,
             counters: StepCounters::new(step.counters().len()),
             wake: WakePlan::standalone(),
+            signal: PipelineSignal::new(),
         }
+    }
+
+    /// A handle that cancels the signal the step sees as [`StepCtx::signal`]
+    /// (from any thread, including from inside the step's own work).
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle::from_signal(Arc::clone(&self.signal))
     }
 
     /// Queue one input item.
@@ -107,6 +119,7 @@ impl<S: Step> StepProbe<S> {
             outputs: &self.outputs,
             counters: &self.counters,
             pool: PoolHandle::new(&self.wake, None, StepIdx(0)),
+            signal: &self.signal,
         };
         step.try_run(&mut ctx)
     }

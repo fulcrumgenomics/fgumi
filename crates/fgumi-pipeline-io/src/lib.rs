@@ -16,6 +16,7 @@
 //!     between steps.
 
 pub mod boundaries;
+pub mod output_compress;
 pub mod pread;
 pub mod sink;
 pub mod sort;

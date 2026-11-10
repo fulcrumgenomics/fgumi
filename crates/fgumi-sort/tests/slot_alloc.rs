@@ -19,7 +19,7 @@ fn open_spill_slot_allocates_no_read_buffer() {
     drop(file);
     let _profiler = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get().total_bytes;
-    let slot = fgumi_sort::open_spill_slot(&path, 0).unwrap();
+    let slot = fgumi_sort::open_spill_slot(&path, 0, fgumi_sort::FramesEnd::AtEof).unwrap();
     let allocated = dhat::HeapStats::get().total_bytes - before;
     assert!(allocated < 8 * 1024, "opening a slot allocated {allocated} bytes (no 8 KiB reader)");
     // The parse-state seam is test support (`test-utils`, on in the workspace
