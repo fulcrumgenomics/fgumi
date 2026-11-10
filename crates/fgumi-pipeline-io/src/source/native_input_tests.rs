@@ -18,7 +18,7 @@ use rstest::rstest;
 
 use super::frame_bgzf_blocks::{AFTER_FRAME as frame_hook, FRAME_BATCH, FrameBgzfBlocks};
 use super::plan_input_reads::PlanInputReads;
-use crate::pread::{AFTER_READ as pread_hook, InputLedger, PreadSlices};
+use crate::pread::{InputLedger, PreadSlices};
 use crate::types::BgzfBlock;
 
 /// Sink that records every block in arrival order.
@@ -273,8 +273,10 @@ fn ratchet_is_driven_by_device_starvation_only(
 }
 
 /// `PreadInputSlices` never runs on the reader worker. The deterministic half
-/// is the placement plan; the run checks the thread names a `PreadSlices` test
-/// hook recorded.
+/// is the placement plan; the run checks the thread names the test's own
+/// source recorded (`PreadSlices` reads on the thread it runs on). A source
+/// scoped to this run, not a process-wide hook, so reads by tests running
+/// beside it in the same process are not recorded.
 #[test]
 fn input_slices_never_run_on_the_reader_worker() {
     assert_eq!(
@@ -287,15 +289,13 @@ fn input_slices_never_run_on_the_reader_worker() {
         .workers,
         vec![1, 2, 3]
     );
-    let names = Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
-    let n2 = Arc::clone(&names);
-    pread_hook.set(move |()| {
-        n2.lock().insert(std::thread::current().name().unwrap_or("<unnamed>").to_owned());
-    });
     let (_dir, path) = bam_fixture(50_000);
-    let result = read_with_native_trio_from(open_source(&path), ReadStreamsPolicy::fixed(4), 4);
-    pread_hook.clear();
-    result.expect("native read");
+    let names = Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
+    let src = Arc::new(ThreadNameSource {
+        file: std::fs::File::open(&path).unwrap(),
+        names: Arc::clone(&names),
+    });
+    read_with_native_trio_from(src, ReadStreamsPolicy::fixed(4), 4).expect("native read");
     let names = names.lock();
     assert!(!names.is_empty(), "the hook observed the reads");
     assert!(!names.contains("fgumi-worker-0"), "{names:?}");

@@ -484,8 +484,6 @@ impl PreadSlices {
         if let Some(l) = &self.input_ledger {
             l.landed.fetch_add(u64::from(req.len), Ordering::Relaxed);
         }
-        #[cfg(test)]
-        AFTER_READ.fire(());
         Ok(ReadSlice {
             ordinal: req.ordinal,
             stream: req.stream,
@@ -560,10 +558,6 @@ impl Step for PreadSlices {
         self.cap.as_ref().map(StepCap::view)
     }
 }
-
-/// A test-only hook run after each successful read, on the reading thread.
-#[cfg(test)]
-pub(crate) static AFTER_READ: crate::test_hook::TestHook<()> = crate::test_hook::TestHook::new();
 
 #[cfg(test)]
 pub(crate) mod tests;
