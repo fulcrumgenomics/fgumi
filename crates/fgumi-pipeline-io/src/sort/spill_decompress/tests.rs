@@ -33,7 +33,8 @@ fn spill_slot(
     }
     file.write_all(fgumi_sort::spill_trailer(SpillCodec::Bgzf)).unwrap();
     drop(file);
-    fgumi_sort::open_spill_slot(&path, file_id).expect("open spill slot")
+    fgumi_sort::open_spill_slot(&path, file_id, fgumi_sort::FramesEnd::AtEof)
+        .expect("open spill slot")
 }
 
 /// The slot's file body cut at `cuts` (slice lengths; the last slice takes the
@@ -83,6 +84,7 @@ fn supply_with(demand: &Arc<fgumi_sort::MergeDemand>) -> SpillSupply {
         demand: Arc::clone(demand),
         ledger: Arc::new(SupplyLedger::default()),
         retire_epoch: Arc::default(),
+        merge_mode: Arc::default(),
     }
 }
 
@@ -527,7 +529,7 @@ fn decompress_notifies_the_consolidation_demand_only_before_all_announced() {
     let deliver = |id: u32, step: &mut SortSpillDecompress| {
         let path = dir.path().join(format!("r{id}"));
         crate::sort::spill_fixtures::write_run_file(&path, SpillCodec::Zstd, id, 0..10);
-        let slot = fgumi_sort::open_spill_slot(&path, id).unwrap();
+        let slot = fgumi_sort::open_spill_slot(&path, id, fgumi_sort::FramesEnd::AtEof).unwrap();
         let body =
             std::fs::read(&path).unwrap()[usize::try_from(slot.body_start()).unwrap()..].to_vec();
         slot.bp_note_issued(body.len() as u64);

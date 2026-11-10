@@ -48,37 +48,9 @@ fn concat(blocks: &[Vec<u8>]) -> Vec<u8> {
     blocks.iter().flat_map(|b| b.iter().copied()).collect()
 }
 
-/// Drive `SpillGather` over a sequence of input events exactly as `try_run`
-/// does — stage each event, then fully frame any active chunk (draining produced
-/// blocks) before staging the next — and return every emitted event in order.
-/// This preserves the dense-ordinal invariant (a chunk is fully framed, and its
-/// block ordinals minted, before the next event is staged).
-///
-/// After the last event, it closes the final run by flushing any withheld block
-/// with `is_last_in_file = true` — mirroring `try_run`'s drain path (in
-/// production `AllAnnounced` closes it; a `drive` without one relies on this).
+/// Every event `step` emits for `events` (see `SpillGather::drive_for_test`).
 fn drive(step: &mut SpillGather, events: Vec<SortChunkEvent>) -> Vec<SpillBlockEvent> {
-    let mut out = Vec::new();
-    for event in events {
-        step.stage_event(event);
-        // Frame the active chunk to completion, collecting blocks as we go.
-        while step.active.is_some() {
-            step.plan_ranges().unwrap();
-            while let Some(ev) = step.pending.pop_front() {
-                out.push(ev);
-            }
-        }
-        // Drain any passthrough (Residual / AllAnnounced) events.
-        while let Some(ev) = step.pending.pop_front() {
-            out.push(ev);
-        }
-    }
-    // Close the final run (no-op if a Residual/AllAnnounced already flushed it).
-    step.flush_held_block(true);
-    while let Some(ev) = step.pending.pop_front() {
-        out.push(ev);
-    }
-    out
+    step.drive_for_test(events)
 }
 
 #[test]
@@ -159,7 +131,7 @@ fn stage_spill_mints_dense_ordinals_and_marks_last_block() {
     let chunk = coord_chunk((0u8..10).map(|i| vec![i; 100]).collect());
     let events = drive(
         &mut step,
-        vec![SortChunkEvent::Spill { seq: 3, chunk, records_ingested_so_far: 10 }],
+        vec![SortChunkEvent::Spill { seq: 3, chunk, records_ingested_so_far: 10, index_stride: 1 }],
     );
 
     assert!(events.len() > 1, "expected multiple block events");
@@ -203,7 +175,12 @@ fn plan_ranges_keeps_pending_bounded() {
     let mut step = SpillGather::new(1 << 20);
     step.block_size = 120; // ~1 record/block over 104-byte records
     let chunk = coord_chunk((0u8..100).map(|i| vec![i; 100]).collect());
-    step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 100 });
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk,
+        records_ingested_so_far: 100,
+        index_stride: 1,
+    });
     step.plan_ranges().unwrap();
     assert_eq!(step.pending.len(), 8, "one plan call tops up to MAX_EVENTS_PER_LOCK ranges");
     assert!(step.active.is_some(), "chunk still mid-framing (not fully drained in one call)");
@@ -223,12 +200,18 @@ fn stage_residual_and_announced_pass_through_with_ordinals() {
                 seq: 0,
                 chunk: coord_chunk(vec![vec![1u8; 10], vec![2u8; 10]]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Residual {
                 chunk: coord_chunk(vec![vec![3u8; 10]]),
                 records_ingested_so_far: 3,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 1, memory_chunk_count: 1, total_records: 3 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 1,
+                memory_chunk_count: 1,
+                total_records: 3,
+                index_stride: 1,
+            },
         ],
     );
 
@@ -281,6 +264,7 @@ fn ordinals_are_dense_and_monotonic_across_event_kinds() {
         slot_count: 1,
         memory_chunk_count: 1,
         total_records: 1,
+        index_stride: 1,
     });
     step.stage_event(SortChunkEvent::Residual {
         chunk: coord_chunk(vec![vec![2u8; 8]]),
@@ -301,6 +285,7 @@ fn an_empty_spill_chunk_is_skipped_rather_than_opening_a_file() {
         seq: 0,
         chunk: coord_chunk(Vec::new()),
         records_ingested_so_far: 0,
+        index_stride: 1,
     });
     assert!(step.active.is_none(), "an empty chunk must not become the active spill");
     assert!(step.pending.is_empty(), "and must emit nothing");
@@ -341,13 +326,20 @@ fn contiguous_chunks_coalesce_into_one_run() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[10, 20]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[30, 40]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 0,
+                total_records: 4,
+                index_stride: 1,
+            },
         ],
     );
 
@@ -372,18 +364,68 @@ fn exact_boundary_tie_extends_the_run_for_content_keys() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[10, 20]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[20, 30]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 0,
+                total_records: 4,
+                index_stride: 1,
+            },
         ],
     );
     let (blocks, slot_count) = blocks_and_announced(&events);
     assert_eq!(blocks, vec![(0, false), (0, true)]);
     assert_eq!(slot_count, 1);
+}
+
+/// A spilled final run (`Spill` then `AllAnnounced` with no residual chunk)
+/// is still subject to run extension: contiguous with the open run, it joins
+/// that run's file, and the announcement carries one run and no chunk.
+#[test]
+fn final_spill_extends_the_open_run() {
+    let mut step = SpillGather::new(1 << 20);
+    let events = drive(
+        &mut step,
+        vec![
+            SortChunkEvent::Spill {
+                seq: 0,
+                chunk: coord_chunk_keyed(&[10, 20]),
+                records_ingested_so_far: 2,
+                index_stride: 1,
+            },
+            SortChunkEvent::Spill {
+                seq: 1,
+                chunk: coord_chunk_keyed(&[30, 40]),
+                records_ingested_so_far: 4,
+                index_stride: 1,
+            },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 0,
+                total_records: 4,
+                index_stride: 1,
+            },
+        ],
+    );
+    let (last, blocks) = events.split_last().expect("events");
+    assert_eq!(block_files(blocks), vec![(0, false), (0, true)], "one file");
+    assert!(matches!(
+        last,
+        SpillBlockEvent::AllAnnounced {
+            slot_count: 1,
+            memory_chunk_count: 0,
+            total_records: 4,
+            ..
+        }
+    ));
+    assert_eq!(step.runs_written, 1);
 }
 
 #[test]
@@ -398,13 +440,20 @@ fn non_contiguous_chunk_starts_a_new_run() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[10, 40]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[20, 30]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 0, total_records: 4 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 0,
+                total_records: 4,
+                index_stride: 1,
+            },
         ],
     );
     let (blocks, slot_count) = blocks_and_announced(&events);
@@ -425,18 +474,26 @@ fn many_presorted_chunks_collapse_to_a_single_run() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[0, 1]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[2, 3]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 2,
                 chunk: coord_chunk_keyed(&[4, 5]),
                 records_ingested_so_far: 6,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 3,
+                memory_chunk_count: 0,
+                total_records: 6,
+                index_stride: 1,
+            },
         ],
     );
     let (blocks, slot_count) = blocks_and_announced(&events);
@@ -456,18 +513,26 @@ fn an_empty_chunk_does_not_close_the_open_run() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[10, 20]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 2,
                 chunk: coord_chunk_keyed(&[30, 40]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 4 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 3,
+                memory_chunk_count: 0,
+                total_records: 4,
+                index_stride: 1,
+            },
         ],
     );
     let (blocks, slot_count) = blocks_and_announced(&events);
@@ -487,6 +552,7 @@ fn a_residual_closes_the_open_run_before_a_later_spill() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[10, 20]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Residual {
                 chunk: coord_chunk_keyed(&[25]),
@@ -496,8 +562,14 @@ fn a_residual_closes_the_open_run_before_a_later_spill() {
                 seq: 2,
                 chunk: coord_chunk_keyed(&[30, 40]),
                 records_ingested_so_far: 5,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 2, memory_chunk_count: 1, total_records: 5 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 2,
+                memory_chunk_count: 1,
+                total_records: 5,
+                index_stride: 1,
+            },
         ],
     );
     // Stream: Block(file0,last), Residual, Block(file2,last), AllAnnounced.
@@ -521,18 +593,26 @@ fn run_formation_summary_matches_the_owned_engine_wording() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[0, 1]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[2, 3]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 2,
                 chunk: coord_chunk_keyed(&[4, 5]),
                 records_ingested_so_far: 6,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 3,
+                memory_chunk_count: 0,
+                total_records: 6,
+                index_stride: 1,
+            },
         ],
     );
     assert_eq!(step.chunks_spilled, 3);
@@ -554,18 +634,26 @@ fn run_formation_summary_counts_each_run_when_nothing_coalesces() {
                 seq: 0,
                 chunk: coord_chunk_keyed(&[40, 50]),
                 records_ingested_so_far: 2,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 1,
                 chunk: coord_chunk_keyed(&[20, 30]),
                 records_ingested_so_far: 4,
+                index_stride: 1,
             },
             SortChunkEvent::Spill {
                 seq: 2,
                 chunk: coord_chunk_keyed(&[0, 10]),
                 records_ingested_so_far: 6,
+                index_stride: 1,
             },
-            SortChunkEvent::AllAnnounced { slot_count: 3, memory_chunk_count: 0, total_records: 6 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 3,
+                memory_chunk_count: 0,
+                total_records: 6,
+                index_stride: 1,
+            },
         ],
     );
     assert_eq!(step.chunks_spilled, 3);
@@ -585,7 +673,12 @@ fn run_formation_summary_is_none_when_nothing_spilled() {
         &mut step,
         vec![
             SortChunkEvent::Residual { chunk: coord_chunk_keyed(&[1]), records_ingested_so_far: 1 },
-            SortChunkEvent::AllAnnounced { slot_count: 0, memory_chunk_count: 1, total_records: 1 },
+            SortChunkEvent::AllAnnounced {
+                slot_count: 0,
+                memory_chunk_count: 1,
+                total_records: 1,
+                index_stride: 1,
+            },
         ],
     );
     assert_eq!(step.chunks_spilled, 0);
@@ -602,6 +695,7 @@ fn the_run_final_block_is_withheld_until_the_run_is_closed() {
         seq: 0,
         chunk: coord_chunk_keyed(&[10, 20]),
         records_ingested_so_far: 2,
+        index_stride: 1,
     });
     step.plan_ranges().unwrap();
     assert!(step.active.is_none(), "the one-block chunk is fully framed");
@@ -617,6 +711,7 @@ fn the_run_final_block_is_withheld_until_the_run_is_closed() {
         slot_count: 1,
         memory_chunk_count: 0,
         total_records: 2,
+        index_stride: 1,
     });
     assert!(!step.held_last_block.is_held(), "closing the run flushes the withheld block");
     assert!(
@@ -635,6 +730,7 @@ fn a_non_empty_spill_chunk_becomes_active_without_emitting_yet() {
         seq: 7,
         chunk: coord_chunk(vec![vec![3u8; 32], vec![4u8; 32]]),
         records_ingested_so_far: 2,
+        index_stride: 1,
     });
     let active = step.active.as_ref().expect("chunk must be parked for incremental framing");
     assert_eq!(active.file_id, 7, "file_id comes from the spill seq, not write order");
@@ -782,6 +878,7 @@ fn single_block_run_is_framed_serially() {
         seq: 0,
         chunk: coord_chunk(vec![vec![1u8; 30], vec![2u8; 40]]),
         records_ingested_so_far: 2,
+        index_stride: 1,
     });
     step.plan_ranges().unwrap();
     assert!(step.pending.is_empty(), "no range is planned for a one-block run");
@@ -821,7 +918,12 @@ fn arena_returns_only_after_the_last_range_is_compressed() {
     ));
     let mut step = SpillGather::new(1 << 20);
     step.block_size = 250; // two records per block → many ranges
-    step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 60 });
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk,
+        records_ingested_so_far: 60,
+        index_stride: 1,
+    });
     let mut ranges = Vec::new();
     while step.active.is_some() {
         step.plan_ranges().unwrap();
@@ -899,12 +1001,14 @@ fn spill_files_are_byte_identical_to_serial_framing(
             seq: u32::try_from(seq).unwrap(),
             chunk,
             records_ingested_so_far: 0,
+            index_stride: 1,
         })
         .collect();
     input.push(SortChunkEvent::AllAnnounced {
         slot_count: 0,
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     let planned = drive(&mut step, input);
     assert!(
@@ -937,6 +1041,8 @@ fn spill_files_are_byte_identical_to_serial_framing(
                 is_last_in_file: last_of_file,
                 records_ingested_so_far: 0,
                 bytes,
+                frames: None,
+                index_stride: 1,
             });
             ordinal += 1;
         }
@@ -946,6 +1052,7 @@ fn spill_files_are_byte_identical_to_serial_framing(
         slot_count: 2,
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     let (_d2, serial_files) = write(serial);
 
@@ -971,7 +1078,12 @@ fn ranges_span_up_to_frames_per_range_frames() {
     let n_frames = frames.len() - 1;
     let mut step = SpillGather::new(1 << 20);
     step.block_size = BLOCK;
-    step.stage_event(SortChunkEvent::Spill { seq: 0, chunk, records_ingested_so_far: 70 });
+    step.stage_event(SortChunkEvent::Spill {
+        seq: 0,
+        chunk,
+        records_ingested_so_far: 70,
+        index_stride: 1,
+    });
     let mut ranges = Vec::new();
     while step.active.is_some() {
         step.plan_ranges().unwrap();
@@ -997,4 +1109,34 @@ fn ranges_span_up_to_frames_per_range_frames() {
     let full = n_frames.saturating_sub(1) / FRAMES_PER_RANGE;
     assert!(spans[..full].iter().all(|&s| s == FRAMES_PER_RANGE), "{spans:?}");
     assert!(spans.iter().all(|&s| (1..=FRAMES_PER_RANGE).contains(&s)), "{spans:?}");
+}
+
+/// The gather copies the run's stride from its `Spill` event onto every
+/// range it plans and onto the run-final block. Columns: the stride.
+#[rstest::rstest]
+#[case::dense(1)]
+#[case::sparse(8)]
+#[case::off(0)]
+fn ranges_and_final_block_carry_the_run_stride(#[case] stride: u32) {
+    let mut step = SpillGather::new(1 << 30);
+    step.block_size = 64;
+    step.frames_per_range = 2;
+    let keys: Vec<u64> = (0..40).collect();
+    let events = step.drive_for_test(vec![SortChunkEvent::Spill {
+        seq: 0,
+        chunk: coord_chunk_keyed(&keys),
+        records_ingested_so_far: 40,
+        index_stride: stride,
+    }]);
+    let strides: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            SpillBlockEvent::Range { index_stride, .. }
+            | SpillBlockEvent::Block { index_stride, .. } => Some(*index_stride),
+            _ => None,
+        })
+        .collect();
+    assert!(strides.len() > 2, "several ranges and the final block: {strides:?}");
+    assert!(strides.iter().all(|&s| s == stride), "{strides:?}");
+    assert!(matches!(events.last(), Some(SpillBlockEvent::Block { .. })), "the final block");
 }

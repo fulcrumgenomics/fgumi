@@ -181,7 +181,13 @@ The following external FFI calls are approved because they back core infrastruct
   mimalloc reads its environment only at process start, and `libmimalloc-sys`
   exports no safe setter.
   The option index (15) is not exported as a constant; a unit test pins it against
-  the linked mimalloc v3's 1000 ms default.
+  the linked mimalloc v3's 1000 ms default. `force_mi_collect` is also called
+  where a range-merging sort frees its retired phase-1 arena (`ArenaPool::release`'s
+  retired branch, and the merge's `transition_to_range_mode` on the coordination
+  thread that allocated it): an arena under 2 GiB is mimalloc-arena-served, so
+  freeing it only schedules a purge, and a block of another thread's page is freed
+  only when that thread collects; without the collects the dead arena stays
+  resident while the merge builds its plan (`tests/arena_release_rss.rs`).
 - **`mach2`** (`crates/fgumi-sort/src/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
@@ -598,16 +604,99 @@ and macOS only):
 - **Merge.** `SpillReadPlanner → PreadSpillSlices → SortSpillDecompress` feeds
   each spill slot's raw stash; the merge pops the slots' FIFOs. The read-ahead
   target is `R = clamp(total / 16, 64 MiB, 512 MiB)` of `--max-memory`, and it
-  adds to the sort buffer: the last run is merged from memory, so up to one
-  full buffer stays resident through the merge. Every slot may hold its cold
-  allowance (an even share of `R` after a 48 MiB hot reserve, never below one
-  256 KiB IOP); everything a slot holds above that is charged to one pool,
-  `P = max(R - k x cold, 3 x 16 MiB)`, which the hot slots (the ones the merge
-  needs next) top up from. A slot keeps its charge until it is drained, so
-  hot-set churn cannot grow read-ahead past `k x cold + P`. The merge's peak
+  adds to the sort buffer: in the serial merge the last run is merged from
+  memory, so up to one full buffer stays resident through the merge. Every
+  slot may hold its cold allowance (an even share of `R` after a 48 MiB hot
+  reserve, never below one 256 KiB IOP); everything a slot holds above that
+  is charged to one pool, `P = max(R - k x cold, 3 x 16 MiB)`, which the hot
+  slots (the ones the merge needs next) top up from. A slot keeps its charge
+  until it is drained, so hot-set churn cannot grow read-ahead past
+  `k x cold + P`. The merge's peak
   above the buffer is at most `k x (cold + one carried frame) + P + decoded`.
   `--sort-stats` logs that bound (`Spill supply:`), the spill byte fetch, disk
   reads, and stash/claim counts.
+
+  **Range merge.** When the sort is eligible (indexable runs, no
+  `FGUMI_SORT_SERIAL_MERGE`; any phase-2 width), the final run is spilled too
+  (`RunSeal::FinalSpill`) and the arena is retired, so the key-range merge reads
+  spill runs only. `range_fit` (`merge_mode.rs`) picks the run-index stride, the
+  range size and the window in one model: decode amplification `A = 1 + kNF/T`
+  targets 1.05 and is bounded at 1.25, a live range holds `rho = 2 + S_c/S`
+  bytes per raw byte, and the total fits `max(R, merge_memory)`; `F` is
+  64 KiB, or the largest frame when a record longer than one frame made one
+  larger. The front (`ReadBlocks` / `SortBuffer`, one `RunIndexPolicy`)
+  decides each run's index stride; `SpillWrite` builds the open run's index
+  at that stride (folded block by block) and writes it as a footer of the
+  run's spill file (`RunIndex::write_footer`; `WriteConsolidatedRun` does the
+  same for a consolidated run, at its job's stride). Through phase 1 the only
+  indexes held are the open run's and an in-flight consolidation's, each at
+  its stride, so `--max-memory` bounds records + refs exactly as in the
+  serial sort. When the final run spilled, `SpillWrite` reads the footers
+  back at `AllAnnounced`, sparsified to the final stride, and the merge
+  budget pays for them (at most `merge_memory / 4`, `INDEX_BUDGET_DIVISOR`);
+  with a resident final run the merge is serial and the footers stay unread.
+  A slot's `len()` is its frames' end, never the footer: the opener is told
+  where the writer ended the frames (`FramesEnd`) and never infers a footer
+  from the file's last bytes. The final run spills only when the front's
+  conservative estimate (worst-case compression, an upper bound on frames
+  and key bytes) fits; the planner then decides on the runs' exact indexes.
+  When nothing fits, the merge is serial (`Sort merge mode: serial (...)`
+  names the reason) and keeps the final run in memory unless it was already
+  spilled. `--sort-stats` logs the stride, planned and plan amplification,
+  and `final run spilled` on the `Sort merge mode: range` line; a plan that
+  decodes more than the fit planned is logged as a warning.
+
+  Scheduling (`sort/merge/range_mode.rs`, `sort/merge/claim.rs`): the merge
+  thread posts each range job, and per merged range one assembly job for the
+  batches its cut closed, into a claim table, with one `MergeTicket` per job
+  on the `MergeWork` edge. The merge thread and the workers both claim the
+  oldest unstarted job; a worker runs a claimed job to completion in one
+  dispatch, holding its phase-2 permit throughout and stopping early only
+  when the pipeline is done, and a ticket whose job is already taken is spent
+  (`JobStep::Spent`). The pool keeps its compression-first walk
+  (compression is the one job only it can do) and the merge thread owns the
+  head of the line: the next result it needs is always delivered, running
+  on a worker, or claimable by itself. `range_fit`'s `started` term counts
+  the merge thread's own range. The assembly job that drops a merged range's
+  last segment returns its output buffers to a pool (at most `window`
+  buffers, none larger than the `T + B` merged output `range_fit` charges
+  a live range) that later range jobs build their output in, so a range's tens of
+  MiB are not page-faulted in again per range. A range the merge thread
+  claims once every earlier range is cut is *fused*: merged straight into
+  output batch builders (`RangeTask::merge_into`, the serial merge's own
+  loop), with no merged buffer and no assembly job; with no assembly
+  outstanding its closed batches go to the output after every slice,
+  otherwise they are emitted at a fresh ordinal behind earlier assemblies,
+  and its open batch's builder leads the next batch plan (`BatchPlan::lead`).
+  The merge thread posts ranges up to the window whatever the ticket edge
+  does (a job without a ticket is claimed by the merge thread, or by a
+  worker once the edge drains), so the pool's pace never paces posting.
+  Downstream backpressure is a gate on workers' claims: they claim only
+  while fewer than `p` (phase-2 width) blocks wait for compression, counted
+  by `OutputDepth` (the merge counts pushes, `BgzfCompress` pops, so it does
+  not depend on the edge's budgeted capacity; without it, e.g. an
+  intermediate sort, the gate reads the merge's refused-block backlog).
+  Meanwhile the merge thread keeps merging ahead in order, taking results
+  so its ranges still fuse, within the window (a queued block keeps its
+  range live; the window is `max(2p, 4)` when memory allows, else `p`,
+  which can be as low as 1); it runs two-batch slices and
+  claims assemblies before ranges. With nothing left to merge and a built
+  block waiting for the output, the merge thread compresses the waiting
+  blocks itself (`OutputCompressor`, the
+  pool compressor's code and settings): the terminal sort emits
+  `OutputBlock`s (`CompressibleBlockOutput`) and `BgzfCompress<OutputBlock>`
+  passes the compressed ones through (its `passed_through` counter), so
+  the BAM and `.bai` are unchanged; intermediate sorts and `fgumi merge`
+  never compress on the merge thread.
+  `FGUMI_SORT_RANGE_CLAIM=merge|pool` (default `auto`; `pool` has no gate)
+  restricts claiming to one side, a diagnostic knob for A/B runs, not
+  a tuning option. `--sort-stats` adds `Range merge thread:` (busy, idle by
+  reason), `Range window occupancy:`, `Range output backlog:` (share of
+  time with a block refused by the output edge), `Range output depth:`
+  (share of time compression's queue held `p` blocks, gate refusals),
+  `Range output:` (blocks the merge thread compressed), `Range jobs (kind, runner):`
+  (queue wait post to claim, run), `Range claims:` (with tickets the gate
+  refused) and `Range fused:` (with batches streamed) lines.
 
 ### Spill framing
 
@@ -632,11 +721,12 @@ its first input's `file_id` and is read again, so every supply map keys by
 (`ReadAheadBudget::for_consolidation`, `R_c = clamp(total / 64, 8, 64 MiB)`),
 `PreadSpillSlices`/`SortSpillDecompress` read and decompress them,
 `ConsolidateRuns` (`sort-io`) merges and frames them with the gather's cut rule,
-`SpillBlockCompressConsolidation` compresses on the pool and
-`WriteConsolidatedRun` writes the run and completes the job through
-`ConsolidationRegistry`, which unparks `SpillWrite`'s thread (pool writer or
-`sort-io` driver). `ConsolidationRetire` then retires the inputs' slots; every
-supply map drops them within one pass. The three supply steps admit through a
+`SpillBlockCompressConsolidation` compresses (and, for a sort that can merge
+by range, indexes) on the pool and `WriteConsolidatedRun` writes the run and
+its index footer and completes the job through `ConsolidationRegistry`, which
+unparks `SpillWrite`'s thread (pool writer or `sort-io` driver).
+`ConsolidationRetire` then retires the inputs' slots; every supply map drops
+them within one pass. The three supply steps admit through a
 `PhasedCap`: phase 1's cap until `AllAnnounced` (no job may be in flight then —
 a protocol error), phase 2's after. The tail exists whenever the limit can
 trigger (always on the CLI); `NoConsolidation` takes branch 2 otherwise.
@@ -693,7 +783,7 @@ coordinate, 40 B queryname, 40–56 B template). `ReadBlocks` seals a run at
 sort's `RunLedger` (run 0: `RUN0_MEAN_RECORD_BYTES` = 258, and the widest
 56-byte template ref under `--key-types auto` until the first record chooses
 the lanes). The run sort publishes each run's totals before its chunk can free
-the arena, so boundaries are a function of the input alone. The charge is an
+the arena, so boundaries are a function of the input alone. The cap is an
 estimate: a run of much shorter records than the previous one holds more refs
 than `w × cap / m`. The published `run_bytes` span complete records only (no
 BAM header, no carried tail), so `m` is exact. Every seal moves the run's refs

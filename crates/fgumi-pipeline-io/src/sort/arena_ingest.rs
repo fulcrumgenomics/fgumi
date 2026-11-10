@@ -8,8 +8,9 @@
 //! seals a run when its cumulative uncompressed bytes reach the run's charged cap
 //! ([`run_cap_for`]: `--max-memory` less room for the
 //! run's sort refs).
-//! Sealed mid-stream runs emit [`ArenaBlock`]s with `seals_to_spill = true`;
-//! the final residual run emits with `seals_to_spill = false`.
+//! Sealed mid-stream runs emit [`ArenaBlock`]s with [`RunSeal::Spill`]; the
+//! final run emits with [`RunSeal::FinalSpill`] when the merge will run in
+//! range mode over at least one spilled run, else [`RunSeal::Residual`].
 //! This is the second `unsafe` site in `fgumi-pipeline-io`; see CLAUDE.md
 //! §"Approved hot-path unsafe (parallel-inflate sort ingest, fgumi-pipeline-io)"
 //! for the full justification.
@@ -37,8 +38,8 @@ use fgumi_bam_io::pread::RawFrame;
 use fgumi_bgzf::{Decompressor, decompress_into_slice_with_crc};
 use fgumi_sort::{
     ArenaPool, BoundedSortPool, PooledSegmentedBuf, QN_CLASS_BATCH_RECORDS, QnBatchLcp,
-    QnComparator, QnRef, QnRefBuilder, QnSortState, RecordRef, coordinate_chunk_from_refs,
-    extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
+    QnComparator, QnRef, QnRefBuilder, QnSortState, RecordRef, SpillKeyKind,
+    coordinate_chunk_from_refs, extract_coordinate_key_inline, queryname_chunk_from_qn_refs,
 };
 
 use crate::types::BgzfBlock;
@@ -55,6 +56,7 @@ use fgumi_pipeline_core::step::{
 use fgumi_pipeline_core::{PhaseCap, WholeCap, admit_input};
 
 use crate::sort::arena_split::QnChunkOrder;
+use crate::sort::merge_mode::{RangeEligibility, RunIndexPolicy, SpillEstimate};
 use crate::sort::protocol::MemoryChunkErased;
 use crate::sort::run_ledger::{RunLedger, run_cap_for};
 
@@ -79,6 +81,18 @@ pub const FRONT_REGION: usize = 8 * 1024 * 1024;
 /// than relying on the `< run_cap` cumulative check being off by one.
 const MAX_BGZF_BLOCK: usize = 1 << 16;
 
+/// The fewest arena bytes one record takes: its `u32` length prefix plus the
+/// fixed fields every BAM record holds. Bounds a run's record count by its
+/// bytes alone.
+const MIN_ARENA_RECORD_BYTES: u64 = (4 + fgumi_raw_bam::MIN_BAM_RECORD_LEN) as u64;
+
+/// An upper bound on the framed spill bytes of an open run of `run_bytes`
+/// arena bytes keyed `kind`, whatever its records: at most
+/// `run_bytes / MIN_ARENA_RECORD_BYTES` records, each adding its key prefix.
+fn open_run_framed_bound(kind: Option<SpillKeyKind>, run_bytes: u64) -> u64 {
+    SpillEstimate::framed_bytes(kind, run_bytes, run_bytes / MIN_ARENA_RECORD_BYTES)
+}
+
 /// Max blocks `ReadBlocks` admits per `try_run` dispatch.
 ///
 /// `ReadBlocks` runs on the coordination driver (`StepKind::Detached`), whose
@@ -97,6 +111,38 @@ const ADMIT_BATCH: usize = 64;
 const READ_BLOCKS_BLOCKS: usize = 0;
 /// `ReadBlocks` counter slot index: compressed bytes consumed from `ctx.input` this call.
 const READ_BLOCKS_BYTES_READ: usize = 1;
+
+// ============================================================================
+// RunSeal: how a run ends
+// ============================================================================
+
+/// How a run is sealed, carried by its last block (`ArenaBlock` →
+/// `InflatedBlock` → `RunEnd`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunSeal {
+    /// A mid-stream run: spilled to disk, its trailing partial record carried
+    /// into the next run.
+    Spill,
+    /// The final run, spilled to disk because the merge will run in range
+    /// mode (which needs every run on disk and the sort buffer freed).
+    FinalSpill,
+    /// The final run, kept in memory as the merge's residual.
+    Residual,
+}
+
+impl RunSeal {
+    /// Whether the run is written to a spill file.
+    #[must_use]
+    pub const fn spills(self) -> bool {
+        matches!(self, Self::Spill | Self::FinalSpill)
+    }
+
+    /// Whether the run is the sort's last: no record is carried past it.
+    #[must_use]
+    pub const fn is_final(self) -> bool {
+        matches!(self, Self::FinalSpill | Self::Residual)
+    }
+}
 
 // ============================================================================
 // ReadBlocks: serial arena-admit step
@@ -118,18 +164,24 @@ const READ_BLOCKS_BYTES_READ: usize = 1;
 /// without inflating), so an inflate worker can start on block 0 while
 /// `ReadBlocks` is still reading block 5000 — the Read‖Inflate overlap.  Exactly
 /// ONE block is withheld at a time (`last_block`): `is_last_of_run` and
-/// `seals_to_spill` are run-level facts known only when the run seals, so the
+/// `seal` are run-level facts known only when the run seals, so the
 /// most-recently-admitted block is held until either a successor in the same run
 /// arrives (confirming it is *not* last → emit it tagged `false`) or the run
-/// seals (it *is* last → stamp `is_last_of_run`/`seals_to_spill` and emit).  This
+/// seals (it *is* last → stamp `is_last_of_run`/`seal` and emit).  This
 /// single held block coincides with the deferred-seal block, so the two are one
 /// mechanism.
 ///
-/// Mid-stream seals set `seals_to_spill = true`; the final (residual) run sets
-/// `seals_to_spill = false`.  Only the LAST block of a run carries a meaningful
-/// `is_last_of_run`/`seals_to_spill`; downstream (`FindRecordBoundaries`) reads
-/// those fields only on the `is_last_of_run` block, so non-last blocks emit
-/// `is_last_of_run = false, seals_to_spill = false`.
+/// Mid-stream seals set [`RunSeal::Spill`]; the final run sets
+/// [`RunSeal::FinalSpill`] when the merge will run in range mode (see
+/// [`Self::with_range_eligibility`]) and [`RunSeal::Residual`] otherwise. Only
+/// the LAST block of a run carries a meaningful `is_last_of_run`/`seal`;
+/// downstream (`FindRecordBoundaries`) reads those fields only on the
+/// `is_last_of_run` block, so non-last blocks emit `is_last_of_run = false`
+/// with the placeholder `seal = Residual`.
+///
+/// After a `FinalSpill` seal the step retires its [`ArenaPool`]: it will never
+/// acquire again, so the final run's arena is freed (not pooled) once the
+/// spill steps release its chunk, and the merge runs without the sort buffer.
 ///
 /// With pool capacity 1, the next run's arena cannot be acquired until the
 /// prior run's [`Arc<PooledSegmentedBuf>`] drops (i.e. after the spill steps
@@ -153,7 +205,7 @@ pub struct ReadBlocks {
     run_offset: u64,
     /// The most-recently-admitted block of the current run, withheld from emission
     /// until we learn whether another block joins this run, so `is_last_of_run` /
-    /// `seals_to_spill` (run-level facts known only at seal) can be stamped on it.
+    /// `seal` (run-level facts known only at seal) can be stamped on it.
     last_block: Option<ArenaBlock>,
     /// A block popped from the input but not yet admitted because a deferred
     /// seal fired first and the pool is momentarily exhausted (the just-sealed
@@ -175,18 +227,32 @@ pub struct ReadBlocks {
     run_cap: usize,
     /// The sort's in-memory budget: a run's records plus its refs.
     memory_limit: usize,
-    /// Per-run facts the run sort publishes; sizes each run's cap.
+    /// Per-run facts the run sort and the boundary step publish; sizes each
+    /// run's cap, and (with the spill key kind) the final-run rule.
     ledger: Arc<RunLedger>,
+    /// The run-index policy: each run's index stride (decided at the run's
+    /// acquire), and whether the final run spills ([`RunSeal::FinalSpill`])
+    /// at EOF.
+    policy: RunIndexPolicy,
+    /// Record bytes of the runs sealed before the current one (the ledger's
+    /// spilled totals at the current run's acquire).
+    spilled_bytes: u64,
+    /// Records of the runs sealed before the current one.
+    spilled_records: u64,
+    /// The largest record (length prefix included) of the runs sealed
+    /// before the current one, when published.
+    spilled_max_record: Option<u64>,
     /// Armed when the current run reached `run_cap`, but the seal is DEFERRED
     /// until the next block arrives.  Deferring by one block guarantees that a
     /// spill seal is only ever fired when at least one more block follows (so
     /// the straddler carry from a spilled run always has a subsequent run to
     /// complete it).  If the input drains while a seal is armed, the run is
-    /// sealed as the RESIDUAL instead (the final run's last record always
-    /// completes at EOF, so the carry is empty).  Without this, the budget seal
-    /// could fire on the very last input block, emitting a trailing *spill*
-    /// whose carry has no following run — surfacing as a spurious "truncated
-    /// BAM" error.
+    /// sealed as the FINAL run instead (`FinalSpill` or `Residual`: the final
+    /// run's last record always completes at EOF, so the carry is empty, and
+    /// no empty run follows).  Without this, the budget seal could fire on the
+    /// very last input block, emitting a trailing mid-stream *spill* whose
+    /// carry has no following run — surfacing as a spurious "truncated BAM"
+    /// error.
     seal_pending: bool,
     /// Set to `true` after the final run has been emitted.
     finished: bool,
@@ -216,11 +282,11 @@ impl ReadBlocks {
     /// - `memory_limit`: the FULL in-memory budget (`--max-memory × threads`, via
     ///   `resolve_memory_budget`) for a run's records **and** its sort refs. Each
     ///   run seals when its record bytes reach
-    ///   [`run_cap_for`]`(memory_limit,
-    ///   ledger.snapshot())` = `memory_limit × m / (m + w)` — `m` the previous
-    ///   run's mean record bytes, `w` the ref width — so records plus refs fit
-    ///   the budget, as v0.7.0's in-memory buffer did. Data that fits leaves one
-    ///   in-memory run and no spills.
+    ///   [`run_cap_for`]`(memory_limit, ledger.snapshot())` =
+    ///   `memory_limit × m / (m + w)` — `m` the previous run's mean record
+    ///   bytes, `w` the ref width — so records plus refs fit the budget, as
+    ///   v0.7.0's in-memory buffer did. Data that fits leaves one in-memory run
+    ///   and no spills.
     /// - `output_byte_limit`: byte-bounds the output queue.
     /// - `ledger`: the sort's [`RunLedger`], which its run sort publishes to.
     ///
@@ -257,6 +323,10 @@ impl ReadBlocks {
             run_cap,
             memory_limit,
             ledger,
+            policy: RunIndexPolicy::new(None),
+            spilled_bytes: 0,
+            spilled_records: 0,
+            spilled_max_record: None,
             seal_pending: false,
             finished: false,
             output_byte_limit,
@@ -268,6 +338,77 @@ impl ReadBlocks {
             #[cfg(test)]
             before_register: None,
         }
+    }
+
+    /// Spill the final run when the merge will run in range mode over the
+    /// spilled runs plus it (see `Self::final_run_stride`). Without an
+    /// eligibility the final run is always the in-memory residual.
+    #[must_use]
+    pub fn with_range_eligibility(mut self, elig: RangeEligibility) -> Self {
+        self.policy = RunIndexPolicy::new(Some(elig));
+        self
+    }
+
+    /// Decide the current run's index stride at its acquire
+    /// ([`RunIndexPolicy::at_run`]), from the deterministic estimate over the
+    /// runs sealed so far (their framed bytes, bounded with their largest
+    /// record) plus this one, estimated at the last run's size with its
+    /// largest record unknown. Run 0 keeps the initial stride: nothing has
+    /// sealed, and the key kind is not yet published.
+    ///
+    /// Every input is a function of the input and the settings alone: the
+    /// previous run sealed (and published its totals and largest record; the
+    /// boundary step published the key kind before it) before its chunk
+    /// released the arena this run acquired. The arena bytes the ledger counts
+    /// already hold each record's `u32` length prefix.
+    fn index_policy(&mut self) {
+        let (bytes, records) = self.ledger.spilled_totals();
+        (self.spilled_bytes, self.spilled_records) = (bytes, records);
+        self.spilled_max_record = self.ledger.spilled_max_record();
+        let prior = self.ledger.snapshot();
+        let kind = self.ledger.spill_key_kind();
+        let spill = SpillEstimate {
+            unbounded: SpillEstimate::framed_bytes(
+                kind,
+                prior.last_run_bytes,
+                prior.last_run_records,
+            ),
+            ..self.spilled_estimate(kind)
+        };
+        self.policy.at_run(self.run_seq as usize + 1, kind, spill);
+    }
+
+    /// The runs sealed before the current one, framed for `kind`, with their
+    /// largest framed record when known.
+    fn spilled_estimate(&self, kind: Option<SpillKeyKind>) -> SpillEstimate {
+        let prefix = kind.map_or(0, |k| k.serialized_key_bytes() as u64);
+        SpillEstimate {
+            framed: SpillEstimate::framed_bytes(kind, self.spilled_bytes, self.spilled_records),
+            max_record: self.spilled_max_record.map(|m| m + prefix),
+            unbounded: 0,
+        }
+    }
+
+    /// The final run's index stride when it spills (the open run, at EOF),
+    /// `None` when it stays the residual: [`RunIndexPolicy::final_stride`]
+    /// over the spilled runs plus this run's arena bytes, its largest record
+    /// unknown. Its record count (which sets the template key bytes each
+    /// record adds when framed) is bounded above by the smallest record a BAM
+    /// can hold, so the framed estimate is an upper bound whatever the run's
+    /// records are; coordinate records add no key, so the bound costs nothing
+    /// there. The planner confirms on the exact figures at `AllAnnounced`,
+    /// failing closed to the serial merge.
+    ///
+    /// Every input is a function of the input alone: the spilled figures were
+    /// read at this run's acquire (see [`Self::index_policy`]), and the arena
+    /// bytes are this step's own count.
+    fn final_run_stride(&self) -> Option<u32> {
+        let kind = self.ledger.spill_key_kind();
+        let spill = SpillEstimate {
+            unbounded: open_run_framed_bound(kind, self.run_cumulative as u64),
+            ..self.spilled_estimate(kind)
+        };
+        self.policy.final_stride(self.run_seq as usize + 1, kind, spill)
     }
 
     /// Log the arena-wait line at `info` (`--sort-stats`) instead of `debug`.
@@ -380,7 +521,12 @@ impl ReadBlocks {
         self.run_offset = FRONT_REGION as u64;
         // The previous run sealed (and published its totals) before its chunk
         // released the arena this run just acquired, so the cap is a function of
-        // the input alone.
+        // the input alone. The front owns the run-index policy: it decides this
+        // run's index stride from the estimate of the range merge the sort is
+        // heading for. The spill steps only follow the stride it stamps on the
+        // run's blocks. The cap leaves no room for the index: each run's index
+        // goes to its spill file's footer and is read back only for the merge.
+        self.index_policy();
         self.run_cap = run_cap_for(self.memory_limit, self.ledger.snapshot());
         true
     }
@@ -411,7 +557,7 @@ impl ReadBlocks {
         self.next_ordinal += 1;
         self.run_cumulative += len as usize;
 
-        // `is_last_of_run` / `seals_to_spill` are run-level facts known only at seal,
+        // `is_last_of_run` / `seal` are run-level facts known only at seal,
         // so the just-admitted block is withheld as the tentative last block.  The
         // PRIOR withheld block now has a same-run successor → it is NOT last → emit it.
         let block = ArenaBlock {
@@ -422,7 +568,8 @@ impl ReadBlocks {
             block: b.bytes,
             is_last_of_run: false,
             run_seq: self.run_seq,
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
+            index_stride: self.policy.stride(),
         };
         if let Some(prev) = self.last_block.replace(block) {
             self.emit.push_back(prev);
@@ -431,23 +578,31 @@ impl ReadBlocks {
     }
 
     /// Seal the current run: stamp the withheld `last_block` as the run's final
-    /// block (`is_last_of_run = true` plus the run's `seals_to_spill`), emit it,
+    /// block (`is_last_of_run = true` plus the run's `seal`), emit it,
     /// drop this step's arena handle (so the arena can return to the pool once all
     /// emitted clones release it), and advance `run_seq`.
     ///
     /// All non-last blocks of the run were already emitted eagerly by `admit_block`;
     /// only the single withheld block remains.
     ///
-    /// `seals_to_spill`: `true` for mid-stream seals (the run becomes a disk spill),
-    /// `false` for the final residual run.
+    /// `seal`: [`RunSeal::Spill`] for mid-stream seals, [`RunSeal::FinalSpill`]
+    /// or [`RunSeal::Residual`] for the final run.
     ///
     /// A `seal_run` call always follows at least one admit for the run, so
     /// `last_block` is `Some`; the `try_run` EOF guard returns before sealing an
     /// arena-less, blockless state.
-    fn seal_run(&mut self, seals_to_spill: bool) {
+    fn seal_run(&mut self, seal: RunSeal) {
+        self.seal_run_at(seal, self.policy.stride());
+    }
+
+    /// [`Self::seal_run`], stamping `index_stride` on the run's last block
+    /// (the block downstream reads the run's stride from): the policy's
+    /// stride for a mid-stream run, the EOF fit's for a spilled final run.
+    fn seal_run_at(&mut self, seal: RunSeal, index_stride: u32) {
         if let Some(mut last) = self.last_block.take() {
             last.is_last_of_run = true;
-            last.seals_to_spill = seals_to_spill;
+            last.seal = seal;
+            last.index_stride = index_stride;
             self.emit.push_back(last);
         }
         // Drop our handle to the sealed run's arena; the emitted blocks (and their
@@ -463,6 +618,15 @@ impl ReadBlocks {
     #[cfg(test)]
     pub(crate) fn ensure_arena_for_test(&mut self) -> bool {
         self.ensure_arena()
+    }
+
+    /// Test seam: acquire run `run_seq`'s arena and return the run's
+    /// `(index stride, run cap)`.
+    #[cfg(test)]
+    pub(crate) fn acquire_run_for_test(&mut self, run_seq: u32) -> (u32, usize) {
+        self.run_seq = run_seq;
+        assert!(self.ensure_arena(), "a fresh pool has an arena");
+        (self.policy.stride(), self.run_cap)
     }
 
     /// Test seam: hand the current run's arena to the caller (as if the run
@@ -487,10 +651,10 @@ impl ReadBlocks {
 
     /// Test seam: admit blocks, then freeze the arena and drain all emitted
     /// [`ArenaBlock`]s into a `Vec` for direct inspection, bypassing the pipeline
-    /// framework.  Uses `seals_to_spill = false` (residual) for the single flush.
+    /// framework.  Seals the single flush as [`RunSeal::Residual`].
     #[cfg(test)]
     pub(crate) fn seal_and_drain_for_test(&mut self) -> Vec<ArenaBlock> {
-        self.seal_run(false);
+        self.seal_run(RunSeal::Residual);
         self.emit.drain(..).collect()
     }
 }
@@ -661,7 +825,7 @@ impl ReadBlocks {
             // be completed by the run this block opens).  End the batch here: the
             // just-sealed run's arena must be consumed before the next admit.
             if self.seal_pending {
-                self.seal_run(true); // deferred mid-stream seal → spill
+                self.seal_run(RunSeal::Spill); // deferred mid-stream seal
                 self.seal_pending = false;
                 // The just-sealed run's arena is held (as an Arc) in `emit` until
                 // it is pushed downstream and consumed, so the capacity-1 pool is
@@ -725,24 +889,36 @@ impl ReadBlocks {
             return Ok(StepOutcome::NoProgress);
         }
 
-        // 7. Input fully drained: seal the final (residual) run.  A pending seal
-        //    is DOWNGRADED to a residual here — there is no following run to
-        //    complete a straddler carry, and the final run's last record always
-        //    completes at EOF, so the carry is empty.  `seal_run(false)` emits
-        //    the residual.
+        // 7. Input fully drained: seal the final run.  A pending seal is folded
+        //    into it here — there is no following run to complete a straddler
+        //    carry, and the final run's last record always completes at EOF,
+        //    so the carry is empty, and the full run is the final run (never
+        //    a spill followed by an empty run).  The final run spills
+        //    (`FinalSpill`) when a range merge over it and the spilled runs
+        //    fits; otherwise it is today's in-memory residual.
         self.seal_pending = false;
         // Only seal if a block is withheld; if no block is held and the arena is
         // None, there was no data at all after the previous seal — i.e. truly
         // empty input (no blocks ever admitted).  NOTE: the deferred-seal design
-        // guarantees the *final* run is always a residual (step 5 only seals a
+        // guarantees the *final* run is always sealed here (step 5 only seals a
         // spill once a following block proves a next run exists; otherwise this
-        // step downgrades the pending seal to a residual), so this branch is NOT
+        // step folds the pending seal into the final run), so this branch is NOT
         // reached after any data — it is the empty-input case only.
         if self.arena.is_none() && self.last_block.is_none() {
             self.finished = true;
             return Ok(StepOutcome::Finished);
         }
-        self.seal_run(false); // final run → residual
+        let (seal, stride) = match self.final_run_stride() {
+            Some(stride) => (RunSeal::FinalSpill, stride),
+            None => (RunSeal::Residual, self.policy.stride()),
+        };
+        self.seal_run_at(seal, stride);
+        if seal == RunSeal::FinalSpill {
+            // This step is the pool's only acquirer and never acquires again:
+            // free the arena when the spill steps release the final run's
+            // chunk, instead of pooling it through the merge.
+            self.pool.retire();
+        }
         self.finished = true;
 
         if let Some(block) = self.emit.pop_front() {
@@ -788,9 +964,15 @@ pub struct ArenaBlock {
     pub is_last_of_run: bool,
     /// Run sequence number; increments with each new run.
     pub run_seq: u32,
-    /// `true` if this run seals to a disk spill (mid-stream seal); `false` if
-    /// this is the final residual run (in-memory, not spilled).
-    pub seals_to_spill: bool,
+    /// How the run ends; meaningful only on its last block
+    /// (`is_last_of_run`), [`RunSeal::Residual`] on the others.
+    pub seal: RunSeal,
+    /// The run's index stride (`0` = no index). Only the run's last block
+    /// (`is_last_of_run`) is authoritative: `FindRecordBoundaries` reads the
+    /// stride from it alone. The other blocks carry the stride `ReadBlocks`
+    /// decided at the run's acquire, which a spilled final run's EOF fit may
+    /// raise after they were emitted.
+    pub index_stride: u32,
 }
 
 impl HeapSize for ArenaBlock {
@@ -824,8 +1006,10 @@ pub struct InflatedBlock {
     pub is_last_of_run: bool,
     /// Forwarded from `ArenaBlock`.
     pub run_seq: u32,
-    /// Forwarded from `ArenaBlock`: `true` if this run seals to a disk spill.
-    pub seals_to_spill: bool,
+    /// Forwarded from `ArenaBlock`: how the run ends.
+    pub seal: RunSeal,
+    /// Forwarded from `ArenaBlock`: the run's index stride.
+    pub index_stride: u32,
 }
 
 impl HeapSize for InflatedBlock {
@@ -974,7 +1158,8 @@ impl InflateToArena {
             block,
             is_last_of_run,
             run_seq,
-            seals_to_spill,
+            seal,
+            index_stride,
         } = item;
 
         // SAFETY: `(offset, len)` was reserved by `grow_uninit` on the serial
@@ -1000,7 +1185,16 @@ impl InflateToArena {
             decompress_into_slice_with_crc(&block, &mut self.decompressor, slot, self.verify_crc)?;
         debug_assert_eq!(n, len_usize, "decompressed length must match ISIZE");
 
-        Ok(InflatedBlock { arena, ordinal, offset, len, is_last_of_run, run_seq, seals_to_spill })
+        Ok(InflatedBlock {
+            arena,
+            ordinal,
+            offset,
+            len,
+            is_last_of_run,
+            run_seq,
+            seal,
+            index_stride,
+        })
     }
 }
 
@@ -1515,7 +1709,8 @@ mod tests {
             block: vec![0xAB; 40].into(),
             is_last_of_run: true,
             run_seq: 2,
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
+            index_stride: 1,
         };
         assert_eq!(block.heap_size(), 40, "only the owned BGZF bytes are charged");
         assert_eq!(block.ordinal(), 7, "ordinal drives ByItemOrdinal reordering");
@@ -1534,7 +1729,8 @@ mod tests {
             block: bytes.into(),
             is_last_of_run: false,
             run_seq: 0,
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
+            index_stride: 1,
         };
         assert_eq!(block.heap_size(), 64);
     }
@@ -1548,7 +1744,8 @@ mod tests {
             len: 256,
             is_last_of_run: false,
             run_seq: 1,
-            seals_to_spill: true,
+            seal: RunSeal::Spill,
+            index_stride: 1,
         };
         assert_eq!(token.heap_size(), 0, "the token owns no bytes of its own");
         assert_eq!(token.ordinal(), 11);
@@ -1718,8 +1915,8 @@ mod tests {
         assert_eq!(emitted[1].ordinal, 1);
         assert_eq!(emitted[0].run_seq, 0);
         assert_eq!(emitted[1].run_seq, 0);
-        assert!(!emitted[0].seals_to_spill, "residual run must not seal to spill");
-        assert!(!emitted[1].seals_to_spill, "residual run must not seal to spill");
+        assert_eq!(emitted[0].seal, RunSeal::Residual, "residual run must not seal to spill");
+        assert_eq!(emitted[1].seal, RunSeal::Residual, "residual run must not seal to spill");
         // All blocks share the same arena Arc.
         assert!(Arc::ptr_eq(&emitted[0].arena, &emitted[1].arena));
     }
@@ -1745,7 +1942,7 @@ mod tests {
         assert!(step.admit_block(block(0)).is_ok());
         assert_eq!(step.run_cap, memory_limit * 258 / (258 + width), "run 0: the prior");
         assert!(step.admit_block(block(1)).is_ok());
-        step.seal_run(true);
+        step.seal_run(RunSeal::Spill);
         drop(step.emit.drain(..).collect::<Vec<_>>());
         // The run sort publishes run 0's exact totals before its chunk frees the arena.
         let (run0_bytes, run0_records) = (2000u64, 8u64);
@@ -1759,9 +1956,9 @@ mod tests {
     ///
     /// Asserts:
     /// - Run 0 blocks: `run_seq == 0`, offsets start at `FRONT_REGION`,
-    ///   last block has `is_last_of_run`, all have `seals_to_spill = true`.
+    ///   last block has `is_last_of_run`, all have `seal = RunSeal::Spill`.
     /// - Run 1 blocks: `run_seq == 1`, offsets restart at `FRONT_REGION`
-    ///   (fresh/reused arena from the pool), `seals_to_spill = false`.
+    ///   (fresh/reused arena from the pool), `seal = RunSeal::Residual`.
     /// - Ordinals are monotonically increasing across both runs.
     /// - Run 0 and run 1 arena `Arc`s differ (or are the same reused physical
     ///   buffer returned via the pool after run 0's Arc drops).
@@ -1817,22 +2014,26 @@ mod tests {
         // blocks (simulating the seal that happens when run_cumulative >= run_cap).
         // In the pipeline try_run, the seal fires after admit; here we do it manually
         // via a dedicated seal so we can inspect both runs independently.
-        step.seal_run(true); // mid-stream → seals_to_spill = true
+        step.seal_run(RunSeal::Spill); // mid-stream → seal = Spill
 
         // Collect run 0 blocks.
         let run0_blocks: Vec<ArenaBlock> = step.emit.drain(..).collect();
         assert_eq!(run0_blocks.len(), 2, "run 0 must emit 2 blocks");
 
         // Run 0 invariants.  Eager emission stamps `is_last_of_run` /
-        // `seals_to_spill` only on the run's LAST block (the withheld one); non-last
+        // `seal` only on the run's LAST block (the withheld one); non-last
         // blocks carry `false` (downstream reads these fields only on the last block).
         for blk in &run0_blocks {
             assert_eq!(blk.run_seq, 0, "run 0 blocks must have run_seq=0");
         }
         assert!(!run0_blocks[0].is_last_of_run, "run 0 block 0 must not be last_of_run");
         assert!(run0_blocks[1].is_last_of_run, "run 0 block 1 must be last_of_run");
-        assert!(!run0_blocks[0].seals_to_spill, "non-last block carries seals_to_spill=false");
-        assert!(run0_blocks[1].seals_to_spill, "run 0 last block must seal to spill");
+        assert_eq!(
+            run0_blocks[0].seal,
+            RunSeal::Residual,
+            "a non-last block carries the placeholder seal"
+        );
+        assert_eq!(run0_blocks[1].seal, RunSeal::Spill, "run 0 last block must seal to spill");
         assert_eq!(
             run0_blocks[0].offset, FRONT_REGION as u64,
             "run 0 block 0 must start at FRONT_REGION"
@@ -1890,14 +2091,14 @@ mod tests {
         );
 
         // Seal run 1 as the residual.
-        step.seal_run(false);
+        step.seal_run(RunSeal::Residual);
         let run1_blocks: Vec<ArenaBlock> = step.emit.drain(..).collect();
         assert_eq!(run1_blocks.len(), 2, "run 1 must emit 2 blocks");
 
         // Run 1 invariants.
         for blk in &run1_blocks {
             assert_eq!(blk.run_seq, 1, "run 1 blocks must have run_seq=1");
-            assert!(!blk.seals_to_spill, "run 1 (residual) blocks must have seals_to_spill=false");
+            assert_eq!(blk.seal, RunSeal::Residual, "run 1 (residual) blocks carry Residual");
         }
         assert!(!run1_blocks[0].is_last_of_run, "run 1 block 0 must not be last_of_run");
         assert!(run1_blocks[1].is_last_of_run, "run 1 block 1 must be last_of_run");
@@ -1957,7 +2158,8 @@ mod tests {
             block: block.into(),
             is_last_of_run: true,
             run_seq: 0,
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
+            index_stride: 1,
         };
 
         let mut step = InflateToArena::new(64 * 1024 * 1024);
@@ -1965,7 +2167,7 @@ mod tests {
 
         assert_eq!(inflated.offset, offset, "offset must be forwarded unchanged");
         assert_eq!(inflated.len, isize, "len must be forwarded unchanged");
-        assert!(!inflated.seals_to_spill, "seals_to_spill must be forwarded");
+        assert_eq!(inflated.seal, RunSeal::Residual, "seal must be forwarded");
         // Confirm the decompressed bytes are in the arena at the reserved slot.
         assert_eq!(
             arena.slice(
@@ -2108,7 +2310,8 @@ mod tests {
             block: block.into(),
             is_last_of_run: true,
             run_seq: 0,
-            seals_to_spill: false,
+            seal: RunSeal::Residual,
+            index_stride: 1,
         };
         (item, arena)
     }
@@ -2332,5 +2535,256 @@ mod tests {
             |cap| InflateToArena::new(1 << 20).with_phase_cap(cap),
             item,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Final run disposition
+    // -----------------------------------------------------------------------
+
+    /// A range eligibility that fits any tiny test sort: indexed runs, eight
+    /// phase-2 threads, 1 GiB of merge memory.
+    fn eligible() -> crate::sort::RangeEligibility {
+        crate::sort::RangeEligibility::for_test(8, 1 << 30, 64 << 20)
+    }
+
+    /// The uncompressed bytes of each [`drive_blocks`] test block.
+    const PAYLOAD_LEN: usize = 1000;
+
+    /// A `ReadBlocks` sealing a run every two `PAYLOAD_LEN` blocks, with
+    /// `elig` (when given) and a ledger on which the boundary step has
+    /// already published the coordinate spill key kind (which the final-run
+    /// rule needs).
+    fn two_block_runs(elig: Option<crate::sort::RangeEligibility>) -> ReadBlocks {
+        let ledger = RunLedger::new(Some(0));
+        ledger.publish_spill_key_kind(fgumi_sort::SpillKeyKind::Coordinate);
+        let step = ReadBlocks::new(2 * PAYLOAD_LEN, 64 << 20, ledger);
+        match elig {
+            Some(elig) => step.with_range_eligibility(elig),
+            None => step,
+        }
+    }
+
+    /// Drive `step` through `n` blocks and EOF, dropping each emitted block
+    /// as it is popped (so its run's arena returns to the pool, as the run
+    /// sort would release it), and return each block's
+    /// `(run_seq, is_last_of_run, seal, index_stride)`.
+    fn drive_blocks(step: &mut ReadBlocks, n: usize) -> Vec<(u32, bool, RunSeal, u32)> {
+        use fgumi_pipeline_core::step::InputHandle as _;
+        use fgumi_pipeline_core::testing::StepProbe;
+        let mut probe = StepProbe::new(&*step);
+        let out = probe.take_output::<ArenaBlock>(0);
+        for serial in 0..n {
+            probe.push_input(BgzfBlock {
+                batch_serial: serial as u64,
+                bytes: make_test_bgzf_block(&[7u8; PAYLOAD_LEN]).into(),
+                uncompressed_size: u32::try_from(PAYLOAD_LEN).unwrap(),
+                index: None,
+            });
+        }
+        probe.close_input();
+        let mut emitted = Vec::new();
+        for _ in 0..1000 {
+            let outcome = probe.try_run(step).expect("try_run");
+            while let Some(block) = out.pop() {
+                emitted.push((block.run_seq, block.is_last_of_run, block.seal, block.index_stride));
+            }
+            if outcome == StepOutcome::Finished {
+                return emitted;
+            }
+        }
+        panic!("ReadBlocks never finished: {emitted:?}");
+    }
+
+    /// The seal of each run's last block, in run order.
+    fn run_seals(emitted: &[(u32, bool, RunSeal, u32)]) -> Vec<(u32, RunSeal)> {
+        emitted.iter().filter(|(_, last, ..)| *last).map(|&(run, _, seal, _)| (run, seal)).collect()
+    }
+
+    /// The final run spills when range mode is eligible and at least one run
+    /// already spilled; a sort of one run, an ineligible sort, and a forced
+    /// serial merge keep today's in-memory residual. A spilled final run
+    /// retires the arena pool, and its last block carries the stride of the
+    /// fit that spilled it; a sort that cannot range stamps 0 on every run.
+    /// Columns: eligibility, runs sealed before EOF, the final run's seal,
+    /// the final run's stride.
+    #[rstest]
+    #[case::final_run_carries_the_fit_stride(Some(eligible()), 1, RunSeal::FinalSpill, 1)]
+    #[case::single_run_stays_residual(Some(eligible()), 0, RunSeal::Residual, 1)]
+    #[case::ineligible(
+        Some(crate::sort::RangeEligibility { indexable: false, ..eligible() }),
+        1,
+        RunSeal::Residual,
+        0
+    )]
+    #[case::forced_serial(
+        Some(crate::sort::RangeEligibility { force_serial: true, ..eligible() }),
+        1,
+        RunSeal::Residual,
+        0
+    )]
+    #[case::no_policy(None, 1, RunSeal::Residual, 0)]
+    fn final_run_disposition_table(
+        #[case] elig: Option<crate::sort::RangeEligibility>,
+        #[case] runs_sealed_before_eof: usize,
+        #[case] expected: RunSeal,
+        #[case] expected_stride: u32,
+    ) {
+        let mut step = two_block_runs(elig);
+        // Two blocks fill a run; one more opens the next (final) run.
+        let emitted = drive_blocks(&mut step, 2 + runs_sealed_before_eof);
+        let seals = run_seals(&emitted);
+        assert_eq!(seals.len(), runs_sealed_before_eof + 1, "{emitted:?}");
+        assert!(seals[..runs_sealed_before_eof].iter().all(|&(_, s)| s == RunSeal::Spill));
+        assert_eq!(seals.last().map(|&(_, s)| s), Some(expected));
+        assert_eq!(emitted.last().map(|&(_, _, s, _)| s), Some(expected), "the last block emitted");
+        assert_eq!(emitted.last().map(|&(.., stride)| stride), Some(expected_stride));
+        assert_eq!(step.pool.is_retired(), expected == RunSeal::FinalSpill);
+    }
+
+    /// Every block of a run carries the run's stride (the last block's is the
+    /// one downstream reads). A fit that first fails at the final run's
+    /// acquire (three runs at 8 workers need about 31.5 MiB at the bound, two
+    /// about 29 MiB, of a 30 MiB budget) stamps 0 on the resident final run,
+    /// which the run sort forwards on `AllAnnounced`. Columns: eligibility,
+    /// expected strides of runs 0, 1 and 2, the final run's seal.
+    #[rstest]
+    #[case::indexed(Some(eligible()), [vec![1, 1], vec![1, 1], vec![1]], RunSeal::FinalSpill)]
+    #[case::fit_fails_at_the_final_run(
+        Some(crate::sort::RangeEligibility { merge_memory: 30 << 20, serial_r: 1 << 20, ..eligible() }),
+        [vec![1, 1], vec![1, 1], vec![0]],
+        RunSeal::Residual
+    )]
+    #[case::no_policy(None, [vec![0, 0], vec![0, 0], vec![0]], RunSeal::Residual)]
+    fn arena_blocks_carry_the_run_stride(
+        #[case] elig: Option<crate::sort::RangeEligibility>,
+        #[case] expected: [Vec<u32>; 3],
+        #[case] final_seal: RunSeal,
+    ) {
+        let mut step = two_block_runs(elig);
+        let emitted = drive_blocks(&mut step, 5);
+        for (run, want) in (0u32..).zip(&expected) {
+            let got: Vec<u32> =
+                emitted.iter().filter(|&&(r, ..)| r == run).map(|&(.., stride)| stride).collect();
+            assert_eq!(&got, want, "run {run}: {emitted:?}");
+        }
+        assert_eq!(run_seals(&emitted).last().map(|&(_, seal)| seal), Some(final_seal));
+    }
+
+    /// The front decides each run's stride at its acquire, from the spilled
+    /// totals plus the next run estimated at the last run's size; the run's
+    /// cap is the serial sort's whatever the stride (no index is held through
+    /// phase 1). A 1_000_000-byte budget, coordinate refs (24 B), runs of
+    /// 300-byte records (the largest 300). Columns: phase-2 threads, forced
+    /// serial, runs sealed, spilled (bytes, records), last run (bytes,
+    /// records), expected (stride, run cap).
+    #[rstest]
+    // No run sealed: the cap uses the run-0 prior, ⌊1e6 × 258 / 282⌋.
+    #[case::run0(8, false, 0, (0, 0), (0, 0), (1, 914_893))]
+    // Run 0 sealed, a dense index fits: ⌊1e6 × 300 / 324⌋.
+    #[case::run1_uncharged(8, false, 1, (900_000, 3_000), (900_000, 3_000), (1, 925_925))]
+    // k = 16 at 32 workers: 32 x 16 x 128 KiB = 64 MiB of cursors, the whole
+    // budget. Indexing stops: ⌊1e6 × 300 / 324⌋.
+    #[case::cursors_exhaust_the_budget(32, false, 15, (13_500_000, 45_000), (900_000, 3_000), (0, 925_925))]
+    #[case::forced_serial(8, true, 1, (900_000, 3_000), (900_000, 3_000), (0, 925_925))]
+    fn index_policy_table(
+        #[case] phase2: usize,
+        #[case] force_serial: bool,
+        #[case] runs_sealed: u32,
+        #[case] spilled: (u64, u64),
+        #[case] last_run: (u64, u64),
+        #[case] expected: (u32, usize),
+    ) {
+        let ((spilled_bytes, spilled_records), (last_run_bytes, last_run_records)) =
+            (spilled, last_run);
+        let ledger = RunLedger::new(Some(24));
+        if runs_sealed > 0 {
+            ledger.publish_spill_key_kind(fgumi_sort::SpillKeyKind::Coordinate);
+            ledger.publish_run_max_record(300);
+            if spilled_bytes > last_run_bytes {
+                ledger.publish_seal(
+                    spilled_bytes - last_run_bytes,
+                    spilled_records - last_run_records,
+                );
+            }
+            ledger.publish_seal(last_run_bytes, last_run_records);
+        }
+        let elig = crate::sort::RangeEligibility {
+            force_serial,
+            ..crate::sort::RangeEligibility::for_test(phase2, 1_000_000, 64 << 20)
+        };
+        let mut step =
+            ReadBlocks::new(1_000_000, 64 << 20, Arc::clone(&ledger)).with_range_eligibility(elig);
+        assert_eq!(step.acquire_run_for_test(runs_sealed), expected);
+        assert_eq!(ledger.spilled_totals(), (spilled_bytes, spilled_records));
+    }
+
+    /// EOF with a seal pending (the last block reached the run cap): the full
+    /// run is the spilled final run — exactly two runs, no empty third.
+    #[test]
+    fn read_blocks_eof_with_pending_seal_spills_final_run_when_eligible() {
+        let mut step = two_block_runs(Some(eligible()));
+        let emitted = drive_blocks(&mut step, 4);
+        assert_eq!(run_seals(&emitted), vec![(0, RunSeal::Spill), (1, RunSeal::FinalSpill)]);
+        assert_eq!(emitted.len(), 4, "every block emitted once: {emitted:?}");
+        assert_eq!(step.run_seq, 2);
+        assert!(step.pool.is_retired());
+        assert_eq!(step.pool.free_len(), 0, "the retired pool keeps no arena");
+    }
+
+    /// One run, even with a seal pending at EOF, is the residual: there is no
+    /// spilled run to merge it with.
+    #[test]
+    fn read_blocks_single_run_stays_residual_when_eligible() {
+        let mut step = two_block_runs(Some(eligible()));
+        let emitted = drive_blocks(&mut step, 2);
+        assert_eq!(run_seals(&emitted), vec![(0, RunSeal::Residual)]);
+        assert_eq!(step.run_seq, 1);
+        assert!(!step.pool.is_retired());
+    }
+
+    /// No spill key kind published (no record provisioned the key context)
+    /// means no indexed spill run: the final run stays the residual even when
+    /// every other condition holds.
+    #[test]
+    fn final_run_stays_residual_without_a_spill_key_kind() {
+        let step = ReadBlocks::new(2 * PAYLOAD_LEN, 64 << 20, RunLedger::new(Some(0)));
+        let mut step = step.with_range_eligibility(eligible());
+        let emitted = drive_blocks(&mut step, 3);
+        assert_eq!(run_seals(&emitted), vec![(0, RunSeal::Spill), (1, RunSeal::Residual)]);
+        assert!(!step.pool.is_retired());
+    }
+
+    /// The open final run's framed bytes are bounded by the smallest BAM
+    /// record (36 arena bytes): coordinate records add no key; a template
+    /// record adds its key, at most once per 36 bytes. Columns: kind, arena
+    /// bytes, expected bound.
+    #[rstest]
+    #[case::coordinate(Some(SpillKeyKind::Coordinate), 36_000, 36_000)]
+    #[case::k40(Some(SpillKeyKind::TemplateK40), 36_000, 36_000 + 1_000 * 40)]
+    #[case::k24_partial(Some(SpillKeyKind::TemplateK24), 71, 71 + 24)]
+    #[case::kind_unknown(None, 36_000, 36_000)]
+    fn open_run_framed_bound_table(
+        #[case] kind: Option<SpillKeyKind>,
+        #[case] run_bytes: u64,
+        #[case] expected: u64,
+    ) {
+        assert_eq!(open_run_framed_bound(kind, run_bytes), expected);
+    }
+
+    /// The final-run decision follows the estimate over the front's own
+    /// counts (the ledger publishes no spill byte totals to depend on).
+    /// Columns: merge memory, the final run's seal.
+    #[rstest]
+    #[case::fits(1 << 30, RunSeal::FinalSpill)]
+    // Two runs at eight workers need 2 MiB of cursors alone.
+    #[case::does_not_fit(2 << 20, RunSeal::Residual)]
+    fn final_run_decision_follows_the_estimate(
+        #[case] merge_memory: u64,
+        #[case] expected: RunSeal,
+    ) {
+        let elig = crate::sort::RangeEligibility { merge_memory, serial_r: 1 << 20, ..eligible() };
+        let mut step = two_block_runs(Some(elig));
+        let emitted = drive_blocks(&mut step, 3);
+        assert_eq!(run_seals(&emitted), vec![(0, RunSeal::Spill), (1, expected)]);
     }
 }

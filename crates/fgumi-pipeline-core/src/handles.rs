@@ -151,6 +151,14 @@ impl<T: Send + HeapSize + 'static> Unpushed<T> {
         &self.item
     }
 
+    /// Borrow the rejected item mutably, to change it in place before
+    /// [`BranchOutputHandle::retry`] (e.g. compress it). The pre-allocated
+    /// ordinal is kept, so the item keeps its place in an ordered branch;
+    /// the queue charges the item's size at the retry.
+    pub fn item_mut(&mut self) -> &mut T {
+        &mut self.item
+    }
+
     /// Discard the framework token and recover the item, abandoning the
     /// pre-allocated ordinal (if any). After calling this, **do not** push
     /// the item back into an ordered branch — the missing ordinal will
@@ -2216,6 +2224,20 @@ mod handle_tests {
         fn ordinal(&self) -> u64 {
             self.ord
         }
+    }
+
+    /// A rejected item changed in place through `item_mut` keeps its
+    /// pre-allocated ordinal: its retry lands in its own slot.
+    #[test]
+    fn item_mut_keeps_the_ordinal_token() {
+        let mut held = Unpushed { item: OrdItem { ord: 4, v: 1 }, ordinal: Some(9) };
+        held.item_mut().v = 2;
+        assert_eq!(held.ordinal, Some(9));
+        assert_eq!(*held.item(), OrdItem { ord: 4, v: 2 });
+        let mut direct = Unpushed { item: 5u32, ordinal: None };
+        *direct.item_mut() += 1;
+        assert_eq!(direct.ordinal, None);
+        assert_eq!(direct.into_item(), 6);
     }
 
     #[test]

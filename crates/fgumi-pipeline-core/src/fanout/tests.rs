@@ -218,6 +218,9 @@ mod worker {
             if self.fail {
                 return Err(io::Error::other("boom"));
             }
+            if self.slices_left == 0 {
+                return Ok(JobStep::Spent);
+            }
             self.slices_left -= 1;
             Ok(if self.slices_left == 0 {
                 JobStep::Done(Out(self.ordinal * 10 + 7))
@@ -282,6 +285,16 @@ mod worker {
         (1, 2)
     )]
     #[case::open_idle_is_no_progress(false, &[], &[Run(NoProgress)], &[], false, (0, 0))]
+    // A job of 0 slices is spent: the slice is counted, nothing is delivered
+    // and nothing is kept, so the drained input then finishes.
+    #[case::spent_job_delivers_nothing(
+        true,
+        &[0],
+        &[Close, Run(Progress), Run(Finished)],
+        &[],
+        false,
+        (1, 1)
+    )]
     fn fanout_worker_dispatch(
         #[case] capped: bool,
         #[case] jobs: &[u32],
@@ -351,6 +364,95 @@ mod worker {
         if let Some(cap) = cap {
             assert_eq!(cap.active(), 0, "the permit is released after Err");
         }
+    }
+
+    /// A job that runs to completion in one dispatch (as the sort's range
+    /// merge tickets do), cancelling the pipeline from inside its slice
+    /// `cancel_at` when given.
+    struct ToCompletionJob {
+        slices_left: u32,
+        slices_run: u32,
+        cancel: Option<(u32, crate::CancelHandle)>,
+    }
+
+    impl HeapSize for ToCompletionJob {
+        fn heap_size(&self) -> usize {
+            16
+        }
+    }
+
+    impl Job for ToCompletionJob {
+        type Output = Out;
+
+        fn ordinal(&self) -> u64 {
+            0
+        }
+
+        fn run_slice(&mut self, _budget: SliceBudget) -> io::Result<JobStep<Out>> {
+            self.slices_left -= 1;
+            self.slices_run += 1;
+            if let Some((at, handle)) = &self.cancel
+                && *at == self.slices_run
+            {
+                handle.cancel();
+            }
+            Ok(if self.slices_left == 0 {
+                JobStep::Done(Out(u64::from(self.slices_run)))
+            } else {
+                JobStep::Continue
+            })
+        }
+
+        fn run_dispatch(
+            &mut self,
+            budget: SliceBudget,
+            stop: &dyn Fn() -> bool,
+        ) -> io::Result<super::super::Dispatched<Out>> {
+            let mut slices = 0;
+            loop {
+                let outcome = self.run_slice(budget)?;
+                slices += 1;
+                if !matches!(outcome, JobStep::Continue) || stop() {
+                    return Ok(super::super::Dispatched { step: outcome, slices });
+                }
+            }
+        }
+    }
+
+    /// The pipeline's signal reaches a job run to completion through the
+    /// worker: uncancelled, a 5-slice job finishes in one dispatch and every
+    /// slice is counted; cancelled from inside slice 2, it stops between
+    /// slices and the worker keeps it, so the next dispatch resumes it (and,
+    /// with the signal still done, stops after one more slice).
+    /// Columns: the slice that cancels (none), slices counted after the
+    /// first dispatch, results delivered after it, slices counted after a
+    /// second dispatch.
+    #[rstest]
+    #[case::runs_to_completion(None, 5, vec![(0, 5)], 5)]
+    #[case::stops_between_slices_and_is_kept(Some(2), 2, vec![], 3)]
+    fn cancel_stops_a_job_between_slices(
+        #[case] cancel_at: Option<u32>,
+        #[case] first_slices: u64,
+        #[case] first_delivered: Vec<(u64, u64)>,
+        #[case] second_slices: u64,
+    ) {
+        let inbox = OrderedInbox::<Out>::new(true);
+        let mut w =
+            FanoutWorker::<ToCompletionJob>::new("to-completion", Arc::clone(&inbox), BUDGET);
+        let probe = StepProbe::new(&w);
+        let cancel = cancel_at.map(|at| (at, probe.cancel_handle()));
+        probe.push_input(ToCompletionJob { slices_left: 5, slices_run: 0, cancel });
+        let take = || {
+            std::iter::from_fn(|| inbox.try_take_next().map(|(o, Out(v))| (o, v)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(probe.try_run(&mut w).unwrap(), Progress);
+        assert_eq!((probe.counter(0), probe.counter(1)), (1, first_slices), "jobs, slices");
+        assert_eq!(take(), first_delivered);
+        let second = probe.try_run(&mut w).unwrap();
+        assert_eq!(probe.counter(1), second_slices, "slices after a second dispatch");
+        assert_eq!(second, if cancel_at.is_some() { Progress } else { NoProgress });
+        assert!(take().is_empty());
     }
 
     #[test]

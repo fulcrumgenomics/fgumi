@@ -66,6 +66,9 @@ test-utils = []
 fgumi-bam-io = { workspace = true }
 # Heap accounting for `tests/slot_alloc.rs` (a safe global allocator).
 dhat = { workspace = true }
+# The CLI's global allocator, for `tests/arena_release_rss.rs` (the retired
+# arena's pages are returned through mimalloc's purge path).
+mimalloc = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
 fgumi-sam = { workspace = true }
 rstest = { workspace = true }

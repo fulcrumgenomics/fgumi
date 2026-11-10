@@ -15,8 +15,9 @@ use fgumi_pipeline_core::step::StepOutcome;
 use fgumi_pipeline_core::testing::StepProbe;
 use fgumi_pipeline_core::{CapPhase, PhaseCap, PhasedCap, StepCap};
 use fgumi_sort::{
-    CONSOLIDATION_SLOT_IDS_START, MergeDemand, RawCoordinateKey, RawSortKey, SpillBlockCompressor,
-    SpillCodec, SpillKeyKind, TemplateKey, open_spill_slot, spill_magic, spill_trailer,
+    CONSOLIDATION_SLOT_IDS_START, FramesEnd, MergeDemand, RawCoordinateKey, RawSortKey,
+    SpillBlockCompressor, SpillCodec, SpillKeyKind, TemplateKey, open_spill_slot, spill_magic,
+    spill_trailer,
 };
 use rstest::rstest;
 use tempfile::TempDir;
@@ -28,8 +29,8 @@ use crate::sort::spill_block_compress::SpillBlockCompress;
 use crate::sort::spill_decompress::SortSpillDecompress;
 use crate::sort::spill_fixtures::{
     FrameShape, KChain, KOpts, coordinate_body, embedded_frame, framed_template_records,
-    keyed_frame, keyed_run, loaded_slot, merged_reference, read_frames, template_key,
-    write_frames_run, write_run_file,
+    framed_template_records_of, keyed_frame, keyed_run, loaded_slot, merged_reference, read_frames,
+    template_key, write_frames_run, write_run_file,
 };
 use crate::sort::spill_gather::frame_one_block;
 use crate::sort::supply_ledger::SpillSupply;
@@ -40,6 +41,8 @@ struct Emitted {
     ordinal: u64,
     last: bool,
     bytes: Vec<u8>,
+    /// The index stride stamped on the block.
+    index_stride: u32,
 }
 
 /// Run `step` over `jobs` to `Finished` through a `StepProbe` and return the
@@ -72,6 +75,7 @@ fn drive_consolidate(mut step: ConsolidateRuns, jobs: Vec<ConsolidationJob>) -> 
             is_last_in_file,
             bytes,
             records_ingested_so_far,
+            index_stride,
             ..
         } = ev
         else {
@@ -82,7 +86,7 @@ fn drive_consolidate(mut step: ConsolidateRuns, jobs: Vec<ConsolidationJob>) -> 
         if is_last_in_file {
             lasts.push(file_id);
         }
-        emitted.push(Emitted { job: file_id, ordinal, last: is_last_in_file, bytes });
+        emitted.push(Emitted { job: file_id, ordinal, last: is_last_in_file, bytes, index_stride });
     }
     assert_eq!(lasts.len(), n_jobs, "one last block per job");
     emitted
@@ -120,6 +124,7 @@ fn try_step_framed_frames_like_the_gather(
         slots: vec![loaded_slot(0, 0, runs[0].clone()), loaded_slot(1, 1, runs[1].clone())],
         key_kind: shape.key_kind(),
         input_paths: vec![PathBuf::from("run-0"), PathBuf::from("run-1")],
+        index_stride: 1,
     };
     let got = drive_consolidate(
         ConsolidateRuns::new(block_size, u64::MAX).with_merge_demand(Arc::new(MergeDemand::new())),
@@ -144,6 +149,7 @@ fn consecutive_jobs_get_dense_ordinals() {
         ],
         key_kind: SpillKeyKind::TemplateK40,
         input_paths: vec![PathBuf::from("a"), PathBuf::from("b")],
+        index_stride: 1,
     };
     let got = drive_consolidate(
         ConsolidateRuns::new(256, u64::MAX).with_merge_demand(Arc::new(MergeDemand::new())),
@@ -159,14 +165,46 @@ fn consecutive_jobs_get_dense_ordinals() {
     assert!(got.windows(2).all(|w| w[0].job <= w[1].job), "job 1's blocks precede job 2's");
 }
 
+/// The merged run's blocks carry the live runs' stride from the job, so a
+/// job started after the front turned indexing off (stride 0) builds no
+/// frames. Columns: the job's stride.
+#[rstest]
+#[case::indexed(1)]
+#[case::sparse(4)]
+#[case::indexing_off(0)]
+fn merged_blocks_carry_the_jobs_stride(#[case] index_stride: u32) {
+    let job = ConsolidationJob {
+        job_id: 1,
+        slots: vec![
+            loaded_slot(0, 10, framed_template_records(0..50)),
+            loaded_slot(1, 11, framed_template_records(25..75)),
+        ],
+        key_kind: SpillKeyKind::TemplateK40,
+        input_paths: vec![PathBuf::from("a"), PathBuf::from("b")],
+        index_stride,
+    };
+    let got = drive_consolidate(
+        ConsolidateRuns::new(256, u64::MAX).with_merge_demand(Arc::new(MergeDemand::new())),
+        vec![job],
+    );
+    assert!(!got.is_empty());
+    assert!(got.iter().all(|e| e.index_stride == index_stride));
+}
+
 /// Overlapping key ranges, so merges interleave.
 fn runs(n: u32) -> Vec<(u32, Range<u64>)> {
     (0..n).map(|id| (id, u64::from(id) * 3..u64::from(id) * 3 + 10)).collect()
 }
 
-fn feed_and_settle(k: &mut KChain, runs: &[(u32, Range<u64>)]) {
+/// Feed each run (built by `run`), settling after each, then announce them
+/// all and settle the tail.
+fn feed_and_settle(
+    k: &mut KChain,
+    runs: &[(u32, Range<u64>)],
+    run: impl Fn(u32, Range<u64>) -> SpillBlockEvent,
+) {
     for (id, keys) in runs {
-        k.feed(keyed_run(SpillCodec::Zstd, *id, keys.clone()));
+        k.feed(run(*id, keys.clone()));
         k.settle().unwrap();
     }
     k.feed(SpillBlockEvent::AllAnnounced {
@@ -174,6 +212,7 @@ fn feed_and_settle(k: &mut KChain, runs: &[(u32, Range<u64>)]) {
         slot_count: u32::try_from(runs.len()).unwrap(),
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     k.close();
     k.settle().unwrap();
@@ -196,7 +235,7 @@ fn consolidated_run_reuses_no_supply_state() {
         k.settle().unwrap();
         let live = k.live_slot_ids();
         for (job_id, at) in &k.retired_at {
-            let (_, slot_ids, _, sources) = k.jobs.iter().find(|j| j.0 == *job_id).unwrap();
+            let (_, slot_ids, _, sources, _) = k.jobs.iter().find(|j| j.0 == *job_id).unwrap();
             for (sid, src) in slot_ids.iter().zip(sources) {
                 assert_eq!(
                     Arc::strong_count(src),
@@ -225,6 +264,7 @@ fn consolidated_run_reuses_no_supply_state() {
         slot_count: N,
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     k.close();
     k.settle().unwrap();
@@ -235,12 +275,45 @@ fn consolidated_run_reuses_no_supply_state() {
     );
 }
 
+/// [`keyed_run`] carrying its one-frame index, so `SpillWrite` writes the run
+/// with an index footer.
+fn indexed_keyed_run(file_id: u32, keys: Range<u64>) -> SpillBlockEvent {
+    let raw = framed_template_records_of(file_id, keys.clone());
+    let SpillBlockEvent::Block { bytes, .. } = keyed_run(SpillCodec::Zstd, file_id, keys.clone())
+    else {
+        unreachable!()
+    };
+    let mut key = Vec::new();
+    template_key(keys.start).write_to(&mut key).unwrap();
+    let mut index = fgumi_sort::RunIndex::new(40);
+    let records = u32::try_from(keys.end - keys.start).unwrap();
+    index.push_frame(
+        u32::try_from(bytes.len()).unwrap(),
+        u32::try_from(raw.len()).unwrap(),
+        records,
+        &key,
+    );
+    SpillBlockEvent::Block {
+        ordinal: 0,
+        file_id,
+        key_kind: SpillKeyKind::TemplateK40,
+        is_last_in_file: true,
+        records_ingested_so_far: u64::from(file_id) + 1,
+        bytes,
+        frames: Some(index),
+        index_stride: 1,
+    }
+}
+
 /// R2 / review I5 (r1): consolidation reads only through the planner. When a job
 /// is forwarded, a decoy run (same names, different records) is renamed over
 /// each input path, so any path-based open reads the decoy and the record oracle
 /// fails. (A plain unlink would also break `SpillWrite`'s own removal of the
 /// absorbed inputs.) Also: each slot is read exactly once, `len − body_start`
-/// bytes.
+/// bytes: its frames, never its index footer. Every input carries a footer
+/// (the phase-1 runs their one-entry index, the merged runs theirs), so a
+/// read past the frames would show; a phase-1 input's footer is the length
+/// its format gives one 40-byte-key entry.
 #[test]
 fn consolidation_reads_go_through_the_planner() {
     let mut k = KChain::new(KOpts::default());
@@ -255,18 +328,37 @@ fn consolidation_reads_go_through_the_planner() {
         }
     }));
     let input = runs(4);
-    feed_and_settle(&mut k, &input);
+    feed_and_settle(&mut k, &input, indexed_keyed_run);
     assert_eq!(k.surviving_runs(), vec![merged_reference(&input)]);
-    for (_, slot_ids, _, sources) in &k.jobs {
-        for (sid, src) in slot_ids.iter().zip(sources) {
+    // The footer of a one-entry index of 40-byte keys: the 36-byte header,
+    // two offsets, one raw length and record count, one key, the 16-byte
+    // trailer.
+    let one_entry_footer: u64 = 36 + 2 * 8 + (4 + 4) + 40 + 16;
+    let body_start = spill_magic(SpillCodec::Zstd).len() as u64;
+    let (mut slots, mut phase1_inputs) = (0, 0);
+    for (_, slot_ids, paths, sources, frame_ends) in &k.jobs {
+        for (((sid, path), src), &frame_end) in
+            slot_ids.iter().zip(paths).zip(sources).zip(frame_ends)
+        {
             let read: u64 =
                 k.requests.iter().filter(|(s, _)| s == sid).map(|(_, l)| u64::from(*l)).sum();
-            let body_start = spill_magic(SpillCodec::Zstd).len() as u64;
-            // The open descriptor's length (fstat): the original file, not the
-            // decoy now at its path.
-            assert_eq!(read, src.byte_len().unwrap() - body_start, "slot {sid}");
+            // The open descriptor (fstat): the original file, not the decoy
+            // now at its path.
+            let file_len = src.byte_len().unwrap();
+            let mut trailer = [0u8; 16];
+            fgumi_bam_io::pread::read_at_exact(src.as_ref(), &mut trailer, file_len - 16).unwrap();
+            assert_eq!(&trailer[8..], b"FGUMIIDX", "slot {sid} carries a footer");
+            let block_len = u64::from_le_bytes(trailer[..8].try_into().unwrap());
+            assert_eq!(frame_end, file_len - block_len - 16, "slot {sid}: frames end at the block");
+            if path.file_name().unwrap().to_string_lossy().starts_with("chunk_") {
+                assert_eq!(file_len - frame_end, one_entry_footer, "slot {sid}");
+                phase1_inputs += 1;
+            }
+            assert_eq!(read, frame_end - body_start, "slot {sid}: its frames, never its footer");
+            slots += 1;
         }
     }
+    assert!(slots >= 2 && phase1_inputs >= 1, "{slots} slots, {phase1_inputs} phase-1 inputs");
 }
 
 /// Review r2 I6 (and Design issue 2): the phase switch happens at `AllAnnounced`
@@ -290,6 +382,7 @@ fn phased_cap_switches_only_after_retire() {
         slot_count: 3,
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     k.close();
     k.settle().unwrap();
@@ -307,7 +400,7 @@ fn supply_steps_take_the_phase1_cap_during_consolidation() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("r0");
     write_run_file(&path, SpillCodec::Zstd, 0, 0..10);
-    let slot = open_spill_slot(&path, 0).unwrap();
+    let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
     let body_len = u32::try_from(slot.len() - slot.body_start()).unwrap();
     // As the planner does when it issues the read the slice answers.
     slot.bp_note_issued(u64::from(body_len));
@@ -342,6 +435,8 @@ fn supply_steps_take_the_phase1_cap_during_consolidation() {
         is_last_in_file: true,
         records_ingested_so_far: 0,
         bytes: framed_template_records(0..10),
+        frames: None,
+        index_stride: 1,
     };
 
     let mut pread = PreadSlices::spill(SliceBufferPool::new(2), 1 << 20).with_step_cap(cap.clone());
@@ -411,11 +506,12 @@ fn merge_is_the_stable_merge_of_its_inputs_in_run_order(
     k.settle().unwrap();
     let mut expected: Vec<(TemplateKey, Vec<u8>)> = runs.concat();
     expected.sort_by(|a, b| a.0.cmp(&b.0)); // stable
+    let (job_id, frames_end, _) = k.registry.take_completed().expect("the job completed");
+    assert_eq!(job_id, 1);
     assert_eq!(
-        read_frames(&output, codec, 40),
+        read_frames(&output, codec, 40, FramesEnd::At(frames_end)),
         expected.iter().map(|(key, b)| keyed_frame(key, b)).collect::<Vec<_>>()
     );
-    assert_eq!(k.registry.take_completed().map(|c| c.0), Some(1));
 }
 
 /// Embedded keys (coordinate): re-extracted from the body. Catches: a
@@ -449,8 +545,9 @@ fn merge_of_embedded_keys_re_extracts_them_from_the_body() {
     k.settle().unwrap();
     let mut expected: Vec<Vec<u8>> = runs.concat();
     expected.sort_by_key(|b| RawCoordinateKey::extract_from_record(b)); // stable
+    let (_, frames_end, _) = k.registry.take_completed().expect("the job completed");
     assert_eq!(
-        read_frames(&output, SpillCodec::Zstd, 0),
+        read_frames(&output, SpillCodec::Zstd, 0, FramesEnd::At(frames_end)),
         expected.iter().map(|b| embedded_frame(b)).collect::<Vec<_>>()
     );
 }
@@ -470,10 +567,10 @@ fn empty_inputs_are_skipped_and_an_all_empty_job_writes_an_empty_run() {
     let (merged, empty) = (path("merged"), path("empty"));
     k.start_job(1, SpillKeyKind::TemplateK40, &[a.clone(), b, c.clone()], &merged);
     k.settle().unwrap();
-    assert_eq!(read_frames(&merged, SpillCodec::Bgzf, 40), records);
+    assert_eq!(read_frames(&merged, SpillCodec::Bgzf, 40, FramesEnd::AtEof), records);
     k.start_job(2, SpillKeyKind::TemplateK40, &[a, c], &empty);
     k.settle().unwrap();
-    assert!(read_frames(&empty, SpillCodec::Bgzf, 40).is_empty());
+    assert!(read_frames(&empty, SpillCodec::Bgzf, 40, FramesEnd::AtEof).is_empty());
     let bytes = std::fs::read(&empty).unwrap();
     assert_eq!(bytes, [spill_magic(SpillCodec::Bgzf), spill_trailer(SpillCodec::Bgzf)].concat());
     let done: Vec<u32> = std::iter::from_fn(|| k.registry.take_completed().map(|c| c.0)).collect();
@@ -528,6 +625,7 @@ fn per_call_budgets_bound_one_try_run() {
         slots: vec![loaded_slot(0, 0, raw.clone())],
         key_kind: SpillKeyKind::TemplateK40,
         input_paths: vec![PathBuf::from("a")],
+        index_stride: 1,
     };
     // 250 bytes of 100-byte bodies: the third record crosses the byte budget.
     let mut step = ConsolidateRuns::new(1 << 20, u64::MAX)
@@ -570,6 +668,7 @@ fn consolidation_keeps_live_runs_under_the_limit_and_preserves_every_record() {
         slot_count: RUNS,
         memory_chunk_count: 0,
         total_records: 0,
+        index_stride: 1,
     });
     k.close();
     k.settle().unwrap();

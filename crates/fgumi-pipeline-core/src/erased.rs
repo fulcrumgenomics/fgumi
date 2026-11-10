@@ -345,7 +345,9 @@ pub struct ErasedStepCtx<'a> {
     pub input: &'a (dyn Any + Send + Sync),
     /// `OutputHandles<S::Outputs>`. Adapter downcasts.
     pub outputs: &'a (dyn Any + Send + Sync),
-    /// Shared signal (error/cancel). Workers consult; steps don't directly.
+    /// Shared signal (error/cancel). Workers check it between dispatches; the
+    /// single-input adapter forwards it into [`StepCtx::signal`], so a step
+    /// running long work inside one dispatch can poll it too.
     pub signal: &'a Arc<PipelineSignal>,
     /// This step's shared [`StepCounters`] (`&contexts.step_counters[step_idx]`).
     /// The adapter forwards it into `StepCtx`/`StepCtx2` so the step body can
@@ -591,7 +593,7 @@ where
         let counters = ctx.counters;
         let input = self.resolve_input(ctx);
         let outputs = self.resolve_outputs(ctx);
-        let mut step_ctx = StepCtx { input, outputs, counters, pool: ctx.pool };
+        let mut step_ctx = StepCtx { input, outputs, counters, pool: ctx.pool, signal: ctx.signal };
         self.inner.try_run(&mut step_ctx)
     }
 

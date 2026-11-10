@@ -61,6 +61,9 @@ use crate::pipeline::steps::types::{
     BamTemplateBatch, BgzfBlock, DecodedRecordBatch, DecompressedBlock, RecordBatch,
 };
 use crate::template::Template;
+use fgumi_pipeline_io::output_compress::{
+    CompressInput, OutputBlock, OutputCompressor, OutputDepth,
+};
 
 /// Per-edge byte budget. Deliberately small relative to the multi-record
 /// fixtures so the byte-bounded edges bind mid-run rather than swallowing the
@@ -587,6 +590,95 @@ fn compress_step_emits_manifest_matching_frames_when_index_bam_true(
         assert!(ctx.is_mapped, "test records are mapped");
         expected_uoffset += 4 + body_len;
     }
+}
+
+/// An emitted BGZF block's serial, bytes and manifest (physical lengths and
+/// each record's `uoffset`, `len` and context).
+type EmittedBlock = (u64, Vec<u8>, Option<(Vec<u32>, Vec<String>)>);
+
+/// Run `items` through `BgzfCompress<I>` (level 1, `index_bam`) and return
+/// each emitted block's serial, bytes and manifest (physical lengths and
+/// per-record `uoffset`/`len`/context), in serial order.
+fn compress_blocks<I: CompressInput>(
+    items: Vec<I>,
+    index_bam: bool,
+    threads: usize,
+    depth: Option<Arc<OutputDepth>>,
+) -> Vec<EmittedBlock> {
+    let collected: Arc<Mutex<Vec<BgzfBlock>>> = Arc::new(Mutex::new(Vec::new()));
+    let builder = Pipeline::builder();
+    builder
+        .chain(ReplaySource::new(items))
+        .chain(
+            BgzfCompress::<I>::for_input(1, EDGE_LIMIT_BYTES, index_bam).with_output_depth(depth),
+        )
+        .chain(CollectSink { collected: Arc::clone(&collected) })
+        .into_sink_marker();
+    let pipeline = builder.build().expect("chain builds");
+    pipeline.run(PipelineConfig { threads, ..Default::default() }).expect("chain runs");
+    let mut blocks: Vec<_> = collected
+        .lock()
+        .expect("mutex not poisoned")
+        .iter()
+        .map(|b| {
+            let manifest = b.index.as_ref().map(|m| {
+                let records =
+                    m.records.iter().map(|r| format!("{} {} {:?}", r.uoffset, r.len, r.ctx));
+                (m.phys_comp_len.clone(), records.collect())
+            });
+            (b.batch_serial, b.bytes.to_vec(), manifest)
+        })
+        .collect();
+    blocks.sort_by_key(|b| b.0);
+    blocks
+}
+
+/// `BgzfCompress<OutputBlock>` over a stream mixing raw blocks and blocks
+/// their producer already compressed (with an `OutputCompressor` of the same
+/// settings, as the range merge's thread does) emits exactly the blocks,
+/// bytes and BAI manifests `BgzfCompress<DecompressedBlock>` emits for the
+/// all-raw stream: the compressed ones pass through with their serial.
+/// Columns: which serials the producer compressed.
+#[rstest]
+#[case::none(vec![])]
+#[case::alternate(vec![0, 2, 4])]
+#[case::all(vec![0, 1, 2, 3, 4, 5])]
+fn compress_passes_precompressed_blocks_through(
+    #[case] precompressed: Vec<u64>,
+    #[values(false, true)] index_bam: bool,
+    #[values(1, 4)] threads: usize,
+) {
+    let records = test_records(60);
+    let batches: Vec<Vec<u8>> = records.chunks(10).map(framed_batch).collect();
+    let raw = |serial: u64, bytes: &Vec<u8>| DecompressedBlock {
+        batch_serial: serial,
+        bytes: bytes.clone(),
+    };
+    let want = compress_blocks(
+        (0u64..).zip(&batches).map(|(i, b)| raw(i, b)).collect(),
+        index_bam,
+        threads,
+        None,
+    );
+    let mut producer = OutputCompressor::new(1, index_bam);
+    let mixed: Vec<OutputBlock> = (0u64..)
+        .zip(&batches)
+        .map(|(i, b)| {
+            let mut block = OutputBlock::Raw(raw(i, b));
+            if precompressed.contains(&i) {
+                assert!(block.compress_in_place(&mut producer).unwrap());
+            }
+            block
+        })
+        .collect();
+    let depth = Arc::new(OutputDepth::new());
+    depth.note_pushed(mixed.len() as u64);
+    let got = compress_blocks(mixed, index_bam, threads, Some(Arc::clone(&depth)));
+    assert_eq!(got.len(), batches.len());
+    // Every pop is counted, raw or passed through, so the queue drains to 0.
+    assert_eq!(depth.popped(), batches.len() as u64);
+    assert_eq!(depth.depth(), 0);
+    assert_eq!(got, want, "a pre-compressed block differs from the step's own output");
 }
 
 /// An input with a header but no records must still complete cleanly and

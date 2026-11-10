@@ -10,13 +10,30 @@ use fgumi_bam_io::ProgressTracker;
 use log::info;
 use std::sync::Arc;
 
-/// Open `path` as a single [`SortMergeSlot`] with the given `file_id`.
+/// Where a spill run's frames end, as its writer recorded it: what tells
+/// [`open_spill_slot`] whether the run carries a run-index footer. The
+/// opener never decides that from the file's bytes: an unindexed zstd run
+/// can end in a frame stored raw, whose last bytes are a record's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramesEnd {
+    /// The writer wrote no footer: the frames run to the end of the file.
+    AtEof,
+    /// The frames end at this byte (the bytes the writer wrote before any
+    /// footer); whatever follows must be exactly one run-index footer.
+    At(u64),
+}
+
+/// Open `path` as a single [`SortMergeSlot`] with the given `file_id`, its
+/// frames ending where its writer said (`frames_end`).
 ///
 /// The spill codec is auto-detected from the file magic: for zstd (`ZSP1`) the
 /// frames start after the 4-byte magic; for BGZF the `1f 8b` is part of the
 /// first block, so the frames start at byte 0. The slot carries the file as a
 /// positional handle with that body range and allocates no read buffer;
-/// `SortSpillDecompress` reads `slot.codec` to decompress accordingly.
+/// `SortSpillDecompress` reads `slot.codec` to decompress accordingly. A run
+/// written with an index footer ([`FramesEnd::At`] short of the file's end)
+/// records the footer's span for [`SortMergeSlot::read_run_index`]; the
+/// slot's frame bytes never include it.
 ///
 /// `file_id` is the slot's stable merge-order identifier — `SortMerge` orders
 /// sources by it so the `LoserTree` tie-break for equal sort keys matches the
@@ -27,9 +44,14 @@ use std::sync::Arc;
 /// # Errors
 ///
 /// Returns an error if the file cannot be opened, or its magic or length
-/// cannot be read.
-pub fn open_spill_slot(path: &std::path::Path, file_id: u32) -> Result<Arc<SortMergeSlot>> {
-    open_spill_slot_as(path, file_id, file_id)
+/// cannot be read; `InvalidData` if `frames_end` does not fit the file or
+/// the bytes after the frames are not one well-formed footer.
+pub fn open_spill_slot(
+    path: &std::path::Path,
+    file_id: u32,
+    frames_end: FramesEnd,
+) -> Result<Arc<SortMergeSlot>> {
+    open_spill_slot_as(path, file_id, file_id, frames_end)
 }
 
 /// Open a merge input — a BAM file or stream behind `source` — as a
@@ -74,6 +96,7 @@ pub fn open_spill_slot_as(
     path: &std::path::Path,
     file_id: u32,
     slot_id: u32,
+    frames_end: FramesEnd,
 ) -> Result<Arc<SortMergeSlot>> {
     if file_id >= crate::merge_slots::CONSOLIDATION_SLOT_IDS_START {
         return Err(std::io::Error::new(
@@ -96,13 +119,22 @@ pub fn open_spill_slot_as(
         crate::codec::SpillCodec::Bgzf
     };
     let body_start = crate::spill_block::spill_magic(codec).len() as u64;
-    let len = file
+    let file_len = file
         .metadata()
         .with_context(|| format!("failed to stat spill chunk {}", path.display()))?
         .len();
-    Ok(Arc::new(
-        SortMergeSlot::new(file_id, Arc::new(file), body_start, len, codec).with_slot_id(slot_id),
-    ))
+    let footer = match frames_end {
+        FramesEnd::AtEof => None,
+        FramesEnd::At(end) => crate::run_index::locate_footer(&file, body_start, end, file_len)
+            .with_context(|| format!("failed to read spill chunk footer {}", path.display()))?,
+    };
+    let len = footer.map_or(file_len, |(offset, _)| offset);
+    let slot = SortMergeSlot::new(file_id, Arc::new(file), body_start, len, codec);
+    let slot = match footer {
+        Some((offset, block_len)) => slot.with_index_span(offset, block_len),
+        None => slot,
+    };
+    Ok(Arc::new(slot.with_slot_id(slot_id)))
 }
 
 // ============================================================================

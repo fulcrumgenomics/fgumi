@@ -1931,19 +1931,203 @@ mod slot_ingest_tests {
         rx.recv_timeout(std::time::Duration::from_secs(5)).expect("did not finish within 5 s");
     }
 
+    /// A one-entry index tiling a spill file's frames `[body_start, body_end)`.
+    fn tiling_index(body_start: u64, body_end: u64) -> crate::RunIndex {
+        let mut index = crate::RunIndex::new(8);
+        let comp = u32::try_from(body_end - body_start).unwrap();
+        index.push_frame(comp, 40_000, 2, &7u64.to_le_bytes());
+        index.rebase(body_start);
+        index
+    }
+
+    /// Append `index`'s footer to the spill file at `path`.
+    fn append_footer(path: &Path, index: &crate::RunIndex) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        index.write_footer(&mut file).unwrap();
+    }
+
+    /// How a test tells the opener where a run's frames end.
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        /// No footer: the frames run to the end of the file.
+        AtEof,
+        /// Where the frames were written to end (before any footer).
+        Written,
+    }
+
+    /// The slot's frame bytes are the file without its index footer: a zstd
+    /// run with a footer ends its frames where the writer said and reads the
+    /// footer back as the written index; without one (or for BGZF) the
+    /// frames run to the file's end, whether the opener is told the frames
+    /// end there or at EOF, and there is no index. Columns: codec, whether a
+    /// footer is appended, how the end is given, expected body start.
     #[rstest::rstest]
-    #[case::bgzf(SpillCodec::Bgzf, 0)]
-    #[case::zstd(SpillCodec::Zstd, 4)]
+    #[case::bgzf(SpillCodec::Bgzf, false, End::AtEof, 0)]
+    #[case::bgzf_written_end(SpillCodec::Bgzf, false, End::Written, 0)]
+    #[case::zstd(SpillCodec::Zstd, false, End::AtEof, 4)]
+    #[case::zstd_written_end(SpillCodec::Zstd, false, End::Written, 4)]
+    #[case::zstd_with_footer(SpillCodec::Zstd, true, End::Written, 4)]
     fn open_spill_slot_reads_codec_and_body_range(
         #[case] codec: SpillCodec,
+        #[case] footer: bool,
+        #[case] end: End,
         #[case] body_start: u64,
     ) {
         let (_dir, path, bytes) = spill_file(codec, 2);
-        let slot = open_spill_slot(&path, 3).unwrap();
+        let body_end = bytes.len() as u64;
+        let index = tiling_index(body_start, body_end);
+        if footer {
+            append_footer(&path, &index);
+        }
+        let frames_end = match end {
+            End::AtEof => FramesEnd::AtEof,
+            End::Written => FramesEnd::At(body_end),
+        };
+        let slot = open_spill_slot(&path, 3, frames_end).unwrap();
         assert_eq!(slot.codec, codec);
-        assert_eq!((slot.body_start(), slot.len()), (body_start, bytes.len() as u64));
+        assert_eq!((slot.body_start(), slot.len()), (body_start, body_end));
+        assert_eq!(slot.has_index_footer(), footer);
+        assert_eq!(slot.read_run_index().unwrap(), footer.then_some(index));
         let r = slot.reader.lock().unwrap();
         assert!(r.slices.is_empty() && r.parser.carry_len() == 0);
+    }
+
+    /// How a test damages a spill file's footer, or misstates where its
+    /// frames end.
+    #[derive(Clone, Copy, Debug)]
+    enum FooterDamage {
+        /// The trailer names a block longer than the file.
+        BlockLongerThanFile,
+        /// The block's magic is overwritten.
+        BlockMagic,
+        /// The block's last key byte is dropped (the trailer's length is
+        /// fixed up), so the block is one byte short of its entries.
+        ShortBlock,
+        /// The frames are said to end one byte before they do.
+        FramesEndShort,
+        /// The frames are said to end one byte past the file.
+        FramesEndPastFile,
+        /// The frames are said to end 4 bytes before they do, so too few
+        /// bytes for any footer follow.
+        TooFewBytesForAFooter,
+    }
+
+    /// A footer that does not lead to a well-formed block, or a frame end
+    /// that disagrees with the file, fails the open or the index read with
+    /// `InvalidData`, rather than being read as frames. Columns: the damage,
+    /// whether the open itself fails, a needle of the error.
+    #[rstest::rstest]
+    #[case::block_longer_than_file(FooterDamage::BlockLongerThanFile, true, "trailer naming")]
+    #[case::block_magic(FooterDamage::BlockMagic, true, "do not start with the block magic")]
+    #[case::short_block(FooterDamage::ShortBlock, false, "the block holds")]
+    #[case::frames_end_short(FooterDamage::FramesEndShort, true, "trailer naming")]
+    #[case::frames_end_past_file(FooterDamage::FramesEndPastFile, true, "were written to end")]
+    #[case::too_few_bytes(FooterDamage::TooFewBytesForAFooter, true, "too few for a footer")]
+    fn a_damaged_footer_is_an_error(
+        #[case] damage: FooterDamage,
+        #[case] open_fails: bool,
+        #[case] needle: &str,
+    ) {
+        let (_dir, path, bytes) = spill_file(SpillCodec::Zstd, 2);
+        let body_end = bytes.len();
+        let index = tiling_index(4, body_end as u64);
+        let mut footer = Vec::new();
+        index.write_footer(&mut footer).unwrap();
+        let block_len = footer.len() - 16;
+        let mut frames_end = body_end as u64;
+        match damage {
+            FooterDamage::BlockLongerThanFile => {
+                footer[block_len..block_len + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            FooterDamage::BlockMagic => footer[0] = b'X',
+            FooterDamage::ShortBlock => {
+                footer.remove(block_len - 1);
+                let short = (block_len - 1) as u64;
+                footer[block_len - 1..block_len + 7].copy_from_slice(&short.to_le_bytes());
+            }
+            FooterDamage::FramesEndShort => frames_end -= 1,
+            FooterDamage::FramesEndPastFile => {
+                frames_end = (body_end + footer.len() + 1) as u64;
+            }
+            FooterDamage::TooFewBytesForAFooter => {
+                footer.clear();
+                frames_end -= 4;
+            }
+        }
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&footer).unwrap();
+        let err: std::io::Error = match open_spill_slot(&path, 0, FramesEnd::At(frames_end)) {
+            Err(e) => {
+                assert!(open_fails, "unexpected open error: {e:#}");
+                e.downcast::<std::io::Error>().expect("an io::Error")
+            }
+            Ok(slot) => {
+                assert!(!open_fails, "the open should have failed");
+                slot.read_run_index().unwrap_err()
+            }
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains(needle), "{err}");
+    }
+
+    /// An unindexed zstd run whose last frame is stored raw ends in its last
+    /// record's own bytes; here they spell a footer trailer
+    /// (`<u64 LE length>FGUMIIDX`). Told the writer wrote no footer, the
+    /// opener reads the whole file as frames and every record comes back.
+    /// Columns: how the end is given (EOF, or the frames' written end, the
+    /// file's length, as `SpillWrite` and the planner pass it).
+    #[rstest::rstest]
+    #[case::frames_to_eof(End::AtEof)]
+    #[case::frames_end_written(End::Written)]
+    fn an_unindexed_run_ending_in_trailer_bytes_reads_every_record(#[case] end: End) {
+        let fake_trailer: Vec<u8> = [&16u64.to_le_bytes()[..], b"FGUMIIDX"].concat();
+        let key = |k: u64| crate::RawCoordinateKey { sort_key: k };
+        let mut first = Vec::new();
+        for k in 0..50u64 {
+            crate::spill_block::frame_keyed_record_into(&mut first, &key(k), &[7u8; 40]).unwrap();
+        }
+        // Incompressible bytes (xorshift), so zstd stores the block raw.
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut body: Vec<u8> = (0..2000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        body.extend_from_slice(&fake_trailer);
+        let mut last = Vec::new();
+        crate::spill_block::frame_keyed_record_into(&mut last, &key(50), &body).unwrap();
+        let mut c = SpillBlockCompressor::new(SpillCodec::Zstd, 1).unwrap();
+        let mut file = spill_magic(SpillCodec::Zstd).to_vec();
+        file.extend_from_slice(&c.compress_block(&first).unwrap());
+        file.extend_from_slice(&c.compress_block(&last).unwrap());
+        assert!(file.ends_with(&fake_trailer), "the last frame was stored raw");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.spill");
+        std::fs::write(&path, &file).unwrap();
+        let end = match end {
+            End::AtEof => FramesEnd::AtEof,
+            End::Written => FramesEnd::At(file.len() as u64),
+        };
+
+        let slot = open_spill_slot(&path, 0, end).unwrap();
+        assert_eq!(slot.len(), file.len() as u64);
+        assert!(!slot.has_index_footer());
+        let pool = SliceBufferPool::new(2);
+        let out = ingest(&slot, 0, lease_of(&pool, &file[4..]), true).unwrap();
+        assert_eq!((out.frames, out.hit_eof), (2, true));
+        serve_stash(&slot);
+        let mut parser = SlotParserState::new();
+        let mut got = Vec::new();
+        loop {
+            match slot_try_load_block(&slot, &mut parser).unwrap() {
+                BlockLoad::Loaded => got.push(std::mem::take(&mut parser.current_buf)),
+                BlockLoad::Eof => break,
+                BlockLoad::WouldBlock => std::thread::yield_now(),
+            }
+        }
+        assert_eq!(got, [first, last], "every record of both frames");
     }
 
     /// A last slice holding only the BGZF EOF marker, after
@@ -1952,7 +2136,7 @@ mod slot_ingest_tests {
     #[test]
     fn eof_marker_only_slice_reaches_eof() {
         let (_dir, path, bytes) = spill_file(SpillCodec::Bgzf, 2);
-        let slot = open_spill_slot(&path, 0).unwrap();
+        let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
         let pool = SliceBufferPool::new(4);
         let body_end = bytes.len() - spill_trailer(SpillCodec::Bgzf).len();
         let out = ingest(&slot, 0, lease_of(&pool, &bytes[..body_end]), false).unwrap();
@@ -1980,7 +2164,7 @@ mod slot_ingest_tests {
     #[case::zstd(SpillCodec::Zstd)]
     fn out_of_order_slices_are_reassembled_by_seq(#[case] codec: SpillCodec) {
         let (_dir, path, bytes) = spill_file(codec, 5);
-        let slot = open_spill_slot(&path, 0).unwrap();
+        let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
         let body = &bytes[usize::try_from(slot.body_start()).unwrap()..];
         let oracle = SpillBlockDecompressor::new().read_raw(&mut &body[..], codec, 64).unwrap();
         let pool = SliceBufferPool::new(8);
@@ -2003,7 +2187,7 @@ mod slot_ingest_tests {
     #[test]
     fn truncated_last_slice_marks_the_slot_failed() {
         let (_dir, path, bytes) = spill_file(SpillCodec::Zstd, 2);
-        let slot = open_spill_slot(&path, 0).unwrap();
+        let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
         let pool = SliceBufferPool::new(2);
         let err = ingest(&slot, 0, lease_of(&pool, &bytes[4..bytes.len() - 9]), true).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -2052,7 +2236,7 @@ mod slot_ingest_tests {
     fn stash_claims_with_borrowed_frames_release_every_slice() {
         for _ in 0..20 {
             let (_dir, path, bytes) = spill_file(SpillCodec::Zstd, 12);
-            let slot = open_spill_slot(&path, 0).unwrap();
+            let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
             let pool = SliceBufferPool::new(8);
             let body = &bytes[4..];
             let oracle: Vec<Vec<u8>> = {
@@ -2111,7 +2295,7 @@ mod slot_ingest_tests {
     #[case::zstd(SpillCodec::Zstd)]
     fn stash_charges_the_slices_its_frames_pin(#[case] codec: SpillCodec) {
         let (_dir, path, bytes) = spill_file(codec, 6);
-        let slot = open_spill_slot(&path, 0).unwrap();
+        let slot = open_spill_slot(&path, 0, FramesEnd::AtEof).unwrap();
         let pool = SliceBufferPool::new(8);
         let body = &bytes[usize::try_from(slot.body_start()).unwrap()..];
         let cut = body.len() / 2 + 5;

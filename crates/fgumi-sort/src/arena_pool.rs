@@ -18,7 +18,7 @@
 //! arena freed — exactly legacy's behaviour, and the RSS-gate-safe footprint.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
 use std::time::Instant;
@@ -41,6 +41,9 @@ pub struct ArenaPool {
     released_at_ns: AtomicU64,
     /// The origin of `released_at_ns`.
     epoch: Instant,
+    /// Set by [`Self::retire`]: returned arenas are dropped, not pooled, and
+    /// `try_acquire` hands out nothing.
+    retired: AtomicBool,
 }
 
 struct PoolInner {
@@ -65,6 +68,7 @@ impl ArenaPool {
             waiter: parking_lot::Mutex::new(None),
             released_at_ns: AtomicU64::new(0),
             epoch: Instant::now(),
+            retired: AtomicBool::new(false),
         })
     }
 
@@ -114,6 +118,9 @@ impl ArenaPool {
     #[must_use]
     pub fn try_acquire(self: &Arc<Self>) -> Option<PooledSegmentedBuf> {
         let mut g = self.inner.lock().expect("arena pool mutex poisoned");
+        if self.retired.load(Ordering::Acquire) {
+            return None;
+        }
         let buf = if let Some(buf) = g.free.pop() {
             buf
         } else if g.made < self.capacity {
@@ -155,15 +162,77 @@ impl ArenaPool {
             self.segment_size,
             "released arena's segment_size doesn't match this pool's configured size"
         );
-        buf.reset_for_reuse();
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).free.push(buf);
-        // Stamp the return, then wake the registered waiter: it may be parked on
-        // another thread (the coordination driver) while this one released.
+        {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Checked under the lock so it cannot race `retire`: either this
+            // sees the flag and drops the buffer, or the push lands before
+            // `retire` takes the lock and clears the free list.
+            if !self.retired.load(Ordering::Acquire) {
+                buf.reset_for_reuse();
+                g.free.push(buf);
+                drop(g);
+                self.stamp_and_wake();
+                return;
+            }
+        }
+        // The retired pool's arenas are freed here, on whichever thread
+        // dropped a chunk's last `Arc`; the free precedes the wake, so a
+        // waiter that sees the stamp sees the arena gone.
+        drop(buf);
+        self.stamp_and_wake();
+        // A segment under mimalloc's `arena_max_object_size` (2 GiB) is
+        // served from a mimalloc arena, and freeing it only schedules a
+        // purge: its pages stay resident until the purge delay (1 s) expires
+        // and some later allocation runs the purge. The range merge builds
+        // its plan and slots in exactly that second, on top of a dead arena,
+        // so return the pages now. This returns them when this thread
+        // allocated the arena; a block of another thread's page is freed
+        // only when that thread collects, which the range merge does on the
+        // allocating (coordination) thread before it builds its plan. The
+        // collect runs after the wake, so it never delays the waiter. Once
+        // per in-flight arena after `retire` (only a retired pool reaches
+        // this branch: one arena per sort at the default capacity of 1, at
+        // most `capacity`), and `mi_collect` does not panic, as this `Drop`
+        // path requires.
+        crate::memory_probe::force_mi_collect();
+    }
+
+    /// Stamp the return, then wake the registered waiter: it may be parked on
+    /// another thread (the coordination driver) while this one released.
+    fn stamp_and_wake(&self) {
         let ns = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
         self.released_at_ns.store(ns + 1, Ordering::Release);
         if let Some(waiter) = self.waiter.lock().as_ref() {
             waiter.unpark();
         }
+    }
+
+    /// Retire the pool so its arenas are freed rather than kept for reuse.
+    ///
+    /// Drops every buffer on the free list now; an arena still in flight is
+    /// dropped when its wrapper drops, instead of returning to the free list.
+    /// After this, [`Self::try_acquire`] returns `None`. A release still stamps
+    /// [`Self::released_at`] and unparks the registered waiter. Idempotent.
+    ///
+    /// `retire` itself also stamps `released_at` and unparks the waiter: after
+    /// it, `try_acquire` returns `None` forever and no release may ever come, so
+    /// a waiter parked on the pool would otherwise depend only on a timer.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        let freed = {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut g.free)
+        };
+        // Free the arenas outside the lock.
+        drop(freed);
+        self.stamp_and_wake();
+    }
+
+    /// Whether [`Self::retire`] has been called (test/diagnostic).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
     }
 
     /// Number of arenas currently available in the free-list (test/diagnostic).
@@ -433,5 +502,70 @@ mod tests {
         drop(pool.try_acquire().unwrap());
         let at = pool.released_at().expect("stamped");
         assert!(at >= before && at <= std::time::Instant::now());
+    }
+
+    #[test]
+    fn retire_frees_returned_arenas() {
+        let pool = ArenaPool::new(1, 1024);
+        let a = pool.try_acquire().expect("acquire");
+        pool.retire();
+        assert!(pool.is_retired());
+        drop(a);
+        assert_eq!(pool.free_len(), 0, "a retired pool frees the returned arena");
+        assert!(pool.released_at().is_some(), "release still stamps released_at");
+    }
+
+    #[test]
+    fn retire_drops_the_free_list() {
+        let pool = ArenaPool::new(1, 1024);
+        drop(pool.try_acquire().expect("acquire"));
+        assert_eq!(pool.free_len(), 1);
+        pool.retire();
+        assert_eq!(pool.free_len(), 0, "retire frees the pooled arena");
+    }
+
+    #[test]
+    fn acquire_after_retire_is_none() {
+        let pool = ArenaPool::new(2, 1024);
+        assert!(!pool.is_retired());
+        pool.retire();
+        assert!(pool.try_acquire().is_none(), "retired pool hands out nothing");
+    }
+
+    /// `retire` wakes the registered waiter and stamps `released_at`, since no
+    /// release may ever follow it.
+    #[test]
+    fn retire_unparks_the_registered_waiter() {
+        use std::time::Duration;
+        let pool = ArenaPool::new(1, 1024);
+        pool.register_waiter();
+        let p = Arc::clone(&pool);
+        std::thread::spawn(move || p.retire()).join().unwrap();
+        let t0 = Instant::now();
+        // The unpark token is already set, so this returns at once; the 10 s
+        // timeout is only a watchdog.
+        std::thread::park_timeout(Duration::from_secs(10));
+        assert!(t0.elapsed() < Duration::from_secs(5), "retire must leave the unpark token set");
+        assert!(pool.released_at().is_some());
+    }
+
+    /// Retire racing a release: whichever wins, no arena is left pooled.
+    #[test]
+    fn retire_racing_a_release_leaves_nothing_pooled() {
+        for _ in 0..64 {
+            let pool = ArenaPool::new(1, 1024);
+            let arena = pool.try_acquire().expect("acquire");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (p, b) = (Arc::clone(&pool), Arc::clone(&barrier));
+            let h = std::thread::spawn(move || {
+                b.wait();
+                p.retire();
+            });
+            barrier.wait();
+            drop(arena);
+            h.join().unwrap();
+            assert_eq!(pool.free_len(), 0);
+            assert!(pool.try_acquire().is_none());
+        }
     }
 }

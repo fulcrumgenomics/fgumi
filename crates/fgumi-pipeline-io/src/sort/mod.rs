@@ -24,7 +24,9 @@ pub mod consolidate_runs;
 pub mod consolidation;
 pub mod merge;
 pub mod merge_job;
+pub(crate) mod merge_mode;
 pub mod protocol;
+pub(crate) mod range_cut;
 pub(crate) mod read_ahead_budget;
 pub mod run_ledger;
 pub(crate) mod run_stack;
@@ -42,7 +44,7 @@ pub mod write_consolidated_run;
 pub use announce_merge_inputs::{AnnounceMergeInputs, MergeInput};
 pub use arena_ingest::{
     ArenaBlock, ArenaSortStrategy, CoordinateStrategy, InflateToArena, InflatedBlock,
-    QuerynameStrategy, ReadBlocks, TemplateStrategy,
+    QuerynameStrategy, ReadBlocks, RunSeal, TemplateStrategy,
 };
 pub use arena_split::{
     ArenaKeyExtractor, CoordinateCtx, CoordinateKeys, ExtractCoordinateKeys, ExtractKeys,
@@ -54,9 +56,16 @@ pub use arena_split::{
 pub use consolidate_runs::{ConsolidateRuns, NoConsolidation};
 pub use consolidation::ConsolidationRegistry;
 pub use merge::{
-    BlockOutput, MergeBatchBuilder, MergeInputs, MergeOutput, RecordBatchOutput, SortMerge,
+    BlockOutput, ClaimPolicy, CompressibleBlockOutput, MergeBatchBuilder, MergeInputs, MergeOutput,
+    OutputCompression, RecordBatchOutput, SortMerge,
 };
 pub use merge_job::serial_merge_output;
+// The merge decision's public surface is the types `SpillSupply::merge_mode`
+// carries and the eligibility the chain builder configures; the fit, the
+// decision and the phase-1 policy are crate-internal.
+pub use merge_mode::{FitInputs, MergeMode, RangeBudget, RangeEligibility, RangeFit, SerialReason};
+#[cfg(test)]
+pub(crate) use merge_mode::{decide_merge_mode, range_fit};
 pub use run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, RunPrior, run_cap_for};
 pub use run_stack::consolidation_can_trigger;
 pub use sort_buffer::{SortBuffer, SortBufferConfig};

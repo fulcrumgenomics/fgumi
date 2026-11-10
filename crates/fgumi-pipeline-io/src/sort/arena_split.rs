@@ -52,14 +52,14 @@ use fgumi_sort::prefetch::{KEY_PREFETCH_DISTANCE, prefetch_read_l1};
 use fgumi_sort::{
     BoundedSortPool, ExtractedRefs, InMemoryChunk, KeyViolation, PooledSegmentedBuf, QnBatchLcp,
     QnComparator, QnKey, QnLex, QnNatural, QnRef, QnRefBuilder, QnSortState, RecordRef,
-    TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateKeyVariant, TemplateMemChunk,
-    coordinate_chunk_from_refs, coordinate_chunks_from_refs, extract_coordinate_key_inline,
-    queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs, radix_sorts_in_parallel,
-    seal_template_refs, seal_template_refs_pieces,
+    SpillKeyKind, TemplateArenaRefs, TemplateKeyContext, TemplateKeySeed, TemplateKeyVariant,
+    TemplateMemChunk, coordinate_chunk_from_refs, coordinate_chunks_from_refs,
+    extract_coordinate_key_inline, queryname_chunk_from_qn_refs, queryname_chunks_from_qn_refs,
+    radix_sorts_in_parallel, seal_template_refs, seal_template_refs_pieces,
 };
 use log::{debug, info};
 
-use super::arena_ingest::{FRONT_REGION, InflatedBlock, reserve_for_run_sort};
+use super::arena_ingest::{FRONT_REGION, InflatedBlock, RunSeal, reserve_for_run_sort};
 use super::run_ledger::{RUN0_MEAN_RECORD_BYTES, RunLedger, run_cap_for};
 use crate::boundaries::bam_header_len;
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent};
@@ -100,6 +100,8 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
     fn known_ref_width(seed: &Self::Seed) -> Option<usize>;
     /// Bytes of one record's ref.
     fn ref_width(ctx: &Self::Ctx) -> usize;
+    /// The key kind this sort's runs spill with.
+    fn spill_key_kind(ctx: &Self::Ctx) -> SpillKeyKind;
     /// Re-walk `[byte_start, byte_end)` of `arena` as exactly `n`
     /// `[u32 len][body]` frames and extract one ref per record, with the
     /// lowest-indexed violation of the batch.
@@ -162,8 +164,9 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
 /// A run's end, carried by its last key batch.
 #[derive(Debug, Clone, Copy)]
 pub struct RunEnd {
-    /// Whether the run spills (`Spill`) or is the final residual.
-    pub seals_to_spill: bool,
+    /// How the run ends: a mid-stream spill, the spilled final run, or the
+    /// final in-memory residual.
+    pub seal: RunSeal,
     /// Records scanned through the end of this run.
     pub records_ingested_so_far: u64,
     /// The bytes of the run's complete records (length prefixes included):
@@ -172,6 +175,12 @@ pub struct RunEnd {
     pub run_bytes: u64,
     /// When the scan finished the run.
     pub scan_end: Instant,
+    /// The run's index stride as `ReadBlocks` stamped it on the run's last
+    /// block (`0` = no index).
+    pub index_stride: u32,
+    /// The run's largest record, its `u32` length prefix included (0 for a
+    /// run with no record).
+    pub max_record_bytes: u64,
 }
 
 /// `FindRecordBoundaries` → `ExtractKeys`: a contiguous range of whole records
@@ -292,11 +301,14 @@ pub struct FindRecordBoundaries<X: ArenaKeyExtractor> {
     batch_n: u32,
     /// Records scanned across all runs.
     total_records: u64,
+    /// The current run's largest record, length prefix included.
+    run_max_record: u64,
     next_ordinal: u64,
     /// The next run's sequence number.
     next_seq: u32,
     finalized: bool,
-    /// Receives the ref width when the sort's first record provisions it.
+    /// Receives the ref width and the spill key kind when the sort's first
+    /// record provisions them.
     ledger: Option<Arc<RunLedger>>,
     /// Test probe: may hold the scan after batch 0 until it is extracted.
     #[cfg(test)]
@@ -326,6 +338,7 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
             batch_first_index: 0,
             batch_n: 0,
             total_records: 0,
+            run_max_record: 0,
             next_ordinal: 0,
             next_seq: 0,
             finalized: false,
@@ -335,8 +348,9 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
         }
     }
 
-    /// Publish the provisioned ref width to the sort's run ledger, which sizes
-    /// the next run's arena cap.
+    /// Publish the provisioned ref width (which sizes the next run's arena
+    /// cap) and spill key kind (which the front's index policy estimates
+    /// with) to the sort's run ledger.
     #[must_use]
     pub fn with_run_ledger(mut self, ledger: Arc<RunLedger>) -> Self {
         self.ledger = Some(ledger);
@@ -450,7 +464,7 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
         let arena = Arc::clone(&block.arena);
         let found = self.scan_available(&arena)?;
         if block.is_last_of_run {
-            self.seal_run(block.seals_to_spill, block.run_seq)?;
+            self.seal_run(block.seal, block.run_seq, block.index_stride)?;
         }
         Ok(found)
     }
@@ -507,10 +521,12 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
                 let ctx = X::provision(&self.seed, &span[cur + 4..cur + 4 + bs]);
                 if let Some(ledger) = &self.ledger {
                     ledger.publish_width(X::ref_width(&ctx));
+                    ledger.publish_spill_key_kind(X::spill_key_kind(&ctx));
                 }
                 self.ctx = Some(ctx);
             }
             cur += 4 + bs;
+            self.run_max_record = self.run_max_record.max(4 + bs as u64);
             found += 1;
             self.batch_n += 1;
             if self.batch_n as usize == self.batch_records {
@@ -524,14 +540,15 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
     }
 
     /// Seal the current run: its trailing partial record becomes the carry (a
-    /// spill) or is a truncation error (the residual); then cut the run's last
-    /// batch, carrying the run's end.
-    fn seal_run(&mut self, seals_to_spill: bool, run_seq: u32) -> io::Result<()> {
+    /// mid-stream [`RunSeal::Spill`]) or is a truncation error (the final run,
+    /// spilled or residual: no run follows to complete it); then cut the
+    /// run's last batch, carrying the run's end.
+    fn seal_run(&mut self, seal: RunSeal, run_seq: u32, index_stride: u32) -> io::Result<()> {
         let arena = self.arena.take().expect("seal_run called with no arena");
         if !self.header_skipped {
             // A spilled run sealed mid-header: the header outgrew one run's arena
             // cap. The final run reaching here is genuinely short input.
-            let msg = if seals_to_spill {
+            let msg = if seal == RunSeal::Spill {
                 format!(
                     "{}: the BAM header does not fit in one run's memory budget ({} bytes \
                      read without reaching its end) — raise --max-memory",
@@ -546,7 +563,7 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
         let cursor = usize::try_from(self.scan_cursor).expect("scan_cursor fits usize");
         let end = usize::try_from(self.run_end).expect("run_end fits usize");
         let tail_len = end.checked_sub(cursor).expect("run_end >= scan_cursor");
-        if seals_to_spill {
+        if seal == RunSeal::Spill {
             if tail_len > 0 {
                 if tail_len > FRONT_REGION {
                     return Err(io::Error::new(
@@ -574,14 +591,16 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
             X::STEP_NAMES[0]
         );
         let run_end = RunEnd {
-            seals_to_spill,
+            seal,
             records_ingested_so_far: self.total_records,
             run_bytes: self.scan_cursor.saturating_sub(self.run_first_record),
             scan_end: Instant::now(),
+            index_stride,
+            max_record_bytes: std::mem::take(&mut self.run_max_record),
         };
         self.cut(&arena, Some(run_end));
         self.next_seq += 1;
-        if !seals_to_spill {
+        if seal.is_final() {
             self.finalized = true;
         }
         self.scan_start = 0;
@@ -592,7 +611,7 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
     }
 
     /// Input drained: seal an open run as the residual. No run at all (empty
-    /// input) emits nothing; spills with no residual (impossible under
+    /// input) emits nothing; spills with no final run (impossible under
     /// `ReadBlocks`' deferred seal) fail on a non-empty carry and otherwise
     /// leave `SortRun` to announce.
     fn finalize(&mut self) -> io::Result<()> {
@@ -601,7 +620,7 @@ impl<X: ArenaKeyExtractor> FindRecordBoundaries<X> {
         }
         if self.arena.is_some() {
             let seq = self.next_seq;
-            return self.seal_run(false, seq);
+            return self.seal_run(RunSeal::Residual, seq, 0);
         }
         if self.next_seq > 0 && !self.carry.is_empty() {
             return Err(io::Error::new(
@@ -907,8 +926,9 @@ impl KeyOverlapCensus {
 
 /// `Detached` step on the `sort-coord` driver: appends each run's batches, in
 /// ordinal order, and at the run's last batch sorts the run and emits its
-/// chunk — `Spill` for a sealed mid-stream run, `Residual` then `AllAnnounced`
-/// for the final run.
+/// chunk — `Spill` for a sealed mid-stream run; for the final run, `Spill`
+/// then `AllAnnounced` with no chunk when it spills (`RunSeal::FinalSpill`),
+/// else `Residual` then `AllAnnounced`.
 pub struct SortRun<X: ArenaKeyExtractor> {
     sort_threads: usize,
     output_byte_limit: u64,
@@ -1059,16 +1079,18 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         let arena = self.run_arena.take().expect("a run with a last batch has an arena");
         if let Some((ledger, _)) = &self.budget {
             let records: u64 = self.run_batches.iter().map(|(n, _)| n).sum();
+            ledger.publish_run_max_record(end.max_record_bytes);
             ledger.publish_seal(end.run_bytes, records);
         }
-        // The final run of a sort that spilled is sealed as `sort_threads`
-        // pieces when the order splits it (`SPLITS_FINAL_RUN`): the k-way merge
-        // interleaves them with the spills anyway, and the pieces sort in
-        // parallel. The piece count is the configured width, so the split is
-        // deterministic. A sort that never spilled keeps one chunk (the merge's
-        // single-chunk fast path).
+        // The residual final run of a sort that spilled is sealed as
+        // `sort_threads` pieces when the order splits it (`SPLITS_FINAL_RUN`):
+        // the k-way merge interleaves them with the spills anyway, and the
+        // pieces sort in parallel. The piece count is the configured width, so
+        // the split is deterministic. A sort that never spilled keeps one chunk
+        // (the merge's single-chunk fast path), and a spilled run, final or
+        // not, is one chunk (one spill run).
         let pieces = if X::SPLITS_FINAL_RUN
-            && !end.seals_to_spill
+            && end.seal == RunSeal::Residual
             && self.spilled_run_count > 0
             && self.sort_threads > 1
         {
@@ -1105,14 +1127,25 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
         self.census.runs += 1;
         let seq = self.next_seq;
         self.next_seq += 1;
-        if end.seals_to_spill {
+        if end.seal.spills() {
             let chunk = chunks.into_iter().next().expect("a spilled run seals one chunk");
             self.pending.push_back(SortChunkEvent::Spill {
                 seq,
                 chunk,
                 records_ingested_so_far: end.records_ingested_so_far,
+                index_stride: end.index_stride,
             });
             self.spilled_run_count += 1;
+            if end.seal == RunSeal::FinalSpill {
+                // Every run is on disk: announce them with no residual chunk.
+                self.pending.push_back(SortChunkEvent::AllAnnounced {
+                    slot_count: self.spilled_run_count,
+                    memory_chunk_count: 0,
+                    total_records: end.records_ingested_so_far,
+                    index_stride: end.index_stride,
+                });
+                self.finalized = true;
+            }
         } else {
             let memory_chunk_count = u32::try_from(chunks.len()).expect("pieces fit u32");
             for chunk in chunks {
@@ -1121,10 +1154,13 @@ impl<X: ArenaKeyExtractor> SortRun<X> {
                     records_ingested_so_far: end.records_ingested_so_far,
                 });
             }
+            // The residual run's stride is the front's decision at its
+            // acquire; no `Spill` carries it, so the announcement does.
             self.pending.push_back(SortChunkEvent::AllAnnounced {
                 slot_count: self.spilled_run_count,
                 memory_chunk_count,
                 total_records: end.records_ingested_so_far,
+                index_stride: end.index_stride,
             });
             self.finalized = true;
         }
@@ -1203,13 +1239,17 @@ impl<X: ArenaKeyExtractor> Step for SortRun<X> {
         if !ctx.input.is_drained() {
             return Ok(StepOutcome::NoProgress);
         }
-        // Drained without a residual: announce the spills (unreachable under
-        // the boundary step's always-residual final run, kept fail-safe).
+        // Drained without a final run: announce the spills (unreachable: the
+        // boundary step always seals a final run, residual or spilled, which
+        // announces; kept fail-safe).
         if self.spilled_run_count > 0 {
+            // No front decision reached here: fail closed (no index, so the
+            // merge is serial).
             self.pending.push_back(SortChunkEvent::AllAnnounced {
                 slot_count: self.spilled_run_count,
                 memory_chunk_count: 0,
                 total_records: self.total_records,
+                index_stride: 0,
             });
             self.finalized = true;
             return Ok(self.emit_pending(ctx));
@@ -1231,6 +1271,16 @@ impl<X: ArenaKeyExtractor> Step for SortRun<X> {
 /// record; refs are the variant's narrow lane.
 pub struct TemplateKeys;
 
+/// The spill key kind of a template sort keyed with `variant`'s lanes.
+const fn template_spill_key_kind(variant: TemplateKeyVariant) -> SpillKeyKind {
+    match (variant.cb, variant.tertiary) {
+        (false, false) => SpillKeyKind::TemplateK24,
+        (true, false) => SpillKeyKind::TemplateCb32,
+        (false, true) => SpillKeyKind::TemplateTert32,
+        (true, true) => SpillKeyKind::TemplateK40,
+    }
+}
+
 impl ArenaKeyExtractor for TemplateKeys {
     const STEP_NAMES: [&'static str; 3] =
         ["FindTemplateBoundaries", "ExtractTemplateKeys", "SortTemplateRun"];
@@ -1250,6 +1300,10 @@ impl ArenaKeyExtractor for TemplateKeys {
 
     fn ref_width(ctx: &Self::Ctx) -> usize {
         ctx.variant.ref_width()
+    }
+
+    fn spill_key_kind(ctx: &Self::Ctx) -> SpillKeyKind {
+        template_spill_key_kind(ctx.variant)
     }
 
     fn extract_batch(
@@ -1445,6 +1499,10 @@ impl ArenaKeyExtractor for CoordinateKeys {
         size_of::<RecordRef>()
     }
 
+    fn spill_key_kind(_ctx: &Self::Ctx) -> SpillKeyKind {
+        SpillKeyKind::Coordinate
+    }
+
     fn extract_batch(
         ctx: &Self::Ctx,
         _scratch: &mut (),
@@ -1544,17 +1602,23 @@ pub type SortCoordinateRun = SortRun<CoordinateKeys>;
 
 /// A queryname comparator that knows the erased chunk its runs seal into.
 pub trait QnChunkOrder: QnComparator + Send + Sync + 'static {
+    /// The key kind this order's runs spill with.
+    const SPILL_KEY_KIND: SpillKeyKind;
     /// Erase a sorted queryname chunk into this order's variant.
     fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased;
 }
 
 impl QnChunkOrder for QnLex {
+    const SPILL_KEY_KIND: SpillKeyKind = SpillKeyKind::QuerynameLex;
+
     fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased {
         MemoryChunkErased::QuerynameLex(chunk)
     }
 }
 
 impl QnChunkOrder for QnNatural {
+    const SPILL_KEY_KIND: SpillKeyKind = SpillKeyKind::QuerynameNatural;
+
     fn wrap(chunk: InMemoryChunk<QnKey>) -> MemoryChunkErased {
         MemoryChunkErased::QuerynameNatural(chunk)
     }
@@ -1587,6 +1651,10 @@ impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
 
     fn ref_width(_ctx: &Self::Ctx) -> usize {
         size_of::<QnRef>()
+    }
+
+    fn spill_key_kind(_ctx: &Self::Ctx) -> SpillKeyKind {
+        C::SPILL_KEY_KIND
     }
 
     fn extract_batch(

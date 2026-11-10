@@ -1,12 +1,15 @@
 //! Fan-out primitives: results of work that pool threads do on behalf of a
 //! serial step return to it through an [`OrderedInbox`].
 //!
-//! A [`FanoutWorker`] runs each [`Job`] in slices and re-contends its phase
-//! cap permit for every slice. The sort's pooled gather finishes in one
-//! slice; the multi-slice consumer is the range-parallel merge's range job
-//! (`MergeJob::Range`, a follow-up), whose run holds a permit for a whole key
-//! range unless each slice gives it back, starving the steps that share the
-//! cap (compression under `--merge-threads`).
+//! A [`FanoutWorker`] runs a [`Job`] one dispatch at a time and re-contends
+//! its phase cap permit for every dispatch. By default a dispatch is one
+//! slice, but a job may run to completion in one dispatch
+//! ([`Job::run_dispatch`]): the sort's range merge does (its claim ticket runs
+//! a claimed range or assembly to completion), because a started job the
+//! merge waits on in order must not be put down behind other work. Such a job
+//! holds its thread and its cap permit until it is done, so steps sharing the
+//! cap wait for it; its only early exit is the pipeline's done signal, which
+//! it checks between slices.
 //!
 //! # Lost-wake protocol
 //!
@@ -38,6 +41,7 @@ use crate::admission::{PhaseCap, StepCap, StepCapRef, admit_input};
 use crate::item::HeapSize;
 use crate::runtime::contexts::StepCounters;
 use crate::runtime::wake::{SideWake, StepWaker};
+use crate::signal::PipelineSignal;
 use crate::step::{CounterSpec, SideChannel, Step, StepCtx, StepKind, StepOutcome, StepProfile};
 
 /// `loom`'s mutex behind `parking_lot`'s `lock()` signature, so the inbox
@@ -296,10 +300,38 @@ pub enum JobStep<R> {
     Continue,
     /// The job is finished and produced this result.
     Done(R),
+    /// The job ran and has nothing to deliver (a claim ticket that found its
+    /// work already taken). The worker counts the slice and delivers nothing.
+    Spent,
 }
 
-/// A unit of work a serial step posts for pool threads, run in slices so no
-/// single dispatch holds a thread or a cap permit for long.
+/// The result of one [`Job::run_dispatch`]: what its last slice returned and
+/// how many slices it ran.
+#[derive(Debug)]
+pub struct Dispatched<R> {
+    /// What the dispatch's last slice returned ([`JobStep::Continue`] for a
+    /// job stopped early, which the worker keeps).
+    pub step: JobStep<R>,
+    /// Slices the dispatch ran: 1 by default; any number for a job that runs
+    /// to completion; 0 for a claim ticket spent before it ran one.
+    pub slices: u64,
+}
+
+impl<R> Dispatched<R> {
+    /// One slice's result, as the default [`Job::run_dispatch`] returns it.
+    #[must_use]
+    pub fn one(step: JobStep<R>) -> Self {
+        Self { step, slices: 1 }
+    }
+}
+
+/// A unit of work a serial step posts for pool threads, run in slices.
+///
+/// A [`FanoutWorker`] calls [`Self::run_dispatch`] once per dispatch, under
+/// one cap permit. By default that runs one slice, so no dispatch holds a
+/// thread or a permit for long. A job that overrides it to run to completion
+/// holds its thread and permit until it is done (see the module docs), and
+/// must check its `stop` callback between slices.
 ///
 /// # Obligations
 ///
@@ -318,12 +350,18 @@ pub enum JobStep<R> {
 ///   job. A job a worker has popped and is running across several slices is
 ///   on no edge; until it delivers, the reservation is the only charge the
 ///   monitor can see.
+/// - A job that returns [`JobStep::Spent`] pops an input item like any other
+///   and delivers nothing; its ordinal (if any) must be delivered by whoever
+///   ran that work instead.
 pub trait Job: Send + HeapSize + 'static {
     /// The result delivered to the owner's [`OrderedInbox`]. Must report a
     /// non-zero [`HeapSize::heap_size`] (see the trait's obligations).
     type Output: Send + HeapSize + 'static;
 
     /// The job's ordinal: the position of its result in the owner's order.
+    /// The worker reads it after each [`Self::run_slice`] (to deliver a
+    /// result or wrap an error), so a job whose work is chosen when it first
+    /// runs (a claim ticket) reports the claimed ordinal from then on.
     fn ordinal(&self) -> u64;
 
     /// Runs one slice of work within `budget`.
@@ -332,6 +370,27 @@ pub trait Job: Send + HeapSize + 'static {
     ///
     /// Any I/O or processing error; the runtime fails the pipeline with it.
     fn run_slice(&mut self, budget: SliceBudget) -> io::Result<JobStep<Self::Output>>;
+
+    /// Runs one dispatch of work: by default one [`Self::run_slice`].
+    ///
+    /// A job may override this to run several slices (to completion) in one
+    /// dispatch. It must then call `stop` between slices and, once `stop`
+    /// returns `true` (the pipeline failed or was cancelled), return
+    /// [`JobStep::Continue`] at once: the worker keeps the job and the runtime
+    /// ends the run instead of dispatching it again. It reports the slices it
+    /// ran in [`Dispatched::slices`] (the worker's `slices` counter).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_slice`].
+    fn run_dispatch(
+        &mut self,
+        budget: SliceBudget,
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<Dispatched<Self::Output>> {
+        let _ = stop;
+        self.run_slice(budget).map(Dispatched::one)
+    }
 }
 
 /// The error a [`FanoutWorker`] fails with when a [`Job::run_slice`] fails:
@@ -351,8 +410,11 @@ pub struct JobError {
 }
 
 impl JobError {
-    /// Wraps `source`, the error of the job with ordinal `ordinal`.
-    fn wrap(ordinal: u64, source: io::Error) -> io::Error {
+    /// Wraps `source`, the error of the job with ordinal `ordinal`. Public so
+    /// an owner that runs one of its jobs itself reports its error as a
+    /// worker would.
+    #[must_use]
+    pub fn wrap(ordinal: u64, source: io::Error) -> io::Error {
         io::Error::new(source.kind(), Self { ordinal, source })
     }
 
@@ -384,8 +446,9 @@ impl std::error::Error for JobError {
 }
 
 /// Step counters. `jobs` counts jobs started (popped), including any that later
-/// fail; `slices` counts completed slices; `output_bytes` the heap bytes of
-/// delivered results.
+/// fail; `slices` counts completed slices (as each dispatch reports them in
+/// [`Dispatched::slices`], so a job run to completion in one dispatch counts
+/// every slice it ran); `output_bytes` the heap bytes of delivered results.
 const COUNTERS: &[CounterSpec] = &[
     CounterSpec::new("jobs", "jobs"),
     CounterSpec::new("slices", "slices"),
@@ -395,8 +458,9 @@ const JOBS: usize = 0;
 const SLICES: usize = 1;
 const OUTPUT_BYTES: usize = 2;
 
-/// A `Parallel` step that runs the [`Job`]s of its input edge, one slice per
-/// dispatch under its phase cap, and delivers each result to an
+/// A `Parallel` step that runs the [`Job`]s of its input edge, one
+/// [`Job::run_dispatch`] (by default one slice) per dispatch under its phase
+/// cap, and delivers each result to an
 /// [`OrderedInbox`]. Each worker instance holds its own in-progress job
 /// between dispatches; a copy made by [`Step::new_worker_copy`] starts with
 /// none.
@@ -433,18 +497,28 @@ impl<J: Job> FanoutWorker<J> {
         self
     }
 
-    /// Runs one slice of `job`: keeps it for the next dispatch on `Continue`,
-    /// delivers its result on `Done`.
-    fn advance(&mut self, mut job: J, counters: &StepCounters) -> io::Result<()> {
-        let ordinal = job.ordinal();
-        let step = job.run_slice(self.budget).map_err(|e| JobError::wrap(ordinal, e))?;
-        counters.add(SLICES, 1);
+    /// Runs one dispatch of `job`: keeps it for the next dispatch on
+    /// `Continue`, delivers its result on `Done`, drops it on `Spent`. The
+    /// ordinal is read after the dispatch (see [`Job::ordinal`]). `signal`
+    /// is the pipeline's, polled by a job that runs several slices.
+    fn advance(
+        &mut self,
+        mut job: J,
+        counters: &StepCounters,
+        signal: &PipelineSignal,
+    ) -> io::Result<()> {
+        let pipeline_done = || signal.is_done();
+        let Dispatched { step, slices } = job
+            .run_dispatch(self.budget, &pipeline_done)
+            .map_err(|e| JobError::wrap(job.ordinal(), e))?;
+        counters.add(SLICES, slices);
         match step {
             JobStep::Continue => self.current = Some(job),
             JobStep::Done(out) => {
                 counters.add(OUTPUT_BYTES, out.heap_size() as u64);
-                let _ = self.inbox.deliver(ordinal, out);
+                let _ = self.inbox.deliver(job.ordinal(), out);
             }
+            JobStep::Spent => {}
         }
         Ok(())
     }
@@ -489,7 +563,7 @@ impl<J: Job> FanoutWorker<J> {
         if first {
             ctx.counters.add(JOBS, 1);
         }
-        self.advance(job, ctx.counters)?;
+        self.advance(job, ctx.counters, ctx.signal)?;
         Ok(StepOutcome::Progress)
     }
 }

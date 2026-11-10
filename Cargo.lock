@@ -1021,6 +1021,7 @@ dependencies = [
  "log",
  "loom",
  "mach2",
+ "mimalloc",
  "nix",
  "noodles",
  "noodles-bgzf",

@@ -40,6 +40,21 @@
 //! This step owns the `TmpDirAllocator` (Serial ⇒ the pick is uncontended) and
 //! the RAII temp-dir handles, which live as long as the step so the spill files
 //! outlive their reads.
+//!
+//! # Run indexes live in the run files until `AllAnnounced`
+//!
+//! For a sort that can merge by key range, each run's index is built as its
+//! blocks are written, at the live stride (folded block by block, never
+//! dense), then written as a footer of its own spill file when the run closes
+//! and dropped ([`RunIndex::write_footer`]); a consolidated run's index is
+//! built the same way by `WriteConsolidatedRun`, at its job's stride. When
+//! the final run was spilled, `announce_runs` reads the footers back, after
+//! the phase-1 arena is gone, and brings them to the final stride; with a
+//! resident final run the merge is serial and the footers are written but
+//! never read. Through phase 1 the only run indexes held are the open run's
+//! and an in-flight consolidation's, each at its stride (an entry per
+//! `stride` frames of that one run), outside `--max-memory`, which bounds the
+//! records and refs exactly as in the serial sort.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -50,7 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fgumi_bam_io::ProgressTracker;
-use fgumi_sort::{SpillCodec, SpillKeyKind, TmpDirAllocator, spill_magic, spill_trailer};
+use fgumi_sort::{RunIndex, SpillCodec, SpillKeyKind, TmpDirAllocator, spill_magic, spill_trailer};
 use log::{info, warn};
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -152,6 +167,13 @@ struct OpenSpill {
     key_kind: SpillKeyKind,
     path: PathBuf,
     writer: BufWriter<File>,
+    /// Bytes handed to `writer` so far, the codec magic included: the file
+    /// offset the next block lands at.
+    bytes_written: u64,
+    /// The file's frames so far, while every block written carried its
+    /// frames; `None` for good once one did not (an index covers every frame
+    /// of its file or none).
+    index: Option<RunIndex>,
 }
 
 /// A consolidation job in flight.
@@ -162,6 +184,65 @@ pub(crate) struct ActiveJob {
     range: std::ops::Range<usize>,
     output: PathBuf,
     started: Instant,
+}
+
+/// Fold one written block's frames into its run's `index`, the rule both run
+/// writers (`SpillWrite` and `WriteConsolidatedRun`) follow: the first
+/// block's frames start the index, at `stride` frames per entry; a later
+/// block's extend it at the index's own stride ([`RunIndex::append_folded`],
+/// so the run's index is never held denser than that); a block without
+/// frames ends it (`None` for good: an index covers every frame or none), and
+/// so does an entry whose sums overflow (logged; the merge is then serial). A
+/// block's frames are indexed from its own first byte, so they are rebased by
+/// `base`, the file position the block lands at.
+pub(crate) fn fold_block_frames(
+    index: &mut Option<RunIndex>,
+    first_block: bool,
+    frames: Option<RunIndex>,
+    base: u64,
+    stride: u32,
+) {
+    let folded = match (first_block, index.take(), frames) {
+        (true, _, Some(frames)) => {
+            let mut open = RunIndex::new_strided(frames.key_width(), stride.max(1));
+            open.rebase(base);
+            open.append_folded(&frames, base).map(|()| open)
+        }
+        (false, Some(mut open), Some(frames)) => open.append_folded(&frames, base).map(|()| open),
+        (_, _, None) | (false, None, Some(_)) => return,
+    };
+    *index =
+        folded.inspect_err(|e| log::warn!("Run index dropped: {e}; the merge will be serial")).ok();
+}
+
+/// Sparsify `index` to `stride` (a power of two at or above its own);
+/// `None` (logged) when its groups overflow ([`RunIndex::sparsify`]), and the
+/// run goes unindexed, so the merge falls back to serial.
+pub(crate) fn sparsify_to(mut index: RunIndex, stride: u32) -> Option<RunIndex> {
+    match index.sparsify(stride / index.stride().max(1)) {
+        Ok(()) => Some(index),
+        Err(e) => {
+            log::warn!("Run index dropped: {e}; the merge will be serial");
+            None
+        }
+    }
+}
+
+/// Write `index` as the footer of a run file whose frames `writer` has just
+/// written (see [`RunIndex::write_footer`]). Returns whether a footer was
+/// written: `false` for no index.
+///
+/// # Errors
+///
+/// Any write error: a run whose footer failed is not a run the merge can
+/// read, so the sort fails rather than silently dropping the index.
+pub(crate) fn write_index_footer<W: Write>(
+    writer: &mut W,
+    index: Option<&RunIndex>,
+) -> io::Result<bool> {
+    let Some(index) = index else { return Ok(false) };
+    index.write_footer(writer)?;
+    Ok(true)
 }
 
 /// `Serial + Affinity::Writer` step that writes per-`file_id` spill files from
@@ -215,6 +296,13 @@ pub struct SpillWrite {
     /// Where each written block's buffer is returned for reuse by
     /// `SpillBlockCompress` (`None`: dropped).
     buf_pool: Option<Arc<SpillBufPool>>,
+    /// `true` once the phase-1 front stopped indexing (a block stamped
+    /// stride 0): every run's index was dropped, later blocks' frames are
+    /// discarded and later runs are not indexed.
+    indexing_off: bool,
+    /// Frames per index entry of every live run's index (a power of two):
+    /// the largest stride the front has stamped so far.
+    index_stride: u32,
 }
 
 impl SpillWrite {
@@ -259,7 +347,58 @@ impl SpillWrite {
             temp_dirs,
             detached: false,
             buf_pool: None,
+            indexing_off: false,
+            index_stride: 1,
         }
+    }
+
+    /// `(indexing on, stride)` of the phase-1 index policy (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn index_policy_for_test(&self) -> (bool, u32) {
+        (!self.indexing_off, self.index_stride)
+    }
+
+    /// `(stride, entries)` of the open run's index, the only run index this
+    /// step holds before `AllAnnounced` (tests): a closed run's lives in its
+    /// file's footer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn open_index_shape_for_test(&self) -> Option<(u32, usize)> {
+        let index = self.current.as_ref()?.index.as_ref()?;
+        Some((index.stride(), index.len()))
+    }
+
+    /// Follow the index stride the phase-1 front stamped on a block or on
+    /// `AllAnnounced` (which carries the decision made for a resident final
+    /// run, which no block carries). The front owns the index policy; this
+    /// step keeps none of its own. `0` drops the open run's index, leaves the
+    /// closed runs' footers unread and stops indexing for good; a stride
+    /// above the live one becomes the stride closing runs are written at and
+    /// every footer is brought to at `AllAnnounced`; a lower one changes
+    /// nothing, as an index cannot be made denser again.
+    fn follow_run_stride(&mut self, index_stride: u32) {
+        if self.indexing_off {
+            return;
+        }
+        if index_stride == 0 {
+            self.indexing_off = true;
+            let mut had_index = self.runs.runs().iter().any(|run| run.index_footer);
+            if let Some(open) = self.current.as_mut() {
+                had_index |= open.index.take().is_some();
+            }
+            let msg = format!(
+                "Run indexes dropped after {} spill runs: the front found no range fit",
+                self.runs_closed
+            );
+            if had_index {
+                info!("{msg}");
+            } else {
+                log::debug!("{msg}");
+            }
+            return;
+        }
+        self.index_stride = self.index_stride.max(index_stride);
     }
 
     /// Keep at most `max_temp_files` spill runs live, consolidating when the
@@ -328,7 +467,8 @@ impl SpillWrite {
             writer.write_all(spill_magic(self.codec))?;
             Ok::<_, io::Error>(writer)
         })?;
-        Ok(OpenSpill { file_id, key_kind, path, writer })
+        let bytes_written = spill_magic(self.codec).len() as u64;
+        Ok(OpenSpill { file_id, key_kind, path, writer, bytes_written, index: None })
     }
 
     /// A path named `name` in the next temp dir the allocator picks.
@@ -369,14 +509,18 @@ impl SpillWrite {
                 is_last_in_file,
                 records_ingested_so_far,
                 bytes,
+                frames,
+                index_stride,
                 ..
             } => {
+                self.follow_run_stride(index_stride);
                 // Open the file on its first block; otherwise the open file must
                 // match (blocks for one file are contiguous in the ordinal stream).
                 // Spill file I/O blocks on the filesystem — minutes on a busy
                 // parallel filesystem — which is an external wait, not a
                 // wedge (#1068).
-                if self.current.is_none() {
+                let first_block = self.current.is_none();
+                if first_block {
                     self.current = Some(self.open_file(file_id, key_kind)?);
                 }
                 let open = self.current.as_mut().expect("open file set above");
@@ -394,7 +538,17 @@ impl SpillWrite {
                         open.key_kind
                     )));
                 }
+                // The first block's frames start the file's index; a later
+                // block's extend it, and a block without frames ends it. A
+                // block's frames are indexed from its own first byte, so they
+                // are rebased by the file position the block lands at.
+                let base = open.bytes_written;
+                // Once the front stopped indexing, frames are dropped as they
+                // arrive.
+                let frames = frames.filter(|_| !self.indexing_off);
+                fold_block_frames(&mut open.index, first_block, frames, base, self.index_stride);
                 external_wait(|| open.writer.write_all(&bytes))?;
+                open.bytes_written += bytes.len() as u64;
                 self.spill_progress.log_if_needed(bytes.len() as u64);
                 if let Some(pool) = &self.buf_pool {
                     pool.give(bytes);
@@ -417,9 +571,16 @@ impl SpillWrite {
                 Ok(())
             }
             SpillBlockEvent::AllAnnounced {
-                slot_count, memory_chunk_count, total_records, ..
+                slot_count,
+                memory_chunk_count,
+                total_records,
+                index_stride,
+                ..
             } => {
                 self.ensure_no_open_file("AllAnnounced")?;
+                // The front's last decision: a stride made for a resident
+                // final run reaches this step only here.
+                self.follow_run_stride(index_stride);
                 self.announce_runs(slot_count, memory_chunk_count, total_records)
             }
         }
@@ -475,16 +636,33 @@ impl SpillWrite {
     }
 
     fn close_run(&mut self, records_ingested_so_far: u64) -> io::Result<()> {
-        let OpenSpill { file_id, key_kind, path, mut writer } =
+        let OpenSpill { file_id, key_kind, path, mut writer, bytes_written, index } =
             self.current.take().expect("open file present");
+        // The run's index, at the live stride (smaller footer, less to read
+        // back), goes into the file after the frames and is dropped here: no
+        // closed run's index is resident through phase 1. `bytes` is where the
+        // frames end, what the merge and a consolidation read.
+        let index = index.filter(|_| !self.indexing_off).and_then(|ix| {
+            debug_assert!(spill_trailer(self.codec).is_empty(), "only zstd runs are indexed");
+            sparsify_to(ix, self.index_stride)
+        });
+        let bytes = bytes_written + spill_trailer(self.codec).len() as u64;
         // Dropping the writer closes the file, which can block on a parallel
         // filesystem (NFS, Lustre) as long as the writes, so it is bracketed too.
-        external_wait(|| {
+        let index_footer = external_wait(|| {
             writer.write_all(spill_trailer(self.codec))?;
+            let index_footer = write_index_footer(&mut writer, index.as_ref())?;
             writer.flush()?;
             drop(writer);
-            Ok::<_, io::Error>(())
+            Ok::<_, io::Error>(index_footer)
+        })
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("SpillWrite: writing spill run {}: {e}", path.display()),
+            )
         })?;
+        drop(index);
         match self.key_kind {
             None => self.key_kind = Some(key_kind),
             Some(kind) if kind == key_kind => {}
@@ -497,8 +675,7 @@ impl SpillWrite {
         }
         self.runs_closed += 1;
         self.stats.record_run_written();
-        let bytes = external_wait(|| std::fs::metadata(&path))?.len();
-        self.runs.push(SpillRun { file_id, path, bytes, records_ingested_so_far });
+        self.runs.push(SpillRun { file_id, path, bytes, records_ingested_so_far, index_footer });
         self.start_consolidation_if_needed()
     }
 
@@ -526,7 +703,13 @@ impl SpillWrite {
             self.runs.runs().len()
         );
         registry.begin(job_id, output.clone());
-        self.outbox.push_back(SortPhase1Event::ConsolidationStart { job_id, inputs, key_kind });
+        let index_stride = if self.indexing_off { 0 } else { self.index_stride };
+        self.outbox.push_back(SortPhase1Event::ConsolidationStart {
+            job_id,
+            inputs,
+            key_kind,
+            index_stride,
+        });
         self.active = Some(ActiveJob { job_id, range, output, started: Instant::now() });
         Ok(())
     }
@@ -554,7 +737,7 @@ impl SpillWrite {
             registry.register_waiter();
             registry.take_completed()
         });
-        let Some((job_id, merged_bytes)) = completed else { return Ok(false) };
+        let Some((job_id, merged_bytes, index_footer)) = completed else { return Ok(false) };
         let ActiveJob { job_id: active_id, range, output, started } =
             self.active.take().expect("active job checked above");
         if job_id != active_id {
@@ -566,7 +749,9 @@ impl SpillWrite {
                 ),
             ));
         }
-        let absorbed = self.runs.complete_merge(range, output, merged_bytes);
+        // The merged run's index is in its footer, read back with the other
+        // runs' at `AllAnnounced`.
+        let absorbed = self.runs.complete_merge(range, output, merged_bytes, index_footer);
         for run in &absorbed {
             if let Err(e) = std::fs::remove_file(&run.path) {
                 // The temp dir removes it at exit regardless; only disk headroom
@@ -580,14 +765,27 @@ impl SpillWrite {
         Ok(true)
     }
 
-    /// On `AllAnnounced`: open a merge slot for every surviving run and queue its
-    /// `SpillReady` (in `file_id` order), then `AllAnnounced` with the surviving
-    /// run count.
+    /// On `AllAnnounced`: open a merge slot for every surviving run (its
+    /// frames ending where they were written), attach the index read back
+    /// from its footer (sparsified to the final stride), and queue its
+    /// `SpillReady` (in `file_id` order), then `AllAnnounced` with the
+    /// surviving run count.
+    ///
+    /// The footers are read back only when the final run was spilled
+    /// (`memory_chunk_count == 0`): the phase-1 arena is retired then, so the
+    /// indexes are resident only from here on, in the merge's budget. With a
+    /// resident final run the merge is serial whatever the indexes say
+    /// ([`SerialReason::ResidualInMemory`](crate::sort::SerialReason::ResidualInMemory)),
+    /// so the footers stay unread rather than sit uncharged beside the
+    /// resident arena.
     ///
     /// # Errors
     ///
-    /// Errors if a slot cannot be opened, or if the upstream run count disagrees
-    /// with the runs this step closed (a lost or duplicated run).
+    /// Errors if a slot cannot be opened, if the upstream run count disagrees
+    /// with the runs this step closed (a lost or duplicated run), if a run's
+    /// frames do not end where they were written or its footer is missing,
+    /// unexpected or unreadable (a damaged run file, which must not be read as
+    /// records), or if a footer's key width is not the runs' key kind's.
     fn announce_runs(
         &mut self,
         runs_announced: u32,
@@ -606,14 +804,36 @@ impl SpillWrite {
         let runs = std::mem::replace(&mut self.runs, RunStack::new(0)).into_runs();
         let slot_count = u32::try_from(runs.len()).expect("live runs bounded by the run count");
         self.stats.set_merge_sources(runs.len() as u64);
-        for SpillRun { file_id, path, records_ingested_so_far, .. } in runs {
-            let slot =
-                external_wait(|| fgumi_sort::open_spill_slot(&path, file_id)).map_err(|e| {
-                    io::Error::other(format!(
-                        "SpillWrite: failed to open spill slot {}: {e:#}",
-                        path.display()
-                    ))
+        let read_back = memory_chunk_count == 0;
+        for SpillRun { file_id, path, bytes, records_ingested_so_far, index_footer } in runs {
+            let frames_end = fgumi_sort::FramesEnd::At(bytes);
+            let slot = external_wait(|| fgumi_sort::open_spill_slot(&path, file_id, frames_end))
+                .map_err(|e| {
+                    let kind =
+                        e.downcast_ref::<io::Error>().map_or(io::ErrorKind::Other, io::Error::kind);
+                    io::Error::new(
+                        kind,
+                        format!("SpillWrite: failed to open spill slot {}: {e:#}", path.display()),
+                    )
                 })?;
+            if slot.has_index_footer() != index_footer {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "SpillWrite: spill run {} was written with {} index footer, but reads \
+                         with {} footer",
+                        path.display(),
+                        if index_footer { "an" } else { "no" },
+                        if slot.has_index_footer() { "an" } else { "no" },
+                    ),
+                ));
+            }
+            if read_back && let Some(index) = self.read_back_index(&slot, &path)? {
+                slot.attach_run_index(Arc::new(index));
+            }
+            // Every run closed with its blocks' key kind, which `close_run`
+            // recorded.
+            slot.attach_key_kind(self.key_kind.expect("a closed spill run set the key kind"));
             self.outbox.push_back(SortPhase1Event::SpillReady {
                 slot,
                 path,
@@ -626,6 +846,49 @@ impl SpillWrite {
             total_records,
         });
         Ok(())
+    }
+
+    /// The index of `slot`'s run, read back from its footer and brought to the
+    /// final stride, or `None` once indexing is off or when the run has no
+    /// footer (a run whose index could not be sparsified; the merge then
+    /// reports the slot unindexed and runs serially).
+    ///
+    /// # Errors
+    ///
+    /// A footer that cannot be read or decoded, or whose key width is not
+    /// the runs' key kind's (`InvalidData`).
+    fn read_back_index(
+        &self,
+        slot: &fgumi_sort::SortMergeSlot,
+        path: &std::path::Path,
+    ) -> io::Result<Option<RunIndex>> {
+        if self.indexing_off {
+            return Ok(None);
+        }
+        let index = external_wait(|| slot.read_run_index()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("SpillWrite: reading the run index of {}: {e}", path.display()),
+            )
+        })?;
+        let kind = self.key_kind.expect("a closed spill run set the key kind");
+        if let Some(ix) = &index
+            && Some(ix.key_width()) != fgumi_sort::spill_key_width(kind)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SpillWrite: the run index of {} has {}-byte keys, but its runs are keyed \
+                     {kind:?}",
+                    path.display(),
+                    ix.key_width()
+                ),
+            ));
+        }
+        Ok(index.and_then(|ix| sparsify_to(ix, self.index_stride)).map(|mut ix| {
+            ix.shrink_to_fit();
+            ix
+        }))
     }
 
     /// Error if input drained with spill runs that were never announced. Runs are

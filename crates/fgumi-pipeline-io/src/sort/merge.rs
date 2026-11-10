@@ -2,15 +2,19 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+use fgumi_sort::RangeSizing;
 use fgumi_sort::{
     CbKey32, InMemoryChunk, MergeDriver, MergeDriverDyn, MergeStep, QnClassTable, QnKey, QnLex,
-    QnMergeKey, QnNatural, QuerynameComparator, RawCoordinateKey, SortMergeSlot, SortOrder,
-    TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
+    QnMergeKey, QnNatural, QuerynameComparator, RECORD_LEN_BYTES, RawCoordinateKey, SortMergeSlot,
+    SortOrder, SpillKeyKind, TemplateKey, TemplateKey24, TemplateMemChunk, TertKey32,
 };
 
-use crate::sort::merge_job::{GatherSizing, MergeJob, MergeResult};
+use crate::output_compress::{OutputBlock, OutputCompressor, OutputDepth};
+use crate::sort::merge_job::{GatherSizing, MergeJob, MergeResult, MergeTicket};
+use crate::sort::merge_mode::{MergeMode, SerialReason};
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
 use crate::types::{DecompressedBlock, RecordBatch, RecordBatchBuilder};
 use fgumi_pipeline_core::{
@@ -20,6 +24,12 @@ use fgumi_pipeline_core::{
     reorder::BranchOrdering,
     step::{CounterSpec, DetachedGroup, Step, StepCtx, StepKind, StepOutcome, StepProfile},
 };
+
+pub(crate) mod claim;
+
+pub use claim::ClaimPolicy;
+mod range_mode;
+use range_mode::RangeModeState;
 
 /// Default output batch size: 1024 records per emitted `RecordBatch`.
 pub const DEFAULT_TARGET_BATCH_COUNT: usize = 1024;
@@ -123,6 +133,18 @@ pub trait MergeOutput: Send + 'static {
     type Item: Send + HeapSize + Ordered + 'static;
     /// The per-batch accumulator.
     type Builder: MergeBatchBuilder<Item = Self::Item>;
+
+    /// Compress `item` in place with `c` (the range merge's thread does this
+    /// to blocks its output edge refuses); `false` when the item cannot be or
+    /// already is compressed. Only [`CompressibleBlockOutput`] compresses;
+    /// every other output is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// The compressor's own error.
+    fn compress_in_place(_item: &mut Self::Item, _c: &mut OutputCompressor) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// A per-batch accumulator for a [`MergeOutput`] strategy. Mirrors the
@@ -170,6 +192,48 @@ pub trait MergeBatchBuilder: Send + 'static {
 
     /// Finalize and produce the batch item, consuming the builder.
     fn build(self) -> Self::Item;
+
+    /// Append every record of `framed`, whole `[u32 LE len][body]` records
+    /// back to back, as [`Self::push_record_bytes`] would push each body;
+    /// returns the record count. The default pushes each body; a builder whose
+    /// own framing is that layout copies the span at once.
+    ///
+    /// # Errors
+    ///
+    /// `framed` ends inside a record, or a body cannot be framed.
+    fn push_framed_records(&mut self, framed: &[u8]) -> io::Result<u64> {
+        walk_framed_records(framed, |body| self.push_record_bytes(body))
+    }
+}
+
+/// Call `f` on each body of `framed` (whole `[u32 LE len][body]` records back
+/// to back) and return the record count.
+///
+/// # Errors
+///
+/// `framed` ends inside a record or its length prefix, or `f` fails.
+fn walk_framed_records(
+    framed: &[u8],
+    mut f: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut span = framed;
+    let mut records = 0u64;
+    while let Some((prefix, rest)) = span.split_first_chunk::<RECORD_LEN_BYTES>() {
+        let len = u32::from_le_bytes(*prefix) as usize;
+        let (body, rest) = rest.split_at_checked(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "batch segment ends inside a record")
+        })?;
+        f(body)?;
+        records += 1;
+        span = rest;
+    }
+    if !span.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch segment ends inside a record prefix",
+        ));
+    }
+    Ok(records)
 }
 
 /// Intermediate-sort output: raw record bodies into a [`RecordBatch`].
@@ -223,6 +287,71 @@ impl MergeOutput for BlockOutput {
     type Builder = BlockBuilder;
 }
 
+/// Terminal standalone-sort output whose blocks the merge may compress
+/// itself: [`BlockOutput`]'s framing, emitted as [`OutputBlock::Raw`], which
+/// the range merge's thread turns into [`OutputBlock::Compressed`] (with the
+/// output's settings, see [`SortMerge::with_output_compression`]) while its
+/// output edge refuses them. Wired to `BgzfCompress<OutputBlock>`, which
+/// compresses the raw blocks and passes the compressed ones through.
+pub struct CompressibleBlockOutput;
+
+impl MergeOutput for CompressibleBlockOutput {
+    type Item = OutputBlock;
+    type Builder = CompressibleBlockBuilder;
+
+    fn compress_in_place(item: &mut OutputBlock, c: &mut OutputCompressor) -> io::Result<bool> {
+        item.compress_in_place(c)
+    }
+}
+
+/// [`BlockBuilder`] emitting an [`OutputBlock::Raw`].
+pub struct CompressibleBlockBuilder(BlockBuilder);
+
+impl MergeBatchBuilder for CompressibleBlockBuilder {
+    type Item = OutputBlock;
+
+    const FRAME_OVERHEAD_PER_RECORD: usize = BlockBuilder::FRAME_OVERHEAD_PER_RECORD;
+
+    fn with_capacity(batch_serial: u64, bytes_cap: usize, records_cap: usize) -> Self {
+        Self(BlockBuilder::with_capacity(batch_serial, bytes_cap, records_cap))
+    }
+
+    fn push_record_bytes(&mut self, body: &[u8]) -> io::Result<()> {
+        self.0.push_record_bytes(body)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.0.total_bytes()
+    }
+
+    fn build(self) -> OutputBlock {
+        OutputBlock::Raw(self.0.build())
+    }
+
+    fn push_framed_records(&mut self, framed: &[u8]) -> io::Result<u64> {
+        self.0.push_framed_records(framed)
+    }
+}
+
+/// The settings of the output's BGZF compression, for a merge that may
+/// compress its own blocks ([`SortMerge::with_output_compression`]): the
+/// same two values the sink's `BgzfCompress` is built with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputCompression {
+    /// The compression level.
+    pub level: u32,
+    /// Whether the sink indexes the BAM (each block carries its manifest).
+    pub index_bam: bool,
+}
+
 /// Accumulates merged winner records as BAM on-disk framing
 /// (`[u32 LE block_size][body]` per record) into a single byte buffer that
 /// becomes a [`DecompressedBlock`]. This is the canonical BAM record layout;
@@ -241,7 +370,7 @@ impl MergeBatchBuilder for BlockBuilder {
     type Item = DecompressedBlock;
 
     // `[u32 LE block_size][body]` framing adds a 4-byte length prefix per record.
-    const FRAME_OVERHEAD_PER_RECORD: usize = 4;
+    const FRAME_OVERHEAD_PER_RECORD: usize = RECORD_LEN_BYTES;
 
     fn with_capacity(batch_serial: u64, bytes_cap: usize, _records_cap: usize) -> Self {
         // `_records_cap` sizes the `RecordBatch` ranges vector; the framed-block
@@ -279,6 +408,15 @@ impl MergeBatchBuilder for BlockBuilder {
     fn build(self) -> DecompressedBlock {
         DecompressedBlock { batch_serial: self.batch_serial, bytes: self.bytes }
     }
+
+    /// The span is already this builder's framing: check it holds whole
+    /// records, then copy it at once.
+    fn push_framed_records(&mut self, framed: &[u8]) -> io::Result<u64> {
+        let records = walk_framed_records(framed, |_| Ok(()))?;
+        self.bytes.extend_from_slice(framed);
+        self.records += usize::try_from(records).expect("records of an in-memory span fit usize");
+        Ok(records)
+    }
 }
 
 /// Same-variant collector for template-coordinate residual chunks.
@@ -303,7 +441,74 @@ enum TemplateChunks {
     K40(Vec<InMemoryChunk<TemplateKey>>),
 }
 
+/// A template-coordinate merge's `--key-types` lane, as its spill slots' key
+/// kind names it: the one dispatch from a [`SpillKeyKind`] to a template key
+/// type, shared by the serial merge's collector and the range plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateLane {
+    /// [`TemplateKey24`].
+    K24,
+    /// [`CbKey32`].
+    Cb32,
+    /// [`TertKey32`].
+    Tert32,
+    /// [`TemplateKey`].
+    K40,
+}
+
+impl TemplateLane {
+    /// The lane `kind` names.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if `kind` is not a template-coordinate kind.
+    fn of(kind: SpillKeyKind) -> io::Result<Self> {
+        match kind {
+            SpillKeyKind::TemplateK24 => Ok(Self::K24),
+            SpillKeyKind::TemplateCb32 => Ok(Self::Cb32),
+            SpillKeyKind::TemplateTert32 => Ok(Self::Tert32),
+            SpillKeyKind::TemplateK40 => Ok(Self::K40),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("SortMerge: a template-coordinate merge got spill slots keyed {other:?}"),
+            )),
+        }
+    }
+}
+
 impl TemplateChunks {
+    /// The empty collector of the lane `kind` names: a merge with no residual
+    /// chunk still knows its lane from its spill slots.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if `kind` is not a template-coordinate kind.
+    fn empty_for(kind: SpillKeyKind) -> io::Result<Self> {
+        Ok(match TemplateLane::of(kind)? {
+            TemplateLane::K24 => Self::K24(Vec::new()),
+            TemplateLane::Cb32 => Self::Cb32(Vec::new()),
+            TemplateLane::Tert32 => Self::Tert32(Vec::new()),
+            TemplateLane::K40 => Self::K40(Vec::new()),
+        })
+    }
+
+    /// Resolve an `Empty` collector over `slots` to the lane their key kind
+    /// names; any other collector (or no slots) is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if the slots disagree on their kind, name a non-template
+    /// kind, or any slot carries none (`template_lane_unknown`).
+    fn resolve_with_slots(self, slots: &[Arc<SortMergeSlot>]) -> io::Result<Self> {
+        if !matches!(self, Self::Empty) || slots.is_empty() {
+            return Ok(self);
+        }
+        match slots_key_kind(slots)? {
+            Some(kind) => Self::empty_for(kind),
+            None => Err(template_lane_unknown()),
+        }
+    }
+
     /// Name the narrowed-lane variant for diagnostics.
     fn variant_name(&self) -> &'static str {
         match self {
@@ -528,6 +733,31 @@ fn build_merge_inputs_driver(
     Ok(driver)
 }
 
+/// The key kind every slot of `slots` carries: `None` when there are no slots
+/// or any slot has no kind attached.
+///
+/// # Errors
+///
+/// `InvalidData` if two slots carry different kinds.
+fn slots_key_kind(slots: &[Arc<SortMergeSlot>]) -> io::Result<Option<SpillKeyKind>> {
+    let mut found: Option<SpillKeyKind> = None;
+    for slot in slots {
+        let Some(kind) = slot.key_kind() else { return Ok(None) };
+        match found {
+            Some(prev) if prev != kind => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "SortMerge: spill slots carry different key kinds ({prev:?}, {kind:?})"
+                    ),
+                ));
+            }
+            _ => found = Some(kind),
+        }
+    }
+    Ok(found)
+}
+
 fn build_driver(
     sort_order: SortOrder,
     slots: Vec<Arc<SortMergeSlot>>,
@@ -565,49 +795,47 @@ fn build_driver(
             ),
             demand,
         )),
-        SortOrder::TemplateCoordinate => match chunks.template_coordinate {
-            // `Empty` means no residual chunk identified the `--key-types` lane.
-            // For valid input this only happens with empty input (no spill files
-            // either) — Phase-1's deferred seal always emits a variant-tagged
-            // residual otherwise. So `Empty` WITH spill slots can only arise from
-            // the documented "defensive/unreachable" no-residual finalize branch
-            // (a seal-logic regression). Defaulting to `TemplateKey` (K40) there
-            // would decode narrow (K24/Cb32/Tert32) spill files at the wrong key
-            // width and silently corrupt output, so fail closed instead of
-            // guessing the width. With no slots, any K is safe (nothing to merge).
-            TemplateChunks::Empty => {
-                if !slots.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "SortMerge: template-coordinate spill slots present but no residual \
-                         chunk to identify the key-types lane — refusing to guess the key \
-                         width (would mis-decode narrow spill files). This indicates a \
-                         Phase-1 seal-logic regression.",
-                    ));
-                }
-                Box::new(attach(
+        SortOrder::TemplateCoordinate => {
+            match chunks.template_coordinate.resolve_with_slots(&slots)? {
+                // `Empty` here means no slots (a slot-bearing `Empty` was resolved
+                // from the slots' key kind, or failed closed, above): empty input,
+                // so any K is safe (nothing to merge).
+                TemplateChunks::Empty => Box::new(attach(
                     MergeDriver::<TemplateKey>::from_slots(slots, Vec::new(), total_records, None),
                     demand,
-                ))
+                )),
+                TemplateChunks::K24(v) => Box::new(attach(
+                    MergeDriver::<TemplateKey24>::from_slots(slots, v, total_records, ()),
+                    demand,
+                )),
+                TemplateChunks::Cb32(v) => Box::new(attach(
+                    MergeDriver::<CbKey32>::from_slots(slots, v, total_records, ()),
+                    demand,
+                )),
+                TemplateChunks::Tert32(v) => Box::new(attach(
+                    MergeDriver::<TertKey32>::from_slots(slots, v, total_records, ()),
+                    demand,
+                )),
+                TemplateChunks::K40(v) => Box::new(attach(
+                    MergeDriver::<TemplateKey>::from_slots(slots, v, total_records, None),
+                    demand,
+                )),
             }
-            TemplateChunks::K24(v) => Box::new(attach(
-                MergeDriver::<TemplateKey24>::from_slots(slots, v, total_records, ()),
-                demand,
-            )),
-            TemplateChunks::Cb32(v) => Box::new(attach(
-                MergeDriver::<CbKey32>::from_slots(slots, v, total_records, ()),
-                demand,
-            )),
-            TemplateChunks::Tert32(v) => Box::new(attach(
-                MergeDriver::<TertKey32>::from_slots(slots, v, total_records, ()),
-                demand,
-            )),
-            TemplateChunks::K40(v) => Box::new(attach(
-                MergeDriver::<TemplateKey>::from_slots(slots, v, total_records, None),
-                demand,
-            )),
-        },
+        }
     })
+}
+
+/// The fail-closed error for template-coordinate spill slots with no residual
+/// chunk to name their `--key-types` lane and no key kind attached to a slot
+/// (see `build_driver`).
+fn template_lane_unknown() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "SortMerge: template-coordinate spill slots present but no residual \
+         chunk to identify the key-types lane — refusing to guess the key \
+         width (would mis-decode narrow spill files). This indicates a \
+         Phase-1 seal-logic regression.",
+    )
 }
 
 /// Hand the sort's merge demand to `driver`, which publishes its predictions
@@ -643,6 +871,21 @@ fn merge_pool_request(pool: &fgumi_pipeline_core::PoolHandle<'_>) -> fgumi_sort:
     }
 }
 
+/// The serial merge's batch-close rule, checked after each record is pushed:
+/// a batch closes once it holds `target_batch_count` records or
+/// `output_byte_limit` bytes (record bytes plus the builder's per-record frame
+/// overhead). The serial merge, the fast-path block plan and the range
+/// merge's batch cutter all close batches through this one predicate, which is
+/// what keeps their batch boundaries identical.
+pub(crate) fn batch_full(
+    count: usize,
+    bytes: u64,
+    target_batch_count: usize,
+    output_byte_limit: u64,
+) -> bool {
+    count >= target_batch_count || bytes >= output_byte_limit
+}
+
 /// Plan the output-block boundaries for a parallel fast-path gather of `chunk`,
 /// reproducing the serial [`SortMerge::next_fast_batch`] count/byte-cap split
 /// byte-for-byte — but from the per-record lengths alone, without constructing a
@@ -661,7 +904,7 @@ fn merge_pool_request(pool: &fgumi_pipeline_core::PoolHandle<'_>) -> fgumi_sort:
 /// `byte_limit == 0` would make every record trip the byte cap (one record per
 /// block) — the same degenerate the serial `>=` comparison produces — so no
 /// special-casing is needed; the two stay in lockstep.
-fn plan_fast_path_blocks<O: MergeOutput>(
+pub(crate) fn plan_fast_path_blocks<O: MergeOutput>(
     chunk: &MemoryChunkErased,
     target_batch_count: usize,
     output_byte_limit: u64,
@@ -675,9 +918,7 @@ fn plan_fast_path_blocks<O: MergeOutput>(
         let framed = u64::from(chunk.record_len(i)) + O::Builder::FRAME_OVERHEAD_PER_RECORD as u64;
         count += 1;
         bytes = bytes.saturating_add(framed);
-        let count_full = count >= target_batch_count;
-        let bytes_full = bytes >= output_byte_limit;
-        if count_full || bytes_full {
+        if batch_full(count, bytes, target_batch_count, output_byte_limit) {
             blocks.push(FastBlock { start, end: i + 1 });
             start = i + 1;
             count = 0;
@@ -718,7 +959,7 @@ fn blocks_total_records(blocks: &[FastBlock]) -> u64 {
     blocks.iter().map(|b| (b.end - b.start) as u64).sum()
 }
 
-enum SortMergeState<B> {
+enum SortMergeState<B: MergeBatchBuilder> {
     WaitingForSetup {
         slots: Vec<Arc<SortMergeSlot>>,
         slot_index: HashMap<u32, usize>,
@@ -769,6 +1010,13 @@ enum SortMergeState<B> {
         /// Ordinal of the next result to take from the inbox and emit.
         next_to_take: u64,
     },
+    /// Range-parallel final merge of a spilled coordinate or template sort
+    /// (the read planner published [`MergeMode::Range`]): `MergeWork` merges
+    /// each key range from the spill files (range mode spills the final run,
+    /// so nothing is merged from memory), this step cuts
+    /// the merged ranges into the serial merge's batches, and `MergeWork`
+    /// assembles each batch. Boxed: it is much larger than the other states.
+    RangeMode(Box<RangeModeState<B>>),
     Done,
 }
 
@@ -778,8 +1026,8 @@ enum SortMergeState<B> {
 /// `SortMergeState::FastPath` mints via `next_ordinal`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FastBlock {
-    start: usize,
-    end: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 fn absorb_phase2_event(
@@ -906,9 +1154,10 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// `MergeWork`. Wired from the sort chain's phase-2 (`merge`) thread budget
     /// in `add_sort`.
     ///
-    /// This affects ONLY the fast path (single already-sorted in-memory chunk).
-    /// The k-way merge path is untouched — it is a genuinely serial loser-tree
-    /// walk whose winner order cannot be produced out of order.
+    /// Range mode's window of live key ranges comes from the planner's
+    /// decision ([`MergeMode::Range`]), not from this. The serial k-way merge
+    /// path is untouched — it is a genuinely serial loser-tree walk whose
+    /// winner order cannot be produced out of order.
     fanout_width: usize,
     /// Minimum record count for the fast path to fan across the pool
     /// ([`FAST_PATH_PARALLEL_MIN_RECORDS`] in production). A field, not the bare
@@ -923,8 +1172,23 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// The inbox's owner waker was bound (on the first dispatch, which is the
     /// first time this step sees its pool handle).
     inbox_bound: bool,
-    /// A gather job the job branch refused, re-posted before any new one.
-    held_job: HeldSlot<Unpushed<MergeJob<O>>>,
+    /// A ticket the job branch refused, re-posted before any new one.
+    held_job: HeldSlot<Unpushed<MergeTicket<O>>>,
+    /// Range mode: the job this thread claimed and runs itself, between
+    /// dispatches (see `emit_range_mode`).
+    own_range: Option<MergeJob<O>>,
+    /// Range mode: the jobs posted and not yet started, which this thread and
+    /// the `MergeWork` workers claim from (see `claim::ClaimTable`).
+    claim_table: Option<Arc<claim::ClaimTable<O>>>,
+    /// Who may claim range mode's posted jobs (see [`Self::with_claim_policy`]).
+    claim_policy: claim::ClaimPolicy,
+    /// The compressor range mode's thread compresses refused output blocks
+    /// with (see [`Self::with_output_compression`]); `None` unless set, and
+    /// unused by every output but [`CompressibleBlockOutput`].
+    output_compressor: Option<OutputCompressor>,
+    /// Compression's queue depth on this merge's output edge, shared with
+    /// the sink's `BgzfCompress` (see [`Self::with_output_depth`]).
+    output_depth: Option<Arc<OutputDepth>>,
     /// Test-only override of [`Self::job_edge_limit`], so a test can make the
     /// job branch refuse a post within the window.
     #[cfg(test)]
@@ -962,6 +1226,14 @@ pub struct SortMerge<O: MergeOutput = RecordBatchOutput> {
     /// The per-slot reorder-window byte budget self-serve claims under (the
     /// decompress step's).
     window_budget: u64,
+    /// The final merge's mode, published by the read planner at
+    /// `AllAnnounced` (before this merge leaves setup). Set with the demand by
+    /// [`Self::with_spill_supply`]; `None`, or an unset cell, merges serially.
+    merge_mode: Option<Arc<OnceLock<MergeMode>>>,
+    /// Test-only override of the range plan's sizing, so a small fixture cuts
+    /// many ranges.
+    #[cfg(test)]
+    range_sizing_override: Option<RangeSizing>,
 }
 
 /// The merge's own supply path: on a stall it claims, decompresses and
@@ -1121,6 +1393,11 @@ impl<O: MergeOutput> SortMerge<O> {
             inbox: None,
             inbox_bound: false,
             held_job: HeldSlot::new(),
+            own_range: None,
+            claim_table: None,
+            claim_policy: claim::ClaimPolicy::Auto,
+            output_compressor: None,
+            output_depth: None,
             #[cfg(test)]
             job_edge_limit_override: None,
             demand: None,
@@ -1132,6 +1409,9 @@ impl<O: MergeOutput> SortMerge<O> {
             ledger: None,
             decomp: None,
             window_budget: super::spill_decompress::reorder_window_budget(output_byte_limit),
+            merge_mode: None,
+            #[cfg(test)]
+            range_sizing_override: None,
         }
     }
 
@@ -1151,6 +1431,47 @@ impl<O: MergeOutput> SortMerge<O> {
     pub fn with_spill_supply(mut self, supply: &super::supply_ledger::SpillSupply) -> Self {
         self.demand = Some(Arc::clone(&supply.demand));
         self.ledger = Some(Arc::clone(&supply.ledger));
+        self.merge_mode = Some(Arc::clone(&supply.merge_mode));
+        self
+    }
+
+    /// Test-only: size the range plan with `sizing` instead of from the
+    /// published range budget.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_range_sizing_for_test(mut self, sizing: RangeSizing) -> Self {
+        self.range_sizing_override = Some(sizing);
+        self
+    }
+
+    /// Run range mode under claim `policy` (default [`ClaimPolicy::Auto`]):
+    /// the chain builder passes the hidden diagnostic
+    /// `FGUMI_SORT_RANGE_CLAIM`'s value, resolved with
+    /// [`ClaimPolicy::from_env_value`].
+    #[must_use]
+    pub fn with_claim_policy(mut self, policy: ClaimPolicy) -> Self {
+        self.claim_policy = policy;
+        self
+    }
+
+    /// Let range mode's thread compress the output blocks its output edge
+    /// refuses, with `settings` (the sink compressor's level and indexing),
+    /// when it has nothing else to do. Only a [`CompressibleBlockOutput`]
+    /// merge compresses; for any other output this has no effect.
+    #[must_use]
+    pub fn with_output_compression(mut self, settings: OutputCompression) -> Self {
+        self.output_compressor = Some(OutputCompressor::new(settings.level, settings.index_bam));
+        self
+    }
+
+    /// Count this merge's output in `depth`, which the sink's compressor
+    /// pops from: range mode then gates the pool's merge-side claims on
+    /// compression's queue depth (workers claim only while fewer blocks than
+    /// the phase-2 width wait). Without it the gate reads the merge's own
+    /// refused-block backlog.
+    #[must_use]
+    pub fn with_output_depth(mut self, depth: Arc<OutputDepth>) -> Self {
+        self.output_depth = Some(depth);
         self
     }
 
@@ -1193,7 +1514,7 @@ impl<O: MergeOutput> SortMerge<O> {
         self,
         width: usize,
         cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
-    ) -> (Self, fgumi_pipeline_core::FanoutWorker<MergeJob<O>>) {
+    ) -> (Self, fgumi_pipeline_core::FanoutWorker<MergeTicket<O>>) {
         let inbox = OrderedInbox::new(true);
         let work = crate::sort::merge_job::merge_work(Arc::clone(&inbox))
             .with_step_cap(cap.map(fgumi_pipeline_core::StepCap::Fixed));
@@ -1202,7 +1523,7 @@ impl<O: MergeOutput> SortMerge<O> {
 
     /// Take pooled gather results from `inbox`. Crate-private: the caller must
     /// wire a `MergeWork` step (a [`fgumi_pipeline_core::FanoutWorker`] over
-    /// [`MergeJob`] delivering to this same inbox) on this step's branch 1, and
+    /// [`MergeTicket`] delivering to this same inbox) on this step's branch 1, and
     /// a mismatch strands every gather result in an orphan inbox. Production
     /// wiring goes through [`Self::with_pooled_gather`], which returns the
     /// merge and the matching `MergeWork` together; the pairing is guaranteed
@@ -1224,9 +1545,11 @@ impl<O: MergeOutput> SortMerge<O> {
     /// which removes the flat ~serial gather cost that otherwise floors the
     /// in-memory sort's wall clock. Clamped to `>= 1`.
     ///
-    /// Only the fast path is affected; the k-way merge path is untouched.
-    /// Crate-private: a width does nothing without the inbox, so callers
-    /// outside the crate set both through [`Self::with_pooled_gather`].
+    /// Range mode takes its window of live key ranges from the planner's
+    /// decision ([`MergeMode::Range`]), not from this; the serial k-way merge
+    /// path is untouched. Crate-private: a width does nothing
+    /// without the inbox, so callers outside the crate set both through
+    /// [`Self::with_pooled_gather`].
     #[must_use]
     pub(crate) fn with_fanout_width(mut self, width: usize) -> Self {
         self.fanout_width = width.max(1);
@@ -1238,15 +1561,17 @@ impl<O: MergeOutput> SortMerge<O> {
         self.fanout_width.saturating_mul(FAST_PATH_BLOCKS_PER_WORKER_WINDOW).max(1)
     }
 
-    /// The byte bound of the job branch: room for twice the window of job
-    /// descriptors, so a post within the window is never refused.
+    /// The byte bound of the job branch: room for twice the gather window of
+    /// tickets, so a gather post within the window is never refused. Range
+    /// mode does not wait on it: tickets it cannot push stay owed while it
+    /// keeps posting and claiming jobs itself.
     fn job_edge_limit(&self) -> u64 {
         #[cfg(test)]
         if let Some(limit) = self.job_edge_limit_override {
             return limit;
         }
         let jobs = self.gather_window().saturating_mul(2);
-        (jobs.saturating_mul(std::mem::size_of::<MergeJob<O>>())) as u64
+        (jobs.saturating_mul(std::mem::size_of::<MergeTicket<O>>())) as u64
     }
 
     /// Test-only: lower the record-count threshold that gates the parallel
@@ -1454,9 +1779,7 @@ impl<O: MergeOutput> SortMerge<O> {
                     builder.push_record_bytes(bytes)?;
                     *records_out += 1;
                     episode.end(demand);
-                    let count_full = builder.len() >= target;
-                    let bytes_full = (builder.total_bytes() as u64) >= byte_limit;
-                    if count_full || bytes_full {
+                    if batch_full(builder.len(), builder.total_bytes() as u64, target, byte_limit) {
                         return Ok(NextBatch::Batch(flush(builder, next_ordinal)));
                     }
                 }
@@ -1598,11 +1921,7 @@ impl<O: MergeOutput> SortMerge<O> {
                             merged,
                             self.chunk_count,
                         );
-                        if let Some(d) = &self.demand {
-                            for line in d.snapshot().log_lines() {
-                                log::info!("{line}");
-                            }
-                        }
+                        self.log_demand_lines();
                         // This function runs only in `Merging` (the fast path has
                         // its own `Done`), and the state leaves it only below.
                         let SortMergeState::Merging { driver, .. } = &self.state else {
@@ -1612,21 +1931,9 @@ impl<O: MergeOutput> SortMerge<O> {
                         log::info!(
                             "Merge output: records borrowed {borrowed} / assembled {assembled}"
                         );
-                        if let Some(s) = &self.supply_diagnostics {
-                            for line in s.lines() {
-                                log::info!("{line}");
-                            }
-                        }
+                        self.log_supply_lines();
                     }
-                    if let Some(slot) = &self.stats_slot {
-                        *slot.lock() = Some(fgumi_sort::SortStats {
-                            total_records: self.processed,
-                            output_records: merged,
-                            runs_written: self.spill_stats.as_ref().map_or(self.chunk_count, |s| {
-                                usize::try_from(s.runs_written()).unwrap_or(usize::MAX)
-                            }),
-                        });
-                    }
+                    self.publish_merge_stats(merged);
                     self.state = SortMergeState::Done;
                     // Reaching `Done` is progress even when this dispatch
                     // delivered nothing (the run-end stall: the last source's
@@ -1790,7 +2097,9 @@ impl<O: MergeOutput> SortMerge<O> {
             let block = blocks[usize::try_from(ordinal).expect("ordinal indexes the plan")];
             *next_to_take += 1;
             *records_out += (block.end - block.start) as u64;
-            let MergeResult::Block(item) = result;
+            let MergeResult::Block(item) = result else {
+                unreachable!("GatherMode posts only gather jobs, which yield blocks")
+            };
             if let Err(unpushed) = ctx.outputs.view().a.push(item) {
                 self.dbg.output_full += 1;
                 self.held.put(unpushed);
@@ -1832,7 +2141,7 @@ impl<O: MergeOutput> SortMerge<O> {
                 _output: std::marker::PhantomData,
             };
             *next_to_post += 1;
-            if let Err(unpushed) = ctx.outputs.view().b.push(job) {
+            if let Err(unpushed) = ctx.outputs.view().b.push(MergeTicket::direct(job)) {
                 self.held_job.put(unpushed);
             }
             progressed = true;
@@ -1843,6 +2152,39 @@ impl<O: MergeOutput> SortMerge<O> {
         }
         // 5. Nothing taken or posted: re-record the wait on this dispatch.
         if inbox.await_next() { StepOutcome::Progress } else { StepOutcome::NoProgress }
+    }
+
+    /// Log the merge demand's `--sort-stats` lines, if a demand is wired. Part
+    /// of the completion tail the serial and range merges share.
+    fn log_demand_lines(&self) {
+        if let Some(d) = &self.demand {
+            for line in d.snapshot().log_lines() {
+                log::info!("{line}");
+            }
+        }
+    }
+
+    /// Log the spill supply's `--sort-stats` lines, if they are collected.
+    fn log_supply_lines(&self) {
+        if let Some(s) = &self.supply_diagnostics {
+            for line in s.lines() {
+                log::info!("{line}");
+            }
+        }
+    }
+
+    /// Fill the stats slot for a k-way (serial or range) merge that emitted
+    /// `merged` records.
+    fn publish_merge_stats(&self, merged: u64) {
+        if let Some(slot) = &self.stats_slot {
+            *slot.lock() = Some(fgumi_sort::SortStats {
+                total_records: self.processed,
+                output_records: merged,
+                runs_written: self.spill_stats.as_ref().map_or(self.chunk_count, |s| {
+                    usize::try_from(s.runs_written()).unwrap_or(usize::MAX)
+                }),
+            });
+        }
     }
 
     /// Emit the fast-path completion log + `--sort-stats` diagnostic, populate
@@ -1910,6 +2252,21 @@ impl<O: MergeOutput> SortMerge<O> {
         // total records ingested and the spill-file count.
         self.processed = total_records;
         self.chunk_count = slots.len();
+        let mode = self.merge_mode.as_ref().and_then(|m| m.get()).cloned();
+        if let Some(MergeMode::Range { budget, inputs, fit, index_bytes }) = mode {
+            self.transition_to_range_mode(slots, &memory_chunks, total_records, &fit)?;
+            self.log_range_mode(&budget, &inputs, &fit, index_bytes);
+            return Ok(());
+        }
+        if self.sort_stats {
+            // Unset only when the planner failed (the run is ending) or no
+            // planner joined this merge (`fgumi merge`, unit tests).
+            let reason = match mode {
+                Some(MergeMode::Serial(reason)) => reason,
+                _ => SerialReason::NoPolicy,
+            };
+            log::info!("Sort merge mode: serial ({reason})");
+        }
         let bytes_cap_for_init = usize::try_from(self.output_byte_limit).unwrap_or(usize::MAX);
         let initial_bytes_for_init = INITIAL_OUTPUT_BUFFER_BYTES.min(bytes_cap_for_init);
         // FAST PATH: zero spill slots + exactly one in-memory chunk → the chunk is
@@ -1988,9 +2345,10 @@ impl<O: MergeOutput> SortMerge<O> {
 impl<O: MergeOutput> Step for SortMerge<O> {
     type Input = SortPhase2Event;
     /// Branch 0: the merged output (declared `ByItemOrdinal`, collapsed to a
-    /// direct edge for this single-producer step). Branch 1: gather jobs for
-    /// the `MergeWork` pool step; empty unless the fast path fans out.
-    type Outputs = (O::Item, MergeJob<O>);
+    /// direct edge for this single-producer step). Branch 1: gather, range and
+    /// assembly jobs for the `MergeWork` pool step; empty unless the fast path
+    /// fans out or the merge runs in range mode.
+    type Outputs = (O::Item, MergeTicket<O>);
 
     fn profile(&self) -> StepProfile {
         StepProfile {
@@ -2046,7 +2404,9 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             }
             self.inbox_bound = true;
         }
-        if !self.flush_held(ctx) {
+        // Range mode handles its own held output: it keeps merging ahead (in
+        // order, within its window) while the output refuses a block.
+        if !matches!(self.state, SortMergeState::RangeMode(_)) && !self.flush_held(ctx) {
             return Ok(StepOutcome::Contention);
         }
 
@@ -2114,6 +2474,7 @@ impl<O: MergeOutput> Step for SortMerge<O> {
             SortMergeState::GatherMode { .. } => {
                 Ok(self.emit_gather_mode(ctx, &mut records_this_call))
             }
+            SortMergeState::RangeMode(_) => self.emit_range_mode(ctx, &mut records_this_call),
             SortMergeState::Done => Ok(StepOutcome::Finished),
             SortMergeState::WaitingForSetup { .. } => {
                 unreachable!("Phase 1 must have left state non-WaitingForSetup")

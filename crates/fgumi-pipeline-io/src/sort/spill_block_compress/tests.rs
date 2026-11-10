@@ -19,6 +19,8 @@ fn raw_block(
         is_last_in_file: is_last,
         records_ingested_so_far,
         bytes,
+        frames: None,
+        index_stride: 1,
     }
 }
 
@@ -36,10 +38,13 @@ fn block_payload_is_compressed_and_routing_preserved(#[case] codec: SpillCodec) 
         is_last_in_file,
         records_ingested_so_far,
         bytes,
+        frames,
+        index_stride,
     } = out
     else {
         panic!("expected Block");
     };
+    assert_eq!(index_stride, 1, "the run's index stride must be preserved ({codec:?})");
     assert_eq!(ordinal, 7, "ordinal must be preserved ({codec:?})");
     assert_eq!(file_id, 2, "file_id must be preserved ({codec:?})");
     assert_eq!(key_kind, SpillKeyKind::TemplateK24, "key_kind must be preserved ({codec:?})");
@@ -50,6 +55,7 @@ fn block_payload_is_compressed_and_routing_preserved(#[case] codec: SpillCodec) 
     );
     assert_ne!(bytes, raw, "payload must change (be compressed) ({codec:?})");
     assert!(!bytes.is_empty(), "compressed payload non-empty ({codec:?})");
+    assert!(frames.is_none(), "no index unless enabled ({codec:?})");
 
     // Round-trip through the matching decoder (independent oracle): a compressor
     // that silently corrupts still changes the bytes, so `assert_ne!` alone is
@@ -90,6 +96,7 @@ fn residual_and_announced_pass_through_unchanged() {
         slot_count: 2,
         memory_chunk_count: 1,
         total_records: 3,
+        index_stride: 1,
     };
     let out = step.compress_event(announced).unwrap();
     assert!(matches!(
@@ -99,6 +106,7 @@ fn residual_and_announced_pass_through_unchanged() {
             slot_count: 2,
             memory_chunk_count: 1,
             total_records: 3,
+            index_stride: 1,
         }
     ));
 }
@@ -202,6 +210,7 @@ fn capped_step_follows_the_admission_contract() {
             slot_count: 0,
             memory_chunk_count: 0,
             total_records: 0,
+            index_stride: 1,
         },
     );
 }
@@ -233,6 +242,7 @@ fn range(chunk: &Arc<MemoryChunkErased>, ordinal: u64, start: u64, end: u64) -> 
         end,
         framed_bytes: u32::try_from(framed_bytes).unwrap(),
         frame_bytes: 0,
+        index_stride: 1,
     }
 }
 
@@ -257,6 +267,8 @@ fn range_compresses_byte_identically_to_the_framed_block(#[case] codec: SpillCod
             is_last_in_file: false,
             records_ingested_so_far: 99,
             bytes: framed,
+            frames: None,
+            index_stride: 1,
         })
         .unwrap();
     let (
@@ -317,6 +329,7 @@ fn a_range_the_planner_and_framing_disagree_on_is_an_error(
         end,
         framed_bytes: framed_bytes + framed_bytes_off_by,
         frame_bytes: 0,
+        index_stride: 1,
     };
     let Err(err) = SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).compress_event(event)
     else {
@@ -401,4 +414,68 @@ fn the_buffer_pool_is_bounded_and_skips_empty_buffers() {
         kept += 1;
     }
     assert_eq!(kept, SPILL_BUF_POOL_CAP);
+}
+
+/// A run's final block reaches `SpillBlockCompress` already framed, as a raw
+/// `Block` from `SpillGather`; with the index on, its one frame is indexed:
+/// the compressed length (with its `u32` prefix), raw length, record count and
+/// first key.
+#[test]
+fn run_final_raw_block_is_indexed() {
+    use fgumi_sort::{RawSortKey, TemplateKey24, frame_keyed_record_into};
+    let keys: Vec<TemplateKey24> = (0..4u64)
+        .map(|i| TemplateKey24 { primary: 10 + i, secondary: i, name_hash_upper: 0 })
+        .collect();
+    let mut raw = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        frame_keyed_record_into(&mut raw, key, &[u8::try_from(i).unwrap(); 50]).unwrap();
+    }
+    let mut first_key = Vec::new();
+    keys[0].write_to(&mut first_key).unwrap();
+    let mut step = SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).with_run_index(true);
+    let SpillBlockEvent::Block { bytes, frames, .. } =
+        step.compress_event(raw_block(0, 0, true, 4, raw.clone())).unwrap()
+    else {
+        panic!("expected Block");
+    };
+    let index = frames.expect("an indexed zstd block carries its frames");
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.comp_len(0), bytes.len() as u64, "the whole block is the one frame");
+    assert_eq!(index.raw_len(0) as usize, raw.len());
+    assert_eq!(index.records(0), 4);
+    assert_eq!(index.key_bytes(0), first_key.as_slice());
+}
+
+/// With the index on and the run stamped with a non-zero stride, a range the
+/// planner's cut rule splits into four frames carries one dense entry per
+/// frame whatever the stride (`SpillWrite` applies it); with the index off,
+/// or a run the front stopped indexing (stride 0), none. Columns: index on,
+/// the run's stride, expected entries.
+#[rstest]
+#[case::indexed(true, 1, Some(4))]
+#[case::indexed_sparse_stride(true, 4, Some(4))]
+#[case::front_stopped_indexing(true, 0, None)]
+#[case::unindexed(false, 1, None)]
+fn compress_indexes_every_frame_of_a_range(
+    #[case] indexed: bool,
+    #[case] index_stride: u32,
+    #[case] expected_entries: Option<usize>,
+) {
+    let chunk = range_chunk(40);
+    let mut framed = Vec::new();
+    for i in 5..31 {
+        chunk.frame_record_into(i, &mut framed).unwrap();
+    }
+    // A range the planner's cut rule splits into four frames.
+    let frame_bytes = u32::try_from(framed.len() / 3 + 1).unwrap();
+    let mut step = SpillBlockCompress::new(SpillCodec::Zstd, 1, 1 << 20).with_run_index(indexed);
+    let mut event = range(&chunk, 0, 5, 31);
+    if let SpillBlockEvent::Range { frame_bytes: fb, index_stride: stride, .. } = &mut event {
+        *fb = frame_bytes;
+        *stride = index_stride;
+    }
+    let SpillBlockEvent::Block { frames, .. } = step.compress_event(event).unwrap() else {
+        panic!("expected Block");
+    };
+    assert_eq!(frames.as_ref().map(RunIndex::len), expected_entries);
 }

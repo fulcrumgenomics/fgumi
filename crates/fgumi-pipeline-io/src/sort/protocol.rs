@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use fgumi_sort::{
     InMemoryChunk, QnKey, RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey,
-    RunBound, SortMergeSlot, SpillKeyKind, TemplateMemChunk,
+    RunBound, RunIndex, SortMergeSlot, SpillKeyKind, TemplateMemChunk,
 };
 
 use fgumi_pipeline_core::item::HeapSize;
@@ -220,21 +220,31 @@ pub enum SortChunkEvent {
     /// front. The spill split names the slot's `file_id` from it, so the merge
     /// tie-break order is the run order regardless of which worker compresses
     /// which block.
-    Spill { seq: u32, chunk: MemoryChunkErased, records_ingested_so_far: u64 },
+    ///
+    /// `index_stride` is the run index stride the phase-1 front chose for
+    /// this run: `0` when the sort does not index (or no longer indexes) its
+    /// runs, else the frames per index entry the run will be merged with.
+    Spill { seq: u32, chunk: MemoryChunkErased, records_ingested_so_far: u64, index_stride: u32 },
     /// A sorted in-memory residual chunk to pass straight through as a
     /// `SortPhase1Event::MemoryChunk` — no disk round-trip. A sort that never
     /// spilled seals its one run as one residual (the merge's single-chunk fast
     /// path); a sort that spilled seals its final run as one residual per
     /// pre-sorted piece (contiguous input ranges, emitted in input order, so
     /// the merge keeps ties stable) when its order splits the final run, and
-    /// as one residual otherwise (coordinate).
+    /// as one residual otherwise (coordinate). A final run the front spilled
+    /// for a range merge (`RunSeal::FinalSpill`) is a `Spill` instead, and no
+    /// residual follows.
     Residual { chunk: MemoryChunkErased, records_ingested_so_far: u64 },
     /// Terminal sentinel carrying the final counts (number of `Spill` chunks =
     /// `slot_count`, number of `Residual` chunks = `memory_chunk_count`: one
     /// without spills, the final run's piece count with them for an order that
-    /// splits it).
-    /// Forwarded verbatim to `SortPhase1Event::AllAnnounced`.
-    AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64 },
+    /// splits it, 0 when the final run was spilled).
+    /// Forwarded to `SortPhase1Event::AllAnnounced`. `index_stride` is the
+    /// front's last stride decision (that of a spilled final run, or the one
+    /// made for a residual final run, which no `Spill` carries): `SpillWrite`
+    /// follows it before announcing, so a decision to stop indexing made at
+    /// the final run still drops the spilled runs' indexes.
+    AllAnnounced { slot_count: u32, memory_chunk_count: u32, total_records: u64, index_stride: u32 },
 }
 
 impl HeapSize for SortChunkEvent {
@@ -294,6 +304,10 @@ pub enum SpillBlockEvent {
     /// `frame_bytes` and compresses each frame independently, concatenating them
     /// into one `Block`. The bytes on disk are identical to one range per frame;
     /// only the number of pipeline items changes. `0` means one frame.
+    ///
+    /// `index_stride` is the run's index stride as the phase-1 front stamped
+    /// it on the run's `Spill` event: `SpillBlockCompress` indexes the range's
+    /// frames (densely) iff it is non-zero, and `SpillWrite` follows it.
     Range {
         ordinal: u64,
         file_id: u32,
@@ -305,6 +319,7 @@ pub enum SpillBlockEvent {
         end: u64,
         framed_bytes: u32,
         frame_bytes: u32,
+        index_stride: u32,
     },
     /// One raw (pre-compression) or compressed (post-`SpillBlockCompress`) block of a
     /// spill file. `file_id` is the spill `seq` (the eventual slot `file_id`),
@@ -321,12 +336,27 @@ pub enum SpillBlockEvent {
         is_last_in_file: bool,
         records_ingested_so_far: u64,
         bytes: Vec<u8>,
+        /// One index entry per zstd frame in `bytes`, in order: set by
+        /// `SpillBlockCompress` when its run index is enabled, the codec is
+        /// zstd and the key kind is indexed; `None` otherwise (and always on a
+        /// raw block).
+        frames: Option<RunIndex>,
+        /// The run's index stride as the phase-1 front stamped it (see
+        /// [`Range`](Self::Range)); a consolidated run's blocks carry 1.
+        index_stride: u32,
     },
     /// A sorted in-memory residual chunk, passed straight through to
     /// `SortPhase1Event::MemoryChunk` (no disk round-trip).
     Residual { ordinal: u64, chunk: MemoryChunkErased, records_ingested_so_far: u64 },
-    /// Terminal sentinel forwarded verbatim as `SortPhase1Event::AllAnnounced`.
-    AllAnnounced { ordinal: u64, slot_count: u32, memory_chunk_count: u32, total_records: u64 },
+    /// Terminal sentinel forwarded as `SortPhase1Event::AllAnnounced`, with
+    /// the front's last index stride (see `SortChunkEvent::AllAnnounced`).
+    AllAnnounced {
+        ordinal: u64,
+        slot_count: u32,
+        memory_chunk_count: u32,
+        total_records: u64,
+        index_stride: u32,
+    },
 }
 
 impl SpillBlockEvent {
@@ -352,7 +382,9 @@ impl HeapSize for SpillBlockEvent {
             // The bytes a range commits a worker to materialise; its chunk's
             // records are the arena, already charged.
             Self::Range { framed_bytes, .. } => base + *framed_bytes as usize,
-            Self::Block { bytes, .. } => base + bytes.capacity(),
+            Self::Block { bytes, frames, .. } => {
+                base + bytes.capacity() + frames.as_ref().map_or(0, RunIndex::heap_bytes)
+            }
             Self::Residual { chunk, .. } => base + chunk.approx_heap_bytes(),
             Self::AllAnnounced { .. } => base,
         }
@@ -382,7 +414,16 @@ pub enum SortPhase1Event {
     /// the merged run at the path `SpillWrite` registered for the job
     /// (`ConsolidationRegistry::begin`, the one place the path is carried) and
     /// reports completion through the registry.
-    ConsolidationStart { job_id: u32, inputs: Vec<ConsolidationInput>, key_kind: SpillKeyKind },
+    ///
+    /// `index_stride` is the live runs' index stride (`0` once the phase-1
+    /// front turned indexing off): the merged run is indexed only when it is
+    /// non-zero, so no frames are built only to be thrown away.
+    ConsolidationStart {
+        job_id: u32,
+        inputs: Vec<ConsolidationInput>,
+        key_kind: SpillKeyKind,
+        index_stride: u32,
+    },
     /// Job `job_id` completed and its inputs were unlinked: the read planner
     /// retires the job's slots, so every supply map releases them (closing their
     /// files) within one pass. Unlinking while a slot still holds the file open
@@ -397,7 +438,8 @@ pub struct ConsolidationInput {
     pub file_id: u32,
     /// The run's file.
     pub path: PathBuf,
-    /// The run's size on disk.
+    /// Where the run's frames end (its file length less any run-index
+    /// footer): the bytes the job reads.
     pub len: u64,
 }
 
@@ -411,6 +453,9 @@ pub struct ConsolidationJob {
     pub slots: Vec<Arc<SortMergeSlot>>,
     /// The key type the inputs were written with.
     pub key_kind: SpillKeyKind,
+    /// The live runs' index stride when the job started (`0`: the merged run
+    /// is not indexed).
+    pub index_stride: u32,
     /// Each input's path, by slot index (for error messages only).
     pub input_paths: Vec<PathBuf>,
 }
@@ -671,7 +716,8 @@ mod tests {
         let chunk = MemoryChunkErased::Coordinate(coord(vec![vec![0xAA; 100], vec![0xBB; 200]]));
         let payload = chunk.approx_heap_bytes();
 
-        let spill = SortChunkEvent::Spill { seq: 3, chunk, records_ingested_so_far: 42 };
+        let spill =
+            SortChunkEvent::Spill { seq: 3, chunk, records_ingested_so_far: 42, index_stride: 1 };
         assert_eq!(spill.heap_size(), std::mem::size_of::<SortChunkEvent>() + payload);
         assert_eq!(spill.records_ingested_so_far(), 42);
 
@@ -687,6 +733,7 @@ mod tests {
             slot_count: 4,
             memory_chunk_count: 1,
             total_records: 500,
+            index_stride: 1,
         };
         assert_eq!(announced.heap_size(), std::mem::size_of::<SortChunkEvent>());
         assert_eq!(announced.records_ingested_so_far(), 500);
@@ -728,6 +775,8 @@ mod tests {
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: vec![0u8; 4],
+            frames: None,
+            index_stride: 1,
         };
         let residual = SpillBlockEvent::Residual {
             ordinal: 4,
@@ -739,6 +788,7 @@ mod tests {
             slot_count: 1,
             memory_chunk_count: 1,
             total_records: 1,
+            index_stride: 1,
         };
 
         assert_eq!(<SpillBlockEvent as Ordered>::ordinal(&block), 3);
@@ -759,6 +809,7 @@ mod tests {
             slot_count: 1,
             memory_chunk_count: 0,
             total_records: 0,
+            index_stride: 1,
         };
         assert_eq!(announced.heap_size(), base, "a control event costs only the base");
 
@@ -769,6 +820,8 @@ mod tests {
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: Vec::with_capacity(64),
+            frames: None,
+            index_stride: 1,
         };
         let large = SpillBlockEvent::Block {
             ordinal: 0,
@@ -777,10 +830,28 @@ mod tests {
             is_last_in_file: false,
             records_ingested_so_far: 0,
             bytes: Vec::with_capacity(4096),
+            frames: None,
+            index_stride: 1,
         };
         assert_eq!(small.heap_size(), base + 64, "a block charges its byte capacity");
         assert_eq!(large.heap_size(), base + 4096);
         assert!(large.heap_size() > small.heap_size(), "cost tracks payload size");
+
+        // An indexed block also charges its index.
+        let mut index = RunIndex::new(8);
+        index.push_frame(64, 128, 2, &[0u8; 8]);
+        let index_bytes = index.heap_bytes();
+        let indexed = SpillBlockEvent::Block {
+            ordinal: 0,
+            file_id: 0,
+            key_kind: SpillKeyKind::Coordinate,
+            is_last_in_file: false,
+            records_ingested_so_far: 0,
+            bytes: Vec::with_capacity(64),
+            frames: Some(index),
+            index_stride: 1,
+        };
+        assert_eq!(indexed.heap_size(), base + 64 + index_bytes, "a block charges its index");
 
         // A residual charges the chunk's records, so it too exceeds the base.
         let residual = SpillBlockEvent::Residual {

@@ -13,6 +13,7 @@ fn run(file_id: u32, bytes: u64) -> SpillRun {
         path: PathBuf::from(format!("chunk_{file_id}")),
         bytes,
         records_ingested_so_far: u64::from(file_id),
+        index_footer: false,
     }
 }
 
@@ -48,7 +49,7 @@ fn simulate(max_temp_files: usize, sizes: &[u64]) -> Simulation {
             let originals: Vec<u32> =
                 inputs.iter().flat_map(|r| contents[&r.path].clone()).collect();
             contents.insert(merged_path.clone(), originals);
-            stack.complete_merge(range, merged_path, merged_bytes);
+            stack.complete_merge(range, merged_path, merged_bytes, false);
         }
         peak_settled = peak_settled.max(stack.runs().len());
     }
@@ -168,7 +169,7 @@ fn merged_run_takes_the_position_and_lowest_file_id_of_its_range() {
     for id in [3, 5, 8] {
         stack.push(run(id, RUN_BYTES));
     }
-    let absorbed = stack.complete_merge(1..3, PathBuf::from("merged"), 1999);
+    let absorbed = stack.complete_merge(1..3, PathBuf::from("merged"), 1999, false);
     assert_eq!(absorbed.iter().map(|r| r.file_id).collect::<Vec<_>>(), vec![5, 8]);
     let runs = stack.runs();
     assert_eq!(runs.len(), 2);
@@ -176,4 +177,20 @@ fn merged_run_takes_the_position_and_lowest_file_id_of_its_range() {
     assert_eq!((runs[1].file_id, runs[1].bytes), (5, 1999));
     assert_eq!(runs[1].path, PathBuf::from("merged"));
     assert_eq!(runs[1].records_ingested_so_far, 8);
+}
+
+/// The merged run records whether its file carries an index footer; the
+/// runs outside the range keep theirs. Columns: the merged run's footer.
+#[rstest]
+#[case::with_footer(true)]
+#[case::without_footer(false)]
+fn complete_merge_records_the_index_footer(#[case] index_footer: bool) {
+    let mut stack = RunStack::new(4);
+    for id in [3, 5, 8] {
+        stack.push(run(id, RUN_BYTES));
+    }
+    stack.complete_merge(1..3, PathBuf::from("merged"), 1999, index_footer);
+    let footers: Vec<bool> = stack.runs().iter().map(|r| r.index_footer).collect();
+    assert_eq!(footers, [false, index_footer]);
+    assert_eq!(stack.runs()[1].bytes, 1999);
 }
