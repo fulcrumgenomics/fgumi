@@ -8,7 +8,7 @@
 
 use fgumi_raw_bam::{
     RawRecordView, alignment_start_from_raw, consumes_query, consumes_ref, find_mc_tag_in_record,
-    flags, get_cigar_ops, mate_pos,
+    flags, get_cigar_ops, mate_pos, parse_cigar_string_ops,
 };
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::Cigar as CigarTrait;
@@ -16,36 +16,8 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
-/// Pair orientation for paired-end reads.
-///
-/// This enum represents the orientation of read pairs based on
-/// the relative positioning and strand of the two reads in a pair.
-///
-/// Note: This is NOT the orientation byte as used in Picard's `MarkDuplicates`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PairOrientation {
-    /// Forward-Reverse orientation ("innie") - reads face each other:
-    /// ```text
-    /// 5' --F-->       <--R-- 5'
-    /// ```
-    /// The positive strand 5' position is less than or equal to the negative strand 5' position
-    /// (htsjdk 5.0.0 `SamPairUtil.getPairOrientation`).
-    FR,
-
-    /// Reverse-Forward orientation ("outie") - reads face away from each other:
-    /// ```text
-    /// <--R-- 5'       5' --F-->
-    /// ```
-    /// The positive strand 5' position is greater than the negative strand 5' position.
-    RF,
-
-    /// Tandem orientation - both reads on the same strand:
-    /// ```text
-    /// 5' --F-->  5' --F-->   (both forward)
-    /// <--R-- 5'  <--R-- 5'   (both reverse)
-    /// ```
-    Tandem,
-}
+/// Pair orientation for paired-end reads (defined in `fgumi-raw-bam`, re-exported here).
+pub use fgumi_raw_bam::PairOrientation;
 
 /// Returns the 1-based read position corresponding to a reference position.
 ///
@@ -134,7 +106,9 @@ pub fn read_pos_at_ref_pos(
 /// - Both are on the same reference
 /// - The pair is in FR orientation (positive strand 5' `<=` negative strand 5', per htsjdk 5.0.0)
 ///
-/// This matches fgbio's `isFrPair` algorithm using htsjdk's pair orientation logic.
+/// This matches fgbio's per-record `isFrPair` using htsjdk's pair orientation logic (see
+/// [`get_pair_orientation`]: on a forward-strand read the mate's end comes from `MC` when present,
+/// else from `TLEN`). When both records are available, use [`is_fr_pair`].
 // RecordBuf kept: accesses flags/ref-id/mate fields via noodles typed API; raw equivalent is is_fr_pair_raw in fgumi-raw-bam.
 #[must_use]
 pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
@@ -454,7 +428,8 @@ pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<usize> {
     }
 }
 
-/// Counts reference-consuming operations from a CIGAR.
+/// Sums the lengths of the reference-consuming operations of a CIGAR, saturating at
+/// `usize::MAX` rather than overflowing on an adversarial CIGAR.
 // RecordBuf kept: parameterized over &impl CigarTrait (noodles trait) to accept both CigarBuf and inline Cigar; raw equivalent is reference_length_from_raw_bam in fgumi-raw-bam.
 #[expect(
     clippy::redundant_closure_for_method_calls,
@@ -476,18 +451,57 @@ pub fn reference_length(cigar: &impl CigarTrait) -> usize {
             )
         })
         .map(|op| op.len())
-        .sum()
+        .fold(0usize, usize::saturating_add)
 }
 
-/// Get pair orientation using htsjdk's algorithm.
-/// This matches htsjdk 5.0.0's `SamPairUtil.getPairOrientation()` when no `MC` tag is used: the
-/// forward-strand arm derives the mate's 5' end from TLEN, and the pair is FR iff the
-/// positive-strand 5' `<=` the negative-strand 5' (`SamPairUtil.java:136`, htsjdk#1771), so a
-/// 5' tie is FR. htsjdk 5.0.0 prefers the `MC` tag on the forward arm when present; this does
-/// not, so a pair whose forward `TLEN` disagrees with the mate's CIGAR (e.g. bwa's `TLEN` 0 at a
-/// 5' tie) can classify differently from its two ends. The reverse arm's alignment end is
-/// htsjdk's `getAlignmentEnd()`, `start + referenceLength - 1`, so a zero reference span ends at
-/// `start - 1`.
+/// htsjdk's `getAlignmentEnd()` for a 1-based `start` and reference span `ref_len`:
+/// `start + ref_len - 1`, unclamped (a zero span ends at `start - 1`), in `i64`. A span or end
+/// too large for `i64` saturates at `i64::MAX` rather than wrapping, so it stays past any real
+/// position.
+fn alignment_end_i64(start: usize, ref_len: usize) -> i64 {
+    let start = i64::try_from(start).unwrap_or(i64::MAX);
+    let ref_len = i64::try_from(ref_len).unwrap_or(i64::MAX);
+    start.saturating_add(ref_len).saturating_sub(1)
+}
+
+/// The mate's inclusive alignment end from the `MC` tag and mate position, htsjdk's
+/// `CoordMath.getEnd(mateStart, mateCigar.getReferenceLength())` = `mateStart + refLen - 1`,
+/// unclamped (a zero span ends at `mateStart - 1`).
+///
+/// Returns `None` when `MC` or the mate position is missing, and when `MC` is not a whole, valid
+/// CIGAR for a mapped record per `fgumi_raw_bam::parse_cigar_string_ops` (a dangling run length
+/// like `100M5`, an unknown operator, a zero or oversized run length, a misplaced clip, or no
+/// reference-consuming operation). Unlike the tolerant [`parse_mate_cigar`], which keeps a valid
+/// prefix for the mate-coordinate helpers, a malformed tag here is treated as unusable so it
+/// cannot override `TLEN`.
+// RecordBuf kept: reads the MC tag via the noodles data map.
+fn mate_alignment_end_from_mc(record: &RecordBuf) -> Option<i64> {
+    let Value::String(mc) = record.data().get(&Tag::from([b'M', b'C']))? else {
+        return None;
+    };
+    let mate_start = usize::from(record.mate_alignment_start()?);
+    let mate_ops = parse_cigar_string_ops(std::str::from_utf8(mc.as_ref()).ok()?)?;
+    // Each run length is at most 2^28 - 1, so the checked sum fails only on an absurd op count.
+    let mate_ref_len = mate_ops
+        .iter()
+        .filter(|&&op| consumes_ref(op & 0xF))
+        .try_fold(0i64, |acc, &op| acc.checked_add(i64::from(op >> 4)))?;
+    i64::try_from(mate_start).ok()?.checked_add(mate_ref_len)?.checked_sub(1)
+}
+
+/// Get pair orientation using htsjdk's algorithm, from this record alone.
+///
+/// This matches htsjdk 5.0.0's `SamPairUtil.getPairOrientation()` (htsjdk#1771): the pair is FR
+/// iff the positive-strand 5' `<=` the negative-strand 5' (`SamPairUtil.java:136`), so a 5' tie
+/// is FR. On the reverse-strand record the negative-strand 5' is its own alignment end, htsjdk's
+/// `getAlignmentEnd()` (`start + referenceLength - 1`, so a zero reference span ends at
+/// `start - 1`). On the forward-strand record it is the mate's alignment end: from the `MC` tag
+/// when present (`CoordMath.getEnd(mateStart, mateReferenceLength)`), else from `TLEN`
+/// (`CoordMath.getEnd(start, TLEN)`). An `MC` that is not a whole, valid CIGAR (see
+/// `mate_alignment_end_from_mc`) is treated as absent.
+///
+/// Being per-record, this can still disagree with the mate's actual alignment when `MC` is
+/// absent or the mate fields are stale. When both records are available, use [`is_fr_pair`].
 // RecordBuf kept: reads flags/positions via noodles typed Flags and Position API; serves noodles-typed callers.
 #[must_use]
 pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
@@ -499,7 +513,6 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
         return PairOrientation::Tandem;
     }
 
-    // Now determine if FR or RF using htsjdk's logic
     let alignment_start = record.alignment_start().map_or(0, usize::from);
     let mate_start = record.mate_alignment_start().map_or(0, usize::from);
     let insert_size = record.template_length();
@@ -514,12 +527,15 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
         // `getAlignmentEnd()` is `start + referenceLength - 1`, deliberately unclamped: a read
         // with no reference-consuming ops ends at `start - 1`, so at its mate's start it is RF.
         let ref_len = reference_length(&record.cigar());
-        (mate_start as i64, alignment_start as i64 + ref_len as i64 - 1)
+        (mate_start as i64, alignment_end_i64(alignment_start, ref_len))
+    } else if let Some(mate_end) = mate_alignment_end_from_mc(record) {
+        // Forward read with a usable `MC` tag: the mate's alignment end, htsjdk's
+        // `CoordMath.getEnd(mateStart, mateCigar.getReferenceLength())`.
+        (alignment_start as i64, mate_end)
     } else {
-        // This read is on positive strand, mate is on reverse strand.
-        // htsjdk `CoordMath.getEnd(alignmentStart, insertSize)` = start + insertSize - 1. With
-        // `<=` below this classifies exactly as the former `start + insertSize` with `<` did
-        // (`a <= b - 1` iff `a < b`), so the TLEN arm's FR/RF boundary does not move.
+        // Forward read without a usable `MC` (absent or malformed): htsjdk
+        // `CoordMath.getEnd(alignmentStart, insertSize)` = start + insertSize - 1. With `<=` below this classifies exactly as the former
+        // `start + insertSize` with `<` did (`a <= b - 1` iff `a < b`).
         (alignment_start as i64, alignment_start as i64 + i64::from(insert_size) - 1)
     };
 
@@ -533,17 +549,14 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
 
 /// Check if a read pair is in FR (forward-reverse) orientation.
 ///
-/// FR orientation means one read is on the forward strand and one on the reverse strand,
-/// with the positive strand 5' end at or before the negative strand 5' end (a 5' tie is FR, per
-/// htsjdk 5.0.0 `SamPairUtil.getPairOrientation`).
-///
-/// Orientation is evaluated on `r1` via [`get_pair_orientation`]. When `r1` is the forward read,
-/// the mate's 5' end comes from `r1`'s `TLEN`, not `r2`'s CIGAR, so the answer can depend on
-/// argument order when `TLEN` disagrees with the mate's alignment — e.g. bwa writes `TLEN` 0 at a
-/// 5' tie, which reads as RF from the forward read and FR from the reverse read.
-///
-/// This matches the behavior of fgbio's `isFrPair` check.
-// RecordBuf kept: reads flags/ref-ids via noodles typed Flags API; serves noodles-typed callers alongside raw is_fr_pair_raw in fgumi-raw-bam.
+/// Pair-level and order-independent: both records must be paired, mapped with mapped mates, on
+/// the same reference and on opposite strands, and the pair is FR iff the positive-strand
+/// record's alignment start `<=` the negative-strand record's alignment end (htsjdk 5.0.0
+/// `SamPairUtil.getPairOrientation`, so a 5' tie is FR). Both positions come from the records'
+/// own alignments, never from `TLEN`, the `MC` tag or the mate-position fields, so the answer is
+/// the same whichever record is passed first. This is the `RecordBuf` counterpart of
+/// `fgumi_raw_bam::is_primary_fr_pair_raw` and matches fgbio's `SamRecord.isFrPair(r1, r2)`.
+// RecordBuf kept: reads flags/ref-ids via noodles typed Flags API; serves noodles-typed callers alongside raw is_primary_fr_pair_raw in fgumi-raw-bam.
 #[must_use]
 pub fn is_fr_pair(r1: &RecordBuf, r2: &RecordBuf) -> bool {
     let r1_flags = r1.flags();
@@ -565,17 +578,29 @@ pub fn is_fr_pair(r1: &RecordBuf, r2: &RecordBuf) -> bool {
     }
 
     // Check if both reads are on the same reference sequence
-    let r1_ref = r1.reference_sequence_id();
-    let r2_ref = r2.reference_sequence_id();
-    if r1_ref != r2_ref {
+    if r1.reference_sequence_id() != r2.reference_sequence_id() {
         return false;
     }
 
-    // Use htsjdk's pair orientation logic (matches fgbio)
-    // FR means one read is forward, one is reverse, with positive strand 5' <= negative strand 5'.
-    // Evaluated on r1 only; see the doc comment for the TLEN-dependent forward arm.
-    let orientation = get_pair_orientation(r1);
-    orientation == PairOrientation::FR
+    // Opposite strands
+    let r1_reverse = r1_flags.is_reverse_complemented();
+    if r1_reverse == r2_flags.is_reverse_complemented() {
+        return false;
+    }
+
+    // FR iff positive-strand start <= negative-strand alignment end (unclamped, as htsjdk's
+    // `getAlignmentEnd()`), both from the records themselves, in i64 (the end saturates).
+    // A missing start is not coordinate 0 (SAM's POS 0 means "unavailable"), so no FR pair.
+    let (positive, negative) = if r1_reverse { (r2, r1) } else { (r1, r2) };
+    let (Some(positive_start), Some(negative_start)) =
+        (positive.alignment_start(), negative.alignment_start())
+    else {
+        return false;
+    };
+    let positive_start = i64::try_from(usize::from(positive_start)).unwrap_or(i64::MAX);
+    let negative_end =
+        alignment_end_i64(usize::from(negative_start), reference_length(&negative.cigar()));
+    positive_start <= negative_end
 }
 
 // ============================================================================
@@ -1473,6 +1498,172 @@ mod tests {
         let rev = create_tie_test_read(FLAG_PAIRED | FLAG_REVERSE, 100, "100S", 100, 0);
         assert_eq!(get_pair_orientation(&rev), PairOrientation::RF);
         assert!(!is_fr_pair_from_tags(&rev));
+    }
+
+    /// The fgbio#1190 dovetail: forward `100M` at 50 (50-149) and reverse `50S50M` at 1 (aligned
+    /// 1-50), so both 5' ends are at 50, with bwa's `TLEN` 0 on both records. Returns
+    /// `(forward, reverse)`; `mc` adds each record's `MC` tag.
+    fn coincident_dovetail(mc: bool) -> (RecordBuf, RecordBuf) {
+        let build = |flags: u16, pos: usize, cigar: &str, mate_pos: usize, mate_cigar: &str| {
+            let mut b = RecordBuilder::new()
+                .name("dovetail")
+                .sequence(&"A".repeat(100))
+                .qualities(&[30u8; 100])
+                .cigar(cigar)
+                .reference_sequence_id(0)
+                .alignment_start(pos)
+                .mate_reference_sequence_id(0)
+                .mate_alignment_start(mate_pos)
+                .template_length(0)
+                .reverse_complement(flags & FLAG_REVERSE != 0)
+                .mate_reverse_complement(flags & FLAG_MATE_REVERSE != 0)
+                .first_segment(flags & FLAG_READ1 != 0)
+                .paired(flags & FLAG_PAIRED != 0);
+            if mc {
+                b = b.tag("MC", mate_cigar);
+            }
+            b.build()
+        };
+        (
+            build(FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE, 50, "100M", 1, "50S50M"),
+            build(FLAG_PAIRED | FLAG_REVERSE, 1, "50S50M", 50, "100M"),
+        )
+    }
+
+    /// Per record, htsjdk 5.0.0 takes the forward record's mate end from `MC` when present, so
+    /// the coincident dovetail is FR from both records; without `MC` the forward record falls
+    /// back to `TLEN` 0 (`50 <= 50 + 0 - 1` is false) and reports RF, while the reverse record's
+    /// own alignment end still gives FR.
+    #[rstest]
+    #[case::with_mc(true, PairOrientation::FR)]
+    #[case::without_mc(false, PairOrientation::RF)]
+    fn test_get_pair_orientation_forward_record_uses_mc(
+        #[case] mc: bool,
+        #[case] expected_forward: PairOrientation,
+    ) {
+        let (fwd, rev) = coincident_dovetail(mc);
+        assert_eq!(get_pair_orientation(&fwd), expected_forward, "forward record");
+        assert_eq!(is_fr_pair_from_tags(&fwd), expected_forward == PairOrientation::FR);
+        assert_eq!(get_pair_orientation(&rev), PairOrientation::FR, "reverse record");
+        assert!(is_fr_pair_from_tags(&rev));
+    }
+
+    /// Per record with `MC`, the forward arm is the mate's `MC`-derived end, not `TLEN`: a `TLEN`
+    /// that alone would say RF does not override an `MC` that says FR.
+    #[test]
+    fn test_get_pair_orientation_forward_record_prefers_mc_over_tlen() {
+        let fwd = create_tie_test_read(FLAG_PAIRED | FLAG_MATE_REVERSE, 200, "100M", 150, -5);
+        assert_eq!(get_pair_orientation(&fwd), PairOrientation::RF, "TLEN arm: 200 > 194");
+        let mut with_mc = fwd;
+        with_mc.data_mut().insert(Tag::from([b'M', b'C']), Value::from("100M"));
+        assert_eq!(get_pair_orientation(&with_mc), PairOrientation::FR, "MC arm: 200 <= 249");
+    }
+
+    /// An `MC` with a run length no BAM CIGAR op can hold (past 2^28 - 1) is treated as unusable,
+    /// so the forward arm falls back to `TLEN` instead of panicking on overflow or wrapping to a
+    /// bogus span. Forward
+    /// `100M` @ 200 with mate @ 300 and `TLEN` 0: the `TLEN` arm is `200 <= 199`, RF, whereas a
+    /// wrapped span would put the mate's end at or just below 300 and call it FR.
+    #[rstest]
+    #[case::sum_overflows_usize("18446744073709551615M1M")]
+    #[case::single_op_exceeds_i64("18446744073709551615M")]
+    #[case::span_exceeds_i64_with_start("9223372036854775807M")]
+    #[case::run_length_one_past_bam_limit("268435456M")]
+    fn test_get_pair_orientation_overflowing_mc_falls_back_to_tlen(#[case] mc: &str) {
+        let mut fwd = create_tie_test_read(FLAG_PAIRED | FLAG_MATE_REVERSE, 200, "100M", 300, 0);
+        fwd.data_mut().insert(Tag::from([b'M', b'C']), Value::from(mc));
+        assert_eq!(get_pair_orientation(&fwd), PairOrientation::RF);
+        assert!(!is_fr_pair_from_tags(&fwd));
+    }
+
+    /// A malformed `MC` is unusable, so the forward arm falls back to `TLEN` rather than reading
+    /// a valid-looking prefix: forward `100M` @ 200, mate @ 150, `TLEN` 0. A valid `100M` puts the
+    /// mate's end at 249 (`200 <= 249`, FR); `100M5` (a dangling run length) and other malformed
+    /// tags fall back to the `TLEN` arm (`200 <= 199`, RF).
+    #[rstest]
+    #[case::valid("100M", PairOrientation::FR)]
+    #[case::dangling_run_length("100M5", PairOrientation::RF)]
+    #[case::unknown_operator("100Mfoo", PairOrientation::RF)]
+    #[case::zero_length_op("0M100M", PairOrientation::RF)]
+    #[case::no_reference_consuming_op("100S", PairOrientation::RF)]
+    fn test_get_pair_orientation_malformed_mc_falls_back_to_tlen(
+        #[case] mc: &str,
+        #[case] expected: PairOrientation,
+    ) {
+        let mut fwd = create_tie_test_read(FLAG_PAIRED | FLAG_MATE_REVERSE, 200, "100M", 150, 0);
+        fwd.data_mut().insert(Tag::from([b'M', b'C']), Value::from(mc));
+        assert_eq!(get_pair_orientation(&fwd), expected);
+        assert_eq!(is_fr_pair_from_tags(&fwd), expected == PairOrientation::FR);
+    }
+
+    /// `is_fr_pair` is pair-level: the MC-less coincident dovetail is FR whichever record is
+    /// passed first, although the forward record's own `TLEN` says RF.
+    #[rstest]
+    fn test_is_fr_pair_mc_less_coincident_dovetail(#[values(false, true)] reverse_first: bool) {
+        let (fwd, rev) = coincident_dovetail(false);
+        let fr = if reverse_first { is_fr_pair(&rev, &fwd) } else { is_fr_pair(&fwd, &rev) };
+        assert!(fr);
+    }
+
+    /// A reverse record whose CIGAR reference span does not fit in `i64` saturates rather than
+    /// wrapping: reverse `<usize::MAX>M` @ 1 ends far past its forward mate's start of 100, so the
+    /// pair is FR. Casting the span with `as i64` would wrap it to -1, end the reverse read at -1
+    /// and call the pair RF.
+    ///
+    /// A second reference-consuming op whose length pushes the sum past `usize::MAX` saturates
+    /// too, rather than panicking on overflow or wrapping the span to zero (which would end the
+    /// reverse read at 0 and call the pair RF).
+    #[rstest]
+    #[case::single_op(&[usize::MAX])]
+    #[case::sum_overflows_usize(&[usize::MAX, 1])]
+    fn test_pair_orientation_reverse_span_exceeding_i64_saturates(#[case] lens: &[usize]) {
+        use noodles::sam::alignment::record::cigar::Op;
+        let fwd =
+            create_tie_test_read(FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE, 100, "100M", 1, 0);
+        let mut rev = create_tie_test_read(FLAG_PAIRED | FLAG_REVERSE, 1, "100M", 100, 0);
+        *rev.cigar_mut() = lens.iter().map(|&len| Op::new(Kind::Match, len)).collect();
+
+        assert_eq!(get_pair_orientation(&rev), PairOrientation::FR, "reverse arm");
+        assert!(is_fr_pair(&fwd, &rev), "(fwd, rev)");
+        assert!(is_fr_pair(&rev, &fwd), "(rev, fwd)");
+    }
+
+    /// `is_fr_pair` needs both alignment starts: a record with no start is not an FR pair, rather
+    /// than being placed at coordinate 0 (`0 <= 199` would call it FR in both orders).
+    #[rstest]
+    #[case::forward_missing_start(true, false)]
+    #[case::reverse_missing_start(false, true)]
+    fn test_is_fr_pair_missing_alignment_start(
+        #[case] clear_forward: bool,
+        #[case] clear_reverse: bool,
+    ) {
+        let mut fwd =
+            create_tie_test_read(FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE, 100, "100M", 100, 0);
+        let mut rev = create_tie_test_read(FLAG_PAIRED | FLAG_REVERSE, 100, "100M", 100, 0);
+        if clear_forward {
+            *fwd.alignment_start_mut() = None;
+        }
+        if clear_reverse {
+            *rev.alignment_start_mut() = None;
+        }
+        assert!(!is_fr_pair(&fwd, &rev), "(fwd, rev)");
+        assert!(!is_fr_pair(&rev, &fwd), "(rev, fwd)");
+    }
+
+    /// `is_fr_pair` reads the two alignments, not the mate fields: here the forward record's
+    /// `MC`, `TLEN` and mate position describe an FR mate, but the reverse record actually ends at
+    /// 199, before the forward start of 300, so the pair is RF.
+    #[test]
+    fn test_is_fr_pair_ignores_stale_mate_fields() {
+        let mut fwd = create_tie_test_read(FLAG_MATE_REVERSE | FLAG_READ1, 300, "100M", 500, 300);
+        fwd.data_mut().insert(Tag::from([b'M', b'C']), Value::from("100M"));
+        let rev = create_tie_test_read(FLAG_REVERSE, 100, "100M", 300, -300);
+        let (mut fwd, mut rev) = (fwd, rev);
+        *fwd.flags_mut() |= Flags::SEGMENTED;
+        *rev.flags_mut() |= Flags::SEGMENTED;
+        assert!(is_fr_pair_from_tags(&fwd), "the forward record's own fields say FR");
+        assert!(!is_fr_pair(&fwd, &rev));
+        assert!(!is_fr_pair(&rev, &fwd));
     }
 
     // =====================================================================

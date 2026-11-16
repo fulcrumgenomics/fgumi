@@ -493,9 +493,11 @@ impl Template {
 
     /// Returns the pair orientation if both R1 and R2 are present and mapped to the same chromosome.
     ///
-    /// This follows htsjdk's `SamPairUtil.getPairOrientation()` evaluated on R1, as fgbio's
-    /// `Template.pairOrientation` does, except that the forward-strand arm uses `TLEN` rather than
-    /// the `MC` tag (see `get_pair_orientation_raw`).
+    /// Computed from both records' own alignments via [`fgumi_raw_bam::pair_orientation_raw`]
+    /// (htsjdk's rule: FR iff the positive-strand start `<=` the negative-strand alignment end),
+    /// never from `TLEN`, `MC` or the mate-position fields, so it gives the same answer for a
+    /// dovetail pair whichever record carries stale or missing mate information. Mirrors fgbio's
+    /// `Template.pairOrientation`.
     ///
     /// # Returns
     ///
@@ -518,25 +520,7 @@ impl Template {
     /// ```
     #[must_use]
     pub fn pair_orientation(&self) -> Option<PairOrientation> {
-        use fgumi_raw_bam;
-        let r1 = self.r1()?;
-        let r2 = self.r2()?;
-        let f1 = RawRecordView::new(r1).flags();
-        let f2 = RawRecordView::new(r2).flags();
-
-        // Both must be mapped
-        if (f1 & fgumi_raw_bam::flags::UNMAPPED) != 0 || (f2 & fgumi_raw_bam::flags::UNMAPPED) != 0
-        {
-            return None;
-        }
-
-        // Must be on the same reference
-        if fgumi_raw_bam::ref_id(r1) != fgumi_raw_bam::ref_id(r2) {
-            return None;
-        }
-
-        // Use R1 to determine orientation (htsjdk uses the first record passed)
-        Some(get_pair_orientation_raw(r1))
+        fgumi_raw_bam::pair_orientation_raw(self.r1()?, self.r2()?)
     }
 
     /// Fixes mate information for paired-end reads.
@@ -1238,63 +1222,6 @@ pub(crate) fn compute_insert_size_from_ends(first: InsertSizeEnd, second: Insert
 /// Computes insert size (TLEN) from two raw BAM records.
 fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
     compute_insert_size_from_ends(insert_size_end(rec1), insert_size_end(rec2))
-}
-
-/// Determines the pair orientation for a paired read using raw BAM bytes.
-///
-/// This follows htsjdk 5.0.0's `SamPairUtil.getPairOrientation()`, with one difference: its
-/// forward-strand arm always derives the mate's 5' end from `TLEN`, whereas htsjdk 5.0.0 prefers
-/// the mate CIGAR from the `MC` tag when present and falls back to `TLEN` only without it. When
-/// `TLEN` disagrees with the mate's CIGAR the two ends can therefore classify differently — e.g.
-/// bwa writes `TLEN` 0 on both reads at a 5' tie, which reads as RF from the forward read
-/// (`start <= start - 1` is false) and FR from the reverse read, where htsjdk 5.0.0 says FR for
-/// both. With htsjdk's own `computeInsertSize` TLEN (as written by `fix_mate_info`) the two
-/// agree. A 5' tie is FR (`<=`, `SamPairUtil.java:136`).
-///
-/// # Arguments
-/// * `record` - Raw BAM bytes of a paired, mapped read with a mapped mate on the same reference
-///
-/// # Returns
-/// The pair orientation (FR, RF, or Tandem)
-#[allow(clippy::cast_possible_wrap)]
-fn get_pair_orientation_raw(record: &[u8]) -> PairOrientation {
-    use fgumi_raw_bam;
-    let f = RawRecordView::new(record).flags();
-    let is_reverse = (f & fgumi_raw_bam::flags::REVERSE) != 0;
-    let mate_reverse = (f & fgumi_raw_bam::flags::MATE_REVERSE) != 0;
-
-    // Same strand = TANDEM
-    if is_reverse == mate_reverse {
-        return PairOrientation::Tandem;
-    }
-
-    // FR vs RF using htsjdk 5.0.0's logic (TLEN fallback for the forward arm):
-    // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
-    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd
-    //                                                    : CoordMath.getEnd(alignmentStart, insertSize)
-    // FR if positiveStrandFivePrimePos <= negativeStrandFivePrimePos (SamPairUtil.java:136,
-    // htsjdk#1771): a 5' tie is FR.
-    //
-    // Widened to i64 so an extreme POS, TLEN or reference length cannot overflow.
-    let alignment_start = i64::from(fgumi_raw_bam::pos(record)) + 1; // 0-based -> 1-based
-    let mate_start = i64::from(fgumi_raw_bam::mate_pos(record)) + 1;
-    let insert_size = i64::from(fgumi_raw_bam::template_length(record));
-
-    let (positive_five_prime, negative_five_prime) = if is_reverse {
-        // htsjdk `getAlignmentEnd()`, unclamped: a zero reference span ends at `start - 1`.
-        let ref_len = i64::from(fgumi_raw_bam::reference_length_from_raw_bam(record));
-        (mate_start, alignment_start + ref_len - 1)
-    } else {
-        // With `<=` below, `start + insertSize - 1` classifies exactly as the former
-        // `start + insertSize` with `<` did; it re-expresses htsjdk's `CoordMath.getEnd`.
-        (alignment_start, alignment_start + insert_size - 1)
-    };
-
-    if positive_five_prime <= negative_five_prime {
-        PairOrientation::FR
-    } else {
-        PairOrientation::RF
-    }
 }
 
 // ============================================================================
@@ -3225,15 +3152,13 @@ mod tests {
     /// read2Reverse)` and the expected orientation. htsjdk builds both reads, calls
     /// `SamPairUtil.setMateInfo(rec1, rec2, true)`, then asserts `getPairOrientation` on each
     /// end; here `fix_mate_info` is the `setMateInfo` equivalent (it populates mate positions,
-    /// mate-strand flags, and TLEN that `pair_orientation` reads), so the reads are built with
-    /// only their own strand set. `Template::pair_orientation` classifies from R1, so the second
-    /// end is asserted through `get_pair_orientation_raw` on R2 directly. Case labels are
+    /// mate-strand flags, and TLEN), so the reads are built with only their own strand set.
+    /// `Template::pair_orientation` is pair-level, so htsjdk's per-end assertions become one
+    /// assertion here, and the records are also classified in the swapped order. Case labels are
     /// htsjdk's own test names.
     ///
     /// `dovetail_5_prime_tie` (htsjdk#1771) puts both 5' ends at 100 (forward R1 @ 100, reverse
-    /// R2 ending at 100) and is FR from both ends: R1's forward arm compares
-    /// `100 <= CoordMath.getEnd(100, TLEN +1) = 100` and R2's reverse arm `100 <= 100`, so it
-    /// pins the inclusive `<=` on both arms.
+    /// R2 ending at 100) and is FR, pinning the inclusive `<=`.
     #[rstest]
     #[case::normal_innie(1, 100, false, 500, 100, true, PairOrientation::FR)]
     #[case::overlapping_innie(1, 100, false, 50, 100, true, PairOrientation::FR)]
@@ -3283,29 +3208,97 @@ mod tests {
 
         let mut template = Template::from_records(vec![r1, r2])?;
         template.fix_mate_info()?;
-        assert_eq!(template.pair_orientation(), Some(expected), "first end");
+        assert_eq!(template.pair_orientation(), Some(expected), "(r1, r2)");
         assert_eq!(
-            get_pair_orientation_raw(template.records()[1].as_ref()),
-            expected,
-            "second end"
+            fgumi_raw_bam::pair_orientation_raw(
+                template.records()[1].as_ref(),
+                template.records()[0].as_ref()
+            ),
+            Some(expected),
+            "(r2, r1)"
         );
         Ok(())
     }
 
     /// A mapped reverse read with no reference-consuming CIGAR ops (`100S`) at its forward
     /// mate's start is RF: htsjdk `getAlignmentEnd` is `start + referenceLength - 1`, which is
-    /// `start - 1` for a zero span, so the reverse arm compares `100 <= 99`.
+    /// `start - 1` for a zero span, so the pair compares `100 <= 99`.
     #[test]
-    fn test_get_pair_orientation_raw_zero_reference_span_reverse_read_is_rf() {
-        let mut rev = build_mapped_for_insert_size(
+    fn test_pair_orientation_zero_reference_span_reverse_read_is_rf() -> Result<()> {
+        let fwd = build_mapped_for_insert_size(b"pair", FLAG_PAIRED | FLAG_READ1, 100, "100M");
+        let rev = build_mapped_for_insert_size(
             b"pair",
             FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE,
             100,
             "100S",
         );
-        rev.set_mate_pos(99);
+        let template = Template::from_records(vec![fwd, rev])?;
+        assert_eq!(template.pair_orientation(), Some(PairOrientation::RF));
+        Ok(())
+    }
+
+    /// The fgbio#1190 dovetail with no `MC` tag and `TLEN` 0 on both records (as bwa writes when
+    /// the 5' ends coincide): forward `100M` at 50 (50-149) and reverse `50S50M` at 1 (aligned
+    /// 1-50). The 5' ends coincide at 50, so the pair is FR whichever record is R1. The old
+    /// R1-only, `TLEN`-based classification called it RF when the forward read was R1.
+    #[rstest]
+    #[case::forward_is_r1(true)]
+    #[case::reverse_is_r1(false)]
+    fn test_pair_orientation_mc_less_coincident_five_prime_dovetail(
+        #[case] forward_is_r1: bool,
+    ) -> Result<()> {
+        let (fwd_read, rev_read) =
+            if forward_is_r1 { (FLAG_READ1, FLAG_READ2) } else { (FLAG_READ2, FLAG_READ1) };
+        let mut fwd = build_mapped_for_insert_size(
+            b"pair",
+            FLAG_PAIRED | fwd_read | FLAG_MATE_REVERSE,
+            50,
+            "100M",
+        );
+        fwd.set_mate_ref_id(0);
+        fwd.set_mate_pos(0);
+        let mut rev = build_mapped_for_insert_size(
+            b"pair",
+            FLAG_PAIRED | rev_read | FLAG_REVERSE,
+            1,
+            "50S50M",
+        );
         rev.set_mate_ref_id(0);
-        assert_eq!(get_pair_orientation_raw(rev.as_ref()), PairOrientation::RF);
+        rev.set_mate_pos(49);
+        let template = Template::from_records(vec![fwd, rev])?;
+        assert_eq!(fgumi_raw_bam::template_length(template.records()[0].as_ref()), 0);
+        assert_eq!(template.pair_orientation(), Some(PairOrientation::FR));
+        Ok(())
+    }
+
+    /// R1's mate fields are stale: they put R2 far downstream (an FR-looking `TLEN` and mate
+    /// position), but R2's actual alignment is upstream of R1, so the pair is RF. The answer
+    /// follows the records' own alignments.
+    #[test]
+    fn test_pair_orientation_ignores_stale_mate_fields() -> Result<()> {
+        // R1: forward at 300 with mate fields claiming a reverse mate at 500, TLEN +300.
+        let r1 = create_mapped_record_with_flags(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
+            300,
+            30,
+            300,
+            Some(0),
+            Some(500),
+        );
+        // R2: reverse at 100 (100-199), so the forward start 300 is past its end.
+        let r2 = create_mapped_record_with_flags(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE,
+            100,
+            30,
+            -300,
+            Some(0),
+            Some(300),
+        );
+        let template = Template::from_records(vec![r1, r2])?;
+        assert_eq!(template.pair_orientation(), Some(PairOrientation::RF));
+        Ok(())
     }
 
     /// Test `pair_orientation` returns None when R1 is missing

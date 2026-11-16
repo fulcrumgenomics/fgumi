@@ -1,6 +1,7 @@
 use crate::SamTag;
 use crate::cigar::{
     consumes_ref, get_cigar_ops, query_length_from_cigar, reference_length_from_raw_bam,
+    reference_length_from_raw_bam_checked,
 };
 use crate::fields::{RawRecordView, aux_data_slice, flags, mate_pos, mate_ref_id, template_length};
 use crate::tags::RawTagsView;
@@ -30,10 +31,11 @@ pub fn is_mapped_opposite_strand_pair_raw(bam: &[u8]) -> bool {
 /// disagree with the mate's CIGAR: a leftmost-to-rightmost `TLEN` on a dovetail, or bwa's `TLEN`
 /// 0 at a 5' tie, makes the forward record report non-FR while the reverse record reports FR
 /// (htsjdk/samtools#1771). It is therefore crate-internal: it exists only as the reverse-arm
-/// building block for the correct, TLEN-independent gates. Callers that need to classify a pair
-/// must use `is_primary_fr_pair_raw` (both records in hand) or `is_fr_pair_with_mate_cigar_raw`
-/// (a read plus its MC tag) instead. Raw-byte counterpart of
-/// `record_utils::is_fr_pair_from_tags`.
+/// building block for `is_fr_pair_with_mate_cigar_raw` (a read plus its MC tag). Callers with
+/// both records in hand must use [`is_primary_fr_pair_raw`] / [`pair_orientation_raw`].
+///
+/// Unlike `fgumi_sam::record_utils::is_fr_pair_from_tags`, which takes the forward-strand arm's
+/// mate end from the `MC` tag when present, this forward arm always uses `TLEN`.
 ///
 /// Returns `true` if the read is paired, both read and mate are mapped,
 /// on the same reference, and in FR orientation (positive strand 5' `<=` negative strand 5').
@@ -79,50 +81,101 @@ pub(crate) fn is_fr_pair_raw(bam: &[u8]) -> bool {
     positive_five_prime <= negative_five_prime
 }
 
-/// Symmetric per-pair FR classification for a template's two primary reads.
+/// Pair orientation for paired-end reads.
 ///
-/// This is the raw-byte port of fgbio `CodecConsensusCaller.isPrimaryFrPair(a, b)`
-/// (`CodecConsensusCaller.scala:424-433`). Unlike `is_fr_pair_raw`, which is a *per-record*
-/// test, this evaluates a *pair* and is order-independent: after confirming both reads are
-/// mapped with mapped mates, on the same reference, and on opposite strands, it derives the FR
-/// orientation from the **reverse-strand record only**. That branch of the orientation test is
-/// CIGAR-derived (`is_fr_pair_raw`'s reverse arm), so it is independent of TLEN and gives the
-/// same answer regardless of argument order — avoiding the htsjdk per-record asymmetry
-/// (samtools/htsjdk#1771) where a forward record's `TLEN` disagrees with its mate's CIGAR and
-/// mis-drops a dovetail FR pair.
+/// This enum represents the orientation of read pairs based on
+/// the relative positioning and strand of the two reads in a pair.
 ///
-/// The orientation test is inclusive, per htsjdk 5.0.0 `SamPairUtil.getPairOrientation`
-/// (`SamPairUtil.java:136`), which fgbio pins: FR iff positive-strand 5' `<=` negative-strand 5'.
-/// This is what keeps the HEK293T geometry this gate was written for (fgumi #505) — the reverse
-/// read's aligned end equal to the forward read's aligned start — classified FR.
+/// Note: This is NOT the orientation byte as used in Picard's `MarkDuplicates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairOrientation {
+    /// Forward-Reverse orientation ("innie") - reads face each other:
+    /// ```text
+    /// 5' --F-->       <--R-- 5'
+    /// ```
+    /// The positive strand 5' position is less than or equal to the negative strand 5' position
+    /// (htsjdk 5.0.0 `SamPairUtil.getPairOrientation`).
+    FR,
+
+    /// Reverse-Forward orientation ("outie") - reads face away from each other:
+    /// ```text
+    /// <--R-- 5'       5' --F-->
+    /// ```
+    /// The positive strand 5' position is greater than the negative strand 5' position.
+    RF,
+
+    /// Tandem orientation - both reads on the same strand:
+    /// ```text
+    /// 5' --F-->  5' --F-->   (both forward)
+    /// <--R-- 5'  <--R-- 5'   (both reverse)
+    /// ```
+    Tandem,
+}
+
+/// Returns the orientation of a read pair given both of its records, or `None` if either record
+/// is unmapped, the two are mapped to different references, or either record is malformed
+/// (shorter than the fixed BAM core, its read name or CIGAR runs past its buffer, or it is mapped
+/// with no position, POS 0 in SAM / -1 in BAM).
 ///
-/// Returns `true` iff `(a, b)` is a single primary FR pair.
+/// This applies htsjdk's `SamPairUtil.getPairOrientation` rule — FR iff the positive-strand
+/// record's start `<=` the negative-strand record's alignment end, so coincident 5' ends are FR
+/// (htsjdk#1771) — but reads each record's position from the record itself, never from `TLEN`,
+/// the `MC` tag or the mate-position fields. A per-record classification has to infer the mate's
+/// 5' end from those fields, so the two records of a dovetail pair (bwa writes `TLEN` 0 when the
+/// 5' ends coincide) can disagree, and the answer goes stale once either record is clipped after
+/// its mate fields were set. This is the raw-byte port of fgbio's
+/// `SamRecord.pairOrientation(r1, r2)`.
+///
+/// The negative-strand record's end is htsjdk's `getAlignmentEnd()`, `start + referenceLength -
+/// 1`, deliberately unclamped: a record with no reference-consuming CIGAR ops ends at
+/// `start - 1`. The paired flag is not checked, and the two records are assumed to be the
+/// primary records of the same template.
+#[must_use]
+pub fn pair_orientation_raw(a: &[u8], b: &[u8]) -> Option<PairOrientation> {
+    let (va, vb) = (RawRecordView::try_new(a)?, RawRecordView::try_new(b)?);
+    let (fa, fb) = (va.flags(), vb.flags());
+    if fa & flags::UNMAPPED != 0 || fb & flags::UNMAPPED != 0 || va.ref_id() != vb.ref_id() {
+        return None;
+    }
+    // A mapped record with no position is malformed; it is not placed at coordinate 0.
+    if va.pos() < 0 || vb.pos() < 0 {
+        return None;
+    }
+    // Both records' read-name and CIGAR bounds are checked before any classification, Tandem
+    // included, so a CIGAR that runs past its buffer is rejected rather than read as a zero span.
+    let a_ref_len = reference_length_from_raw_bam_checked(a)?;
+    let b_ref_len = reference_length_from_raw_bam_checked(b)?;
+    let a_reverse = fa & flags::REVERSE != 0;
+    if a_reverse == (fb & flags::REVERSE != 0) {
+        return Some(PairOrientation::Tandem);
+    }
+    let (positive, negative, negative_ref_len) =
+        if a_reverse { (vb, va, a_ref_len) } else { (va, vb, b_ref_len) };
+    // Widened to i64 so an extreme POS or reference length cannot overflow.
+    let positive_five_prime = i64::from(positive.pos()) + 1;
+    let negative_five_prime = i64::from(negative.pos()) + i64::from(negative_ref_len);
+    if positive_five_prime <= negative_five_prime {
+        Some(PairOrientation::FR)
+    } else {
+        Some(PairOrientation::RF)
+    }
+}
+
+/// Whether two records are both paired and mapped as an FR pair.
+///
+/// Order-independent. The orientation is computed from both records' own alignments via
+/// [`pair_orientation_raw`], not from `TLEN`, the `MC` tag or the mate-position fields. A record
+/// flagged as having an unmapped mate is not part of a primary FR pair. Mirrors
+/// fgbio's `SamRecord.isFrPair(r1, r2)`, which also requires both records to be paired.
 #[must_use]
 pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
-    let (va, vb) = (RawRecordView::new(a), RawRecordView::new(b));
+    let (Some(va), Some(vb)) = (RawRecordView::try_new(a), RawRecordView::try_new(b)) else {
+        return false;
+    };
     let (fa, fb) = (va.flags(), vb.flags());
-
-    // Both reads mapped.
-    if fa & flags::UNMAPPED != 0 || fb & flags::UNMAPPED != 0 {
-        return false;
-    }
-    // Both mates mapped.
-    if fa & flags::MATE_UNMAPPED != 0 || fb & flags::MATE_UNMAPPED != 0 {
-        return false;
-    }
-    // Same reference.
-    if va.ref_id() != vb.ref_id() {
-        return false;
-    }
-    // Opposite strands.
-    let a_reverse = fa & flags::REVERSE != 0;
-    let b_reverse = fb & flags::REVERSE != 0;
-    if a_reverse == b_reverse {
-        return false;
-    }
-    // Evaluate FR orientation on the reverse-strand record only (the symmetric branch).
-    let reverse_record = if a_reverse { a } else { b };
-    is_fr_pair_raw(reverse_record)
+    let both_paired = fa & fb & flags::PAIRED != 0;
+    let mates_mapped = (fa | fb) & flags::MATE_UNMAPPED == 0;
+    both_paired && mates_mapped && pair_orientation_raw(a, b) == Some(PairOrientation::FR)
 }
 
 /// FR classification for the MC-tag consensus path, evaluated per-*pair* rather than via the
@@ -131,8 +184,9 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 /// `is_fr_pair_raw`'s forward-strand arm derives the negative-strand 5' end from `TLEN`, which can
 /// disagree with the mate's CIGAR on dovetail FR pairs (htsjdk/samtools#1771) and would zero the
 /// read-through clip for the forward read. The simplex/duplex callers hold the read plus its
-/// `MC` tag (mate CIGAR), so the reverse-strand record's CIGAR-derived orientation — the branch
-/// [`is_primary_fr_pair_raw`] evaluates — can be reconstructed for either strand:
+/// `MC` tag (mate CIGAR), so the reverse-strand record's CIGAR-derived alignment end — what
+/// [`pair_orientation_raw`] reads from the reverse record in hand — can be reconstructed for
+/// either strand:
 /// - a reverse-strand read *is* the reverse record, so its own CIGAR-based arm (exactly
 ///   `is_fr_pair_raw`) is already correct and TLEN-independent;
 /// - a forward-strand read's mate is the reverse record: its leftmost (5') is `mate_pos` and its
@@ -145,7 +199,8 @@ pub fn is_primary_fr_pair_raw(a: &[u8], b: &[u8]) -> bool {
 ///
 /// `mate_ref_len` is the reference span of the mate's CIGAR (from the `MC` tag), clamped by
 /// [`saturating_reference_length`]. This matches `is_primary_fr_pair_raw(read, mate)` on dovetail
-/// pairs without needing the mate record in hand.
+/// pairs without needing the mate record in hand, provided the read's mate-position field and
+/// `MC` tag describe the mate's current alignment.
 #[must_use]
 fn is_fr_pair_with_mate_cigar_raw(bam: &[u8], mate_ref_len: i32) -> bool {
     // Paired, both read and mate mapped, same reference, opposite strands — the same guards as
@@ -265,11 +320,12 @@ fn clip_against_valid_mate_cigar(bam: &[u8], mate_ops: &[u32]) -> usize {
 /// backfills the mate CIGAR from the in-group mate before clipping. Measures the same query
 /// distance as [`num_bases_extending_past_mate_raw`].
 ///
-/// Because both records are in hand, FR classification uses the symmetric per-pair
-/// [`is_primary_fr_pair_raw`] rather than the per-record `is_fr_pair_raw`. The per-record test is
-/// asymmetric for dovetail pairs (htsjdk/samtools#1771): a valid dovetail-forward pair can be
-/// mis-classified as non-FR from the forward read's perspective, which would zero its clip even
-/// though the caller (e.g. the codec caller's `is_primary_fr_pair_raw` gate) accepted the pair.
+/// Because both records are in hand, FR classification uses the pair-level
+/// [`is_primary_fr_pair_raw`], computed from both records' own alignments, rather than the
+/// per-record `is_fr_pair_raw`. The per-record test is asymmetric for dovetail pairs
+/// (htsjdk/samtools#1771): a valid dovetail-forward pair can be mis-classified as non-FR from the
+/// forward read's perspective, which would zero its clip even though the caller (e.g. the codec
+/// caller's `is_primary_fr_pair_raw` gate) accepted the pair.
 #[must_use]
 pub fn num_bases_extending_past_mate_vs_mate_raw(rec: &[u8], mate: &[u8]) -> usize {
     if !is_primary_fr_pair_raw(rec, mate) {
@@ -1153,8 +1209,8 @@ mod tests {
         //    (101 <= 101 - 90 - 1 => false) and wrongly reports NOT FR (CODEC-01);
         //  - reverse read (100M @ 61..160, mate 5' at 101) uses the CIGAR branch
         //    (101 <= 160 => true) and reports FR.
-        // is_primary_fr_pair_raw evaluates the reverse record only, so it is symmetric
-        // and returns true regardless of argument order.
+        // is_primary_fr_pair_raw reads both records' own alignments (forward start 101 <=
+        // reverse end 160), so it is symmetric and returns true regardless of argument order.
         let fwd = make_bam_bytes_with_tlen(
             0,
             100,
@@ -1272,6 +1328,250 @@ mod tests {
             &[],
         );
         assert!(!is_primary_fr_pair_raw(&fr_fwd, &xchrom), "cross-chromosomal is not FR");
+    }
+
+    // ========================================================================
+    // pair_orientation_raw tests (pair-level orientation from both alignments)
+    // ========================================================================
+
+    /// One record for the pair-level orientation tests: 0-based `pos`, a `<n>M` (or soft-clipped)
+    /// CIGAR, and the given strand. The mate fields are set to a fixed, deliberately meaningless
+    /// value (mate at 0-based 9999 on reference 0, `TLEN` 0, no `MC`) so that any dependence on
+    /// them would show up as a wrong answer.
+    fn orientation_rec(tid: i32, pos: i32, reverse: bool, ops: &[u32]) -> Vec<u8> {
+        let mut flag = flags::PAIRED;
+        if reverse {
+            flag |= flags::REVERSE;
+        } else {
+            flag |= flags::MATE_REVERSE;
+        }
+        let seq_len = query_length_from_cigar(ops);
+        make_bam_bytes_with_tlen(tid, pos, flag, b"o", ops, seq_len, 0, 9999, 0, &[])
+    }
+
+    /// `pair_orientation_raw` over a matrix of geometries, in both argument orders. Each record is
+    /// `(tid, 0-based pos, reverse)` with a `100M` CIGAR; positions in the comments are 1-based.
+    /// Each record's mate fields are junk (see `orientation_rec`), so every answer comes from the
+    /// two alignments.
+    #[rstest]
+    // + at 100-199, - at 300-399: an ordinary innie.
+    #[case::fr((0, 99, false), (0, 299, true), Some(PairOrientation::FR))]
+    // - at 100-199, + at 300-399: positive start 300 > negative end 199.
+    #[case::rf((0, 99, true), (0, 299, false), Some(PairOrientation::RF))]
+    #[case::tandem_forward((0, 99, false), (0, 299, false), Some(PairOrientation::Tandem))]
+    #[case::tandem_reverse((0, 99, true), (0, 299, true), Some(PairOrientation::Tandem))]
+    #[case::cross_contig((0, 99, false), (1, 299, true), None)]
+    // + at 100-199, - at 1-100: the 5' ends coincide at 100, which htsjdk calls FR.
+    #[case::coincident_five_prime_is_fr((0, 99, false), (0, 0, true), Some(PairOrientation::FR))]
+    // + at 101-200, - at 1-100: one base apart, RF.
+    #[case::one_base_apart_is_rf((0, 100, false), (0, 0, true), Some(PairOrientation::RF))]
+    fn test_pair_orientation_raw(
+        #[case] a: (i32, i32, bool),
+        #[case] b: (i32, i32, bool),
+        #[case] expected: Option<PairOrientation>,
+    ) {
+        let a = orientation_rec(a.0, a.1, a.2, &[encode_op(0, 100)]);
+        let b = orientation_rec(b.0, b.1, b.2, &[encode_op(0, 100)]);
+        assert_eq!(pair_orientation_raw(&a, &b), expected, "(a, b)");
+        assert_eq!(pair_orientation_raw(&b, &a), expected, "(b, a)");
+        let fr = expected == Some(PairOrientation::FR);
+        assert_eq!(is_primary_fr_pair_raw(&a, &b), fr, "is_primary_fr_pair_raw(a, b)");
+        assert_eq!(is_primary_fr_pair_raw(&b, &a), fr, "is_primary_fr_pair_raw(b, a)");
+    }
+
+    /// Either record unmapped gives no orientation; the unmapped record's own position and CIGAR
+    /// are not consulted.
+    #[rstest]
+    #[case::first_unmapped(true, false)]
+    #[case::second_unmapped(false, true)]
+    #[case::both_unmapped(true, true)]
+    fn test_pair_orientation_raw_unmapped(#[case] a_unmapped: bool, #[case] b_unmapped: bool) {
+        let mut a = orientation_rec(0, 99, false, &[encode_op(0, 100)]);
+        let mut b = orientation_rec(0, 299, true, &[encode_op(0, 100)]);
+        let unmap = |rec: &mut Vec<u8>| {
+            let f = RawRecordView::new(rec).flags() | flags::UNMAPPED;
+            crate::fields::set_flags(rec, f);
+        };
+        if a_unmapped {
+            unmap(&mut a);
+        }
+        if b_unmapped {
+            unmap(&mut b);
+        }
+        assert_eq!(pair_orientation_raw(&a, &b), None);
+        assert_eq!(pair_orientation_raw(&b, &a), None);
+        assert!(!is_primary_fr_pair_raw(&a, &b));
+    }
+
+    /// Malformed records fail closed rather than panicking or reading a bogus span: a record
+    /// shorter than the 32-byte fixed core gives no orientation, and so does a record of either
+    /// strand whose declared CIGAR runs past the end of its buffer.
+    #[rstest]
+    #[case::forward_shorter_than_core(Some(10), None)]
+    #[case::reverse_shorter_than_core(None, Some(10))]
+    #[case::both_empty(Some(0), Some(0))]
+    // 32-byte core + "o\0" read name, but the 4-byte CIGAR is cut off.
+    #[case::reverse_cigar_truncated(None, Some(34))]
+    #[case::forward_cigar_truncated(Some(34), None)]
+    fn test_pair_orientation_raw_malformed_fails_closed(
+        #[case] forward_len: Option<usize>,
+        #[case] reverse_len: Option<usize>,
+    ) {
+        let mut fwd = orientation_rec(0, 99, false, &[encode_op(0, 100)]);
+        let mut rev = orientation_rec(0, 299, true, &[encode_op(0, 100)]);
+        if let Some(len) = forward_len {
+            fwd.truncate(len);
+        }
+        if let Some(len) = reverse_len {
+            rev.truncate(len);
+        }
+        assert_eq!(pair_orientation_raw(&fwd, &rev), None, "(fwd, rev)");
+        assert_eq!(pair_orientation_raw(&rev, &fwd), None, "(rev, fwd)");
+        assert!(!is_primary_fr_pair_raw(&fwd, &rev));
+        assert!(!is_primary_fr_pair_raw(&rev, &fwd));
+    }
+
+    /// A mapped record with no position (BAM POS -1) gives no orientation, rather than being
+    /// placed at coordinate 0, where `0 <= 199` would call the pair FR.
+    #[rstest]
+    #[case::forward_no_position(true, false)]
+    #[case::reverse_no_position(false, true)]
+    fn test_pair_orientation_raw_missing_position_fails_closed(
+        #[case] clear_forward: bool,
+        #[case] clear_reverse: bool,
+    ) {
+        let fwd =
+            orientation_rec(0, if clear_forward { -1 } else { 99 }, false, &[encode_op(0, 100)]);
+        let rev =
+            orientation_rec(0, if clear_reverse { -1 } else { 99 }, true, &[encode_op(0, 100)]);
+        assert_eq!(pair_orientation_raw(&fwd, &rev), None, "(fwd, rev)");
+        assert_eq!(pair_orientation_raw(&rev, &fwd), None, "(rev, fwd)");
+        assert!(!is_primary_fr_pair_raw(&fwd, &rev));
+    }
+
+    /// A same-strand pair is still checked for a CIGAR that runs past its buffer before it is
+    /// called Tandem, so a truncated record gives no orientation whatever the strands.
+    #[rstest]
+    fn test_pair_orientation_raw_tandem_cigar_truncated_fails_closed(
+        #[values(false, true)] reverse: bool,
+    ) {
+        let mut a = orientation_rec(0, 99, reverse, &[encode_op(0, 100)]);
+        let b = orientation_rec(0, 299, reverse, &[encode_op(0, 100)]);
+        a.truncate(34);
+        assert_eq!(pair_orientation_raw(&a, &b), None, "(a, b)");
+        assert_eq!(pair_orientation_raw(&b, &a), None, "(b, a)");
+    }
+
+    /// `is_primary_fr_pair_raw` requires both records to be paired, as fgbio's
+    /// `SamRecord.isFrPair(r1, r2)` does; `pair_orientation_raw` does not look at the flag.
+    #[rstest]
+    #[case::first_unpaired(true, false)]
+    #[case::second_unpaired(false, true)]
+    fn test_is_primary_fr_pair_raw_requires_both_paired(
+        #[case] a_unpaired: bool,
+        #[case] b_unpaired: bool,
+    ) {
+        let mut a = orientation_rec(0, 99, false, &[encode_op(0, 100)]);
+        let mut b = orientation_rec(0, 299, true, &[encode_op(0, 100)]);
+        let unpair = |rec: &mut Vec<u8>| {
+            let f = RawRecordView::new(rec).flags() & !flags::PAIRED;
+            crate::fields::set_flags(rec, f);
+        };
+        if a_unpaired {
+            unpair(&mut a);
+        }
+        if b_unpaired {
+            unpair(&mut b);
+        }
+        assert_eq!(pair_orientation_raw(&a, &b), Some(PairOrientation::FR));
+        assert!(!is_primary_fr_pair_raw(&a, &b));
+        assert!(!is_primary_fr_pair_raw(&b, &a));
+    }
+
+    /// The dovetail from fgbio#1190 with no `MC` tag and bwa's `TLEN` 0: forward `100M` at 50
+    /// (50-149), reverse `50S50M` at 1 (aligned 1-50). The 5' ends coincide at 50, so the pair is
+    /// FR. The forward record's per-record `TLEN` arm says RF (`50 <= 50 + 0 - 1` is false), which
+    /// is why the pair-level check must not consult it.
+    #[test]
+    fn test_pair_orientation_raw_mc_less_coincident_five_prime_dovetail() {
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            49,
+            flags::PAIRED | flags::MATE_REVERSE | flags::FIRST_SEGMENT,
+            b"dovetail",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            0,
+            0,
+            &[],
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            0,
+            flags::PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+            b"dovetail",
+            &[encode_op(4, 50), encode_op(0, 50)],
+            100,
+            0,
+            49,
+            0,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&fwd), "the per-record TLEN arm disagrees");
+        assert_eq!(pair_orientation_raw(&fwd, &rev), Some(PairOrientation::FR));
+        assert_eq!(pair_orientation_raw(&rev, &fwd), Some(PairOrientation::FR));
+        assert!(is_primary_fr_pair_raw(&fwd, &rev));
+        assert!(is_primary_fr_pair_raw(&rev, &fwd));
+    }
+
+    /// The reverse record's mate-position field is stale (for example, left over from before the
+    /// forward record was clipped). The answer must follow the forward record's actual start, not
+    /// that field. The reverse record is `100M` at 100-199.
+    #[rstest]
+    // Forward actually starts at 250 (RF), but the stale field says 150 (would read as FR).
+    #[case::stale_field_says_fr(249, 149, Some(PairOrientation::RF))]
+    // Forward actually starts at 150 (FR), but the stale field says 250 (would read as RF).
+    #[case::stale_field_says_rf(149, 249, Some(PairOrientation::FR))]
+    fn test_pair_orientation_raw_ignores_stale_mate_position(
+        #[case] fwd_pos: i32,
+        #[case] stale_mate_pos: i32,
+        #[case] expected: Option<PairOrientation>,
+    ) {
+        let fwd = make_bam_bytes_with_tlen(
+            0,
+            fwd_pos,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"stale",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            99,
+            0,
+            &[],
+        );
+        let rev = make_bam_bytes_with_tlen(
+            0,
+            99,
+            flags::PAIRED | flags::REVERSE,
+            b"stale",
+            &[encode_op(0, 100)],
+            100,
+            0,
+            stale_mate_pos,
+            0,
+            &[],
+        );
+        assert_ne!(
+            Some(is_fr_pair_raw(&rev)),
+            expected.map(|o| o == PairOrientation::FR),
+            "the reverse record's per-record arm reads the stale field"
+        );
+        assert_eq!(pair_orientation_raw(&fwd, &rev), expected);
+        assert_eq!(pair_orientation_raw(&rev, &fwd), expected);
+        let fr = expected == Some(PairOrientation::FR);
+        assert_eq!(is_primary_fr_pair_raw(&fwd, &rev), fr);
+        assert_eq!(is_primary_fr_pair_raw(&rev, &fwd), fr);
     }
 
     /// The fgbio `CodecConsensusCallerTest` dovetail pair (`isPrimaryFrPair` test, ~line 359 on
