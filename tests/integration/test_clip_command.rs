@@ -1436,6 +1436,93 @@ fn test_clip_command_with_metrics() {
     assert!(metrics_path.exists(), "Metrics file not created");
 }
 
+/// End to end, `clip --clip-overlapping-reads` on a pair whose 5' ends coincide (as proposed in
+/// fulcrumgenomics/fgbio#1191, open; fgbio main leaves R2 unclipped): R1 is `+` `100M` at 50 (50-149) and R2 is `-` `50S50M` at 1
+/// (aligned 1-50). The reference midpoint is 50, R2's last aligned base, so R1 keeps 50-50 and
+/// the whole of R2 is clipped, which unmaps it. The mate fields must agree with that, and the
+/// metrics must count R1's 99 overlapping bases and R2 as unmapped. Run with and without
+/// `--clip-bases-past-mate` (which then has nothing to do) and at one and two threads.
+#[rstest]
+fn test_clip_unmaps_reverse_read_of_coincident_five_prime_pair(
+    #[values(false, true)] clip_bases_past_mate: bool,
+    #[values(None, Some("2"))] threads: Option<&str>,
+) {
+    use fgumi_lib::metrics::{ClippingMetrics, ReadType};
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // 0-based positions: R1 at 49, R2 at 0.
+    let r1 = read_with_cigar_mc(
+        b"q1",
+        flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE,
+        49,
+        0,
+        &[100 << 4],
+        60,
+        b"50S50M",
+    );
+    let r2 = read_with_cigar_mc(
+        b"q1",
+        flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+        0,
+        49,
+        &[(50 << 4) | 4, 50 << 4],
+        60,
+        b"100M",
+    );
+    create_paired_bam(&input_bam, vec![(r1, r2)]);
+
+    let mut args = vec![
+        "clip",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--metrics",
+        metrics_path.to_str().unwrap(),
+        "--clip-overlapping-reads",
+        "true",
+        "--clip-bases-past-mate",
+        if clip_bases_past_mate { "true" } else { "false" },
+        "--compression-level",
+        "1",
+    ];
+    if let Some(t) = threads {
+        args.extend_from_slice(&["--threads", t]);
+    }
+    Clip::try_parse_from(args).expect("parse clip args").execute("fgumi clip").expect("clip");
+
+    let recs = read_output_record_bufs(&output_bam);
+    assert_eq!(recs.len(), 2, "both reads retained");
+    let r1 = recs.iter().find(|r| r.flags().is_first_segment()).expect("R1");
+    let r2 = recs.iter().find(|r| r.flags().is_last_segment()).expect("R2");
+
+    assert!(!r1.flags().is_unmapped(), "R1 stays mapped");
+    assert_eq!(r1.alignment_start().map(usize::from), Some(50));
+    assert_eq!(r1.alignment_end().map(usize::from), Some(50));
+    assert!(r1.flags().is_mate_unmapped(), "R1's mate is now unmapped");
+
+    assert!(r2.flags().is_unmapped(), "R2 is fully clipped and unmapped");
+    assert!(!r2.flags().is_mate_unmapped(), "R2's mate is still mapped");
+    // An unmapped read is placed at its mapped mate's position.
+    assert_eq!(r2.alignment_start().map(usize::from), Some(50));
+    assert_eq!(r2.mate_alignment_start().map(usize::from), Some(50));
+
+    let rows = fgumi_lib::metrics::read_metrics::<_, ClippingMetrics>(&metrics_path, "clipping")
+        .expect("parse metrics");
+    let row = |t: ReadType| rows.iter().find(|m| m.read_type == t).expect("metrics row");
+    assert_eq!(row(ReadType::ReadOne).bases_clipped_overlapping, 99);
+    assert_eq!(row(ReadType::ReadTwo).bases_clipped_overlapping, 50);
+    assert_eq!(row(ReadType::ReadTwo).reads_unmapped, 1);
+    assert_eq!(row(ReadType::ReadOne).reads_unmapped, 0);
+}
+
 /// Write a BAM from an explicit list of records (any flags), using the shared minimal header.
 fn create_bam_from_records(path: &Path, records: &[RawRecord]) {
     let header = create_minimal_header("chr1", 10000);
