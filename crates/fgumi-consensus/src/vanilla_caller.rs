@@ -41,7 +41,8 @@ type ConsensusResult = (Vec<u8>, Vec<PhredScore>, Vec<u16>, Vec<u16>);
 /// This is the core logic for `filterToMostCommonAlignment` from fgbio's `UmiConsensusCaller`.
 /// It groups reads by compatible CIGAR patterns (using prefix matching) and returns the
 /// indices of reads in the largest group. In case of ties, deterministic tie-breaking is
-/// used: larger group size wins, then smaller CIGAR wins.
+/// used: larger group size wins, then smaller CIGAR wins. See
+/// [`select_most_common_alignment_group_by_strand`] for a strand-aware tie-break.
 ///
 /// # Arguments
 /// * `indexed` - Slice of (`original_index`, length, `simplified_cigar`) tuples,
@@ -52,6 +53,17 @@ type ConsensusResult = (Vec<u8>, Vec<PhredScore>, Vec<u16>, Vec<u16>);
 /// # Returns
 /// Vector of indices belonging to the most common alignment group.
 pub(crate) fn select_most_common_alignment_group(indexed: &[IndexedSourceRead]) -> Vec<usize> {
+    select_most_common_alignment_group_by_strand(indexed, |_| true)
+}
+
+/// Like [`select_most_common_alignment_group`], but on a tie between group sizes prefers the
+/// group with the most reads on its weaker strand, before falling back to the smaller CIGAR.
+///
+/// `strand` maps an `original_index` to its source strand.
+pub(crate) fn select_most_common_alignment_group_by_strand(
+    indexed: &[IndexedSourceRead],
+    strand: impl Fn(usize) -> bool,
+) -> Vec<usize> {
     if indexed.len() < 2 {
         return indexed.iter().map(|(idx, _, _)| *idx).collect();
     }
@@ -114,12 +126,21 @@ pub(crate) fn select_most_common_alignment_group(indexed: &[IndexedSourceRead]) 
         a.len().cmp(&b.len())
     };
 
-    // Deterministic tie-breaking: by size (larger wins), then by CIGAR (smaller wins)
-    // This ensures consistent results regardless of input order
+    let weaker_strand_size = |indices: &[usize]| -> usize {
+        let n = indices.iter().filter(|&&i| strand(i)).count();
+        n.min(indices.len() - n)
+    };
+
+    // Deterministic tie-breaking: by size (larger wins), then by weaker-strand support (larger
+    // wins), then by CIGAR (smaller wins)
     groups
         .into_iter()
         .max_by(|(cigar_a, indices_a), (cigar_b, indices_b)| {
-            indices_a.len().cmp(&indices_b.len()).then_with(|| cmp_cigar(cigar_b, cigar_a))
+            indices_a
+                .len()
+                .cmp(&indices_b.len())
+                .then_with(|| weaker_strand_size(indices_a).cmp(&weaker_strand_size(indices_b)))
+                .then_with(|| cmp_cigar(cigar_b, cigar_a))
         })
         .map(|(_, indices)| indices)
         .unwrap_or_default()
@@ -705,14 +726,17 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Filters `SourceReads` by common alignment pattern.
-    /// This is the public wrapper for use by `DuplexConsensusCaller`.
+    /// This is the public wrapper for use by `DuplexConsensusCaller`, whose pools mix AB and BA
+    /// reads that the first-of-pair flag tells apart, so ties are broken by strand support.
     ///
     /// Returns the filtered `SourceReads` and a set of rejected original indices.
     pub(crate) fn filter_by_alignment(
         &mut self,
         source_reads: Vec<SourceRead>,
     ) -> (Vec<SourceRead>, HashSet<usize>) {
-        self.filter_source_reads_by_alignment(source_reads)
+        self.filter_source_reads_by_alignment_with(source_reads, |sr| {
+            sr.flags & flags::FIRST_SEGMENT != 0
+        })
     }
 
     /// Builds consensus from already-filtered `SourceReads`.
@@ -1267,6 +1291,16 @@ impl VanillaUmiConsensusCaller {
         &mut self,
         source_reads: Vec<SourceRead>,
     ) -> (Vec<SourceRead>, HashSet<usize>) {
+        self.filter_source_reads_by_alignment_with(source_reads, |_| true)
+    }
+
+    /// Like [`Self::filter_source_reads_by_alignment`], with `strand` splitting the reads into
+    /// their source strands for the tie-break.
+    fn filter_source_reads_by_alignment_with(
+        &mut self,
+        source_reads: Vec<SourceRead>,
+        strand: impl Fn(&SourceRead) -> bool,
+    ) -> (Vec<SourceRead>, HashSet<usize>) {
         let (source_reads, unmapped_rejected) = self.drop_unmapped_if_any_mapped(source_reads);
 
         if source_reads.len() < 2 {
@@ -1283,8 +1317,8 @@ impl VanillaUmiConsensusCaller {
         // Sort by descending length for prefix matching
         indexed.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Use shared grouping logic with deterministic tie-breaking
-        let keep_indices = select_most_common_alignment_group(&indexed);
+        let on_strand: Vec<bool> = source_reads.iter().map(&strand).collect();
+        let keep_indices = select_most_common_alignment_group_by_strand(&indexed, |i| on_strand[i]);
 
         // For small sets, a boolean vec is more efficient than HashSet
         // due to cache locality and no hashing overhead
