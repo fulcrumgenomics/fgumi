@@ -4505,6 +4505,57 @@ mod tests {
         reads
     }
 
+    /// Builds one molecule whose pooled AB-R1 and BA-R2 reads split between `10M` (named `ref_*`)
+    /// and `5M1I4M` (named `ins_*`).
+    fn tied_molecule(ab_ref: usize, ab_ins: usize, ba_ref: usize, ba_ins: usize) -> Vec<RawRecord> {
+        let cigar_10m = &[encode_op(0, 10)];
+        let cigar_ins = &[encode_op(0, 5), encode_op(1, 1), encode_op(0, 4)];
+        let quals = &[30u8; 10];
+        let mut b = SamBuilder::new();
+        let mut reads = Vec::new();
+        let mut ab = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
+            reads.push(ab_r1(b, name.as_bytes(), b"AAAAAAAAAA", quals, cigar, b"foo/A", &[]));
+            reads.push(ab_r2(b, name.as_bytes(), b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]));
+        };
+        (0..ab_ref).for_each(|i| ab(&mut b, format!("ref_ab{i}"), cigar_10m));
+        (0..ab_ins).for_each(|i| ab(&mut b, format!("ins_ab{i}"), cigar_ins));
+        let mut ba = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
+            reads.push(ba_r1(b, name.as_bytes(), b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]));
+            reads.push(ba_r2(b, name.as_bytes(), b"AAAAAAAAAA", quals, cigar, b"foo/B", &[]));
+        };
+        (0..ba_ref).for_each(|i| ba(&mut b, format!("ref_ba{i}"), cigar_10m));
+        (0..ba_ins).for_each(|i| ba(&mut b, format!("ins_ba{i}"), cigar_ins));
+        reads
+    }
+
+    /// On a tie, the alignment both strands support must win: `10M` (6 AB + 4 BA) over
+    /// `5M1I4M` (9 AB + 1 BA).
+    #[test]
+    fn test_alignment_tie_prefers_the_group_supported_by_both_strands() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+        let result = caller.consensus_reads(tied_molecule(6, 9, 4, 1))?;
+        assert_eq!(result.count, 2);
+        assert_eq!(caller.rejected_reads.len(), 10);
+        for record in &caller.rejected_reads {
+            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ins_"));
+        }
+        Ok(())
+    }
+
+    /// An indel both strands support wins: `5M1I4M` (5 AB + 5 BA) over `10M` (9 AB + 1 BA),
+    /// even though `10M` is the smaller CIGAR.
+    #[test]
+    fn test_alignment_tie_prefers_a_two_strand_indel_over_a_one_strand_reference() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+        let result = caller.consensus_reads(tied_molecule(9, 5, 1, 5))?;
+        assert_eq!(result.count, 2);
+        assert_eq!(caller.rejected_reads.len(), 10);
+        for record in &caller.rejected_reads {
+            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ref_"));
+        }
+        Ok(())
+    }
+
     /// Builds a duplex caller for the #757 fixtures above.
     fn rejection_accounting_caller(
         min_reads: Vec<usize>,
