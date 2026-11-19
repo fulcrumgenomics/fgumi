@@ -444,7 +444,9 @@ mod tests {
     /// than `seen` times; returns the new count. `full_waits` is bumped only
     /// after a chunk is filled and the queue refused it, so the producer is
     /// then blocked with the buffer full and reads nothing more until the
-    /// consumer drains a chunk.
+    /// consumer drains a chunk. That holds only while the consumer is not
+    /// reading: a wait counted during a drain can end mid-drain, so after a
+    /// drain use [`wait_until_queue_full`] to see how far the producer got.
     fn wait_until_full(reader: &ReadBuffer, seen: u64) -> u64 {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -453,6 +455,17 @@ mod tests {
                 return waits;
             }
             assert!(Instant::now() < deadline, "the buffer never filled: {:?}", reader.stats());
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wait (up to 10 s) until the queue holds `depth` chunks. Only the
+    /// consumer takes chunks out, so while it reads nothing the queue stays
+    /// full once it gets there.
+    fn wait_until_queue_full(reader: &ReadBuffer) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !reader.rx.is_full() {
+            assert!(Instant::now() < deadline, "the queue never filled: {:?}", reader.stats());
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -539,20 +552,35 @@ mod tests {
     /// Draining the buffer lets the producer read further, and drained chunks
     /// are reused: across several fill/drain cycles the producer allocates no
     /// more chunks than the queue holds plus the two in flight.
+    ///
+    /// Each cycle waits for the queue to be full again rather than for the
+    /// producer's next full wait: the producer can find the queue full while
+    /// `read_exact` is still draining it, and that wait says nothing about how
+    /// far it got after the drain (#1109). A full queue does: everything read
+    /// but not yet consumed before the drain (at most `budget` bytes: the
+    /// queue, the producer's chunk and the consumer's current chunk) has been
+    /// consumed, so its `depth` chunks, of which only the oldest can be partly
+    /// filled (and it holds at least one inner read), were all read since.
+    /// Once the queue is full and the consumer idle, the producer fills one
+    /// more chunk and blocks, so each cycle also counts another full wait.
     #[test]
     fn resumes_after_the_consumer_drains() {
         let budget = 16 * KIB64;
-        let (_, depth) = layout(budget);
+        let step = KIB64;
+        let (chunk_size, depth) = layout(budget);
         let read = Arc::new(AtomicUsize::new(0));
-        let mut reader = buffer(Counting { step: 65536, read: Arc::clone(&read) }, budget);
+        let mut reader = buffer(Counting { step, read: Arc::clone(&read) }, budget);
+        wait_until_queue_full(&reader);
         let mut waits = wait_until_full(&reader, 0);
         let mut sink = vec![0u8; budget];
         for _ in 0..4 {
             let before = read.load(Ordering::SeqCst);
             reader.read_exact(&mut sink).unwrap();
-            waits = wait_until_full(&reader, waits);
+            wait_until_queue_full(&reader);
             let after = read.load(Ordering::SeqCst);
-            assert!(after >= before + budget / 2, "producer did not resume: {before} -> {after}");
+            waits = wait_until_full(&reader, waits);
+            let resumed = step + (depth - 1) * chunk_size;
+            assert!(after >= before + resumed, "producer did not resume: {before} -> {after}");
         }
         assert!(reader.stats().peak_queued <= budget as u64);
         let allocations = reader.stats.allocations.load(Ordering::Relaxed);
