@@ -1,0 +1,83 @@
+[package]
+name = "fgumi-htslib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Vendored htslib CRAM codec with an external-executor hook, for the fgumi family of crates"
+repository.workspace = true
+license.workspace = true
+links = "fgumi-hts"
+build = "build.rs"
+# The vendored htslib tree (vendor/htslib, MIT/BSD) is patched by
+# vendor/container-executor.patch (the same
+# change proposed upstream as `cram_set_container_executor`); see that file and csrc/fgumi_hts.c.
+# Only what build.rs compiles is published: its C sources (`FILES`), every
+# header they may include, the patch and the licenses. The unbuilt rest of the
+# pristine upstream tree stays in the repository (for diffing against
+# upstream) but out of the crate.
+include = [
+    "src/**",
+    "csrc/**",
+    "build.rs",
+    "Cargo.toml",
+    "/README.md",
+    "vendor/container-executor.patch",
+    "vendor/htslib/LICENSE",
+    "vendor/htslib/**/*.h",
+    "vendor/htslib/kfunc.c",
+    "vendor/htslib/kstring.c",
+    "vendor/htslib/bcf_sr_sort.c",
+    "vendor/htslib/bgzf.c",
+    "vendor/htslib/errmod.c",
+    "vendor/htslib/faidx.c",
+    "vendor/htslib/header.c",
+    "vendor/htslib/hfile.c",
+    "vendor/htslib/hts.c",
+    "vendor/htslib/hts_expr.c",
+    "vendor/htslib/hts_os.c",
+    "vendor/htslib/os/rand.c",
+    "vendor/htslib/md5.c",
+    "vendor/htslib/multipart.c",
+    "vendor/htslib/probaln.c",
+    "vendor/htslib/realn.c",
+    "vendor/htslib/regidx.c",
+    "vendor/htslib/region.c",
+    "vendor/htslib/sam.c",
+    "vendor/htslib/sam_mods.c",
+    "vendor/htslib/simd.c",
+    "vendor/htslib/synced_bcf_reader.c",
+    "vendor/htslib/vcf_sweep.c",
+    "vendor/htslib/tbx.c",
+    "vendor/htslib/textutils.c",
+    "vendor/htslib/thread_pool.c",
+    "vendor/htslib/vcf.c",
+    "vendor/htslib/vcfutils.c",
+    "vendor/htslib/cram/*.c",
+    "vendor/htslib/htscodecs/LICENSE.md",
+    "vendor/htslib/htscodecs/htscodecs/*.c",
+]
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+
+[dependencies]
+log = { workspace = true }
+# Linked for their C libraries only (htslib's zlib and libdeflate); declared
+# so their `DEP_*_INCLUDE` reach build.rs and the link lines are emitted once.
+libdeflate-sys = "1.26"
+libz-sys = { version = "1.1.33", default-features = false, features = ["libc"] }
+# CRAM's optional bzip2 / lzma block codecs (`use_bzip2` / `use_lzma`), built
+# from source so a CRAM written with them reads anywhere fgumi runs.
+bzip2-sys = { version = "0.1.13", features = ["static"] }
+lzma-sys = { version = "0.1.20", features = ["static"] }
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
+
+[dev-dependencies]
+fgumi-raw-bam = { workspace = true }
+fgumi-tag = { workspace = true }
+flate2 = { workspace = true }
+rstest = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+tempfile = { workspace = true }

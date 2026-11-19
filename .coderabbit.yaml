@@ -135,6 +135,9 @@ reviews:
     - "!docs/book/**"
     - "!docs/theme/**"
     - "!docs/LAST_SYNCED"
+    # Verbatim upstream htslib (~125k lines of C); review the patch
+    # (vendor/container-executor.patch), csrc/, build.rs and src/ instead.
+    - "!crates/fgumi-htslib/vendor/htslib/**"
 
   # Suggest the per-command labels this repo already uses, so triage does not
   # depend on the author remembering. Suggestion only — never auto-applied.
@@ -333,11 +336,9 @@ reviews:
       instructions: >-
         SIMD-accelerated FASTQ lexing over hand-written NEON and AVX2 intrinsics
         with runtime feature dispatch. This is the sharpest `unsafe` exposure in
-        the repo and is an exception on three counts: it is the only workspace
-        member without `#![deny(unsafe_code)]` at its crate root, its `unsafe`
-        sites are absent from CLAUDE.md's allowlist, and Miri cannot execute the
-        intrinsics so `miri.yml` does not cover it. It also parses untrusted
-        input. Require, for every intrinsic block: a `// SAFETY:` comment naming
+        the repo: all of the crate's `unsafe` is confined to `lexer.rs`, and Miri
+        cannot execute the intrinsics, so `miri.yml` does not cover it. It also
+        parses untrusted input. Require, for every intrinsic block: a `// SAFETY:` comment naming
         the target feature it assumes, evidence that the runtime dispatch
         actually gates that feature, and a bounds argument for every load/store
         showing the vector width cannot read past the end of the buffer. Flag
@@ -345,6 +346,24 @@ reviews:
         `movemask` index arithmetic that can point outside the chunk, and any
         record-boundary decision reachable on malformed FASTQ that the scalar
         fallback does not also cover.
+    - path: "crates/fgumi-htslib/**"
+      instructions: >-
+        The FFI crate for CRAM (feature `cram`): a vendored htslib (`vendor/htslib`,
+        upstream, do not review) patched by `vendor/container-executor.patch`, C glue
+        in `csrc/fgumi_hts.c` that calls htslib internals, and the safe wrapper
+        `src/lib.rs`, the one workspace crate that is `#![allow(unsafe_code)]`.
+        Check every `unsafe` block's `// SAFETY:` against the invariants in
+        CLAUDE.md's "Approved FFI crate: `fgumi-htslib`" section: a `SliceJob` is
+        freed before the `Container` and `ReaderInner` it holds; each write-side
+        container has exactly one owner (`EncodeJob` / `EncodedContainer`, freed
+        with `cram_free_container` on drop); the executor's context (the raw-owned
+        `DispatchSink`) is detached in `CramWriter::drop` before it is freed there;
+        container writes are serialized by the `WriteState` mutex and checked for
+        order; `shared_ref` is set before any concurrent decode or encode; an
+        abandoned writer must never end in an EOF container. Compare the glue with
+        the htslib code it re-states (`cram_next_slice`, `bam_read1`, `bam_write1`,
+        `bam_tag2cigar`) and flag any check it drops, and any path where a
+        truncated or malformed CRAM reads as a clean end of file.
     - path: "src/lib/commands/**/*.rs"
       instructions: >-
         This is the CLI layer: argument contracts, defaults, validation, and

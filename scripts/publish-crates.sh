@@ -28,6 +28,7 @@ CRATES=(
   fgumi-cli-common
   fgumi-pipeline-core
   fgumi-raw-bam
+  fgumi-htslib
   fgumi-bam-io
   fgumi-umi
   fgumi-sam
