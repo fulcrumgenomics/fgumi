@@ -1317,8 +1317,11 @@ impl VanillaUmiConsensusCaller {
         // Sort by descending length for prefix matching
         indexed.sort_by_key(|&(_, len, _)| std::cmp::Reverse(len));
 
-        let on_strand: Vec<bool> = source_reads.iter().map(&strand).collect();
-        let keep_indices = select_most_common_alignment_group_by_strand(&indexed, |i| on_strand[i]);
+        // Group indices are positions in `source_reads`, not in the length-sorted `indexed`. The
+        // strand is looked up lazily, so it is only tallied when two groups tie on size (never
+        // when there is a single group).
+        let keep_indices =
+            select_most_common_alignment_group_by_strand(&indexed, |i| strand(&source_reads[i]));
 
         // For small sets, a boolean vec is more efficient than HashSet
         // due to cache locality and no hashing overhead
