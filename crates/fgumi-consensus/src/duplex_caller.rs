@@ -4505,26 +4505,38 @@ mod tests {
         reads
     }
 
-    /// Builds one molecule whose pooled AB-R1 and BA-R2 reads split between `10M` (named `ref_*`)
-    /// and `5M1I4M` (named `ins_*`).
-    fn tied_molecule(ab_ref: usize, ab_ins: usize, ba_ref: usize, ba_ins: usize) -> Vec<RawRecord> {
-        let cigar_10m = &[encode_op(0, 10)];
-        let cigar_ins = &[encode_op(0, 5), encode_op(1, 1), encode_op(0, 4)];
-        let quals = &[30u8; 10];
+    /// Builds one molecule whose pooled AB-R1 and BA-R2 reads split between a full-length match
+    /// (named `ref_*`) and a 1-base insertion after the fifth base (named `ins_*`). AB reads are
+    /// `ab_len` bases long and BA reads `ba_len`, so the two alignments are `{len}M` and
+    /// `5M1I{len - 6}M` on each strand.
+    fn tied_molecule(
+        ab_len: usize,
+        ba_len: usize,
+        ab_ref: usize,
+        ab_ins: usize,
+        ba_ref: usize,
+        ba_ins: usize,
+    ) -> Vec<RawRecord> {
+        let ref_cigar = |len: usize| vec![encode_op(0, len)];
+        let ins_cigar = |len: usize| vec![encode_op(0, 5), encode_op(1, 1), encode_op(0, len - 6)];
         let mut b = SamBuilder::new();
         let mut reads = Vec::new();
+
+        let (ab_a, ab_c, ab_q) = (vec![b'A'; ab_len], vec![b'C'; ab_len], vec![30u8; ab_len]);
         let mut ab = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
-            reads.push(ab_r1(b, name.as_bytes(), b"AAAAAAAAAA", quals, cigar, b"foo/A", &[]));
-            reads.push(ab_r2(b, name.as_bytes(), b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]));
+            reads.push(ab_r1(b, name.as_bytes(), &ab_a, &ab_q, cigar, b"foo/A", &[]));
+            reads.push(ab_r2(b, name.as_bytes(), &ab_c, &ab_q, &ref_cigar(ab_len), b"foo/A", &[]));
         };
-        (0..ab_ref).for_each(|i| ab(&mut b, format!("ref_ab{i}"), cigar_10m));
-        (0..ab_ins).for_each(|i| ab(&mut b, format!("ins_ab{i}"), cigar_ins));
+        (0..ab_ref).for_each(|i| ab(&mut b, format!("ref_ab{i}"), &ref_cigar(ab_len)));
+        (0..ab_ins).for_each(|i| ab(&mut b, format!("ins_ab{i}"), &ins_cigar(ab_len)));
+
+        let (ba_a, ba_c, ba_q) = (vec![b'A'; ba_len], vec![b'C'; ba_len], vec![30u8; ba_len]);
         let mut ba = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
-            reads.push(ba_r1(b, name.as_bytes(), b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]));
-            reads.push(ba_r2(b, name.as_bytes(), b"AAAAAAAAAA", quals, cigar, b"foo/B", &[]));
+            reads.push(ba_r1(b, name.as_bytes(), &ba_c, &ba_q, &ref_cigar(ba_len), b"foo/B", &[]));
+            reads.push(ba_r2(b, name.as_bytes(), &ba_a, &ba_q, cigar, b"foo/B", &[]));
         };
-        (0..ba_ref).for_each(|i| ba(&mut b, format!("ref_ba{i}"), cigar_10m));
-        (0..ba_ins).for_each(|i| ba(&mut b, format!("ins_ba{i}"), cigar_ins));
+        (0..ba_ref).for_each(|i| ba(&mut b, format!("ref_ba{i}"), &ref_cigar(ba_len)));
+        (0..ba_ins).for_each(|i| ba(&mut b, format!("ins_ba{i}"), &ins_cigar(ba_len)));
         reads
     }
 
@@ -4533,7 +4545,7 @@ mod tests {
     #[test]
     fn test_alignment_tie_prefers_the_group_supported_by_both_strands() -> Result<()> {
         let mut caller = rejection_accounting_caller(vec![1], true)?;
-        let result = caller.consensus_reads(tied_molecule(6, 9, 4, 1))?;
+        let result = caller.consensus_reads(tied_molecule(10, 10, 6, 9, 4, 1))?;
         assert_eq!(result.count, 2);
         assert_eq!(caller.rejected_reads.len(), 10);
         for record in &caller.rejected_reads {
@@ -4547,7 +4559,23 @@ mod tests {
     #[test]
     fn test_alignment_tie_prefers_a_two_strand_indel_over_a_one_strand_reference() -> Result<()> {
         let mut caller = rejection_accounting_caller(vec![1], true)?;
-        let result = caller.consensus_reads(tied_molecule(9, 5, 1, 5))?;
+        let result = caller.consensus_reads(tied_molecule(10, 10, 9, 5, 1, 5))?;
+        assert_eq!(result.count, 2);
+        assert_eq!(caller.rejected_reads.len(), 10);
+        for record in &caller.rejected_reads {
+            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ref_"));
+        }
+        Ok(())
+    }
+
+    /// The two-strand indel must still win when the BA reads are longer than the AB reads:
+    /// `5M1I4M`/`5M1I6M` (5 AB + 5 BA) over `10M`/`12M` (9 AB + 1 BA). The pooled reads are sorted
+    /// by descending length before grouping, which moves the BA reads ahead of the AB reads, so
+    /// each read's strand must be looked up by its own index, not its position in sorted order.
+    #[test]
+    fn test_alignment_tie_prefers_both_strands_with_mixed_read_lengths() -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+        let result = caller.consensus_reads(tied_molecule(10, 12, 9, 5, 1, 5))?;
         assert_eq!(result.count, 2);
         assert_eq!(caller.rejected_reads.len(), 10);
         for record in &caller.rejected_reads {
