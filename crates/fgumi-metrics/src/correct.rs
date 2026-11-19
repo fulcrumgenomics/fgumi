@@ -25,7 +25,9 @@ use crate::Metric;
 /// * `representation` - Ratio of this UMI's count to the mean count across all UMIs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UmiCorrectionMetrics {
-    /// The corrected UMI sequence (or all Ns for unmatched).
+    /// The corrected UMI sequence, or all `N`s for UMIs that could not be matched.
+    /// There is one row of `N`s for each length of the fixed UMIs, holding the
+    /// unmatched UMIs of that length.
     pub umi: String,
 
     /// The number of UMI sequences that matched/were corrected to this UMI.
@@ -43,11 +45,13 @@ pub struct UmiCorrectionMetrics {
     /// The number of UMI sequences that matched with three or more mismatches.
     pub other_matches: u64,
 
-    /// The fraction of all UMIs that matched or were corrected to this UMI.
+    /// The fraction of all UMIs that matched or were corrected to this UMI, or zero
+    /// if no UMIs were examined.
     #[serde(with = "crate::float")]
     pub fraction_of_matches: f64,
 
-    /// The `total_matches` for this UMI divided by the mean `total_matches` for all UMIs.
+    /// The `total_matches` for this UMI divided by the mean `total_matches` for all
+    /// fixed UMIs (excluding the rows of `N`s), or zero if no UMIs matched a fixed UMI.
     #[serde(with = "crate::float")]
     pub representation: f64,
 }

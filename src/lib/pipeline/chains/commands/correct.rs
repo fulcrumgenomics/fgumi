@@ -54,7 +54,7 @@ use crate::pipeline::chains::{ChainSpec, FinalizeHook, Stage};
 /// its input, or returns `None` when the chain does not run the correct stage.
 ///
 /// Called by `ChainBuilder::new` ahead of `open_source`, so a bad set (none,
-/// an empty `--umis` value, or mixed lengths) is reported even when the input
+/// an empty `--umis` value, or a UMI containing `-`) is reported even when the input
 /// is empty or unreadable, as fgbio checks the UMIs at the top of
 /// `CorrectUmis.execute` before opening `SamSource` (`CorrectUmis.scala:168-176`,
 /// `:190`). Correct options carried by a chain without the correct stage are
@@ -153,7 +153,7 @@ impl FinalizeHook for CorrectFinalizeHook {
             }
             if counts.wrong_length > 0 {
                 error!(
-                    "# {} had unexpected UMIs of differing lengths in the BAM file!",
+                    "# {} had UMIs whose lengths matched no fixed UMI length in the BAM file!",
                     counts.wrong_length
                 );
             }
@@ -180,7 +180,6 @@ pub(crate) struct CorrectMetricsFinalizeHook {
     pub(crate) metrics: Arc<PerThreadAccumulator<CollectedCorrectMetrics>>,
     pub(crate) records_emitted: Arc<AtomicU64>,
     pub(crate) encoded_umi_set: Arc<EncodedUmiSet>,
-    pub(crate) unmatched_umi: String,
     /// Used by `finalize_metrics` to compute and write the metrics TSV, and
     /// to read the `--min-corrected` gate value (if any).
     pub(crate) correct: CorrectOptions,
@@ -188,13 +187,8 @@ pub(crate) struct CorrectMetricsFinalizeHook {
 
 impl FinalizeHook for CorrectMetricsFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let CorrectMetricsFinalizeHook {
-            metrics,
-            records_emitted,
-            encoded_umi_set,
-            unmatched_umi,
-            correct,
-        } = *self;
+        let CorrectMetricsFinalizeHook { metrics, records_emitted, encoded_umi_set, correct } =
+            *self;
 
         // Drain every PerThreadAccumulator slot's `umi_matches` into a single
         // AHashMap that `finalize_metrics` consumes. This hook is the sole
@@ -209,15 +203,17 @@ impl FinalizeHook for CorrectMetricsFinalizeHook {
             }
         }
 
-        // Ensure ALL UMI rows present (matches fgbio behavior).
-        for umi in encoded_umi_set.strings.iter().chain(std::iter::once(&unmatched_umi.clone())) {
+        // Ensure ALL UMI rows present, including one all-`N` row per fixed-UMI
+        // length (matches fgbio behavior).
+        let unmatched_umis = encoded_umi_set.unmatched_umis();
+        for umi in encoded_umi_set.strings.iter().chain(&unmatched_umis) {
             merged_umi_matches
                 .entry(umi.clone())
                 .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
         }
         // Write the metrics TSV BEFORE the ratio gate below, so a
         // --min-corrected failure still leaves it on disk (fgbio parity).
-        correct.finalize_metrics(&mut merged_umi_matches, &unmatched_umi)?;
+        correct.finalize_metrics(&mut merged_umi_matches, &unmatched_umis)?;
 
         // Enforce the --min-corrected ratio gate, if requested. Uses the same
         // `sum_correct_counts` reducer as CorrectFinalizeHook's summary, so
@@ -279,7 +275,7 @@ mod tests {
     /// also match an unrelated banner, so anchoring on the two message lines
     /// keeps a false match from masking a real regression.
     const MISSING_UMI_NEEDLE: &str = "were missing UMI attributes";
-    const WRONG_LENGTH_NEEDLE: &str = "had unexpected UMIs of differing lengths";
+    const WRONG_LENGTH_NEEDLE: &str = "had UMIs whose lengths matched no fixed UMI length";
 
     /// fgbio logs the missing/wrong-length-UMI summary banner at error level
     /// (`CorrectUmis.scala:275-280`), and the legacy single-threaded path

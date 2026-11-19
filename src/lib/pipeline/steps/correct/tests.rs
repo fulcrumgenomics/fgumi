@@ -42,14 +42,13 @@ fn make_default_cfg() -> CorrectStepConfig {
     let opts = make_default_opts();
     CorrectStepConfig {
         encoded_umi_set: Arc::new(EncodedUmiSet::new(&["AAAA".to_string()])),
-        umi_length: 4,
+        warned_wrong_length: AtomicBool::new(false),
         umi_tag: opts.target.sequence_tag().into(),
         original_tag: opts.target.original_tag().into(),
         opts,
         metrics: PerThreadAccumulator::new(1),
         records_emitted: Arc::new(AtomicU64::new(0)),
         output_byte_limit: 1024,
-        unmatched_umi: "NNNN".to_string(),
     }
 }
 
@@ -784,5 +783,227 @@ fn correct_worker_state_reports_zero_heap_size() {
         CorrectWorkerState { cache: None }.heap_size(),
         0,
         "cache-disabled worker reports zero",
+    );
+}
+
+// --- Fixed UMIs of different lengths (port of fgbio#1197) ---
+
+/// A config whose fixed UMIs are `umis` (of any lengths), with the given
+/// `--max-mismatches` and `--min-distance`.
+fn make_cfg_with_umis(
+    umis: &[&str],
+    max_mismatches: usize,
+    min_distance_diff: usize,
+) -> CorrectStepConfig {
+    let sequences: Vec<String> = umis.iter().map(ToString::to_string).collect();
+    let mut cfg = make_default_cfg();
+    cfg.encoded_umi_set = Arc::new(EncodedUmiSet::new(&sequences));
+    cfg.opts.max_mismatches = max_mismatches;
+    cfg.opts.min_distance_diff = min_distance_diff;
+    cfg
+}
+
+/// Port of fgbio `CorrectUmisTest` "correct each UMI only against the fixed
+/// UMIs of the same length when the fixed UMIs have different lengths". With
+/// fixed `AAAAAA` and `CCCCCCC`, `--max-mismatches 2` and `--min-distance 2`,
+/// each UMI is matched only against the fixed UMI of its own length (so
+/// `--min-distance` never applies), and an unmatched UMI credits the all-`N`
+/// row of its own length.
+#[test]
+fn run_batch_corrects_each_umi_against_fixed_umis_of_its_length() {
+    let cfg = Arc::new(make_cfg_with_umis(&["AAAAAA", "CCCCCCC"], 2, 2));
+    let mut state = make_state();
+
+    let templates = vec![
+        make_template_with_rx(b"q01", "AAAAAA"),
+        make_template_with_rx(b"q02", "AAAAAA"),
+        make_template_with_rx(b"q03", "AATAAA"),
+        make_template_with_rx(b"q04", "AATTAA"),
+        make_template_with_rx(b"q05", "AAATGC"),
+        make_template_with_rx(b"q06", "CCCCCCC"),
+        make_template_with_rx(b"q07", "CCTCCCC"),
+        make_template_with_rx(b"q08", "CCTCCCC"),
+        make_template_with_rx(b"q09", "CCTGCCC"),
+        make_template_with_rx(b"q10", "GGGGGGG"),
+    ];
+    let (kept, rejects) =
+        run_batch_collecting_rejects(&mut state, &cfg, BamTemplateBatch::new(0, templates));
+
+    let mut kept_qnames: Vec<String> = kept.templates().iter().map(template_qname).collect();
+    kept_qnames.sort();
+    assert_eq!(kept_qnames, ["q01", "q02", "q03", "q04", "q06", "q07", "q08", "q09"]);
+    let mut rejected = reject_block_qnames(&rejects.bytes);
+    rejected.sort();
+    assert_eq!(rejected, ["q05", "q10"]);
+
+    let slot = &cfg.metrics.slots()[0];
+    let metrics = slot.lock();
+    assert_eq!(metrics.wrong_length, 0, "every UMI has a fixed-UMI length");
+    assert_eq!(metrics.mismatched, 2, "q5 and q10 match no fixed UMI");
+    // (umi, total, perfect, one mismatch, two mismatches, other)
+    for (umi, total, perfect, one, two, other) in [
+        ("AAAAAA", 4, 2, 1, 1, 0),
+        ("CCCCCCC", 4, 1, 2, 1, 0),
+        ("NNNNNN", 1, 0, 0, 0, 0),
+        ("NNNNNNN", 1, 0, 0, 0, 0),
+    ] {
+        let m = metrics.umi_matches.get(umi).unwrap_or_else(|| panic!("no {umi} row"));
+        assert_eq!(
+            (
+                m.total_matches,
+                m.perfect_matches,
+                m.one_mismatch_matches,
+                m.two_mismatch_matches,
+                m.other_matches
+            ),
+            (total, perfect, one, two, other),
+            "{umi} counts"
+        );
+    }
+}
+
+/// Port of fgbio `CorrectUmisTest` "correct each UMI of a multi-UMI tag against
+/// the fixed UMIs of its own length": each `-`-separated segment is matched
+/// against the fixed UMIs of its own length, in either order, and a template
+/// with any segment whose length matches no fixed UMI is rejected as wrong
+/// length, crediting no per-UMI metrics row (fgbio rejects it before matching).
+#[rstest]
+#[case::exact("AAAAAA-CCCCCCC", Some("AAAAAA-CCCCCCC"))]
+#[case::corrected("AAAATA-CCCCGCC", Some("AAAAAA-CCCCCCC"))]
+#[case::swapped("CCCCCCC-AAAAAA", Some("CCCCCCC-AAAAAA"))]
+#[case::wrong_length_segment("AAAAAA-CCCCC", None)]
+fn run_batch_corrects_each_segment_against_its_own_length(
+    #[case] rx: &str,
+    #[case] expected_rx: Option<&str>,
+) {
+    let cfg = Arc::new(make_cfg_with_umis(&["AAAAAA", "CCCCCCC"], 1, 1));
+    let mut state = make_state();
+
+    let batch = BamTemplateBatch::new(0, vec![make_template_with_rx(b"t", rx)]);
+    let kept = run_batch(&mut state, &cfg, batch, None).expect("run_batch");
+
+    let kept_rx: Option<String> = kept.templates().first().map(template_rx);
+    assert_eq!(kept_rx.as_deref(), expected_rx);
+    let slot = &cfg.metrics.slots()[0];
+    let metrics = slot.lock();
+    assert_eq!(metrics.wrong_length, u64::from(expected_rx.is_none()), "wrong_length");
+    assert_eq!(metrics.mismatched, 0, "no segment of a fixed-UMI length fails to match");
+    if expected_rx.is_none() {
+        assert!(
+            metrics.umi_matches.values().all(|m| m.total_matches == 0),
+            "a wrong-length template must credit no per-UMI row: {:?}",
+            metrics.umi_matches
+        );
+    }
+}
+
+/// Port of fgbio `CorrectUmisTest` "match a UMI to the only fixed UMI of its
+/// length without applying --min-distance": with no other fixed UMI of the same
+/// length there is no next-best UMI to be far from, so a UMI matches iff it is
+/// within `--max-mismatches`, however large `--min-distance` is.
+#[rstest]
+#[case::within_max_mismatches("AAATTT", Some("AAAAAA"), 0)]
+#[case::beyond_max_mismatches("AAATTTT", None, 1)]
+fn run_batch_single_fixed_umi_of_a_length_ignores_min_distance(
+    #[case] rx: &str,
+    #[case] expected_rx: Option<&str>,
+    #[case] expected_mismatched: u64,
+) {
+    let cfg = Arc::new(make_cfg_with_umis(&["AAAAAA", "CCCCCCC"], 3, 5));
+    let mut state = make_state();
+
+    let batch = BamTemplateBatch::new(0, vec![make_template_with_rx(b"t", rx)]);
+    let kept = run_batch(&mut state, &cfg, batch, None).expect("run_batch");
+
+    let kept_rx: Option<String> = kept.templates().first().map(template_rx);
+    assert_eq!(kept_rx.as_deref(), expected_rx);
+    assert_eq!(cfg.metrics.slots()[0].lock().mismatched, expected_mismatched, "mismatched");
+}
+
+/// Port of fgbio `CorrectUmisTest` "reject reads whose UMI length matches no
+/// fixed UMI length": such a template is rejected as wrong length, and the
+/// first one logs a warning naming the read and the expected lengths. The
+/// warning is logged once per run (per shared `CorrectStepConfig`), not once
+/// per template or per worker: two batches run with fresh worker state against
+/// the same config log it once.
+#[test]
+fn run_batch_rejects_and_warns_once_on_a_length_matching_no_fixed_umi() {
+    use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+    let _session = capture_logs();
+    let cfg = Arc::new(make_cfg_with_umis(&["AAAAAA", "CCCCCCC"], 1, 1));
+
+    let first_batch = vec![
+        make_template_with_rx(b"warnonce_match6", "AAAAAA"),
+        make_template_with_rx(b"warnonce_match7", "CCCCCCC"),
+        make_template_with_rx(b"warnonce_short4", "ACGT"),
+        make_template_with_rx(b"warnonce_short5", "ACGTA"),
+    ];
+    let (kept, rejects) = run_batch_collecting_rejects(
+        &mut make_state(),
+        &cfg,
+        BamTemplateBatch::new(0, first_batch),
+    );
+    let mut kept_qnames: Vec<String> = kept.templates().iter().map(template_qname).collect();
+    kept_qnames.sort();
+    assert_eq!(kept_qnames, ["warnonce_match6", "warnonce_match7"]);
+    assert_eq!(reject_block_qnames(&rejects.bytes), ["warnonce_short4", "warnonce_short5"]);
+
+    // A second worker (fresh state) sharing the config sees another wrong-length
+    // template; it must not warn again.
+    let second_batch = vec![make_template_with_rx(b"warnonce_short3", "ACG")];
+    let kept = run_batch(&mut make_state(), &cfg, BamTemplateBatch::new(1, second_batch), None)
+        .expect("run_batch");
+    assert!(kept.templates().is_empty());
+    assert_eq!(cfg.metrics.slots()[0].lock().wrong_length, 3);
+
+    // Count only this test's lines, so a sibling test logging the same text
+    // cannot change the count.
+    let logs = captured();
+    let warnings: Vec<&String> = logs
+        .iter()
+        .filter(|msg| msg.contains("detected with unexpected length UMI(s)"))
+        .filter(|msg| msg.contains("(warnonce_"))
+        .collect();
+    assert_eq!(
+        warnings,
+        ["Read (warnonce_short4) detected with unexpected length UMI(s): ACGT."],
+        "expected exactly one wrong-length warning; got: {logs:?}"
+    );
+    let expected_lengths_lines =
+        logs.iter().filter(|msg| *msg == "Expected UMI length(s): 6, 7").count();
+    assert!(expected_lengths_lines >= 1, "the expected lengths must be logged: {logs:?}");
+}
+
+/// The wrong-length warning names the UMI segments as they were length-checked,
+/// separated by a space, as fgbio does: split on `-`, and with `--revcomp` each
+/// segment reverse-complemented and their order reversed.
+#[rstest]
+#[case::forward(false, "AAAAAA-ACGT", "AAAAAA ACGT")]
+#[case::revcomp(true, "AAAAAA-ACGT", "ACGT TTTTTT")]
+fn run_batch_wrong_length_warning_names_the_checked_segments(
+    #[case] revcomp: bool,
+    #[case] rx: &str,
+    #[case] expected_segments: &str,
+) {
+    use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+    let _session = capture_logs();
+    let mut cfg = make_cfg_with_umis(&["AAAAAA", "CCCCCCC"], 1, 1);
+    cfg.opts.revcomp = revcomp;
+    let cfg = Arc::new(cfg);
+    let name = format!("segments_{revcomp}");
+
+    let batch = BamTemplateBatch::new(0, vec![make_template_with_rx(name.as_bytes(), rx)]);
+    let kept = run_batch(&mut make_state(), &cfg, batch, None).expect("run_batch");
+    assert!(kept.templates().is_empty());
+
+    let expected =
+        format!("Read ({name}) detected with unexpected length UMI(s): {expected_segments}.");
+    let logs = captured();
+    assert_eq!(
+        logs.iter().filter(|msg| **msg == expected).count(),
+        1,
+        "expected {expected:?}; got: {logs:?}"
     );
 }

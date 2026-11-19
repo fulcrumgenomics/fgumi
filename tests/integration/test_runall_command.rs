@@ -3613,18 +3613,16 @@ fn simplex_allow_unmapped_is_not_exposed() {
     );
 }
 
-/// `runall --start-from correct` rejects a mixed-length `--correct::umis` set
-/// before it opens the input, so the UMI error is reported even when the input
-/// is empty or not a BAM at all, and no output is written.
+/// `runall --start-from correct` rejects a fixed UMI containing `-` before it
+/// opens the input, so the UMI error is reported even when the input is empty
+/// or not a BAM at all, and no output is written.
 ///
-/// The runall counterpart of `correct`'s `test_validation_different_length_umis`
-/// (ported from fgbio `CorrectUmisTest.scala:106`, which runs on an empty
-/// `NoBam` input): runall applies the same check, with the same error text,
-/// after its input-exists and path-collision guards and before the chain opens
-/// its source. The mixed lengths are given inline or split across
-/// `--correct::umis` and `--correct::umi-files`.
+/// The runall counterpart of `correct`'s `test_validation_rejects_bad_umi_set`:
+/// runall applies the same check, with the same error text, after its
+/// input-exists and path-collision guards and before the chain opens its
+/// source. The hyphenated UMI is given inline or in a `--correct::umi-files`.
 #[rstest::rstest]
-fn start_from_correct_rejects_mixed_length_umis_before_reading_input(
+fn start_from_correct_rejects_hyphenated_umis_before_reading_input(
     #[values(b"".as_slice(), b"not a BAM file\n".as_slice())] input_contents: &[u8],
     #[values(false, true)] split_into_umi_file: bool,
 ) {
@@ -3632,7 +3630,7 @@ fn start_from_correct_rejects_mixed_length_umis_before_reading_input(
     let input = tmp.path().join("input.bam");
     std::fs::write(&input, input_contents).unwrap();
     let umi_file = tmp.path().join("umis.txt");
-    std::fs::write(&umi_file, "CCC\n").unwrap();
+    std::fs::write(&umi_file, "AC-GT\n").unwrap();
     let out = tmp.path().join("out.bam");
 
     let mut args = vec![
@@ -3653,37 +3651,35 @@ fn start_from_correct_rejects_mixed_length_umis_before_reading_input(
     if split_into_umi_file {
         args.extend(["--correct::umi-files", p(&umi_file)]);
     } else {
-        args.extend(["--correct::umis", "CCC"]);
+        args.extend(["--correct::umis", "AC-GT"]);
     }
 
     let output = fgumi(&args);
-    assert!(!output.status.success(), "a mixed-length UMI set must be rejected");
+    assert!(!output.status.success(), "a hyphenated fixed UMI must be rejected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     // A UMI file is checked line by line, so its error names the offending line.
-    let expected = if split_into_umi_file {
-        format!(
-            "Error: UMI file {} line 1: UMI CCC has length 3, but earlier UMIs have length 6; all \
-             UMIs from --umis / --umi-files must have the same length.",
-            umi_file.display()
-        )
+    let source = if split_into_umi_file {
+        format!("UMI file {} line 1", umi_file.display())
     } else {
-        "Error: All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6."
-            .to_string()
+        "--umis".to_string()
     };
+    let expected = format!(
+        "Error: {source}: UMI AC-GT contains '-'. UMIs in the BAM are split on '-' and each part is corrected separately, so a fixed UMI containing '-' would be compared to a single part and could write an extra '-' into the corrected UMI; give each part as its own fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA)."
+    );
     assert_eq!(
         stderr.lines().last(),
         Some(expected.as_str()),
-        "expected the UMI-length error, got:\n{stderr}"
+        "expected the hyphenated-UMI error, got:\n{stderr}"
     );
     assert!(!out.exists(), "no output may be written when the UMI set is rejected");
 }
 
 /// `runall --start-from extract` splices the correct stage in when
-/// `--correct::umis` is given; a mixed-length set is rejected before the FASTQs
-/// are opened, so unreadable FASTQs do not mask the UMI error and no output is
-/// written.
+/// `--correct::umis` is given; a hyphenated fixed UMI is rejected before the
+/// FASTQs are opened, so unreadable FASTQs do not mask the UMI error and no
+/// output is written.
 #[test]
-fn start_from_extract_rejects_mixed_length_umis_before_reading_fastqs() {
+fn start_from_extract_rejects_hyphenated_umis_before_reading_fastqs() {
     let tmp = TempDir::new().unwrap();
     let r1 = tmp.path().join("r1.fq.gz");
     let r2 = tmp.path().join("r2.fq.gz");
@@ -3712,18 +3708,18 @@ fn start_from_extract_rejects_mixed_length_umis_before_reading_fastqs() {
         "--correct::umis",
         "AAAAAA",
         "--correct::umis",
-        "CCC",
+        "AC-GT",
         "-o",
         p(&out),
     ]);
-    assert!(!output.status.success(), "a mixed-length UMI set must be rejected");
+    assert!(!output.status.success(), "a hyphenated fixed UMI must be rejected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.lines().last(),
         Some(
-            "Error: All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6."
+            "Error: --umis: UMI AC-GT contains '-'. UMIs in the BAM are split on '-' and each part is corrected separately, so a fixed UMI containing '-' would be compared to a single part and could write an extra '-' into the corrected UMI; give each part as its own fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA)."
         ),
-        "expected the UMI-length error, got:\n{stderr}"
+        "expected the hyphenated-UMI error, got:\n{stderr}"
     );
     assert!(!out.exists(), "no output may be written when the UMI set is rejected");
 }
