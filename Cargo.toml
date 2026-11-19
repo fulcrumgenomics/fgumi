@@ -70,15 +70,14 @@ mimalloc = { version = "0.1.52", default-features = false }
 # reports only when an output file is closed. Other members still scope it to
 # Linux for Linux-only APIs (`posix_fadvise`, ...).
 nix = { version = "0.31", default-features = false, features = ["fs"] }
-# The noodles stack is held one minor behind (noodles 0.111 / noodles-bgzf 0.47 / noodles-csi
-# 0.56). noodles-bgzf 0.48 deprecates `MultithreadedReader::with_worker_count` and
-# `multithreaded_writer::Builder::set_worker_count` into no-ops that defer to rayon's *global*
-# thread pool, so `--threads` would silently stop bounding BGZF decompression/compression
-# parallelism — and fgumi already runs work inside its own scoped rayon pools. Upgrading needs a
-# dedicated, benchmarked migration PR.
-noodles = "0.115.0"
-noodles-bgzf = { version = "0.51.0", features = ["libdeflate"] }
-noodles-csi = "0.60.0"
+# The noodles crates are bumped together: `noodles`, `noodles-bgzf` and `noodles-csi` must
+# resolve to the same sub-crate versions or their types (e.g. `bgzf::VirtualPosition`,
+# `csi::binning_index::Indexer`) do not unify. When bumping, check that
+# `bgzf::io::MultithreadedReader::with_worker_count` still sizes its own worker pool (it does in
+# noodles-bgzf 0.52), or `--threads` would stop bounding BGZF decompression in `fgumi extract`.
+noodles = "0.119.0"
+noodles-bgzf = { version = "0.52.0", features = ["libdeflate"] }
+noodles-csi = "0.62.0"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.10"

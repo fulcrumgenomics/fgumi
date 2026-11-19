@@ -850,6 +850,8 @@ impl Review {
     /// The BAM is written to a temporary file in `output`'s directory and returned
     /// finished; the caller renames it to `output` with `persist`. Dropping it instead
     /// (on any error) deletes it, so no partial BAM is left at `output`.
+    /// Headers with a reference longer than 2^29 bp are rejected before staging because
+    /// the output requires a BAI sidecar.
     fn extract_variant_reads<K>(
         input: &Path,
         output: &Path,
@@ -871,6 +873,16 @@ impl Review {
 
         // Add @PG record with PP chaining
         let header = crate::commands::common::add_pg_record(header, command_line)?;
+
+        // Both output BAMs require BAI sidecars. Reject a header that would make noodles
+        // choose CSI here, before either staged BAM can replace an existing output.
+        if header.reference_sequences().values().any(|sequence| sequence.length().get() > (1 << 29))
+        {
+            anyhow::bail!(
+                "Cannot write a BAI for {}: a reference sequence is longer than 2^29 bp",
+                output.display()
+            );
+        }
 
         // Stage beside the output so the final rename stays on one filesystem. The file
         // is created with the default `0o666 & !umask` mode, not `NamedTempFile`'s
@@ -1856,7 +1868,9 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             drop(writer);
 
             let index_path = fgumi_bam_io::bai_sidecar_path(path);
-            let index = bam::fs::index(path).expect("index bam");
+            let bam::Index::Bai(index) = bam::fs::index(path).expect("index bam") else {
+                panic!("expected a BAI index");
+            };
             let mut index_writer =
                 bai::io::Writer::new(std::fs::File::create(&index_path).expect("create bai"));
             index_writer.write_index(&index).expect("write bai");
@@ -1922,42 +1936,47 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             );
             con_writer.write_header(&header).expect("failed to write BAM header");
 
+            // Records are buffered and written coordinate-sorted below: the header
+            // declares `SO:coordinate`, and noodles' indexer rejects out-of-order starts.
+            let mut raw_records = Vec::new();
+            let mut con_records = Vec::new();
+
             // Add reads with variant at chr1:10 (A->T)
             let (r1, r2) =
                 create_read_pair("A1", 0, 6, 50, b"AAAATAAAAA", b"AAAAAAAAAA", "A", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("A2", 0, 6, 50, b"AAAATAAAAG", b"AAAAAAAAAA", "A", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) = create_read_pair("A", 0, 6, 50, b"AAAATAAAAN", b"AAAAAAAAAA", "A", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // Add reads at chr1:20 (A->C)
             let (r1, r2) =
                 create_read_pair("B1", 0, 16, 50, b"AAAACAAAAA", b"AAAAAAAAAA", "B", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("B", 0, 16, 50, b"AAAACAAAAA", b"AAAAAAAAAA", "B", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // Reference read at chr1:20
             let (r1, r2) =
                 create_read_pair("C1", 0, 17, 50, b"AAAAAAAAAA", b"AAAAAAAAAA", "C", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("C", 0, 17, 50, b"AAAAAAAAAA", b"AAAAAAAAAA", "C", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // Reads at chr1:30 with various edge cases
             // D: spanning deletion
@@ -1971,46 +1990,60 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 "D",
                 Some("4M4D6M"),
             );
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("D", 0, 25, 60, b"AAAAAAAAAA", b"AAAAAAAAAA", "D", Some("4M4D6M"));
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // E: no-call (N)
             let (r1, r2) =
                 create_read_pair("E1", 0, 26, 60, b"AAAANAAAAA", b"AAAAAAAAAA", "E", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("E", 0, 26, 60, b"AAAANAAAAA", b"AAAAAAAAAA", "E", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // F: variant allele (G)
             let (r1, r2) =
                 create_read_pair("F1", 0, 27, 60, b"AAAGAAAAAA", b"AAAAAAAAAA", "F", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("F", 0, 27, 60, b"AAAGAAAAAA", b"AAAAAAAAAA", "F", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
 
             // Reads at chr2:20 where both ends overlap variant
             let (r1, r2) =
                 create_read_pair("H1", 1, 15, 19, b"CCCCCTCCCC", b"CTCCCCCCCC", "H", None);
-            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            raw_records.push(r1);
+            raw_records.push(r2);
 
             let (r1, r2) =
                 create_read_pair("H", 1, 15, 19, b"CCCCCTCCCC", b"CTCCCCCCCC", "H", None);
-            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
-            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
+            con_records.push(r1);
+            con_records.push(r2);
+
+            // Sort by (reference, start) to honor `SO:coordinate`; the sort is stable, so
+            // records at the same position keep their insertion order.
+            for (writer, records) in
+                [(&mut raw_writer, &mut raw_records), (&mut con_writer, &mut con_records)]
+            {
+                records
+                    .sort_by_key(|r: &RecordBuf| (r.reference_sequence_id(), r.alignment_start()));
+                for record in records.iter() {
+                    writer
+                        .write_alignment_record(&header, record)
+                        .expect("failed to write BAM record");
+                }
+            }
 
             // Close writers to flush data
             drop(raw_writer);
@@ -2021,7 +2054,11 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
 
             // Index raw BAM
             let raw_index_path = fgumi_bam_io::bai_sidecar_path(&raw_path);
-            let raw_index = bam::fs::index(&raw_path).expect("failed to index BAM file");
+            let bam::Index::Bai(raw_index) =
+                bam::fs::index(&raw_path).expect("failed to index BAM file")
+            else {
+                panic!("expected a BAI index");
+            };
             let mut raw_index_writer = bai::io::Writer::new(
                 std::fs::File::create(&raw_index_path).expect("failed to create file"),
             );
@@ -2029,7 +2066,11 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
 
             // Index consensus BAM
             let consensus_index_path = fgumi_bam_io::bai_sidecar_path(&consensus_path);
-            let con_index = bam::fs::index(&consensus_path).expect("failed to index BAM file");
+            let bam::Index::Bai(con_index) =
+                bam::fs::index(&consensus_path).expect("failed to index BAM file")
+            else {
+                panic!("expected a BAI index");
+            };
             let mut con_index_writer = bai::io::Writer::new(
                 std::fs::File::create(&consensus_index_path).expect("failed to create file"),
             );
@@ -2091,9 +2132,11 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         /// `r2_override` is `Some((r2_start, r2_base))`, R2 is instead placed at `r2_start`
         /// carrying `r2_base` at offset 4, so it overlaps the queried locus and (when the
         /// base is non-reference) emits a `/2` row — letting a single MI produce both a
-        /// `/1` and a `/2` row to exercise the read-number tie-break. Read pairs are
-        /// written in the given slice order, so the natural BAM/query order can differ from
-        /// fgbio's MI+read-number sorted order. The same pairs are written to the grouped
+        /// `/1` and a `/2` row to exercise the read-number tie-break. Records are written
+        /// coordinate-sorted (the header declares `SO:coordinate`, which noodles' indexer
+        /// enforces) with a stable sort, so records at the same position keep the given
+        /// slice order and the natural BAM/query order can differ from fgbio's
+        /// MI+read-number sorted order. The same pairs are written to the grouped
         /// BAM so the raw-count lookups find a matching MI.
         ///
         /// Returns `(grouped_bam, consensus_bam)`.
@@ -2115,6 +2158,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             );
             con_writer.write_header(&header).expect("failed to write consensus header");
 
+            let mut records = Vec::new();
             for (name, chrom_idx, start, variant_base, mi, r2_override) in reads {
                 let mut bases1 = vec![b'A'; 10];
                 bases1[4] = *variant_base;
@@ -2131,21 +2175,28 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
                 };
                 let (r1, r2) =
                     create_read_pair(name, *chrom_idx, *start, start2, &bases1, &bases2, mi, None);
-                for rec in [&r1, &r2] {
-                    con_writer
-                        .write_alignment_record(&header, rec)
-                        .expect("failed to write consensus record");
-                    grp_writer
-                        .write_alignment_record(&header, rec)
-                        .expect("failed to write grouped record");
-                }
+                records.push(r1);
+                records.push(r2);
+            }
+
+            records.sort_by_key(|r: &RecordBuf| (r.reference_sequence_id(), r.alignment_start()));
+            for rec in &records {
+                con_writer
+                    .write_alignment_record(&header, rec)
+                    .expect("failed to write consensus record");
+                grp_writer
+                    .write_alignment_record(&header, rec)
+                    .expect("failed to write grouped record");
             }
 
             drop(grp_writer);
             drop(con_writer);
 
             for path in [&consensus_path, &grouped_path] {
-                let index = bam::fs::index(path).expect("failed to index BAM");
+                let bam::Index::Bai(index) = bam::fs::index(path).expect("failed to index BAM")
+                else {
+                    panic!("expected a BAI index");
+                };
                 let mut writer = bai::io::Writer::new(
                     std::fs::File::create(fgumi_bam_io::bai_sidecar_path(path))
                         .expect("failed to create BAM index"),
@@ -2919,6 +2970,88 @@ chr1\t10\t.\tA\tT\t.\tPASS\t.\n",
             .collect();
         after.sort();
         assert_eq!(after, before, "a failed run must not add files to the output directory");
+    }
+
+    /// A header requiring CSI must not replace either BAM, its sidecar, or the report.
+    #[rstest]
+    #[case::bai_limit(1 << 29, false)]
+    #[case::requires_csi((1 << 29) + 1, true)]
+    fn test_review_bai_reference_limit_preserves_outputs(
+        #[case] reference_length: usize,
+        #[case] expect_error: bool,
+        #[values("consensus", "grouped")] oversized_input: &str,
+        #[values(false, true)] existing_outputs: bool,
+    ) {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use std::num::NonZeroUsize;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let review = review_with_one_variant_and_consensus(&temp_dir, &[], &[]);
+        let input = match oversized_input {
+            "consensus" => &review.consensus_bam,
+            "grouped" => &review.grouped_bam,
+            _ => unreachable!(),
+        };
+        let mut header = test_utils::create_test_header();
+        // An unused long reference still forces noodles to select CSI. The existing BAI
+        // has no chunks, so rewriting this empty BAM's header keeps its input index valid.
+        header.reference_sequences_mut().insert(
+            "chr2".into(),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(reference_length).unwrap()),
+        );
+        let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(input).unwrap());
+        writer.write_header(&header).unwrap();
+        writer.into_inner().finish().unwrap();
+
+        let suffixes =
+            ["consensus.bam", "grouped.bam", "consensus.bam.bai", "grouped.bam.bai", "txt"];
+        if existing_outputs {
+            for suffix in suffixes {
+                std::fs::write(test_utils::suffixed(&review.output, suffix), suffix).unwrap();
+            }
+        }
+        let snapshot = || {
+            let mut files: Vec<_> = std::fs::read_dir(temp_dir.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        let result = review.execute("test");
+        if expect_error {
+            let error = result.expect_err("a long reference cannot be indexed with BAI");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Cannot write a BAI for {}: a reference sequence is longer than 2^29 bp",
+                    test_utils::suffixed(&review.output, &format!("{oversized_input}.bam"))
+                        .display()
+                )
+            );
+            assert_eq!(snapshot(), before, "all existing files must remain unchanged");
+        } else {
+            result.expect("a reference exactly at the BAI limit must be accepted");
+            for kind in ["consensus", "grouped"] {
+                let path = test_utils::suffixed(&review.output, &format!("{kind}.bam"));
+                let mut reader = noodles::bam::io::reader::Builder.build_from_path(&path).unwrap();
+                let header = reader.read_header().unwrap();
+                let expected_length = if kind == oversized_input { reference_length } else { 100 };
+                assert_eq!(header.reference_sequences()[1].length().get(), expected_length);
+                assert_eq!(reader.read_record(&mut noodles::bam::Record::default()).unwrap(), 0);
+                let index =
+                    noodles::bam::bai::fs::read(fgumi_bam_io::bai_sidecar_path(path)).unwrap();
+                assert_eq!(index.reference_sequences().len(), 2);
+            }
+            assert_eq!(
+                std::fs::read_to_string(test_utils::suffixed(&review.output, "txt")).unwrap(),
+                format!("{}\n", ConsensusVariantReviewInfo::tsv_header())
+            );
+        }
     }
 
     /// A mapped grouped read with a zero-length reference span (here CIGAR `10S`) placed at

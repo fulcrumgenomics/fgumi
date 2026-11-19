@@ -599,7 +599,9 @@ mod tests {
         tmp.write_all(&bam_bytes).expect("write bam");
         tmp.flush().expect("flush");
 
-        let index = bam::fs::index(tmp.path()).expect("index bam");
+        let bam::Index::Bai(index) = bam::fs::index(tmp.path()).expect("index bam") else {
+            panic!("expected a BAI index");
+        };
         (bam_bytes, index)
     }
 
