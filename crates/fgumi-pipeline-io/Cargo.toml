@@ -21,8 +21,13 @@ parking_lot = "0.12"
 # The seeded fixture generator of the `test-utils` sort oracle (`sort::testing`).
 rand = { workspace = true, optional = true }
 tempfile = "3.4"
+fgumi-htslib = { workspace = true, optional = true }
 
 [features]
+# CRAM source and sink steps (`source::read_cram`, `sink::write_cram`), through
+# a vendored htslib. Enables `fgumi-bam-io/cram` for the shared CRAM error
+# context and reference lookup (`fgumi_bam_io::cram_input`).
+cram = ["dep:fgumi-htslib", "fgumi-bam-io/cram"]
 # Test support exported to other crates' tests: the sort oracle
 # (`sort::testing`) builds its fixtures with `fgumi-raw-bam`'s test utilities.
 test-utils = ["fgumi-raw-bam/test-utils", "dep:rand"]

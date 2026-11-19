@@ -28,6 +28,7 @@ use std::num::NonZero;
 use std::path::{Path, PathBuf};
 
 use crate::output::{OutputFile, OutputSink};
+pub use crate::paths::bai_sidecar_path;
 use crate::paths::is_stdout_path;
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
 
@@ -215,6 +216,17 @@ pub(crate) fn make_bgzf_writer(
     }
 }
 
+/// A SAM header as SAM text (the `@`-lines), as BAM and CRAM headers carry it.
+///
+/// # Errors
+///
+/// Returns an error if noodles cannot serialize the header.
+pub fn sam_header_text(header: &Header) -> io::Result<Vec<u8>> {
+    let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
+    sam_writer.write_header(header)?;
+    Ok(sam_writer.into_inner())
+}
+
 /// Write a BAM header (magic, SAM text, reference sequences) to any writer.
 ///
 /// Shared implementation used by both [`RawBamWriter`] and [`IndexingBamWriter`].
@@ -234,9 +246,7 @@ pub fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<
     writer.write_all(fgumi_raw_bam::BAM_MAGIC)?;
 
     // Header text (SAM header serialized using noodles)
-    let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
-    sam_writer.write_header(header)?;
-    let header_bytes = sam_writer.into_inner();
+    let header_bytes = sam_header_text(header)?;
     let l_text = header_bytes.len() as i32;
     writer.write_all(&l_text.to_le_bytes())?;
     writer.write_all(&header_bytes)?;
@@ -1055,6 +1065,7 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
             "Cannot create an indexing BAM writer for stdout (indexing requires a seekable file)"
         );
     }
+    reject_cram_output(path_ref)?;
     let output_file = OutputFile::create(path_ref)
         .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
     indexing_bam_writer_from_sink(Box::new(output_file), header, compression_level, threads)
@@ -1084,28 +1095,6 @@ fn indexing_bam_writer_from_sink(
     writer.write_header(header)?;
 
     Ok(writer)
-}
-
-/// Append `.bai` to a BAM path to form its conventional sidecar index path.
-///
-/// This appends to the **full** path, which is the samtools convention, rather
-/// than replacing the final extension:
-///
-/// - `foo.bam` → `foo.bam.bai`
-/// - `foo` (no extension) → `foo.bai`
-/// - `foo.sorted` → `foo.sorted.bai`
-///
-/// `Path::with_extension("bam.bai")` is not equivalent and must not be used
-/// here: it replaces everything after the last `.`, so it is correct only for
-/// paths ending in exactly `.bam`. For anything else it rewrites the basename
-/// itself — `foo.sorted` and `foo.other` both collapse to `foo.bam.bai`, so the
-/// index lands beside a file that does not exist and two sorts in one directory
-/// silently overwrite each other's index.
-#[must_use]
-pub fn bai_sidecar_path<P: AsRef<Path>>(bam_path: P) -> PathBuf {
-    let mut index_os = bam_path.as_ref().as_os_str().to_owned();
-    index_os.push(".bai");
-    PathBuf::from(index_os)
 }
 
 /// Build a BAI index for a finished coordinate-sorted BAM and write it to the
@@ -1282,6 +1271,30 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
     }
 }
 
+/// Refuse to write BAM bytes under a `.cram` name.
+///
+/// CRAM output is written by the pipeline's CRAM sink (feature `cram`); a
+/// command whose output is opened here writes BGZF BAM, so a `*.cram` name
+/// would produce a BAM that every reader rejects as CRAM.
+///
+/// Public so a command that stages its BAM under a temporary name (and so
+/// opens no `*.cram` path itself) can apply the same check to its destination.
+///
+/// # Errors
+///
+/// Returns an error if `path` ends in `.cram`.
+pub fn reject_cram_output(path: &Path) -> Result<()> {
+    if crate::paths::is_cram_path(path) {
+        anyhow::bail!(
+            "This command writes BAM, not CRAM: {} — name the output `*.bam`, or convert \
+             it afterwards (CRAM output is supported by the pipeline commands such as sort, \
+             group, the consensus callers and runall when fgumi is built with `--features cram`)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Open an output writer for a path, supporting stdout via `-` or `/dev/stdout`.
 ///
 /// This is the single place the `-` convention is honoured **for BAM output**,
@@ -1309,6 +1322,7 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 /// stdout descriptor cannot be duplicated.
 pub fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn OutputSink>> {
     let path_ref = path.as_ref();
+    reject_cram_output(path_ref)?;
     crate::output::open_output_sink(path_ref).with_context(|| {
         if is_stdout_path(path_ref) {
             "Failed to duplicate stdout for BAM output".to_string()

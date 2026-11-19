@@ -791,7 +791,8 @@ fn resolve_output_identity(path: &Path) -> (PathBuf, Option<&std::ffi::OsStr>) {
 /// different path). Falls back to canonical-path comparison, then to the
 /// canonical-parent-plus-file-name identity, when either file does not exist
 /// yet, so differently spelled paths to one future file still match.
-pub(crate) fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+#[must_use]
+pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

@@ -1,6 +1,6 @@
-//! Path utility functions for stdin and stdout detection.
+//! Path utility functions: stdin/stdout detection and index sidecar names.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Returns `true` if the path refers to stdin (`-` or `/dev/stdin`).
 ///
@@ -73,6 +73,47 @@ fn stdin_metadata() -> std::io::Result<std::fs::Metadata> {
 pub fn is_stdout_path<P: AsRef<Path>>(path: P) -> bool {
     let path_str = path.as_ref().to_string_lossy();
     path_str == "-" || path_str == "/dev/stdout"
+}
+
+/// Whether `path` names a CRAM file (`.cram`, any case).
+#[must_use]
+pub fn is_cram_path(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cram"))
+}
+
+/// Append `suffix` to the **full** path (`foo.bam` + `.bai` → `foo.bam.bai`),
+/// the samtools convention for index sidecars.
+///
+/// `Path::with_extension` is not equivalent and must not be used for this: it
+/// replaces everything after the last `.`, so it is correct only for paths
+/// that end in exactly the expected extension. For anything else it rewrites
+/// the basename itself: `foo.sorted` and `foo.other` both collapse to
+/// `foo.bam.bai`, so the index lands beside a file that does not exist and two
+/// sorts in one directory silently overwrite each other's index.
+pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Append `.bai` to a BAM path to form its conventional sidecar index path.
+///
+/// This appends to the full path rather than replacing the final extension
+/// (see `append_suffix`):
+///
+/// - `foo.bam` → `foo.bam.bai`
+/// - `foo` (no extension) → `foo.bai`
+/// - `foo.sorted` → `foo.sorted.bai`
+#[must_use]
+pub fn bai_sidecar_path<P: AsRef<Path>>(bam_path: P) -> PathBuf {
+    append_suffix(bam_path.as_ref(), ".bai")
+}
+
+/// The CRAI index written beside a CRAM: `<cram>.crai`, appended to the full
+/// path as for [`bai_sidecar_path`].
+#[must_use]
+pub fn crai_sidecar_path(cram: &Path) -> PathBuf {
+    append_suffix(cram, ".crai")
 }
 
 #[cfg(test)]

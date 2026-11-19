@@ -122,6 +122,7 @@ cargo build --release
 | `simulate` | Commands for generating synthetic test data |
 | `profile-adjacency` | Enable profiling output for adjacency UMI assigner |
 | `aligner-bwa-mem3` | In-process bwa-mem3 aligner for `runall` (`--aligner::preset bwa-mem3-inproc`); needs a C++17 compiler and zlib headers, and on x86_64 the binary needs a CPU with AVX2 |
+| `cram` | CRAM input (detected by content) and output (`*.cram` output names; `--write-index` writes a `.crai`) through a vendored htslib; needs a C compiler. Give the reference before the command, `fgumi --reference <FASTA> <command>`, or with the command's own `--ref` |
 Enable with: `cargo build --release --features <feature>`
 
 ## Available Tools
@@ -250,6 +251,8 @@ fgumi supports multi-threading and memory management for optimal performance:
 >
 > See the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md)
 > for detailed guidance, including scenario-based configurations and troubleshooting.
+
+With `cram` enabled, readers reserve estimated decoded memory before dispatching slices, separately from compressed-input and decoded-output queues. Pipeline readers use the per-step queue allowance; readers outside the pipeline share a 256 MiB allowance per input. An oversized slice runs alone. These estimates include bases, uncompressed blocks, record overhead, and expansion slack, but are not hard RSS limits: unusually large repeated deletions, codec scratch space, and shared reference caches can exceed them.
 
 ## Performance
 

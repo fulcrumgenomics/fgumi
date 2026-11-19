@@ -100,7 +100,7 @@ impl ChainSpec {
         Self {
             stages: vec![stage],
             source: SourceSpec::Bam(ctx.io.input.clone()),
-            sink: SinkSpec::Bam(ctx.io.output.clone()),
+            sink: SinkSpec::alignment(ctx.io.output.clone(), &ctx.io.output, false),
             stage_opts,
             threading: ctx.threading.clone(),
             compression: ctx.compression.clone(),

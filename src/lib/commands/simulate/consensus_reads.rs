@@ -15,7 +15,7 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_alignment_writer;
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::{ConversionPattern, MethylationAnnotation, MethylationEvidence};
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
@@ -42,7 +42,7 @@ Reads contain consensus tags (cD, cM, cE, cd, ce) for filtering.
 "#
 )]
 pub struct ConsensusReads {
-    /// Output BAM file (mapped)
+    /// Output BAM or CRAM file (mapped)
     #[arg(short = 'o', long = "output", required = true)]
     pub output: PathBuf,
 
@@ -157,6 +157,8 @@ const CHANNEL_CAPACITY: usize = 1_000;
 
 impl Command for ConsensusReads {
     fn execute(&self, command_line: &str) -> Result<()> {
+        fgumi_bam_io::validate_alignment_output(&self.output)?;
+
         let methylation = self.methylation.resolve(self.seed);
         self.methylation.validate()?;
         if methylation.mode.is_enabled()
@@ -242,9 +244,10 @@ impl Command for ConsensusReads {
         let writer_threads = self.threads;
         let header_clone = header.clone();
 
-        // Spawn writer thread with multi-threaded BGZF compression
+        // BAM compression uses the requested workers; CRAM encodes inline on this writer.
         let writer_handle = thread::spawn(move || -> Result<u64> {
-            let mut writer = create_raw_bam_writer(
+            let mut writer = create_raw_alignment_writer(
+                &output_path,
                 &output_path,
                 &header_clone,
                 writer_threads,

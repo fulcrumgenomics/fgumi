@@ -143,8 +143,13 @@ Rather than converting back to FASTQ and re-running extraction and alignment, `f
 build the paired `RX` directly. The `pair` operation writes `rb-mb` on R1 and `mb-rb` on R2, so
 both mates carry the same R1-first barcode pair that `fgumi extract` would have produced:
 
+A default `fgumi` build reads BAM, not CRAM, so decode the CRAM with samtools first, as below. A
+build with `--features cram` reads the CRAM directly: drop the `samtools view` step, pass
+`--input shared.cram`, and give the reference before the command
+(`fgumi --reference hs37d5.fa retag ...`).
+
 ```bash
-# fgumi reads BAM, so decode the CRAM first (use the reference it was aligned to)
+# Default builds: decode the CRAM first (use the reference it was aligned to)
 samtools view -b -@ 8 -T hs37d5.fa -o shared.bam shared.cram
 
 fgumi retag --input shared.bam --output retagged.bam rb,mb::pair::RX rb::delete mb::delete

@@ -27,17 +27,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail, ensure};
 
 use super::SinkSpec;
+use super::sink_spec::IndexKind;
 
 /// A staged sort output (see the module docs).
 pub(crate) struct StagedSortOutput {
     target: fgumi_sort::MergeOutputTarget,
     output: PathBuf,
-    /// The staged BAI the sink writes, removed unless published.
-    staged_index: Option<RemoveOnDrop>,
+    /// The staged index the sink writes (`.bai` or `.crai`), removed unless
+    /// published; `None` when not indexing.
+    staged_index: RemoveOnDrop,
 }
 
-/// A file removed on drop unless disarmed.
+/// A file (if any) removed on drop unless disarmed.
 struct RemoveOnDrop(Option<PathBuf>);
+
+impl RemoveOnDrop {
+    /// Stop guarding the file, returning its path.
+    fn disarm(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
@@ -48,28 +57,43 @@ impl Drop for RemoveOnDrop {
 }
 
 impl StagedSortOutput {
-    /// Stage `command`'s output for `output`, with its BAI when `write_index`.
+    /// Stage `command`'s output for `output`, with its index (`.bai`, or
+    /// `.crai` for a `*.cram` output) when `write_index`.
     ///
     /// # Errors
     ///
     /// An index requested for stdout, or a destination that cannot be staged.
     pub(crate) fn create(output: &Path, write_index: bool, command: &str) -> Result<Self> {
         if write_index && fgumi_bam_io::is_stdout_path(output) {
-            bail!("a BAI index needs a file output, not stdout");
+            let kind = IndexKind::for_path(output).name();
+            bail!("a {kind} index needs a file output, not stdout");
         }
         let target = fgumi_sort::MergeOutputTarget::create_for(output, command)?;
         let staged_index =
-            write_index.then(|| RemoveOnDrop(Some(fgumi_bam_io::bai_sidecar_path(target.path()))));
+            RemoveOnDrop(write_index.then(|| IndexKind::for_path(output).sidecar(target.path())));
         Ok(Self { target, output: output.to_path_buf(), staged_index })
     }
 
-    /// The sink the chain writes: the staged BAM, with its BAI when indexing.
-    pub(crate) fn sink(&self) -> SinkSpec {
-        let path = self.target.path().to_path_buf();
-        if self.staged_index.is_some() { SinkSpec::BamWithIndex(path) } else { SinkSpec::Bam(path) }
+    /// Protect the input from the final sidecar, not just the staged one.
+    pub(crate) fn validate_input(&self, input: &Path) -> Result<()> {
+        if self.staged_index.0.is_some() {
+            crate::commands::common::reject_writes_aliasing_inputs(
+                &[(input, "--input")],
+                &[(&destination_index(&self.output), "--write-index sidecar")],
+            )?;
+        }
+        Ok(())
     }
 
-    /// The staged BAM's path.
+    /// The sink the chain writes: the staged output, with its index when
+    /// indexing, in the format the destination's name selects.
+    pub(crate) fn sink(&self) -> SinkSpec {
+        let path = self.target.path().to_path_buf();
+        SinkSpec::alignment(path, &self.output, self.staged_index.0.is_some())
+    }
+
+    /// The staged output's path.
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         self.target.path()
     }
@@ -85,12 +109,21 @@ impl StagedSortOutput {
     /// each failure leaves behind).
     pub(crate) fn finish(mut self, stats: &fgumi_sort::SortStats) -> Result<()> {
         ensure_all_written(stats, &self.output)?;
-        let staged_index = self.staged_index.take();
-        if staged_index.is_some() {
+        // The staged index stays armed in `self` (removed on any early return)
+        // until it is renamed into place.
+        if self.staged_index.0.is_some() {
             // This run writes an index: never let the new BAM sit beside the
             // old BAM's index. A run without one leaves any sidecar alone (see
             // the module docs).
-            let dest = fgumi_bam_io::bai_sidecar_path(&self.output);
+            let dest = destination_index(&self.output);
+            if let fgumi_sort::MergeOutputTarget::Temp { dest: primary, .. } = &self.target {
+                ensure!(
+                    !crate::commands::common::paths_refer_to_same_file(primary, &dest),
+                    "the index {} and resolved output {} are the same file; choose a different path",
+                    dest.display(),
+                    primary.display()
+                );
+            }
             match std::fs::remove_file(&dest) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -98,9 +131,8 @@ impl StagedSortOutput {
             }
         }
         self.target.persist()?;
-        if let Some(mut index) = staged_index {
-            let staged = index.0.take().expect("armed until published");
-            let dest = fgumi_bam_io::bai_sidecar_path(&self.output);
+        if let Some(staged) = self.staged_index.disarm() {
+            let dest = destination_index(&self.output);
             if let Err(e) = std::fs::rename(&staged, &dest) {
                 let _ = std::fs::remove_file(&staged);
                 bail!("failed to publish the index {}: {e}", dest.display());
@@ -108,6 +140,11 @@ impl StagedSortOutput {
         }
         Ok(())
     }
+}
+
+/// The destination's index sidecar: `.crai` beside a CRAM, `.bai` beside a BAM.
+fn destination_index(output: &Path) -> PathBuf {
+    IndexKind::for_path(output).sidecar(output)
 }
 
 /// The sort's permutation guard: every record read was written.
@@ -126,6 +163,119 @@ fn ensure_all_written(stats: &fgumi_sort::SortStats, output: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// The sink's format, index and CRAM file ID follow the destination name
+    /// and `--write-index`, while it writes to the staged path. Catches: the
+    /// format or the CRAM file ID taken from the staged temp's name.
+    #[rstest]
+    #[case::bam("out.bam", false, false, false, None)]
+    #[case::bam_indexed("out.bam", true, false, true, Some("out.bam.bai"))]
+    #[case::cram("out.cram", false, true, false, None)]
+    #[case::cram_indexed("out.cram", true, true, true, Some("out.cram.crai"))]
+    fn the_sink_follows_the_destination_name(
+        #[case] name: &str,
+        #[case] write_index: bool,
+        #[case] is_cram: bool,
+        #[case] has_index: bool,
+        #[case] dest_index: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join(name);
+        let staged = StagedSortOutput::create(&out, write_index, "sort").unwrap();
+        let sink = staged.sink();
+        assert_eq!(sink.is_cram(), is_cram);
+        assert_eq!(sink.has_index(), has_index);
+        assert_eq!(sink.cram_name(), is_cram.then_some(out.as_path()));
+        assert_eq!(sink.path().map(PathBuf::as_path), Some(staged.path()), "writes the stage");
+        assert_ne!(staged.path(), out.as_path());
+        let staged_index = staged.staged_index.0.clone();
+        let sink_index = sink.index().map(|(_, sidecar)| sidecar);
+        assert_eq!(staged_index, sink_index, "the staged index is the sink's");
+        assert_eq!(
+            write_index.then(|| destination_index(&out)),
+            dest_index.map(|n| dir.path().join(n))
+        );
+    }
+
+    /// Publishing must not replace the primary file with its own sidecar.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::bam("out.bam")]
+    #[case::cram("out.cram")]
+    fn a_sidecar_aliasing_the_resolved_destination_is_rejected(#[case] name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join(name);
+        let index = destination_index(&out);
+        std::fs::write(&index, b"previous").unwrap();
+        std::os::unix::fs::symlink(index.file_name().unwrap(), &out).unwrap();
+        let staged = StagedSortOutput::create(&out, true, "sort").unwrap();
+        std::fs::write(staged.path(), b"alignment").unwrap();
+        std::fs::write(staged.staged_index.0.as_ref().unwrap(), b"index").unwrap();
+        let stats = fgumi_sort::SortStats { total_records: 1, output_records: 1, runs_written: 0 };
+        let err = staged.finish(&stats).unwrap_err();
+        assert!(err.to_string().contains("same file"), "{err:#}");
+        assert_eq!(std::fs::read(&index).unwrap(), b"previous");
+        assert!(out.is_symlink());
+    }
+
+    /// A symlink destination remains supported when its sidecar is distinct.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::bam("out.bam")]
+    #[case::cram("out.cram")]
+    fn a_distinct_symlink_destination_is_published(#[case] name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join(name);
+        let target = dir.path().join("alignment");
+        std::fs::write(&target, b"previous").unwrap();
+        std::os::unix::fs::symlink("alignment", &out).unwrap();
+        let staged = StagedSortOutput::create(&out, true, "sort").unwrap();
+        std::fs::write(staged.path(), b"alignment").unwrap();
+        std::fs::write(staged.staged_index.0.as_ref().unwrap(), b"index").unwrap();
+        let stats = fgumi_sort::SortStats { total_records: 1, output_records: 1, runs_written: 0 };
+        staged.finish(&stats).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"alignment");
+        assert_eq!(std::fs::read(destination_index(&out)).unwrap(), b"index");
+        assert!(out.is_symlink());
+    }
+
+    /// Library sorting shares the command's final-sidecar input protection.
+    #[rstest]
+    #[case::bam("out.bam")]
+    #[cfg_attr(feature = "cram", case::cram("out.cram"))]
+    fn library_sort_rejects_input_at_the_final_index(#[case] name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join(name);
+        let input = destination_index(&output);
+        fgumi_bam_io::create_raw_bam_writer(&input, &noodles::sam::Header::default(), 1, 1)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let before = std::fs::read(&input).unwrap();
+        let config = crate::sort::SortConfig {
+            input: input.clone(),
+            output: output.clone(),
+            order: crate::commands::sort::SortOrderArg::Coordinate,
+            threads: 1,
+            max_memory: Some(64 << 20),
+            tmp_dirs: vec![],
+            compression: 1,
+            write_index: true,
+            key_types: fgumi_sort::KeyTypesSpec::Auto,
+        };
+        let err = crate::sort::sort_bam(&config).unwrap_err();
+        assert!(err.to_string().contains("same file"), "{err:#}");
+        assert_eq!(std::fs::read(input).unwrap(), before);
+        assert!(!output.exists());
+    }
+
+    /// An index for stdout is refused, naming the index the name selects.
+    #[test]
+    fn an_index_for_stdout_is_refused() {
+        let err = StagedSortOutput::create(Path::new("-"), true, "sort").err().unwrap();
+        assert_eq!(err.to_string(), "a BAI index needs a file output, not stdout");
+    }
 
     /// A count mismatch publishes nothing: the staged BAM and BAI are removed
     /// and an existing destination keeps its bytes. Catches: a short output

@@ -58,8 +58,8 @@ use bstr::BString;
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_bam_io::{
-    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path, is_stdout_path,
-    make_bgzf_reader,
+    RawBamReaderAuto, create_raw_alignment_writer, create_raw_bam_reader, is_stdin_path,
+    is_stdout_path, make_bgzf_reader,
 };
 use fgumi_raw_bam;
 use fgumi_raw_bam::{RawRecord, RawRecordView, TagBitset};
@@ -1111,6 +1111,15 @@ impl Zipper {
         })
     }
 
+    /// Whether `execute` routes this run through [`Self::execute_chain`]:
+    /// `--threads >= 4` (the chain floors its pool to 4 workers, so 1..=3 stay
+    /// on `process_raw` to honor the exact count) and both inputs regular
+    /// files (the `PairedBams` source opens them by path, so stdin and FIFOs
+    /// stay on the streaming `process_raw`).
+    fn uses_chain(&self) -> bool {
+        self.threads >= 4 && is_regular_file(&self.unmapped) && is_regular_file(&self.input)
+    }
+
     /// Run standalone zipper on the declarative pipeline chain (issue #972).
     ///
     /// Used for `--threads >= 4`: routing the per-template merge through the
@@ -1149,7 +1158,7 @@ impl Zipper {
                 mapped: self.input.clone(),
                 reference: self.reference.clone(),
             },
-            sink: SinkSpec::Bam(self.output.clone()),
+            sink: SinkSpec::alignment(self.output.clone(), &self.output, false),
             stage_opts: StageOptionsBag {
                 zipper: Some(self.to_zipper_options()),
                 ..Default::default()
@@ -1187,7 +1196,8 @@ impl Zipper {
         U: Iterator<Item = Result<Template>>,
         M: Iterator<Item = Result<Template>>,
     {
-        let mut writer = create_raw_bam_writer(
+        let mut writer = create_raw_alignment_writer(
+            &self.output,
             &self.output,
             output_header,
             self.threads,
@@ -1341,6 +1351,7 @@ impl Command for Zipper {
         if self.restore_unconverted_bases {
             bail!(RESTORE_UNCONVERTED_BASES_REMOVED);
         }
+        fgumi_bam_io::validate_alignment_output(&self.output)?;
         info!("Starting zipper");
 
         let timer = OperationTimer::new("Zipping BAMs");
@@ -1369,13 +1380,9 @@ impl Command for Zipper {
         })?;
 
         // High thread counts: route through the declarative pipeline chain so the
-        // per-template merge fans out across workers (issue #972). Gated at `>= 4`,
-        // not `> 2`: the zipper chain floors its pool to 4 workers (`add_zipper`),
-        // so routing a `--threads 3` request through it would run 4 threads and
-        // break the "--threads N caps at N" contract — 1..=3 stay on process_raw,
-        // which honors the exact count. The PairedBams source opens inputs by
-        // path, so a stdin/FIFO input (either side) also keeps process_raw.
-        if self.threads >= 4 && is_regular_file(&self.unmapped) && is_regular_file(&self.input) {
+        // per-template merge fans out across workers (issue #972). See
+        // `uses_chain` for why it is gated at `>= 4` and on regular-file inputs.
+        if self.uses_chain() {
             return self.execute_chain(command_line);
         }
 

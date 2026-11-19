@@ -507,6 +507,9 @@ fn for_each_umi_in_stream<R: std::io::Read>(
         fgumi_bam_io::InputFormat::Text | fgumi_bam_io::InputFormat::Empty => {
             for_each_umi_line(std::io::BufReader::new(replayed), path, on_umi)
         }
+        fgumi_bam_io::InputFormat::Cram => {
+            anyhow::bail!("UMI file {} is a CRAM file, not a list of UMIs", path.display())
+        }
     }
 }
 

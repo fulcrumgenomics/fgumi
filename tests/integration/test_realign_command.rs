@@ -66,7 +66,7 @@ fn consensus_read(name: &str, seg: u16, rw: Option<&str>) -> fgumi_raw_bam::RawR
 }
 
 /// `n` consensus pairs `cons:<i>`; `rw(i)` gives each pair's `(R1, R2)` windows.
-fn write_consensus(
+pub(crate) fn write_consensus(
     dir: &Path,
     n: usize,
     rw: impl Fn(usize) -> (Option<&'static str>, Option<&'static str>),

@@ -12,7 +12,9 @@ use crate::sam::{SamTag, is_template_coordinate_sorted};
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::{RawBamWriter, create_raw_bam_reader_with_opts, create_raw_bam_writer};
+use fgumi_bam_io::{
+    RawAlignmentWriter, create_raw_alignment_writer, create_raw_bam_reader_with_opts,
+};
 use fgumi_raw_bam::{
     RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
 };
@@ -88,7 +90,7 @@ pub struct Downsample {
     #[arg(short = 'f', long = "fraction")]
     pub fraction: f64,
 
-    /// Optional output BAM file for rejected reads
+    /// Optional output BAM or CRAM file for rejected reads
     #[arg(long = "rejects")]
     pub rejects: Option<PathBuf>,
 
@@ -151,6 +153,11 @@ impl Downsample {
 
 impl Command for Downsample {
     fn execute(&self, command_line: &str) -> Result<()> {
+        fgumi_bam_io::validate_alignment_output(&self.io.output)?;
+        if let Some(path) = &self.rejects {
+            fgumi_bam_io::validate_alignment_output(path)?;
+        }
+
         // Validate inputs. Use the shared validator so stdin (`-` / `/dev/stdin`)
         // is exempt from the file-existence check, matching every other streaming
         // command; the BAM reader already handles stdin.
@@ -216,15 +223,28 @@ impl Command for Downsample {
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Create output BAM writer (single-threaded, downsample doesn't have threads parameter)
-        let mut writer =
-            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
+        // Downsample has no thread option; both formats use a serial writer.
+        let mut writer = create_raw_alignment_writer(
+            &self.io.output,
+            &self.io.output,
+            &header,
+            1,
+            self.compression.compression_level,
+        )?;
 
         // Create optional rejects writer
-        let mut rejects_writer: Option<RawBamWriter> = self
+        let mut rejects_writer: Option<RawAlignmentWriter> = self
             .rejects
             .as_ref()
-            .map(|path| create_raw_bam_writer(path, &header, 1, self.compression.compression_level))
+            .map(|path| {
+                create_raw_alignment_writer(
+                    path,
+                    path,
+                    &header,
+                    1,
+                    self.compression.compression_level,
+                )
+            })
             .transpose()?;
 
         // Statistics
@@ -302,7 +322,7 @@ impl Command for Downsample {
         }
 
         // Finalize writers before summary so any I/O failure surfaces here rather
-        // than silently on drop (flushes buffered records + writes BGZF EOF).
+        // than silently on drop (flushes records and writes the format's EOF marker).
         writer.finish()?;
         if let Some(rw) = rejects_writer {
             rw.finish()?;

@@ -10,7 +10,7 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_bam_io::OutputFile;
 use fgumi_bam_io::ProgressTracker;
-use fgumi_bam_io::create_raw_bam_writer;
+use fgumi_bam_io::create_raw_alignment_writer;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
 use noodles::sam::header::Header;
@@ -34,7 +34,7 @@ to test the correction algorithm's ability to find the correct UMI.
 "#
 )]
 pub struct CorrectReads {
-    /// Output BAM file (unmapped)
+    /// Output BAM or CRAM file (unmapped)
     #[arg(short = 'o', long = "output", required = true)]
     pub output: PathBuf,
 
@@ -120,6 +120,8 @@ const CHANNEL_CAPACITY: usize = 1_000;
 
 impl Command for CorrectReads {
     fn execute(&self, command_line: &str) -> Result<()> {
+        fgumi_bam_io::validate_alignment_output(&self.output)?;
+
         // Validate that we can generate enough unique UMIs
         let max_possible_umis = 4_usize.saturating_pow(self.umi_length as u32);
         if self.num_umis > max_possible_umis {
@@ -212,9 +214,10 @@ impl Command for CorrectReads {
         let header_clone = header.clone();
         let num_reads = self.num_reads;
 
-        // Spawn writer thread with multi-threaded BGZF compression
+        // BAM compression uses the requested workers; CRAM encodes inline on this writer.
         let writer_handle = thread::spawn(move || -> Result<(u64, u64, u64, u64, u64)> {
-            let mut writer = create_raw_bam_writer(
+            let mut writer = create_raw_alignment_writer(
+                &output_path,
                 &output_path,
                 &header_clone,
                 writer_threads,
