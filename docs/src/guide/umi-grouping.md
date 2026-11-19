@@ -30,7 +30,7 @@ Reads and templates are filtered before grouping to prevent splitting reads from
 - All reads for the template are unmapped (unless `--allow-unmapped`)
 - Any non-secondary, non-supplementary read has mapping quality < `--min-map-q`
 - Any UMI sequence contains one or more `N` bases
-- `--min-umi-length` is specified and the UMI does not meet the length requirement
+- `--min-umi-length` is specified and the UMI has fewer bases than that (see [UMIs of Different Lengths](#umis-of-different-lengths))
 
 ### Grouping Unmapped Reads
 
@@ -79,6 +79,47 @@ Similar to adjacency but for duplex sequencing where each template has two UMIs 
 The molecular IDs produced have structure: `{base}/{A|B}`. For example, UMI pairs `AAAA-GGGG` and `GGGG-AAAA` map to `1/A` and `1/B` respectively. See [Tracking Reads](tracking-reads.md) for details. **Recommended for duplex workflows.**
 
 The `edit`, `adjacency`, and `paired` strategies use the `--edits` parameter to control matching of non-identical UMIs.
+
+## UMIs of Different Lengths
+
+UMIs may have different lengths, but only UMIs with the same length are compared, so reads whose
+UMIs have different lengths are never assigned to the same molecule. For UMIs with multiple
+segments separated by `-`, each segment must have the same length (e.g. `ACGT-CCGGA` is never
+grouped with `ACGTC-CGGA` or `ACGT-CCGG`). For the `paired` strategy, the two orientations of a UMI
+pair (e.g. `ACGT-CCGGA` and `CCGGA-ACGT`) are compared with each other as usual.
+
+If `--min-umi-length=len` is given, reads with fewer than `len` bases in their UMI are discarded.
+The number of bases is the number of `A`, `C`, `G` and `T` characters in the UMI: dashes and other
+characters are not counted, and reads with an `N` in their UMI are discarded earlier. The UMIs of
+the remaining reads are not changed, so UMIs of different lengths are still never grouped
+together.
+
+To group UMIs of different lengths together, give `--truncate` together with
+`--min-umi-length=len`. Each UMI then has its dashes and other non-base characters removed and is
+truncated to its first `len` bases before it is compared, so the position of a dash does not
+matter. For example, with `--min-umi-length=6 --truncate` the UMIs `ACGTAC`, `ACGTACGT` and
+`ACG-TACG` are all compared as `ACGTAC`. Only the UMIs used for grouping are truncated: the raw UMI
+tag (`RX`) is not changed. `--min-umi-length` and `--truncate` cannot be used with the `paired`
+strategy. `fgumi dedup` accepts the same two options and applies the same rules.
+
+```bash
+fgumi group \
+  --input sorted.bam \
+  --output grouped.bam \
+  --strategy adjacency \
+  --min-umi-length 8 \
+  --truncate
+```
+
+> **Note:** in earlier fgumi releases, `--min-umi-length` on its own also truncated UMIs (to the shortest
+> UMI they were compared with). It now only filters; add `--truncate` to group UMIs of different
+> lengths. UMIs with the same bases but a different `-` segment layout (e.g. `ACGT` and `ACGT-`, or
+> `AC-GTTA` and `ACGTA-A`) were grouped together when `--min-umi-length` was given (it removed the
+> dashes), and UMIs of one total length but different segment lengths could be grouped by the
+> `adjacency` and `edit` strategies when within `--edits` of each other (the dash was compared as a
+> character). They are now always separate molecules unless `--truncate` is given. Because UMIs of each segment-length layout are assigned
+> separately, in ascending order of their segment lengths, the `MI` labels can change for inputs
+> that mix UMI lengths. This matches fgbio's `GroupReadsByUmi` as of fulcrumgenomics/fgbio#1198.
 
 > **Note:** `fgumi group` and fgbio's `GroupReadsByUmi` produce identical groupings but generally
 > assign different integer `MI` values to the same molecules. This is a known, expected

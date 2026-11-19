@@ -21,7 +21,9 @@ use rayon::prelude::*;
 use crate::bitenc::BitEnc;
 use crate::template::MoleculeId;
 
-use fgumi_umi::assigner::{check_uniform_single_umi_length, check_uniform_umi_length};
+use fgumi_umi::assigner::{
+    check_uniform_umi_length, paired_forward_is_canonical, paired_umi_segment_lengths,
+};
 
 use super::{Umi, UmiAssigner};
 
@@ -602,10 +604,6 @@ impl UmiAssigner for ParallelIdentityAssigner {
         self.counter.reset();
     }
 
-    fn groups_identical_umis_only(&self) -> bool {
-        true
-    }
-
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         let mut assignments = self.assign_local(raw_umis);
         self.counter.rebase(&mut assignments);
@@ -681,7 +679,7 @@ impl ParallelEditAssigner {
         let unique_umis: Vec<(BitEnc, usize)> = umi_counts.into_iter().collect();
 
         // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
-        check_uniform_single_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
+        check_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
 
         let mut enc_to_idx: AHashMap<BitEnc, usize> =
             AHashMap::with_hasher(crate::hashing::deterministic_state());
@@ -735,10 +733,6 @@ impl ParallelEditAssigner {
 impl UmiAssigner for ParallelEditAssigner {
     fn reset(&self) {
         self.counter.reset();
-    }
-
-    fn groups_identical_umis_only(&self) -> bool {
-        self.max_mismatches == 0
     }
 
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
@@ -824,7 +818,7 @@ impl ParallelAdjacencyAssigner {
             sorted_umis.iter().map(|(_, count, enc)| (*enc, *count)).collect();
 
         // Reject differing-length UMIs the way fgbio (and the sequential assigner) does.
-        check_uniform_single_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
+        check_uniform_umi_length(unique_umis.iter().map(|(enc, _)| enc.len()))?;
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         let max_mismatches = self.max_mismatches;
@@ -911,10 +905,6 @@ impl ParallelAdjacencyAssigner {
 impl UmiAssigner for ParallelAdjacencyAssigner {
     fn reset(&self) {
         self.counter.reset();
-    }
-
-    fn groups_identical_umis_only(&self) -> bool {
-        self.max_mismatches == 0
     }
 
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
@@ -1005,14 +995,23 @@ impl ParallelPairedAssigner {
         if parts.len() == 2 { Some(format!("{}-{}", parts[1], parts[0])) } else { None }
     }
 
-    /// Canonicalize a paired UMI by taking the lexicographically smaller of A-B and B-A.
-    /// Always returns uppercase.
+    /// Canonicalize a paired UMI to `A-B` or `B-A` by the halves rule the sequential paired
+    /// assigner and the length buckets share ([`paired_forward_is_canonical`]). Always returns
+    /// uppercase.
+    ///
+    /// This used to take the lower of the whole `A-B` and `B-A` strings. The two rules only
+    /// differ when one half is a prefix of the other and the next character sorts before `-`;
+    /// a key that reaches grouping holds only bases, the orientation prefix letters (`A`/`B`),
+    /// `:` and one `-`, so they pick the same form for every such key.
     fn canonicalize(umi: &str) -> String {
         let upper = umi.to_uppercase();
-        if let Some(reversed) = Self::reverse_paired(&upper) {
-            if reversed < upper { reversed } else { upper }
-        } else {
-            upper
+        match upper.split_once('-') {
+            Some((first, second))
+                if !second.contains('-') && !paired_forward_is_canonical(first, second) =>
+            {
+                format!("{second}-{first}")
+            }
+            _ => upper,
         }
     }
 
@@ -1412,6 +1411,10 @@ impl UmiAssigner for ParallelPairedAssigner {
         self.counter.reset();
     }
 
+    fn segment_lengths(&self, umi: &str, lengths: &mut Vec<usize>) {
+        paired_umi_segment_lengths(umi, lengths);
+    }
+
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         let mut assignments = self.assign_local(raw_umis)?;
         self.counter.rebase(&mut assignments);
@@ -1776,19 +1779,20 @@ mod tests {
         );
     }
 
-    // fgbio's GroupReadsByUmi throws on UMIs of differing length; every parallel
-    // mismatch-based assigner must reject them the same way rather than silently
-    // under-group (tracker GRP-01), matching the sequential assigners.
+    // A library caller passing UMIs of differing length to one `assign` call (`group` and
+    // `dedup` never do: they bucket by segment lengths first) must get an error from every
+    // parallel mismatch-based assigner rather than a silent under-grouping (tracker GRP-01),
+    // matching the sequential assigners.
     #[rstest]
     #[case::edit(
         || Box::new(ParallelEditAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
         &["AAAA", "AAA"],
-        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+        "Multiple UMI lengths: 3, 4"
     )]
     #[case::adjacency(
         || Box::new(ParallelAdjacencyAssigner::new(1, 2)) as Box<dyn UmiAssigner>,
         &["AAAA", "AAA"],
-        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+        "Multiple UMI lengths: 3, 4"
     )]
     #[case::paired(
         || Box::new(ParallelPairedAssigner::new(1, 2)) as Box<dyn UmiAssigner>,

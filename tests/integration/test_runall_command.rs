@@ -3727,3 +3727,93 @@ fn start_from_extract_rejects_mixed_length_umis_before_reading_fastqs() {
     );
     assert!(!out.exists(), "no output may be written when the UMI set is rejected");
 }
+
+// ─────────────────────── group stage: --group::min-umi-length / --group::truncate ───────────────────────
+
+/// Writes one single-end read per `(name, umi)` at one position, as `runall --start-from group`
+/// input, and returns its path.
+fn write_mixed_length_umi_bam(dir: &Path, umis: &[(&str, &str)]) -> PathBuf {
+    let input = dir.join("input.bam");
+    let records: Vec<_> = umis
+        .iter()
+        .flat_map(|(name, umi)| create_umi_family_at_pos(umi, 1, name, "ACGTACGTACGT", 30, 100))
+        .collect();
+    write_bam(&input, &create_minimal_header("chr1", 10_000), &records);
+    input
+}
+
+/// `runall`'s group stage applies `group`'s `--min-umi-length` / `--truncate` checks, with the
+/// same messages: `--group::truncate` needs `--group::min-umi-length`, and the paired strategy
+/// rejects both (checked first, so a paired run with `--group::truncate` alone gets the paired
+/// message).
+#[rstest::rstest]
+#[case::truncate_without_min_length(
+    &["--group::strategy", "adjacency", "--group::truncate"],
+    "Error: --truncate requires --min-umi-length"
+)]
+#[case::paired_min_length(
+    &["--group::strategy", "paired", "--group::min-umi-length", "3"],
+    "Error: --min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs \
+     of different lengths are grouped by the lengths of their two UMIs"
+)]
+#[case::paired_truncate_without_min_length(
+    &["--group::strategy", "paired", "--group::truncate"],
+    "Error: --min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs \
+     of different lengths are grouped by the lengths of their two UMIs"
+)]
+fn runall_group_rejects_invalid_min_umi_length_and_truncate(
+    #[case] group_args: &[&str],
+    #[case] expected: &str,
+) {
+    let tmp = TempDir::new().unwrap();
+    let input = write_mixed_length_umi_bam(tmp.path(), &[("a", "ACGTAC-GT")]);
+    let out = tmp.path().join("out.bam");
+    let mut args = vec!["runall", "--start-from", "group", "--stop-after", "group"];
+    args.extend(["-i", p(&input), "-o", p(&out)]);
+    args.extend_from_slice(group_args);
+
+    let output = fgumi(&args);
+    assert!(!output.status.success(), "{group_args:?} must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.lines().last(), Some(expected), "unexpected error, got:\n{stderr}");
+}
+
+/// `runall`'s group stage keeps UMIs of different lengths at one position apart (one molecule
+/// per UMI) unless `--group::truncate` is given with `--group::min-umi-length`, which truncates
+/// them all to the same bases and makes them one molecule.
+#[rstest::rstest]
+#[case::separate_without_truncate(&[], 3)]
+#[case::min_length_only(&["--group::min-umi-length", "6"], 3)]
+#[case::truncate(&["--group::min-umi-length", "6", "--group::truncate"], 1)]
+fn runall_group_mixed_length_umis(
+    #[case] group_args: &[&str],
+    #[case] expected_molecules: usize,
+    #[values("1", "4")] threads: &str,
+) {
+    let tmp = TempDir::new().unwrap();
+    let input = write_mixed_length_umi_bam(
+        tmp.path(),
+        &[("a", "ACGTAC"), ("b", "ACGTACG"), ("c", "ACG-TACGT")],
+    );
+    let out = tmp.path().join("out.bam");
+    let mut args = vec!["runall", "--start-from", "group", "--stop-after", "group"];
+    args.extend(["-i", p(&input), "-o", p(&out), "--threads", threads]);
+    args.extend(["--group::strategy", "adjacency"]);
+    args.extend_from_slice(group_args);
+    run_ok(&args, "runall group with mixed-length UMIs");
+
+    let (_, records) = read_bam_output(&out);
+    assert_eq!(records.len(), 3, "every read must be written");
+    let mi_tag =
+        noodles::sam::alignment::record::data::field::Tag::from(fgumi_lib::sam::SamTag::MI);
+    let molecules: std::collections::BTreeSet<String> = records
+        .iter()
+        .map(|record| match record.data().get(&mi_tag) {
+            Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi)) => {
+                mi.to_string()
+            }
+            other => panic!("every record must have a string MI, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(molecules.len(), expected_molecules, "molecules: {molecules:?}");
+}

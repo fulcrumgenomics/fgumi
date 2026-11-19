@@ -4929,9 +4929,9 @@ impl<'a> ChainBuilder<'a> {
         // Reject the same incompatible flag combinations that standalone
         // `fgumi group` rejects up front, so the runall path enforces them too
         // (S5c2-003). These read the user-supplied `strategy`/`no_umi`/
-        // `min_umi_length` (not the derived `effective_*`), matching
+        // `min_umi_length`/`truncate` (not the derived `effective_*`), matching
         // `GroupReadsByUmi::execute`.
-        crate::umi::validate_min_umi_length(group.min_umi_length, group.strategy)?;
+        crate::umi::validate_min_umi_length(group.min_umi_length, group.truncate, group.strategy)?;
         if group.no_umi && matches!(group.strategy, crate::assigner::Strategy::Paired) {
             bail!("--no-umi cannot be used with --strategy paired");
         }
@@ -4951,6 +4951,13 @@ impl<'a> ChainBuilder<'a> {
         info!("Edits: {}", group.effective_edits);
         if group.no_umi {
             info!("No-UMI mode: grouping by position only");
+        }
+        // Logged here, not in `GroupReadsByUmi::execute`: standalone `group` and `runall` both
+        // build the stage through `add_group`, so this fires once per run.
+        if let Some(notice) =
+            crate::umi::min_umi_length_notice(group.min_umi_length, group.truncate, group.no_umi)
+        {
+            info!("{notice}");
         }
         crate::commands::common::log_index_threshold(
             group.effective_strategy,
@@ -5097,6 +5104,7 @@ impl<'a> ChainBuilder<'a> {
             group.effective_edits,
             group.index_threshold,
             raw_tag,
+            crate::umi::truncate_length(group.min_umi_length, group.truncate),
             group.no_umi,
             group.allow_unmapped,
             group.parallel_group_min_templates.clone(),
@@ -7323,8 +7331,8 @@ impl<'a> ChainBuilder<'a> {
             .as_ref()
             .ok_or_else(|| anyhow!("Stage::Dedup options missing from StageOptionsBag"))?;
 
-        // Same `--min-umi-length` checks as standalone `fgumi dedup`.
-        crate::umi::validate_min_umi_length(dedup.min_umi_length, dedup.strategy)?;
+        // Same `--min-umi-length` / `--truncate` checks as standalone `fgumi dedup`.
+        crate::umi::validate_min_umi_length(dedup.min_umi_length, dedup.truncate, dedup.strategy)?;
 
         let tail = self.current_tail.expect("add_dedup called before add_source");
 
@@ -7375,6 +7383,12 @@ impl<'a> ChainBuilder<'a> {
         if dedup.no_umi {
             info!("No-UMI mode: deduplicating by position only");
         }
+        // Standalone `dedup` builds its stage through `add_dedup` too, so this fires once.
+        if let Some(notice) =
+            crate::umi::min_umi_length_notice(dedup.min_umi_length, dedup.truncate, dedup.no_umi)
+        {
+            info!("{notice}");
+        }
         crate::commands::common::log_index_threshold(
             effective_strategy,
             effective_edits,
@@ -7412,7 +7426,7 @@ impl<'a> ChainBuilder<'a> {
             effective_edits,
             dedup.index_threshold,
             raw_tag,
-            dedup.min_umi_length,
+            crate::umi::truncate_length(dedup.min_umi_length, dedup.truncate),
             dedup.no_umi,
             dedup.include_unmapped,
             accumulators_for_process,
