@@ -656,6 +656,136 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
     ref_path
 }
 
+/// A `tc` tag value for [`single_end_read_with_tc`].
+#[derive(Clone, Debug)]
+pub enum TcTagValue {
+    /// A `B:i` array.
+    I32(Vec<i32>),
+    /// A `B:S` array.
+    U16(Vec<u16>),
+}
+
+/// An unpaired, 50-base (`50M`) read named `name` aligned at 1-based position 101 on
+/// reference 0 with UMI `AAAAAAAA`, on the reverse strand when `reverse`, and with the `tc`
+/// tag `tc` when given. Its unclipped 5' position is 101 forward and 150 reverse.
+pub fn single_end_read_with_tc(name: &str, reverse: bool, tc: Option<TcTagValue>) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .ref_id(0)
+        .pos(100)
+        .mapq(60)
+        .flags(if reverse { flags::REVERSE } else { 0 })
+        .cigar_ops(&[50u32 << 4]) // 50M
+        .sequence(&[b'A'; 50])
+        .qualities(&[30u8; 50]);
+    b.add_string_tag(SamTag::RX, b"AAAAAAAA");
+    match tc {
+        None => {}
+        Some(TcTagValue::I32(values)) => {
+            b.add_array_i32(SamTag::TC, &values);
+        }
+        Some(TcTagValue::U16(values)) => {
+            b.add_array_u16(SamTag::TC, &values);
+        }
+    }
+    b.build()
+}
+
+/// A read as [`single_end_read_with_tc`] builds it. With `Some(end)` its primary carries a
+/// valid `tc` insert-end hint whose virtual mate (opposite strand) puts the insert's far end
+/// at `end`: at or after 150 (the aligned end) for a forward read, at or before 101 (the
+/// aligned start) for a reverse one.
+pub fn single_end_read_with_insert_end(
+    name: &str,
+    reverse: bool,
+    insert_end: Option<i32>,
+) -> RawRecord {
+    let tc = insert_end.map(|end| {
+        TcTagValue::I32(if reverse {
+            vec![0, end, 0, 0, 150, 1]
+        } else {
+            vec![0, 101, 0, 0, end, 1]
+        })
+    });
+    single_end_read_with_tc(name, reverse, tc)
+}
+
+/// The single-end reads of the insert-end tests, in template-coordinate order: forward reads
+/// `a1..a6` (5' position 101) alternate between insert ends 300 and 250, then `u1`, `u2`
+/// carry no `tc` tag; reverse reads `r1..r6` (5' position 150) alternate between insert ends
+/// 30 and 60. Reads of one strand thus share a 5' position with insert ends interleaved by
+/// name. All share one UMI.
+pub fn interleaved_insert_end_reads() -> Vec<RawRecord> {
+    let forward = [
+        ("a1", Some(300)),
+        ("a2", Some(250)),
+        ("a3", Some(300)),
+        ("a4", Some(250)),
+        ("a5", Some(300)),
+        ("a6", Some(250)),
+        ("u1", None),
+        ("u2", None),
+    ];
+    let reverse = [("r1", 30), ("r2", 60), ("r3", 30), ("r4", 60), ("r5", 30), ("r6", 60)];
+    forward
+        .iter()
+        .map(|(name, end)| single_end_read_with_insert_end(name, false, *end))
+        .chain(
+            reverse
+                .iter()
+                .map(|(name, end)| single_end_read_with_insert_end(name, true, Some(*end))),
+        )
+        .collect()
+}
+
+/// The molecules [`interleaved_insert_end_reads`] form, by read name.
+pub const INTERLEAVED_INSERT_END_FAMILIES: &[&[&str]] = &[
+    &["a1", "a3", "a5"],
+    &["a2", "a4", "a6"],
+    &["u1", "u2"],
+    &["r1", "r3", "r5"],
+    &["r2", "r4", "r6"],
+];
+
+/// Single-end reads whose `tc` tags `group` and `dedup` count and warn about as rejected
+/// insert-end hints (`rejected_*`, three of them), or treat as no hint at all (`plain_*`), in
+/// template-coordinate order: forward reads at 5' position 101, then one reverse read at 150,
+/// so rejections occur in two position groups. Every read groups by its 5' end only.
+pub fn rejected_and_plain_insert_end_reads() -> Vec<RawRecord> {
+    vec![
+        // Written 0-based: the own slot is one base before the read's 5' position.
+        single_end_read_with_tc(
+            "rejected_0based",
+            false,
+            Some(TcTagValue::I32(vec![0, 100, 0, 0, 299, 1])),
+        ),
+        // A `B:S` array: only `B:i` is read.
+        single_end_read_with_tc(
+            "rejected_subtype",
+            false,
+            Some(TcTagValue::U16(vec![0, 101, 0, 0, 300, 1])),
+        ),
+        // One primary, in the current and the legacy both-slots-equal encoding.
+        single_end_read_with_tc(
+            "plain_one_primary",
+            false,
+            Some(TcTagValue::I32(vec![0, 101, 0, i32::MAX, i32::MAX, 0])),
+        ),
+        single_end_read_with_tc(
+            "plain_legacy",
+            false,
+            Some(TcTagValue::I32(vec![0, 101, 0, 0, 101, 0])),
+        ),
+        single_end_read_with_tc("plain_untagged", false, None),
+        // A `B:S` array on a reverse read, in a second position group.
+        single_end_read_with_tc(
+            "rejected_reverse_subtype",
+            true,
+            Some(TcTagValue::U16(vec![0, 30, 0, 0, 150, 1])),
+        ),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // `compare`-feature-only helpers.
 //

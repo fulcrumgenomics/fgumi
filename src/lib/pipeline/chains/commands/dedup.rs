@@ -184,6 +184,7 @@ impl FinalizeHook for DedupFinalizeHook {
         // Report filtered templates identically to the non-chain path (shared
         // helper, so the two paths cannot drift).
         crate::commands::dedup::log_filtered_templates(&final_counts.filter_counts);
+        crate::umi::log_rejected_insert_end_hints(final_counts.rejected_insert_end_hints);
 
         timer.log_completion(final_counts.total_reads);
 
@@ -227,6 +228,8 @@ pub(crate) fn build_process_step(
     + Sync
     + 'static,
 > {
+    // One run-wide flag, so a rejected single-end insert-end hint is warned about once.
+    let insert_end_hint_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
     process_ordered::<BatchedRawPositionGroups, BatchedProcessedDedupGroups, _>(
         "DedupProcess",
         limit_bytes,
@@ -245,6 +248,7 @@ pub(crate) fn build_process_step(
                     min_umi_length,
                     no_umi,
                     include_unmapped,
+                    &insert_end_hint_warned,
                 )?;
                 accumulators.with_slot(|acc| {
                     // A position group is always single-library, so its counts

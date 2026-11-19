@@ -36,8 +36,8 @@
 use crate::sam::SamTag;
 use anyhow::{Result, bail};
 use fgumi_bam_io::{DecodedRecord, MemoryEstimate};
-use fgumi_raw_bam::TemplateCoordinateTag;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::{SingleEndInsertEnd, TemplateCoordinateTag};
 
 // Re-export PairOrientation from sam module for backwards compatibility
 pub use crate::sam::PairOrientation;
@@ -159,6 +159,38 @@ impl Template {
     #[must_use]
     pub fn r2(&self) -> Option<&RawRecord> {
         self.r2.map(|(i, _)| &self.records[i])
+    }
+
+    /// The optional `tc` insert-end hint on a single-end template's primary
+    /// R1/fragment record: the insert's far end `(tid, 1-based position,
+    /// is_reverse)` when valid, or why there is none.
+    ///
+    /// [`SingleEndInsertEnd::NotApplicable`] when the template has no primary
+    /// R1/fragment; otherwise see
+    /// [`fgumi_raw_bam::TemplateCoordinateTag::single_end_insert_end`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the primary R1/fragment record is not a well-formed BAM record
+    /// payload.
+    #[must_use]
+    pub(crate) fn single_end_insert_end(&self) -> SingleEndInsertEnd {
+        self.r1().map_or(SingleEndInsertEnd::NotApplicable, |r1| {
+            fgumi_raw_bam::TemplateCoordinateTag::single_end_insert_end(r1.as_ref())
+        })
+    }
+
+    /// The strands of the template's primary reads, `(r1_positive, r2_positive)`:
+    /// whether its primary R1/fragment and R2 are on the forward strand. A missing
+    /// read counts as forward. `group` and `dedup` split position groups by this
+    /// (strand of origin) before assigning molecule ids. Unlike
+    /// [`Self::pair_orientation`] (FR/RF/tandem), it needs no mate information.
+    #[must_use]
+    pub(crate) fn pair_strand_orientation(&self) -> (bool, bool) {
+        let is_positive = |r: &RawRecord| {
+            (RawRecordView::new(r.as_ref()).flags() & fgumi_raw_bam::flags::REVERSE) == 0
+        };
+        (self.r1().is_none_or(is_positive), self.r2().is_none_or(is_positive))
     }
 
     /// Returns all records as a slice.

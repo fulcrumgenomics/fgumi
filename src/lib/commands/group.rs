@@ -9,11 +9,11 @@ use crate::commands::common::{
 use crate::metrics::TemplateFilterCounts;
 use crate::metrics::group::UmiGroupingMetrics;
 use crate::template::Template;
-use crate::umi::assign_umis;
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
     ParallelPairedAssigner,
 };
+use crate::umi::{RejectedInsertEndHints, assign_umis, partition_for_umi_assignment};
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -31,6 +31,9 @@ pub(crate) struct GroupMetricsAccumulator {
     pub(crate) family_sizes: AHashMap<usize, u64>,
     pub(crate) position_group_sizes: AHashMap<usize, u64>,
     pub(crate) filter_counts: TemplateFilterCounts,
+    /// Single-end primaries whose `tc` insert-end hint was rejected; see
+    /// [`crate::umi::RejectedInsertEndHints`].
+    pub(crate) rejected_insert_end_hints: u64,
 }
 
 impl GroupMetricsAccumulator {
@@ -53,20 +56,6 @@ impl GroupMetricsAccumulator {
 // =============================================================================
 // Raw-byte filter and helper functions
 // =============================================================================
-
-/// Get pair orientation from raw-byte template.
-fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    use fgumi_raw_bam;
-    use fgumi_raw_bam::RawRecordView;
-
-    let r1_positive = template
-        .r1()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
-    let r2_positive = template
-        .r2()
-        .is_none_or(|r| (RawRecordView::new(r).flags() & fgumi_raw_bam::flags::REVERSE) == 0);
-    (r1_positive, r2_positive)
-}
 
 // =============================================================================
 // Static _impl functions - core logic used by both closures and &self methods
@@ -112,12 +101,6 @@ fn umi_for_read_impl(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner)
 
         Ok(result)
     }
-}
-
-/// Get pair orientation for a template.
-#[cfg(test)]
-fn get_pair_orientation_impl(template: &Template) -> (bool, bool) {
-    get_pair_orientation_raw(template)
 }
 
 /// Empirical minimum group size at which the parallel assigner is at least as
@@ -199,13 +182,16 @@ pub(crate) fn create_umi_assigner(
 }
 
 /// Assign UMI groups to templates (static implementation).
+///
+/// Returns the single-end insert-end hints (`tc` tags) rejected while partitioning the
+/// templates; see [`partition_for_umi_assignment`].
 pub(crate) fn assign_umi_groups_impl(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
     no_umi: bool,
-) -> Result<()> {
+) -> Result<RejectedInsertEndHints> {
     // All templates are in raw-byte mode (Template always uses RawRecord)
 
     // Unlike `dedup`, `group` keeps the strand-of-origin split even under `--no-umi`:
@@ -213,39 +199,16 @@ pub(crate) fn assign_umi_groups_impl(
     // every read 1 in a molecule to be the same physical strand. `dedup` gates the
     // same split on `!no_umi` (see `dedup::splits_by_strand_of_origin`); this site
     // deliberately does not, so do not "harmonize" the two by adding `&& !no_umi` here.
-    if assigner.split_templates_by_pair_orientation() {
-        // Group by pair orientation
-        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> =
-            AHashMap::with_hasher(crate::hashing::deterministic_state());
-        for (idx, template) in templates.iter().enumerate() {
-            let orientation = get_pair_orientation_raw(template);
-            subgroups.entry(orientation).or_default().push(idx);
-        }
-
-        // Process each subgroup separately, in deterministic orientation
-        // order. `subgroups` is an `AHashMap` whose iteration order varies
-        // per process; without sorting, two runs would walk FR/RF (etc.)
-        // subgroups in different orders and assign different local
-        // `MoleculeId`s to the same templates.
-        let mut ordered_subgroups: Vec<((bool, bool), Vec<usize>)> =
-            subgroups.into_iter().collect();
-        ordered_subgroups.sort_by_key(|(orientation, _)| *orientation);
-        for (_orientation, indices) in &ordered_subgroups {
-            assign_umi_groups_for_indices_impl(
-                templates,
-                indices,
-                assigner,
-                raw_tag,
-                min_umi_length,
-                no_umi,
-            )?;
-        }
-    } else {
-        // No splitting - process all templates together
-        let all_indices: Vec<usize> = (0..templates.len()).collect();
+    //
+    // Templates are also always split by single-end insert end (from an optional `tc`
+    // tag); see `partition_for_umi_assignment`. Subgroups come back in a deterministic
+    // order, so the same templates get the same local `MoleculeId`s on every run.
+    let mut rejected = RejectedInsertEndHints::default();
+    let split_by_orientation = assigner.split_templates_by_pair_orientation();
+    for indices in partition_for_umi_assignment(templates, split_by_orientation, &mut rejected) {
         assign_umi_groups_for_indices_impl(
             templates,
-            &all_indices,
+            &indices,
             assigner,
             raw_tag,
             min_umi_length,
@@ -253,7 +216,7 @@ pub(crate) fn assign_umi_groups_impl(
         )?;
     }
 
-    Ok(())
+    Ok(rejected)
 }
 
 /// Assign UMI groups to a subset of templates (static implementation).
@@ -431,6 +394,10 @@ UMIs are compared case-insensitively.
 
 Note: the --min-map-q parameter defaults to 1 and is directly settable on the command line.
 (Duplicate marking is not performed by this command in fgumi; it is handled by `fgumi dedup`.)
+
+Single-end reads are grouped by their 5' end only, unless an upstream tool records the insert's
+far end in an optional `tc` tag on the primary record; see "Single-End Reads" in the UMI grouping
+guide (docs/src/guide/umi-grouping.md).
 
 # Cell Barcodes
 
@@ -5509,7 +5476,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = get_pair_orientation_impl(&template);
+        let orientation = template.pair_strand_orientation();
         assert_eq!(orientation, (true, false), "F1R2 should have orientation (true, false)");
 
         Ok(())
@@ -5522,7 +5489,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = get_pair_orientation_impl(&template);
+        let orientation = template.pair_strand_orientation();
         assert_eq!(orientation, (false, true), "F2R1 should have orientation (false, true)");
 
         Ok(())
@@ -5536,7 +5503,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = get_pair_orientation_impl(&template);
+        let orientation = template.pair_strand_orientation();
         assert_eq!(
             orientation,
             (true, true),
@@ -5553,7 +5520,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = get_pair_orientation_impl(&template);
+        let orientation = template.pair_strand_orientation();
         assert_eq!(
             orientation,
             (false, false),
@@ -7060,5 +7027,68 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(entries.len(), 3, "expected exactly 3 files, got {entries:?}");
+    }
+
+    // ========================================================================
+    // Single-end insert end (`tc` tag on an unpaired primary)
+    // ========================================================================
+
+    /// Single-end templates at one 5' position are given different molecule ids when their
+    /// `tc` insert ends differ, whatever their UMIs, and with or without `--no-umi`. A template
+    /// without an insert end is never grouped with one that has an insert end. Each read is
+    /// `(umi, reverse, insert end)`; a reverse read's virtual mate is forward, at or before its
+    /// aligned start (100).
+    #[rstest]
+    #[case::different_insert_ends(&[("AAAA", false, Some(300)), ("AAAA", false, Some(250))], false, &[0, 1])]
+    #[case::same_insert_end(&[("AAAA", false, Some(300)), ("AAAA", false, Some(300))], false, &[0, 0])]
+    #[case::no_tags(&[("AAAA", false, None), ("AAAA", false, None)], false, &[0, 0])]
+    #[case::same_insert_end_different_umis(
+        &[("AAAA", false, Some(300)), ("CCCC", false, Some(300))],
+        false,
+        &[0, 1]
+    )]
+    #[case::mixed_tagged_and_untagged(
+        &[("AAAA", false, Some(300)), ("AAAA", false, None), ("AAAA", false, None), ("AAAA", false, Some(300))],
+        false,
+        &[0, 1, 1, 0]
+    )]
+    #[case::interleaved_insert_ends(
+        &[("AAAA", false, Some(300)), ("AAAA", false, Some(250)), ("AAAA", false, Some(300)), ("AAAA", false, Some(250))],
+        false,
+        &[0, 1, 0, 1]
+    )]
+    #[case::reverse_interleaved_insert_ends(
+        &[("AAAA", true, Some(20)), ("AAAA", true, Some(50)), ("AAAA", true, Some(20)), ("AAAA", true, Some(50))],
+        false,
+        &[0, 1, 0, 1]
+    )]
+    #[case::reverse_mixed_tagged_and_untagged(
+        &[("AAAA", true, Some(20)), ("AAAA", true, None), ("AAAA", true, Some(20))],
+        false,
+        &[0, 1, 0]
+    )]
+    #[case::no_umi_different_insert_ends(&[("AAAA", false, Some(300)), ("CCCC", false, Some(250))], true, &[0, 1])]
+    #[case::no_umi_same_insert_end(&[("AAAA", false, Some(300)), ("CCCC", false, Some(300))], true, &[0, 0])]
+    #[case::no_umi_no_tags(&[("AAAA", false, None), ("CCCC", false, None)], true, &[0, 0])]
+    #[case::no_umi_reverse_different_insert_ends(&[("AAAA", true, Some(20)), ("CCCC", true, Some(50))], true, &[0, 1])]
+    #[case::no_umi_reverse_same_insert_end(&[("AAAA", true, Some(20)), ("CCCC", true, Some(20))], true, &[0, 0])]
+    fn test_assign_umi_groups_impl_splits_single_end_by_insert_end(
+        #[case] reads: &[(&str, bool, Option<i32>)],
+        #[case] no_umi: bool,
+        #[case] expected: &[usize],
+    ) {
+        use crate::umi::test_support::{molecule_classes, single_end_template};
+        let mut templates: Vec<Template> = reads
+            .iter()
+            .enumerate()
+            .map(|(i, (umi, reverse, end))| {
+                single_end_template(&format!("q{i}"), umi, *reverse, *end)
+            })
+            .collect();
+        let assigner = IdentityUmiAssigner::new();
+        let rejected = assign_umi_groups_impl(&mut templates, &assigner, *SamTag::RX, None, no_umi)
+            .expect("assignment succeeds");
+        assert_eq!(molecule_classes(&templates), expected);
+        assert_eq!(rejected.count, 0, "no hint is rejected");
     }
 }

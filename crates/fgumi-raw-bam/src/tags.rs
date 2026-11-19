@@ -660,6 +660,17 @@ pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
 /// primary into both slots; readers use [`Self::from_record_aux`], which
 /// recognizes those tags from the record's own flags so existing BAMs need not
 /// be re-run through zipper.
+///
+/// # Insert-end hint on single-end primaries
+///
+/// zipper writes `tc` only on secondary and supplementary records. `group` and
+/// `dedup` also read it on a mapped, unpaired primary record, and only there, as
+/// an optional hint (from another tool) of where the read's insert ends: one
+/// slot is the read itself and the other is a "virtual mate" on the opposite
+/// strand at the insert's other end. The template-coordinate sort and the
+/// position key ignore it on a primary. On secondary and supplementary records
+/// the tag keeps its meaning above, so the two-slot hint must not be copied onto
+/// them. See [`Self::single_end_insert_end`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TemplateCoordinateTag {
     /// Reference ID of the lower primary.
@@ -765,6 +776,154 @@ impl TemplateCoordinateTag {
     pub fn zero_based_positions(&self) -> (i32, i32) {
         let shift = |pos: i32| if pos == Self::UNKNOWN_POS { pos } else { pos.saturating_sub(1) };
         (shift(self.pos1), shift(self.pos2))
+    }
+
+    /// Classifies the optional `tc` insert-end hint on a single-end read's
+    /// primary record, returning the insert's far end as
+    /// `(tid, 1-based position, is_reverse)` when the hint is valid.
+    ///
+    /// A plain single-end read's length mostly reflects trimming and quality,
+    /// not the molecule, so `group` and `dedup` key it by its 5' end only. When
+    /// a single-end read spans the whole insert (e.g. it reads through to the
+    /// adapter), its 3' end is a real molecular coordinate. An upstream tool
+    /// that knows this may record it in a `tc` tag on the primary record (a
+    /// `B:i` array of six values, 1-based), as the template coordinate a read
+    /// pair spanning the same insert would get:
+    ///
+    /// - one slot is the read itself: its reference, its 1-based unclipped 5'
+    ///   position (as [`crate::unclipped_5prime_from_raw_bam`] computes it) and
+    ///   its strand;
+    /// - the other slot is a "virtual mate": the insert's other end, written as
+    ///   the 1-based unclipped 5' position of a hypothetical read on the same
+    ///   reference and the opposite strand. It must lie at or beyond the read's
+    ///   aligned extent (clips excluded): for a forward read, at or after the
+    ///   read's 1-based aligned end (its last reference-consuming base); for a
+    ///   reverse read, at or before its 1-based aligned start.
+    ///
+    /// `fgumi zipper` never writes `tc` on primary records; this is an optional
+    /// hint from other tools. Returns:
+    ///
+    /// - [`SingleEndInsertEnd::NotApplicable`] when no hint applies: `record` is
+    ///   paired, secondary, supplementary or unmapped (on secondary and
+    ///   supplementary records `tc` is zipper's template-coordinate key, not a
+    ///   hint), it has no `tc` tag, or the tag has one primary (in either the
+    ///   current or the legacy both-slots-equal encoding, see
+    ///   [`Self::from_record_aux`]);
+    /// - [`SingleEndInsertEnd::Rejected`] when a mapped, unpaired primary
+    ///   carries a `tc` tag that is not a valid hint: it is not a six-value
+    ///   `B:i` array (other integer array subtypes are rejected too), neither
+    ///   slot is the read's own `(tid, unclipped 5' position, strand)` (or the
+    ///   read has no computable unclipped 5' position), or the other slot is on
+    ///   another reference, on the same strand, at an unknown position, or not
+    ///   at or beyond the read's aligned extent;
+    /// - [`SingleEndInsertEnd::End`] otherwise, with the virtual mate's slot.
+    ///
+    /// Both non-`End` outcomes leave the read keyed by its 5' end only. The
+    /// read's own aligned 3' end is never used as the insert end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `record` is not a well-formed BAM record payload.
+    #[must_use]
+    pub fn single_end_insert_end(record: &[u8]) -> SingleEndInsertEnd {
+        use crate::fields::flags::{PAIRED, REVERSE, SECONDARY, SUPPLEMENTARY, UNMAPPED};
+
+        let view = RawRecordView::new(record);
+        let record_flags = view.flags();
+        if record_flags & (PAIRED | SECONDARY | SUPPLEMENTARY | UNMAPPED) != 0 {
+            return SingleEndInsertEnd::NotApplicable;
+        }
+        // One aux scan for the common untagged read; decode only when present.
+        let aux = aux_data_slice(record);
+        if find_tag_type(aux, SamTag::TC).is_none() {
+            return SingleEndInsertEnd::NotApplicable;
+        }
+        let Some(tc) = Self::from_record_aux(aux, record_flags) else {
+            return SingleEndInsertEnd::Rejected(
+                "the tc tag is not a B:i array of six values (other subtypes are not read)",
+            );
+        };
+        if tc.has_one_primary() {
+            return SingleEndInsertEnd::NotApplicable;
+        }
+
+        let own_pos = crate::unclipped_5prime_from_raw_bam(record);
+        if own_pos == Self::UNKNOWN_POS {
+            return SingleEndInsertEnd::Rejected(
+                "the read has no computable unclipped 5' position (empty CIGAR)",
+            );
+        }
+        let own_tid = view.ref_id();
+        let own_reverse = record_flags & REVERSE != 0;
+        let own = (own_tid, own_pos, own_reverse);
+        let slot1 = (tc.tid1, tc.pos1, tc.neg1);
+        let slot2 = (tc.tid2, tc.pos2, tc.neg2);
+        let (other_tid, other_pos, other_reverse) = if slot1 == own {
+            slot2
+        } else if slot2 == own {
+            slot1
+        } else if [slot1, slot2].contains(&(own_tid, own_pos.saturating_sub(1), own_reverse)) {
+            return SingleEndInsertEnd::Rejected(
+                "neither slot is the read itself, but one is one base before its unclipped 5' \
+                 position; tc positions are 1-based, so the tag may have been written 0-based",
+            );
+        } else {
+            return SingleEndInsertEnd::Rejected(
+                "neither slot is the read's own reference, unclipped 5' position and strand",
+            );
+        };
+
+        if other_tid != own_tid {
+            return SingleEndInsertEnd::Rejected("the virtual mate is on another reference");
+        }
+        if other_reverse == own_reverse {
+            return SingleEndInsertEnd::Rejected("the virtual mate is on the read's own strand");
+        }
+        if other_pos == Self::UNKNOWN_POS {
+            return SingleEndInsertEnd::Rejected("the virtual mate's position is unknown");
+        }
+        // The read is mapped with a computable 5' end, so its aligned extent is too;
+        // a record whose CIGAR consumes no reference has none and is rejected.
+        // Positions are 1-based, so a negative one is never a valid far end.
+        let Ok(other_pos_1based) = usize::try_from(other_pos) else {
+            return SingleEndInsertEnd::Rejected("the virtual mate's position is negative");
+        };
+        let beyond_aligned_extent = if own_reverse {
+            crate::alignment_start_from_raw(record).is_some_and(|start| other_pos_1based <= start)
+        } else {
+            crate::alignment_end_from_raw(record).is_some_and(|end| other_pos_1based >= end)
+        };
+        if !beyond_aligned_extent {
+            return SingleEndInsertEnd::Rejected(
+                "the virtual mate's position is not at or beyond the read's aligned extent",
+            );
+        }
+        SingleEndInsertEnd::End((other_tid, other_pos, other_reverse))
+    }
+}
+
+/// What a single-end read's optional `tc` insert-end hint says; see
+/// [`TemplateCoordinateTag::single_end_insert_end`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SingleEndInsertEnd {
+    /// No hint applies (a paired, secondary, supplementary or unmapped record;
+    /// no `tc` tag; or a one-primary tag). Not an error.
+    NotApplicable,
+    /// The insert's far end, `(tid, 1-based position, is_reverse)`.
+    End((i32, i32, bool)),
+    /// A mapped, unpaired primary carries a `tc` tag that is not a valid
+    /// hint, for the given reason. The read is keyed by its 5' end only.
+    Rejected(&'static str),
+}
+
+impl SingleEndInsertEnd {
+    /// The insert's far end, when the hint is valid.
+    #[must_use]
+    pub const fn end(self) -> Option<(i32, i32, bool)> {
+        match self {
+            Self::End(end) => Some(end),
+            Self::NotApplicable | Self::Rejected(_) => None,
+        }
     }
 }
 
@@ -6036,5 +6195,207 @@ mod tests {
         let tc = TemplateCoordinateTag::one_primary((2, 309, true));
         assert_eq!(tc.to_values(), [2, 309, 1, i32::MAX, i32::MAX, 0]);
         assert_eq!(tc.zero_based_positions(), (308, i32::MAX), "the no-mate slot is not shifted");
+    }
+
+    /// The `tc` tag a test single-end record carries.
+    #[derive(Clone, Copy, Debug)]
+    enum TestTc {
+        /// No `tc` tag.
+        Absent,
+        /// A `B:i` array of these values.
+        I32(&'static [i32]),
+        /// A `B:S` array of these values.
+        U16(&'static [u16]),
+    }
+
+    /// A 50-base single-end read on reference 0 aligned at 1-based position 100
+    /// with `cigar`, the given `record_flags`, and the `tc` tag `tc`. With `50M`
+    /// its unclipped 5' position is 100 forward and 149 reverse, and its aligned
+    /// extent is 100-149.
+    fn single_end_record(record_flags: u16, cigar: &[u32], tc: TestTc) -> Vec<u8> {
+        let mut builder = crate::builder::SamBuilder::new();
+        builder
+            .read_name(b"q1")
+            .ref_id(0)
+            .pos(99)
+            .flags(record_flags)
+            .cigar_ops(cigar)
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50]);
+        match tc {
+            TestTc::Absent => {}
+            TestTc::I32(values) => {
+                builder.add_array_i32(SamTag::TC, values);
+            }
+            TestTc::U16(values) => {
+                builder.add_array_u16(SamTag::TC, values);
+            }
+        }
+        builder.build().as_ref().to_vec()
+    }
+
+    /// The expected outcome of [`TemplateCoordinateTag::single_end_insert_end`].
+    #[derive(Clone, Copy, Debug)]
+    enum Expect {
+        /// [`SingleEndInsertEnd::NotApplicable`].
+        NotApplicable,
+        /// [`SingleEndInsertEnd::End`] at this slot.
+        End((i32, i32, bool)),
+        /// [`SingleEndInsertEnd::Rejected`], whose reason contains this text.
+        Rejected(&'static str),
+    }
+
+    const M50: &[u32] = &[0x320]; // 50M
+    const M40_S10: &[u32] = &[0x280, 0xA4]; // 40M10S
+    const HINT: TestTc = TestTc::I32(&[0, 100, 0, 0, 300, 1]);
+
+    #[rstest]
+    #[case::forward(0, M50, HINT, Expect::End((0, 300, true)))]
+    #[case::forward_far_end_at_aligned_end(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, 149, 1]),
+        Expect::End((0, 149, true))
+    )]
+    #[case::forward_soft_clipped_far_end_at_aligned_end(
+        0,
+        M40_S10,
+        TestTc::I32(&[0, 100, 0, 0, 139, 1]),
+        Expect::End((0, 139, true))
+    )]
+    #[case::forward_far_end_inside_read_rejected(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, 148, 1]),
+        Expect::Rejected("not at or beyond the read's aligned extent")
+    )]
+    #[case::forward_far_end_at_own_five_prime_rejected(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, 100, 1]),
+        Expect::Rejected("not at or beyond the read's aligned extent")
+    )]
+    #[case::reverse(flags::REVERSE, M50, TestTc::I32(&[0, 20, 0, 0, 149, 1]), Expect::End((0, 20, false)))]
+    #[case::reverse_far_end_at_aligned_start(
+        flags::REVERSE,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, 149, 1]),
+        Expect::End((0, 100, false))
+    )]
+    #[case::reverse_far_end_inside_read_rejected(
+        flags::REVERSE,
+        M50,
+        TestTc::I32(&[0, 101, 0, 0, 149, 1]),
+        Expect::Rejected("not at or beyond the read's aligned extent")
+    )]
+    #[case::reverse_soft_clipped(
+        flags::REVERSE,
+        M40_S10,
+        TestTc::I32(&[0, 20, 0, 0, 149, 1]),
+        Expect::End((0, 20, false))
+    )]
+    #[case::absent(0, M50, TestTc::Absent, Expect::NotApplicable)]
+    #[case::one_primary(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, i32::MAX, i32::MAX, 0]),
+        Expect::NotApplicable
+    )]
+    #[case::legacy_both_slots_equal(0, M50, TestTc::I32(&[0, 100, 0, 0, 100, 0]), Expect::NotApplicable)]
+    #[case::unsigned_short_subtype_rejected(
+        0,
+        M50,
+        TestTc::U16(&[0, 100, 0, 0, 300, 1]),
+        Expect::Rejected("not a B:i array")
+    )]
+    #[case::five_values_rejected(0, M50, TestTc::I32(&[0, 100, 0, 0, 300]), Expect::Rejected("not a B:i array"))]
+    #[case::zero_based_own_slot_rejected(
+        0,
+        M50,
+        TestTc::I32(&[0, 99, 0, 0, 299, 1]),
+        Expect::Rejected("written 0-based")
+    )]
+    #[case::slot_not_own_five_prime(
+        0,
+        M50,
+        TestTc::I32(&[0, 101, 0, 0, 300, 1]),
+        Expect::Rejected("neither slot is the read's own")
+    )]
+    #[case::slot_not_own_five_prime_or_strand(
+        flags::REVERSE,
+        M50,
+        HINT,
+        Expect::Rejected("neither slot is the read's own")
+    )]
+    #[case::slot_not_own_strand(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 1, 0, 300, 1]),
+        Expect::Rejected("neither slot is the read's own")
+    )]
+    #[case::other_reference(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 1, 300, 1]),
+        Expect::Rejected("another reference")
+    )]
+    #[case::same_strand(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, 300, 0]),
+        Expect::Rejected("the read's own strand")
+    )]
+    #[case::unknown_other_position(
+        0,
+        M50,
+        TestTc::I32(&[0, 100, 0, 0, i32::MAX, 1]),
+        Expect::Rejected("position is unknown")
+    )]
+    #[case::forward_other_end_before(
+        0,
+        M50,
+        TestTc::I32(&[0, 50, 1, 0, 100, 0]),
+        Expect::Rejected("not at or beyond the read's aligned extent")
+    )]
+    #[case::reverse_other_end_after(
+        flags::REVERSE,
+        M50,
+        TestTc::I32(&[0, 149, 1, 0, 200, 0]),
+        Expect::Rejected("not at or beyond the read's aligned extent")
+    )]
+    #[case::paired(flags::PAIRED, M50, HINT, Expect::NotApplicable)]
+    #[case::paired_mate_unmapped(
+        flags::PAIRED | flags::MATE_UNMAPPED,
+        M50,
+        HINT,
+        Expect::NotApplicable
+    )]
+    #[case::secondary(flags::SECONDARY, M50, HINT, Expect::NotApplicable)]
+    #[case::supplementary(flags::SUPPLEMENTARY, M50, HINT, Expect::NotApplicable)]
+    #[case::unmapped(flags::UNMAPPED, M50, HINT, Expect::NotApplicable)]
+    #[case::unmapped_bad_subtype(
+        flags::UNMAPPED,
+        M50,
+        TestTc::U16(&[0, 100, 0, 0, 300, 1]),
+        Expect::NotApplicable
+    )]
+    #[case::empty_cigar(0, &[], HINT, Expect::Rejected("no computable unclipped 5' position"))]
+    fn test_template_coordinate_tag_single_end_insert_end(
+        #[case] record_flags: u16,
+        #[case] cigar: &[u32],
+        #[case] tc: TestTc,
+        #[case] expected: Expect,
+    ) {
+        let record = single_end_record(record_flags, cigar, tc);
+        let actual = TemplateCoordinateTag::single_end_insert_end(&record);
+        match (expected, actual) {
+            (Expect::NotApplicable, SingleEndInsertEnd::NotApplicable) => {}
+            (Expect::End(want), SingleEndInsertEnd::End(got)) => assert_eq!(got, want),
+            (Expect::Rejected(text), SingleEndInsertEnd::Rejected(reason)) => {
+                assert!(reason.contains(text), "reason {reason:?} should contain {text:?}");
+            }
+            (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
+        }
+        assert_eq!(actual.end(), if let Expect::End(end) = expected { Some(end) } else { None });
     }
 }
