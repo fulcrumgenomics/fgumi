@@ -39,6 +39,7 @@ cargo bench
 - `compare` - Enable compare subcommand (developer tools)
 - `simulate` - Enable simulate command for test data generation
 - `profile-adjacency` - Enable profiling output for adjacency UMI assigner
+- `cram` - Opt-in CRAM input and output through a vendored, patched htslib (`crates/fgumi-htslib`); off by default, and compiling it requires a C toolchain. CRAM input is detected by content; alignment outputs named `*.cram` are written as CRAM (`--write-index` writes a `.crai`). Pipeline commands encode containers on their worker pool; serial commands (`downsample`, simulation writers, and zipper with streamed inputs or fewer than four threads) use the shared serial alignment writer. The reference is `fgumi --reference <fa>` (before the subcommand) or the subcommand's own `--ref`/`-r` (the two must agree), else `FGUMI_REFERENCE`; past that, CRAM input uses htslib's `REF_PATH`/`REF_CACHE`/`@SQ UR:` lookup, and CRAM output uses htslib's lookup if `REF_PATH` or `REF_CACHE` is set, else is written reference-free. CRAM input older than version 2.1 is refused: it has no EOF container, so a truncated file could not be told from a complete one. In a default build (no `cram`), any output named `*.cram` is rejected; before this feature such a name was silently written as BAM. As with samtools, a CRAM round trip is not lossless at the record level: reading regenerates `MD`/`NM` on mapped records (so a record read from CRAM can carry tags the source BAM lacked), unmapped records keep no MAPQ or CIGAR, aux tag order is not preserved (`RG`/`MD`/`NM` move to the end), and a reference-based CRAM's header gains `M5`/`UR` on its `@SQ` lines. CRAM output bytes are not reproducible run to run; compare decoded records instead.
 - `aligner-bwa-mem3` - Opt-in in-process bwa-mem3 aligner for `runall` (`--aligner::preset bwa-mem3-inproc`); off by default, and compiling it requires a C++17 toolchain (see `Cargo.toml`'s `bwa-mem3-rs` dependency)
 
 Build with features: `cargo build --release --features compare,simulate`
@@ -143,7 +144,8 @@ Uses `mimalloc` as global allocator for performance.
 
 ## Unsafe Code
 
-`#![deny(unsafe_code)]` is set at the crate root of every workspace member. Targeted
+`#![deny(unsafe_code)]` is set at the crate root of every workspace member except
+`fgumi-htslib` (see the approved FFI section below). Targeted
 `#[allow(unsafe_code)]` blocks are permitted only at the documented sites listed below;
 any new `unsafe` block requires updating this section with a written justification.
 
@@ -151,6 +153,53 @@ Enabling the optional `aligner-bwa-mem3` feature links `bwa-mem3-sys`/`bwa-mem3-
 (vendored C++ plus its Rust FFI bindings), which contain their own `unsafe` outside
 this workspace's `deny(unsafe_code)`; fgumi's own crates carry no new `unsafe` for it
 and remain `#![deny(unsafe_code)]` regardless of the feature.
+
+### Approved FFI crate: `fgumi-htslib` (feature `cram`)
+
+`crates/fgumi-htslib` is the one workspace crate that is `#![allow(unsafe_code)]`
+at its root: it is the Rust FFI to a vendored htslib (`vendor/htslib`, patched by
+`vendor/container-executor.patch`, the container-executor API proposed
+upstream as samtools/htslib#2157) plus C glue (`csrc/fgumi_hts.c`). As a workspace member it
+is compiled (C included, so a C toolchain is needed) and tested by every
+`--workspace` build, lint and test, with or without `cram`; the `fgumi` binary
+links it only with the `cram` feature, which also gates the CRAM code paths in
+`fgumi`, `fgumi-bam-io` and `fgumi-pipeline-io`. Every other crate stays `#![deny(unsafe_code)]`
+and reaches it only through its safe API (`CramReader`/`SliceJob`,
+`CramWriter`/`EncodeJob`/`EncodedContainer`/`CramFinisher`). Approved because
+there is no safe alternative for CRAM at this speed: decoding the same 2M-read
+CRAM took 24.7 s wall / 18.8 CPU-s with noodles (single-threaded) and 3.0 s /
+6.1 CPU-s with htslib (4 threads), and htslib exposes CRAM only through C. Each `unsafe` block carries a
+`// SAFETY:` comment; the invariants that matter:
+
+- **Ownership.** Containers and slices are freed exactly once: a `SliceJob` owns
+  its slice and holds an `Arc` to its container and file; a container is freed
+  when the reader has moved past it and its last slice job drops; the file closes
+  when the last `Arc` drops. Write-side containers are owned by one
+  `EncodeJob`/`EncodedContainer` at a time (`cram_free_container` on drop).
+- **Concurrency mirrors htslib's own thread pool.** Slice decodes and container
+  encodes run on any thread concurrently, guarded by htslib's own
+  `ref_lock`/`metrics_lock`/`bam_list_lock`, exactly as under
+  `CRAM_OPT_THREAD_POOL`; like that option, the crate sets `fd->shared_ref = 1`
+  (otherwise concurrent decodes clobber a shared partial reference window and
+  bases decode as `N`). The patch also protects every decoder access to the
+  mutable container `unsorted` flag with `ref_lock`; an unlocked read would
+  race a different slice's update even with shared references enabled.
+  Serial operations (`next_slice`, `write_raw`, `seal`) need
+  `&mut`; container writes are serialized by a mutex and checked for order.
+- **The dispatch hook's context** is the `CramWriter`'s `DispatchSink`, owned
+  through a raw pointer for its whole life and accessed only through it. The
+  executor is detached only in `CramWriter::drop`, which then frees the sink;
+  that drop always runs before a `CramFinisher` or the last `WriterInner`
+  reference can use the file, because `CramWriter::seal` consumes the writer
+  before returning the finisher. The finisher and `WriterInner::drop` never
+  detach it.
+- **Callbacks.** `read_cb` and `dispatch_cb` are called by htslib only from the
+  thread driving the corresponding serial operation (`next_slice`; `write_raw`
+  or `seal`). `close_cb` runs from `hts_close` in `ReaderInner::drop`, on
+  whichever thread drops the file's last `Arc` (often a worker finishing a
+  `SliceJob`); by then no other reference to the file exists. Before calling a
+  safe Rust `Read`, the callback initializes the native destination storage;
+  afterward it rejects counts exceeding the buffer or `isize` range.
 
 ### Approved non-stdlib FFI exceptions
 
