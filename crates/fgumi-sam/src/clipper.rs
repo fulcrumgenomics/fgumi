@@ -10,8 +10,6 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 const TAGS_TO_REVERSE_COMPLEMENT: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::E2, fgumi_raw_bam::SamTag::SQ];
 
-/// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
-/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
 /// Base modification tags. `MM`/`am`/`bm` strings and the `ML` array are not per-base, so
 /// `--auto-clip-attributes` must not slice them even when their length happens to equal the
 /// read's; the `clip` command keeps them in step with the clipped SEQ itself.
@@ -83,6 +81,8 @@ fn is_never_auto_clipped(tag: [u8; 2]) -> bool {
     is_modification_tag(tag) || NON_PER_BASE_TAGS.iter().any(|t| **t == tag)
 }
 
+/// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
+/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
 
