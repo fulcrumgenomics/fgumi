@@ -222,7 +222,7 @@ fn generate<K: Lane>(params: &Params, seed: u64) -> Generated<K> {
         all[source].push(K::record(ord, unmapped, id, len));
     }
     for source in &mut all {
-        source.sort_by(|a, b| a.0.cmp(&b.0));
+        source.sort_by_key(|a| a.0);
     }
     all
 }
@@ -424,7 +424,7 @@ fn coordinate_records(spec: &[(u64, usize)], first_id: u64) -> Vec<(RawCoordinat
         .zip(first_id..)
         .map(|(&(ord, len), id)| RawCoordinateKey::record(ord, false, id, len))
         .collect();
-    recs.sort_by(|a, b| a.0.cmp(&b.0));
+    recs.sort_by_key(|a| a.0);
     recs
 }
 
@@ -775,7 +775,7 @@ fn equal_key_groups_split_into_bounded_ranges(
         recs[run].push(RawCoordinateKey::record(ord, unmapped, id, len));
     }
     for run in &mut recs {
-        run.sort_by(|a, b| a.0.cmp(&b.0));
+        run.sort_by_key(|a| a.0);
     }
     let dir = tempfile::tempdir().unwrap();
     let slots: Vec<_> = recs
@@ -833,7 +833,7 @@ proptest! {
                         RawCoordinateKey::record(ord, unmapped, id, len)
                     })
                     .collect();
-                recs.sort_by(|a, b| a.0.cmp(&b.0));
+                recs.sort_by_key(|a| a.0);
                 recs
             })
             .collect();

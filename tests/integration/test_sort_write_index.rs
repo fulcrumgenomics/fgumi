@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 /// Check if samtools is available in PATH.
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("samtools").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Create a small test BAM file using samtools.

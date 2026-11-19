@@ -181,7 +181,7 @@ fn splitters_of<K: Ord + Copy>(
     if samples.len() < 2 {
         return Vec::new();
     }
-    samples.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    samples.sort_unstable_by_key(|a| a.0);
     let total: u128 = samples.iter().map(|&(_, w)| u128::from(w)).sum();
     let ranges = sizing.range_count(total);
 

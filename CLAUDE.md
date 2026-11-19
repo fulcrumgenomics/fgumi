@@ -128,7 +128,7 @@ migration note. Do not start a wrapped footer line with a token followed by `:` 
 
 ## Rust Version
 
-Minimum supported and pinned build version: 1.93.0 (edition 2024).
+Minimum supported and pinned build version: 1.95.0 (edition 2024).
 
 fgumi supports exactly the Rust it is developed and tested on: `rust-version`
 in `Cargo.toml` (the published MSRV) is kept identical to the `channel` in

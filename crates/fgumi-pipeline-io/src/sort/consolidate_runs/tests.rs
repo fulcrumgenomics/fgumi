@@ -505,7 +505,7 @@ fn merge_is_the_stable_merge_of_its_inputs_in_run_order(
     k.start_job(1, SpillKeyKind::TemplateK40, &inputs, &output);
     k.settle().unwrap();
     let mut expected: Vec<(TemplateKey, Vec<u8>)> = runs.concat();
-    expected.sort_by(|a, b| a.0.cmp(&b.0)); // stable
+    expected.sort_by_key(|a| a.0); // stable
     let (job_id, frames_end, _) = k.registry.take_completed().expect("the job completed");
     assert_eq!(job_id, 1);
     assert_eq!(

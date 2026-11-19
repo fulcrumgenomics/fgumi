@@ -153,7 +153,7 @@ fn metrics_match_across_worker_counts(#[case] threads: usize) {
     assert!(
         single_worker_tsv.lines().any(|l| {
             let cols: Vec<&str> = l.split('\t').collect();
-            cols.len() >= 3 && cols[2].parse::<u64>().map(|n| n > 0).unwrap_or(false)
+            cols.len() >= 3 && cols[2].parse::<u64>().is_ok_and(|n| n > 0)
         }),
         "expected a non-zero records_applied somewhere in the metrics:\n{single_worker_tsv}"
     );

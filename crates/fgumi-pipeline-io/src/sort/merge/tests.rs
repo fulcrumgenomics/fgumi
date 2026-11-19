@@ -869,7 +869,7 @@ impl<K: Lane> RangeInputs<K> {
                     K::record(ord, id)
                 })
                 .collect();
-            recs.sort_by(|a, b| a.0.cmp(&b.0));
+            recs.sort_by_key(|a| a.0);
             recs
         };
         let runs = (0..runs).map(|_| leaf(per_run)).collect();
@@ -1042,7 +1042,7 @@ fn within_watchdog<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) ->
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(std::time::Duration::from_secs(60)).expect("WEDGED: the merge did not finish")
+    rx.recv_timeout(std::time::Duration::from_mins(1)).expect("WEDGED: the merge did not finish")
 }
 
 /// What a range-mode test merge run is given.

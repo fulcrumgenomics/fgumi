@@ -1281,7 +1281,7 @@ impl VanillaUmiConsensusCaller {
             .collect();
 
         // Sort by descending length for prefix matching
-        indexed.sort_by(|a, b| b.1.cmp(&a.1));
+        indexed.sort_by_key(|&(_, len, _)| std::cmp::Reverse(len));
 
         // Use shared grouping logic with deterministic tie-breaking
         let keep_indices = select_most_common_alignment_group(&indexed);
@@ -6330,7 +6330,7 @@ mod tests {
         // test would fail rather than report a clean error.
         let result = caller.consensus_reads(vec![r1, r2]);
 
-        assert_eq!(result.is_ok(), expect_ok, "UMI of {umi_len} bytes: expected ok={expect_ok}",);
+        assert_eq!(result.is_ok(), expect_ok, "UMI of {umi_len} bytes: expected ok={expect_ok}");
         if let Err(e) = result {
             let msg = format!("{e:#}");
             assert!(msg.contains("read name too long"), "unexpected error for {umi_len}: {msg}");

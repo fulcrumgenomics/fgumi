@@ -939,13 +939,7 @@ mod tests {
                 // A very large interval: the first tick fires immediately, then
                 // the sampler parks in its stop-checked sleep — so exactly one
                 // regular tick emits before the terminal finalize runs.
-                run_occupancy_sampler(
-                    &stop_c,
-                    &edges_c,
-                    Duration::from_secs(3600),
-                    None,
-                    Some(tele),
-                );
+                run_occupancy_sampler(&stop_c, &edges_c, Duration::from_hours(1), None, Some(tele));
             });
             // Let the single regular tick emit (it fires within microseconds of
             // thread start), THEN advance the shared counter during the final

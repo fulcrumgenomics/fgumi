@@ -58,8 +58,8 @@ pub fn radix_sort_coordinate_adaptive<T: Clone>(
         aux.set_len(n);
     }
 
-    let mut src = entries as *mut [(u64, T)];
-    let mut dst = aux.as_mut_slice() as *mut [(u64, T)];
+    let mut src = std::ptr::from_mut::<[(u64, T)]>(entries);
+    let mut dst = std::ptr::from_mut::<[(u64, T)]>(aux.as_mut_slice());
 
     // LSD radix sort - byte by byte from least significant
     for byte_idx in 0..total_bytes {

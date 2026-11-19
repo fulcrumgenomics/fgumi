@@ -126,7 +126,7 @@ fn run_sort_with_pipeline_stats(input: Input, extra: &[&str]) -> String {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("run fgumi sort");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         if child.try_wait().unwrap().is_some() {
             break;

@@ -805,7 +805,7 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_counts: &mut
         templates.iter().enumerate().map(|(i, t)| (i, score_template(t))).collect();
 
     // Sort by score descending (highest first)
-    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    scores.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
 
     // First template (highest score) is representative
     dedup_counts.unique_templates += 1;

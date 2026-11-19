@@ -6656,7 +6656,7 @@ mod tests {
         assert!(!signal.is_done(), "however long it lasts, the run is not failed");
         assert_eq!(
             mon_state.stall_start,
-            t0 + std::time::Duration::from_secs(600),
+            t0 + std::time::Duration::from_mins(10),
             "the wedge clock restarts at every external-wait poll"
         );
     }

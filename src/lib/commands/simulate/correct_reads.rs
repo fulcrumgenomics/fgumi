@@ -280,13 +280,13 @@ impl Command for CorrectReads {
             .with_context(|| "Failed to create thread pool")?;
 
         // Generate reads in parallel and stream to writer
-        let generation_result: Result<(), crossbeam_channel::SendError<CorrectReadPair>> = pool
-            .install(|| {
-                read_seeds.into_par_iter().enumerate().try_for_each(|(read_idx, seed)| {
-                    let pair = generate_correct_read_pair(read_idx, seed, &params, &umis);
-                    sender.send(pair)
-                })
-            });
+        let generation_result: Result<(), crossbeam_channel::SendError<()>> = pool.install(|| {
+            read_seeds.into_par_iter().enumerate().try_for_each(|(read_idx, seed)| {
+                let pair = generate_correct_read_pair(read_idx, seed, &params, &umis);
+                // Drop the undelivered pair from the error: only the failure is reported.
+                sender.send(pair).map_err(|_| crossbeam_channel::SendError(()))
+            })
+        });
 
         // Drop sender to signal writer thread that we're done
         drop(sender);

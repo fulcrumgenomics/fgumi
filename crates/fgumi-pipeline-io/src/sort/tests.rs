@@ -1567,7 +1567,7 @@ fn block_parallel_high_contention_soak_matches_reference() {
         inflight_caps: Some((2, 8 << 10)),
     };
     // Per-iteration watchdog: a livelock in any single iteration fails fast.
-    const WATCHDOG: Duration = Duration::from_secs(60);
+    const WATCHDOG: Duration = Duration::from_mins(1);
 
     let iterations = soak_iterations(40, 2);
     let sort_order = SortOrder::Coordinate;
@@ -1617,7 +1617,7 @@ fn sort_buffer_chain_tight_memory_soak_no_deadlock() {
     // records ⇒ maximal seal/spill/merge churn across the pipeline threads.
     const MEMORY_LIMIT: usize = 24 * 1024;
     const OUTPUT_BYTE_LIMIT: u64 = 48 * 1024;
-    const WATCHDOG: Duration = Duration::from_secs(60);
+    const WATCHDOG: Duration = Duration::from_mins(1);
 
     let iterations = soak_iterations(24, 2);
     for iter in 0..iterations {
@@ -1817,7 +1817,7 @@ fn block_parallel_soak_matrix_matches_reference(
     use std::time::Duration;
 
     const SORTER_THREADS: usize = 2;
-    const WATCHDOG: Duration = Duration::from_secs(120);
+    const WATCHDOG: Duration = Duration::from_mins(2);
 
     let iterations = soak_iterations(4, 1);
     let sort_order = SortOrder::Coordinate;
@@ -5131,10 +5131,8 @@ fn template_records(n: usize, seed: u64, cb: bool, mi: bool) -> (Header, Vec<Raw
     let records = (0..n)
         .map(|i| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let (tid, pos) = (
-                rng.random_range(0..N_TEST_REFS as u64) as i32,
-                rng.random_range(0..500_000) as i32,
-            );
+            let (tid, pos) =
+                (rng.random_range(0..N_TEST_REFS as u64) as i32, rng.random_range(0..500_000));
             let mut aux = Vec::new();
             if cb {
                 aux.extend_from_slice(b"CBZ");
@@ -5524,7 +5522,7 @@ fn three_step_chain_large_spill_completes_on_the_arena_split(
         let _ = tx.send(out.map(|r| (r.merge_sources, r.records)));
     });
     let (merge_sources, out) = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
+        .recv_timeout(std::time::Duration::from_mins(2))
         .expect("watchdog: the split front did not finish")
         .unwrap();
     assert!(merge_sources >= 4, "the soak spills several runs (got {merge_sources})");

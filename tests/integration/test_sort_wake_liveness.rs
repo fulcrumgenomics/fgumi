@@ -111,7 +111,7 @@ fn sort_group_chain_completes_under_long_timers_at_t2() {
     let stages = || vec![Stage::Sort, Stage::Group];
     let tc = SortOrderArg::TemplateCoordinate;
     let (i, o) = (input.clone(), normal.clone());
-    run_with_timeout("normal-timer sort+group run", Duration::from_secs(60), move || {
+    run_with_timeout("normal-timer sort+group run", Duration::from_mins(1), move || {
         run_chain_at_t2(stages(), tc, ReadStreams::Auto, &i, &o, false);
     });
     let (i, o) = (input.clone(), slow.clone());

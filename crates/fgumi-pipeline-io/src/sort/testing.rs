@@ -243,11 +243,11 @@ pub fn tie_heavy_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
         } else {
             (
                 rng.random_range(0..N_TEST_REFS as u64) as i32,
-                rng.random_range(0..1_000_000) as i32,
+                rng.random_range(0..1_000_000),
                 chance(&mut rng, 50),
             )
         };
-        let (t2, p2, r2) = (t1, p1 + 100 + rng.random_range(0..400) as i32, !r1);
+        let (t2, p2, r2) = (t1, p1 + 100 + rng.random_range(0..400), !r1);
         let strand = |reverse: bool, mate_reverse: bool| {
             (if reverse { REVERSE } else { 0 }) | if mate_reverse { MATE_REVERSE } else { 0 }
         };
@@ -265,7 +265,7 @@ pub fn tie_heavy_records(n: usize, seed: u64) -> (Header, Vec<RawRecord>) {
                 }
             }
             if chance(&mut rng, 20) {
-                let pos = rng.random_range(0..1_000_000) as i32;
+                let pos = rng.random_range(0..1_000_000);
                 for _ in 0..=rng.random_range(0..2) {
                     specs.push((b.0, pos, b.2 | SUPPLEMENTARY, name.clone(), b.4, b.5));
                 }
