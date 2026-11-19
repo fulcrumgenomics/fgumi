@@ -478,6 +478,19 @@ fn empty_input_error(path: &Path, empty_desc: &str) -> anyhow::Error {
     }
 }
 
+/// Whether `prefix` begins an unframed BAM byte stream (`BAM\x01`): what a BAM
+/// becomes after a spec-complete gzip decompressor strips its BGZF framing.
+#[must_use]
+pub fn is_unframed_bam(prefix: &[u8]) -> bool {
+    prefix.starts_with(BAM_MAGIC)
+}
+
+/// Re-frame an unframed BAM byte stream (see [`is_unframed_bam`]) as BGZF,
+/// copying the bytes without decoding any record.
+pub fn frame_unframed_bam<R: Read + Send + 'static>(reader: R) -> Box<dyn Read + Send> {
+    Box::new(BgzfFramer::new(reader))
+}
+
 /// Normalize `reader` to a BGZF byte stream, whatever it arrived as.
 ///
 /// BGZF passes through; SAM text is transcoded; plain gzip is decompressed once
@@ -511,6 +524,7 @@ pub fn normalize_to_bgzf(
             return Err(empty_input_error(path, "Input is empty"));
         }
         InputFormat::Bgzf => return Ok(Box::new(ChainedReader::new(magic, reader))),
+        InputFormat::Cram => return open_cram(Box::new(ChainedReader::new(magic, reader)), path),
         // Plain gzip: decompress at the boundary and classify what comes out, so
         // the rest of the pipeline still sees only BGZF. `MultiGzDecoder` handles
         // concatenated members and, unlike fgumi's own block reader, the whole of
@@ -547,8 +561,8 @@ pub fn normalize_to_bgzf(
                 // This is also where a BGZF member fgumi's own decoder cannot frame
                 // ends up — `MultiGzDecoder` reads the whole of RFC 1952, so what
                 // comes out of it is the naked BAM byte stream, not BGZF.
-                InputFormat::Text if inner.starts_with(BAM_MAGIC) => {
-                    return Ok(Box::new(BgzfFramer::new(ChainedReader::new(inner, decoded))));
+                InputFormat::Text if is_unframed_bam(&inner) => {
+                    return Ok(frame_unframed_bam(ChainedReader::new(inner, decoded)));
                 }
                 InputFormat::Text => (inner, decoded),
                 InputFormat::Empty => {
@@ -559,6 +573,12 @@ pub fn normalize_to_bgzf(
                 InputFormat::Gzip => bail!(
                     "Input is gzip-compressed twice over: {} — decompress it once \
                      (`gzip -dc`) before handing it to fgumi",
+                    path.display()
+                ),
+                // CRAM is already compressed; a gzip wrapper is unusual enough
+                // to name rather than silently unwrap.
+                InputFormat::Cram => bail!(
+                    "Input is a gzip-compressed CRAM: {} — decompress it (`gzip -dc`) first",
                     path.display()
                 ),
             }
@@ -583,6 +603,30 @@ pub fn normalize_to_bgzf(
     }
 
     Ok(Box::new(sam))
+}
+
+/// CRAM input: decoded through htslib (feature `cram`), BGZF-framed like an
+/// unframed BAM stream.
+#[cfg(feature = "cram")]
+fn open_cram(reader: Box<dyn Read + Send>, path: &Path) -> Result<Box<dyn Read + Send>> {
+    let bam = crate::cram_input::CramToBamBytes::open(reader, path)?;
+    Ok(Box::new(BgzfFramer::new(bam)))
+}
+
+#[cfg(not(feature = "cram"))]
+fn open_cram(_reader: Box<dyn Read + Send>, path: &Path) -> Result<Box<dyn Read + Send>> {
+    Err(cram_input_unsupported(path))
+}
+
+/// The error for CRAM input `path` in a build without the `cram` feature: how
+/// to rebuild with it, or convert the input first.
+#[must_use]
+pub fn cram_input_unsupported(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Input is CRAM: {} — this fgumi was built without CRAM support. Rebuild with \
+         `--features cram`, or convert first (`samtools view -u -T ref.fa in.cram | fgumi ... -i -`)",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -879,6 +923,53 @@ mod tests {
 
         assert_eq!(round_tripped, bgzf);
         Ok(())
+    }
+
+    /// A synthetic CRAM file-definition prefix: `CRAM`, version 3.0, and a
+    /// 20-byte file ID. Enough for `classify_input`, not a readable CRAM.
+    fn cram_prefix() -> Vec<u8> {
+        let mut prefix = b"CRAM\x03\x00".to_vec();
+        prefix.extend_from_slice(&[b'x'; 20]);
+        prefix
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).expect("write");
+        enc.finish().expect("finish")
+    }
+
+    /// Without the `cram` feature, CRAM input is refused up front with a
+    /// message naming the input and the two ways forward.
+    #[cfg(not(feature = "cram"))]
+    #[test]
+    fn cram_input_is_refused_without_the_cram_feature() {
+        let Err(err) =
+            normalize_to_bgzf(Box::new(io::Cursor::new(cram_prefix())), Path::new("in.cram"))
+        else {
+            panic!("CRAM input should be refused without the cram feature");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Input is CRAM: in.cram"), "input not named: {msg}");
+        assert!(msg.contains("--features cram"), "rebuild hint lost: {msg}");
+        assert!(msg.contains("samtools view"), "conversion hint lost: {msg}");
+    }
+
+    /// A gzip-wrapped CRAM is named rather than unwrapped, with or without the
+    /// `cram` feature.
+    #[test]
+    fn gzip_wrapped_cram_is_refused() {
+        let Err(err) = normalize_to_bgzf(
+            Box::new(io::Cursor::new(gzip(&cram_prefix()))),
+            Path::new("in.cram.gz"),
+        ) else {
+            panic!("a gzip-wrapped CRAM should be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("gzip-compressed CRAM: in.cram.gz"),
+            "expected the gzip-wrapped CRAM error naming the input, got: {msg}"
+        );
     }
 
     /// An empty input is neither BAM nor SAM; it must be reported rather than

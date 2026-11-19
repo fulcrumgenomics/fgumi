@@ -34,6 +34,7 @@ mod test_copy_umi_command;
 mod test_copy_umi_cutover_parity;
 mod test_correct_command;
 mod test_correct_cutover_parity;
+mod test_cram;
 mod test_dedup_command;
 mod test_dedup_cutover_parity;
 mod test_downsample_command;

@@ -29,8 +29,13 @@ crossbeam-channel = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
+fgumi-htslib = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 
 [features]
+# CRAM input (and the output types the pipeline uses), decoded and encoded
+# through a vendored htslib (`fgumi-htslib`). Off by default: it compiles C.
+cram = ["dep:fgumi-htslib", "dep:rayon"]
 # Exposes `pread::test_sources` (in-memory and fault-injecting positional
 # sources) to downstream crates' tests.
 test-utils = []
@@ -42,6 +47,7 @@ test-utils = []
 nix = { workspace = true }
 
 [dev-dependencies]
+fgumi-tag = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }

@@ -65,8 +65,9 @@ jobs:
   # `aligner-bwa-mem3`, off by default). This is the one feature that pulls a
   # C++ toolchain into the build (the vendored bwa-mem3 kernels via
   # `bwa-mem3-sys`'s `cc`-driven build.rs), so it gets its own job rather than
-  # folding into `test`/`lint`: those two stay C-toolchain-free, matching every
-  # other job's fast/portable assumption.
+  # folding into `test`/`lint`: those two need no C++ toolchain. (They do
+  # compile C: `fgumi-htslib` is a workspace member, so every `--workspace`
+  # job builds its vendored htslib with the runner's preinstalled C compiler.)
   #
   # Matrix covers both architectures the feature compiles on (the dependency is
   # gated in Cargo.toml to `x86_64`/`aarch64` — see the `bwa-mem3-rs` entry).
@@ -131,6 +132,59 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps -p fgumi --document-private-items --features aligner-bwa-mem3 --locked
+
+  # The opt-in `cram` feature: CRAM input and output through the vendored,
+  # patched htslib in `crates/fgumi-htslib` (C, built with `cc`). The FFI crate
+  # itself is a workspace member, so every `--workspace` job builds and tests
+  # it; this is the job that enables the `cram` code paths in `fgumi`,
+  # `fgumi-bam-io` and `fgumi-pipeline-io` (pipeline steps, CLI paths) for
+  # tests, clippy and rustdoc, on both architectures (htscodecs has separate
+  # x86_64 SIMD and aarch64 NEON code). The `coverage` job also enables it, on
+  # x86_64 only. `cargo package` checks the new crate, with its vendored C
+  # tree, can be published.
+  cram:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build deps and samtools (CRAM indexed-query tests)
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev samtools
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install nextest
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: nextest
+      - name: Tests (cram)
+        run: |
+          cargo nextest run --workspace --locked --no-tests=pass \
+            --features compare,simulate,profile-adjacency,cram
+      - name: Indexed CRAM queries (samtools)
+        run: |
+          cargo nextest run -p fgumi --test integration --locked --features cram \
+            --run-ignored ignored-only -E 'test(cram_index_queries_return_expected_records)'
+      - name: Clippy (cram, pedantic)
+        run: |
+          cargo clippy --workspace --all-targets \
+            --features compare,simulate,profile-adjacency,cram --locked \
+            -- -D warnings -W clippy::pedantic
+      - name: Rustdoc (cram, -D warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps -p fgumi -p fgumi-htslib --document-private-items --features cram --locked
+      - name: Package fgumi-htslib
+        run: cargo package -p fgumi-htslib --locked
 
   # CPU-floor smoke test for the `aligner-bwa-mem3` build. AVX2 is that build's
   # x86_64 floor: the linked bwa-mem3 compiles its non-kernel code with -mavx2
@@ -396,7 +450,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     if: github.actor != 'dependabot[bot]'
     environment: github-actions
     steps:
@@ -416,12 +470,18 @@ jobs:
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
+      - name: Install build deps (C toolchain for the vendored htslib)
+        # Same deps as the `cram` job; the `cram` feature below needs them.
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
       - name: Generate coverage
         # Includes `fgumi-pipeline-io/stress-tests`: the soak/matrix/proptest
         # suites are gated off the fast `test` job, but they cover ~200 lines that
         # nothing else reaches. Measuring without them under-reports patch
         # coverage for code that IS tested, just not on the PR-latency path.
-        run: cargo llvm-cov nextest --workspace --features compare,simulate,profile-adjacency,fgumi-pipeline-io/stress-tests --no-tests=pass --lcov --output-path lcov.info
+        # Includes `cram` for the same reason: without it the CRAM code paths
+        # (`cram_input.rs`, `read_cram.rs`, `write_cram.rs`, the builder's CRAM
+        # arms) are not compiled, so the patch-coverage gate never sees them.
+        run: cargo llvm-cov nextest --workspace --features compare,simulate,profile-adjacency,cram,fgumi-pipeline-io/stress-tests --no-tests=pass --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -519,7 +579,13 @@ jobs:
         # Add a crate to this list whenever it gains a default-off optional
         # dep. Current members:
         #   - fgumi-raw-bam: default = [], `noodles`/`anyhow` behind feature
-        run: cargo check -p fgumi-raw-bam --no-default-features --all-targets
+        #   - fgumi-bam-io: `fgumi-htslib`/`rayon` behind `cram`
+        #   - fgumi-pipeline-io: `fgumi-htslib` behind `cram`, `rand` behind
+        #     `test-utils`
+        run: |
+          cargo check -p fgumi-raw-bam --no-default-features --all-targets
+          cargo check -p fgumi-bam-io --no-default-features --all-targets
+          cargo check -p fgumi-pipeline-io --no-default-features --all-targets
 
   no-default-features-check:
     runs-on: ubuntu-latest

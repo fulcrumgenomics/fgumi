@@ -50,6 +50,39 @@ use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::refill::RefillHint;
 use crate::pipeline::steps::tuning::BamPipelineTuning;
 
+/// Where a BAM-record preamble reads from (see `ChainBuilder::append_record_front`).
+enum RecordFront {
+    /// A BGZF BAM byte stream, header included.
+    Bgzf(Box<dyn std::io::Read + Send>),
+    /// A CRAM reader positioned after its header (feature `cram`), and the
+    /// input's name for error messages.
+    #[cfg(feature = "cram")]
+    Cram(fgumi_htslib::CramReader, String),
+}
+
+/// An opened input's preamble front: framed BAM records (BAM or CRAM, see
+/// [`RecordFront`]), or SAM text for the text-parse preamble.
+enum InputFront {
+    Records(RecordFront, Header),
+    Sam(noodles::sam::io::Reader<Box<dyn std::io::BufRead + Send>>, Header),
+}
+
+impl InputFront {
+    fn of(input: crate::pipeline::steps::source::InputSource) -> Self {
+        use crate::pipeline::steps::source::InputSource;
+        match input {
+            InputSource::Bam { reader, header } => {
+                InputFront::Records(RecordFront::Bgzf(reader), header)
+            }
+            #[cfg(feature = "cram")]
+            InputSource::Cram { reader, header, label } => {
+                InputFront::Records(RecordFront::Cram(reader, label), header)
+            }
+            InputSource::Sam { reader, header } => InputFront::Sam(reader, header),
+        }
+    }
+}
+
 /// Nominal decompressed size of one BGZF block, used to turn the
 /// `blocks_per_batch` tuning knob into the byte target of a queryname-cut batch
 /// (see `ChainBuilder::queryname_min_emit_bytes`).
@@ -1015,6 +1048,22 @@ impl<'a> ChainBuilder<'a> {
         })
     }
 
+    /// Whether the retained, already-classified single alignment source is
+    /// CRAM. Called before `add_source` consumes the pending reader.
+    pub(crate) fn source_is_cram(&self) -> bool {
+        self.pending_source.as_ref().is_some_and(|source| {
+            #[cfg(feature = "cram")]
+            if let PendingSource::Single(input) = source {
+                return matches!(
+                    input.as_ref(),
+                    crate::pipeline::steps::source::InputSource::Cram { .. }
+                );
+            }
+            let _ = source;
+            false
+        })
+    }
+
     /// The input when a sort-first chain reads it chain-natively: the spec
     /// asks for concurrent reads (`--read-streams` other than `1`), and the
     /// source is a regular file (decided by `stat` before it is opened — an
@@ -1507,32 +1556,37 @@ impl<'a> ChainBuilder<'a> {
                                 self.current_tail = Some(tail);
                             }
                             self.chain_tail_kind = ChainTailKind::BgzfBlockArena;
-                        } else if self.first_stage_uses_raw_record_fast_path() {
-                            // Decode-free fast path: the first stage is a
-                            // per-record transform that reads no `GroupKey`, so
-                            // end the preamble at `ParseBamRecords` (borrowed
-                            // `RecordBatch`) instead of `DecodeRecords`, skipping
-                            // the per-record `DecodedRecord` allocation and the
-                            // dead key computation. `group_key_config` is unused
-                            // here (no `DecodeRecords`).
-                            let _ = group_key_config;
-                            let tail =
-                                self.build_bam_record_batch_preamble(reader, self.header.clone());
+                        } else {
+                            self.append_record_preamble(
+                                RecordFront::Bgzf(reader),
+                                group_key_config,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "cram")]
+                    InputSource::Cram { reader, label, .. } => {
+                        // CRAM slices decode on the pool into record-aligned
+                        // batches of framed BAM records (see
+                        // `append_record_front`). A sort-first chain takes the
+                        // record-input sort front, since the arena front
+                        // inflates raw BGZF blocks: `ParseBamRecords` feeds
+                        // `add_sort` a `RecordBatch` directly, with no
+                        // `DecodedRecord` round trip.
+                        let front = RecordFront::Cram(reader, label);
+                        if sort_is_first_intermediate {
+                            // Decoding is sort ingest here, so it shares the
+                            // sort's phase-1 cap (`--sort-threads`), as the
+                            // BAM arena front and the SAM parse do.
+                            let decode_cap = self.sort_plan().and_then(|plan| plan.caps.phase1);
+                            let tail = self.build_bam_record_batch_preamble(
+                                front,
+                                self.header.clone(),
+                                decode_cap,
+                            );
                             self.current_tail = Some(tail);
                             self.chain_tail_kind = ChainTailKind::RecordBatch;
                         } else {
-                            let cut = self.source_batch_cut();
-                            let tail = self.build_bam_decode_preamble(
-                                reader,
-                                self.header.clone(),
-                                group_key_config,
-                                cut,
-                            );
-                            self.current_tail = Some(tail);
-                            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch {
-                                closed_under_queryname: cut
-                                    == crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
-                            };
+                            self.append_record_preamble(front, group_key_config);
                         }
                     }
                     InputSource::Sam { reader: sam_reader, .. } => {
@@ -1630,16 +1684,16 @@ impl<'a> ChainBuilder<'a> {
                 let closed_tail =
                     ChainTailKind::DecodedRecordBatch { closed_under_queryname: true };
 
-                // Unmapped preamble: always BAM (guaranteed by open_source).
-                let unmapped_decoded = match unmapped {
-                    InputSource::Bam { reader, header: bam_header } => self
-                        .build_bam_decode_preamble(
-                            reader,
-                            bam_header,
-                            group_key_config.clone(),
-                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
-                        ),
-                    InputSource::Sam { .. } => {
+                // Unmapped preamble: always BAM or CRAM (guaranteed by open_source).
+                let queryname = crate::pipeline::steps::boundaries::state::BatchCut::Queryname;
+                let unmapped_decoded = match InputFront::of(unmapped) {
+                    InputFront::Records(front, header) => self.build_bam_decode_preamble(
+                        front,
+                        header,
+                        group_key_config.clone(),
+                        queryname,
+                    ),
+                    InputFront::Sam(..) => {
                         // Guarded in open_source; belt-and-suspenders.
                         bail!(
                             "SAM input is not supported for --unmapped \
@@ -1650,25 +1704,18 @@ impl<'a> ChainBuilder<'a> {
                 self.chain_tail_kind = closed_tail;
                 let unmapped_tail = self.append_queryname_grouper(unmapped_decoded);
 
-                // Mapped preamble: BAM or SAM.
-                let mapped_decoded = match mapped {
-                    InputSource::Bam { reader, header: bam_header } => self
-                        .build_bam_decode_preamble(
-                            reader,
-                            bam_header,
-                            group_key_config,
-                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
-                        ),
-                    InputSource::Sam { reader: rdr, header: hdr } => {
-                        let buf = rdr.into_inner();
-                        self.build_sam_parse_preamble(
-                            buf,
-                            hdr,
-                            group_key_config,
-                            crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
-                            None,
-                        )
+                // Mapped preamble: BAM, CRAM or SAM.
+                let mapped_decoded = match InputFront::of(mapped) {
+                    InputFront::Records(front, header) => {
+                        self.build_bam_decode_preamble(front, header, group_key_config, queryname)
                     }
+                    InputFront::Sam(rdr, hdr) => self.build_sam_parse_preamble(
+                        rdr.into_inner(),
+                        hdr,
+                        group_key_config,
+                        queryname,
+                        None,
+                    ),
                 };
                 self.chain_tail_kind = closed_tail;
                 let mapped_tail = self.append_queryname_grouper(mapped_decoded);
@@ -2059,9 +2106,9 @@ impl<'a> ChainBuilder<'a> {
         }
     }
 
-    /// Wire the rejects fan-out branch (branch 1) of a 2-output consensus step:
-    /// `BgzfCompress` → `WriteBgzfFile` with the **input** header, in input
-    /// order — the PR #332 fan-out contract (rejects flow through the ordered
+    /// Wire the rejects fan-out branch (branch 1) of a 2-output consensus step
+    /// to its writer ([`Self::wire_rejects_writer`]) with the **input** header,
+    /// in input order — the PR #332 fan-out contract (rejects flow through the ordered
     /// serialize/compress stages, not a mutex side-channel).
     ///
     /// `consensus_pt` is the just-appended consensus step (branch 0 is its kept
@@ -2077,29 +2124,90 @@ impl<'a> ChainBuilder<'a> {
         input_header: &Header,
         label: &'static str,
     ) -> Result<()> {
+        let rejects_path = rejects_path
+            .ok_or_else(|| anyhow!("rejects path unexpectedly None when track_rejects is set"))?;
+        self.wire_rejects_writer(
+            (consensus_pt.0, BranchIdx(1)),
+            rejects_path,
+            input_header.clone(),
+            label,
+        );
+        Ok(())
+    }
+
+    /// Wire a rejects branch to its writer: `BgzfCompress → WriteBgzfFile`
+    /// for a BAM name, created with the other rejects files before the run
+    /// (see [`Self::defer_output`]). With the `cram` feature, a `.cram` name
+    /// gets the CRAM writer chain instead (`CramPack → CramEncode →
+    /// CramWrite`, as `add_cram_sink` wires the primary output), so a
+    /// `.cram` rejects file never holds BAM bytes. Either way the records
+    /// arrive in input order with `header`.
+    fn wire_rejects_writer(
+        &mut self,
+        branch: (StepIdx, BranchIdx),
+        path: &std::path::Path,
+        header: Header,
+        label: &'static str,
+    ) {
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
 
-        let rejects_path = rejects_path
-            .ok_or_else(|| anyhow!("rejects path unexpectedly None when track_rejects is set"))?;
-        let (rejects_write, open) = WriteBgzfFile::deferred(
-            rejects_path.to_path_buf(),
-            input_header.clone(),
-            self.tuning.compression_level,
-        );
+        #[cfg(feature = "cram")]
+        if fgumi_bam_io::is_cram_path(path) {
+            self.wire_cram_rejects_writer(branch, path, header);
+            return;
+        }
+        let (rejects_write, open) =
+            WriteBgzfFile::deferred(path.to_path_buf(), header, self.tuning.compression_level);
         self.defer_output(label, open);
-
-        let rejects_branch = (consensus_pt.0, BranchIdx(1));
-        let rejects_compress_tail = self.pipeline.append_step(
+        let compress_tail = self.pipeline.append_step(
             BgzfCompress::new(
                 self.tuning.compression_level,
                 self.tuning.per_step_byte_limit,
                 false,
             ),
-            rejects_branch,
+            branch,
         );
-        self.pipeline.append_step(rejects_write, rejects_compress_tail);
-        Ok(())
+        self.pipeline.append_step(rejects_write, compress_tail);
+    }
+
+    /// The CRAM arm of [`Self::wire_rejects_writer`]. Like the primary CRAM
+    /// sink, the file is created when `CramPack` first runs, not at build
+    /// time, so it is not in `created_outputs`: a build failure leaves a
+    /// pre-existing file of that name alone, and a failed run leaves the
+    /// file without its EOF container, which readers refuse as truncated.
+    #[cfg(feature = "cram")]
+    fn wire_cram_rejects_writer(
+        &mut self,
+        branch: (StepIdx, BranchIdx),
+        path: &std::path::Path,
+        header: Header,
+    ) {
+        use fgumi_pipeline_io::sink::write_cram::{
+            CramEncode, CramHeader, CramPack, CramSetup, CramWrite, FinisherSlot,
+        };
+        use fgumi_pipeline_io::types::DecompressedBlock;
+
+        let policy = fgumi_bam_io::CramOutputPolicy::new(
+            path,
+            !header.reference_sequences().is_empty(),
+            self.tuning.compression_level,
+        );
+        let setup = CramSetup {
+            path: path.to_path_buf(),
+            display: path.to_path_buf(),
+            header: CramHeader::Eager(Box::new(header)),
+            reference: policy.reference,
+            no_ref: policy.no_ref,
+            file_id: policy.file_id,
+            crai: None,
+        };
+        let finisher: FinisherSlot = Arc::default();
+        let limit = self.tuning.per_step_byte_limit;
+        let pack = CramPack::<DecompressedBlock>::new(setup, Arc::clone(&finisher), limit);
+        let tail = self.pipeline.append_step(pack, branch);
+        let tail = self.pipeline.append_step(CramEncode::new(limit), tail);
+        self.pipeline.append_step(CramWrite::new(finisher), tail);
     }
 
     /// Whether the first stage is a per-record transform that reads no
@@ -2127,8 +2235,103 @@ impl<'a> ChainBuilder<'a> {
         }
     }
 
-    /// Append the 4-step BAM decode preamble:
-    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → DecodeRecords`.
+    /// A BAM-record source's preamble after its front: the decode-free fast
+    /// path when the first stage is a per-record transform that reads no
+    /// `GroupKey` (ending at `ParseBamRecords`'s borrowed `RecordBatch`,
+    /// skipping the per-record `DecodedRecord` allocation and the dead key
+    /// computation), else the decode preamble. A sort-first chain is never on
+    /// the fast path (`first_stage_uses_raw_record_fast_path` is false for it).
+    fn append_record_preamble(
+        &mut self,
+        front: RecordFront,
+        group_key_config: fgumi_bam_io::GroupKeyConfig,
+    ) {
+        if self.first_stage_uses_raw_record_fast_path() {
+            // `group_key_config` is unused here (no `DecodeRecords`).
+            let _ = group_key_config;
+            let tail = self.build_bam_record_batch_preamble(front, self.header.clone(), None);
+            self.current_tail = Some(tail);
+            self.chain_tail_kind = ChainTailKind::RecordBatch;
+        } else {
+            let cut = self.source_batch_cut();
+            let tail =
+                self.build_bam_decode_preamble(front, self.header.clone(), group_key_config, cut);
+            self.current_tail = Some(tail);
+            self.chain_tail_kind = ChainTailKind::DecodedRecordBatch {
+                closed_under_queryname: cut
+                    == crate::pipeline::steps::boundaries::state::BatchCut::Queryname,
+            };
+        }
+    }
+
+    /// The start of a BAM-record preamble: record-aligned batches of framed BAM
+    /// records, in order, as `DecompressedBlock`s cut by `cut`. BGZF input is
+    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries` (the boundary step
+    /// strips the BAM header and re-cuts blocks at record ends). CRAM input
+    /// (feature `cram`) is `ReadCramSlices → DecodeCramSlices`, decoded on the
+    /// pool: each slice decodes to whole records with consecutive serials and no
+    /// header, so it is already a record-aligned batch, and `FindBamBoundaries`
+    /// is added only to coalesce under [`BatchCut::Queryname`].
+    ///
+    /// `decode_cap` caps `DecodeCramSlices` (a sort-first chain passes the
+    /// sort's phase-1 cap); `None` leaves decoding unrestricted. A BGZF front
+    /// ignores it: a sort-first BAM source takes the arena front instead.
+    ///
+    /// [`BatchCut::Queryname`]: crate::pipeline::steps::boundaries::state::BatchCut::Queryname
+    fn append_record_front(
+        &mut self,
+        front: RecordFront,
+        header: Header,
+        cut: crate::pipeline::steps::boundaries::state::BatchCut,
+        decode_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+    ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
+    {
+        use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
+        use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
+        use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
+
+        // Only the CRAM decode takes a cap.
+        #[cfg(not(feature = "cram"))]
+        drop(decode_cap);
+        let limit = self.tuning.per_step_byte_limit;
+        let (tail, boundaries) = match front {
+            RecordFront::Bgzf(reader) => {
+                let (read_step, _) =
+                    read_bam_from_reader(reader, header, self.tuning.blocks_per_batch, limit);
+                let tail = self.pipeline.append_source(read_step);
+                // Honor the command's CRC-verification policy (`--check-crc` /
+                // `--no-check-crc`, via `effective_check_crc`) so the chain's BAM
+                // decode matches the non-chain path rather than always verifying.
+                let tail = self
+                    .pipeline
+                    .append_step(BgzfDecompress::new_with_crc(limit, self.spec.verify_crc), tail);
+                (tail, FindBamBoundaries::new(limit))
+            }
+            #[cfg(feature = "cram")]
+            RecordFront::Cram(reader, label) => {
+                use crate::pipeline::steps::boundaries::state::BatchCut;
+                use fgumi_pipeline_io::source::read_cram::{
+                    CramErrorContext, DecodeCramSlices, ReadCramSlices,
+                };
+                let _ = header;
+                let context = CramErrorContext::from_global(&label);
+                let read = ReadCramSlices::new(reader, limit, context.clone());
+                let tail = self.pipeline.append_source(read);
+                let decode = DecodeCramSlices::new(limit, context).with_phase_cap(decode_cap);
+                let tail = self.pipeline.append_step(decode, tail);
+                if cut == BatchCut::Record {
+                    return tail;
+                }
+                (tail, FindBamBoundaries::new_no_header(limit))
+            }
+        };
+        let boundaries = boundaries.with_cut(cut, self.queryname_min_emit_bytes());
+        self.pipeline.append_step(boundaries, tail)
+    }
+
+    /// Append the BAM decode preamble: the record front
+    /// ([`Self::append_record_front`], e.g.
+    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries`), then `DecodeRecords`.
     ///
     /// `cut` selects the boundary policy: [`BatchCut::Record`] (one block per
     /// batch, record-aligned) or [`BatchCut::Queryname`] (batches closed under
@@ -2143,77 +2346,44 @@ impl<'a> ChainBuilder<'a> {
     /// [`AssembleTemplates`]: crate::pipeline::steps::group::assemble::AssembleTemplates
     fn build_bam_decode_preamble(
         &mut self,
-        reader: Box<dyn std::io::Read + Send>,
+        front: RecordFront,
         header: Header,
         group_key_config: fgumi_bam_io::GroupKeyConfig,
         cut: crate::pipeline::steps::boundaries::state::BatchCut,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
-        use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
-        use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
         use crate::pipeline::steps::boundaries::state::BatchCut;
         use crate::pipeline::steps::parse::decode::DecodeRecords;
-        use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
 
-        let closed = cut == BatchCut::Queryname;
-
-        let (read_step, _) = read_bam_from_reader(
-            reader,
-            header,
-            self.tuning.blocks_per_batch,
-            self.tuning.per_step_byte_limit,
-        );
-        let tail = self.pipeline.append_source(read_step);
-        // Honor the command's CRC-verification policy (`--check-crc` /
-        // `--no-check-crc`, via `effective_check_crc`) so the chain's BAM
-        // decode matches the non-chain path rather than always verifying.
-        let tail = self.pipeline.append_step(
-            BgzfDecompress::new_with_crc(self.tuning.per_step_byte_limit, self.spec.verify_crc),
-            tail,
-        );
-        let boundaries = FindBamBoundaries::new(self.tuning.per_step_byte_limit)
-            .with_cut(cut, self.queryname_min_emit_bytes());
-        let tail = self.pipeline.append_step(boundaries, tail);
+        let tail = self.append_record_front(front, header, cut, None);
         self.pipeline.append_step(
             DecodeRecords::new(group_key_config, self.tuning.per_step_byte_limit)
-                .with_closed_batches(closed),
+                .with_closed_batches(cut == BatchCut::Queryname),
             tail,
         )
     }
 
-    /// The decode-free BAM preamble for per-record-transform fast-path stages:
-    /// `ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries → ParseBamRecords`,
+    /// The decode-free BAM preamble: the record front
+    /// ([`Self::append_record_front`], record cut), then `ParseBamRecords`,
     /// yielding a borrowed [`RecordBatch`] tail (no per-record `DecodedRecord`
     /// allocation, no `GroupKey`). Mirrors [`Self::build_bam_decode_preamble`]
-    /// but ends in `ParseBamRecords` instead of `DecodeRecords`; used only when
-    /// [`Self::first_stage_uses_raw_record_fast_path`] holds.
+    /// but ends in `ParseBamRecords` instead of `DecodeRecords`; used when
+    /// [`Self::first_stage_uses_raw_record_fast_path`] holds, and for a CRAM
+    /// source feeding a sort-first chain's record-input front. `decode_cap` as
+    /// for [`Self::append_record_front`].
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     fn build_bam_record_batch_preamble(
         &mut self,
-        reader: Box<dyn std::io::Read + Send>,
+        front: RecordFront,
         header: Header,
+        decode_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
-        use crate::pipeline::steps::bgzf::decompress::BgzfDecompress;
-        use crate::pipeline::steps::boundaries::bam::FindBamBoundaries;
+        use crate::pipeline::steps::boundaries::state::BatchCut;
         use crate::pipeline::steps::parse::bam::ParseBamRecords;
-        use crate::pipeline::steps::source::read_bam::read_bam_from_reader;
 
-        let (read_step, _) = read_bam_from_reader(
-            reader,
-            header,
-            self.tuning.blocks_per_batch,
-            self.tuning.per_step_byte_limit,
-        );
-        let tail = self.pipeline.append_source(read_step);
-        let tail = self.pipeline.append_step(
-            BgzfDecompress::new_with_crc(self.tuning.per_step_byte_limit, self.spec.verify_crc),
-            tail,
-        );
-        let tail = self
-            .pipeline
-            .append_step(FindBamBoundaries::new(self.tuning.per_step_byte_limit), tail);
+        let tail = self.append_record_front(front, header, BatchCut::Record, decode_cap);
         self.pipeline.append_step(ParseBamRecords::new(self.tuning.per_step_byte_limit), tail)
     }
 
@@ -2540,6 +2710,73 @@ impl<'a> ChainBuilder<'a> {
         Ok(())
     }
 
+    /// Wire the CRAM sink (`CramPack → CramEncode → CramWrite`) after `tail`.
+    #[cfg(feature = "cram")]
+    fn add_cram_sink(&mut self, tail: (StepIdx, BranchIdx)) {
+        use fgumi_pipeline_io::output_compress::OutputBlock;
+        use fgumi_pipeline_io::sink::write_cram::{
+            CramEncode, CramHeader, CramPack, CramSetup, CramWrite, FinisherSlot,
+        };
+        use fgumi_pipeline_io::types::DecompressedBlock;
+
+        let output_path = self.spec.sink.output_path().clone();
+        // The name the user asked for: `output_path` may be a staged temporary.
+        let shown_path =
+            self.spec.sink.cram_name().expect("add_cram_sink on a CRAM sink").to_path_buf();
+        // A deferred header can acquire mapped reads when its aligner runs.
+        let may_be_mapped =
+            self.pending_header_handle.is_some() || !self.header.reference_sequences().is_empty();
+        let policy = fgumi_bam_io::CramOutputPolicy::new(
+            &shown_path,
+            may_be_mapped,
+            self.tuning.compression_level,
+        );
+        let header = match self.pending_header_handle.take() {
+            Some(handle) => {
+                CramHeader::Deferred { handle, transform: self.pending_header_transform.take() }
+            }
+            None => CramHeader::Eager(Box::new(self.header.clone())),
+        };
+        let crai = self.spec.sink.index().map(|(_, sidecar)| sidecar);
+        let setup = CramSetup {
+            path: output_path,
+            display: shown_path,
+            header,
+            reference: policy.reference,
+            no_ref: policy.no_ref,
+            file_id: policy.file_id,
+            crai,
+        };
+        let finisher: FinisherSlot = Arc::default();
+        let limit = self.tuning.per_step_byte_limit;
+        let cap = self.sink_phase_cap.take();
+
+        let tail = if self.chain_tail_kind == ChainTailKind::SortOutputBlocks {
+            // The terminal sort was built without merge-thread compression for
+            // a CRAM sink (see `add_sort`), so every block arrives raw.
+            let pack = CramPack::<OutputBlock>::new(setup, Arc::clone(&finisher), limit)
+                .with_output_depth(self.sink_output_depth.take());
+            self.pipeline.append_step(pack, tail)
+        } else {
+            let pack = CramPack::<DecompressedBlock>::new(setup, Arc::clone(&finisher), limit);
+            self.pipeline.append_step(pack, tail)
+        };
+        let tail = self.pipeline.append_step(CramEncode::new(limit).with_phase_cap(cap), tail);
+        // Not recorded in `created_outputs`: unlike the BAM sink, nothing is
+        // created at build time (`CramPack` creates the file when it runs), so
+        // a build failure must not remove a pre-existing file of that name.
+        let write = CramWrite::new(finisher);
+        let write = if self.detached_writer {
+            use crate::pipeline::core::step::DetachedGroup;
+            use crate::pipeline::steps::sort::SORT_IO_GROUP;
+            write.with_detached(DetachedGroup::Shared(SORT_IO_GROUP))
+        } else {
+            write
+        };
+        let tail = self.pipeline.append_step(write, tail);
+        self.current_tail = Some(tail);
+    }
+
     /// Add the output sink step(s) to the pipeline.
     ///
     /// Appends `BgzfCompress` + `WriteBgzfFile`. Reads `spec.sink` for the
@@ -2595,15 +2832,17 @@ impl<'a> ChainBuilder<'a> {
         // `WriteBgzfFile::with_bai_index` joins those manifests against its own
         // cumulative compressed offset as it writes, building the `.bai`
         // in-band rather than re-reading the finished BAM afterward.
-        let want_index = matches!(self.spec.sink, SinkSpec::BamWithIndex(_));
-        if want_index {
+        let index = self.spec.sink.index();
+        let want_index = index.is_some();
+        if let Some((kind, _)) = &index {
+            let index_kind = kind.name();
             ensure!(
                 !fgumi_bam_io::is_stdout_path(output_path),
                 "--write-index cannot target stdout"
             );
             ensure!(
                 self.pending_header_handle.is_none(),
-                "inline BAI indexing requires a resolved (non-deferred) header"
+                "inline {index_kind} indexing requires a resolved (non-deferred) header"
             );
             // The inline BAI indexer (`WriteBgzfFile::with_bai_index`) position-bins
             // records purely by arrival order and does not itself verify sort order
@@ -2627,9 +2866,27 @@ impl<'a> ChainBuilder<'a> {
                         AsRef::<[u8]>::as_ref(so)
                             == noodles::sam::header::record::value::map::header::sort_order::COORDINATE
                     }),
-                "inline BAI indexing requires an @HD SO:coordinate header"
+                "inline {index_kind} indexing requires an @HD SO:coordinate header"
             );
         }
+
+        // A `.cram` output is written as CRAM (feature `cram`): packed,
+        // container-compressed on the pool and written by htslib instead of
+        // `BgzfCompress → WriteBgzfFile`. `CramWithIndex` writes a `.crai`.
+        // The standalone sort's `detached_writer` runs `CramWrite` on the sort's
+        // I/O thread, as it does `WriteBgzfFile`.
+        #[cfg(feature = "cram")]
+        if self.spec.sink.is_cram() {
+            self.add_cram_sink(tail);
+            return Ok(());
+        }
+        // Name the user's destination, not the staged temp the sort writes.
+        #[cfg(not(feature = "cram"))]
+        ensure!(
+            !self.spec.sink.is_cram(),
+            "CRAM output ({}) requires fgumi built with `--features cram`",
+            self.spec.sink.cram_name().unwrap_or(output_path).display()
+        );
 
         // Standalone-sort terminal: the output compressor shares the merge
         // phase's cap. `sink_phase_cap` is `None` for every other chain.
@@ -2672,12 +2929,11 @@ impl<'a> ChainBuilder<'a> {
         // `want_index` is only ever true on the eager-header branch above (the
         // `ensure!` on `pending_header_handle` guarantees it), so
         // `with_bai_index`'s eager-header requirement always holds here.
-        let write_step = if want_index {
+        let write_step = if let Some((_, bai_path)) = index {
             let num_refs = self.header.reference_sequences().len();
             // The derived `.bai` sidecar's collision with the BAM or a rejects
             // branch is rejected up front by `validate_cross_stage_constraints`
             // (before any sink opens and truncates a file), not here.
-            let bai_path = fgumi_bam_io::bai_sidecar_path(output_path);
             write_step.with_bai_index(bai_path, num_refs)
         } else {
             write_step
@@ -3253,37 +3509,22 @@ impl<'a> ChainBuilder<'a> {
         // Dispatch on rejects presence: either a 2-output or a 1-output step.
         let process_tail = if track_rejects {
             use crate::pipeline::core::topology::BranchIdx;
-            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
 
             let rejects_path = correct_opts.rejects_path.as_ref().ok_or_else(|| {
                 anyhow!("rejects_path unexpectedly None (build_for dispatch bug)")
             })?;
-            // PR #332 contract: rejects carry the INPUT header verbatim (raw-input
-            // records, input order). For correct, `self.header` IS the input header.
-            let rejects_header = self.header.clone();
-            let (rejects_write, open) = WriteBgzfFile::deferred(
-                rejects_path.clone(),
-                rejects_header,
-                self.tuning.compression_level,
-            );
-            self.defer_output("correct", open);
-
             let step = correct_step_with_rejects(cfg);
             let pt = self.pipeline.append_step(step, tail);
 
-            // Branch 1 = pre-framed rejects bytes → BgzfCompress → WriteBgzfFile.
-            let rejects_branch = (pt.0, BranchIdx(1));
-            let rejects_compress_tail = self.pipeline.append_step(
-                BgzfCompress::new(
-                    self.tuning.compression_level,
-                    self.tuning.per_step_byte_limit,
-                    false,
-                ),
-                rejects_branch,
+            // Branch 1 = pre-framed rejects bytes. PR #332 contract: rejects carry
+            // the INPUT header verbatim (raw-input records, input order). For
+            // correct, `self.header` IS the input header.
+            self.wire_rejects_writer(
+                (pt.0, BranchIdx(1)),
+                rejects_path,
+                self.header.clone(),
+                "correct",
             );
-            let _rejects_write_tail =
-                self.pipeline.append_step(rejects_write, rejects_compress_tail);
 
             // Branch 0 = kept BamTemplateBatch (needs SerializeBamRecords).
             pt
@@ -4109,8 +4350,8 @@ impl<'a> ChainBuilder<'a> {
             use crate::pipeline::core::step::Affinity;
             use crate::pipeline::steps::parse::decode::DecodeFromRecords;
             use crate::pipeline::steps::sort::{
-                CompressibleBlockOutput, OutputCompression, RecordBatchOutput, SortBuffer,
-                SortMerge, SortSpillDecompress, SpillBlockCompress, SpillGather, SpillReadPlanner,
+                CompressibleBlockOutput, RecordBatchOutput, SortBuffer, SortMerge,
+                SortSpillDecompress, SpillBlockCompress, SpillGather, SpillReadPlanner,
                 SpillRunStats, SpillSupply, SpillWrite, SupplyDiagnostics,
             };
             use fgumi_sort::SortOrder;
@@ -4733,7 +4974,7 @@ impl<'a> ChainBuilder<'a> {
                 // the framing is byte-for-byte identical to what that step
                 // produced, but emitted on the already-in-order `Detached` merge
                 // thread, dropping one pool step and one memcpy per record.
-                let (mut merge, merge_work) = SortMerge::<CompressibleBlockOutput>::new(
+                let merge_builder = SortMerge::<CompressibleBlockOutput>::new(
                     sort_order,
                     self.tuning.per_step_byte_limit,
                 )
@@ -4742,22 +4983,27 @@ impl<'a> ChainBuilder<'a> {
                 // The range merge's thread may compress the blocks its output
                 // refuses, with the settings `add_sink` builds the sink
                 // compressor from, for `BgzfCompress` to pass through.
-                .with_output_depth(Arc::clone(self.sink_output_depth.insert(Arc::default())))
-                .with_output_compression(*self.sort_output_compression.insert(OutputCompression {
-                    level: self.tuning.compression_level,
-                    index_bam: matches!(self.spec.sink, SinkSpec::BamWithIndex(_)),
-                }))
-                // Fan the in-memory fast-path gather across the phase-2
-                // (merge) thread budget: the single already-sorted chunk
-                // is gathered into output blocks by `MergeWork` on the
-                // pool instead of on the lone detached thread, removing
-                // the flat serial gather that otherwise floors the
-                // in-memory sort's wall clock. The window is sized from
-                // the effective phase-2 count (`--merge-threads` within
-                // `--threads`).
-                // `with_pooled_gather` creates the inbox and returns the
-                // matching `MergeWork` step, wired on branch 1 below.
-                .with_pooled_gather(phases.phase2, phase2_cap.clone());
+                .with_output_depth(Arc::clone(self.sink_output_depth.insert(Arc::default())));
+                // A CRAM sink packs raw records itself: the merge must not
+                // BGZF-compress any block (as for intermediate sorts).
+                self.sort_output_compression =
+                    self.spec.sink.merge_output_compression(self.tuning.compression_level);
+                let merge_builder = match self.sort_output_compression {
+                    Some(settings) => merge_builder.with_output_compression(settings),
+                    None => merge_builder,
+                };
+                let (mut merge, merge_work) = merge_builder
+                    // Fan the in-memory fast-path gather across the phase-2
+                    // (merge) thread budget: the single already-sorted chunk
+                    // is gathered into output blocks by `MergeWork` on the
+                    // pool instead of on the lone detached thread, removing
+                    // the flat serial gather that otherwise floors the
+                    // in-memory sort's wall clock. The window is sized from
+                    // the effective phase-2 count (`--merge-threads` within
+                    // `--threads`).
+                    // `with_pooled_gather` creates the inbox and returns the
+                    // matching `MergeWork` step, wired on branch 1 below.
+                    .with_pooled_gather(phases.phase2, phase2_cap.clone());
                 if let Some(slot) = &sort_stats_slot {
                     merge = merge.with_stats_slot(Arc::clone(slot));
                 }
@@ -7054,31 +7300,17 @@ impl<'a> ChainBuilder<'a> {
 
         // Wire the rejects branch (branch 1) to its own compress+write sink, when present.
         if track_rejects {
-            use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-            use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
-
             let rejects_path = filter
                 .rejects
                 .as_ref()
                 .ok_or_else(|| anyhow!("rejects path missing (build_for dispatch bug)"))?;
-            let rejects_compress = BgzfCompress::new(
-                self.tuning.compression_level,
-                self.tuning.per_step_byte_limit,
-                false,
-            );
-            let (rejects_writer, open) = WriteBgzfFile::deferred(
-                rejects_path.clone(),
-                self.header.clone(),
-                self.tuning.compression_level,
-            );
-            self.defer_output("filter", open);
-
             // Branch 1 of process_tail is the rejects output.
-            let rejects_branch = (process_tail.0, BranchIdx(1));
-            let rejects_compress_tail = self.pipeline.append_step(rejects_compress, rejects_branch);
-            // Sink: no tail needed after this.
-            let _rejects_write_tail =
-                self.pipeline.append_step(rejects_writer, rejects_compress_tail);
+            self.wire_rejects_writer(
+                (process_tail.0, BranchIdx(1)),
+                rejects_path,
+                self.header.clone(),
+                "filter",
+            );
         }
 
         match position {
@@ -9755,7 +9987,11 @@ mod tests {
         // Seed a real borrowed-`RecordBatch` decode-free preamble as the tail;
         // the reader is never read (the pipeline is built, not run).
         let reader: Box<dyn std::io::Read + Send> = Box::new(std::io::empty());
-        let tail = builder.build_bam_record_batch_preamble(reader, Header::default());
+        let tail = builder.build_bam_record_batch_preamble(
+            RecordFront::Bgzf(reader),
+            Header::default(),
+            None,
+        );
         builder.current_tail = Some(tail);
         builder.chain_tail_kind = ChainTailKind::RecordBatch;
 

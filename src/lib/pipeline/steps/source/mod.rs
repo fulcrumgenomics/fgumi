@@ -34,8 +34,9 @@ fn open_error(path: &std::path::Path, source: &io::Error) -> io::Error {
     io::Error::new(source.kind(), format!("open {}: {source}", path.display()))
 }
 
-/// The BAM-opener counterpart to [`open_error`], preserving the underlying
-/// [`io::ErrorKind`] across an `anyhow::Error`.
+/// The BAM/CRAM-opener counterpart to [`open_error`], preserving the underlying
+/// [`io::ErrorKind`] across an `anyhow::Error`; `format` (`"BAM"`, `"CRAM"`)
+/// names what was being opened.
 ///
 /// `create_bam_reader_for_pipeline_with_opts` returns `anyhow::Error`, so
 /// `io::Error::other` on it would flatten `NotFound` to `Other` — exactly the
@@ -47,12 +48,21 @@ fn open_error(path: &std::path::Path, source: &io::Error) -> io::Error {
 /// `chain()` finds the first I/O error wherever it sits, and a non-I/O failure
 /// (a malformed header, say) still falls back to `Other`, which is accurate for
 /// it.
-fn open_bam_error(path: &std::path::Path, source: &anyhow::Error) -> io::Error {
-    let message = format!("open BAM {}: {source}", path.display());
+fn open_input_error(format: &str, path: &std::path::Path, source: &anyhow::Error) -> io::Error {
+    let message = format!("open {format} {}: {source:#}", path.display());
     match source.chain().find_map(|e| e.downcast_ref::<io::Error>()) {
         Some(io_err) => io::Error::new(io_err.kind(), message),
         None => io::Error::other(message),
     }
+}
+
+/// The error for CRAM input `path` in a build without the `cram` feature.
+#[cfg(not(feature = "cram"))]
+fn cram_unsupported(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        fgumi_bam_io::cram_input_unsupported(path).to_string(),
+    )
 }
 
 /// Parse a whole-record-aligned FASTQ chunk into records, returning them with
@@ -133,14 +143,21 @@ pub enum InputSource {
     /// Pair with `FindBamBoundaries::new_no_header` (the SAM source
     /// emits record bodies directly, no header bytes to strip).
     Sam { reader: sam::io::Reader<Box<dyn BufRead + Send>>, header: sam::Header },
+    /// CRAM input (feature `cram`), positioned after its header. Read slice by
+    /// slice by `ReadCramSlices` and decoded on the pool by `DecodeCramSlices`
+    /// into header-less framed BAM records (pair with
+    /// `FindBamBoundaries::new_no_header`).
+    #[cfg(feature = "cram")]
+    Cram { reader: fgumi_htslib::CramReader, header: sam::Header, label: String },
 }
 
 impl InputSource {
     /// Open `path` and detect the input shape.
     ///
     /// Detection: `is_stdin_path` chooses stdin vs file; a `.bam` extension
-    /// selects the BAM reader (itself content-aware — see below); anything
-    /// else (no extension, or `.sam`) is classified by content through
+    /// selects the BAM reader (itself content-aware — see below) unless, with
+    /// the `cram` feature, the file's bytes are CRAM; anything else (no
+    /// extension, or `.sam`) is classified by content through
     /// [`fgumi_bam_io::classify_input`].
     ///
     /// Content classification never reduces to a magic-byte test. A leading
@@ -203,24 +220,25 @@ impl InputSource {
 
         if is_stdin {
             // The path is just `-`, so there is no suffix to consult and the
-            // content decides. `PipelineReaderOpts` is not threaded through here:
-            // there is no path to reopen, so there is no async-reader wiring.
-            // Stdin redirected from a regular file has no writer to wait on, so
-            // it is read directly.
+            // content decides. Stdin redirected from a regular file has no
+            // writer to wait on, so it gets no read buffer.
             let read_buffer = if read_buffer > 0 && fgumi_bam_io::is_stream_input(path) {
                 read_buffer
             } else {
                 0
             };
-            open_stream_by_content(read_buffered(Box::new(io::stdin()), read_buffer)?, "stdin")
-        } else if suffix_is_bam && !(read_buffer > 0 && fgumi_bam_io::is_stream_input(path)) {
+            open_stream_by_content(
+                stream_reader(Box::new(io::stdin()), read_buffer, opts.async_reader)?,
+                "stdin",
+            )
+        } else if bam_by_suffix(path, suffix_is_bam) {
             // BAM file: parse header via the existing helper, which
             // handles the seek-to-0 + opt.async_reader wiring. A FIFO named
-            // `*.bam` that is to be read through the read buffer goes to the
-            // content branch below instead, which buffers non-regular inputs.
+            // `*.bam` goes through content classification below instead, retaining
+            // its original format and prefix without reopening the stream.
             let (reader, header) =
                 fgumi_bam_io::create_bam_reader_for_pipeline_with_opts(path, opts)
-                    .map_err(|e| open_bam_error(path, &e))?;
+                    .map_err(|e| open_input_error("BAM", path, &e))?;
             Ok(InputSource::Bam { reader, header })
         } else {
             // No suffix hint, or a `.sam` suffix that content may contradict:
@@ -234,14 +252,13 @@ impl InputSource {
             //
             // An `fstat` on an already-open descriptor essentially cannot fail, but
             // `is_ok_and` picks the safe direction if it somehow does: the
-            // in-stream path always yields correct bytes and merely forgoes the
-            // async-reader wiring, whereas a wrong "regular" answer corrupts input.
+            // in-stream path always yields correct bytes and merely forgoes
+            // reopening, whereas a wrong "regular" answer corrupts input.
             if !file.metadata().is_ok_and(|m| m.is_file()) {
-                // Non-regular: classify in-stream. Same trade-off the stdin branch
-                // makes — no async-reader wiring, because there is no reopenable
-                // path.
+                // Non-regular: classify in-stream, from the descriptor already
+                // open, as the stdin branch does.
                 return open_stream_by_content(
-                    read_buffered(Box::new(file), read_buffer)?,
+                    stream_reader(Box::new(file), read_buffer, opts.async_reader)?,
                     &path.display().to_string(),
                 );
             }
@@ -257,6 +274,15 @@ impl InputSource {
                 InputFormat::Text => {
                     open_sam_from_boxed_buf(buffered(ChainedReader::new(prefix, file)))
                 }
+                // CRAM is read slice by slice on the pipeline (feature `cram`).
+                #[cfg(feature = "cram")]
+                InputFormat::Cram => {
+                    let replay = Box::new(ChainedReader::new(prefix, file));
+                    open_cram_source(replay, path)
+                }
+                // Without `cram`, refuse CRAM with a clear error.
+                #[cfg(not(feature = "cram"))]
+                InputFormat::Cram => Err(cram_unsupported(path)),
                 // Compressed: re-open through the helper, which seeks to byte 0,
                 // preserves the async-reader wiring, and normalizes — so a plain
                 // gzip member is decompressed there rather than handed to a block
@@ -266,7 +292,7 @@ impl InputSource {
                     drop(file);
                     let (reader, header) =
                         fgumi_bam_io::create_bam_reader_for_pipeline_with_opts(path, opts)
-                            .map_err(|e| open_bam_error(path, &e))?;
+                            .map_err(|e| open_input_error("BAM", path, &e))?;
                     Ok(InputSource::Bam { reader, header })
                 }
                 InputFormat::Empty => Err(io::Error::new(
@@ -294,8 +320,35 @@ impl InputSource {
     pub fn header(&self) -> &sam::Header {
         match self {
             InputSource::Bam { header, .. } | InputSource::Sam { header, .. } => header,
+            #[cfg(feature = "cram")]
+            InputSource::Cram { header, .. } => header,
         }
     }
+}
+
+/// Whether `path` takes the `.bam` suffix fast path: a regular file named
+/// `*.bam` (a stream named so is classified in-stream instead). With the `cram`
+/// feature, a regular `*.bam` file whose bytes are CRAM does not: content
+/// decides, so it opens as `InputSource::Cram` and the source reports CRAM.
+fn bam_by_suffix(path: &Path, suffix_is_bam: bool) -> bool {
+    let by_suffix = suffix_is_bam && !fgumi_bam_io::is_stream_input(path);
+    #[cfg(feature = "cram")]
+    let by_suffix = by_suffix && !regular_file_is_cram(path);
+    by_suffix
+}
+
+/// Whether `path` is a regular file whose content (not its name) is CRAM.
+///
+/// Streams (stdin, FIFOs, `/dev/fd/N`) answer `false` without being read:
+/// consuming their prefix here would lose it before the source reads them.
+/// An unreadable file also answers `false`; opening the source reports why.
+#[cfg(feature = "cram")]
+pub(crate) fn regular_file_is_cram(path: &Path) -> bool {
+    if fgumi_bam_io::is_stdin_path(path) || !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else { return false };
+    take_format_prefix(&mut file).is_ok_and(|(_, format)| format == InputFormat::Cram)
 }
 
 /// Consume up to [`fgumi_bam_io::FORMAT_PREFIX_LEN`] bytes and classify them.
@@ -324,6 +377,15 @@ fn take_format_prefix<R: Read + ?Sized>(reader: &mut R) -> io::Result<(Vec<u8>, 
     prefix.truncate(filled);
     let format = fgumi_bam_io::classify_input(&prefix);
     Ok((prefix, format))
+}
+
+/// Open a CRAM stream (its sniffed leading bytes replayed) as a pipeline
+/// [`InputSource::Cram`], with the configured reference.
+#[cfg(feature = "cram")]
+fn open_cram_source(reader: Box<dyn Read + Send>, path: &Path) -> io::Result<InputSource> {
+    let (reader, header) = fgumi_bam_io::cram_input::open_cram_reader(reader, path)
+        .map_err(|e| open_input_error("CRAM", path, &e))?;
+    Ok(InputSource::Cram { reader, header, label: path.display().to_string() })
 }
 
 /// Open a stream that cannot be reopened — stdin, a FIFO, a `/dev/fd/N` from
@@ -355,6 +417,15 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>, subject: &str) -> io::Re
             open_bam_from_boxed_buf(buffered(ChainedReader::new(prefix, reader)), subject)
         }
         InputFormat::Text => open_sam_from_boxed_buf(buffered(ChainedReader::new(prefix, reader))),
+        // CRAM: with the `cram` feature, read slice by slice on the pipeline
+        // (`InputSource::Cram`); without it, the shared normalizer reports an
+        // error naming the feature.
+        #[cfg(feature = "cram")]
+        InputFormat::Cram => {
+            open_cram_source(Box::new(ChainedReader::new(prefix, reader)), Path::new(subject))
+        }
+        #[cfg(not(feature = "cram"))]
+        InputFormat::Cram => Err(cram_unsupported(Path::new(subject))),
         // Plain gzip: one deflate stream, so no block-parallel decode. Decompress
         // at this boundary and classify what comes out, exactly as
         // `normalize_to_bgzf` does for reopenable inputs.
@@ -372,6 +443,17 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>, subject: &str) -> io::Re
                     buffered(ChainedReader::new(inner_prefix, decoded)),
                     subject,
                 ),
+                // A BAM whose BGZF framing a gzip decompressor stripped: re-frame
+                // it, as `normalize_to_bgzf` does, rather than parse it as SAM.
+                InputFormat::Text if fgumi_bam_io::is_unframed_bam(&inner_prefix) => {
+                    open_bam_from_boxed_buf(
+                        buffered(fgumi_bam_io::frame_unframed_bam(ChainedReader::new(
+                            inner_prefix,
+                            decoded,
+                        ))),
+                        subject,
+                    )
+                }
                 InputFormat::Text => {
                     open_sam_from_boxed_buf(buffered(ChainedReader::new(inner_prefix, decoded)))
                 }
@@ -379,6 +461,10 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>, subject: &str) -> io::Re
                     io::ErrorKind::InvalidData,
                     "input stream is gzip-compressed more than once; decompress it before \
                      piping it in",
+                )),
+                InputFormat::Cram => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "input stream is a gzip-compressed CRAM; decompress it before piping it in",
                 )),
                 InputFormat::Empty => Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -389,17 +475,26 @@ fn open_stream_by_content(reader: Box<dyn Read + Send>, subject: &str) -> io::Re
     }
 }
 
-/// Read `reader` through a [`fgumi_bam_io::read_buffer::ReadBuffer`] of
-/// `budget` bytes, or directly when `budget` is `0`.
+/// Read a streamed input through a [`fgumi_bam_io::read_buffer::ReadBuffer`]
+/// of `budget` bytes. With no budget (`0`), `async_reader` (`--async-reader`)
+/// prefetches it on a [`fgumi_bam_io::prefetch_reader::PrefetchReader`]
+/// thread, as the path opener does for a regular file; otherwise it is read
+/// directly.
 ///
 /// # Errors
 ///
 /// Returns the error from starting the read buffer's thread.
-fn read_buffered(reader: Box<dyn Read + Send>, budget: usize) -> io::Result<Box<dyn Read + Send>> {
-    if budget == 0 {
-        Ok(reader)
-    } else {
+fn stream_reader(
+    reader: Box<dyn Read + Send>,
+    budget: usize,
+    async_reader: bool,
+) -> io::Result<Box<dyn Read + Send>> {
+    if budget > 0 {
         Ok(Box::new(fgumi_bam_io::read_buffer::ReadBuffer::try_new(reader, budget)?))
+    } else if async_reader {
+        Ok(Box::new(fgumi_bam_io::prefetch_reader::PrefetchReader::new(reader)))
+    } else {
+        Ok(reader)
     }
 }
 
@@ -422,7 +517,7 @@ fn open_bam_from_boxed_buf(buf: Box<dyn BufRead + Send>, subject: &str) -> io::R
         .read_header()
         // Preserve the source kind: a truncated header arrives as
         // `UnexpectedEof`, and flattening it to `Other` loses the one signal a
-        // caller can branch on. Same policy as `open_error`/`open_bam_error`.
+        // caller can branch on. Same policy as `open_error`/`open_input_error`.
         .map_err(|e| io::Error::new(e.kind(), format!("read BAM header from {subject}: {e}")))?;
     let bgzf = bam_reader.into_inner();
     let tee = bgzf.into_inner();
@@ -539,7 +634,17 @@ read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n";
     /// the writer runs concurrently with the open.
     #[cfg(unix)]
     fn open_via_fifo(bytes: Vec<u8>, dir: &tempfile::TempDir) -> io::Result<InputSource> {
-        let fifo = dir.path().join("stream"); // deliberately no extension
+        open_via_named_fifo(bytes, dir, "stream") // deliberately no extension
+    }
+
+    /// [`open_via_fifo`] with the FIFO named `name`.
+    #[cfg(unix)]
+    fn open_via_named_fifo(
+        bytes: Vec<u8>,
+        dir: &tempfile::TempDir,
+        name: &str,
+    ) -> io::Result<InputSource> {
+        let fifo = dir.path().join(name);
         let status = std::process::Command::new("mkfifo").arg(&fifo).status().expect("mkfifo runs");
         assert!(status.success(), "mkfifo failed for {}", fifo.display());
 
@@ -674,6 +779,76 @@ read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n";
         assert_eq!(source.header().reference_sequences().len(), 1);
     }
 
+    /// Counts the bytes taken from a stream, to tell read-ahead from on-demand reads.
+    struct CountingStream {
+        inner: io::Cursor<Vec<u8>>,
+        taken: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.taken.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    /// `--async-reader` prefetches a stream (a FIFO or stdin) on its own thread
+    /// when no read buffer is set, as it does for a regular file; without it,
+    /// the stream is read only as the consumer asks.
+    #[rstest]
+    #[case::async_reader(true, true)]
+    #[case::sync_reader(false, false)]
+    fn stream_reader_prefetches_only_with_async_reader(
+        #[case] async_reader: bool,
+        #[case] expect_read_ahead: bool,
+    ) {
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream = CountingStream {
+            inner: io::Cursor::new(vec![7u8; 1 << 20]),
+            taken: std::sync::Arc::clone(&taken),
+        };
+        let mut reader = stream_reader(Box::new(stream), 0, async_reader).unwrap();
+        let mut one = [0u8; 1];
+        reader.read_exact(&mut one).unwrap();
+        let taken = taken.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(taken > 1, expect_read_ahead, "{taken} bytes taken for a 1-byte read");
+    }
+
+    /// Plain gzip around an *unframed* BAM byte stream (what `gzip -dc` makes of
+    /// a BAM, recompressed) is re-framed and read as BAM over a pipe, whatever
+    /// the pipe is named: a `.bam` FIFO is classified in-stream too, and must
+    /// not lose the re-framing a regular `.bam` file gets from the normalizer.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::suffix_less("stream")]
+    #[case::bam_suffix("stream.bam")]
+    fn plain_gzip_of_unframed_bam_over_a_pipe_is_read_as_bam(#[case] name: &str) {
+        use flate2::read::MultiGzDecoder;
+        use flate2::write::GzEncoder;
+        use std::io::Read as _;
+
+        let mut unframed = Vec::new();
+        MultiGzDecoder::new(std::fs::File::open(write_bam("")).unwrap())
+            .read_to_end(&mut unframed)
+            .expect("strip the BGZF framing");
+        assert!(unframed.starts_with(b"BAM\x01"), "the fixture is an unframed BAM stream");
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&unframed).expect("gzip the unframed BAM");
+        let gzipped = encoder.finish().expect("finish gzip member");
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = open_via_named_fifo(gzipped, &dir, name).expect("gzipped unframed BAM opens");
+
+        assert!(matches!(source, InputSource::Bam { .. }));
+        // The fixture is header-only, so its one reference is the whole content.
+        let refs = source.header().reference_sequences();
+        assert_eq!(refs.len(), 1);
+        let (name, reference) = refs.first().expect("one reference");
+        assert_eq!(name.as_slice(), b"chr1");
+        assert_eq!(reference.length().get(), 1000);
+    }
+
     /// A suffix-less BGZF input that is **not** a regular file must be read
     /// through the buffer that already holds the peeked bytes. Re-opening the
     /// path — which is what a regular file gets, to keep the async-reader
@@ -766,7 +941,7 @@ read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n";
     /// let a regression back to `io::Error::other` pass unnoticed, so both
     /// properties are pinned here. One case per branch that can fail to open: the
     /// `.sam` and suffix-less branches go through `open_error`, and the `.bam`
-    /// branch through `open_bam_error`, which has to recover the kind from an
+    /// branch through `open_input_error`, which has to recover the kind from an
     /// `anyhow::Error` chain rather than from an `io::Error` directly.
     #[rstest]
     #[case::sam_suffix("/nonexistent/fgumi-test-input.sam")]
@@ -779,5 +954,60 @@ read1\t0\tchr1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n";
 
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "kind must survive the wrap: {err}");
         assert!(err.to_string().contains(path), "the message must name the path; got: {err}");
+    }
+
+    /// Write a one-record, reference-free CRAM to `path`.
+    #[cfg(feature = "cram")]
+    fn write_tiny_cram(path: &Path) {
+        use fgumi_htslib::{CramWriteOptions, CramWriter};
+        let options = CramWriteOptions { no_ref: true, ..CramWriteOptions::default() };
+        let mut writer = CramWriter::create(path, "@HD\tVN:1.6\n", &options).unwrap();
+        let record = fgumi_raw_bam::SamBuilder::new()
+            .read_name(b"r0")
+            .flags(4)
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .build();
+        writer.write_raw(record.as_ref()).unwrap();
+        let (jobs, finisher) = writer.seal().unwrap();
+        for job in jobs {
+            job.encode().unwrap().write().unwrap();
+        }
+        finisher.finish().unwrap();
+    }
+
+    /// A regular file's content, not its name, decides whether it is CRAM:
+    /// a CRAM named `*.bam` opens as CRAM (and reports so), like one named
+    /// `*.cram` or with no suffix.
+    #[cfg(feature = "cram")]
+    #[rstest]
+    #[case::mislabeled_bam("input.bam")]
+    #[case::cram_suffix("input.cram")]
+    #[case::no_suffix("input")]
+    fn cram_content_opens_as_cram_whatever_the_name(#[case] name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        write_tiny_cram(&path);
+        assert!(regular_file_is_cram(&path));
+        let source = InputSource::open(&path).unwrap();
+        assert!(matches!(source, InputSource::Cram { .. }), "{name} must open as CRAM");
+    }
+
+    /// Non-CRAM regular files, and paths that are not regular files, are not
+    /// CRAM (and a missing path is not opened to find out).
+    #[cfg(feature = "cram")]
+    #[rstest]
+    #[case::bam_file(true)]
+    #[case::missing(false)]
+    fn non_cram_paths_are_not_cram(#[case] write_bam: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.bam");
+        if write_bam {
+            let header = noodles::sam::Header::default();
+            let writer = fgumi_bam_io::create_raw_bam_writer(&path, &header, 1, 1).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(!regular_file_is_cram(&path));
+        assert!(!regular_file_is_cram(dir.path()), "a directory is not a regular file");
     }
 }

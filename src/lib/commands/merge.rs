@@ -77,7 +77,7 @@ EXAMPLES:
 "#
 )]
 pub struct Merge {
-    /// Output BAM file.
+    /// Output BAM or CRAM file (CRAM requires a build with `--features cram`).
     #[arg(short = 'o', long = "output")]
     pub output: PathBuf,
 
@@ -125,6 +125,8 @@ pub struct Merge {
 
 impl Command for Merge {
     fn execute(&self, command_line: &str) -> Result<()> {
+        fgumi_bam_io::validate_alignment_output(&self.output)?;
+
         let mut input_paths: Vec<PathBuf> = self.inputs.clone();
 
         if let Some(ref list_path) = self.input_list {
@@ -300,6 +302,7 @@ impl Command for Merge {
             template_ctx,
             rewrite,
             output: target.path().to_path_buf(),
+            output_name: self.output.clone(),
             compression: self.compression_level,
             threads: self.threads,
             deadlock_timeout_secs: self.deadlock.deadlock_timeout,

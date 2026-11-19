@@ -11,6 +11,9 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod alignment_writer;
+#[cfg(feature = "cram")]
+pub mod cram_input;
 pub mod format;
 pub mod fs_mode;
 pub mod grouping;
@@ -31,6 +34,11 @@ pub mod writer;
 
 pub(crate) mod vendored;
 
+#[cfg(feature = "cram")]
+pub use alignment_writer::CramOutputPolicy;
+pub use alignment_writer::{
+    RawAlignmentWriter, create_raw_alignment_writer, validate_alignment_output,
+};
 pub use format::{FORMAT_PREFIX_LEN, InputFormat, classify_input};
 pub use fs_mode::restamp_for_persist;
 pub use grouping::{
@@ -40,7 +48,10 @@ pub use grouping::{
 pub use library::{LibraryIndex, LibraryLookup, build_library_lookup, unknown_library};
 pub use mem_estimate::MemoryEstimate;
 pub use output::{OutputFile, OutputSink, close_buffered, open_output_sink, persist_after_close};
-pub use paths::{is_stdin_path, is_stdout_path, is_stream_input};
+pub use paths::{
+    bai_sidecar_path, crai_sidecar_path, is_cram_path, is_stdin_path, is_stdout_path,
+    is_stream_input,
+};
 pub use progress::ProgressTracker;
 pub use reader::{
     BamReaderAuto, BgzfReaderEnum, ChainedReader, FgumiBgzfReader, PipelineReaderOpts,
@@ -50,11 +61,12 @@ pub use reader::{
     open_normalized_input, read_header_and_replay, read_prefix,
 };
 pub use reorder::{DrainReady, ReorderBuffer};
+pub use sam_input::{cram_input_unsupported, frame_unframed_bam, is_unframed_bam};
 pub use writer::{
     AlignmentContext, BaiBuilder, BamWriter, BgzfWriterEnum, IndexingBamWriter, RawBamWriter,
-    bai_sidecar_path, create_bam_writer, create_indexing_bam_writer, create_optional_bam_writer,
-    create_raw_bam_writer, extract_alignment_context, open_output_writer, write_bai_index,
-    write_bai_sidecar, write_bam_header,
+    create_bam_writer, create_indexing_bam_writer, create_optional_bam_writer,
+    create_raw_bam_writer, extract_alignment_context, open_output_writer, reject_cram_output,
+    sam_header_text, write_bai_index, write_bai_sidecar, write_bam_header,
 };
 
 /// The message of a caught panic's `payload` (a `&str` or `String`, as

@@ -3,7 +3,7 @@
 //! 1. [`validate_stage_progression`] — ordering rules and mutual exclusions.
 //! 2. [`validate_stage_opts_present`] — each stage has its options in the bag.
 //! 3. [`validate_cross_stage_constraints`] — Zipper source, Duplex/Group
-//!    strategy, `BamWithIndex` terminal-sort, and Extract source rules.
+//!    strategy, indexed-sink terminal-sort, and Extract source rules.
 
 use anyhow::{Result, bail};
 
@@ -433,7 +433,7 @@ fn validate_metrics_slots_exclusive(spec: &ChainSpec) -> Result<()> {
 pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     use crate::assigner::Strategy;
     use crate::commands::sort::SortOrderArg;
-    use crate::pipeline::chains::{SinkSpec, SourceSpec};
+    use crate::pipeline::chains::SourceSpec;
 
     // Rule 1: Zipper requires a PairedBams source.
     if spec.stages.contains(&Stage::Zipper) {
@@ -473,9 +473,10 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
         );
     }
 
-    // Rule 3: `SinkSpec::BamWithIndex` requires the terminal stage to be
-    // `Stage::Sort`, sorting by *coordinate*. The BAI file format indexes BGZF
-    // virtual offsets of a coordinate-sorted BAM; emitting one for a non-sort
+    // Rule 3: an indexed sink (`SinkSpec::BamWithIndex` / `CramWithIndex`)
+    // requires the terminal stage to be `Stage::Sort`, sorting by *coordinate*.
+    // A BAI indexes BGZF virtual offsets of a coordinate-sorted BAM (a CRAI,
+    // container offsets of a coordinate-sorted CRAM); emitting one for a non-sort
     // terminal stage (or for a chain where sort is intermediate, leaving some
     // other stage as terminal) would either reference a file that isn't
     // coordinate-sorted or attempt to index an output type the hook isn't
@@ -490,7 +491,8 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // is constructed, is what protects a *direct* chain (built programmatically
     // rather than through the sort command) from writing an invalid BAI in a
     // release build.
-    if matches!(spec.sink, SinkSpec::BamWithIndex(_)) {
+    if let Some((index_kind, _)) = spec.sink.index() {
+        let rule3_sink = spec.sink.name();
         let terminal_is_sort = spec.stages.last().is_some_and(|s| *s == Stage::Sort);
         if !terminal_is_sort {
             // `validate_stage_progression` rejects empty `stages` before
@@ -500,13 +502,13 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
             // change degrades to a clean error instead of a panic.
             let terminal = spec.stages.last().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "SinkSpec::BamWithIndex requires Stage::Sort as the terminal chain stage; \
-                     got an empty chain (should have been caught by validate_stage_progression)",
+                    "{rule3_sink} requires Stage::Sort as the terminal chain stage; got an \
+                     empty chain (should have been caught by validate_stage_progression)",
                 )
             })?;
             bail!(
-                "SinkSpec::BamWithIndex requires Stage::Sort as the terminal chain stage; \
-                 got terminal stage {terminal:?}",
+                "{rule3_sink} requires Stage::Sort as the terminal chain stage; got terminal \
+                 stage {terminal:?}",
             );
         }
 
@@ -525,14 +527,16 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
             && !matches!(sort_opts.order, SortOrderArg::Coordinate)
         {
             bail!(
-                "SinkSpec::BamWithIndex requires the terminal Stage::Sort to sort by coordinate \
-                 (the BAI format indexes a coordinate-sorted BAM); got sort order {:?}",
+                "{rule3_sink} requires the terminal Stage::Sort to sort by coordinate (a \
+                 {} indexes coordinate-sorted output); got sort order {:?}",
+                index_kind.name(),
                 sort_opts.order,
             );
         }
     }
 
-    // Rule 3b: structural preconditions on `SinkSpec::BamWithIndex` that
+    // Rule 3b: structural preconditions on an indexed sink
+    // (`SinkSpec::BamWithIndex` / `CramWithIndex`) that
     // `add_sink` also enforces (as `ensure!` guards) but only *after* earlier
     // stages have run. `build_for` adds the sink last, so a rejects-bearing
     // stage such as `add_correct` has already created and truncated its rejects
@@ -542,45 +546,18 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     // before any `File::create` truncates a file), preserves the
     // check-then-truncate discipline; the `add_sink` guards remain as defense in
     // depth. This affects `Correct → Sort` and `Correct → Align → Sort`.
-    if let SinkSpec::BamWithIndex(output) = &spec.sink {
-        // An inline BAI is a sidecar file joined against the primary BAM's
-        // compressed offsets; it cannot be produced for a streamed stdout
-        // output (there is no seekable file to index). Mirrors `add_sink`'s
-        // `--write-index cannot target stdout` guard.
-        if fgumi_bam_io::is_stdout_path(output) {
-            bail!(
-                "SinkSpec::BamWithIndex cannot target stdout; an inline BAI index requires a \
-                 seekable on-disk output"
-            );
-        }
-
-        // The align-like stages (`Stage::Align`, `Stage::Realign`) defer the
-        // output header (it is rewritten once the aligner has emitted its @SQ
-        // lines), and the inline BAI indexer requires a resolved (non-deferred)
-        // header. Mirrors `add_sink`'s `inline BAI indexing requires a resolved
-        // (non-deferred) header` guard, which fires on
-        // `self.pending_header_handle` — set by every align-like stage
-        // (`add_align`, `add_realign`, via `finish_align_like_stage`).
-        if let Some(stage) = spec.stages.iter().find(|s| matches!(s, Stage::Align | Stage::Realign))
-        {
-            bail!(
-                "SinkSpec::BamWithIndex is incompatible with Stage::{stage:?}: alignment defers \
-                 the output header, but inline BAI indexing requires a resolved (non-deferred) \
-                 header"
-            );
-        }
-
-        // The derived `.bai` sidecar must not collide with the primary BAM or
-        // any rejects branch. The sidecar path is *derived* (`bai_sidecar_path`),
-        // so the command-layer output-collision check never saw it: two
-        // `WriteBgzfFile` sinks aimed at one path would otherwise clobber each
-        // other byte for byte.
-        reject_index_sidecar_collisions(
-            output,
-            &fgumi_bam_io::bai_sidecar_path(output),
-            &spec_rejects_paths(spec),
-        )?;
+    // A `.cram` rejects branch is an alignment output too: refuse it here,
+    // before the source opens (which can block on stdin), rather than letting
+    // the stage queue a BGZF writer for it.
+    #[cfg(not(feature = "cram"))]
+    if let Some(name) = spec
+        .sink
+        .cram_name()
+        .or_else(|| spec_rejects_paths(spec).into_iter().find(|p| fgumi_bam_io::is_cram_path(p)))
+    {
+        bail!("CRAM output ({}) requires fgumi built with `--features cram`", name.display());
     }
+    validate_index_sink(spec)?;
 
     // Rule 4: `Stage::Extract` requires a FASTQ source — `SourceSpec::Fastqs`
     // or `SourceSpec::InterleavedFastq`. Extract reads directly from FASTQ;
@@ -649,10 +626,57 @@ pub fn validate_cross_stage_constraints(spec: &ChainSpec) -> Result<()> {
     Ok(())
 }
 
+/// Rule 3b: structural preconditions on an indexed sink (`BamWithIndex` /
+/// `CramWithIndex`) that the index writers would otherwise hit at build time.
+fn validate_index_sink(spec: &ChainSpec) -> Result<()> {
+    if let (Some(output), Some((kind, sidecar))) = (spec.sink.path(), spec.sink.index()) {
+        let index_kind = kind.name();
+        // An inline index is a sidecar file joined against the primary
+        // output's offsets; it cannot be produced for a streamed stdout output
+        // (there is no seekable file to index). Mirrors `add_sink`'s
+        // `--write-index cannot target stdout` guard.
+        let sink_name = spec.sink.name();
+        if fgumi_bam_io::is_stdout_path(output) {
+            bail!(
+                "{sink_name} cannot target stdout; an inline {index_kind} index requires a \
+                 seekable on-disk output"
+            );
+        }
+
+        // The align-like stages (`Stage::Align`, `Stage::Realign`) defer the
+        // output header (it is rewritten once the aligner has emitted its @SQ
+        // lines), and the inline indexer requires a resolved (non-deferred)
+        // header. Mirrors `add_sink`'s `inline indexing requires a resolved
+        // (non-deferred) header` guard, which fires on
+        // `self.pending_header_handle` — set by every align-like stage
+        // (`add_align`, `add_realign`, via `finish_align_like_stage`).
+        if let Some(stage) = spec.stages.iter().find(|s| matches!(s, Stage::Align | Stage::Realign))
+        {
+            bail!(
+                "{sink_name} is incompatible with Stage::{stage:?}: alignment defers the output \
+                 header, but inline {index_kind} indexing requires a resolved (non-deferred) \
+                 header"
+            );
+        }
+
+        // The derived `.bai` / `.crai` sidecar must not collide with the primary
+        // output or any rejects branch. The sidecar path is *derived*
+        // (`SinkSpec::index`), so the command-layer output-collision
+        // check never saw it: two sinks aimed at one path would otherwise
+        // clobber each other byte for byte.
+        reject_index_sidecar_collisions(
+            output,
+            (&sidecar, kind.sidecar_label()),
+            &spec_rejects_paths(spec),
+        )?;
+    }
+    Ok(())
+}
+
 /// The rejects/secondary output paths a chain's stage options declare.
 ///
 /// These are the writable files a chain produces besides its primary sink;
-/// [`validate_cross_stage_constraints`] checks the derived `.bai` sidecar
+/// [`validate_cross_stage_constraints`] checks the derived index sidecar
 /// against them (see [`reject_index_sidecar_collisions`]). Only stages that
 /// actually emit a rejects branch carry one — the consensus stages are
 /// `consensus`-gated, matching their `StageOptionsBag` slots.
@@ -690,10 +714,13 @@ fn spec_rejects_paths(spec: &ChainSpec) -> Vec<&std::path::Path> {
     paths
 }
 
-/// Reject a collision between the inline-index `.bai` sidecar and any other file
-/// the chain writes (the primary BAM or a rejects branch).
+/// Reject a collision between the inline-index sidecar (`.bai` or `.crai`,
+/// with its label from
+/// [`IndexKind::sidecar_label`](crate::pipeline::chains::sink_spec::IndexKind::sidecar_label)) and any other file
+/// the chain writes (the primary output or a rejects branch).
 ///
-/// The sidecar path is *derived* ([`fgumi_bam_io::bai_sidecar_path`]), so the
+/// The sidecar path is *derived*
+/// ([`SinkSpec::index`](crate::pipeline::chains::SinkSpec::index)), so the
 /// command-layer
 /// [`reject_output_collisions`](crate::commands::common::reject_output_collisions)
 /// check — which only sees the paths the CLI passed — never inspects it. Two
@@ -701,18 +728,18 @@ fn spec_rejects_paths(spec: &ChainSpec) -> Vec<&std::path::Path> {
 /// byte for byte, exactly the corruption `reject_output_collisions` prevents.
 fn reject_index_sidecar_collisions(
     output_path: &std::path::Path,
-    bai_path: &std::path::Path,
+    (sidecar, sidecar_label): (&std::path::Path, &str),
     rejects_paths: &[&std::path::Path],
 ) -> Result<()> {
     let mut targets: Vec<(&std::path::Path, &str)> =
-        vec![(output_path, "--output"), (bai_path, "--write-index (.bai sidecar)")];
+        vec![(output_path, "--output"), (sidecar, sidecar_label)];
     targets.extend(rejects_paths.iter().map(|p| (*p, "--rejects")));
     crate::commands::common::reject_output_collisions(&targets)
 }
 
 /// Reject a collision between any thread-telemetry TSV (`<stem>.ticks.*.tsv`)
 /// and the chain's other on-disk outputs — the primary sink, any rejects
-/// branch, and (for an indexed sink) the derived `.bai` sidecar.
+/// branch, and (for an indexed sink) the derived `.bai` / `.crai` sidecar.
 ///
 /// The telemetry stem is resolved from `--pipeline-telemetry-out` / its env var
 /// exactly as the real telemetry setup resolves it, and the six file paths are
@@ -735,10 +762,7 @@ fn reject_telemetry_collisions(spec: &ChainSpec) -> Result<()> {
         .iter()
         .map(|suffix| format!("--pipeline-telemetry-out (.ticks.{suffix}.tsv)"))
         .collect();
-    let bai_sidecar = match &spec.sink {
-        SinkSpec::BamWithIndex(output) => Some(fgumi_bam_io::bai_sidecar_path(output)),
-        _ => None,
-    };
+    let index = spec.sink.index();
 
     // The chain's non-telemetry write targets. `reject_output_collisions`
     // itself skips stdout / null-device targets, so they need no pre-filter
@@ -756,8 +780,8 @@ fn reject_telemetry_collisions(spec: &ChainSpec) -> Result<()> {
             targets.push((out0.as_path(), "--output (read 0)"));
         }
     }
-    if let Some(bai) = &bai_sidecar {
-        targets.push((bai.as_path(), "--write-index (.bai sidecar)"));
+    if let Some((kind, sidecar)) = &index {
+        targets.push((sidecar.as_path(), kind.sidecar_label()));
     }
     targets.extend(spec_rejects_paths(spec).into_iter().map(|p| (p, "--rejects")));
     for (path, label) in tele_paths.iter().zip(tele_labels.iter()) {
@@ -1234,6 +1258,126 @@ mod tests {
         );
     }
 
+    /// `SinkSpec::CramWithIndex` gets the same Rule 3 / 3b checks as
+    /// `BamWithIndex`, worded for a CRAM and its `.crai`: a non-sort or
+    /// non-coordinate terminal, stdout, an align-like stage, and a rejects
+    /// branch on the derived `<out>.cram.crai` are all refused.
+    #[cfg(feature = "cram")]
+    #[rstest]
+    #[case::non_sort_terminal(
+        vec![Stage::Sort, Stage::Group], "out.cram", None, None,
+        &["SinkSpec::CramWithIndex requires Stage::Sort as the terminal"]
+    )]
+    #[case::non_coordinate_sort(
+        vec![Stage::Sort], "out.cram", Some(SortOrderArg::Queryname), None,
+        &["SinkSpec::CramWithIndex requires the terminal Stage::Sort to sort by coordinate"]
+    )]
+    #[case::stdout_dash(
+        vec![Stage::Correct, Stage::Sort], "-", None, None,
+        &["SinkSpec::CramWithIndex cannot target stdout", "inline CRAI index"]
+    )]
+    #[case::dev_stdout(
+        vec![Stage::Correct, Stage::Sort], "/dev/stdout", None, None,
+        &["SinkSpec::CramWithIndex cannot target stdout", "inline CRAI index"]
+    )]
+    #[case::align(
+        vec![Stage::Correct, Stage::Align, Stage::Sort], "out.cram", None, None,
+        &["SinkSpec::CramWithIndex is incompatible with Stage::Align", "inline CRAI indexing"]
+    )]
+    #[case::realign(
+        vec![Stage::Simplex, Stage::Realign, Stage::Sort], "out.cram", None, None,
+        &["SinkSpec::CramWithIndex is incompatible with Stage::Realign", "inline CRAI indexing"]
+    )]
+    #[case::rejects_on_the_crai(
+        vec![Stage::Correct, Stage::Sort], "out.cram", None, Some("out.cram.crai"),
+        &["--write-index (.crai sidecar)", "--rejects"]
+    )]
+    fn cross_stage_cram_with_index_is_rejected(
+        #[case] stages: Vec<Stage>,
+        #[case] output: &str,
+        #[case] order: Option<SortOrderArg>,
+        #[case] rejects: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let mut spec = empty_spec(stages);
+        spec.sink =
+            SinkSpec::CramWithIndex { path: PathBuf::from(output), name: PathBuf::from(output) };
+        spec.stage_opts.sort = order.map(sort_opts_with_order);
+        if let Some(rejects) = rejects {
+            spec.stage_opts.correct = Some(correct_opts_with_rejects(Some(PathBuf::from(rejects))));
+        }
+        let msg = validate_cross_stage_constraints(&spec).unwrap_err().to_string();
+        for want in expected {
+            assert!(msg.contains(want), "expected {want:?} in error, got: {msg}");
+        }
+        assert!(!msg.contains("BAI") && !msg.contains(".bai"), "BAM wording for a CRAM: {msg}");
+    }
+
+    /// Unsupported CRAM sinks fail validation before a source can be opened.
+    #[cfg(not(feature = "cram"))]
+    #[rstest]
+    #[case::unindexed(false)]
+    #[case::indexed(true)]
+    fn cross_stage_rejects_cram_without_feature(#[case] indexed: bool) {
+        let mut spec = empty_spec(vec![Stage::Sort]);
+        spec.sink = SinkSpec::alignment(
+            PathBuf::from("out.cram"),
+            std::path::Path::new("out.cram"),
+            indexed,
+        );
+        spec.stage_opts.sort = Some(sort_opts_with_order(SortOrderArg::Coordinate));
+        let err = validate_cross_stage_constraints(&spec).unwrap_err();
+        assert!(err.to_string().contains("requires fgumi built with `--features cram`"), "{err:#}");
+    }
+
+    /// A `.cram` rejects branch is refused the same way, before a source opens,
+    /// even when the primary output is BAM; a `.bam` rejects branch is not.
+    #[cfg(not(feature = "cram"))]
+    #[rstest]
+    #[case::cram_rejects(
+        "rejects.cram",
+        Some("CRAM output (rejects.cram) requires fgumi built with `--features cram`")
+    )]
+    #[case::bam_rejects("rejects.bam", None)]
+    fn cross_stage_rejects_cram_rejects_without_feature(
+        #[case] rejects: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut spec = empty_spec(vec![Stage::Correct]);
+        spec.sink = SinkSpec::Bam(PathBuf::from("out.bam"));
+        spec.stage_opts.correct = Some(correct_opts_with_rejects(Some(PathBuf::from(rejects))));
+        let result = validate_cross_stage_constraints(&spec);
+        match expected {
+            Some(want) => {
+                let err = result.unwrap_err().to_string();
+                assert_eq!(err, want);
+            }
+            None => result.expect("a BAM rejects branch needs no `cram` feature"),
+        }
+    }
+
+    /// The valid counterparts: a coordinate terminal sort, alone or with a
+    /// rejects branch that does not collide with the `.crai`.
+    #[cfg(feature = "cram")]
+    #[rstest]
+    #[case::terminal_sort(vec![Stage::Sort], None)]
+    #[case::distinct_rejects(vec![Stage::Correct, Stage::Sort], Some("rejects.bam"))]
+    fn cross_stage_cram_with_index_is_accepted(
+        #[case] stages: Vec<Stage>,
+        #[case] rejects: Option<&str>,
+    ) {
+        let mut spec = empty_spec(stages);
+        spec.sink = SinkSpec::CramWithIndex {
+            path: PathBuf::from("out.cram"),
+            name: PathBuf::from("out.cram"),
+        };
+        spec.stage_opts.sort = Some(sort_opts_with_order(SortOrderArg::Coordinate));
+        if let Some(rejects) = rejects {
+            spec.stage_opts.correct = Some(correct_opts_with_rejects(Some(PathBuf::from(rejects))));
+        }
+        validate_cross_stage_constraints(&spec).expect("a coordinate-sorted indexed CRAM is valid");
+    }
+
     #[test]
     fn opts_present_downsample_not_wired() {
         // Stage::Downsample has no bag slot yet; should fail at options-presence time.
@@ -1531,7 +1675,7 @@ mod tests {
             .expect("a non-metrics chain must not trip the metrics both-slots guard");
     }
 
-    // --- Rule 3b: inline-index `.bai` sidecar collision ---
+    // --- Rule 3b: inline-index sidecar collision ---
 
     /// The `reject_index_sidecar_collisions` helper: a sidecar colliding with a
     /// rejects branch is rejected, and the error names both flags.
@@ -1541,8 +1685,12 @@ mod tests {
         let output = Path::new("out.bam");
         let bai = Path::new("out.bam.bai");
         let rejects = [Path::new("out.bam.bai")];
-        let err = super::reject_index_sidecar_collisions(output, bai, &rejects)
-            .expect_err("sidecar/rejects collision must be rejected");
+        let err = super::reject_index_sidecar_collisions(
+            output,
+            (bai, "--write-index (.bai sidecar)"),
+            &rejects,
+        )
+        .expect_err("sidecar/rejects collision must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("--write-index") && msg.contains("--rejects"),
@@ -1555,8 +1703,12 @@ mod tests {
     fn sidecar_helper_rejects_collision_with_the_output() {
         use std::path::Path;
         let output = Path::new("out.bam");
-        let err = super::reject_index_sidecar_collisions(output, output, &[])
-            .expect_err("sidecar/output collision must be rejected");
+        let err = super::reject_index_sidecar_collisions(
+            output,
+            (output, "--write-index (.bai sidecar)"),
+            &[],
+        )
+        .expect_err("sidecar/output collision must be rejected");
         assert!(err.to_string().contains("--output"), "error must name --output");
     }
 
@@ -1567,10 +1719,21 @@ mod tests {
         use std::path::Path;
         let output = Path::new("out.bam");
         let bai = Path::new("out.bam.bai");
-        assert!(super::reject_index_sidecar_collisions(output, bai, &[]).is_ok());
         assert!(
-            super::reject_index_sidecar_collisions(output, bai, &[Path::new("rejects.bam")])
-                .is_ok(),
+            super::reject_index_sidecar_collisions(
+                output,
+                (bai, "--write-index (.bai sidecar)"),
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            super::reject_index_sidecar_collisions(
+                output,
+                (bai, "--write-index (.bai sidecar)"),
+                &[Path::new("rejects.bam")]
+            )
+            .is_ok(),
             "a distinct rejects path must not collide with the sidecar"
         );
     }
