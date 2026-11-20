@@ -1436,9 +1436,10 @@ mod tests {
         quote! { pub struct Opts where u32: Clone { #[arg(long)] pub a: u32 } }
     )]
     fn rejects_generic_structs(#[case] tokens: TokenStream2) {
-        let err = parse_annotated_struct(&tokens)
-            .expect_err("a generic struct must be rejected")
-            .to_string();
+        let Err(err) = parse_annotated_struct(&tokens) else {
+            panic!("a generic struct must be rejected");
+        };
+        let err = err.to_string();
         assert!(err.contains("generic"), "message should mention generics: {err}");
     }
 
