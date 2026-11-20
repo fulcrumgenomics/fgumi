@@ -1086,8 +1086,8 @@ fn test_correct_chain_writes_metrics_on_min_corrected_failure_empty_input() {
         parsed.iter().any(|m| m.umi == "ACGTACGT"),
         "expected a row for the whitelisted UMI: {parsed:?}"
     );
-    // The unmatched bucket's UMI is `"N".repeat(umi_length)` (correct.rs), which
-    // is `NNNNNNNN` for the 8bp whitelist UMI. Assert it by identity so a TSV
+    // The unmatched bucket is the all-`N` row for the fixed-UMI length (one per
+    // length), which is `NNNNNNNN` for the 8bp whitelist UMI. Assert it by identity so a TSV
     // carrying some other second key cannot satisfy the row-count check above.
     assert!(
         parsed.iter().any(|m| m.umi == "NNNNNNNN"),
@@ -1420,7 +1420,7 @@ fn correct_reads_a_umi_fifo_exactly_once() {
 
 /// The correct stage's UMI set is resolved only when the chain runs the correct
 /// stage: correct options carried by a chain without it (here a simplex chain
-/// with a mixed-length set and an unreadable UMI file) are never read, so they
+/// with a hyphenated UMI and an unreadable UMI file) are never read, so they
 /// cannot fail an otherwise valid build.
 #[test]
 fn test_build_for_ignores_correct_options_without_a_correct_stage() {
@@ -1461,7 +1461,7 @@ fn test_build_for_ignores_correct_options_without_a_correct_stage() {
         command_line: "test",
     };
     let correct_opts = CorrectOptions {
-        umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
+        umis: vec!["AAAAAA".to_string(), "AC-GT".to_string()],
         umi_files: vec![temp_dir.path().join("missing-umis.txt")],
         ..Default::default()
     };
@@ -1476,4 +1476,369 @@ fn test_build_for_ignores_correct_options_without_a_correct_stage() {
         .and_then(BuiltPipeline::run)
         .expect("correct options must be ignored by a chain without the correct stage");
     assert!(output_bam.exists(), "the simplex chain must write its output");
+}
+
+// ============================================================================
+// Fixed UMIs of different lengths (port of fulcrumgenomics/fgbio#1197)
+// ============================================================================
+
+/// Writes one single-read family per `(name, umi)` (no `RX` when `umi` is
+/// `None`), so each read is named `{name}_0`.
+fn create_named_umi_bam(path: &PathBuf, reads: &[(&str, Option<&str>)]) {
+    let families = reads
+        .iter()
+        .map(|(name, umi)| match umi {
+            Some(umi) => create_umi_family(umi, 1, name, "AAAAGGGG", 30),
+            None => create_family_with_tags(&[], 1, name, "AAAAGGGG", 30),
+        })
+        .collect();
+    create_umi_bam(path, families);
+}
+
+/// Runs `correct --umis <umis>` with the given mismatch/distance limits plus
+/// `extra`, panicking with the command's error on failure.
+fn run_correct_with_umis(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    umis: &[&str],
+    max_mismatches: usize,
+    min_distance: usize,
+    extra: &[&str],
+) {
+    let max_mismatches = max_mismatches.to_string();
+    let min_distance = min_distance.to_string();
+    let mut args = vec![
+        "correct",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--max-mismatches",
+        &max_mismatches,
+        "--min-distance",
+        &min_distance,
+        "--compression-level",
+        "1",
+    ];
+    for umi in umis {
+        args.extend(["--umis", umi]);
+    }
+    args.extend_from_slice(extra);
+    let cmd = CorrectUmis::try_parse_from(args).expect("parse correct args");
+    cmd.execute("fgumi correct").unwrap_or_else(|e| panic!("correct failed: {e:#}"));
+}
+
+/// Read names in a BAM, sorted.
+fn sorted_read_names(path: &PathBuf) -> Vec<String> {
+    records_by_name(path, &[]).into_keys().collect()
+}
+
+/// Reads the metrics TSV keyed by UMI, asserting first that no value is NaN or
+/// infinite (fgbio#1197 writes zero instead).
+fn read_metrics_by_umi(
+    path: &std::path::Path,
+) -> BTreeMap<String, fgumi_lib::metrics::UmiCorrectionMetrics> {
+    let text = fs::read_to_string(path).expect("read metrics");
+    let lower = text.to_ascii_lowercase();
+    assert!(!lower.contains("nan") && !lower.contains("inf"), "NaN/Infinity in metrics:\n{text}");
+    fgumi_lib::metrics::UmiCorrectionMetrics::read_metrics(path)
+        .expect("parse metrics")
+        .into_iter()
+        .map(|m| (m.umi.clone(), m))
+        .collect()
+}
+
+/// Port of fgbio `CorrectUmisTest` "correct each UMI only against the fixed UMIs
+/// of the same length when the fixed UMIs have different lengths", end to end
+/// with exact metrics, single- and multi-worker. Each UMI is matched only
+/// against the fixed UMI of its own length, each length has its own all-`N`
+/// row, and `representation` divides by the mean over the two fixed UMIs only
+/// (8 / 2 = 4).
+#[rstest]
+#[case::single_worker(&[])]
+#[case::four_workers(&["--threads", "4"])]
+fn correct_fixed_umis_of_different_lengths_end_to_end(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let rejects = temp_dir.path().join("rejects.bam");
+    let metrics = temp_dir.path().join("metrics.tsv");
+    create_named_umi_bam(
+        &input,
+        &[
+            ("q1", Some("AAAAAA")),
+            ("q2", Some("AAAAAA")),
+            ("q3", Some("AATAAA")),
+            ("q4", Some("AATTAA")),
+            ("q5", Some("AAATGC")),
+            ("q6", Some("CCCCCCC")),
+            ("q7", Some("CCTCCCC")),
+            ("q8", Some("CCTCCCC")),
+            ("q9", Some("CCTGCCC")),
+            ("q10", Some("GGGGGGG")),
+        ],
+    );
+
+    let mut args =
+        vec!["--rejects", rejects.to_str().unwrap(), "--metrics", metrics.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    run_correct_with_umis(&input, &output, &["AAAAAA", "CCCCCCC"], 2, 2, &args);
+
+    assert_eq!(
+        sorted_read_names(&output),
+        ["q1_0", "q2_0", "q3_0", "q4_0", "q6_0", "q7_0", "q8_0", "q9_0"]
+    );
+    assert_eq!(sorted_read_names(&rejects), ["q10_0", "q5_0"]);
+
+    let by_umi = read_metrics_by_umi(&metrics);
+    assert_eq!(by_umi.keys().collect::<Vec<_>>(), ["AAAAAA", "CCCCCCC", "NNNNNN", "NNNNNNN"]);
+    // (umi, total, perfect, one, two, other, fraction_of_matches, representation)
+    for (umi, total, perfect, one, two, other, fraction, representation) in [
+        ("AAAAAA", 4, 2, 1, 1, 0, 0.4, 1.0),
+        ("CCCCCCC", 4, 1, 2, 1, 0, 0.4, 1.0),
+        ("NNNNNN", 1, 0, 0, 0, 0, 0.1, 0.25),
+        ("NNNNNNN", 1, 0, 0, 0, 0, 0.1, 0.25),
+    ] {
+        let m = &by_umi[umi];
+        assert_eq!(
+            (
+                m.total_matches,
+                m.perfect_matches,
+                m.one_mismatch_matches,
+                m.two_mismatch_matches,
+                m.other_matches
+            ),
+            (total, perfect, one, two, other),
+            "{umi} counts"
+        );
+        assert!((m.fraction_of_matches - fraction).abs() < 1e-6, "{umi} fraction: {m:?}");
+        assert!((m.representation - representation).abs() < 1e-6, "{umi} representation: {m:?}");
+    }
+}
+
+/// Port of fgbio `CorrectUmisTest` "reject reads whose UMI length matches no
+/// fixed UMI length": the reads are rejected, and the first one logs a warning
+/// listing the expected lengths. Run as a subprocess to capture the log.
+#[test]
+fn correct_rejects_umi_length_matching_no_fixed_umi_length() {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let rejects = temp_dir.path().join("rejects.bam");
+    create_named_umi_bam(
+        &input,
+        &[("match6", Some("AAAAAA")), ("match7", Some("CCCCCCC")), ("short4", Some("ACGT"))],
+    );
+
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "correct",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--rejects",
+            rejects.to_str().unwrap(),
+            "--max-mismatches",
+            "1",
+            "--min-distance",
+            "1",
+            "--umis",
+            "AAAAAA",
+            "--umis",
+            "CCCCCCC",
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("spawn fgumi");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "correct failed:\n{stderr}");
+    assert!(
+        stderr.contains("Read (short4_0) detected with unexpected length UMI(s): ACGT."),
+        "missing warning:\n{stderr}"
+    );
+    assert!(stderr.contains("Expected UMI length(s): 6, 7"), "missing warning:\n{stderr}");
+    assert!(
+        stderr.contains("1 had UMIs whose lengths matched no fixed UMI length"),
+        "missing wrong-length summary:\n{stderr}"
+    );
+
+    assert_eq!(sorted_read_names(&output), ["match6_0", "match7_0"]);
+    assert_eq!(sorted_read_names(&rejects), ["short4_0"]);
+}
+
+/// Port of fgbio `CorrectUmisTest` "correct each UMI of a multi-UMI tag against
+/// the fixed UMIs of its own length", end to end: each segment corrects against
+/// its own length in either order, and a segment of no fixed-UMI length rejects
+/// the read without crediting any metrics row. With `half_match`, a read whose
+/// 6bp segment matches `AAAAAA` but whose 7bp segment matches nothing is
+/// rejected, yet still credits `AAAAAA` and the 7bp all-`N` row (fgbio credits
+/// every segment before the accept/reject decision).
+#[rstest]
+#[case::all_segments_matched(false, 3, 0, &["wrongLen_0"])]
+#[case::one_segment_unmatched(true, 4, 1, &["halfMatch_0", "wrongLen_0"])]
+fn correct_multi_umi_segments_against_their_own_lengths(
+    #[case] half_match: bool,
+    #[case] expected_aaaaaa_total: u64,
+    #[case] expected_nnnnnnn_total: u64,
+    #[case] expected_rejects: &[&str],
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let rejects = temp_dir.path().join("rejects.bam");
+    let metrics = temp_dir.path().join("metrics.tsv");
+    let mut reads = vec![
+        ("exact", Some("AAAAAA-CCCCCCC")),
+        ("corrected", Some("AAAATA-CCCCGCC")),
+        ("swapped", Some("CCCCCCC-AAAAAA")),
+        ("wrongLen", Some("AAAAAA-CCCCC")),
+    ];
+    if half_match {
+        reads.push(("halfMatch", Some("AAAAAA-GGGGGGG")));
+    }
+    create_named_umi_bam(&input, &reads);
+
+    run_correct_with_umis(
+        &input,
+        &output,
+        &["AAAAAA", "CCCCCCC"],
+        1,
+        1,
+        &["--rejects", rejects.to_str().unwrap(), "--metrics", metrics.to_str().unwrap()],
+    );
+
+    let rx: BTreeMap<String, Option<String>> = records_by_name(&output, &[SamTag::RX])
+        .into_iter()
+        .map(|(name, mut tags)| (name, tags.remove(0)))
+        .collect();
+    let expected: BTreeMap<String, Option<String>> = [
+        ("corrected_0", "AAAAAA-CCCCCCC"),
+        ("exact_0", "AAAAAA-CCCCCCC"),
+        ("swapped_0", "CCCCCCC-AAAAAA"),
+    ]
+    .into_iter()
+    .map(|(name, umi)| (name.to_string(), Some(umi.to_string())))
+    .collect();
+    assert_eq!(rx, expected);
+    assert_eq!(sorted_read_names(&rejects), expected_rejects);
+
+    // `wrongLen` is rejected before matching, so it credits no row.
+    let totals: BTreeMap<String, u64> =
+        read_metrics_by_umi(&metrics).into_iter().map(|(umi, m)| (umi, m.total_matches)).collect();
+    let expected_totals: BTreeMap<String, u64> = [
+        ("AAAAAA", expected_aaaaaa_total),
+        ("CCCCCCC", 3),
+        ("NNNNNN", 0),
+        ("NNNNNNN", expected_nnnnnnn_total),
+    ]
+    .into_iter()
+    .map(|(umi, total)| (umi.to_string(), total))
+    .collect();
+    assert_eq!(totals, expected_totals);
+}
+
+/// Port of fgbio `CorrectUmisTest` "match a UMI to the only fixed UMI of its
+/// length without applying --min-distance", end to end: `AAATTT` is three
+/// mismatches from `AAAAAA`, the only 6bp fixed UMI, and is corrected even
+/// though `--min-distance 5` could never be met.
+#[test]
+fn correct_single_fixed_umi_of_a_length_ignores_min_distance() {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    create_named_umi_bam(&input, &[("q1", Some("AAATTT"))]);
+
+    run_correct_with_umis(&input, &output, &["AAAAAA", "CCCCCCC"], 3, 5, &[]);
+
+    let records = records_by_name(&output, &[SamTag::RX, SamTag::OX]);
+    assert_eq!(
+        records.get("q1_0"),
+        Some(&vec![Some("AAAAAA".to_string()), Some("AAATTT".to_string())])
+    );
+}
+
+/// Port of fgbio `CorrectUmisTest` "write zero fractions instead of NaN or
+/// Infinity when no UMIs could be examined or matched": every row is written,
+/// and `fraction_of_matches` / `representation` are zero wherever their
+/// denominator is zero.
+#[rstest]
+#[case::no_umis_examined(None, 0.0)]
+#[case::no_umis_matched(Some("GGGGGG"), 1.0)]
+fn correct_writes_zero_fractions_instead_of_nan(
+    #[case] umi: Option<&str>,
+    #[case] expected_nnnnnn_fraction: f64,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let metrics = temp_dir.path().join("metrics.tsv");
+    create_named_umi_bam(&input, &[("q1", umi)]);
+
+    run_correct_with_umis(
+        &input,
+        &output,
+        &["AAAAAA", "CCCCCCC"],
+        1,
+        1,
+        &["--metrics", metrics.to_str().unwrap()],
+    );
+
+    let by_umi = read_metrics_by_umi(&metrics);
+    assert_eq!(by_umi.keys().collect::<Vec<_>>(), ["AAAAAA", "CCCCCCC", "NNNNNN", "NNNNNNN"]);
+    for (umi, m) in &by_umi {
+        let expected_fraction = if umi == "NNNNNN" { expected_nnnnnn_fraction } else { 0.0 };
+        assert!((m.fraction_of_matches - expected_fraction).abs() < 1e-9, "{umi}: {m:?}");
+        assert!(m.representation.abs() < 1e-9, "{umi}: {m:?}");
+    }
+}
+
+/// A fixed UMI containing `-` is rejected at startup, whether given via `--umis`
+/// or `--umi-files`, and no output is written: observed UMIs are split on `-`
+/// before correction, so such a UMI would be compared to a single part and
+/// could write an extra `-` into the corrected tag.
+#[rstest]
+#[case::via_umis(false)]
+#[case::via_umi_files(true)]
+fn correct_rejects_a_fixed_umi_containing_a_hyphen(#[case] via_umi_file: bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+    create_named_umi_bam(&input, &[("q1", Some("ACGT-GGCA"))]);
+    create_whitelist(&whitelist, &["ACGT-GGCA"]);
+
+    let mut args = vec![
+        "correct",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--min-distance",
+        "1",
+    ];
+    if via_umi_file {
+        args.extend(["--umi-files", whitelist.to_str().unwrap()]);
+    } else {
+        args.extend(["--umis", "ACGT-GGCA"]);
+    }
+    let cmd = CorrectUmis::try_parse_from(args).expect("parse correct args");
+    let err = cmd.execute("fgumi correct").expect_err("a hyphenated fixed UMI must be rejected");
+
+    let source = if via_umi_file {
+        format!("UMI file {} line 1", whitelist.display())
+    } else {
+        "--umis".to_string()
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{source}: UMI ACGT-GGCA contains '-'. UMIs in the BAM are split on '-' and each part \
+             is corrected separately, so a fixed UMI containing '-' would be compared to a single \
+             part and could write an extra '-' into the corrected UMI; give each part as its own \
+             fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA)."
+        )
+    );
+    assert!(!output.exists(), "no output may be written when the UMI set is rejected");
 }

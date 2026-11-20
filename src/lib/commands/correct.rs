@@ -196,7 +196,7 @@ pub struct UmiMatch {
 Corrects UMIs stored in BAM files when a set of fixed UMIs is in use.
 
 If the set of sequences used in an experiment is known and is a _subset_ of the possible randomers
-of the same length, it is possible to error-correct them prior to grouping reads. By default
+of each length, it is possible to error-correct them prior to grouping reads. By default
 (`--target umi`), the tool corrects the `RX` UMI tag and stores the original in `OX`. With
 `--target barcode`, it corrects the `BC` barcode tag and stores the original in the fgumi-local
 `ob` tag. The tool accepts a set of known sequences (either on the command line or in a file)
@@ -206,10 +206,15 @@ and produces:
 2. Optionally a set of metrics about the representation of each sequence in the set
 3. Optionally a second BAM file of reads whose sequences could not be corrected within the specific parameters
 
-All of the fixed UMIs must be of the same length, and all UMIs in the BAM file must also have
-the same length. Multiple UMIs that are concatenated with hyphens (e.g. `AACCAGT-AGGTAGA`) are
-split apart, corrected individually and then re-assembled. A read is accepted only if all the
-UMIs can be corrected.
+The fixed UMIs may have different lengths. Each UMI in the BAM file is compared only to the
+fixed UMIs of the same length (e.g. a 6bp UMI is never corrected to a 7bp fixed UMI), and a
+record is rejected if any of its UMIs has a length that matches no fixed UMI. The metrics have
+one row of `N`s for each fixed UMI length, counting the UMIs of that length that could not be
+matched.
+
+Multiple UMIs that are concatenated with hyphens (e.g. `AACCAGT-AGGTAGA`) are split apart,
+corrected individually and then re-assembled. A read is accepted only if all the UMIs can be
+corrected.
 
 ## Correction Parameters
 
@@ -217,13 +222,14 @@ Correction is controlled by two parameters that are applied per-UMI:
 
 1. **--max-mismatches** controls how many mismatches (no-calls are counted as mismatches) are
    tolerated between a UMI as read and a fixed UMI
-2. **--min-distance** controls how many *more* mismatches the next best hit must have
+2. **--min-distance** controls how many *more* mismatches the next best hit must have; it is not
+   applied when only one fixed UMI has the same length as the UMI
 
 For example, with two fixed UMIs `AAAAA` and `CCCCC` and `--max-mismatches=3` and `--min-distance=2`:
 
 - AAAAA would match to AAAAA
-- AAGTG would match to AAAAA with three mismatches because CCCCC has six mismatches and 6 >= 3 + 2
-- AACCA would be rejected because it is 2 mismatches to AAAAA and 3 to CCCCC and 3 <= 2 + 2
+- AAGTG would match to AAAAA with three mismatches because CCCCC has five mismatches and 5 >= 3 + 2
+- AACCA would be rejected because it is 2 mismatches to AAAAA and 3 to CCCCC and 3 < 2 + 2
 
 ## Specifying UMIs
 
@@ -231,7 +237,8 @@ The set of fixed UMIs may be specified on the command line using `--umis umi1 um
 one or more files of UMIs with a single sequence per line using `--umi-files umis.txt more_umis.txt`.
 If there are multiple UMIs per template, leading to hyphenated UMI tags, the values for the fixed
 UMIs should be single, non-hyphenated UMIs (e.g. if a record has `RX:Z:ACGT-GGCA`, you would use
-`--umis ACGT GGCA`).
+`--umis ACGT GGCA`). A fixed UMI containing `-` is an error: it would be compared to a single
+part of the UMI and could write an extra `-` into the corrected UMI.
 
 ## Original Sequence Storage
 
@@ -428,7 +435,10 @@ impl CorrectUmis {
 }
 
 /// A known-UMI set that has been read and validated: non-empty, upper-cased,
-/// de-duplicated, sorted, and of a single length.
+/// de-duplicated and sorted, with no UMI containing `-` (observed UMIs are
+/// split on `-` and each part corrected on its own, so such a UMI could only
+/// ever match by writing an extra `-` into the corrected tag). The UMIs may
+/// have different lengths.
 ///
 /// Only [`CorrectOptions::resolve_umi_set`] constructs one, after running
 /// [`CorrectOptions::validate`], so holding a `ResolvedUmiSet` proves both the
@@ -438,7 +448,6 @@ impl CorrectUmis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedUmiSet {
     sequences: Vec<String>,
-    umi_length: usize,
 }
 
 impl ResolvedUmiSet {
@@ -446,11 +455,53 @@ impl ResolvedUmiSet {
     pub(crate) fn sequences(&self) -> &[String] {
         &self.sequences
     }
+}
 
-    /// The length shared by every UMI in the set.
-    pub(crate) fn umi_length(&self) -> usize {
-        self.umi_length
+/// Formats UMI lengths for messages, e.g. `6, 7`.
+pub(crate) fn format_umi_lengths(lengths: &[usize]) -> String {
+    lengths.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+}
+
+/// Rejects a fixed UMI containing `-`. Observed UMIs are split on `-` before
+/// correction and each segment is matched on its own, so a fixed UMI with a `-`
+/// in it is not what the user meant: it could still match a segment of the same
+/// length (e.g. `ACGT-GGCA` is within one mismatch of the 9-base `ACGTAGGCA`),
+/// and the correction would then write an extra `-` into the corrected tag.
+fn check_fixed_umi_has_no_hyphen(umi: &str, source: &str) -> Result<()> {
+    if umi.contains('-') {
+        bail!(
+            "{source}: UMI {umi} contains '-'. UMIs in the BAM are split on '-' and each part is \
+             corrected separately, so a fixed UMI containing '-' would be compared to a single \
+             part and could write an extra '-' into the corrected UMI; give each part as its own \
+             fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA)."
+        );
     }
+    Ok(())
+}
+
+/// The most fixed UMIs named in the warning about unexpected characters.
+const MAX_SUSPICIOUS_UMIS_LOGGED: usize = 5;
+
+/// Warns once about fixed UMIs (already upper-cased) containing characters
+/// other than `A`, `C`, `G`, `T` and `N`, such as a stray header or comment line
+/// in a `--umi-files` file. Such UMIs are kept and used as given, as fgbio does.
+fn warn_on_non_acgtn_umis(sequences: &[String]) {
+    let suspicious: Vec<&str> = sequences
+        .iter()
+        .filter(|umi| umi.bytes().any(|b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'N')))
+        .map(String::as_str)
+        .collect();
+    if suspicious.is_empty() {
+        return;
+    }
+    let shown = suspicious[..suspicious.len().min(MAX_SUSPICIOUS_UMIS_LOGGED)].join(", ");
+    let more = suspicious.len().saturating_sub(MAX_SUSPICIOUS_UMIS_LOGGED);
+    let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+    warn!(
+        "{} fixed UMI(s) contain characters other than A, C, G, T and N: {shown}{more}. They are \
+         used as given; check --umis / --umi-files for a header or comment line.",
+        suspicious.len()
+    );
 }
 
 /// The advice every "this is not a UMI file" error ends with.
@@ -586,14 +637,16 @@ impl CorrectOptions {
     /// gzip/BGZF-compressed (detected by content, as fgbio's `Io.readLines`
     /// decompresses `.gz` paths); each is opened and read exactly once, so a FIFO
     /// or process-substitution path is safe. UMI files are streamed and checked
-    /// line by line, so the first non-text line or length mismatch is reported by
-    /// file and line number without reading the rest of the file.
+    /// line by line, so the first non-text line or UMI containing `-` is reported
+    /// by file and line number without reading the rest of the file. The UMIs may
+    /// have different lengths. UMIs containing characters other than `ACGTN` are
+    /// kept, with a single warning listing some of them.
     ///
     /// # Errors
     ///
     /// Returns an error if [`Self::validate`] fails, a `--umis` value is empty, a
-    /// UMI file cannot be read or is not text, no UMIs are found, or the UMIs
-    /// differ in length.
+    /// UMI file cannot be read or is not text, a UMI contains `-`, or no UMIs are
+    /// found.
     pub(crate) fn resolve_umi_set(&self) -> Result<ResolvedUmiSet> {
         self.validate()?;
 
@@ -604,55 +657,38 @@ impl CorrectOptions {
             if umi.is_empty() {
                 bail!("--umis contains an empty UMI.");
             }
+            check_fixed_umi_has_no_hyphen(umi, "--umis")?;
             umi_set.insert(umi.to_uppercase());
         }
 
-        // `--umis` is already in memory, so its lengths are checked as a whole;
-        // UMI files are checked line by line as they are read, so a mismatch
-        // stops the read at the line that introduces it.
-        let umis_lengths: std::collections::BTreeSet<usize> =
-            umi_set.iter().map(String::len).collect();
-        if umis_lengths.len() > 1 {
-            let lengths: Vec<String> = umis_lengths.iter().map(ToString::to_string).collect();
-            bail!(
-                "All UMIs from --umis / --umi-files must have the same length; found lengths {}.",
-                lengths.join(", ")
-            );
-        }
-        let mut umi_length = umis_lengths.first().copied();
-
         for file in &self.umi_files {
             for_each_umi_in_file(file, |umi, line_number| {
-                let umi = umi.to_uppercase();
-                let expected = *umi_length.get_or_insert(umi.len());
-                if umi.len() != expected {
-                    bail!(
-                        "UMI file {} line {line_number}: UMI {umi} has length {}, but earlier \
-                         UMIs have length {expected}; all UMIs from --umis / --umi-files must \
-                         have the same length.",
-                        file.display(),
-                        umi.len()
-                    );
-                }
-                umi_set.insert(umi);
+                check_fixed_umi_has_no_hyphen(
+                    umi,
+                    &format!("UMI file {} line {line_number}", file.display()),
+                )?;
+                umi_set.insert(umi.to_uppercase());
                 Ok(())
             })?;
         }
 
-        let Some(umi_length) = umi_length else {
+        if umi_set.is_empty() {
             bail!("No UMIs provided: --umis / --umi-files contain only blank lines.");
-        };
+        }
 
         let mut sequences: Vec<String> = umi_set.into_iter().collect();
         sequences.sort_unstable();
+        warn_on_non_acgtn_umis(&sequences);
 
-        Ok(ResolvedUmiSet { sequences, umi_length })
+        Ok(ResolvedUmiSet { sequences })
     }
 
     /// Checks distances between UMI pairs and warns about ambiguities.
     ///
     /// Identifies pairs of UMIs that are within `min_distance_diff` of each other,
-    /// which could lead to ambiguous matching situations.
+    /// which could lead to ambiguous matching situations. Only UMIs of the same
+    /// length are compared, since an observed UMI is only ever matched against
+    /// the fixed UMIs of its own length.
     pub(crate) fn check_umi_distances(&self, umi_sequences: &[String]) {
         // fgbio computes `findUmiPairsWithinDistance(umis, minDistanceDiff - 1)`
         // with signed arithmetic, so `--min-distance 0` yields a threshold of -1
@@ -662,7 +698,15 @@ impl CorrectOptions {
         if self.min_distance_diff == 0 {
             return;
         }
-        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
+        let mut by_length: std::collections::BTreeMap<usize, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for umi in umi_sequences {
+            by_length.entry(umi.len()).or_default().push(umi.clone());
+        }
+        let pairs: Vec<(String, String, usize)> = by_length
+            .values()
+            .flat_map(|umis| find_umi_pairs_within_distance(umis, self.min_distance_diff - 1))
+            .collect();
 
         if !pairs.is_empty() {
             warn!("###################################################################");
@@ -679,32 +723,39 @@ impl CorrectOptions {
     /// writes the TSV when `--metrics` was given. Reads only the `metrics` path,
     /// so it lives on [`CorrectOptions`] and is shared with the chain builder's
     /// finalize hook.
+    ///
+    /// `unmatched_umis` are the all-`N` rows, one per fixed-UMI length. The
+    /// `fraction_of_matches` denominator is the total over every row, and the
+    /// `representation` denominator is the mean `total_matches` over the fixed
+    /// UMIs only (excluding the all-`N` rows). When a denominator is zero (no
+    /// UMIs examined, or none matched a fixed UMI) the value is written as zero
+    /// rather than NaN or Infinity, as fgbio does.
     pub(crate) fn finalize_metrics(
         &self,
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
-        unmatched_umi: &str,
+        unmatched_umis: &[String],
     ) -> Result<()> {
+        let is_unmatched = |umi: &String| unmatched_umis.contains(umi);
+
         // Calculate totals
         let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
         let matched_total: u64 = umi_metrics
             .iter()
-            .filter(|(umi, _)| *umi != unmatched_umi)
+            .filter(|(umi, _)| !is_unmatched(umi))
             .map(|(_, m)| m.total_matches)
             .sum();
-
-        // Calculate fractions (allow NaN when total is 0, matching fgbio behavior)
-        #[allow(clippy::cast_precision_loss)]
-        for metric in umi_metrics.values_mut() {
-            metric.fraction_of_matches = metric.total_matches as f64 / total as f64;
-        }
-
-        // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
-        let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
+        let umi_count = umi_metrics.keys().filter(|umi| !is_unmatched(umi)).count();
 
         #[allow(clippy::cast_precision_loss)]
-        let mean = matched_total as f64 / umi_count as f64;
+        let total = total as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let mean = if umi_count == 0 { 0.0 } else { matched_total as f64 / umi_count as f64 };
+
+        #[allow(clippy::cast_precision_loss)]
         for metric in umi_metrics.values_mut() {
-            metric.representation = metric.total_matches as f64 / mean;
+            let count = metric.total_matches as f64;
+            metric.fraction_of_matches = if total > 0.0 { count / total } else { 0.0 };
+            metric.representation = if mean > 0.0 { count / mean } else { 0.0 };
         }
 
         // Write metrics if requested
@@ -897,10 +948,13 @@ impl CorrectUmis {
     }
 
     /// Compute UMI correction for a template (called once per template).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Each `-`-separated segment of `umi` is matched only against the fixed
+    /// UMIs of its own length; the template is rejected as
+    /// [`RejectionReason::WrongLength`] if any segment's length matches no
+    /// fixed UMI.
     pub(crate) fn compute_template_correction(
         umi: &str,
-        umi_length: usize,
         revcomp: bool,
         max_mismatches: usize,
         min_distance_diff: usize,
@@ -908,16 +962,10 @@ impl CorrectUmis {
         cache: &mut Option<LruCache<Vec<u8>, UmiMatch>>,
     ) -> TemplateCorrection {
         let original_umi = umi.to_string();
+        let sequences = Self::umi_segments(umi, revcomp);
 
-        // Split and optionally reverse complement
-        let sequences: Vec<String> = if revcomp {
-            umi.split('-').map(reverse_complement_str).rev().collect()
-        } else {
-            umi.split('-').map(std::string::ToString::to_string).collect()
-        };
-
-        // Check length
-        if sequences.iter().any(|s| s.len() != umi_length) {
+        // Every segment must have the length of at least one fixed UMI
+        if sequences.iter().any(|s| encoded_umi_set.umis_of_length(s.len()).is_none()) {
             return TemplateCorrection {
                 matched: false,
                 corrected_umi: None,
@@ -932,6 +980,9 @@ impl CorrectUmis {
         // Find matches for each UMI segment
         let mut matches = Vec::with_capacity(sequences.len());
         for seq in &sequences {
+            let candidates = encoded_umi_set
+                .umis_of_length(seq.len())
+                .expect("every segment's length was checked above");
             // Uppercase using bytes directly - avoids String allocation
             let seq_bytes: Vec<u8> = seq.bytes().map(|b| b.to_ascii_uppercase()).collect();
 
@@ -941,7 +992,7 @@ impl CorrectUmis {
                 } else {
                     let result = find_best_match_encoded(
                         &seq_bytes,
-                        encoded_umi_set,
+                        candidates,
                         max_mismatches,
                         min_distance_diff,
                     );
@@ -949,12 +1000,7 @@ impl CorrectUmis {
                     result
                 }
             } else {
-                find_best_match_encoded(
-                    &seq_bytes,
-                    encoded_umi_set,
-                    max_mismatches,
-                    min_distance_diff,
-                )
+                find_best_match_encoded(&seq_bytes, candidates, max_mismatches, min_distance_diff)
             };
 
             matches.push(umi_match);
@@ -990,13 +1036,24 @@ impl CorrectUmis {
         }
     }
 
+    /// Splits a UMI tag value into the segments that are length-checked and
+    /// matched: split on `-`, and with `revcomp` each segment reverse-complemented
+    /// and their order reversed.
+    pub(crate) fn umi_segments(umi: &str, revcomp: bool) -> Vec<String> {
+        if revcomp {
+            umi.split('-').map(reverse_complement_str).rev().collect()
+        } else {
+            umi.split('-').map(ToString::to_string).collect()
+        }
+    }
+
     /// Credits per-UMI correction metrics for one template's segment matches.
     ///
     /// Mirrors fgbio `CorrectUmis` (CorrectUmis.scala:218-232): the metric loop
     /// runs for every correct-length template *before* the accept/reject
     /// decision, so each matched segment credits its fixed UMI (bucketed by
-    /// mismatch count) and each unmatched segment credits the all-`N` bucket —
-    /// even when the template as a whole is rejected because a *different*
+    /// mismatch count) and each unmatched segment credits the all-`N` bucket of
+    /// its length — even when the template as a whole is rejected because a *different*
     /// segment failed to match. Wrong-length and missing-UMI templates never
     /// reach this with a populated `matches` (fgbio rejects them before
     /// matching), so they contribute nothing to the per-UMI metrics.
@@ -1006,7 +1063,7 @@ impl CorrectUmis {
     pub(crate) fn credit_umi_metrics(
         matches: &[UmiMatch],
         num_records: u64,
-        unmatched_umi: &str,
+        encoded_umi_set: &EncodedUmiSet,
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
     ) {
         for m in matches {
@@ -1022,9 +1079,15 @@ impl CorrectUmis {
                     _ => entry.other_matches += num_records,
                 }
             } else {
+                // `m.umi` is the closest fixed UMI, which has the observed
+                // segment's length, so this is the all-`N` row of that length.
+                let unmatched_umi = &encoded_umi_set
+                    .umis_of_length(m.umi.len())
+                    .expect("an unmatched segment's closest fixed UMI has a fixed-UMI length")
+                    .unmatched_umi;
                 umi_metrics
-                    .entry(unmatched_umi.to_string())
-                    .or_insert_with(|| UmiCorrectionMetrics::new(unmatched_umi.to_string()))
+                    .entry(unmatched_umi.clone())
+                    .or_insert_with_key(|umi| UmiCorrectionMetrics::new(umi.clone()))
                     .total_matches += num_records;
             }
         }
@@ -1250,17 +1313,35 @@ pub fn count_mismatches_with_max(a: &[u8], b: &[u8], max_mismatches: usize) -> u
     mismatches
 }
 
-/// A set of UMIs with pre-computed bit encodings for fast comparison.
-///
-/// Stores both the original byte sequences and their `BitEnc` representations
-/// for efficient Hamming distance computation.
+/// The fixed UMIs of one length, with pre-computed bit encodings for fast
+/// comparison. An observed UMI is only ever compared to the fixed UMIs of its
+/// own length.
 #[derive(Clone)]
-pub struct EncodedUmiSet {
-    /// Original byte sequences for fallback comparison
-    bytes: Vec<Vec<u8>>,
+pub(crate) struct UmisOfLength {
+    /// The length shared by every UMI in this group.
+    length: usize,
     /// Bit-encoded sequences for fast comparison (None if encoding failed)
     encoded: Vec<Option<BitEnc>>,
-    /// Original strings for output
+    /// The upper-cased UMIs, for output and for the byte-comparison fallback
+    strings: Vec<String>,
+    /// The all-`N` UMI of this length, whose metrics row counts the UMIs of this
+    /// length that matched no fixed UMI.
+    unmatched_umi: String,
+}
+
+/// A set of UMIs with pre-computed bit encodings for fast comparison.
+///
+/// The UMIs may have different lengths. They are grouped by length, so that an
+/// observed UMI is compared only to the fixed UMIs of the same length; each
+/// group stores both the upper-cased sequences and their `BitEnc`
+/// representations for efficient Hamming distance computation.
+#[derive(Clone)]
+pub struct EncodedUmiSet {
+    /// The fixed UMIs grouped by length, in ascending length order. There are
+    /// only as many groups as distinct lengths (one to three in practice), so a
+    /// lookup is a short linear scan with no allocation.
+    groups: Vec<UmisOfLength>,
+    /// Every fixed UMI, upper-cased, in input order (for the metrics rows)
     pub(crate) strings: Vec<String>,
 }
 
@@ -1270,27 +1351,64 @@ impl EncodedUmiSet {
     /// All sequences are converted to uppercase for case-insensitive matching.
     /// Pre-encodes all sequences that contain only ACGT bases.
     /// Sequences with other characters will use fallback byte comparison.
+    /// Sequences may have different lengths.
+    #[must_use]
     pub fn new(sequences: &[String]) -> Self {
-        // Store uppercase bytes for comparison
-        let bytes: Vec<Vec<u8>> =
-            sequences.iter().map(|s| s.bytes().map(|b| b.to_ascii_uppercase()).collect()).collect();
-        let encoded: Vec<Option<BitEnc>> = bytes.iter().map(|b| BitEnc::from_bytes(b)).collect();
         // Store uppercase strings for output
         let strings: Vec<String> = sequences.iter().map(|s| s.to_uppercase()).collect();
 
-        Self { bytes, encoded, strings }
+        let mut groups: Vec<UmisOfLength> = Vec::new();
+        for umi in &strings {
+            let index =
+                if let Some(index) = groups.iter().position(|group| group.length == umi.len()) {
+                    index
+                } else {
+                    groups.push(UmisOfLength {
+                        length: umi.len(),
+                        encoded: Vec::new(),
+                        strings: Vec::new(),
+                        unmatched_umi: "N".repeat(umi.len()),
+                    });
+                    groups.len() - 1
+                };
+            let group = &mut groups[index];
+            group.encoded.push(BitEnc::from_bytes(umi.as_bytes()));
+            group.strings.push(umi.clone());
+        }
+        groups.sort_unstable_by_key(|group| group.length);
+
+        Self { groups, strings }
+    }
+
+    /// The fixed UMIs of the given length, or `None` if no fixed UMI has it.
+    #[inline]
+    pub(crate) fn umis_of_length(&self, length: usize) -> Option<&UmisOfLength> {
+        self.groups.iter().find(|group| group.length == length)
+    }
+
+    /// The distinct lengths of the fixed UMIs, in ascending order.
+    #[must_use]
+    pub fn umi_lengths(&self) -> Vec<usize> {
+        self.groups.iter().map(|group| group.length).collect()
+    }
+
+    /// The all-`N` "unmatched" UMI for each fixed-UMI length, in ascending
+    /// length order. Each names the metrics row counting the UMIs of its length
+    /// that matched no fixed UMI.
+    pub(crate) fn unmatched_umis(&self) -> Vec<String> {
+        self.groups.iter().map(|group| group.unmatched_umi.clone()).collect()
     }
 
     /// Get the number of UMIs in the set.
     #[inline]
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.strings.len()
     }
 
     /// Check if the set is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.strings.is_empty()
     }
 }
 
@@ -1301,9 +1419,13 @@ impl EncodedUmiSet {
 ///
 /// This function tracks the best match index during iteration and only clones
 /// the matching string once at the end, avoiding repeated string allocations.
+///
+/// `umi_set` holds the fixed UMIs of the observed UMI's length. When it holds a
+/// single UMI there is no next-best UMI, so the UMI matches if it is within
+/// `max_mismatches`; `min_distance_diff` cannot reject it.
 fn find_best_match_encoded(
     observed: &[u8],
-    umi_set: &EncodedUmiSet,
+    umi_set: &UmisOfLength,
     max_mismatches: usize,
     min_distance_diff: usize,
 ) -> UmiMatch {
@@ -1323,7 +1445,11 @@ fn find_best_match_encoded(
                     enc.hamming_distance(&obs_enc) as usize
                 } else {
                     // Fixed UMI couldn't be encoded, fall back to bytes
-                    count_mismatches_with_max(observed, &umi_set.bytes[i], second_best_mismatches)
+                    count_mismatches_with_max(
+                        observed,
+                        umi_set.strings[i].as_bytes(),
+                        second_best_mismatches,
+                    )
                 };
 
                 if mismatches < best_mismatches {
@@ -1337,9 +1463,12 @@ fn find_best_match_encoded(
         }
         None => {
             // Slow path: observed UMI can't be encoded, use byte comparison
-            for (i, fixed_umi) in umi_set.bytes.iter().enumerate() {
-                let mismatches =
-                    count_mismatches_with_max(observed, fixed_umi, second_best_mismatches);
+            for (i, fixed_umi) in umi_set.strings.iter().enumerate() {
+                let mismatches = count_mismatches_with_max(
+                    observed,
+                    fixed_umi.as_bytes(),
+                    second_best_mismatches,
+                );
 
                 if mismatches < best_mismatches {
                     second_best_mismatches = best_mismatches;
@@ -1357,12 +1486,14 @@ fn find_best_match_encoded(
         return UmiMatch { matched: false, umi: String::new(), mismatches: usize::MAX };
     };
 
-    let matched = if best_mismatches <= max_mismatches {
-        let distance_to_second = second_best_mismatches.saturating_sub(best_mismatches);
-        distance_to_second >= min_distance_diff
-    } else {
-        false
-    };
+    // With a single candidate the second-best count stays at the `usize::MAX`
+    // sentinel, so the distance test below already passes for any
+    // `--min-distance`; the explicit `== 1` clause states fgbio#1197's rule
+    // ("min-distance is not applied to a lone candidate") rather than relying
+    // on the sentinel. It does not change the result.
+    let distance_ok = umi_set.strings.len() == 1
+        || second_best_mismatches.saturating_sub(best_mismatches) >= min_distance_diff;
+    let matched = best_mismatches <= max_mismatches && distance_ok;
 
     UmiMatch { matched, umi: umi_set.strings[idx].clone(), mismatches: best_mismatches }
 }
@@ -1591,6 +1722,19 @@ mod tests {
         EncodedUmiSet::new(&strings)
     }
 
+    /// Matches `observed` against the fixed UMIs of its own length in `umi_set`,
+    /// as `compute_template_correction` does for each UMI segment.
+    fn find_best_match(
+        observed: &[u8],
+        umi_set: &EncodedUmiSet,
+        max_mismatches: usize,
+        min_distance_diff: usize,
+    ) -> UmiMatch {
+        let candidates =
+            umi_set.umis_of_length(observed.len()).expect("a fixed UMI of the observed length");
+        find_best_match_encoded(observed, candidates, max_mismatches, min_distance_diff)
+    }
+
     #[test]
     fn parses_default_target_as_umi() {
         let cmd = CorrectUmis::try_parse_from([
@@ -1625,12 +1769,12 @@ mod tests {
     fn test_find_best_match_perfect() {
         let umi_set = get_encoded_umi_set();
 
-        let hit1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2);
+        let hit1 = find_best_match(b"AAAAAA", &umi_set, 2, 2);
         assert!(hit1.matched);
         assert_eq!(hit1.mismatches, 0);
         assert_eq!(hit1.umi, "AAAAAA");
 
-        let hit2 = find_best_match_encoded(b"CCCCCC", &umi_set, 2, 2);
+        let hit2 = find_best_match(b"CCCCCC", &umi_set, 2, 2);
         assert!(hit2.matched);
         assert_eq!(hit2.mismatches, 0);
         assert_eq!(hit2.umi, "CCCCCC");
@@ -1640,22 +1784,22 @@ mod tests {
     fn test_find_best_match_with_mismatches() {
         let umi_set = get_encoded_umi_set();
 
-        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2);
+        let m1 = find_best_match(b"AAAAAA", &umi_set, 2, 2);
         assert!(m1.matched);
         assert_eq!(m1.umi, "AAAAAA");
         assert_eq!(m1.mismatches, 0);
 
-        let m2 = find_best_match_encoded(b"AAAAAT", &umi_set, 2, 2);
+        let m2 = find_best_match(b"AAAAAT", &umi_set, 2, 2);
         assert!(m2.matched);
         assert_eq!(m2.umi, "AAAAAA");
         assert_eq!(m2.mismatches, 1);
 
-        let m3 = find_best_match_encoded(b"AAAACT", &umi_set, 2, 2);
+        let m3 = find_best_match(b"AAAACT", &umi_set, 2, 2);
         assert!(m3.matched);
         assert_eq!(m3.umi, "AAAAAA");
         assert_eq!(m3.mismatches, 2);
 
-        let m4 = find_best_match_encoded(b"AAAGCT", &umi_set, 2, 2);
+        let m4 = find_best_match(b"AAAGCT", &umi_set, 2, 2);
         assert!(!m4.matched);
         assert_eq!(m4.mismatches, 3);
     }
@@ -1664,7 +1808,7 @@ mod tests {
     fn test_no_match_when_umis_too_similar() {
         let umi_set = EncodedUmiSet::new(&["AAAG".to_string(), "AAAT".to_string()]);
 
-        let m = find_best_match_encoded(b"AAAG", &umi_set, 2, 2);
+        let m = find_best_match(b"AAAG", &umi_set, 2, 2);
         assert!(!m.matched);
     }
 
@@ -1672,23 +1816,138 @@ mod tests {
     fn test_match_with_many_mismatches() {
         let umi_set = get_encoded_umi_set();
 
-        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 3, 2);
+        let m1 = find_best_match(b"AAAAAA", &umi_set, 3, 2);
         assert!(m1.matched);
         assert_eq!(m1.umi, "AAAAAA");
         assert_eq!(m1.mismatches, 0);
 
-        let m2 = find_best_match_encoded(b"AAACGT", &umi_set, 3, 2);
+        let m2 = find_best_match(b"AAACGT", &umi_set, 3, 2);
         assert!(m2.matched);
         assert_eq!(m2.umi, "AAAAAA");
         assert_eq!(m2.mismatches, 3);
 
-        let m3 = find_best_match_encoded(b"AAACCC", &umi_set, 3, 2);
+        let m3 = find_best_match(b"AAACCC", &umi_set, 3, 2);
         assert!(!m3.matched);
         assert_eq!(m3.mismatches, 3);
 
-        let m4 = find_best_match_encoded(b"AAACCT", &umi_set, 3, 2);
+        let m4 = find_best_match(b"AAACCT", &umi_set, 3, 2);
         assert!(!m4.matched);
         assert_eq!(m4.mismatches, 3);
+    }
+
+    /// When only one fixed UMI has the observed UMI's length there is no
+    /// next-best UMI, so `--min-distance` is not applied and the UMI matches iff
+    /// it is within `--max-mismatches` (fgbio#1197). This holds through the
+    /// `usize::MAX` second-best sentinel alone; the explicit single-candidate
+    /// clause only states the rule. A second fixed UMI of the same length
+    /// restores the `--min-distance` check.
+    #[rstest]
+    #[case::only_umi_of_its_length_within_max(&["AAAAAA", "CCCCCCC"], b"AAATTT", 3, 5, true, "AAAAAA", 3)]
+    #[case::only_umi_of_its_length_beyond_max(&["AAAAAA", "CCCCCCC"], b"AAATTTT", 3, 5, false, "CCCCCCC", 7)]
+    #[case::two_umis_of_its_length_too_close(&["AAAAAA", "TTTTTT"], b"AAATTT", 3, 5, false, "AAAAAA", 3)]
+    fn test_find_best_match_min_distance_needs_a_next_best_umi(
+        #[case] fixed: &[&str],
+        #[case] observed: &[u8],
+        #[case] max_mismatches: usize,
+        #[case] min_distance_diff: usize,
+        #[case] expected_matched: bool,
+        #[case] expected_umi: &str,
+        #[case] expected_mismatches: usize,
+    ) {
+        let fixed: Vec<String> = fixed.iter().map(ToString::to_string).collect();
+        let umi_set = EncodedUmiSet::new(&fixed);
+        let m = find_best_match(observed, &umi_set, max_mismatches, min_distance_diff);
+        assert_eq!(
+            m,
+            UmiMatch {
+                matched: expected_matched,
+                umi: expected_umi.to_string(),
+                mismatches: expected_mismatches,
+            }
+        );
+    }
+
+    /// The fixed UMIs are grouped by length, and each length has its own all-`N`
+    /// unmatched UMI.
+    #[test]
+    fn test_encoded_umi_set_groups_umis_by_length() {
+        let fixed: Vec<String> =
+            ["CCCCCCC", "aaaaaa", "GGGGGG"].iter().map(ToString::to_string).collect();
+        let umi_set = EncodedUmiSet::new(&fixed);
+
+        assert_eq!(umi_set.len(), 3);
+        assert_eq!(umi_set.unmatched_umis(), ["NNNNNN", "NNNNNNN"]);
+        assert!(umi_set.umis_of_length(5).is_none());
+        assert!(umi_set.umis_of_length(8).is_none());
+        assert_eq!(
+            umi_set.umis_of_length(6).map(|group| group.strings.clone()),
+            Some(vec!["AAAAAA".to_string(), "GGGGGG".to_string()])
+        );
+        assert_eq!(
+            umi_set.umis_of_length(7).map(|group| group.strings.clone()),
+            Some(vec!["CCCCCCC".to_string()])
+        );
+    }
+
+    /// The too-close-pairs warning compares only UMIs of the same length:
+    /// `AAAAAA` and `AAAAAAA` are one apart by `count_mismatches_with_max`, but
+    /// an observed UMI is never matched against both, so they are not reported.
+    #[rstest]
+    #[case::same_length_pair_reported(&["AAAAAA", "AAAAAT"], true)]
+    #[case::different_length_pair_not_reported(&["AAAAAA", "AAAAAAA"], false)]
+    fn test_check_umi_distances_compares_within_a_length(
+        #[case] fixed: &[&str],
+        #[case] expect_warning: bool,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let _session = capture_logs();
+        let opts = CorrectOptions { min_distance_diff: 2, ..CorrectOptions::default() };
+        let fixed: Vec<String> = fixed.iter().map(ToString::to_string).collect();
+        opts.check_umi_distances(&fixed);
+
+        let warned = captured().iter().any(|msg| msg.contains("within min-distance-diff"));
+        assert_eq!(warned, expect_warning);
+    }
+
+    /// `finalize_metrics` never writes NaN or Infinity: `fraction_of_matches` is
+    /// zero when no UMIs were examined, and `representation` is zero when no UMI
+    /// matched a fixed UMI (fgbio#1197). The all-`N` rows (one per length) are
+    /// excluded from the `representation` mean.
+    #[rstest]
+    #[case::no_umis_examined(0, 0, 0.0, 0.0, 0.0)]
+    #[case::no_umis_matched(0, 1, 0.0, 1.0, 0.0)]
+    #[case::some_umis_matched(2, 2, 0.5, 0.5, 2.0)]
+    fn test_finalize_metrics_never_writes_nan_or_infinity(
+        #[case] aaaaaa_matches: u64,
+        #[case] nnnnnn_matches: u64,
+        #[case] expected_aaaaaa_fraction: f64,
+        #[case] expected_nnnnnn_fraction: f64,
+        #[case] expected_aaaaaa_representation: f64,
+    ) -> Result<()> {
+        let unmatched_umis = vec!["NNNNNN".to_string(), "NNNNNNN".to_string()];
+        let mut umi_metrics: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+        for umi in
+            ["AAAAAA", "CCCCCCC"].iter().map(ToString::to_string).chain(unmatched_umis.clone())
+        {
+            umi_metrics.insert(umi.clone(), UmiCorrectionMetrics::new(umi));
+        }
+        umi_metrics.get_mut("AAAAAA").expect("AAAAAA row").total_matches = aaaaaa_matches;
+        umi_metrics.get_mut("NNNNNN").expect("NNNNNN row").total_matches = nnnnnn_matches;
+
+        CorrectOptions::default().finalize_metrics(&mut umi_metrics, &unmatched_umis)?;
+
+        for m in umi_metrics.values() {
+            assert!(m.fraction_of_matches.is_finite(), "{} fraction: {m:?}", m.umi);
+            assert!(m.representation.is_finite(), "{} representation: {m:?}", m.umi);
+        }
+        let aaaaaa = &umi_metrics["AAAAAA"];
+        let nnnnnn = &umi_metrics["NNNNNN"];
+        assert!((aaaaaa.fraction_of_matches - expected_aaaaaa_fraction).abs() < f64::EPSILON);
+        assert!((nnnnnn.fraction_of_matches - expected_nnnnnn_fraction).abs() < f64::EPSILON);
+        assert!((aaaaaa.representation - expected_aaaaaa_representation).abs() < f64::EPSILON);
+        assert!(umi_metrics["CCCCCCC"].representation.abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
@@ -1915,30 +2174,27 @@ mod tests {
         Ok(())
     }
 
-    /// A bad UMI set (mixed lengths, or no UMIs at all) is rejected before the
-    /// input is opened, so the error does not depend on the input's contents and
-    /// no output is written.
+    /// A bad UMI set (a UMI containing `-`, or no UMIs at all) is rejected before
+    /// the input is opened, so the error does not depend on the input's contents
+    /// and no output is written.
     ///
-    /// Ported from fgbio `CorrectUmisTest.scala:106` ("throw an exception if all
-    /// the fixed umis are not the same length"), which passes `NoBam` (an empty
-    /// temp file from `makeTempFile`) as the input with fixed UMIs `AAAAAA` and
-    /// `CCC`, and expects a `ValidationException` (the `empty_input_like_fgbio_nobam`
-    /// case). fgbio does not check the message; this test asserts fgumi's exact
-    /// text so that an unrelated input error (e.g. the empty file failing to
-    /// parse as BAM) cannot satisfy it. The remaining cases are added guards: a
-    /// readable BAM yields the same error (`non_empty_input_guard`, which also
-    /// passed before the fix), mixed lengths split across `--umis` and
-    /// `--umi-files`, a `--umi-files` holding only blank lines, and an empty
-    /// `--umis` value (e.g. `--umis ""` from an unset shell variable), which
-    /// could never match a read.
+    /// The exact text is asserted so that an unrelated input error (e.g. the
+    /// empty file failing to parse as BAM) cannot satisfy it. A fixed UMI
+    /// containing `-` is rejected, since observed UMIs are split on `-` before
+    /// correction and such a UMI could only match by writing an extra `-` into
+    /// the corrected tag; it is rejected whether given via `--umis` (with an
+    /// empty or a readable input) or on a `--umi-files` line. A `--umi-files`
+    /// holding only blank lines, and an empty `--umis` value (e.g. `--umis ""`
+    /// from an unset shell variable), could never match a read. Fixed
+    /// UMIs of different lengths are allowed (fgbio#1197), so they are not here.
     #[rstest]
-    #[case::empty_input_like_fgbio_nobam(false, &["AAAAAA", "CCC"], None, "All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6.")]
-    #[case::non_empty_input_guard(true, &["AAAAAA", "CCC"], None, "All UMIs from --umis / --umi-files must have the same length; found lengths 3, 6.")]
-    #[case::mixed_lengths_across_umis_and_file(false, &["AAAAAA"], Some("CCC\n"), "UMI file {umi_file} line 1: UMI CCC has length 3, but earlier UMIs have length 6; all UMIs from --umis / --umi-files must have the same length.")]
+    #[case::hyphen_in_umis_empty_input(false, &["AAAAAA", "AC-GT"], None, "--umis: UMI AC-GT contains '-'. UMIs in the BAM are split on '-' and each part is corrected separately, so a fixed UMI containing '-' would be compared to a single part and could write an extra '-' into the corrected UMI; give each part as its own fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA).")]
+    #[case::hyphen_in_umis_non_empty_input(true, &["AAAAAA", "AC-GT"], None, "--umis: UMI AC-GT contains '-'. UMIs in the BAM are split on '-' and each part is corrected separately, so a fixed UMI containing '-' would be compared to a single part and could write an extra '-' into the corrected UMI; give each part as its own fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA).")]
+    #[case::hyphen_in_umi_file(false, &["AAAAAA"], Some("CCCCCC\nAC-GT\n"), "UMI file {umi_file} line 2: UMI AC-GT contains '-'. UMIs in the BAM are split on '-' and each part is corrected separately, so a fixed UMI containing '-' would be compared to a single part and could write an extra '-' into the corrected UMI; give each part as its own fixed UMI (e.g. --umis ACGT GGCA rather than --umis ACGT-GGCA).")]
     #[case::blank_only_umi_file(false, &[], Some("\n   \n"), "No UMIs provided: --umis / --umi-files contain only blank lines.")]
     #[case::empty_umis_value(false, &[""], None, "--umis contains an empty UMI.")]
     #[case::blank_umis_value_beside_valid_umis(false, &["ACGT", "  "], None, "--umis contains an empty UMI.")]
-    fn test_validation_different_length_umis(
+    fn test_validation_rejects_bad_umi_set(
         #[case] write_records: bool,
         #[case] umis: &[&str],
         #[case] umi_file_contents: Option<&str>,
@@ -1994,7 +2250,7 @@ mod tests {
     }
 
     /// `resolve_umi_set` merges `--umis` and `--umi-files` into one set,
-    /// trimmed, upper-cased, de-duplicated and sorted, with its common length.
+    /// trimmed, upper-cased, de-duplicated and sorted.
     #[test]
     fn resolve_umi_set_merges_umis_and_umi_files() -> Result<()> {
         let dir = TempDir::new()?;
@@ -2009,7 +2265,7 @@ mod tests {
         let resolved = opts.resolve_umi_set()?;
 
         assert_eq!(resolved.sequences(), ["ACGT", "GGTT", "TTAA"]);
-        assert_eq!(resolved.umi_length(), 4);
+        assert_eq!(EncodedUmiSet::new(resolved.sequences()).umi_lengths(), [4]);
         Ok(())
     }
 
@@ -2043,7 +2299,7 @@ mod tests {
         let resolved = opts.resolve_umi_set()?;
 
         assert_eq!(resolved.sequences(), ["ACGTACGT", "TTTTCCCC"]);
-        assert_eq!(resolved.umi_length(), 8);
+        assert_eq!(EncodedUmiSet::new(resolved.sequences()).umi_lengths(), [8]);
         Ok(())
     }
 
@@ -2067,25 +2323,59 @@ mod tests {
         Ok(())
     }
 
-    /// A UMI file is validated line by line as it is read, so a length mismatch
-    /// is reported at the line that introduces it, by file and line number.
+    /// Fixed UMIs of different lengths, across `--umis` and `--umi-files`, are
+    /// accepted (fgbio#1197) and their distinct lengths reported in order.
     #[test]
-    fn resolve_umi_set_names_the_umi_file_line_with_a_length_mismatch() -> Result<()> {
+    fn resolve_umi_set_accepts_umis_of_different_lengths() -> Result<()> {
         let dir = TempDir::new()?;
         let umi_file = dir.path().join("umis.txt");
         std::fs::write(&umi_file, "ACGT\n\nttgg\nAC\nCCCC\n")?;
-        let opts =
-            CorrectOptions { umi_files: vec![umi_file.clone()], ..CorrectOptions::default() };
+        let opts = CorrectOptions {
+            umis: vec!["AAAAAAA".to_string()],
+            umi_files: vec![umi_file],
+            ..CorrectOptions::default()
+        };
 
-        let err = opts.resolve_umi_set().expect_err("a mixed-length UMI file must be rejected");
+        let resolved = opts.resolve_umi_set()?;
 
+        assert_eq!(resolved.sequences(), ["AAAAAAA", "AC", "ACGT", "CCCC", "TTGG"]);
+        assert_eq!(EncodedUmiSet::new(resolved.sequences()).umi_lengths(), [2, 4, 7]);
+        Ok(())
+    }
+
+    /// A fixed UMI with characters other than `ACGTN` (e.g. a stray header line
+    /// in a `--umi-files` file) is kept as given, as fgbio does, but logged in a
+    /// single warning that names at most a few of them.
+    #[rstest]
+    #[case::all_acgtn(&["ACGTN", "ttgca"], None)]
+    #[case::header_line(
+        &["ACGT", "umi"],
+        Some("1 fixed UMI(s) contain characters other than A, C, G, T and N: UMI. They are used as given; check --umis / --umi-files for a header or comment line.")
+    )]
+    #[case::more_than_logged(
+        &["#1", "#2", "#3", "#4", "#5", "#6", "#7"],
+        Some("7 fixed UMI(s) contain characters other than A, C, G, T and N: #1, #2, #3, #4, #5 and 2 more. They are used as given; check --umis / --umi-files for a header or comment line.")
+    )]
+    fn resolve_umi_set_warns_on_non_acgtn_umis(
+        #[case] umis: &[&str],
+        #[case] expected_warning: Option<&str>,
+    ) -> Result<()> {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let _session = capture_logs();
+        let opts = CorrectOptions {
+            umis: umis.iter().map(ToString::to_string).collect(),
+            ..CorrectOptions::default()
+        };
+
+        let resolved = opts.resolve_umi_set()?;
+
+        assert_eq!(resolved.sequences().len(), umis.len(), "every UMI must be kept");
+        let warnings: Vec<String> =
+            captured().into_iter().filter(|msg| msg.contains("fixed UMI(s) contain")).collect();
         assert_eq!(
-            err.to_string(),
-            format!(
-                "UMI file {} line 4: UMI AC has length 2, but earlier UMIs have length 4; all \
-                 UMIs from --umis / --umi-files must have the same length.",
-                umi_file.display()
-            )
+            warnings,
+            expected_warning.map(ToString::to_string).into_iter().collect::<Vec<_>>()
         );
         Ok(())
     }
@@ -3275,9 +3565,8 @@ mod tests {
         let umi_set = get_encoded_umi_set();
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAAAA", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAAAA", false, 2, 2, &umi_set, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -3292,9 +3581,8 @@ mod tests {
         let umi_set = get_encoded_umi_set();
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAAAT", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAAAT", false, 2, 2, &umi_set, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -3310,7 +3598,7 @@ mod tests {
         let mut cache = None;
 
         let correction =
-            CorrectUmis::compute_template_correction("AAAA", 6, false, 2, 2, &umi_set, &mut cache);
+            CorrectUmis::compute_template_correction("AAAA", false, 2, 2, &umi_set, &mut cache);
 
         assert!(!correction.matched);
         assert!(correction.corrected_umi.is_none());
@@ -3322,9 +3610,8 @@ mod tests {
         let umi_set = get_encoded_umi_set();
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAGGG", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAGGG", false, 2, 2, &umi_set, &mut cache);
 
         assert!(!correction.matched);
         assert!(correction.corrected_umi.is_none());
@@ -3338,7 +3625,7 @@ mod tests {
 
         // TTTTTT revcomp -> AAAAAA
         let correction =
-            CorrectUmis::compute_template_correction("TTTTTT", 6, true, 2, 2, &umi_set, &mut cache);
+            CorrectUmis::compute_template_correction("TTTTTT", true, 2, 2, &umi_set, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -3355,7 +3642,6 @@ mod tests {
         // Dual UMI: AAAAAA-CCCCCC (both should match)
         let correction = CorrectUmis::compute_template_correction(
             "AAAAAA-CCCCCC",
-            6,
             false,
             2,
             2,
