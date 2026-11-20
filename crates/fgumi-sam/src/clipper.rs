@@ -580,21 +580,34 @@ impl RawRecordClipper {
     }
 
     /// Helper: count query bases in a raw CIGAR corresponding to a reference region.
+    ///
+    /// Counts the query bases of the first `ref_bases` reference positions from the start of the
+    /// alignment (`from_start`) or from its end, plus any insertion that fgbio's
+    /// `clipOverlappingReads` puts on the clipped side of the boundary. fgbio clips everything
+    /// past a read position from `readPosAtRefPos`, so an insertion between the boundary and the
+    /// nearest kept aligned base is clipped with the region:
+    /// - from the end (the positive-strand read, which keeps up to the midpoint, or the last
+    ///   aligned base before it when the midpoint is in a deletion), insertions beyond the
+    ///   region are clipped up to the next aligned base;
+    /// - from the start (the negative-strand read, which keeps from the base after the midpoint),
+    ///   insertions beyond the region are clipped when that base is aligned. When that base is
+    ///   deleted the count is left as it was (the region's own bases).
     fn calculate_query_bases_for_ref_region_raw(
         ops: &[u32],
         ref_bases: usize,
         from_start: bool,
     ) -> usize {
+        let ordered: Vec<u32> =
+            if from_start { ops.to_vec() } else { ops.iter().rev().copied().collect() };
         let mut remaining_ref = ref_bases;
         let mut query_bases: usize = 0;
+        // Whether the region ended part-way through the last op it consumed, and that op's kind.
+        let mut split_kind: Option<u32> = None;
+        let mut next = 0;
 
-        let iter: Box<dyn Iterator<Item = &u32>> =
-            if from_start { Box::new(ops.iter()) } else { Box::new(ops.iter().rev()) };
-
-        for &op in iter {
-            if remaining_ref == 0 {
-                break;
-            }
+        while next < ordered.len() && remaining_ref > 0 {
+            let op = ordered[next];
+            next += 1;
             let kind = op & 0xF;
             let len = (op >> 4) as usize;
 
@@ -609,12 +622,38 @@ impl RawRecordClipper {
                 if consumes_query {
                     query_bases += ref_consumed;
                 }
-            } else if consumes_query && remaining_ref > 0 {
+                if ref_consumed < len {
+                    split_kind = Some(kind);
+                }
+            } else if consumes_query {
                 // Insertion before we've consumed all the ref we need
                 query_bases += len;
             }
         }
 
+        if remaining_ref > 0 || ref_bases == 0 {
+            return query_bases;
+        }
+
+        // The region ended. Find the insertions between it and the next aligned op.
+        // Inside an aligned op the kept base is adjacent, so there is nothing to add. Inside a
+        // deletion only the positive-strand read clips on to the next aligned base; the
+        // negative-strand read is left as before.
+        match split_kind {
+            Some(kind) if kind != 2 || from_start => return query_bases,
+            _ => {}
+        }
+        let mut inserted = 0;
+        for &op in &ordered[next..] {
+            match op & 0xF {
+                1 => inserted += (op >> 4) as usize,
+                // A deletion: the positive-strand read clips back to the last aligned base before
+                // it; for the negative-strand read the base after the midpoint is deleted.
+                2 if !from_start => {}
+                0 | 7 | 8 => return query_bases + inserted,
+                _ => break,
+            }
+        }
         query_bases
     }
 
@@ -1552,6 +1591,23 @@ mod tests {
         total
     }
 
+    /// Reference-consuming length of a CIGAR string: the sum of `M`/`D`/`N`/`=`/`X` run lengths.
+    fn cigar_ref_len(cigar_str: &str) -> usize {
+        let mut total = 0usize;
+        let mut num = 0usize;
+        for ch in cigar_str.chars() {
+            if let Some(d) = ch.to_digit(10) {
+                num = num * 10 + d as usize;
+            } else {
+                if matches!(ch, 'M' | 'D' | 'N' | '=' | 'X') {
+                    total += num;
+                }
+                num = 0;
+            }
+        }
+        total
+    }
+
     fn create_test_record(cigar_str: &str, seq: &str, start_pos: usize) -> RecordBuf {
         // The raw BAM path (and the spec) require SEQ length to equal the CIGAR's query length.
         // Many clipper tests pass a placeholder sequence (too short or too long) and only assert
@@ -2373,6 +2429,71 @@ mod tests {
         *r1.flags_mut() = Flags::empty();
 
         assert!(!record_utils::is_fr_pair(&r1, &r2));
+    }
+
+    /// An insertion adjacent to the overlap midpoint is clipped with the overlap, as fgbio's
+    /// `clipOverlappingReads` does: it clips everything past `readPosAtRefPos(midpoint)` on the
+    /// positive-strand read and before `readPosAtRefPos(midpoint + 1)` on the negative-strand
+    /// read. 30-base reads, as fgbio's `SamBuilder` makes them; positions are 1-based.
+    ///
+    /// - `fwd_insertion`: `+` `10M2I18M` at 100 (100-127) and `-` `30M` at 90 (90-119). The
+    ///   midpoint is (100 + 119) / 2 = 109, the forward read's 10th aligned base, so its 2I and
+    ///   18M are clipped: `10M20S`. The reverse read keeps 110-119: `20S10M`.
+    /// - `rev_insertion`: `+` `30M` at 91 (91-120) and `-` `10M2I18M` at 100 (100-127). The
+    ///   midpoint is (91 + 127) / 2 = 109, so the forward read keeps 91-109 (`19M11S`) and the
+    ///   reverse read keeps from 110, the first base after its 2I: `12S18M`.
+    #[rstest]
+    #[case::fwd_insertion((100, "10M2I18M"), (90, "30M"), (20, 20), "10M20S", (110, "20S10M"))]
+    #[case::rev_insertion((91, "30M"), (100, "10M2I18M"), (11, 12), "19M11S", (110, "12S18M"))]
+    fn test_clip_overlapping_reads_insertion_at_midpoint(
+        #[case] fwd: (usize, &str),
+        #[case] rev: (usize, &str),
+        #[case] expected: (usize, usize),
+        #[case] expected_fwd: &str,
+        #[case] expected_rev: (usize, &str),
+        #[values(false, true)] mate_first: bool,
+    ) {
+        let seq = "A".repeat(30);
+        let mut f = create_paired_record(fwd.1, &seq, fwd.0, false, true, rev.0, rev.1);
+        let mut r = create_paired_record(rev.1, &seq, rev.0, true, false, fwd.0, fwd.1);
+        let clipper = RawClipperOnBuf::new(ClippingMode::Soft);
+        let clipped = if mate_first {
+            let (c_rev, c_fwd) = clipper.clip_overlapping_reads(&mut r, &mut f);
+            (c_fwd, c_rev)
+        } else {
+            clipper.clip_overlapping_reads(&mut f, &mut r)
+        };
+        assert_eq!(clipped, expected);
+        assert_eq!(f.alignment_start().map(usize::from), Some(fwd.0));
+        assert_eq!(format_cigar(&f.cigar()), expected_fwd);
+        assert_eq!(r.alignment_start().map(usize::from), Some(expected_rev.0));
+        assert_eq!(format_cigar(&r.cigar()), expected_rev.1);
+    }
+
+    /// A deletion next to the insertion on the forward read, traced through fgbio's
+    /// `readPosAtRefPos` (htsjdk `getReadPositionAtReferencePosition`). 30-base reads: `+`
+    /// `10M2I3D18M` at 100 (100-130) and `-` `30M` at 90 (90-119). The midpoint (100 + 119) / 2 =
+    /// 109 is the forward read's 10th aligned base; the 2I after it is clipped: `10M20S`.
+    #[rstest]
+    #[case::fwd_midpoint_before_insertion_and_deletion(
+        (100, "10M2I3D18M"),
+        (90, "30M"),
+        "10M20S",
+        (110, "20S10M")
+    )]
+    fn test_clip_overlapping_reads_insertion_and_deletion_at_midpoint(
+        #[case] fwd: (usize, &str),
+        #[case] rev: (usize, &str),
+        #[case] expected_fwd: &str,
+        #[case] expected_rev: (usize, &str),
+    ) {
+        let seq = "A".repeat(30);
+        let mut f = create_paired_record(fwd.1, &seq, fwd.0, false, true, rev.0, rev.1);
+        let mut r = create_paired_record(rev.1, &seq, rev.0, true, false, fwd.0, fwd.1);
+        RawClipperOnBuf::new(ClippingMode::Soft).clip_overlapping_reads(&mut f, &mut r);
+        assert_eq!(format_cigar(&f.cigar()), expected_fwd);
+        assert_eq!(r.alignment_start().map(usize::from), Some(expected_rev.0));
+        assert_eq!(format_cigar(&r.cigar()), expected_rev.1);
     }
 
     #[test]
@@ -5061,6 +5182,144 @@ mod tests {
                 (r1, r2)
             },
         )
+    }
+
+    /// A random indel-bearing CIGAR that starts and ends with an aligned op: `(M (I|D|ID|DI)?)+ M`,
+    /// with an optional leading and trailing soft clip.
+    fn arb_indel_cigar() -> impl Strategy<Value = String> {
+        (
+            0usize..4,
+            proptest::collection::vec((1usize..8, 0u8..5, 1usize..4), 1..5),
+            1usize..8,
+            0usize..4,
+        )
+            .prop_map(|(lead, segs, last, trail)| {
+                use std::fmt::Write as _;
+                let mut c = String::new();
+                if lead > 0 {
+                    write!(c, "{lead}S").expect("write to String");
+                }
+                for (m, kind, len) in segs {
+                    write!(c, "{m}M").expect("write to String");
+                    match kind {
+                        1 => write!(c, "{len}I").expect("write to String"),
+                        2 => write!(c, "{len}D").expect("write to String"),
+                        3 => write!(c, "{len}I{len}D").expect("write to String"),
+                        4 => write!(c, "{len}D{len}I").expect("write to String"),
+                        _ => {}
+                    }
+                }
+                write!(c, "{last}M").expect("write to String");
+                if trail > 0 {
+                    write!(c, "{trail}S").expect("write to String");
+                }
+                c
+            })
+    }
+
+    /// fgbio's `readPosAtRefPos` (htsjdk `getReadPositionAtReferencePosition`), by brute force
+    /// over the record's bases: the 1-based read position aligned to `pos`, else (if
+    /// `last_if_deleted`) the last aligned read position before `pos`, else 0.
+    fn oracle_read_pos(
+        record: &fgumi_raw_bam::RawRecord,
+        pos: usize,
+        last_if_deleted: bool,
+    ) -> usize {
+        let mut ref_pos = record.alignment_start_1based().expect("mapped");
+        let mut read_pos = 0usize;
+        let mut last_aligned = 0usize;
+        let mut aligned_any_after = false;
+        for op in record.cigar_ops_vec() {
+            let len = (op >> 4) as usize;
+            match op & 0xF {
+                0 | 7 | 8 => {
+                    for _ in 0..len {
+                        read_pos += 1;
+                        if ref_pos == pos {
+                            return read_pos;
+                        }
+                        if ref_pos > pos {
+                            aligned_any_after = true;
+                        }
+                        if ref_pos < pos {
+                            last_aligned = read_pos;
+                        }
+                        ref_pos += 1;
+                    }
+                }
+                1 | 4 => read_pos += len,
+                2 | 3 => ref_pos += len,
+                _ => {}
+            }
+        }
+        if last_if_deleted && aligned_any_after { last_aligned } else { 0 }
+    }
+
+    proptest! {
+        // A deleted base after the midpoint is skipped (`prop_assume!`), which is common with
+        // random indels, so allow more rejects than the default.
+        #![proptest_config(ProptestConfig {
+            max_global_rejects: 1_000_000,
+            ..ProptestConfig::default()
+        })]
+
+        /// `clip_overlapping_reads` clips the lengths fgbio's `clipOverlappingReads` derives from
+        /// `readPosAtRefPos`, on random FR pairs with indels. The oracle applies those lengths
+        /// with fgumi's own read-end clipping primitives, so this checks the clip lengths, not
+        /// the primitives. Pairs whose reverse read has a deleted base after the midpoint are
+        /// out of scope and skipped.
+        #[test]
+        fn raw_clip_overlapping_reads_matches_fgbio(
+            fwd_cigar in arb_indel_cigar(),
+            rev_cigar in arb_indel_cigar(),
+            offset in 0usize..1000,
+            mode in prop_oneof![
+                Just(ClippingMode::Soft),
+                Just(ClippingMode::SoftWithMask),
+                Just(ClippingMode::Hard),
+            ],
+        ) {
+            let fwd_ref = cigar_ref_len(&fwd_cigar);
+            let rev_ref = cigar_ref_len(&rev_cigar);
+            // Forward start 1000; reverse placed so it overlaps the forward read and ends after
+            // the forward start (not a coincident 5' tie): rev_start in [1000 - rev_ref + 2,
+            // fwd_end].
+            let fwd_start = 1000usize;
+            let lo = fwd_start + 2 - rev_ref.min(fwd_start + 1);
+            let hi = fwd_start + fwd_ref - 1;
+            prop_assume!(lo <= hi);
+            let rev_start = lo + offset % (hi - lo + 1);
+            let fwd_seq = "A".repeat(cigar_query_len(&fwd_cigar));
+            let rev_seq = "A".repeat(cigar_query_len(&rev_cigar));
+            let f_buf = create_paired_record(&fwd_cigar, &fwd_seq, fwd_start, false, true, rev_start, &rev_cigar);
+            let r_buf = create_paired_record(&rev_cigar, &rev_seq, rev_start, true, false, fwd_start, &fwd_cigar);
+            let (mut f, mut r) = (to_raw(&f_buf), to_raw(&r_buf));
+            let (mut f_oracle, mut r_oracle) = (f.clone(), r.clone());
+
+            // fgbio's midpoint and clip lengths.
+            let rev_end = rev_start + rev_ref - 1;
+            let fwd_end = fwd_start + fwd_ref - 1;
+            let mut mid = usize::midpoint(fwd_start, rev_end);
+            if mid > fwd_end {
+                mid = fwd_end;
+            } else if mid < rev_start {
+                mid = rev_start - 1;
+            }
+            prop_assume!(mid < rev_end);
+            let read_end = oracle_read_pos(&f_oracle, mid, true);
+            // Out of scope: the reverse read's base after the midpoint is deleted.
+            let mate_start = oracle_read_pos(&r_oracle, mid + 1, false);
+            prop_assume!(mate_start != 0);
+            let clipper = RawRecordClipper::new(mode);
+            let expected = (
+                clipper.clip_end_of_read_raw(&mut f_oracle, f.l_seq() as usize - read_end),
+                clipper.clip_start_of_read_raw(&mut r_oracle, mate_start - 1),
+            );
+
+            prop_assert_eq!(clipper.clip_overlapping_reads(&mut f, &mut r), expected);
+            prop_assert_eq!(f.as_ref(), f_oracle.as_ref());
+            prop_assert_eq!(r.as_ref(), r_oracle.as_ref());
+        }
     }
 
     proptest! {
