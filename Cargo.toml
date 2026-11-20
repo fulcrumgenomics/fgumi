@@ -56,13 +56,13 @@ crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 csv = "1.1"
 dhat = "0.3"
-fgoxide = "0.6.0"
+fgoxide = "0.7.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-itertools = "0.14.0"
+itertools = "0.15.0"
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
-mach2 = "0.6"
+mach2 = "0.7"
 memchr = "2"
 mimalloc = { version = "0.1.52", default-features = false }
 # Built on every Unix target: `fgumi-bam-io` needs `unistd::close`, the only safe
@@ -95,11 +95,11 @@ rand = "0.10"
 # feature-unification trap documented on `flate2` above.
 rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
-rstest = "0.26"
+rstest = "0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 syn = { version = "3", features = ["full"] }
-statrs = "0.18"
+statrs = { version = "0.19", default-features = false, features = ["std"] }
 # Held at 0.38 because sysinfo >=0.39 requires rustc 1.95 > our MSRV (rust-toolchain.toml pins
 # 1.93). Centralized so `fgumi` and `fgumi-cli-common` cannot drift onto different versions and
 # silently raise the effective MSRV.
@@ -141,7 +141,7 @@ bstr = { workspace = true }
 bytes = { workspace = true }
 fgoxide = { workspace = true }
 tempfile = { workspace = true }
-lru = "0.18.0"
+lru = "0.19.0"
 crc32fast = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossbeam-queue = { workspace = true }
