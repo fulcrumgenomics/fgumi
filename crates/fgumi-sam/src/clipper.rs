@@ -10,8 +10,6 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 const TAGS_TO_REVERSE_COMPLEMENT: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::E2, fgumi_raw_bam::SamTag::SQ];
 
-/// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
-/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
 /// Base modification tags. `MM`/`am`/`bm` strings and the `ML` array are not per-base, so
 /// `--auto-clip-attributes` must not slice them even when their length happens to equal the
 /// read's; the `clip` command keeps them in step with the clipped SEQ itself.
@@ -30,7 +28,7 @@ fn is_modification_tag(tag: [u8; 2]) -> bool {
 /// Tags whose values are not this read's per-base data, so `--auto-clip-attributes` must not
 /// slice them even when their length happens to equal the read's. Best-effort: an unlisted tag
 /// whose length matches the read's is still clipped.
-const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 44] = [
+const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 45] = [
     fgumi_raw_bam::SamTag::RG,
     fgumi_raw_bam::SamTag::LB,
     fgumi_raw_bam::SamTag::PU,
@@ -58,6 +56,7 @@ const NON_PER_BASE_TAGS: [fgumi_raw_bam::SamTag; 44] = [
     fgumi_raw_bam::SamTag::OC,
     fgumi_raw_bam::SamTag::CG,
     fgumi_raw_bam::SamTag::XA,
+    fgumi_raw_bam::SamTag::XB,
     fgumi_raw_bam::SamTag::CS,
     fgumi_raw_bam::SamTag::JM,
     fgumi_raw_bam::SamTag::JI,
@@ -82,6 +81,8 @@ fn is_never_auto_clipped(tag: [u8; 2]) -> bool {
     is_modification_tag(tag) || NON_PER_BASE_TAGS.iter().any(|t| **t == tag)
 }
 
+/// Quality-oriented aux tags that are reversed (with `QUAL`) when a read is
+/// reverse-complemented, mirroring htsjdk `SAMRecord.TAGS_TO_REVERSE`.
 const TAGS_TO_REVERSE: [fgumi_raw_bam::SamTag; 2] =
     [fgumi_raw_bam::SamTag::OQ, fgumi_raw_bam::SamTag::U2];
 
@@ -2848,7 +2849,7 @@ mod tests {
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
-        let tag = Tag::from([b'X', b'B']);
+        let tag = Tag::from([b'z', b'z']);
         let array: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let value = Value::from(array);
         record.data_mut().insert(tag, value);
@@ -2862,7 +2863,7 @@ mod tests {
             let vec_data: Vec<u8> = arr.clone();
             assert_eq!(vec_data, vec![3, 4, 5, 6, 7, 8, 9]);
         } else {
-            panic!("Tag XB not found or wrong type");
+            panic!("Tag zz not found or wrong type");
         }
     }
 
@@ -2875,7 +2876,7 @@ mod tests {
         let mut record = create_test_record("10M", "ACGTACGTAC", 1000);
 
         // Add a UInt8Array attribute that matches the read length
-        let tag = Tag::from([b'X', b'B']);
+        let tag = Tag::from([b'z', b'z']);
         let array: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let value = Value::from(array);
         record.data_mut().insert(tag, value);
@@ -2889,7 +2890,7 @@ mod tests {
             let vec_data: Vec<u8> = arr.clone();
             assert_eq!(vec_data, vec![0, 1, 2, 3, 4, 5, 6]);
         } else {
-            panic!("Tag XB not found or wrong type");
+            panic!("Tag zz not found or wrong type");
         }
     }
 
@@ -2944,7 +2945,7 @@ mod tests {
 
         use fgumi_raw_bam::SamTag;
 
-        let expected: [SamTag; 44] = [
+        let expected: [SamTag; 45] = [
             SamTag::RG,
             SamTag::LB,
             SamTag::PU,
@@ -2972,6 +2973,7 @@ mod tests {
             SamTag::OC,
             SamTag::CG,
             SamTag::XA,
+            SamTag::XB,
             SamTag::CS,
             SamTag::JM,
             SamTag::JI,
@@ -3002,7 +3004,7 @@ mod tests {
         for tag in expected.into_iter().filter(|t| *t != SamTag::CG) {
             record.data_mut().insert(Tag::from(*tag), Value::from("0123456789"));
         }
-        let per_base = [Tag::from(SamTag::OQ), Tag::from(SamTag::E2), Tag::from([b'X', b'B'])];
+        let per_base = [Tag::from(SamTag::OQ), Tag::from(SamTag::E2), Tag::from([b'z', b'z'])];
         for tag in per_base {
             record.data_mut().insert(tag, Value::from("0123456789"));
         }
@@ -3760,9 +3762,11 @@ mod tests {
         {
             let mut ed = fgumi_raw_bam::RawTagsEditor::from_vec(&mut rec);
             ed.append_string(fgumi_raw_bam::SamTag::RG, &value);
+            ed.append_string(fgumi_raw_bam::SamTag::XB, &value);
             ed.append_array_i32(fgumi_raw_bam::SamTag::CG, &[0; 50]);
+            ed.append_array_u8(fgumi_raw_bam::SamTag::ML, &[0; 50]);
             ed.append_string(fgumi_raw_bam::SamTag::OQ, &value);
-            ed.append_string([b'X', b'B'], &value);
+            ed.append_string([b'z', b'z'], &value);
         }
         let mut record = fgumi_raw_bam::RawRecord::from(rec);
 
@@ -3775,17 +3779,26 @@ mod tests {
             fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::RG)
                 .expect("RG tag present");
         assert_eq!(rg, &value[..], "a protected tag must not be clipped on upgrade");
+        let xb =
+            fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::XB)
+                .expect("XB tag present");
+        assert_eq!(xb, &value[..], "bwa mem -u's XB must not be clipped on upgrade");
         let aux = fgumi_raw_bam::aux_data_slice(record.as_ref());
-        let cg =
-            fgumi_raw_bam::find_array_tag(aux, fgumi_raw_bam::SamTag::CG).expect("CG tag present");
-        assert_eq!(cg.count, 50, "a protected array tag must not be clipped on upgrade");
+        for tag in [fgumi_raw_bam::SamTag::CG, fgumi_raw_bam::SamTag::ML] {
+            let array = fgumi_raw_bam::find_array_tag(aux, tag)
+                .unwrap_or_else(|| panic!("{tag:?} tag present"));
+            assert_eq!(
+                array.count, 50,
+                "protected array tag {tag:?} must not be clipped on upgrade"
+            );
+        }
         let oq =
             fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), fgumi_raw_bam::SamTag::OQ)
                 .expect("OQ tag present");
         assert_eq!(oq, &value[5..40], "a per-base tag is clipped on upgrade");
-        let xb = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), [b'X', b'B'])
-            .expect("XB tag present");
-        assert_eq!(xb, &value[5..40], "an unlisted tag is clipped on upgrade");
+        let zz = fgumi_raw_bam::find_string_tag_in_record(record.as_ref(), [b'z', b'z'])
+            .expect("zz tag present");
+        assert_eq!(zz, &value[5..40], "an unlisted tag is clipped on upgrade");
     }
 
     #[test]

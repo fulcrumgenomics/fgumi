@@ -175,6 +175,9 @@ impl SamTag {
     pub const CG: SamTag = SamTag::new(b'C', b'G');
     /// Alternative hits, `Z` string (written by `bwa` / `bwa-mem3`).
     pub const XA: SamTag = SamTag::new(b'X', b'A');
+    /// Alternative hits with each hit's alignment score and mapping quality, `Z` string (written
+    /// by `bwa mem -u` in place of `XA`).
+    pub const XB: SamTag = SamTag::new(b'X', b'B');
     /// Difference string against the reference, `cs:Z` (written by `minimap2 --cs`).
     pub const CS: SamTag = SamTag::new(b'c', b's');
     /// Intron motifs, `jM:B:c` array (written by STAR).
