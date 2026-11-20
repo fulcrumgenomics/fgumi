@@ -473,7 +473,7 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 /// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
 /// build feature; see `AlignerOptions::resolve`). Under runall's
 /// `--methylation-mode em-seq`, both bwa-mem3 presets align bisulfite-aware
-/// with `bwa-mem3 mem --meth` (see [`AlignerPreset::validate_methylation`]);
+/// with `bwa-mem3 mem --meth` (see `AlignerPreset::validate_with_methylation`);
 /// other bisulfite aligners (e.g. bwameth) go through `--aligner::command`.
 /// TAPS reads align with the plain presets.
 ///
@@ -592,12 +592,13 @@ impl AlignerPreset {
     ///   via `PATH`.
     /// * `methylation` - The chemistry from `--methylation-mode`. EM-seq adds
     ///   bwa-mem3's `--meth` (see [`bwa_mem3_meth_flag`]), so it must not reach
-    ///   `bwa`, which has no bisulfite mode ([`Self::validate_methylation`]
+    ///   `bwa`, which has no bisulfite mode ([`Self::validate_with_methylation`]
     ///   rejects that combination first).
     // `pub(crate)`, not `pub`: this interpolates `reference` / `binary_override`
     // into a string later run via `/bin/bash -c`, and it does not itself validate
-    // those paths — it trusts that `validate` (which runs `check_shell_safe_path`)
-    // was called first. Restricting the method to in-crate callers keeps a direct
+    // those paths — it trusts that `validate_with_methylation` (which runs
+    // `check_shell_safe_path`; `validate` and `AlignerOptions::resolve` go through
+    // it) was called first. Restricting the method to in-crate callers keeps a direct
     // external caller from bypassing that validation and injecting shell syntax.
     #[must_use]
     pub(crate) fn build_command(
@@ -622,9 +623,11 @@ impl AlignerPreset {
         format!("{binary} mem{output}{meth} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
     }
 
-    /// Validate that the aligner binary and required index files are present.
+    /// Validate that the aligner binary and required index files are present
+    /// for plain (non-bisulfite) alignment.
     ///
-    /// Checks, in order:
+    /// Equivalent to the in-crate `validate_with_methylation` with
+    /// [`MethylationMode::Disabled`]. Checks, in order:
     /// 1. The reference FASTA itself exists (so a typo in `--ref`
     ///    surfaces with a clean error rather than "index file not
     ///    found").
@@ -647,6 +650,50 @@ impl AlignerPreset {
     ///
     /// Returns an error with a fix-it hint if any of the above fail.
     pub fn validate(self, reference: &Path, binary_override: Option<&Path>) -> Result<()> {
+        self.validate_with_methylation(reference, binary_override, MethylationMode::Disabled)
+    }
+
+    /// Validate that the aligner binary and the index files needed to align
+    /// for `methylation` (`--methylation-mode`) are present.
+    ///
+    /// Runs [`Self::validate`]'s checks, except that the index files required
+    /// beside the reference depend on the chemistry: disabled and TAPS need
+    /// the plain index ([`Self::index_extensions`]); EM-seq aligns with
+    /// `bwa-mem3 mem --meth` and needs the files
+    /// [`Self::validate_methylation`] checks instead. Under EM-seq, `bwa` is
+    /// rejected before anything else, since no index or binary fixes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error with a fix-it hint if any check fails.
+    pub(crate) fn validate_with_methylation(
+        self,
+        reference: &Path,
+        binary_override: Option<&Path>,
+        methylation: MethylationMode,
+    ) -> Result<()> {
+        let emseq = bwa_mem3_meth_flag(methylation).is_some();
+        if emseq {
+            self.reject_without_bisulfite_mode()?;
+        }
+        self.validate_reference_and_binary(reference, binary_override)?;
+        if emseq {
+            self.require_meth_index_files(reference)
+        } else {
+            Self::require_index_files(reference, self.index_extensions(), || {
+                format!("run `{} index {}`", self.index_binary_hint(), reference.display())
+            })
+        }
+    }
+
+    /// Steps 1-3 of [`Self::validate`]: the reference FASTA exists, its path
+    /// (and any `--aligner-bin` path) is safe to interpolate, and the aligner
+    /// binary is reachable when the preset needs one.
+    fn validate_reference_and_binary(
+        self,
+        reference: &Path,
+        binary_override: Option<&Path>,
+    ) -> Result<()> {
         let binary_name = self.binary_name();
 
         // 1. Reference FASTA presence (separated from the index-loop
@@ -718,20 +765,90 @@ impl AlignerPreset {
             }
         }
 
-        // 4. Index files for the chosen preset.
-        for ext in self.index_extensions() {
-            let index_path = append_extension(reference, ext);
+        Ok(())
+    }
+
+    /// Require `<prefix><ext>` to be a regular file for every `ext` in
+    /// `extensions`, naming the first missing file and appending `fix()` (a
+    /// fix-it hint) to the error.
+    fn require_index_files<F: Fn() -> String>(
+        prefix: &Path,
+        extensions: &[&str],
+        fix: F,
+    ) -> Result<()> {
+        for ext in extensions {
+            let index_path = append_extension(prefix, ext);
             if !index_path.is_file() {
-                bail!(
-                    "required index file not found: {} (run `{} index {}`)",
-                    index_path.display(),
-                    self.index_binary_hint(),
-                    reference.display()
-                );
+                bail!("required index file not found: {} ({})", index_path.display(), fix());
             }
         }
-
         Ok(())
+    }
+
+    /// Reject `bwa` under EM-seq: it has no bisulfite mode.
+    fn reject_without_bisulfite_mode(self) -> Result<()> {
+        if self == Self::Bwa {
+            bail!(
+                "--methylation-mode em-seq needs a bisulfite-aware aligner, and `bwa` has \
+                 none; use --aligner::preset bwa-mem3 or bwa-mem3-inproc (which align with \
+                 bwa-mem3's --meth), or --aligner::command"
+            );
+        }
+        Ok(())
+    }
+
+    /// Index file extensions the original (un-converted) `<ref>` prefix needs
+    /// when aligning with `bwa-mem3 mem --meth`.
+    ///
+    /// `bwa-mem3 mem --meth` seeds against the converted `<ref>.meth` index and
+    /// reads only the original reference's contigs and sequence (`.amb`,
+    /// `.ann`, `.pac`), never the plain `<ref>.bwt.2bit.64`. A
+    /// `bwa-mem3 index --meth --meth-only` index omits that file, so the
+    /// subprocess preset does not require it: its list is
+    /// [`Self::index_extensions`] minus the plain FM-index `.bwt.2bit.64`.
+    ///
+    /// The in-process backend still requires the full plain index. This
+    /// mirrors bwa-mem3-rs's index check in `BwaIndex::load_meth`, which
+    /// requires the plain `<ref>.bwt.2bit.64` on the original prefix before
+    /// loading a dual index, so it cannot load a `--meth-only` index. That
+    /// list is a private constant in bwa-mem3-rs, so it cannot be imported
+    /// here.
+    #[must_use]
+    fn meth_original_index_extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::BwaMem3 => &[".amb", ".ann", ".pac"],
+            // `Bwa` is unreachable here: it is rejected under EM-seq
+            // (`reject_without_bisulfite_mode`) before any index is checked.
+            Self::BwaMem3InProc | Self::Bwa => self.index_extensions(),
+        }
+    }
+
+    /// The fix-it hint for a missing file of the `bwa-mem3 index --meth` dual
+    /// index. The subprocess preset also accepts a `--meth-only` index, but the
+    /// hint suggests the full dual index: a `--meth-only` index cannot align
+    /// plain (duplex re-alignment, runs without `--methylation-mode`), and the
+    /// in-process backend needs the full dual index
+    /// ([`Self::meth_original_index_extensions`]). bwa-mem3 refuses to
+    /// overwrite existing index files without `--force`, so the hint says so.
+    fn meth_index_hint(self, reference: &Path) -> String {
+        let binary = self.index_binary_hint();
+        let reference = reference.display();
+        let run = format!(
+            "run `{binary} index --meth {reference}` (add `--force` to replace an existing index)"
+        );
+        match self {
+            Self::BwaMem3InProc => format!(
+                "--methylation-mode em-seq aligns with bwa-mem3 --meth, and the in-process \
+                 backend needs the full dual index, including the plain \
+                 `{reference}.bwt.2bit.64`; {run}"
+            ),
+            // `Bwa` is unreachable here: it is rejected under EM-seq
+            // (`reject_without_bisulfite_mode`) before any index is checked.
+            Self::BwaMem3 | Self::Bwa => format!(
+                "--methylation-mode em-seq aligns with bwa-mem3 --meth, which needs the dual \
+                 index; {run}"
+            ),
+        }
     }
 
     /// Validate that this preset can align for `methylation` (`--methylation-mode`).
@@ -740,9 +857,13 @@ impl AlignerPreset {
     /// as T, so a plain aligner scores most cytosines as mismatches, heavily
     /// converted reads map worse, and the methylation calls are biased.
     /// bwa-mem3's `--meth` aligns them against a dual index built by
-    /// `bwa-mem3 index --meth` — the converted seed index `<ref>.meth.*` beside
-    /// the original `<ref>.*` — so this checks for the `.meth` files on top of
-    /// [`Self::validate`]'s, and rejects `bwa`, which has no bisulfite mode.
+    /// `bwa-mem3 index --meth`: the converted seed index
+    /// `<ref>.meth.{amb,ann,bwt.2bit.64,pac}` plus the original reference's
+    /// `<ref>.{amb,ann,pac}`. This checks for those files and rejects `bwa`,
+    /// which has no bisulfite mode. The plain `<ref>.bwt.2bit.64` is not
+    /// required for the `bwa-mem3` preset, so a `bwa-mem3 index --meth
+    /// --meth-only` index (which omits it) is accepted; `bwa-mem3-inproc`
+    /// still requires it (see `meth_original_index_extensions`).
     ///
     /// A no-op for [`MethylationMode::Disabled`] and [`MethylationMode::Taps`]:
     /// TAPS converts only the (rare) methylated cytosines, so its reads align
@@ -750,8 +871,17 @@ impl AlignerPreset {
     ///
     /// # Errors
     ///
-    /// Returns an error, under EM-seq, if the preset is `bwa` or a `.meth`
-    /// index file is missing.
+    /// Returns an error, under EM-seq, if the preset is `bwa` or a dual index
+    /// file is missing.
+    ///
+    /// # Pairing with `validate`
+    ///
+    /// This checks the EM-seq index files only, and is meant to be paired with
+    /// [`Self::validate`], which requires the plain index (including
+    /// `<ref>.bwt.2bit.64`). The pair therefore rejects a `--meth-only` index.
+    /// In-crate resolution uses `validate_with_methylation` instead, which
+    /// picks the required index files by chemistry and accepts a `--meth-only`
+    /// index for the `bwa-mem3` preset under EM-seq.
     pub fn validate_methylation(
         self,
         reference: &Path,
@@ -760,28 +890,19 @@ impl AlignerPreset {
         if bwa_mem3_meth_flag(methylation).is_none() {
             return Ok(());
         }
-        if self == Self::Bwa {
-            bail!(
-                "--methylation-mode em-seq needs a bisulfite-aware aligner, and `bwa` has \
-                 none; use --aligner::preset bwa-mem3 or bwa-mem3-inproc (which align with \
-                 bwa-mem3's --meth), or --aligner::command"
-            );
-        }
+        self.reject_without_bisulfite_mode()?;
+        self.require_meth_index_files(reference)
+    }
+
+    /// Require the `bwa-mem3 index --meth` files this preset reads under
+    /// EM-seq: the original reference's files
+    /// ([`Self::meth_original_index_extensions`]) and the converted
+    /// `<ref>.meth` seed index.
+    fn require_meth_index_files(self, reference: &Path) -> Result<()> {
+        let fix = || self.meth_index_hint(reference);
+        Self::require_index_files(reference, self.meth_original_index_extensions(), fix)?;
         let seed_prefix = append_extension(reference, BWA_MEM3_METH_INDEX_SUFFIX);
-        for ext in self.index_extensions() {
-            let index_path = append_extension(&seed_prefix, ext);
-            if !index_path.is_file() {
-                bail!(
-                    "required bisulfite index file not found: {} (--methylation-mode em-seq \
-                     aligns with bwa-mem3 --meth, which needs the dual index; run `{} index \
-                     --meth {}`)",
-                    index_path.display(),
-                    self.index_binary_hint(),
-                    reference.display()
-                );
-            }
-        }
-        Ok(())
+        Self::require_index_files(&seed_prefix, self.index_extensions(), fix)
     }
 }
 
@@ -1205,11 +1326,11 @@ impl AlignerOptions {
     /// - `--aligner::preset bwa-mem3-inproc` built without the
     ///   `aligner-bwa-mem3` feature.
     /// - Preset-mode index files / binary missing (delegated to
-    ///   [`AlignerPreset::validate`]).
+    ///   [`AlignerPreset::validate_with_methylation`]).
     /// - `methylation_mode` EM-seq with the `bwa` preset, or with a bwa-mem3
-    ///   preset whose `bwa-mem3 index --meth` files are missing (delegated to
-    ///   [`AlignerPreset::validate_methylation`]). Command mode is not checked:
-    ///   the command picks its own (bisulfite-aware) aligner and flags.
+    ///   preset whose `bwa-mem3 index --meth` files are missing (also delegated
+    ///   to [`AlignerPreset::validate_with_methylation`]). Command mode is not
+    ///   checked: the command picks its own (bisulfite-aware) aligner and flags.
     pub(crate) fn resolve(
         self,
         reference: &Path,
@@ -1285,8 +1406,7 @@ impl AlignerOptions {
             ),
             (Some(preset), None) => {
                 // Preset mode: validate indexes + binary, build argv.
-                preset.validate(reference, aligner_bin)?;
-                preset.validate_methylation(reference, self.methylation_mode)?;
+                preset.validate_with_methylation(reference, aligner_bin, self.methylation_mode)?;
                 // An explicit `--aligner::threads 0` would reach the aligner as
                 // `-t 0`. `None` means "default to runall's --threads" (not
                 // zero), so only reject an explicit zero.
@@ -1415,8 +1535,7 @@ fn resolve_inproc(
     {
         // Binary discovery is skipped for this preset (`requires_binary()`
         // is false); index files are still required.
-        AlignerPreset::BwaMem3InProc.validate(reference, None)?;
-        AlignerPreset::BwaMem3InProc.validate_methylation(reference, methylation)?;
+        AlignerPreset::BwaMem3InProc.validate_with_methylation(reference, None, methylation)?;
         let sub_batch_templates = sub_batch_templates.unwrap_or_else(default_sub_batch_templates);
         Ok(ResolvedAligner {
             backend: ResolvedBackend::InProcessBwaMem3 {
@@ -1505,6 +1624,13 @@ fn check_header_safe_path(path: &Path, flag_label: &str) -> Result<()> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// The seven files `bwa-mem3 index --meth --meth-only` writes: the original
+/// reference's `.amb/.ann/.pac` and the full `.meth` seed index, with no
+/// plain `<ref>.bwt.2bit.64`.
+#[cfg(test)]
+pub(crate) const METH_ONLY_INDEX_FILES: [&str; 7] =
+    [".amb", ".ann", ".pac", ".meth.amb", ".meth.ann", ".meth.bwt.2bit.64", ".meth.pac"];
 
 #[cfg(test)]
 mod tests {
@@ -2576,10 +2702,113 @@ mod tests {
             preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap_err().to_string();
         assert!(err.contains("ref.fa.meth."), "names the missing .meth file; got: {err}");
         assert!(err.contains("bwa-mem3 index --meth"), "gives the fix; got: {err}");
+        assert!(err.contains("add `--force` to replace"), "mentions --force; got: {err}");
 
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), true);
         preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap();
+    }
+
+    /// A reference with a `--meth-only` index ([`METH_ONLY_INDEX_FILES`]),
+    /// leaving out `omit` when given.
+    fn reference_with_meth_only_index(dir: &Path, omit: Option<&str>) -> PathBuf {
+        let ref_path = dir.join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in METH_ONLY_INDEX_FILES.iter().filter(|ext| Some(**ext) != omit) {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        ref_path
+    }
+
+    /// `bwa-mem3 mem --meth` never reads the plain `<ref>.bwt.2bit.64`, so the
+    /// subprocess preset accepts a `--meth-only` index under EM-seq.
+    #[test]
+    fn validate_with_methylation_accepts_a_meth_only_index_for_emseq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), None);
+        let bin = make_existing_binary(tmp.path());
+        AlignerPreset::BwaMem3
+            .validate_with_methylation(&ref_path, Some(&bin), MethylationMode::EmSeq)
+            .unwrap();
+    }
+
+    /// Under EM-seq every file of the `--meth-only` layout is still required;
+    /// the error names the missing file and suggests the full dual index (not
+    /// `--meth-only`, which cannot align plain), with `--force` to replace one.
+    #[rstest]
+    #[case::orig_amb(".amb")]
+    #[case::orig_ann(".ann")]
+    #[case::orig_pac(".pac")]
+    #[case::seed_amb(".meth.amb")]
+    #[case::seed_ann(".meth.ann")]
+    #[case::seed_bwt(".meth.bwt.2bit.64")]
+    #[case::seed_pac(".meth.pac")]
+    fn validate_with_methylation_requires_each_meth_only_file_for_emseq(#[case] missing: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), Some(missing));
+        let bin = make_existing_binary(tmp.path());
+        let err = AlignerPreset::BwaMem3
+            .validate_with_methylation(&ref_path, Some(&bin), MethylationMode::EmSeq)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("ref.fa{missing} ")), "names {missing}; got: {err}");
+        assert!(
+            err.contains("run `bwa-mem3 index --meth ") && err.contains("ref.fa` (add `--force`"),
+            "gives the fix; got: {err}"
+        );
+        assert!(!err.contains("--meth-only"), "does not suggest --meth-only; got: {err}");
+    }
+
+    /// Plain and TAPS alignment read the plain index, so a `--meth-only` index
+    /// (no `<ref>.bwt.2bit.64`) is still rejected for them.
+    #[rstest]
+    #[case::disabled(MethylationMode::Disabled)]
+    #[case::taps(MethylationMode::Taps)]
+    fn validate_with_methylation_requires_the_plain_index_unless_emseq(
+        #[case] methylation: MethylationMode,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), None);
+        let bin = make_existing_binary(tmp.path());
+        let err = AlignerPreset::BwaMem3
+            .validate_with_methylation(&ref_path, Some(&bin), methylation)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ref.fa.bwt.2bit.64 "), "names the plain index; got: {err}");
+        assert!(!err.contains("--meth"), "plain mode suggests a plain index; got: {err}");
+    }
+
+    /// The in-process backend's index loader checks for the plain
+    /// `<ref>.bwt.2bit.64` even for a dual index, so it rejects a `--meth-only`
+    /// index up front, says it needs the full dual index, and suggests building
+    /// it (with `--force` to replace the existing files).
+    #[test]
+    fn validate_with_methylation_inproc_rejects_a_meth_only_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), None);
+        let err = AlignerPreset::BwaMem3InProc
+            .validate_with_methylation(&ref_path, None, MethylationMode::EmSeq)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ref.fa.bwt.2bit.64 "), "names the plain index; got: {err}");
+        assert!(
+            err.contains("needs the full dual index, including the plain `"),
+            "explains why; got: {err}"
+        );
+        assert!(err.contains("add `--force` to replace"), "mentions --force; got: {err}");
+    }
+
+    /// `bwa` is rejected under EM-seq before its binary or index is checked:
+    /// no binary or index would make it bisulfite-aware.
+    #[test]
+    fn validate_with_methylation_rejects_bwa_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("missing.fa");
+        let err = AlignerPreset::Bwa
+            .validate_with_methylation(&ref_path, None, MethylationMode::EmSeq)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`bwa` has none"), "got: {err}");
     }
 
     /// The subprocess preset carries `--methylation-mode` into its command:
@@ -2606,6 +2835,25 @@ mod tests {
             panic!("the bwa-mem3 preset resolves to a subprocess");
         };
         assert_eq!(command.contains(" --meth"), expect_meth, "got: {command}");
+    }
+
+    /// `--aligner::preset bwa-mem3 --methylation-mode em-seq` resolves against a
+    /// `bwa-mem3 index --meth --meth-only` index.
+    #[test]
+    fn resolve_preset_accepts_a_meth_only_index_for_emseq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), None);
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions {
+            preset: Some(AlignerPreset::BwaMem3),
+            methylation_mode: MethylationMode::EmSeq,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
+        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
+            panic!("the bwa-mem3 preset resolves to a subprocess");
+        };
+        assert!(command.contains(" --meth "), "got: {command}");
     }
 
     /// `bwa` cannot align bisulfite reads, so `--methylation-mode em-seq` rejects it at
