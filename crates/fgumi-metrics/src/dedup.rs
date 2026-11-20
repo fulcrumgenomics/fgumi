@@ -23,7 +23,18 @@ use crate::library_size::estimate_library_size;
 ///    the pre-grouping filter are dropped and never reach the output. The
 ///    `filtered_*` columns give the count per reason in **template** units — note
 ///    that `group`'s fgbio-shaped `.grouping_metrics.txt` counts primary
-///    *records*, so the two files' discard counts are not comparable.
+///    *records*, so the two files' discard counts are not comparable. Likewise,
+///    `passthrough_templates` totals the templates emitted untouched by
+///    `--include-unmapped` and `--include-invalid-umis`; group 6 breaks that total
+///    down by reason.
+///    Pass-through templates are also counted in `total_templates` and
+///    `unique_templates`, and their primary reads are classified into the
+///    pair/orphan breakdown (group 4) as non-duplicates like any other counted
+///    read. A *mapped* `--include-invalid-umis` pass-through therefore adds to
+///    `mapped_pairs` or `mapped_orphans` (Picard `READ_PAIRS_EXAMINED` /
+///    `UNPAIRED_READS_EXAMINED`), which lowers `percent_duplication` and moves
+///    `estimated_library_size`, the same way Picard counts every mapped read it
+///    examines. They are kept there so the read-unit identities in group 4 hold.
 /// 2. **Deduplication** — `total_templates` through `duplicate_reads`, covering
 ///    only what survived filtering. These count what *passed the filter*, not what
 ///    reaches the output file: under `--remove-duplicates` the duplicates are
@@ -54,6 +65,11 @@ use crate::library_size::estimate_library_size;
 ///    otherwise.
 /// 5. **Complexity** — `percent_duplication` (Picard-parity pair/orphan units) and
 ///    the Lander-Waterman `estimated_library_size`.
+/// 6. **Pass-through breakdown** — `passthrough_unmapped` through
+///    `passthrough_umi_too_short`: `passthrough_templates` split by the reason the
+///    filter would otherwise have dropped the template, using the `filtered_*`
+///    suffixes. They come last so earlier column positions match older
+///    releases.
 ///
 /// Templates read from the input are `filtered_templates + total_templates`; that
 /// sum is not emitted as its own column because it is derivable, matching
@@ -90,7 +106,7 @@ pub struct DeduplicationMetrics {
     pub filtered_ns_in_umi: u64,
     /// Templates dropped (UMI shorter than `--min-umi-length`)
     pub filtered_umi_too_short: u64,
-    /// Templates emitted untouched by `--include-unmapped`
+    /// Templates emitted untouched by `--include-unmapped` or `--include-invalid-umis` (any reason)
     pub passthrough_templates: u64,
     /// Templates that passed the filter
     pub total_templates: u64,
@@ -144,14 +160,23 @@ pub struct DeduplicationMetrics {
     /// `mapped_pairs - duplicate_pairs` as `n_unique`), matching Picard
     /// `MarkDuplicates`, which excludes orphans from the library-size estimate.
     pub estimated_library_size: Option<u64>,
+    /// Templates emitted untouched by `--include-unmapped` (no mapped primary read)
+    pub passthrough_unmapped: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (no UMI tag)
+    pub passthrough_missing_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (N base in the UMI)
+    pub passthrough_ns_in_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (UMI shorter than `--min-umi-length`)
+    pub passthrough_umi_too_short: u64,
 }
 
 /// Raw per-library (or aggregate) counts used to build a [`DeduplicationMetrics`]
 /// row.
 ///
-/// Everything except the three derived columns — `duplicate_rate`,
-/// `percent_duplication`, and `estimated_library_size` — is copied through 1:1
-/// by [`DeduplicationMetrics::from_counts`], which computes those three. Using a
+/// Everything except the four derived columns — `passthrough_templates`,
+/// `duplicate_rate`, `percent_duplication`, and `estimated_library_size` — is
+/// copied through 1:1 by [`DeduplicationMetrics::from_counts`], which computes
+/// those four. Using a
 /// struct rather than a 20-plus-argument constructor keeps the call sites (one
 /// per library, plus the total) readable and self-labeling.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -180,8 +205,6 @@ pub struct DeduplicationCounts {
     pub filtered_ns_in_umi: u64,
     /// Templates dropped (UMI shorter than `--min-umi-length`).
     pub filtered_umi_too_short: u64,
-    /// Templates emitted untouched by `--include-unmapped`.
-    pub passthrough_templates: u64,
     /// Templates that passed the filter.
     pub total_templates: u64,
     /// Templates kept as their family's representative.
@@ -214,6 +237,15 @@ pub struct DeduplicationCounts {
     pub unmapped_orphans: u64,
     /// Primary reads with no paired flag (single-end).
     pub unmated_templates: u64,
+    /// Templates emitted untouched by `--include-unmapped` (no mapped primary read).
+    pub passthrough_unmapped: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (no UMI tag).
+    pub passthrough_missing_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (N base in the UMI).
+    pub passthrough_ns_in_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` (UMI shorter than
+    /// `--min-umi-length`).
+    pub passthrough_umi_too_short: u64,
 }
 
 impl DeduplicationMetrics {
@@ -224,7 +256,8 @@ impl DeduplicationMetrics {
     }
 
     /// Builds a metrics row from summed counts for one library (or the aggregate
-    /// total across all libraries), computing the derived `duplicate_rate`,
+    /// total across all libraries), computing the derived `passthrough_templates`
+    /// (the sum of the `passthrough_*` reasons), `duplicate_rate`,
     /// `percent_duplication`, and `estimated_library_size` columns.
     #[must_use]
     pub fn from_counts(counts: DeduplicationCounts) -> Self {
@@ -241,7 +274,6 @@ impl DeduplicationMetrics {
             filtered_missing_umi,
             filtered_ns_in_umi,
             filtered_umi_too_short,
-            passthrough_templates,
             total_templates,
             unique_templates,
             duplicate_templates,
@@ -258,6 +290,10 @@ impl DeduplicationMetrics {
             unmapped_pairs,
             unmapped_orphans,
             unmated_templates,
+            passthrough_unmapped,
+            passthrough_missing_umi,
+            passthrough_ns_in_umi,
+            passthrough_umi_too_short,
         } = counts;
         Self {
             sample,
@@ -272,7 +308,11 @@ impl DeduplicationMetrics {
             filtered_missing_umi,
             filtered_ns_in_umi,
             filtered_umi_too_short,
-            passthrough_templates,
+            // Derived from the per-reason columns so the total cannot drift from them.
+            passthrough_templates: passthrough_unmapped
+                + passthrough_missing_umi
+                + passthrough_ns_in_umi
+                + passthrough_umi_too_short,
             total_templates,
             unique_templates,
             duplicate_templates,
@@ -306,6 +346,10 @@ impl DeduplicationMetrics {
                 mapped_pairs,
                 mapped_pairs.saturating_sub(duplicate_pairs),
             ),
+            passthrough_unmapped,
+            passthrough_missing_umi,
+            passthrough_ns_in_umi,
+            passthrough_umi_too_short,
         }
     }
 }
@@ -453,10 +497,29 @@ mod tests {
         }
     }
 
+    /// Each reason a template can be passed through for has a `passthrough_*`
+    /// column named with the same suffix as its `filtered_*` column.
+    #[test]
+    fn every_passthrough_reason_has_a_column() {
+        let header = header_of(DeduplicationMetrics::default());
+        let columns: Vec<&str> = header.split('\t').collect();
+        for reason in [
+            TemplateFilterReason::Unmapped,
+            TemplateFilterReason::MissingUmi,
+            TemplateFilterReason::NsInUmi,
+            TemplateFilterReason::UmiTooShort,
+        ] {
+            let column = format!("passthrough_{}", reason.column_suffix());
+            assert!(columns.contains(&column.as_str()), "missing {column} for {reason:?}");
+        }
+    }
+
     /// Column order is the file's contract; pin it whole so a field reorder is a
     /// deliberate, reviewed change rather than a silent schema break. `library`
     /// leads; the filtering/dedup/diagnostics block matches the pre-per-library
-    /// schema; `percent_duplication` and `estimated_library_size` trail.
+    /// schema; `percent_duplication` and `estimated_library_size` follow, and the
+    /// per-reason `passthrough_*` breakdown is appended last so existing column
+    /// positions are unchanged.
     #[test]
     fn serializes_expected_columns_in_order() {
         assert_eq!(
@@ -469,7 +532,9 @@ mod tests {
              secondary_reads\tsupplementary_reads\tmissing_tc_tag\t\
              mapped_pairs\tduplicate_pairs\tmapped_orphans\tduplicate_orphans\t\
              unmapped_pairs\tunmapped_orphans\tunmated_templates\t\
-             percent_duplication\testimated_library_size"
+             percent_duplication\testimated_library_size\t\
+             passthrough_unmapped\tpassthrough_missing_umi\tpassthrough_ns_in_umi\t\
+             passthrough_umi_too_short"
         );
     }
 
@@ -548,7 +613,8 @@ mod tests {
         );
     }
 
-    /// `from_counts` copies the per-reason filter counts through unchanged, and
+    /// `from_counts` copies the per-reason filter counts through unchanged, derives
+    /// `passthrough_templates` as the sum of the `passthrough_*` reasons, and
     /// `ProcessingMetrics` reconciles input from them.
     #[test]
     fn from_counts_carries_filter_counts_through() {
@@ -558,7 +624,10 @@ mod tests {
             filtered_templates: 7,
             filtered_unmapped: 4,
             filtered_missing_umi: 3,
-            passthrough_templates: 2,
+            passthrough_unmapped: 2,
+            passthrough_missing_umi: 3,
+            passthrough_ns_in_umi: 4,
+            passthrough_umi_too_short: 5,
             total_templates: 90,
             unique_templates: 80,
             duplicate_templates: 10,
@@ -567,7 +636,11 @@ mod tests {
         assert_eq!(metrics.filtered_templates, 7);
         assert_eq!(metrics.filtered_unmapped, 4);
         assert_eq!(metrics.filtered_missing_umi, 3);
-        assert_eq!(metrics.passthrough_templates, 2);
+        assert_eq!(metrics.passthrough_templates, 14);
+        assert_eq!(metrics.passthrough_unmapped, 2);
+        assert_eq!(metrics.passthrough_missing_umi, 3);
+        assert_eq!(metrics.passthrough_ns_in_umi, 4);
+        assert_eq!(metrics.passthrough_umi_too_short, 5);
         assert_eq!(metrics.total_input(), 97);
         assert_eq!(metrics.total_filtered(), 7);
     }

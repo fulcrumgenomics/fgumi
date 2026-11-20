@@ -83,14 +83,40 @@ impl Default for TemplateFilterConfig {
 ///
 /// Returns `true` when the template should be kept. Every call records exactly
 /// one outcome — one accept or one rejection with a specific
-/// [`TemplateFilterReason`] — so the counts always reconcile.
+/// [`TemplateFilterReason`] — so the counts always reconcile. The decision itself
+/// is `check_template`; this only records it.
 pub fn filter_template(
     template: &Template,
     config: &TemplateFilterConfig,
     counts: &mut TemplateFilterCounts,
 ) -> bool {
-    // Primary-record count, recorded alongside the template count so `group` and
-    // `dedup` can render the same measurement in their respective units.
+    match check_template(template, config) {
+        Ok(primary_reads) => {
+            counts.record_accepted(primary_reads);
+            true
+        }
+        Err((reason, primary_reads)) => {
+            counts.record_rejected(reason, primary_reads);
+            false
+        }
+    }
+}
+
+/// Decides whether a template passes `config`, without recording anything.
+///
+/// Returns `Ok(primary_reads)` when the template is accepted, or
+/// `Err((reason, primary_reads))` naming the *first* check it fails, where
+/// `primary_reads` is the number of primary R1/R2 records present (the unit
+/// `group` reports its discards in). [`filter_template`] records exactly this
+/// outcome; callers that need to inspect the reason before deciding what to
+/// record (e.g. `dedup`'s `--include-invalid-umis` pass-through) call this
+/// directly and record the outcome themselves.
+pub(crate) fn check_template(
+    template: &Template,
+    config: &TemplateFilterConfig,
+) -> Result<u64, (TemplateFilterReason, u64)> {
+    // Primary-record count, returned with the outcome so the recorded counts let
+    // `group` and `dedup` render the same measurement in their respective units.
     let primary_reads = u64::from(template.r1().is_some()) + u64::from(template.r2().is_some());
 
     // Fail closed when *any* record (primary, secondary, or supplementary) is
@@ -99,35 +125,30 @@ pub fn filter_template(
     // malformed record silently dropped (and later panic in RawRecordView::new
     // on the dedup/serialize path).
     if template_has_malformed_record(template) {
-        counts.record_rejected(TemplateFilterReason::MalformedRecord, primary_reads);
-        return false;
+        return Err((TemplateFilterReason::MalformedRecord, primary_reads));
     }
 
     let raw_r1 = template.r1();
     let raw_r2 = template.r2();
 
     if raw_r1.is_none() && raw_r2.is_none() {
-        counts.record_rejected(TemplateFilterReason::NoPrimaryReads, primary_reads);
-        return false;
+        return Err((TemplateFilterReason::NoPrimaryReads, primary_reads));
     }
 
     if template_is_fully_unmapped(template) && !config.allow_unmapped {
-        counts.record_rejected(TemplateFilterReason::Unmapped, primary_reads);
-        return false;
+        return Err((TemplateFilterReason::Unmapped, primary_reads));
     }
 
     // Phase 1: Flag-based checks
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
         if !config.include_non_pf && raw.is_qc_fail() {
-            counts.record_rejected(TemplateFilterReason::NotPassingFilter, primary_reads);
-            return false;
+            return Err((TemplateFilterReason::NotPassingFilter, primary_reads));
         }
 
         if !raw.is_unmapped() {
             let mapq = fgumi_raw_bam::mapq(raw);
             if mapq < config.min_mapq {
-                counts.record_rejected(TemplateFilterReason::LowMappingQuality, primary_reads);
-                return false;
+                return Err((TemplateFilterReason::LowMappingQuality, primary_reads));
             }
         }
     }
@@ -147,8 +168,7 @@ pub fn filter_template(
         if let Some(mq) = found_mq
             && mq < i64::from(config.min_mapq)
         {
-            counts.record_rejected(TemplateFilterReason::LowMateMappingQuality, primary_reads);
-            return false;
+            return Err((TemplateFilterReason::LowMateMappingQuality, primary_reads));
         }
 
         // Skip UMI validation in no-umi mode
@@ -159,26 +179,22 @@ pub fn filter_template(
         if let Some(umi_bytes) = found_umi {
             match validate_umi(umi_bytes) {
                 UmiValidation::ContainsN => {
-                    counts.record_rejected(TemplateFilterReason::NsInUmi, primary_reads);
-                    return false;
+                    return Err((TemplateFilterReason::NsInUmi, primary_reads));
                 }
                 UmiValidation::Valid(base_count) => {
                     if let Some(min_len) = config.min_umi_length
                         && base_count < min_len
                     {
-                        counts.record_rejected(TemplateFilterReason::UmiTooShort, primary_reads);
-                        return false;
+                        return Err((TemplateFilterReason::UmiTooShort, primary_reads));
                     }
                 }
             }
         } else {
-            counts.record_rejected(TemplateFilterReason::MissingUmi, primary_reads);
-            return false;
+            return Err((TemplateFilterReason::MissingUmi, primary_reads));
         }
     }
 
-    counts.record_accepted(primary_reads);
-    true
+    Ok(primary_reads)
 }
 
 /// Scans a record's aux block once for both the `MQ` tag and the UMI tag.
