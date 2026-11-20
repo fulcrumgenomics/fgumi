@@ -16,7 +16,9 @@ use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_umi_family, create_umi_family_at_pos, to_record_buf,
+    INTERLEAVED_INSERT_END_FAMILIES, create_minimal_header, create_umi_family,
+    create_umi_family_at_pos, interleaved_insert_end_reads, rejected_and_plain_insert_end_reads,
+    to_record_buf, write_bam,
 };
 use crate::helpers::cli::run_and_capture_logs;
 use fgumi_lib::sam::SamTag;
@@ -1035,4 +1037,80 @@ fn group_with_flag_stamps_rw() {
             assert!(!w.reverse);
         }
     }
+}
+
+// ============================================================================
+// Single-end insert end from a `tc` tag on the primary
+// ============================================================================
+
+/// Single-end reads at one 5' position whose `tc` insert ends differ are separate
+/// molecules, even when interleaved in the input and sharing a UMI, on either strand.
+/// Reads of one insert end are not split, and untagged reads form their own molecule.
+/// The input passes `--verify`, so the interleaving is a legal template-coordinate order.
+#[rstest]
+#[case::threads_1(&["--threads", "1"])]
+#[case::threads_4(&["--threads", "4"])]
+#[case::no_umi(&["--no-umi"])]
+fn test_group_single_end_insert_end_from_tc_tag(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    write_bam(&input_bam, &create_minimal_header("chr1", 20000), &interleaved_insert_end_reads());
+
+    let mut args = extra.to_vec();
+    args.push("--verify");
+    let records = run_group_records(temp_dir.path(), "insert_end", &input_bam, &args);
+
+    let mi = fgumi_lib::sam::SamTag::MI.to_noodles_tag();
+    let mut families: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for record in &records {
+        let name = record.name().expect("record has a name").to_string();
+        let Some(noodles::sam::alignment::record_buf::data::field::Value::String(id)) =
+            record.data().get(&mi)
+        else {
+            panic!("record {name} has no MI:Z");
+        };
+        families.entry(id.to_string()).or_default().insert(name);
+    }
+    let actual: std::collections::BTreeSet<Vec<String>> =
+        families.into_values().map(|names| names.into_iter().collect()).collect();
+    let expected: std::collections::BTreeSet<Vec<String>> = INTERLEAVED_INSERT_END_FAMILIES
+        .iter()
+        .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+/// `group` warns once about the first rejected `tc` insert-end hint, naming the read and
+/// the reason, and logs the run's total of rejected hints (the 0-based and the two `B:S`
+/// tags, in two position groups). One-primary, legacy and absent tags are not hints, so are
+/// not counted.
+#[rstest]
+#[case::threads_1(&["--threads", "1"])]
+#[case::threads_4(&["--threads", "4"])]
+fn test_group_reports_rejected_insert_end_hints(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    write_bam(
+        &input_bam,
+        &create_minimal_header("chr1", 20000),
+        &rejected_and_plain_insert_end_reads(),
+    );
+
+    let mut args = vec!["--strategy", "identity", "--edits", "0"];
+    args.extend_from_slice(extra);
+    let stderr = run_and_capture_logs("group", &input_bam, &output_bam, &args);
+    let warnings: Vec<&str> =
+        stderr.lines().filter(|line| line.contains("Ignoring the tc insert-end hint")).collect();
+    assert_eq!(warnings.len(), 1, "one warning per run; got:\n{stderr}");
+    // Which rejected read is seen first depends on the order templates are built in.
+    let names_rejected_read = (warnings[0].contains("rejected_0based")
+        && warnings[0].contains("written 0-based"))
+        || (warnings[0].contains("_subtype") && warnings[0].contains("not a B:i array"));
+    assert!(names_rejected_read, "names a rejected read and its reason: {stderr}");
+    assert!(
+        stderr.contains("Rejected the tc insert-end hint on 3 single-end reads"),
+        "logs the total; got:\n{stderr}"
+    );
 }

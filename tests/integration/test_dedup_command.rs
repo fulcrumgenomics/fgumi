@@ -24,7 +24,10 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_bam_sorted;
-use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
+use crate::helpers::bam_generator::{
+    INTERLEAVED_INSERT_END_FAMILIES, create_minimal_header, interleaved_insert_end_reads,
+    rejected_and_plain_insert_end_reads, to_record_buf,
+};
 use crate::helpers::cli::run_and_capture_logs;
 
 /// Create a template-coordinate sorted BAM with UMI-tagged reads.
@@ -3305,5 +3308,95 @@ fn test_dedup_verify_rejects_coordinate_ordered_input() {
     assert!(
         format!("{err:#}").contains("template-coordinate sort order"),
         "error should name the ordering requirement, got: {err:#}",
+    );
+}
+
+/// Single-end reads at one 5' position whose `tc` insert ends differ are separate molecules,
+/// even when interleaved by name in the template-coordinate-sorted input and sharing a UMI,
+/// on either strand, with or without `--no-umi`. Reads of one insert end are not split,
+/// untagged reads form their own molecule, and each molecule keeps exactly one non-duplicate
+/// read.
+#[rstest]
+#[case::threads_1(&["--threads", "1"])]
+#[case::threads_4(&["--threads", "4"])]
+#[case::no_umi(&["--no-umi"])]
+fn test_dedup_single_end_insert_end_from_tc_tag(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, interleaved_insert_end_reads());
+
+    let mut command_line = vec![
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+        "--verify",
+    ];
+    command_line.extend_from_slice(extra);
+    let cmd = MarkDuplicates::try_parse_from(&command_line).expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("dedup should succeed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut by_mi: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut non_duplicates_by_mi: BTreeMap<String, usize> = BTreeMap::new();
+    for result in reader.record_bufs(&header) {
+        let record = result.expect("read record");
+        let name = String::from_utf8_lossy(record.name().expect("record has a name")).to_string();
+        let Some(Value::String(mi)) = record.data().get(&mi_tag) else {
+            panic!("record {name} has no MI:Z");
+        };
+        let mi = mi.to_string();
+        let non_duplicates = non_duplicates_by_mi.entry(mi.clone()).or_default();
+        if !record.flags().is_duplicate() {
+            *non_duplicates += 1;
+        }
+        by_mi.entry(mi).or_default().insert(name);
+    }
+    let actual: BTreeSet<BTreeSet<String>> = by_mi.into_values().collect();
+    let expected: BTreeSet<BTreeSet<String>> = INTERLEAVED_INSERT_END_FAMILIES
+        .iter()
+        .map(|names| names.iter().map(|name| (*name).to_string()).collect())
+        .collect();
+    assert_eq!(actual, expected);
+    for (mi, non_duplicates) in &non_duplicates_by_mi {
+        assert_eq!(*non_duplicates, 1, "molecule {mi} keeps exactly one non-duplicate read");
+    }
+}
+
+/// `dedup` warns once about the first rejected `tc` insert-end hint, naming the read and
+/// the reason, and logs the run's total of rejected hints (the 0-based and the two `B:S`
+/// tags, in two position groups). One-primary, legacy and absent tags are not hints, so are
+/// not counted.
+#[rstest]
+#[case::threads_1(&["--threads", "1"])]
+#[case::threads_4(&["--threads", "4"])]
+fn test_dedup_reports_rejected_insert_end_hints(#[case] extra: &[&str]) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    create_sorted_bam(&input_bam, rejected_and_plain_insert_end_reads());
+
+    let mut args = vec!["--strategy", "identity"];
+    args.extend_from_slice(extra);
+    let stderr = run_and_capture_logs("dedup", &input_bam, &output_bam, &args);
+    let warnings: Vec<&str> =
+        stderr.lines().filter(|line| line.contains("Ignoring the tc insert-end hint")).collect();
+    assert_eq!(warnings.len(), 1, "one warning per run; got:\n{stderr}");
+    // Which rejected read is seen first depends on the order templates are built in.
+    let names_rejected_read = (warnings[0].contains("rejected_0based")
+        && warnings[0].contains("written 0-based"))
+        || (warnings[0].contains("_subtype") && warnings[0].contains("not a B:i array"));
+    assert!(names_rejected_read, "names a rejected read and its reason: {stderr}");
+    assert!(
+        stderr.contains("Rejected the tc insert-end hint on 3 single-end reads"),
+        "logs the total; got:\n{stderr}"
     );
 }
