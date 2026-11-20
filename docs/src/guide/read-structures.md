@@ -24,7 +24,9 @@ Five kinds of operator are supported:
 
 - Any number of segments >= 1 is valid
 - The length of each segment must be a positive integer >= 1, or `+`
-- Only the last segment in a read structure may use `+` for its length
+- At most one segment in a read structure may use `+` for its length, and it may sit in any position (e.g. `+M70T`, `8B+M10T`); segments after the `+` are measured back from the end of the read
+- A `+` segment matches zero or more bases, so a read that holds only the fixed-length segments yields an empty `+` segment
+- A read structure with no `+` must match the read length exactly; reads that are longer or shorter are rejected
 - Adjacent segments may use the same operator (e.g. `6B6B+T` is valid if two sample indices are ligated separately)
 
 ## Examples
@@ -58,13 +60,14 @@ R1 contains two cell barcodes separated by linker sequences, then a UMI, then te
 ## Formal Grammar
 
 ```text
-<read-structure>     ::= <fixed-structure> <segment>
-<fixed-structure>    ::= "" | <fixed-length> <operator> <fixed-structure>
-<segment>            ::= <fixed-length> <operator> | <variable-length> <operator>
+<read-structure>     ::= <fixed-segments> <fixed-segment>
+                       | <fixed-segments> <variable-segment> <fixed-segments>
+<fixed-segments>     ::= "" | <fixed-segment> <fixed-segments>
+<fixed-segment>      ::= <fixed-length> <operator>
+<variable-segment>   ::= <variable-length> <operator>
 <operator>           ::= "T" | "B" | "M" | "C" | "S"
 <fixed-length>       ::= <non-zero-digit>{<digit>}
 <variable-length>    ::= "+"
-<any-length>         ::= <fixed-length> | <variable-length>
 <non-zero-digit>     ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
 <digit>              ::= "0" | <non-zero-digit>
 ```

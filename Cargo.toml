@@ -137,7 +137,7 @@ libmimalloc-sys = { workspace = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
 anyhow = { workspace = true }
-read-structure = "0.2.0" # held at 0.2 because 0.3 is a breaking API + behavior change (zero-length-read handling) that needs a dedicated migration PR
+read-structure = "0.3.0"
 bstr = { workspace = true }
 bytes = { workspace = true }
 fgoxide = { workspace = true }

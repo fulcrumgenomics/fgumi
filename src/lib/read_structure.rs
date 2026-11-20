@@ -1,16 +1,15 @@
 //! A local read-structure implementation that supports a `+` (any-length) segment in **any**
 //! position, matching fgbio 4.1.0's `ReadStructure` (PR #1157).
 //!
-//! # Why not the `read-structure` crate?
-//! fgumi depends on `read-structure = "0.2.0"`, which rejects a non-terminal `+` at parse time
-//! and, for a fully-fixed structure, silently ignores trailing bases on an over-long read. fgbio
-//! 4.1.0 does neither: it accepts a `+` anywhere (resolving segments after the `+` by walking
-//! back from the read end) and *requires* a fully-fixed structure to match the read length
-//! exactly. Bumping the crate to 0.3.0 would fix the first gap but change the trailing-`+`
-//! semantics from zero-or-more to one-or-more (a new parity break) and force a breaking API
-//! migration; the crate pin is therefore held at 0.2.0 and this module reimplements the parsing,
-//! offset, and length-validation logic faithfully to fgbio. The crate's [`SegmentType`] enum is
-//! reused as-is.
+//! # Why not the `read-structure` crate's `ReadStructure`?
+//! As of 0.3.0 the `read-structure` crate also accepts a `+` anywhere and rejects an over-long
+//! read against a fully-fixed structure, but its `ReadStructure::extract` requires the `+`
+//! segment to cover **at least one** base (`ReadTooShort` when the read holds only the fixed
+//! bases). fgbio's `+` is **zero-or-more**: a read that exactly fills the fixed segments yields an
+//! empty `+` segment. Using the crate's extraction would therefore turn reads that fgbio (and
+//! fgumi) extract today into errors, so this module keeps its own parsing, offset, and
+//! length-validation logic, written to match fgbio. Only the crate's [`SegmentType`] enum is
+//! reused.
 //!
 //! The model mirrors `fgbio` `com.fulcrumgenomics.util.ReadStructure`:
 //! - At most one segment may be indefinite-length (`+`); it may sit at any index.
@@ -418,6 +417,46 @@ mod tests {
         assert_eq!(structure.span_of(1, 10), (4, 10));
         // Zero-or-more: a read that only satisfies the fixed prefix yields an empty `+` segment.
         assert_eq!(structure.span_of(1, 4), (4, 4));
+    }
+
+    /// The `+` segment may sit at any index and absorbs whatever the fixed segments leave over.
+    ///
+    /// It is zero-or-more, as in fgbio: a read holding exactly the fixed bases is accepted and
+    /// yields an empty `+` span, wherever the `+` sits. The `read-structure` crate's own
+    /// `ReadStructure::extract` (0.3) rejects such reads as `ReadTooShort`; the `zero_width_*`
+    /// cases pin that fgumi keeps fgbio's behavior rather than the crate's.
+    #[rstest]
+    #[case::leading_plus("+T12M", 20, &[(0, 8), (8, 20)])]
+    #[case::middle_plus("8B+M10T", 25, &[(0, 8), (8, 15), (15, 25)])]
+    #[case::terminal_plus("10M+T", 25, &[(0, 10), (10, 25)])]
+    #[case::bare_plus("+T", 7, &[(0, 7)])]
+    #[case::zero_width_leading_plus("+T12M", 12, &[(0, 0), (0, 12)])]
+    #[case::zero_width_middle_plus("8B+M10T", 18, &[(0, 8), (8, 8), (8, 18)])]
+    #[case::zero_width_terminal_plus("10M+T", 10, &[(0, 10), (10, 10)])]
+    #[case::zero_width_bare_plus_empty_read("+T", 0, &[(0, 0)])]
+    fn plus_segment_spans_in_any_position(
+        #[case] structure: &str,
+        #[case] read_len: usize,
+        #[case] expected_spans: &[(usize, usize)],
+    ) {
+        let structure = rs(structure);
+        assert_eq!(structure.check_read_length(read_len), LengthCheck::Ok);
+        let spans: Vec<(usize, usize)> =
+            (0..structure.number_of_segments()).map(|i| structure.span_of(i, read_len)).collect();
+        assert_eq!(spans, expected_spans);
+    }
+
+    /// One base short of the fixed segments is still too few, wherever the `+` sits.
+    #[rstest]
+    #[case::leading_plus("+T12M", 11, 12)]
+    #[case::middle_plus("8B+M10T", 17, 18)]
+    #[case::terminal_plus("10M+T", 9, 10)]
+    fn read_shorter_than_fixed_segments_is_too_few(
+        #[case] structure: &str,
+        #[case] read_len: usize,
+        #[case] need: usize,
+    ) {
+        assert_eq!(rs(structure).check_read_length(read_len), LengthCheck::TooFew { need });
     }
 
     #[test]

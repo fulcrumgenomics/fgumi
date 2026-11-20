@@ -899,6 +899,34 @@ mod tests {
         assert_eq!(result.segments[2].seq, b"ACGTACGTAC"); // 10T from the read end
     }
 
+    /// Extraction with the `+` in any position, including a zero-width `+` (a read holding only
+    /// the fixed bases). fgbio's `+` is zero-or-more, so these reads extract with an empty `+`
+    /// segment rather than failing as too short.
+    #[rstest::rstest]
+    #[case::leading_plus("+M4T", b"AACCGGTT", &[(b"AACC" as &[u8], SegmentType::MolecularBarcode), (b"GGTT", SegmentType::Template)])]
+    #[case::middle_plus("2B+M3T", b"AACCGGT", &[(b"AA" as &[u8], SegmentType::SampleBarcode), (b"CC", SegmentType::MolecularBarcode), (b"GGT", SegmentType::Template)])]
+    #[case::zero_width_leading_plus("+M4T", b"GGTT", &[(b"" as &[u8], SegmentType::MolecularBarcode), (b"GGTT", SegmentType::Template)])]
+    #[case::zero_width_middle_plus("2B+M3T", b"AAGGT", &[(b"AA" as &[u8], SegmentType::SampleBarcode), (b"", SegmentType::MolecularBarcode), (b"GGT", SegmentType::Template)])]
+    #[case::zero_width_terminal_plus("4M+T", b"AACC", &[(b"AACC" as &[u8], SegmentType::MolecularBarcode), (b"", SegmentType::Template)])]
+    fn test_from_record_with_plus_in_any_position(
+        #[case] structure: &str,
+        #[case] seq: &[u8],
+        #[case] expected: &[(&[u8], SegmentType)],
+    ) {
+        let read_structure = ReadStructure::from_str(structure).expect("valid read structure");
+        let quals = vec![b'I'; seq.len()];
+        let result =
+            FastqSet::from_record_with_structure(b"rs03", seq, &quals, &read_structure, &[])
+                .expect("extraction should succeed");
+        assert_eq!(result.skip_reason, None);
+        let actual: Vec<(&[u8], SegmentType)> =
+            result.segments.iter().map(|s| (s.seq.as_slice(), s.segment_type)).collect();
+        assert_eq!(actual, expected);
+        for segment in &result.segments {
+            assert_eq!(segment.quals.len(), segment.seq.len());
+        }
+    }
+
     #[test]
     fn test_from_record_rejects_over_long_read_for_fixed_structure() {
         // fgbio requires an exact length for a fully-fixed structure; an over-long read is an
