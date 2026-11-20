@@ -801,9 +801,10 @@ pub struct RunAll {
     pub queue_memory: QueueMemoryOptions,
 
     /// Methylation chemistry (requires --ref). Drives methylation-aware
-    /// consensus calling. With `em-seq` on a chain that includes align, the
-    /// bwa-mem3 presets also align bisulfite-aware (`bwa-mem3 mem --meth`,
-    /// against a `bwa-mem3 index --meth` index); `taps` aligns plain.
+    /// consensus calling. On a chain that includes align, the bwa-mem3 presets
+    /// also align conversion-aware, against a `bwa-mem3 index --meth` index:
+    /// `bwa-mem3 mem --meth` for `em-seq` and `bwa-mem3 mem --meth=taps` for
+    /// `taps` (the `bwa` preset aligns `taps` plain and rejects `em-seq`).
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 
@@ -1005,7 +1006,7 @@ pub struct RunAll {
     /// consensus stage (`--stop-after consensus`, or `--start-from
     /// consensus`). With `--start-from filter --realign` it names the input's
     /// consensus type: `duplex` re-aligns with the plain preset under
-    /// `--methylation-mode em-seq`, and `simplex` or `codec` (single-strand input)
+    /// `--methylation-mode`, and `simplex` or `codec` (single-strand input)
     /// rejects filter's methylation options, which check nothing on unaligned
     /// single-strand reads; ignored otherwise. `duplex` requires
     /// `--strategy paired`. Selects which standalone caller's output the
@@ -1052,11 +1053,12 @@ pub struct RunAll {
     /// `--start-from consensus|filter` the input reads must already carry it
     /// (`rw`). Realign uses the same `--aligner::*` selection, `--aligner-bin`
     /// and `--ref` as the align stage, and needs them even when the run does
-    /// not align raw reads. Under `--methylation-mode em-seq`, duplex consensus
-    /// reads are re-aligned with the plain preset (their sequence is the
-    /// molecule's own), simplex ones bisulfite-aware; with `--start-from filter`,
-    /// pass `--consensus duplex` for duplex input. An `--aligner::command` runs as
-    /// written, so do not put `--meth` in it for duplex input. See `fgumi realign`.
+    /// not align raw reads. Under `--methylation-mode`, duplex consensus reads
+    /// are re-aligned with the plain preset (their sequence is the molecule's
+    /// own), simplex ones conversion-aware (`--meth`, or `--meth=taps`); with
+    /// `--start-from filter`, pass `--consensus duplex` for duplex input. An
+    /// `--aligner::command` runs as written, so do not put `--meth` in it for
+    /// duplex input. See `fgumi realign`.
     #[arg(long = "realign", default_value_t = false)]
     pub realign: bool,
 
@@ -1378,8 +1380,9 @@ impl RunAll {
     /// duplex consensus reads align with the plain (non-`--meth`) preset whatever
     /// `--methylation-mode` is. A duplex read's SEQ is the molecule's sequence
     /// (its methylation is carried by `MM`/`ML`), so, as the methylation guide
-    /// prescribes, it aligns with a standard aligner; simplex EM-seq consensus
-    /// keeps `--meth`. The raw-read align stage is unaffected.
+    /// prescribes, it aligns with a standard aligner; simplex consensus keeps
+    /// its conversions and so keeps `--meth` (EM-seq) or `--meth=taps` (TAPS).
+    /// The raw-read align stage is unaffected.
     ///
     /// # Errors
     ///
@@ -1411,9 +1414,9 @@ impl RunAll {
     /// - `--aligner::preset` and `--aligner::command` both unset, or both
     ///   set, or a preset-only flag paired with command mode, or preset-mode
     ///   index files missing, or a command-mode template missing `{ref}`, or
-    ///   `--methylation-mode em-seq` with the `bwa` preset or without the
-    ///   `bwa-mem3 index --meth` files (delegated to
-    ///   [`crate::aligner::AlignerOptions::resolve`]).
+    ///   `--methylation-mode em-seq` with the `bwa` preset, or a bwa-mem3 preset
+    ///   under `--methylation-mode` without the `bwa-mem3 index --meth` files
+    ///   (delegated to [`crate::aligner::AlignerOptions::resolve`]).
     pub(crate) fn validate_align_and_merge(
         &self,
         stages: &[crate::pipeline::chains::Stage],
@@ -1459,9 +1462,9 @@ impl RunAll {
         Ok(())
     }
 
-    /// The validated `--aligner::*` options, carrying `--methylation-mode` so,
-    /// under EM-seq, a preset aligns bisulfite-aware (bwa-mem3 `--meth`) for
-    /// the methylation consensus callers downstream. Both the up-front validation and the
+    /// The validated `--aligner::*` options, carrying `--methylation-mode` so a
+    /// bwa-mem3 preset aligns conversion-aware (bwa-mem3 `--meth`, or
+    /// `--meth=taps`) for the methylation consensus callers downstream. Both the up-front validation and the
     /// stage bag go through here, so they resolve the same aligner.
     ///
     /// # Errors
@@ -2098,12 +2101,12 @@ impl Command for RunAll {
         // is wired into the simplex/duplex consensus stages (see the
         // `simplex_opts`/`duplex_opts` bag population in
         // `build_stage_options_bag`; codec rejects it with its own message),
-        // filter's methylation filters, and, for EM-seq, a preset align
-        // (bisulfite-aware alignment; see `align_consumes_methylation` below).
+        // filter's methylation filters, and a bwa-mem3 preset align
+        // (conversion-aware alignment; see `align_consumes_methylation` below).
         // On a chain that reaches none of those (e.g. `group → group`,
-        // `correct → sort`, or a TAPS or command-mode align that stops before
-        // consensus) it is dead — silently ignored — so reject it rather than
-        // mislead.
+        // `correct → sort`, or a command-mode or TAPS `bwa` align that stops
+        // before consensus) it is dead — silently ignored — so reject it rather
+        // than mislead.
         let chain_reaches_consensus = stages.iter().any(|s| s.is_consensus());
         // The raw-read align stage or the `--realign` stage: both align with the
         // `--aligner::*` selection, need `--ref`, and are validated alike.
@@ -2206,28 +2209,33 @@ impl Command for RunAll {
                  the input is duplex consensus"
             );
         }
-        // A preset align consumes EM-seq too: it aligns bisulfite-aware
-        // (bwa-mem3 --meth). TAPS aligns plain, and `--aligner::command` runs
-        // its own command with its own flags, so neither consumes it. The
-        // `--realign` stage aligns duplex consensus plain whatever the mode (see
-        // `realign_align_options`), so it consumes EM-seq only for other input.
+        // A preset align consumes the mode too: the bwa-mem3 presets align
+        // conversion-aware (bwa-mem3 --meth, or --meth=taps). `bwa` aligns TAPS
+        // plain (EM-seq is consumed only to be rejected by its validation), and
+        // `--aligner::command` runs its own command with its own flags, so
+        // neither consumes TAPS. The `--realign` stage aligns duplex consensus
+        // plain whatever the mode (see `realign_align_options`), so it consumes
+        // the mode only for other input.
         let aligns_with_methylation = stages.contains(&Stage::Align)
             || (stages.contains(&Stage::Realign) && !self.realign_input_is_duplex(&stages));
-        let align_consumes_methylation = aligns_with_methylation
-            && self.aligner_opts.aligner_preset.is_some()
-            && matches!(
-                self.methylation_mode,
-                Some(crate::commands::common::MethylationModeArg::EmSeq)
-            );
+        let mode = crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+        let preset = self.aligner_opts.aligner_preset;
+        let align_consumes_methylation =
+            aligns_with_methylation && preset.is_some_and(|p| p.consumes_methylation(mode));
+        // Narrower: the align actually runs conversion-aware (a bwa-mem3 preset).
+        // `bwa` under EM-seq consumes the mode only to be rejected by validation.
+        let align_is_conversion_aware =
+            aligns_with_methylation && preset.is_some_and(|p| p.meth_flag(mode).is_some());
         let chain_consumes_methylation =
             chain_reaches_consensus || filter_consumes_methylation || align_consumes_methylation;
         if self.methylation_mode.is_some() && !chain_consumes_methylation {
             bail!(
                 "--methylation-mode is consumed only by the consensus stages, filter's \
                  methylation filters (--min-conversion-fraction, --min-methylation-depth, \
-                 --require-strand-methylation-agreement), and, for em-seq, a preset align \
-                 (--aligner::preset, which aligns bisulfite-aware); it is dead on a runall chain \
-                 that reaches none of them"
+                 --require-strand-methylation-agreement), and a bwa-mem3 preset align \
+                 (--aligner::preset bwa-mem3 or bwa-mem3-inproc, which aligns \
+                 conversion-aware; the bwa preset aligns taps reads plain, so does not \
+                 consume it); it is dead on a runall chain that reaches none of them"
             );
         }
 
@@ -2275,20 +2283,18 @@ impl Command for RunAll {
         }
 
         // `--start-from filter --realign` cannot see whether its consensus input is
-        // simplex or duplex; under EM-seq it re-aligns bisulfite-aware unless
-        // `--consensus duplex` says the input is duplex.
+        // simplex or duplex; under `--methylation-mode` a bwa-mem3 preset re-aligns
+        // conversion-aware unless `--consensus duplex` says the input is duplex.
         if self.realign
             && !chain_reaches_consensus
             && self.consensus_mode.is_none()
-            && matches!(
-                self.methylation_mode,
-                Some(crate::commands::common::MethylationModeArg::EmSeq)
-            )
+            && align_is_conversion_aware
         {
             log::warn!(
-                "--realign with --start-from filter and --methylation-mode em-seq re-aligns the \
-                 consensus reads bisulfite-aware, which suits simplex consensus; if the input is \
-                 duplex consensus, pass --consensus duplex so it aligns with the plain preset"
+                "--realign with --start-from filter and --methylation-mode re-aligns the \
+                 consensus reads conversion-aware (bwa-mem3 --meth or --meth=taps), which suits simplex \
+                 consensus; if the input is duplex consensus, pass --consensus duplex so it \
+                 aligns with the plain preset"
             );
         }
 
@@ -2780,12 +2786,12 @@ mod execute_tests {
         assert!(e.contains("dead on a runall chain"), "guard should reject the inert flag: {e}");
     }
 
-    /// On a chain that aligns but reaches neither consensus nor filter, a preset
-    /// align consumes `--methylation-mode em-seq` (it aligns with bwa-mem3
-    /// `--meth`), so the dead-flag guard lets it through and the run fails
-    /// later, at the missing `.dict`. TAPS aligns plain, and a command-mode
-    /// align never reads the mode (the command picks its own flags), so there
-    /// the flag is dead.
+    /// On a chain that aligns but reaches neither consensus nor filter, a
+    /// bwa-mem3 preset align consumes `--methylation-mode` (it aligns with
+    /// bwa-mem3 `--meth` or `--meth=taps`), so the dead-flag guard lets it
+    /// through and the run fails later, at the missing `.dict`. The `bwa` preset
+    /// aligns TAPS plain, and a command-mode align never reads the mode (the
+    /// command picks its own flags), so there the flag is dead.
     #[rstest::rstest]
     #[case::emseq_preset_aligns_bisulfite_aware(
         &["--aligner::preset", "bwa-mem3"],
@@ -2797,9 +2803,19 @@ mod execute_tests {
         "em-seq",
         "no sequence-dictionary file"
     )]
-    #[case::taps_preset_aligns_plain(&["--aligner::preset", "bwa-mem3"], "taps", "dead on a runall chain")]
-    #[case::taps_inproc_preset_aligns_plain(
+    #[case::taps_preset_aligns_meth_taps(
+        &["--aligner::preset", "bwa-mem3"],
+        "taps",
+        "no sequence-dictionary file"
+    )]
+    #[case::taps_inproc_preset_aligns_meth_taps(
         &["--aligner::preset", "bwa-mem3-inproc"],
+        "taps",
+        "no sequence-dictionary file"
+    )]
+    #[case::taps_bwa_preset_aligns_plain(&["--aligner::preset", "bwa"], "taps", "dead on a runall chain")]
+    #[case::taps_command_mode_ignores_it(
+        &["--aligner::command", "bwa-mem3 mem --meth=taps -p {ref} /dev/stdin"],
         "taps",
         "dead on a runall chain"
     )]
@@ -2808,7 +2824,14 @@ mod execute_tests {
         "em-seq",
         "dead on a runall chain"
     )]
-    fn align_chain_consumes_methylation_mode_for_emseq_presets_only(
+    // `bwa` under EM-seq is consumed (to be rejected by its validation, which
+    // runs after the `.dict` check), not dead.
+    #[case::emseq_bwa_preset_is_not_dead(
+        &["--aligner::preset", "bwa"],
+        "em-seq",
+        "no sequence-dictionary file"
+    )]
+    fn align_chain_consumes_methylation_mode_for_bwa_mem3_presets(
         #[case] aligner: &[&str],
         #[case] mode: &str,
         #[case] expected: &str,
@@ -4216,44 +4239,49 @@ mod realign_tests {
         assert_eq!(warned, warns);
     }
 
-    /// Under `--methylation-mode em-seq`, the realign stage aligns duplex
-    /// consensus reads with the plain preset (their SEQ is the molecule's
-    /// sequence) and simplex consensus reads bisulfite-aware; the raw-read align
-    /// stage keeps EM-seq either way. With `--start-from filter`, `--consensus`
-    /// says what the input consensus is.
+    /// Under `--methylation-mode` (EM-seq or TAPS), the realign stage aligns
+    /// duplex consensus reads with the plain preset (their SEQ is the molecule's
+    /// sequence) and simplex consensus reads, which keep their conversions,
+    /// conversion-aware; the raw-read align stage keeps the mode either way.
+    /// With `--start-from filter`, `--consensus` says what the input consensus is.
     #[rstest]
     #[case::simplex(&[
         "--start-from", "group", "--stop-after", "consensus", "--consensus", "simplex",
         "--group::strategy", "adjacency", "--simplex::min-reads", "1",
-    ], MethylationMode::EmSeq, None)]
+    ], true, false)]
     #[case::duplex(&[
         "--start-from", "group", "--stop-after", "consensus", "--consensus", "duplex",
         "--group::strategy", "paired", "--duplex::min-reads", "1",
-    ], MethylationMode::Disabled, None)]
+    ], false, false)]
     #[case::duplex_with_raw_align(&[
         "--start-from", "align", "--stop-after", "consensus", "--consensus", "duplex",
         "--group::strategy", "paired", "--duplex::min-reads", "1",
-    ], MethylationMode::Disabled, Some(MethylationMode::EmSeq))]
+    ], false, true)]
     #[case::simplex_with_raw_align(&[
         "--start-from", "align", "--stop-after", "consensus", "--consensus", "simplex",
         "--group::strategy", "adjacency", "--simplex::min-reads", "1",
-    ], MethylationMode::EmSeq, Some(MethylationMode::EmSeq))]
+    ], true, true)]
     #[case::filter_duplex(&[
         "--start-from", "filter", "--stop-after", "filter", "--consensus", "duplex",
         "--filter::min-reads", "1",
-    ], MethylationMode::Disabled, None)]
+    ], false, false)]
     #[case::filter_unspecified(&[
         "--start-from", "filter", "--stop-after", "filter", "--filter::min-reads", "1",
-    ], MethylationMode::EmSeq, None)]
+    ], true, false)]
     fn realign_aligns_duplex_consensus_without_meth(
         #[case] args: &[&str],
-        #[case] realign_mode: MethylationMode,
-        #[case] align_mode: Option<MethylationMode>,
+        #[case] realign_keeps_mode: bool,
+        #[case] aligns_raw_reads: bool,
+        #[values(("em-seq", MethylationMode::EmSeq), ("taps", MethylationMode::Taps))] mode: (
+            &str,
+            MethylationMode,
+        ),
     ) {
+        let (mode_arg, mode) = mode;
         let mut args = args.to_vec();
         args.extend_from_slice(&[
             "--methylation-mode",
-            "em-seq",
+            mode_arg,
             "--ref",
             "ref.fa",
             "--aligner::preset",
@@ -4263,8 +4291,74 @@ mod realign_tests {
         let r = parse_io(&args);
         let stages = r.derive_stages().unwrap();
         let bag = r.build_stage_options_bag(&stages).unwrap();
+        let realign_mode = if realign_keeps_mode { mode } else { MethylationMode::Disabled };
         assert_eq!(bag.realign.unwrap().align.aligner.methylation_mode, realign_mode);
+        let align_mode = aligns_raw_reads.then_some(mode);
         assert_eq!(bag.aligner.map(|a| a.aligner.methylation_mode), align_mode);
+    }
+
+    /// `--start-from filter --realign` cannot tell simplex from duplex input, so
+    /// when a bwa-mem3 preset would re-align conversion-aware it warns to pass
+    /// `--consensus duplex` for duplex input; an `--aligner::command` runs as
+    /// written and `--consensus` settles it, so neither warns. Nor does the `bwa`
+    /// preset, which aligns TAPS plain and is rejected for EM-seq.
+    #[rstest]
+    #[case::emseq_preset("em-seq", &["--aligner::preset", "bwa-mem3"], true)]
+    #[case::taps_preset("taps", &["--aligner::preset", "bwa-mem3"], true)]
+    #[case::taps_duplex(
+        "taps",
+        &["--aligner::preset", "bwa-mem3", "--consensus", "duplex",
+          "--filter::min-methylation-depth", "1"],
+        false
+    )]
+    #[case::taps_command(
+        "taps",
+        &["--aligner::command", "bwa-mem3 mem --meth=taps -p {ref} /dev/stdin",
+          "--filter::min-methylation-depth", "1"],
+        false
+    )]
+    #[case::emseq_command(
+        "em-seq",
+        &["--aligner::command", "bwa-mem3 mem --meth -p {ref} /dev/stdin",
+          "--filter::min-methylation-depth", "1"],
+        false
+    )]
+    #[case::taps_bwa_preset(
+        "taps",
+        &["--aligner::preset", "bwa", "--filter::min-methylation-depth", "1"],
+        false
+    )]
+    // Consumed by the align (which its validation rejects, after the `.dict`
+    // check this test stops at), so it needs no filter option to pass the guard.
+    #[case::emseq_bwa_preset("em-seq", &["--aligner::preset", "bwa"], false)]
+    fn start_from_filter_realign_warns_when_input_type_is_unknown(
+        #[case] mode: &str,
+        #[case] extra: &[&str],
+        #[case] warns: bool,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let mut args = vec![
+            "--start-from",
+            "filter",
+            "--stop-after",
+            "filter",
+            "--filter::min-reads",
+            "1",
+            "--methylation-mode",
+            mode,
+            "--ref",
+            "ref.fa",
+            "--realign",
+        ];
+        args.extend_from_slice(extra);
+        let r = parse_io(&args);
+        let _session = capture_logs();
+        let err = format!("{:#}", r.execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(PAST_VALIDATION), "{err}");
+        let warned =
+            captured().iter().any(|line| line.contains("pass --consensus duplex so it aligns"));
+        assert_eq!(warned, warns);
     }
 
     /// A `--sort::order` the user passed that the chain's sorts override is
