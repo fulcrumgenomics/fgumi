@@ -482,8 +482,8 @@ pub struct GroupReadsByUmi {
     pub metrics: Option<PathBuf>,
 
     /// Minimum mapping quality for mapped reads
-    #[arg(short = 'm', long = "min-map-q")]
-    pub min_map_q: Option<u8>,
+    #[arg(short = 'm', long = "min-map-q", default_value_t = 1)]
+    pub min_map_q: u8,
 
     /// Include non-PF reads
     #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
@@ -652,12 +652,11 @@ pub struct GroupReadsByUmi {
 /// `--group::<flag>`, via the generated `MultiGroupOptions` companion, without
 /// hand-maintaining a parallel option set.
 ///
-/// Two fields hold *resolved* values rather than raw flags, because grouping
-/// cannot be configured from the raw ones alone: `min_map_q` applies the
-/// default that [`GroupReadsByUmi`] would otherwise apply at run time, and
-/// `effective_strategy` / `effective_edits` carry the `--no-umi` and
-/// identity-implies-zero-edits rules. Both come from the same methods
-/// `execute` uses, so the command and the chain builder cannot drift apart.
+/// `effective_strategy` / `effective_edits` hold *resolved* values rather than
+/// raw flags, because grouping cannot be configured from the raw ones alone:
+/// they carry the `--no-umi` and identity-implies-zero-edits rules. They come
+/// from the same method `execute` uses, so the command and the chain builder
+/// cannot drift apart.
 #[fgumi_cli_macros::multi_options("group", "Group Options")]
 #[derive(Debug, Clone, clap::Args)]
 #[allow(clippy::struct_excessive_bools)] // mirrors the CLI flags 1:1; each bool is a distinct option
@@ -785,12 +784,6 @@ impl GroupOptions {
 }
 
 impl GroupReadsByUmi {
-    /// The minimum mapping quality to apply, defaulting when the flag is absent.
-    #[must_use]
-    pub fn resolved_min_map_q(&self) -> u8 {
-        self.min_map_q.unwrap_or(1)
-    }
-
     /// Resolve the strategy and edit distance grouping will actually use.
     ///
     /// `--no-umi` forces identity grouping, and identity grouping requires an
@@ -811,7 +804,7 @@ impl GroupReadsByUmi {
     pub fn to_group_options(&self) -> GroupOptions {
         let (effective_strategy, effective_edits) = self.resolve_strategy_and_edits();
         GroupOptions {
-            min_map_q: self.resolved_min_map_q(),
+            min_map_q: self.min_map_q,
             include_non_pf_reads: self.include_non_pf_reads,
             allow_unmapped: self.allow_unmapped,
             strategy: self.strategy,
@@ -1158,26 +1151,17 @@ mod tests {
         assert_eq!(o.resolve_strategy_and_edits(), expected);
     }
 
-    /// `--min-map-q` is optional on the command line but not optional for
-    /// grouping, so the projection applies the same default `execute` does.
+    /// `--min-map-q` defaults to 1 when absent, and an explicit 0 is honored.
     #[rstest]
-    #[case::absent_defaults_to_one(None, 1)]
-    #[case::zero_is_honored_not_treated_as_absent(Some(0), 0)]
-    #[case::explicit_value(Some(30), 30)]
-    fn resolved_min_map_q_applies_the_default(#[case] flag: Option<u8>, #[case] expected: u8) {
-        let mut cmd = GroupReadsByUmi::try_parse_from([
-            "group",
-            "-i",
-            "in.bam",
-            "-o",
-            "out.bam",
-            "-s",
-            "adjacency",
-        ])
-        .expect("parses");
-        cmd.min_map_q = flag;
+    #[case::absent_defaults_to_one(&[], 1)]
+    #[case::zero_is_honored(&["--min-map-q", "0"], 0)]
+    #[case::explicit_value(&["--min-map-q", "30"], 30)]
+    fn min_map_q_defaults_to_one(#[case] extra: &[&str], #[case] expected: u8) {
+        let mut args = vec!["group", "-i", "in.bam", "-o", "out.bam", "-s", "adjacency"];
+        args.extend_from_slice(extra);
+        let cmd = GroupReadsByUmi::try_parse_from(args).expect("parses");
 
-        assert_eq!(cmd.resolved_min_map_q(), expected);
+        assert_eq!(cmd.min_map_q, expected);
     }
 
     /// Every tuning flag must survive the projection into [`GroupOptions`].
@@ -1247,9 +1231,8 @@ mod tests {
     /// The projection must carry defaults faithfully too — a field hard-coded to
     /// the value the non-default test happens to pass would slip through it.
     ///
-    /// `min_map_q` is the interesting one: the CLI holds `Option<u8>` and the
-    /// projection resolves the absent case to 1, so this pins the resolution
-    /// rather than the raw flag.
+    /// `min_map_q` is the interesting one: its CLI default (1) must reach the
+    /// projection unchanged.
     #[test]
     fn to_group_options_carries_defaults() {
         let cmd = GroupReadsByUmi::try_parse_from([
@@ -1640,7 +1623,7 @@ mod tests {
             family_size_histogram: None,
             grouping_metrics: None,
             metrics: None,
-            min_map_q: None,
+            min_map_q: 1,
             include_non_pf_reads: false,
             verify: false,
             realign_window: false,
@@ -2143,7 +2126,7 @@ mod tests {
                 check_crc: false,
                 no_check_crc: false,
             },
-            min_map_q: Some(30),
+            min_map_q: 30,
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -2234,7 +2217,7 @@ mod tests {
                 check_crc: false,
                 no_check_crc: false,
             },
-            min_map_q: Some(30),
+            min_map_q: 30,
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -2823,7 +2806,7 @@ mod tests {
                 no_check_crc: false,
             },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
-            min_map_q: Some(30),
+            min_map_q: 30,
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -5253,7 +5236,7 @@ mod tests {
                 check_crc: false,
                 no_check_crc: false,
             },
-            min_map_q: Some(20), // Filter reads with mapq < 20
+            min_map_q: 20, // Filter reads with mapq < 20
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -5410,7 +5393,7 @@ mod tests {
                 check_crc: false,
                 no_check_crc: false,
             },
-            min_map_q: Some(30), // Threshold is 30, "bad" pair has MAPQ=10
+            min_map_q: 30, // Threshold is 30, "bad" pair has MAPQ=10
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -5835,7 +5818,7 @@ mod tests {
                 no_check_crc: false,
             },
             threading: ThreadingOptions::new(4),
-            min_map_q: Some(30),
+            min_map_q: 30,
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -6457,7 +6440,7 @@ mod tests {
                 no_check_crc: false,
             },
             allow_unmapped,
-            min_map_q: Some(0),
+            min_map_q: 0,
             ..test_group_cmd(Strategy::Identity, 0)
         };
 

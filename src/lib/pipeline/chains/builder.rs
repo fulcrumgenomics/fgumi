@@ -7362,7 +7362,7 @@ impl<'a> ChainBuilder<'a> {
 
         info!("Strategy: {effective_strategy:?}");
 
-        let min_mapq: u8 = dedup.min_map_q.unwrap_or(0);
+        let min_mapq: u8 = dedup.min_map_q;
         let effective_edits =
             if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
                 0
