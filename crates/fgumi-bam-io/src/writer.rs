@@ -660,9 +660,8 @@ impl BaiBuilder {
 
     /// Build the final BAI index.
     ///
-    /// The index is compacted (see `compact_bai_index`) so its on-disk size
-    /// matches what htslib/samtools produce; noodles' `Indexer` alone emits a
-    /// spec-valid but far larger index (see that function for why).
+    /// The index is compacted (see `compact_bai_index`) so its binning matches
+    /// what htslib/samtools produce (see that function for why).
     ///
     /// # Errors
     /// Returns an error if any record remains unresolved (its block position was
@@ -700,15 +699,21 @@ impl Default for BaiBuilder {
 const HTS_MIN_MARKER_DIST: u64 = 0x1_0000;
 
 /// Compact a freshly built BAI index the way htslib's `compress_binning`
-/// (`hts.c`) does — a finalization step noodles' `Indexer` does not perform.
+/// (`hts.c`) does.
 ///
-/// noodles builds a spec-valid index but, for dense short-read data, one that
-/// is roughly an order of magnitude larger than samtools': it keeps a distinct
-/// bin at every level down to the 16 KiB leaves (redundant with the linear
-/// index it also stores) and merges only exactly-adjacent chunks. htslib folds
-/// the small fine-grained bins into their parents and merges every chunk that
-/// shares a BGZF block, then relies on the linear index for finer lookup. This
-/// reproduces that pass on the built index.
+/// Without compaction, an index for dense short-read data is roughly an order
+/// of magnitude larger than samtools': it keeps a distinct bin at every level
+/// down to the 16 KiB leaves (redundant with the linear index it also stores)
+/// and merges only exactly-adjacent chunks. htslib folds the small fine-grained
+/// bins into their parents and merges every chunk that shares a BGZF block,
+/// then relies on the linear index for finer lookup. This reproduces that pass
+/// on the built index.
+///
+/// Since noodles-csi 0.61, noodles' `Indexer::build` performs an equivalent
+/// fold and merge itself, but emits bins in descending bin-number order. This
+/// pass is idempotent on that output, so it is kept: it pins the htslib
+/// semantics independently of noodles and emits bins in ascending order, which
+/// keeps the `.bai` byte-identical to what earlier noodles versions produced.
 ///
 /// Only the binning index changes: the linear index, metadata, and header are
 /// carried over untouched (htslib leaves them alone here too), so region
@@ -1127,8 +1132,17 @@ pub fn bai_sidecar_path<P: AsRef<Path>>(bam_path: P) -> PathBuf {
 pub fn write_bai_sidecar<P: AsRef<Path>>(bam_path: P) -> Result<PathBuf> {
     let bam_path = bam_path.as_ref();
 
-    let index = noodles::bam::fs::index(bam_path)
-        .with_context(|| format!("Failed to index {}", bam_path.display()))?;
+    let index = match noodles::bam::fs::index(bam_path)
+        .with_context(|| format!("Failed to index {}", bam_path.display()))?
+    {
+        noodles::bam::Index::Bai(index) => index,
+        // noodles returns a CSI only when a reference sequence is longer than BAI's
+        // 2^29 limit, which a `.bai` sidecar cannot represent.
+        noodles::bam::Index::Csi(_) => anyhow::bail!(
+            "Cannot write a BAI for {}: a reference sequence is longer than 2^29 bp",
+            bam_path.display()
+        ),
+    };
 
     let index_path = bai_sidecar_path(bam_path);
     write_bai_index(&index_path, &index)
@@ -2141,6 +2155,48 @@ mod tests {
         assert_ne!(bai_sidecar_path("foo.sorted"), bai_sidecar_path("foo.other"));
     }
 
+    /// CSI-only headers must not overwrite an existing BAI sidecar.
+    #[rstest::rstest]
+    #[case::bai_limit(1 << 29, false)]
+    #[case::requires_csi((1 << 29) + 1, true)]
+    fn test_write_bai_sidecar_reference_limit(
+        #[case] reference_length: usize,
+        #[case] expect_error: bool,
+    ) {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bam_path = dir.path().join("input.bam");
+        let index_path = dir.path().join("input.bam.bai");
+        let mut header: noodles::sam::Header = "@HD\tVN:1.6\tSO:coordinate\n".parse().unwrap();
+        header.reference_sequences_mut().insert(
+            "chr1".into(),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(reference_length).unwrap()),
+        );
+        let mut writer = noodles::bam::io::Writer::new(File::create(&bam_path).unwrap());
+        writer.write_header(&header).unwrap();
+        writer.into_inner().finish().unwrap();
+        std::fs::write(&index_path, b"previous index").unwrap();
+
+        let result = write_bai_sidecar(&bam_path);
+        if expect_error {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!(
+                    "Cannot write a BAI for {}: a reference sequence is longer than 2^29 bp",
+                    bam_path.display()
+                )
+            );
+            assert_eq!(std::fs::read(index_path).unwrap(), b"previous index");
+        } else {
+            assert_eq!(result.unwrap(), index_path);
+            let index = noodles::bam::bai::fs::read(index_path).unwrap();
+            assert_eq!(index.reference_sequences().len(), 1);
+            assert!(index.reference_sequences()[0].bins().is_empty());
+        }
+    }
+
     /// The persisted `.bai` sidecar lands at the umask-respecting mode a plain
     /// `File::create` produces, not the owner-only `0o600` the staging
     /// `NamedTempFile` starts with. Compared against a live `File::create` so it
@@ -2267,26 +2323,21 @@ mod tests {
         // 4681; one read straddling the 16 KiB boundary lands in parent bin 585
         // (so the parent exists). All chunks sit in one compressed block, so the
         // leaf's span is tiny and must fold.
-        let mut indexer = Indexer::<LinearIndex>::default();
-        let context = |start: usize, end: usize| {
-            Some((0usize, Position::new(start).unwrap(), Position::new(end).unwrap(), true))
-        };
-        for i in 0..10u16 {
-            let start = vpos(100, i * 20);
-            let end = vpos(100, i * 20 + 20);
-            let pos = usize::from(i) * 30 + 1;
-            indexer.add_record(context(pos, pos + 149), Chunk::new(start, end)).unwrap();
-        }
-        // Boundary-spanning read -> parent bin 585, later in the file.
-        indexer
-            .add_record(context(16_300, 16_449), Chunk::new(vpos(100, 250), vpos(100, 300)))
-            .unwrap();
-
-        let index = indexer.build(1);
-        assert!(
-            index.reference_sequences()[0].bins().contains_key(&4681),
-            "sanity: the uncompacted noodles index keeps the 16 KiB leaf bin",
+        //
+        // The uncompacted index is built by hand: noodles' `Indexer::build` (since
+        // noodles-csi 0.61) already folds small bins itself, so it can no longer
+        // produce the input this test needs.
+        let leaf_chunks: Vec<Chunk> =
+            (0..10u16).map(|i| Chunk::new(vpos(100, i * 20), vpos(100, i * 20 + 20))).collect();
+        let parent_chunks = vec![Chunk::new(vpos(100, 250), vpos(100, 300))];
+        let bins =
+            [(4681, Bin::new(leaf_chunks)), (585, Bin::new(parent_chunks))].into_iter().collect();
+        let reference_sequence = noodles_csi::binning_index::index::ReferenceSequence::new(
+            bins,
+            LinearIndex::default(),
+            None,
         );
+        let index = bai::Index::builder().set_reference_sequences(vec![reference_sequence]).build();
 
         let index = compact_bai_index(&index);
         let reference_sequences = index.reference_sequences();

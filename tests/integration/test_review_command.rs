@@ -58,7 +58,9 @@ fn create_indexed_bam(path: &Path, records: &[RawRecord]) -> PathBuf {
     }
 
     let index_path = appended_bai_path(path);
-    let index = bam::fs::index(path).expect("Failed to create BAM index");
+    let bam::Index::Bai(index) = bam::fs::index(path).expect("Failed to create BAM index") else {
+        panic!("expected a BAI index");
+    };
     let mut index_writer =
         noodles::bam::bai::io::Writer::new(fs::File::create(&index_path).unwrap());
     index_writer.write_index(&index).expect("Failed to write BAM index");
