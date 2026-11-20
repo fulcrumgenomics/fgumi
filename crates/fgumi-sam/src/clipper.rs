@@ -731,16 +731,20 @@ impl RawRecordClipper {
         let clipped_r1 = self.clip_end_of_read_raw(r1, r1_existing + r1_bases_to_clip);
         // The negative-strand read keeps reference positions after the midpoint. When the
         // midpoint is its last aligned position — reachable only when its alignment end
-        // coincides with the positive-strand read's start, a 5' tie classified FR (htsjdk 5.0.0
-        // `getPairOrientation`) — fgbio's `mate.readPosAtRefPos(midPoint + 1)` falls past the
-        // alignment and returns 0, so it clips `leadingHardClippedBases + 0` bases: a no-op that
-        // neither clips nor upgrades clipping. Mirror that rather than clipping its whole
-        // alignment away.
-        let clipped_r2 = if midpoint < r2_end {
-            self.clip_start_of_read_raw(r2, r2_existing + r2_bases_to_clip)
+        // coincides with the positive-strand read's start (the overlap check above rules out
+        // `r1_start > r2_end`) — no base of it lies after the midpoint, so the whole read is
+        // clipped, which unmaps it as any clip that removes every aligned base does. This
+        // deliberately departs from fgbio main, whose `clipOverlappingReads` leaves the reverse
+        // read unclipped here (and which #1022 mirrored); fulcrumgenomics/fgbio#1191 (open)
+        // proposes the same change.
+        let r2_clip_length = if midpoint < r2_end {
+            r2_existing + r2_bases_to_clip
         } else {
-            0
+            let leading_hard: usize =
+                r2_ops.iter().take_while(|&&op| op & 0xF == 5).map(|&op| (op >> 4) as usize).sum();
+            leading_hard + r2.l_seq() as usize
         };
+        let clipped_r2 = self.clip_start_of_read_raw(r2, r2_clip_length);
 
         // Map clip counts back to the caller's original (r1, r2) argument order.
         if swapped { (clipped_r2, clipped_r1) } else { (clipped_r1, clipped_r2) }
@@ -2593,28 +2597,20 @@ mod tests {
     /// and 359 on fgbio main; the HEK293T geometry of fgumi #505): 129 bp reads, forward
     /// `68S53M8S` @ 96 (aligned 96..148), reverse `28S48M53S` @ 49 (aligned 49..96). The reverse
     /// read's aligned end equals the forward read's aligned start, a 5' tie that htsjdk 5.0.0
-    /// `SamPairUtil.getPairOrientation` (`SamPairUtil.java:136`, `<=`) classifies FR, so fgbio
-    /// clips it.
+    /// `SamPairUtil.getPairOrientation` (`SamPairUtil.java:136`, `<=`) classifies FR.
     ///
-    /// Expected results, tracing fgbio `SamRecordClipper.clipOverlappingReads`
-    /// (SamRecordClipper.scala:302-325) with `rec` = forward, `mate` = reverse:
-    /// - `matesOverlap`: mate 49..96 overlaps rec 96..148 at 96; `isFrPair` is FR (96 <= 96).
-    /// - `midPoint = (rec.start + mate.end) / 2 = (96 + 96) / 2 = 96`; within `[mate.start,
-    ///   rec.end]`, so unclamped.
+    /// Expected results, tracing fgbio `SamRecordClipper.clipOverlappingReads` as proposed in
+    /// fulcrumgenomics/fgbio#1191 (open; fgbio main leaves the reverse read unclipped), with
+    /// `rec` = forward, `mate` = reverse:
+    /// - `midPoint = (rec.start + mate.end) / 2 = (96 + 96) / 2 = 96`, the mate's last aligned
+    ///   base.
     /// - `readEnd = rec.readPosAtRefPos(96) = 69` (68 soft-clipped bases + 1), so the forward
-    ///   read gets `clipEndOfRead(rec, 0 + 129 - 69 = 60)`: 8 bases are already clipped, so
-    ///   `clipEndOfAlignment` clips 52 more and returns 52. `clip` then folds the existing 8S and
-    ///   the new 52 into one 60-base clip: `68S1M60S` (soft), `68S1M60H` (hard, the existing soft
-    ///   clip converted too), or `68S1M60S` with all 60 masked (soft-with-mask, which masks
-    ///   "both the existing and new soft clipped bases").
-    /// - `mateStart = mate.readPosAtRefPos(97)`: 97 is past the mate's alignment end, so htsjdk
-    ///   returns 0 for both `returnLastBaseIfDeleted` values and `mateStart = 0 + 1 = 1`. The
-    ///   mate gets `clipStartOfRead(mate, 0 + 1 - 1 = 0)`, which reaches `upgradeClipping(mate,
-    ///   0, ..)`, a no-op in every mode (its `length > 0` guard, scala:512). So the reverse read
-    ///   keeps `28S48M53S` — its 28S is neither hard-clipped nor masked — and returns 0.
-    ///
-    /// The Soft case alone cannot tell the tie guard's `0` from a wrong branch that re-clips the
-    /// reverse read to its existing 28 bases; `Hard` and `SoftWithMask` can.
+    ///   read gets `clipEndOfRead(rec, 0 + 129 - 69 = 60)`: 8 bases are already clipped, so 52
+    ///   more are clipped, giving `68S1M60S` (soft), `68S1M60H` (hard), or `68S1M60S` with all 60
+    ///   masked (soft-with-mask).
+    /// - `midPoint >= mate.end`, so `mateStart = mate.length + 1 = 130` and the mate gets
+    ///   `clipStartOfRead(mate, 129)`: 28 are already clipped and only 48 aligned bases remain
+    ///   for the other 101, so the mate is unmapped and 48 is returned.
     #[rstest]
     #[case::soft(ClippingMode::Soft, "68S1M60S", 0)]
     #[case::soft_with_mask(ClippingMode::SoftWithMask, "68S1M60S", 60)]
@@ -2628,7 +2624,6 @@ mod tests {
         let seq = "A".repeat(129);
         let mut fwd = create_paired_record("68S53M8S", &seq, 96, false, true, 49, "28S48M53S");
         let mut rev = create_paired_record("28S48M53S", &seq, 49, true, false, 96, "68S53M8S");
-        let rev_quals_before: Vec<u8> = rev.quality_scores().as_ref().to_vec();
 
         let clipper = RawClipperOnBuf::new(mode);
         let (clipped_fwd, clipped_rev) = if reverse_first {
@@ -2638,7 +2633,7 @@ mod tests {
             clipper.clip_overlapping_reads(&mut fwd, &mut rev)
         };
 
-        assert_eq!((clipped_fwd, clipped_rev), (52, 0));
+        assert_eq!((clipped_fwd, clipped_rev), (52, 48));
         assert_eq!(format_cigar(&fwd.cigar()), expected_fwd);
         assert_eq!(fwd.alignment_start().map(usize::from), Some(96));
 
@@ -2651,13 +2646,64 @@ mod tests {
         assert!(fwd_seq[unmasked..].iter().all(|&b| b == NO_CALL_BASE), "forward tail unmasked");
         assert!(fwd_quals[unmasked..].iter().all(|&q| q == MIN_PHRED), "forward tail quals");
 
-        // Reverse read: untouched — not clipped, not upgraded to hard clipping, not masked.
-        assert_eq!(format_cigar(&rev.cigar()), "28S48M53S");
-        assert_eq!(rev.alignment_start().map(usize::from), Some(49));
+        // Reverse read: fully clipped, so unmapped, with its bases kept (not masked).
+        assert!(rev.flags().is_unmapped(), "reverse read should be unmapped");
+        assert!(rev.cigar().as_ref().is_empty());
         let rev_seq: &[u8] = rev.sequence().as_ref();
         assert_eq!(rev_seq.len(), 129);
-        assert!(rev_seq.iter().all(|&b| b == b'A'), "reverse read was masked");
-        assert_eq!(rev.quality_scores().as_ref(), rev_quals_before.as_slice());
+        assert!(rev_seq.iter().all(|&b| b == b'T'), "reverse read was masked");
+    }
+
+    /// The cases from fulcrumgenomics/fgbio#1191 (open): forward `100M` at 50 (50-149) against a
+    /// reverse read whose alignment ends at 50 (coincident 5' ends) or 51 (one base after the
+    /// forward start).
+    /// Positions are 1-based; `expected_rev` is `None` when the reverse read is fully clipped
+    /// and unmapped, otherwise its `(start, end, cigar)`.
+    #[rstest]
+    // R2 1-51: midpoint (50 + 51) / 2 = 50, so the reverse read keeps 51.
+    #[case::adjacent(ClippingMode::Soft, 1, "49S51M", false, (99, 50), "1M99S", Some((51, 51, "99S1M")))]
+    #[case::adjacent_mate_first(ClippingMode::Soft, 1, "49S51M", true, (99, 50), "1M99S", Some((51, 51, "99S1M")))]
+    // R2 1-50: midpoint 50 is the reverse read's last aligned base, so all of it is clipped.
+    #[case::coincident_soft(ClippingMode::Soft, 1, "50S50M", false, (99, 50), "1M99S", None)]
+    #[case::coincident_hard(ClippingMode::Hard, 1, "50S50M", false, (99, 50), "1M99H", None)]
+    #[case::coincident_mate_first(ClippingMode::Soft, 1, "50S50M", true, (99, 50), "1M99S", None)]
+    // R2 6-50 with a trailing soft clip: 45 aligned bases are clipped.
+    #[case::coincident_trailing_soft_clip(ClippingMode::Soft, 6, "50S45M5S", false, (99, 45), "1M99S", None)]
+    fn test_raw_clip_overlapping_reads_fgbio_1191(
+        #[case] mode: ClippingMode,
+        #[case] rev_start: usize,
+        #[case] rev_cigar: &str,
+        #[case] mate_first: bool,
+        #[case] expected: (usize, usize),
+        #[case] expected_fwd: &str,
+        #[case] expected_rev: Option<(usize, usize, &str)>,
+    ) {
+        let seq = "A".repeat(100);
+        let mut fwd = create_paired_record("100M", &seq, 50, false, true, rev_start, rev_cigar);
+        let mut rev = create_paired_record(rev_cigar, &seq, rev_start, true, false, 50, "100M");
+
+        let clipper = RawClipperOnBuf::new(mode);
+        let clipped = if mate_first {
+            let (c_rev, c_fwd) = clipper.clip_overlapping_reads(&mut rev, &mut fwd);
+            (c_fwd, c_rev)
+        } else {
+            clipper.clip_overlapping_reads(&mut fwd, &mut rev)
+        };
+        assert_eq!(clipped, expected);
+
+        assert_eq!(fwd.alignment_start().map(usize::from), Some(50));
+        assert_eq!(fwd.alignment_end().map(usize::from), Some(50));
+        assert_eq!(format_cigar(&fwd.cigar()), expected_fwd);
+
+        match expected_rev {
+            None => assert!(rev.flags().is_unmapped(), "reverse read should be unmapped"),
+            Some((start, end, cigar)) => {
+                assert!(!rev.flags().is_unmapped());
+                assert_eq!(rev.alignment_start().map(usize::from), Some(start));
+                assert_eq!(rev.alignment_end().map(usize::from), Some(end));
+                assert_eq!(format_cigar(&rev.cigar()), cigar);
+            }
+        }
     }
 
     /// `clip_extending_past_mate_ends` (the `fgumi clip --clip-extending-past-mate` path) on a
