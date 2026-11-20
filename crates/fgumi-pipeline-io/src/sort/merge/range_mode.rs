@@ -1205,6 +1205,7 @@ impl<O: MergeOutput> SortMerge<O> {
         let outputs = ctx.outputs.view();
         // While the gate bars workers, tickets stay owed: one pushed now would
         // only be refused (and this thread claims the jobs meanwhile).
+        #[expect(clippy::result_large_err, reason = "a refused ticket is handed back by value")]
         let tickets = |held: &mut HeldSlot<Unpushed<MergeTicket<O>>>, owed: &mut usize| {
             !table.workers_gated()
                 && push_tickets(held, owed, &table, |t| outputs.b.push(t), |u| outputs.b.retry(u))

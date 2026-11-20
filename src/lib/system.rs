@@ -30,7 +30,11 @@
 /// physical RAM on bare-metal or macOS. Always returns `min(cgroup, physical)`.
 #[must_use]
 pub fn detect_total_memory() -> usize {
-    let mut system = sysinfo::System::new();
+    // `System::new` fails only on platforms sysinfo does not support, where it used to report
+    // zero total memory; keep that result rather than guessing a size.
+    let Ok(mut system) = sysinfo::System::new() else {
+        return 0;
+    };
     system.refresh_memory();
     let physical = system.total_memory();
     let bytes = system.cgroup_limits().map_or(physical, |c| c.total_memory.min(physical));
@@ -63,7 +67,7 @@ mod tests {
     #[test]
     fn test_detect_total_memory_bounded_by_physical() {
         let total = detect_total_memory();
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new().expect("sysinfo supports this platform");
         system.refresh_memory();
         let physical = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
         assert!(total <= physical, "cgroup-limited total {total} exceeded physical {physical}");

@@ -1220,10 +1220,7 @@ impl Step for SubprocessAlignStep {
                 }
             }
             // 4b. Pump from ctx.input → in_chan until either side stalls.
-            loop {
-                let Some(batch) = ctx.input.pop() else {
-                    break;
-                };
+            while let Some(batch) = ctx.input.pop() {
                 match in_tx.try_send(batch) {
                     Ok(()) => did_work = true,
                     Err(TrySendError::Full(b)) => {
@@ -1868,7 +1865,7 @@ mod tests {
         }
         assert!(handle.is_set(), "handle not resolved within 5s on SAM-text input");
         let result = handle.try_get().expect("set");
-        assert!(result.is_ok(), "SAM-text header should resolve handle to Ok: {:?}", result.err(),);
+        assert!(result.is_ok(), "SAM-text header should resolve handle to Ok: {:?}", result.err());
     }
 
     /// How one group of same-queryname aligner records should assemble: one

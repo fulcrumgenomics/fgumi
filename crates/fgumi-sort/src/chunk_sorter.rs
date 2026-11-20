@@ -767,7 +767,7 @@ mod tests {
         // refusal must persist for the mid-fill reason alone.
         drop(held);
         assert_eq!(pool.free_len(), 1, "the arena is back on the free list");
-        assert!(!sorter.ensure_arena(), "an available arena must still not be installed mid-fill",);
+        assert!(!sorter.ensure_arena(), "an available arena must still not be installed mid-fill");
 
         // Draining the buffer clears the condition.
         drop(sorter.take_sorted_chunk());

@@ -124,8 +124,8 @@ mod tests {
     #[case::sub_millisecond_guard(5, Duration::from_micros(100), "5 items/s")]
     #[case::exactly_one_per_second(1, Duration::from_secs(1), "1 items/s")]
     #[case::thousands_per_second(1000, Duration::from_secs(1), "1,000 items/s")]
-    #[case::below_one_per_second(30, Duration::from_secs(60), "30.0 items/min")]
-    #[case::far_below_one_per_second(1, Duration::from_secs(120), "0.5 items/min")]
+    #[case::below_one_per_second(30, Duration::from_mins(1), "30.0 items/min")]
+    #[case::far_below_one_per_second(1, Duration::from_mins(2), "0.5 items/min")]
     fn format_rate_switches_units_below_one_per_second(
         #[case] count: u64,
         #[case] duration: Duration,

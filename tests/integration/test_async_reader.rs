@@ -616,7 +616,7 @@ fn test_simplex_async_reader_stdin() {
 
 /// Check if samtools is available for sort tests.
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("samtools").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Create an unsorted BAM with many records spread across chromosomes using samtools.

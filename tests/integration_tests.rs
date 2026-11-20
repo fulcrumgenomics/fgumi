@@ -228,7 +228,7 @@ fn test_format_duration_realistic() {
     let medium_job = Duration::from_secs(125);
     assert_eq!(format_duration(medium_job), "2m 5s");
 
-    let long_job = Duration::from_secs(7200); // Exactly 2 hours
+    let long_job = Duration::from_hours(2); // Exactly 2 hours
     assert_eq!(format_duration(long_job), "2h");
 }
 
@@ -242,7 +242,7 @@ fn test_format_rate_with_realistic_data() {
 
     // Simulate slow processing
     let slow_count = 50;
-    let slow_duration = Duration::from_secs(60);
+    let slow_duration = Duration::from_mins(1);
     let slow_rate = format_rate(slow_count, slow_duration);
     assert!(slow_rate.contains("items/min"));
 }

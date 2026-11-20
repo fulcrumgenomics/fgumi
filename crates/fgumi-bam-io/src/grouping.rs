@@ -1080,7 +1080,7 @@ mod tests {
 
         let same_pos_low_name = GroupKey::paired(0, 100, 0, 0, 200, 0, 0, 0, 1);
         let same_pos_high_name = GroupKey::paired(0, 100, 0, 0, 200, 0, 0, 0, 2);
-        assert!(same_pos_low_name < same_pos_high_name, "equal positions must order by name_hash",);
+        assert!(same_pos_low_name < same_pos_high_name, "equal positions must order by name_hash");
     }
 
     // ========================================================================

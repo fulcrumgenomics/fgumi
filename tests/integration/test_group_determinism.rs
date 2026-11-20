@@ -130,8 +130,8 @@ fn build_mixed_orientation_bam(path: &Path) {
         for &b in &bases {
             for &c in &bases {
                 for &d in &bases {
-                    let prefix = format!("{}{}{}{}", a as char, b as char, c as char, d as char,);
-                    let suffix = format!("{}{}{}{}", d as char, c as char, b as char, a as char,);
+                    let prefix = format!("{}{}{}{}", a as char, b as char, c as char, d as char);
+                    let suffix = format!("{}{}{}{}", d as char, c as char, b as char, a as char);
                     umis.push(format!("{prefix}{prefix}-{suffix}{suffix}"));
                 }
             }
@@ -270,7 +270,7 @@ fn assert_mi_deterministic(subcommand: &str, threads: Option<&str>, n_runs: usiz
                 keyed_mismatches += 1;
                 if sample_diffs.len() < 5 {
                     sample_diffs
-                        .push(format!("{qname} flags={flags}: run0={mi_base} run{run}={mi_run}",));
+                        .push(format!("{qname} flags={flags}: run0={mi_base} run{run}={mi_run}"));
                 }
             }
         }

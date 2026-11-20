@@ -2937,7 +2937,7 @@ fn parallel_grouping_matches_serial_groupbyqueryname(
     let serial_names: Vec<Vec<u8>> = serial.iter().map(|(n, _)| n.clone()).collect();
     assert_eq!(serial_names, expected, "serial path template order");
     assert_eq!(parallel, serial, "parallel path must byte-match the serial grouper");
-    assert!(parallel.iter().all(|(_, recs)| recs.len() == 2), "every template holds its R1+R2",);
+    assert!(parallel.iter().all(|(_, recs)| recs.len() == 2), "every template holds its R1+R2");
 }
 
 /// `AssembleTemplates` fed by a NON-queryname-cut source (batches not marked

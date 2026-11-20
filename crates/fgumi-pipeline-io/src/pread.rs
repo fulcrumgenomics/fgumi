@@ -233,7 +233,7 @@ impl Default for RequestSizeHist {
 impl RequestSizeHist {
     /// Count one completed request of `len` bytes.
     pub fn record(&self, len: u32) {
-        let log2 = 31 - len.max(1).leading_zeros();
+        let log2 = len.max(1).ilog2();
         let i = (log2.saturating_sub(HIST_BASE_LOG2) as usize).min(HIST_BUCKETS - 1);
         self.buckets[i].fetch_add(1, Ordering::Relaxed);
         self.min.fetch_min(u64::from(len), Ordering::Relaxed);

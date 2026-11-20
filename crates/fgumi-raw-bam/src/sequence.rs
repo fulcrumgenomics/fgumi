@@ -229,7 +229,7 @@ pub fn pack_sequence_into_slice(dst: &mut [u8], bases: &[u8]) {
     let packed_len = bases.len().div_ceil(2);
     // Public precondition: keep the check active in release builds so a too-small
     // `dst` aborts immediately instead of panicking mid-write after partial output.
-    assert!(dst.len() >= packed_len, "dst too short: got {} bytes, need {packed_len}", dst.len(),);
+    assert!(dst.len() >= packed_len, "dst too short: got {} bytes, need {packed_len}", dst.len());
     let mut i = 0usize;
     let mut chunks = bases.chunks_exact(PACK_CHUNK);
     for chunk in chunks.by_ref() {

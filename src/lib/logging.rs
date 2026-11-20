@@ -281,17 +281,17 @@ mod tests {
     fn test_format_duration() {
         assert_eq!(format_duration(Duration::from_secs(0)), "0s");
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(format_duration(Duration::from_mins(1)), "1m");
         assert_eq!(format_duration(Duration::from_secs(135)), "2m 15s");
-        assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
-        assert_eq!(format_duration(Duration::from_secs(5400)), "1h 30m");
+        assert_eq!(format_duration(Duration::from_hours(1)), "1h");
+        assert_eq!(format_duration(Duration::from_mins(90)), "1h 30m");
     }
 
     #[test]
     fn test_format_rate() {
         assert_eq!(format_rate(1000, Duration::from_secs(1)), "1,000 items/s");
-        assert_eq!(format_rate(60, Duration::from_secs(60)), "1 items/s");
-        assert_eq!(format_rate(30, Duration::from_secs(60)), "30.0 items/min");
+        assert_eq!(format_rate(60, Duration::from_mins(1)), "1 items/s");
+        assert_eq!(format_rate(30, Duration::from_mins(1)), "30.0 items/min");
         // Near-zero duration
         assert!(format_rate(1000, Duration::from_nanos(1)).contains("items/s"));
     }

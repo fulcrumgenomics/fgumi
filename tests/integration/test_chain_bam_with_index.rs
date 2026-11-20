@@ -76,7 +76,7 @@ fn unsorted_records(n: usize) -> Vec<fgumi_raw_bam::RawRecord> {
 }
 
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("samtools").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 #[test]

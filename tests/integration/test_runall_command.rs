@@ -2886,7 +2886,7 @@ fn extract_to_zipper_guard_is_dropped() {
             "extract->zipper should run to completion when a real aligner is available: {stderr}"
         );
         assert!(
-            std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false),
+            std::fs::metadata(&out).is_ok_and(|m| m.len() > 0),
             "expected a non-empty output BAM"
         );
     } else {

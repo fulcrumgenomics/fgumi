@@ -238,7 +238,7 @@ pub fn run_fused_single_thread(
     // timer only resets on progress — so a tight default trades a real risk of failing
     // a healthy run for a few seconds off the report of a wedge that has already hung.
     // The costs are asymmetric; err long.
-    const DEFAULT_STALL_BUDGET: Duration = Duration::from_secs(60);
+    const DEFAULT_STALL_BUDGET: Duration = Duration::from_mins(1);
     // Long enough to stop pegging the calling thread at 100%, short enough that it
     // adds no meaningful latency to a source that is about to produce.
     const IDLE_BACKOFF: Duration = Duration::from_micros(50);

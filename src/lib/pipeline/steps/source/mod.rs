@@ -233,10 +233,10 @@ impl InputSource {
             // of the stream, not the start of it — silently losing the header.
             //
             // An `fstat` on an already-open descriptor essentially cannot fail, but
-            // `unwrap_or(false)` picks the safe direction if it somehow does: the
+            // `is_ok_and` picks the safe direction if it somehow does: the
             // in-stream path always yields correct bytes and merely forgoes the
             // async-reader wiring, whereas a wrong "regular" answer corrupts input.
-            if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            if !file.metadata().is_ok_and(|m| m.is_file()) {
                 // Non-regular: classify in-stream. Same trade-off the stdin branch
                 // makes — no async-reader wiring, because there is no reopenable
                 // path.

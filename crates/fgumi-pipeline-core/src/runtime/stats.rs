@@ -471,8 +471,7 @@ impl PipelineStats {
         s.held_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
         s.held_wait_max_ns.fetch_max(wait_ns, Ordering::Relaxed);
         let us = wait_ns / 1_000;
-        let bucket =
-            if us == 0 { 0 } else { (63 - us.leading_zeros()) as usize }.min(HELD_HIST_BUCKETS - 1);
+        let bucket = if us == 0 { 0 } else { us.ilog2() as usize }.min(HELD_HIST_BUCKETS - 1);
         s.held_wait_hist[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1036,7 +1035,7 @@ impl StepStatsSnapshot {
 
     #[must_use]
     pub fn avg_run_ns(&self) -> Option<u64> {
-        if self.try_run_total == 0 { None } else { Some(self.total_run_ns / self.try_run_total) }
+        self.total_run_ns.checked_div(self.try_run_total)
     }
 }
 

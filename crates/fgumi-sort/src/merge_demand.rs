@@ -234,7 +234,7 @@ pub struct MergeDemandSnapshot {
 
 /// `num / den` as a whole percentage, rounded to nearest; `0` when `den == 0`.
 fn pct_int(num: u64, den: u64) -> u64 {
-    if den == 0 { 0 } else { (num * 100 + den / 2) / den }
+    (num * 100 + den / 2).checked_div(den).unwrap_or(0)
 }
 
 /// `num / den` as a percentage; `0.0` when `den == 0`.

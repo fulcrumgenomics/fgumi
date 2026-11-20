@@ -147,7 +147,7 @@ fn load_includelist(path: &Path) -> Result<Vec<Vec<u8>>> {
         }
         let umi = trimmed.as_bytes().to_ascii_uppercase();
         if !umi.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T')) {
-            bail!("Invalid UMI at line {}: '{}' (only A, C, G, T allowed)", line_num + 1, trimmed,);
+            bail!("Invalid UMI at line {}: '{}' (only A, C, G, T allowed)", line_num + 1, trimmed);
         }
         umis.push((line_num + 1, umi));
     }

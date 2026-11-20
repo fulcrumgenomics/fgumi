@@ -815,7 +815,7 @@ mod tests {
         let mut cursor = Cursor::new(&all);
         let mut read_back: Vec<Vec<u8>> = Vec::new();
         let mut len_buf = [0u8; 4];
-        while Read::read(&mut cursor, &mut len_buf).map(|n| n == 4).unwrap_or(false) {
+        while Read::read(&mut cursor, &mut len_buf).is_ok_and(|n| n == 4) {
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut rec = vec![0u8; len];
             cursor.read_exact(&mut rec).expect("record body");

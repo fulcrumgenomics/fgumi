@@ -3802,7 +3802,7 @@ mod tests {
     #[cfg(feature = "memory-debug")]
     fn test_sysinfo_returns_reasonable_values() {
         use sysinfo::System;
-        let mut system = System::new();
+        let mut system = System::new().expect("sysinfo supports this platform");
         system.refresh_memory();
 
         let total = system.total_memory();
@@ -4155,7 +4155,7 @@ mod tests {
         // cgroup_limits().total_memory is min(cgroup_max, physical_ram), so
         // detect_total_memory() can never exceed what sysinfo reports.
         let total = detect_total_memory();
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new().expect("sysinfo supports this platform");
         system.refresh_memory();
         let sysinfo_total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
         assert!(

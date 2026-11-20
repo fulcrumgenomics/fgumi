@@ -111,7 +111,7 @@ fn sort_command_produces_coordinate_sorted_output_via_chain() {
 
 /// Whether `samtools` is on `PATH` and runnable.
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("samtools").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Runs `<bin> sort -i <input> -o <output> --order <order_flag>` and asserts success.
@@ -144,8 +144,7 @@ fn fgumi_verify_sorted(bin: &Path, path: &Path, order_flag: &str) -> bool {
             OsStr::new(order_flag),
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Order-independent multiset of full records, each rendered to a stable string

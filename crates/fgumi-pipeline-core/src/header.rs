@@ -468,7 +468,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_mins(1))
             .expect("the deadlock monitor must fail a header-wedged run, not let it hang");
         join.join().expect("run thread panicked");
 

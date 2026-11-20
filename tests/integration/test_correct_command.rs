@@ -303,7 +303,7 @@ fn test_correct_command_rejects_streaming_threaded_integrity() {
     // Strict equality on the full sequence catches both drops/dupes (covered
     // by the count check) and a regression to mutex-acquisition (or any other
     // non-input) ordering.
-    assert_eq!(observed_order, expected_order, "rejects should be emitted in batch-input order",);
+    assert_eq!(observed_order, expected_order, "rejects should be emitted in batch-input order");
     let observed_names: std::collections::HashSet<String> =
         observed_order.iter().cloned().collect();
     assert_eq!(observed_names, expected_names, "unexpected reject-name set");
@@ -1404,7 +1404,7 @@ fn correct_reads_a_umi_fifo_exactly_once() {
     std::thread::spawn(move || {
         let _ = tx.send(cmd.execute("fgumi correct").map_err(|e| format!("{e:#}")));
     });
-    let result = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+    let result = rx.recv_timeout(std::time::Duration::from_mins(1)).unwrap_or_else(|_| {
         panic!("correct did not finish within 60s; it likely opened the UMI FIFO a second time")
     });
     result.expect("correct must succeed when its UMI file is a FIFO");

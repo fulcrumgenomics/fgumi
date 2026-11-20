@@ -29,7 +29,7 @@ fn fgumi_sort_in_process(args: &[OsString]) -> anyhow::Result<()> {
 }
 
 fn samtools_available() -> bool {
-    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("samtools").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Create a test BAM with many records at various positions using samtools.

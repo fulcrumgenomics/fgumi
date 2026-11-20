@@ -1225,7 +1225,7 @@ impl CodecConsensusCaller {
             })
             .collect();
 
-        indexed.sort_by(|a, b| b.1.cmp(&a.1));
+        indexed.sort_by_key(|&(_, len, _)| std::cmp::Reverse(len));
 
         let best_indices = select_most_common_alignment_group(&indexed);
 

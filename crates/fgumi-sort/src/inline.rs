@@ -1763,8 +1763,8 @@ fn radix_sort_sized(
     // `[RecordRef]` storage of `refs`/`aux` (same length `n`); each pass writes
     // every `dst` slot exactly once (the scatter loop) before that buffer is read
     // as `src` on the next pass. See CLAUDE.md "Approved hot-path unsafe".
-    let mut src = refs as *mut [RecordRef];
-    let mut dst = aux.as_mut_slice() as *mut [RecordRef];
+    let mut src = std::ptr::from_mut::<[RecordRef]>(refs);
+    let mut dst = std::ptr::from_mut::<[RecordRef]>(aux.as_mut_slice());
     let mut precomputed = first_counts.copied();
 
     // LSD radix sort - byte by byte from least significant
@@ -2054,8 +2054,8 @@ fn radix_sort_template_field<K: TemplateLaneKey>(
     // pass writes every `dst` slot exactly once (the scatter loop) before that
     // buffer is read as `src` on the next pass. Unchanged invariant from the
     // non-generic version — see CLAUDE.md "Approved hot-path unsafe".
-    let mut src = refs as *mut [TemplateRecordRef<K>];
-    let mut dst = aux as *mut [TemplateRecordRef<K>];
+    let mut src = std::ptr::from_mut::<[TemplateRecordRef<K>]>(refs);
+    let mut dst = std::ptr::from_mut::<[TemplateRecordRef<K>]>(aux);
 
     for byte_idx in 0..bytes_needed {
         let src_slice = unsafe { &*src };
@@ -3520,7 +3520,7 @@ mod tests {
                 }
 
                 let mut expected = refs.clone();
-                expected.sort_by(|a, b| a.key.cmp(&b.key));
+                expected.sort_by_key(|a| a.key);
 
                 radix_sort_template_refs(&mut refs);
 
@@ -3553,7 +3553,7 @@ mod tests {
                 }
 
                 let mut expected = refs.clone();
-                expected.sort_by(|a, b| a.key.cmp(&b.key));
+                expected.sort_by_key(|a| a.key);
 
                 radix_sort_template_refs(&mut refs);
 

@@ -368,7 +368,7 @@ mod tests {
         #[case] expect_ok: bool,
     ) {
         let result = parse_memory_size(input);
-        assert_eq!(result.is_ok(), expect_ok, "{input}: expected ok={expect_ok}, got {result:?}",);
+        assert_eq!(result.is_ok(), expect_ok, "{input}: expected ok={expect_ok}, got {result:?}");
         if !expect_ok {
             let msg = result.unwrap_err().to_string();
             assert!(
