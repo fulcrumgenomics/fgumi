@@ -1609,8 +1609,15 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
         let out_r1 = place(first, r1_pos, r2_pos, r1_flags);
         let out_r2 = place(second, r2_pos, r1_pos, r2_flags);
         let out_supp = place(first, 3000, r2_pos, r1_flags | Flags::SUPPLEMENTARY);
-        for record in [&out_r1, &out_r2, &out_supp] {
-            writer.write_alignment_record(&header, record).unwrap();
+        for mut record in [out_r1, out_r2, out_supp] {
+            // The aligner flags the first template QC-fail (as bwameth.py and
+            // `bwa-mem3 mem --meth --chimera-qc` flag a whole suspected chimera); the
+            // kept unmapped reads all passed, so the merge clears it unless
+            // `--keep-aligner-qc-fail` is given.
+            if t == 0 {
+                *record.flags_mut() |= Flags::QC_FAIL;
+            }
+            writer.write_alignment_record(&header, &record).unwrap();
         }
     }
     writer.try_finish().unwrap();
@@ -1724,6 +1731,7 @@ impl MappedReplay {
 #[case::tags_to_reverse(&["--tags-to-reverse", "RX"])]
 #[case::tags_to_revcomp(&["--tags-to-revcomp", "RX"])]
 #[case::skip_tc_tags(&["--skip-tc-tags"])]
+#[case::keep_aligner_qc_fail(&["--keep-aligner-qc-fail"])]
 fn fused_chain_honors_zipper_merge_flags(
     #[case] flags: &[&str],
     #[values(false, true)] start_from_align: bool,
@@ -1747,6 +1755,55 @@ fn fused_chain_honors_zipper_merge_flags(
     assert_ne!(
         default_records, flagged_records,
         "{flags:?} must change the fused chain's output on this fixture"
+    );
+}
+
+/// `runall --start-from zipper` merges an aligned BAM with its unmapped BAM through
+/// the zipper chain's own merge step, not the fused align stage's: it must honour
+/// `--zipper::keep-aligner-qc-fail` exactly as standalone `fgumi zipper
+/// --keep-aligner-qc-fail` does on the same inputs, and the flag must change the
+/// output (the replay's first template carries an aligner-set QC-fail).
+#[cfg(feature = "simulate")]
+#[test]
+fn zipper_chain_honors_keep_aligner_qc_fail() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = MappedReplay::new(tmp.path());
+    let run_chain = |out: &Path, flags: &[&str]| {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "zipper",
+            "--stop-after",
+            "zipper",
+            "-i",
+            p(&fixture.replay),
+            "--unmapped",
+            p(&fixture.kept),
+            "--ref",
+            p(&fixture.reference),
+            "-o",
+            p(out),
+        ];
+        args.extend_from_slice(flags);
+        run_ok(args, &format!("runall --start-from zipper {flags:?}"));
+    };
+
+    let chain_default = tmp.path().join("chain_default.bam");
+    run_chain(&chain_default, &[]);
+    let chain_flagged = tmp.path().join("chain_flagged.bam");
+    run_chain(&chain_flagged, &["--zipper::keep-aligner-qc-fail"]);
+    let oracle_default = tmp.path().join("oracle_default.bam");
+    fixture.run_standalone(&oracle_default, &[]);
+    let oracle = tmp.path().join("oracle.bam");
+    fixture.run_standalone(&oracle, &["--keep-aligner-qc-fail"]);
+
+    assert_bams_record_equivalent_nonempty(&chain_default, &oracle_default);
+    assert_bams_record_equivalent_nonempty(&chain_flagged, &oracle);
+    let (_, default_records) = read_bam_output(&chain_default);
+    let (_, flagged_records) = read_bam_output(&chain_flagged);
+    assert_ne!(
+        default_records, flagged_records,
+        "--zipper::keep-aligner-qc-fail must change the zipper chain's output on this fixture"
     );
 }
 

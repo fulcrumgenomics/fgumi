@@ -446,3 +446,101 @@ fn test_zipper_bam_stdin_input() {
         assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
     }
 }
+
+/// QC-fail (0x200) transfer, with and without `--keep-aligner-qc-fail`, under both
+/// thread settings of standalone zipper (`--threads 1` reads inline; `--threads 4`
+/// adds reader threads; both merge through the same `process_raw`). The
+/// `runall --start-from zipper` chain path is covered in `test_runall_command.rs`.
+///
+/// `read1` was flagged QC-fail by the aligner but passed in the unmapped BAM,
+/// `read2` failed in the unmapped BAM only, and `read3` was flagged by neither.
+/// By default zipper copies the unmapped read's flag (fgbio `ZipperBams` parity),
+/// clearing `read1`; with `--keep-aligner-qc-fail` the two flags are combined, so `read1`
+/// stays QC-fail.
+#[rstest::rstest]
+fn test_zipper_keep_aligner_qc_fail(
+    #[values(false, true)] keep_aligner_qc_fail: bool,
+    #[values("1", "4")] threads: &str,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let unmapped_bam = temp_dir.path().join("unmapped.bam");
+    let mapped_sam = temp_dir.path().join("mapped.sam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // (name, unmapped QC-fail, aligner QC-fail)
+    let reads: [(&[u8], bool, bool); 3] =
+        [(b"read1", false, true), (b"read2", true, false), (b"read3", false, false)];
+    let qc = |fail: bool| if fail { flags::QC_FAIL } else { 0 };
+
+    let unmapped_records: Vec<RawRecord> = reads
+        .iter()
+        .map(|&(name, unmapped_fail, _)| {
+            let mut b = SamBuilder::new();
+            b.read_name(name)
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED | qc(unmapped_fail))
+                .add_string_tag(SamTag::RX, b"AACCGGTT");
+            b.build()
+        })
+        .collect();
+    create_unmapped_bam(&unmapped_bam, &unmapped_records);
+
+    let mapped_header = create_minimal_header("chr1", 10000);
+    let mapped_records: Vec<RawRecord> = reads
+        .iter()
+        .zip([99, 199, 299])
+        .map(|(&(name, _, aligner_fail), pos)| {
+            let mut b = SamBuilder::new();
+            b.read_name(name)
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(qc(aligner_fail))
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        })
+        .collect();
+    create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
+
+    let mut args = vec![
+        "zipper",
+        "--input",
+        mapped_sam.to_str().unwrap(),
+        "--unmapped",
+        unmapped_bam.to_str().unwrap(),
+        "--reference",
+        ref_path.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--compression-level",
+        "1",
+        "--threads",
+        threads,
+    ];
+    if keep_aligner_qc_fail {
+        args.push("--keep-aligner-qc-fail");
+    }
+    let cmd = Zipper::try_parse_from(args).expect("failed to parse zipper args");
+    cmd.execute("fgumi zipper").expect("Zipper command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let mut observed: Vec<(String, bool)> = reader
+        .record_bufs(&header)
+        .map(|r| {
+            let r = r.unwrap();
+            (r.name().unwrap().to_string(), r.flags().is_qc_fail())
+        })
+        .collect();
+    observed.sort();
+    let expected = vec![
+        ("read1".to_string(), keep_aligner_qc_fail),
+        ("read2".to_string(), true),
+        ("read3".to_string(), false),
+    ];
+    assert_eq!(observed, expected);
+}

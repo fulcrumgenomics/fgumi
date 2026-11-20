@@ -673,6 +673,82 @@ pub(crate) mod fake {
             "n/a (FakeEngine)".to_string()
         }
     }
+
+    /// [`FakeEngine`], but the aligner flags the R1 record of
+    /// [`RecordOrigin::Pair(0)`] QC-fail (0x200), as an aligner that QC-fails reads
+    /// (`bwa-mem3 mem --meth --set-as-failed`) would. For tests of how the merge
+    /// treats an aligner-set QC-fail.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct QcFailFakeEngine;
+
+    /// Forwards every record to `inner`, setting QC-fail on the first record of
+    /// `Pair(0)` (its R1: [`FakeEngine::pair_emit`] emits a pair's R1 first).
+    struct QcFailFirstR1<'a> {
+        inner: &'a mut dyn RecordSink,
+        flagged: bool,
+    }
+
+    impl RecordSink for QcFailFirstR1<'_> {
+        fn emit(&mut self, origin: RecordOrigin, body: &[u8]) {
+            if self.flagged || origin != RecordOrigin::Pair(0) {
+                self.inner.emit(origin, body);
+                return;
+            }
+            let mut record = fgumi_raw_bam::RawRecord::from(body.to_vec());
+            record.set_flags(record.flags() | flags::QC_FAIL);
+            self.flagged = true;
+            self.inner.emit(origin, record.as_ref());
+        }
+    }
+
+    impl AlignEngine for QcFailFakeEngine {
+        type Scratch = ();
+        type Cohort = FakeCohort;
+        type Ranges = Vec<TaggedRead>;
+        type PeStat = ();
+
+        fn new_scratch(&self) -> anyhow::Result<Self::Scratch> {
+            FakeEngine.new_scratch()
+        }
+
+        fn new_cohort(&self) -> anyhow::Result<Self::Cohort> {
+            FakeEngine.new_cohort()
+        }
+
+        fn seed_extend(
+            &self,
+            scratch: &mut Self::Scratch,
+            cohort: &Self::Cohort,
+            batch: EngineBatch<'_>,
+        ) -> anyhow::Result<Self::Ranges> {
+            FakeEngine.seed_extend(scratch, cohort, batch)
+        }
+
+        fn infer_cohort(&self, cohort: &Self::Cohort) -> anyhow::Result<Self::PeStat> {
+            FakeEngine.infer_cohort(cohort)
+        }
+
+        fn pair_emit(
+            &self,
+            scratch: &mut Self::Scratch,
+            cohort: &Self::Cohort,
+            regs: Self::Ranges,
+            pestat: Option<&Self::PeStat>,
+            ids: IdBases,
+            sink: &mut dyn RecordSink,
+        ) -> anyhow::Result<()> {
+            let mut sink = QcFailFirstR1 { inner: sink, flagged: false };
+            FakeEngine.pair_emit(scratch, cohort, regs, pestat, ids, &mut sink)
+        }
+
+        fn n_pairs(regs: &Self::Ranges) -> usize {
+            FakeEngine::n_pairs(regs)
+        }
+
+        fn pestat_summary(pestat: &Self::PeStat) -> String {
+            FakeEngine::pestat_summary(pestat)
+        }
+    }
 }
 
 #[cfg(test)]

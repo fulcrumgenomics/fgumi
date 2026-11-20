@@ -464,6 +464,7 @@ mod tests {
             xa_max_hits,
             xa_max_hits_option: "--xa-max-hits",
             in_memory_reference: false,
+            keep_aligner_qc_fail: false,
         }
     }
 

@@ -44,6 +44,10 @@ pub(crate) struct MergeConfig {
     /// `ZipperMergeConfig::skip_tc_tags`.
     pub(crate) skip_tc_tags: bool,
 
+    /// Whether a mapped record keeps a QC-fail flag the aligner set. Mirrors
+    /// `ZipperMergeConfig::keep_aligner_qc_fail`.
+    pub(crate) keep_aligner_qc_fail: bool,
+
     /// Whether the input may hold lone mates: templates holding one end of a
     /// pair whose mate is absent ([`Template::lone_mate_segment`]), as after
     /// per-record filtering. Set by the realign stage, whose input may be
@@ -188,6 +192,7 @@ pub(crate) fn merge_zipper_batch(
             &mut mapped_template,
             tags,
             cfg.skip_tc_tags,
+            cfg.keep_aligner_qc_fail,
             &mut aux_scratch,
         )
         .map_err(|e| io::Error::other(format!("align-and-merge: {e:#}")))?;
@@ -268,6 +273,7 @@ mod tests {
         MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
             skip_tc_tags: true,
+            keep_aligner_qc_fail: false,
             lone_mates: false,
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 1024 * 1024,
