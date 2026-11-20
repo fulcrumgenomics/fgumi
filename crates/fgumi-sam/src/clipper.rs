@@ -626,12 +626,10 @@ impl RawRecordClipper {
         r1: &mut fgumi_raw_bam::RawRecord,
         r2: &mut fgumi_raw_bam::RawRecord,
     ) -> (usize, usize) {
-        // Gate on the symmetric, order-independent per-*pair* FR classifier. The per-record
-        // `is_fr_pair_raw` derives the mate 5' from TLEN on its forward-strand arm, which can
-        // disagree with the mate's CIGAR on dovetail FR pairs (htsjdk/samtools#1771) and would
-        // skip overlap clipping on a valid pair. Both records are in hand here, so
-        // `is_primary_fr_pair_raw` (the same gate the sibling `clip_extending_past_mate_ends`
-        // uses) is the correct check.
+        // Gate on the pair-level FR classifier, computed from both records' own alignments (the
+        // same gate the sibling `clip_extending_past_mate_ends` uses). A per-record check would
+        // read TLEN, MC or the mate-position fields, which can disagree with the mate's actual
+        // alignment on dovetail pairs (htsjdk/samtools#1771) or after earlier clipping.
         if !fgumi_raw_bam::is_primary_fr_pair_raw(r1.as_ref(), r2.as_ref()) {
             return (0, 0);
         }
@@ -2460,7 +2458,7 @@ mod tests {
         let mut fwd = encode_record_buf_to_raw(&fwd_buf, &header).expect("encode fwd");
         let mut rev = encode_record_buf_to_raw(&rev_buf, &header).expect("encode rev");
 
-        // The pair is a valid primary FR pair (classified on the reverse record's CIGAR arm),
+        // The pair is a valid primary FR pair (classified from both records' alignments),
         // even though the forward read's per-record TLEN arm misclassifies it.
         assert!(fgumi_raw_bam::is_primary_fr_pair_raw(fwd.as_ref(), rev.as_ref()));
 
