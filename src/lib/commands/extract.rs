@@ -107,7 +107,8 @@ fn classify_compression_header(header: &[u8]) -> CompressionFormat {
     match fgumi_bam_io::classify_input(header) {
         InputFormat::Bgzf => CompressionFormat::Bgzf,
         InputFormat::Gzip => CompressionFormat::Gzip,
-        InputFormat::Text | InputFormat::Empty => CompressionFormat::Plain,
+        // CRAM is not FASTQ; read it as plain so the FASTQ parser names the problem.
+        InputFormat::Text | InputFormat::Cram | InputFormat::Empty => CompressionFormat::Plain,
     }
 }
 
@@ -757,7 +758,10 @@ impl Extract {
         Ok(ChainSpec {
             stages: vec![Stage::Extract],
             source,
-            sink: SinkSpec::Bam(self.output.clone()),
+            // `-o *.cram` writes unmapped CRAM (feature `cram`); with no
+            // reference configured it is reference-free, which unmapped reads
+            // need anyway.
+            sink: SinkSpec::alignment(self.output.clone(), &self.output, false),
             stage_opts,
             threading: self.threading.clone(),
             compression: self.compression.clone(),

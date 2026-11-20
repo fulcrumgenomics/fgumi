@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/fgumi-pipeline-io", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-fmt", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-bam-io", "crates/fgumi-sort", "crates/fgumi-cli-common", "crates/fgumi-cli-macros", "crates/fgumi-pipeline-core", "crates/fgumi-pipeline-io", "crates/fgumi-htslib", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -25,6 +25,7 @@ fgumi-bgzf = { version = "0.9.0", path = "crates/fgumi-bgzf" }
 fgumi-cli-common = { version = "0.9.0", path = "crates/fgumi-cli-common" }
 fgumi-cli-macros = { version = "0.9.0", path = "crates/fgumi-cli-macros" }
 fgumi-fmt = { version = "0.9.0", path = "crates/fgumi-fmt" }
+fgumi-htslib = { version = "0.9.0", path = "crates/fgumi-htslib" }
 fgumi-consensus = { version = "0.9.0", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.9.0", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.9.0", path = "crates/fgumi-metrics" }
@@ -130,6 +131,7 @@ log = { workspace = true }
 thiserror = { workspace = true }
 noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { workspace = true }
+fgumi-htslib = { workspace = true, optional = true }
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 env_logger = "0.11.8"
@@ -235,6 +237,11 @@ stress-tests = []
 # alignment). Scoped to this feature because it is the only build that links the
 # C++ aligner; a pure-Rust fgumi build gains nothing from the C interpose.
 aligner-bwa-mem3 = ["dep:bwa-mem3-rs", "mimalloc/override"]
+# CRAM input and output through a vendored, patched htslib (`fgumi-htslib`).
+# Off by default: it compiles htslib's C (a C toolchain is required). CRAM is
+# detected by content on every input; outputs named `*.cram` are written as
+# CRAM. Decoding and encoding run on fgumi's threads, not htslib's pool.
+cram = ["fgumi-bam-io/cram", "fgumi-pipeline-io/cram", "dep:fgumi-htslib"]
 # Test-only feature (not part of the supported public API). Its former gated
 # helper (the legacy multi-thread engine's `run_bam_pipeline_with_grouper`) was
 # removed in R6/C6; retained as the self dev-dependency's feature hook. Enabled

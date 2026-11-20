@@ -22,7 +22,9 @@ use crate::simulate::{
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_bam_io::{OutputFile, ProgressTracker, create_raw_bam_reader, create_raw_bam_writer};
+use fgumi_bam_io::{
+    OutputFile, ProgressTracker, create_raw_alignment_writer, create_raw_bam_reader,
+};
 use fgumi_raw_bam::{
     RawRecord, SamBuilder, aux_data_slice, find_string_tag, flags as raw_flags, update_string_tag,
 };
@@ -48,7 +50,7 @@ The output is template-coordinate sorted and suitable for input to
 "#
 )]
 pub struct GroupedReads {
-    /// Output BAM file (template-coordinate sorted)
+    /// Output BAM or CRAM file (template-coordinate sorted)
     #[arg(short = 'o', long = "output", required = true)]
     pub output: PathBuf,
 
@@ -125,6 +127,8 @@ struct GenerationParams {
 
 impl Command for GroupedReads {
     fn execute(&self, command_line: &str) -> Result<()> {
+        fgumi_bam_io::validate_alignment_output(&self.output)?;
+
         // Validate methylation args
         let methylation = self.methylation.resolve(self.common.seed);
         self.methylation.validate()?;
@@ -294,6 +298,7 @@ impl Command for GroupedReads {
             let old_to_new = renumber_sorted_mi(
                 &temp_bam,
                 &staged_bam,
+                &self.output,
                 self.threads,
                 self.compression.compression_level,
             )
@@ -384,11 +389,13 @@ fn split_mi_base(mi: &[u8]) -> Result<(u64, &[u8])> {
 fn renumber_sorted_mi(
     input: &Path,
     output: &Path,
+    named: &Path,
     threads: usize,
     compression_level: u32,
 ) -> Result<HashMap<u64, u64>> {
     let (mut reader, header) = create_raw_bam_reader(input, threads)?;
-    let mut writer = create_raw_bam_writer(output, &header, threads, compression_level)?;
+    let mut writer =
+        create_raw_alignment_writer(output, named, &header, threads, compression_level)?;
 
     let mut old_to_new: HashMap<u64, u64> = HashMap::new();
     let mut current_old_base: Option<u64> = None;

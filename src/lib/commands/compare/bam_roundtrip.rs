@@ -20,7 +20,8 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 
 use crate::commands::command::Command;
-use crate::pipeline::steps::{RoundtripConfig, run_bam_roundtrip};
+use crate::pipeline::steps::RoundtripConfig;
+use crate::pipeline::steps::roundtrip::run_bam_roundtrip_named;
 
 /// Run the new pipeline as a no-op chain on an input BAM and assert
 /// record-count parity.
@@ -34,7 +35,7 @@ pub struct CompareBamRoundtrip {
     #[arg(index = 1)]
     pub input: PathBuf,
 
-    /// Optional output BAM path. If unset, output goes to a tempfile and
+    /// Optional output BAM or CRAM path. If unset, output goes to a tempfile and
     /// is discarded after the comparison.
     #[arg(long = "output")]
     pub output: Option<PathBuf>,
@@ -63,6 +64,10 @@ pub struct CompareBamRoundtrip {
 
 impl Command for CompareBamRoundtrip {
     fn execute(&self, _command_line: &str) -> Result<()> {
+        if let Some(path) = &self.output {
+            fgumi_bam_io::validate_alignment_output(path)?;
+        }
+
         // Fail early with a clear message if the input is missing, matching the
         // sibling compare subcommands rather than surfacing a raw open error.
         crate::validation::validate_file_exists(&self.input, "Input BAM")?;
@@ -107,8 +112,13 @@ impl Command for CompareBamRoundtrip {
             self.output.as_deref().unwrap_or(&staging_path).display(),
             self.threads
         );
-        run_bam_roundtrip(&self.input, &staging_path, cfg)
-            .with_context(|| format!("run_bam_roundtrip on {}", self.input.display()))?;
+        run_bam_roundtrip_named(
+            &self.input,
+            &staging_path,
+            self.output.as_deref().unwrap_or(&staging_path),
+            cfg,
+        )
+        .with_context(|| format!("run_bam_roundtrip on {}", self.input.display()))?;
 
         // Record-count parity check against the staging file.
         let input_n = count_records(&self.input)?;
@@ -175,7 +185,7 @@ mod tests {
                 .read_name(format!("read{i:07}").as_bytes())
                 .sequence(&[b'A'; 60])
                 .qualities(&[30; 60])
-                .flags(flags::FIRST_SEGMENT)
+                .flags(flags::UNMAPPED | flags::FIRST_SEGMENT)
                 .build();
             let buf = fgumi_raw_bam::raw_record_to_record_buf(&record, &header)
                 .expect("raw_record_to_record_buf");
@@ -329,6 +339,45 @@ mod tests {
         };
         let err = cmd.execute("compare bam-roundtrip").expect_err("clobber must error");
         assert!(err.to_string().contains("clobber"), "unexpected error: {err}");
+    }
+
+    /// A CRAM output name requires the opt-in build, even with staged output.
+    #[cfg(not(feature = "cram"))]
+    #[test]
+    fn execute_rejects_cram_output() {
+        let input = write_input_bam(1);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("out.cram");
+        let cmd = CompareBamRoundtrip {
+            input: input.path().to_path_buf(),
+            output: Some(output.clone()),
+            threads: 1,
+            compression_level: 1,
+        };
+        let err = cmd.execute("compare bam-roundtrip").expect_err("cram output must error");
+        let message = format!("{err:#}");
+        assert!(message.contains("--features cram"), "unexpected error: {message}");
+        assert!(message.contains(&output.display().to_string()), "unexpected error: {message}");
+        assert!(!output.exists(), "nothing is published under the .cram name");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no staging file is left");
+    }
+
+    #[cfg(feature = "cram")]
+    #[test]
+    fn execute_publishes_validated_cram_output() {
+        let input = write_input_bam(10);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.cram");
+        let cmd = CompareBamRoundtrip {
+            input: input.path().to_path_buf(),
+            output: Some(output.clone()),
+            threads: 4,
+            compression_level: 1,
+        };
+        cmd.execute("compare bam-roundtrip").expect("CRAM roundtrip passes parity");
+        assert_eq!(&std::fs::read(&output).unwrap()[..4], b"CRAM");
+        assert_eq!(count_records(&output).unwrap(), 10);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no staging file left");
     }
 
     /// `--compression-level` is range-checked at parse time so an out-of-range

@@ -1,0 +1,280 @@
+diff -ru a/cram/cram_decode.c htslib/cram/cram_decode.c
+--- a/cram/cram_decode.c
++++ b/cram/cram_decode.c
+@@ -2649,9 +2649,9 @@
+             }
+             if (r) goto block_err;;
+             if (c->comp_hdr->AP_delta) {
+-                if (cr->apos < 0 && c->unsorted == 0) {
+-                    // cache locally in c->unsorted so we don't have an
+-                    // excessive number of locks
++                if (cr->apos < 0) {
++                    // Slices in this container can decode concurrently. Do not
++                    // read c->unsorted outside the lock used to update it.
+                     pthread_mutex_lock(&fd->ref_lock);
+                     c->unsorted = fd->unsorted = 1;
+                     pthread_mutex_unlock(&fd->ref_lock);
+diff -ru a/cram/cram_encode.c htslib/cram/cram_encode.c
+--- a/cram/cram_encode.c
++++ b/cram/cram_encode.c
+@@ -3300,7 +3300,7 @@
+         /* Encode slices */
+         if (-1 == cram_flush_container_mt(fd, c))
+             return NULL;
+-        if (!fd->pool) {
++        if (!fd->pool && !fd->executor) {
+             // Move to sep func, as we need cram_flush_container for
+             // the closing phase to flush the partial container.
+             for (i = 0; i < c->max_slice; i++) {
+diff -ru a/cram/cram_encode.h htslib/cram/cram_encode.h
+--- a/cram/cram_encode.h
++++ b/cram/cram_encode.h
+@@ -97,7 +97,7 @@
+  * we should be able to do read_container / write_container or
+  * decode_container / encode_container.
+  */
+-int cram_encode_container(cram_fd *fd, cram_container *c);
++/* cram_encode_container() is public; see htslib/cram.h. */
+ 
+ /*! INTERNAL:
+  *
+diff -ru a/cram/cram_io.c htslib/cram/cram_io.c
+--- a/cram/cram_io.c
++++ b/cram/cram_io.c
+@@ -2669,7 +2669,11 @@
+         r->nref = ++id;
+     }
+
+-    if(hclose(fp) < 0)
++    if (herrno(fp))
++        goto err;
++    int close_ret = hclose(fp);
++    fp = NULL; // hclose consumes the handle even when closing fails.
++    if (close_ret < 0)
+         goto err;
+     return r;
+
+@@ -4297,6 +4301,13 @@
+     }
+     fd->last_mapped = c->n_mapped * (c->max_rec+1)/(c->curr_rec+1) ;
+     pthread_mutex_unlock(&fd->metrics_lock);
++
++    if (fd->executor) {
++        pthread_mutex_lock(&fd->metrics_lock);
++        fd->executor_pending++;
++        pthread_mutex_unlock(&fd->metrics_lock);
++        return fd->executor(fd->executor_arg, fd, c);
++    }
+ 
+     if (!fd->pool)
+         return cram_flush_container(fd, c);
+@@ -4321,7 +4328,41 @@
+         hts_usleep(1000);
+     }
+ 
++    return 0;
++}
++
++/* ----------------------------------------------------------------------
++ * Caller-supplied container executor.
++ */
++
++int cram_set_container_executor(cram_fd *fd, cram_container_executor *fn,
++                                void *arg) {
++    if (!fd || fd->mode != 'w') {
++        hts_log_error("A container executor needs a CRAM file open for writing");
++        return -1;
++    }
++    if (fd->pool && fn) {
++        hts_log_error("A container executor cannot be combined with a thread pool");
++        return -1;
++    }
++    fd->executor = fn;
++    fd->executor_arg = fn ? arg : NULL;
++    // As for a thread pool: containers encode concurrently, so they must not
++    // share (and so clobber) a partially loaded reference.
++    if (fn)
++        fd->shared_ref = 1;
+     return 0;
++}
++
++int cram_flush_encoded_container(cram_fd *fd, cram_container *c) {
++    int ret = cram_flush_container2(fd, c);
++    cram_free_container(c);
++    if (ret == 0) {
++        pthread_mutex_lock(&fd->metrics_lock);
++        fd->executor_pending--;
++        pthread_mutex_unlock(&fd->metrics_lock);
++    }
++    return ret;
+ }
+ 
+ /* ----------------------------------------------------------------------
+@@ -5461,7 +5502,9 @@
+         if (-1 == cram_flush_container_mt(fd, fd->ctr))
+             ret = -1;
+ 
+-        cram_free_container(fd->ctr);
++        // An executor now owns the container (see cram_set_container_executor)
++        if (!fd->executor)
++            cram_free_container(fd->ctr);
+         if (fd->ctr_mt == fd->ctr)
+             fd->ctr_mt = NULL;
+         fd->ctr = NULL;
+@@ -5568,11 +5611,19 @@
+         return -1;
+ 
+     if (fd->mode == 'w' && fd->ctr) {
+-        if(fd->ctr->slice)
+-            cram_update_curr_slice(fd->ctr, fd->version);
+-
+-        if (-1 == cram_flush_container_mt(fd, fd->ctr))
++        if (fd->executor) {
++            // The executor could no longer write it before the EOF block.
++            hts_log_error("CRAM closed with an unflushed container; call "
++                          "cram_flush() and write every container handed to "
++                          "the executor before closing");
+             ret = -1;
++        } else {
++            if(fd->ctr->slice)
++                cram_update_curr_slice(fd->ctr, fd->version);
++
++            if (-1 == cram_flush_container_mt(fd, fd->ctr))
++                ret = -1;
++        }
+     }
+ 
+     if (fd->mode != 'w')
+@@ -5597,6 +5648,19 @@
+     pthread_mutex_destroy(&fd->range_lock);
+     pthread_mutex_destroy(&fd->bam_list_lock);
+ 
++    if (fd->mode == 'w' && fd->executor_pending != 0) {
++        // Containers the executor never wrote: the file is incomplete, so do
++        // not mark it complete with an EOF block.
++        hts_log_error("CRAM closed with %"PRId64" container(s) handed to the "
++                      "executor but never written", fd->executor_pending);
++        ret = -1;
++    } else if (fd->mode == 'w' && fd->executor_abandoned) {
++        // Every handed-over container was written, but the application
++        // abandoned the file: it is still incomplete.
++        hts_log_error("CRAM closed after being abandoned; no EOF block written");
++        ret = -1;
++    }
++
+     if (ret == 0 && fd->mode == 'w') {
+         /* Write EOF block */
+         if (0 != cram_write_eof_block(fd))
+@@ -5868,6 +5932,10 @@
+ 
+     case CRAM_OPT_NTHREADS: {
+         int nthreads =  va_arg(args, int);
++        if (fd->executor) {
++            hts_log_error("CRAM threads cannot be combined with a container executor");
++            return -1;
++        }
+         if (fd->pool)
+             return -2;  //already exists!
+         if (nthreads >= 1) {
+@@ -5883,6 +5951,10 @@
+ 
+     case CRAM_OPT_THREAD_POOL: {
+         htsThreadPool *p = va_arg(args, htsThreadPool *);
++        if (fd->executor) {
++            hts_log_error("A CRAM thread pool cannot be combined with a container executor");
++            return -1;
++        }
+         if (fd->pool)
+             return -2;  //already exists!
+         fd->pool = p ? p->pool : NULL;
+diff -ru a/cram/cram_structs.h htslib/cram/cram_structs.h
+--- a/cram/cram_structs.h
++++ b/cram/cram_structs.h
+@@ -861,6 +861,16 @@
+     int own_pool;
+     hts_tpool *pool;
+     hts_tpool_process *rqueue;
++    // Caller-supplied container executor (cram_set_container_executor).
++    // When set, full containers are handed to it instead of being encoded
++    // in this thread or dispatched to `pool`.
++    cram_container_executor *executor;
++    void *executor_arg;
++    // Containers handed to the executor and not yet written (metrics_lock).
++    int64_t executor_pending;
++    // Set when the application gives up on the file part-way through; the
++    // file is then incomplete, so cram_close() writes no EOF block.
++    int executor_abandoned;
+     pthread_mutex_t metrics_lock;
+     pthread_mutex_t ref_lock;
+     pthread_mutex_t range_lock;
+diff -ru a/htslib/cram.h htslib/htslib/cram.h
+--- a/htslib/cram.h
++++ b/htslib/cram.h
+@@ -636,6 +636,67 @@
+ HTSLIB_EXPORT
+ int cram_flush(cram_fd *fd);
+ 
++/*! Receives each full container from a CRAM writer; see
++ *  cram_set_container_executor().
++ *
++ * Called from the thread that is writing records (inside sam_write1(),
++ * cram_put_bam_seq() or cram_flush()), once per container, in file order.
++ * The executor takes ownership of @p c.
++ *
++ * @return 0 on success, -1 to fail the write that triggered it.
++ */
++typedef int cram_container_executor(void *arg, cram_fd *fd, cram_container *c);
++
++/*! Encode CRAM containers on the caller's own threads.
++ *
++ * By default a CRAM writer encodes each full container in the writing thread,
++ * or on its thread pool (CRAM_OPT_NTHREADS, CRAM_OPT_THREAD_POOL).  With an
++ * executor installed, each full container is instead handed to @p fn, which
++ * must arrange for:
++ *
++ *  - cram_encode_container() to be called on it, on any thread, and possibly
++ *    concurrently with other encodes and with further records being written;
++ *  - cram_flush_encoded_container() to be called on it after it is encoded, from one
++ *    thread at a time, in the order the executor received the containers.
++ *
++ * The final, partial container is handed over by cram_flush().  Every handed
++ * over container must be written before hts_close()/cram_close(), which then
++ * write only the EOF block (and finish any index).  This lets an application
++ * with its own thread pool or task scheduler parallelise CRAM encoding without
++ * starting htslib's.
++ *
++ * Set this immediately after opening, before writing the header.  It cannot be
++ * combined with CRAM_OPT_NTHREADS or CRAM_OPT_THREAD_POOL.  Passing a NULL
++ * @p fn removes the executor.
++ *
++ * @return 0 on success, -1 on failure.
++ */
++HTSLIB_EXPORT
++int cram_set_container_executor(cram_fd *fd, cram_container_executor *fn,
++                                void *arg);
++
++/*! Encode a container handed to a cram_container_executor.
++ *
++ * Thread safe: may run concurrently with other encodes and with records being
++ * added to the file.
++ *
++ * @return 0 on success, -1 on failure.  On failure the container is still
++ * owned by the caller; free it with cram_free_container().
++ */
++HTSLIB_EXPORT
++int cram_encode_container(cram_fd *fd, cram_container *c);
++
++/*! Write an encoded container to the file (and to its index, if any), then
++ *  free it.
++ *
++ * Containers must be written one at a time, in the order the executor
++ * received them.
++ *
++ * @return 0 on success, -1 on failure.  The container is freed either way.
++ */
++HTSLIB_EXPORT
++int cram_flush_encoded_container(cram_fd *fd, cram_container *c);
++
+ /*! Checks for end of file on a cram_fd stream.
+  *
+  * @return

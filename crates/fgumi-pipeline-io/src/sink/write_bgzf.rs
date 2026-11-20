@@ -110,6 +110,25 @@ struct BaiSink {
 /// provenance by writing a build-time header.
 pub type ResolvedHeaderTransform = Box<dyn Fn(Header) -> io::Result<Header> + Send + Sync>;
 
+/// A deferred header once `handle` resolves, with `transform` (if any)
+/// re-applied on top of it: `Ok(None)` while it is still pending, `Err` if the
+/// handle was poisoned or the transform failed. Shared by the BAM and CRAM
+/// sinks so both write the same header.
+pub(crate) fn resolve_deferred_header(
+    handle: &HeaderHandle,
+    transform: Option<&ResolvedHeaderTransform>,
+) -> io::Result<Option<Header>> {
+    let header = match handle.try_get() {
+        None => return Ok(None),
+        Some(Err(e)) => return Err(e),
+        Some(Ok(h)) => h.clone(),
+    };
+    match transform {
+        Some(transform) => transform(header).map(Some),
+        None => Ok(Some(header)),
+    }
+}
+
 struct PendingHeader {
     handle: HeaderHandle,
     compression_level: u32,
@@ -298,19 +317,15 @@ impl WriteBgzfFile {
         let Some(pending) = state.pending_header.as_ref() else {
             return Ok(true);
         };
-        let header_clone = match pending.handle.try_get() {
-            None => return Ok(false),
-            Some(Err(e)) => return Err(e),
-            Some(Ok(h)) => h.clone(),
-        };
-        let level = pending.compression_level;
         // Re-apply the post-align header change (sort order / consensus / clip)
         // on top of the aligner's runtime-resolved header so its @PG/@RG/@CO
         // survive into the written header.
-        let header_clone = match &pending.transform {
-            Some(transform) => transform(header_clone)?,
-            None => header_clone,
+        let Some(header_clone) =
+            resolve_deferred_header(&pending.handle, pending.transform.as_ref())?
+        else {
+            return Ok(false);
         };
+        let level = pending.compression_level;
 
         let mut header_bytes = Vec::new();
         fgumi_bam_io::write_bam_header(&mut header_bytes, &header_clone)

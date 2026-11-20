@@ -1350,10 +1350,9 @@ impl RunAll {
     }
 
     /// Build the [`SinkSpec`](crate::pipeline::chains::SinkSpec) for the
-    /// `ChainSpec`. Runall always writes a plain BAM via `SinkSpec::Bam` —
-    /// `BamWithIndex` is never constructed here because runall's sort output
-    /// is either intermediate or a final template-coordinate BAM, neither of
-    /// which admits a valid BAI. Runall does not expose a
+    /// `ChainSpec`. Runall writes a plain BAM (`SinkSpec::Bam`), or CRAM
+    /// when `--output` ends in `.cram` (`SinkSpec::Cram`, feature `cram`) —
+    /// never an indexed sink, because runall does not expose a
     /// `--sort::write-index` flag.
     ///
     /// # Errors
@@ -1361,7 +1360,57 @@ impl RunAll {
     /// Currently infallible; returns `Result` for API symmetry with the
     /// other `derive_*` helpers.
     pub(crate) fn derive_sink_spec(&self) -> Result<crate::pipeline::chains::SinkSpec> {
-        Ok(crate::pipeline::chains::SinkSpec::Bam(self.output.clone()))
+        Ok(crate::pipeline::chains::SinkSpec::alignment(self.output.clone(), &self.output, false))
+    }
+
+    /// Whether an enabled alignment output or a reopenable input uses a CRAM
+    /// reference. Do not open streams here: consuming their prefix would lose it
+    /// before the chain reads the source. Streams are checked after normal source
+    /// classification, before any output is opened.
+    fn cram_consumes_reference(&self, stages: &[crate::pipeline::chains::Stage]) -> bool {
+        #[cfg(feature = "cram")]
+        {
+            use std::io::Read;
+
+            use crate::pipeline::chains::Stage;
+
+            let correct_rejects = stages
+                .contains(&Stage::Correct)
+                .then(|| self.correct_rejects_source().map(|(path, _)| path))
+                .flatten();
+            let consensus_rejects = stages
+                .iter()
+                .any(|stage| stage.is_consensus())
+                .then_some(self.rejects_opts.rejects.as_ref())
+                .flatten();
+            let filter_rejects = stages
+                .contains(&Stage::Filter)
+                .then_some(self.filter_opts.filter_rejects.as_ref())
+                .flatten();
+            if [Some(&self.output), correct_rejects.as_ref(), consensus_rejects, filter_rejects]
+                .into_iter()
+                .flatten()
+                .any(|path| fgumi_bam_io::is_cram_path(path))
+            {
+                return true;
+            }
+            self.input.as_ref().is_some_and(|path| {
+                if fgumi_bam_io::is_stdin_path(path)
+                    || !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+                {
+                    return false;
+                }
+                let Ok(mut file) = std::fs::File::open(path) else { return false };
+                let mut prefix = [0; fgumi_bam_io::FORMAT_PREFIX_LEN];
+                file.read_exact(&mut prefix).is_ok()
+                    && fgumi_bam_io::classify_input(&prefix) == fgumi_bam_io::InputFormat::Cram
+            })
+        }
+        #[cfg(not(feature = "cram"))]
+        {
+            let _ = stages;
+            false
+        }
     }
 
     /// Whether the `--realign` stage re-aligns duplex consensus reads: the chain
@@ -2078,7 +2127,8 @@ impl Command for RunAll {
         // `--ref` pairs with `--methylation-mode` for the consensus stages, but
         // it is also legitimately consumed *without* methylation when the
         // derived chain includes `Stage::Align` (the aligner reference) or
-        // starts at `zipper` (the FASTA + `.dict` for the output BAM header).
+        // starts at `zipper` (the FASTA + `.dict` for the output BAM header),
+        // or reads/writes CRAM (the codec reference).
         // For any other chain `--ref` is dead, so reject it without
         // `--methylation-mode` rather than silently ignore it. Keyed on the
         // derived chain — not the start stage — so a fused `extract`/`correct →
@@ -2086,11 +2136,16 @@ impl Command for RunAll {
         // `correct → correct`) is not. This must run after `derive_stages()`.
         let ref_is_consumed_without_methylation = self.start_from == RunAllStage::Zipper
             || stages.contains(&Stage::Align)
-            || stages.contains(&Stage::Realign);
-        if !ref_is_consumed_without_methylation
+            || stages.contains(&Stage::Realign)
+            || (self.reference.is_some() && self.cram_consumes_reference(&stages));
+        let ref_needs_cram_input = !ref_is_consumed_without_methylation
             && self.reference.is_some()
-            && self.methylation_mode.is_none()
-        {
+            && self.methylation_mode.is_none();
+        let defer_reference_validation = cfg!(feature = "cram")
+            && self.input.as_ref().is_some_and(|path| {
+                fgumi_bam_io::is_stdin_path(path) || fgumi_bam_io::is_stream_input(path)
+            });
+        if ref_needs_cram_input && !defer_reference_validation {
             bail!("--ref requires --methylation-mode to be set");
         }
 
@@ -2457,7 +2512,13 @@ impl Command for RunAll {
             command_line: command_line.to_string(),
         };
 
-        crate::pipeline::chains::build_for(spec)?.run()?;
+        crate::pipeline::chains::build::build_for_with_source_validation(spec, |source_is_cram| {
+            if ref_needs_cram_input && !source_is_cram {
+                bail!("--ref requires --methylation-mode to be set");
+            }
+            Ok(())
+        })?
+        .run()?;
 
         timer.log_completion(0);
         log::info!("runall completed successfully");
@@ -2595,6 +2656,37 @@ mod execute_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("--ref requires --methylation-mode"), "got: {e}");
+    }
+
+    /// Rejects are alignment outputs too: a CRAM rejects destination consumes
+    /// the reference even when the primary destination is BAM.
+    #[cfg(feature = "cram")]
+    #[rstest::rstest]
+    #[case::filter("filter", "--filter::rejects")]
+    #[case::correct("correct", "--rejects")]
+    #[case::correct_stage_option("correct", "--correct::rejects")]
+    fn cram_rejects_consume_reference(#[case] stage: &str, #[case] rejects_flag: &str) {
+        let error = run(&[
+            "--start-from",
+            stage,
+            "--stop-after",
+            stage,
+            "-i",
+            "missing-input.bam",
+            "-o",
+            "out.bam",
+            "--ref",
+            "ref.fa",
+            rejects_flag,
+            "rejects.cram",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !error.contains("--ref requires --methylation-mode"),
+            "CRAM rejects consume --ref: {error}"
+        );
+        assert!(error.contains("missing-input.bam"), "validation proceeds to the input: {error}");
     }
 
     /// With only `--filter::ref` supplying the reference, the depth and agreement masks never

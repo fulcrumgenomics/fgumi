@@ -16,7 +16,7 @@ use crate::output_compress::{OutputBlock, OutputCompressor, OutputDepth};
 use crate::sort::merge_job::{GatherSizing, MergeJob, MergeResult, MergeTicket};
 use crate::sort::merge_mode::{MergeMode, SerialReason};
 use crate::sort::protocol::{MemoryChunkErased, SortPhase2Event};
-use crate::types::{DecompressedBlock, RecordBatch, RecordBatchBuilder};
+use crate::types::{DecompressedBlock, RecordBatch, RecordBatchBuilder, walk_framed_records};
 use fgumi_pipeline_core::{
     HeapSize, Ordered, OrderedInbox, SideChannel, Unpushed,
     held::HeldSlot,
@@ -204,36 +204,6 @@ pub trait MergeBatchBuilder: Send + 'static {
     fn push_framed_records(&mut self, framed: &[u8]) -> io::Result<u64> {
         walk_framed_records(framed, |body| self.push_record_bytes(body))
     }
-}
-
-/// Call `f` on each body of `framed` (whole `[u32 LE len][body]` records back
-/// to back) and return the record count.
-///
-/// # Errors
-///
-/// `framed` ends inside a record or its length prefix, or `f` fails.
-fn walk_framed_records(
-    framed: &[u8],
-    mut f: impl FnMut(&[u8]) -> io::Result<()>,
-) -> io::Result<u64> {
-    let mut span = framed;
-    let mut records = 0u64;
-    while let Some((prefix, rest)) = span.split_first_chunk::<RECORD_LEN_BYTES>() {
-        let len = u32::from_le_bytes(*prefix) as usize;
-        let (body, rest) = rest.split_at_checked(len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "batch segment ends inside a record")
-        })?;
-        f(body)?;
-        records += 1;
-        span = rest;
-    }
-    if !span.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "batch segment ends inside a record prefix",
-        ));
-    }
-    Ok(records)
 }
 
 /// Intermediate-sort output: raw record bodies into a [`RecordBatch`].

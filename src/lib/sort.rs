@@ -69,6 +69,7 @@ pub fn sort_bam(config: &SortConfig) -> Result<SortStats> {
         sort.memory_per_thread,
     );
     let staged = StagedSortOutput::create(&config.output, config.write_index, "sort")?;
+    staged.validate_input(&config.input)?;
     let spec = ChainSpec {
         stages: vec![Stage::Sort],
         source: SourceSpec::Bam(config.input.clone()),
