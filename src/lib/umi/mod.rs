@@ -17,7 +17,7 @@ pub mod parallel_assigner;
 pub mod read_name;
 
 use anyhow::{Result, bail};
-use std::collections::BTreeMap;
+use fgumi_umi::assigner::assign_by_segment_lengths;
 
 /// Prefix of the error `group` and `dedup` report when UMI assignment fails for a
 /// position group (e.g. mixed UMI lengths, or an unparseable UMI for the strategy).
@@ -32,27 +32,58 @@ pub(crate) fn assign_umi_groups_error(e: &anyhow::Error) -> std::io::Error {
     )
 }
 
-/// Checks `--min-umi-length` for `group` and `dedup`: it must be at least 1, and the paired
-/// strategy rejects it.
+/// Checks `--min-umi-length` and `--truncate` for `group` and `dedup`: `--min-umi-length` must
+/// be at least 1, `--truncate` requires `--min-umi-length`, and the paired strategy rejects
+/// both.
 ///
 /// # Errors
 ///
-/// Returns an error if `min_umi_length` is `Some(0)`, or is set with [`Strategy::Paired`].
+/// Returns an error if `min_umi_length` or `truncate` is set with [`Strategy::Paired`] (checked
+/// first, so a paired run with `--truncate` alone gets the paired message), if `min_umi_length`
+/// is `Some(0)`, or if `truncate` is set without `min_umi_length`.
 pub(crate) fn validate_min_umi_length(
     min_umi_length: Option<usize>,
+    truncate: bool,
     strategy: Strategy,
 ) -> Result<()> {
+    if matches!(strategy, Strategy::Paired) && (min_umi_length.is_some() || truncate) {
+        bail!(
+            "--min-umi-length and --truncate cannot be used with the paired strategy; paired \
+             UMIs of different lengths are grouped by the lengths of their two UMIs"
+        );
+    }
     match min_umi_length {
-        Some(_) if matches!(strategy, Strategy::Paired) => {
-            bail!("Paired strategy cannot be used with --min-umi-length")
-        }
         Some(0) => bail!("--min-umi-length must be at least 1"),
+        None if truncate => bail!("--truncate requires --min-umi-length"),
         _ => Ok(()),
     }
 }
 
-/// Whether `b` is kept when comparing UMIs under `--min-umi-length`: `A`, `C`, `G`, `T` or `N`
-/// in either case, like fgbio's `basesOnly` (which keeps upper-case `ACGTN` of an upper-cased
+/// Logged once per `group` or `dedup` stage when `--min-umi-length` is given without
+/// `--truncate`, because earlier releases also truncated UMIs with `--min-umi-length` alone.
+pub(crate) const MIN_UMI_LENGTH_WITHOUT_TRUNCATE_NOTICE: &str = "--min-umi-length only discards reads with too few UMI bases; UMIs of different lengths are \
+     grouped separately. Add --truncate to group them together.";
+
+/// The notice to log for `--min-umi-length` without `--truncate` (see
+/// [`MIN_UMI_LENGTH_WITHOUT_TRUNCATE_NOTICE`]), or `None` when it does not apply: no
+/// `--min-umi-length`, `--truncate` given, or `--no-umi` (which ignores UMIs entirely).
+pub(crate) fn min_umi_length_notice(
+    min_umi_length: Option<usize>,
+    truncate: bool,
+    no_umi: bool,
+) -> Option<&'static str> {
+    (min_umi_length.is_some() && !truncate && !no_umi)
+        .then_some(MIN_UMI_LENGTH_WITHOUT_TRUNCATE_NOTICE)
+}
+
+/// The number of bases to truncate each UMI to before grouping: `--min-umi-length` when
+/// `--truncate` is given, otherwise `None` (UMIs are grouped as they are).
+pub(crate) fn truncate_length(min_umi_length: Option<usize>, truncate: bool) -> Option<usize> {
+    min_umi_length.filter(|_| truncate)
+}
+
+/// Whether `b` is kept when truncating UMIs with `--truncate`: `A`, `C`, `G`, `T` or `N` in
+/// either case, like fgbio's `basesOnly` (which keeps upper-case `ACGTN` of an upper-cased
 /// UMI). `N` cannot reach here from the CLI, since the template filter discards UMIs with one.
 const fn is_umi_base(b: u8) -> bool {
     matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't' | b'N' | b'n')
@@ -66,148 +97,79 @@ fn remove_non_bases(umi: &mut String) {
     }
 }
 
-/// Removes non-bases from every UMI (see [`remove_non_bases`]) and checks that each has at
-/// least `min_len` bases.
+/// Truncates every UMI to exactly `length` bases for `--truncate`, matching fgbio's
+/// `GroupReadsByUmi.umiForGrouping` (as of fulcrumgenomics/fgbio#1198): every character that
+/// is not a base (e.g. `-`) is removed, so the position of a dash does not matter, and the
+/// first `length` bases are kept.
 ///
 /// # Errors
 ///
-/// Returns an error if any UMI has fewer than `min_len` bases. The template filter normally
-/// discards such reads before this point.
-fn remove_non_bases_and_check_length(umis: &mut [String], min_len: usize) -> Result<()> {
+/// Returns an error if any UMI has fewer than `length` bases. The template filter discards
+/// such reads (`--min-umi-length`) before this point.
+pub(crate) fn truncate_umis(umis: &mut [String], length: usize) -> Result<()> {
     for umi in umis.iter_mut() {
         remove_non_bases(umi);
-    }
-    if let Some(shortest) = umis.iter().map(String::len).min()
-        && shortest < min_len
-    {
-        bail!("UMI found that had shorter length than expected ({shortest} < {min_len})");
+        if umi.len() < length {
+            bail!("UMI found that had shorter length than expected ({} < {length})", umi.len());
+        }
+        // Bases are ASCII, so every byte offset is a char boundary.
+        umi.truncate(length);
     }
     Ok(())
 }
 
-/// Truncates bases-only UMIs to the length of the shortest one.
-fn truncate_to_shortest(umis: &mut [String]) {
-    if let Some(shortest) = umis.iter().map(String::len).min() {
-        // Bases are ASCII, so every byte offset is a char boundary.
-        for umi in umis.iter_mut() {
-            umi.truncate(shortest);
-        }
-    }
-}
-
-/// Truncates a set of UMIs to a common length for `--min-umi-length`.
-///
-/// With `None` the UMIs are returned unchanged. With `Some(min_len)`, every character that is
-/// not a base (e.g. `-`) is removed and every UMI is truncated to the number of bases in the
-/// SHORTEST UMI in `umis`, matching fgbio's `GroupReadsByUmi.truncateUmis` (as of
-/// fulcrumgenomics/fgbio#1185). `min_len` only bounds that length from below. Removing the
-/// non-bases means the bases of a multi-segment UMI (e.g. `ACG-TACGT`) are compared as one
-/// sequence, wherever its dash falls.
-///
-/// # Errors
-///
-/// Returns an error if any UMI has fewer than `min_len` bases.
-pub(crate) fn truncate_umis(
-    mut umis: Vec<String>,
-    min_umi_length: Option<usize>,
-) -> Result<Vec<String>> {
-    let Some(min_len) = min_umi_length else { return Ok(umis) };
-    remove_non_bases_and_check_length(&mut umis, min_len)?;
-    truncate_to_shortest(&mut umis);
-    Ok(umis)
-}
-
-/// Assigns molecule ids to one position (and orientation) subgroup's UMIs, applying
-/// `--min-umi-length` the way fgbio's `GroupReadsByUmi.assignUmiGroups` does.
+/// Assigns molecule ids to one position (and orientation) subgroup's UMIs the way fgbio's
+/// `GroupReadsByUmi.assignUmiGroups` does (as of fulcrumgenomics/fgbio#1198).
 ///
 /// `umis` must already be normalized for the strategy (upper-cased, or prefixed for the
-/// paired strategy). With `None` they are assigned as given. With `Some(min_len)`:
-///
-/// - if the assigner groups only identical UMIs (identity, or `--edits 0`), the UMIs are first
-///   split by their first `min_len` bases, and each split is truncated to its own shortest UMI
-///   and assigned separately, so the result does not depend on the order of the input;
-/// - otherwise the whole set is truncated to its shortest UMI (see [`truncate_umis`]).
-///
-/// Splits are assigned in ascending key order, so molecule ids are deterministic.
+/// paired strategy). With `truncate_length` set (`--truncate`), every UMI is first truncated
+/// to exactly that many bases (see [`truncate_umis`]), so all UMIs have the same length and
+/// are assigned in one call. Otherwise the UMIs are bucketed by segment lengths and each bucket
+/// is assigned separately (see [`assign_by_segment_lengths`]).
 ///
 /// # Errors
 ///
-/// Returns an error if any UMI has fewer than `min_len` bases, or if the assigner fails.
+/// Returns an error if any UMI has fewer than `truncate_length` bases, or if the assigner
+/// fails.
 pub(crate) fn assign_umis(
     assigner: &dyn UmiAssigner,
     mut umis: Vec<String>,
-    min_umi_length: Option<usize>,
+    truncate_length: Option<usize>,
 ) -> Result<Vec<MoleculeId>> {
-    let Some(min_len) = min_umi_length else { return assigner.assign(&umis) };
-    if !assigner.groups_identical_umis_only() {
-        return assigner.assign(&truncate_umis(umis, min_umi_length)?);
-    }
-
-    remove_non_bases_and_check_length(&mut umis, min_len)?;
-    let Some(splits) = split_by_prefix(&umis, min_len) else {
-        truncate_to_shortest(&mut umis);
+    if let Some(length) = truncate_length {
+        // Every truncated UMI is `length` bases with no dash: one bucket.
+        truncate_umis(&mut umis, length)?;
         return assigner.assign(&umis);
-    };
-
-    let mut assignments = vec![MoleculeId::None; umis.len()];
-    for indices in splits {
-        let mut split: Vec<String> =
-            indices.iter().map(|&i| std::mem::take(&mut umis[i])).collect();
-        truncate_to_shortest(&mut split);
-        for (i, id) in indices.into_iter().zip(assigner.assign(&split)?) {
-            assignments[i] = id;
-        }
     }
-    Ok(assignments)
-}
-
-/// Splits the indices of bases-only `umis`, each at least `len` bases long, by their first
-/// `len` bases, in ascending key order. Returns `None`, without allocating, when every UMI
-/// shares the same first `len` bases (one split).
-fn split_by_prefix(umis: &[String], len: usize) -> Option<Vec<Vec<usize>>> {
-    let first = &umis.first()?[..len];
-    if umis.iter().all(|u| &u[..len] == first) {
-        return None;
-    }
-    let mut by_prefix: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (i, umi) in umis.iter().enumerate() {
-        by_prefix.entry(&umi[..len]).or_default().push(i);
-    }
-    Some(by_prefix.into_values().collect())
+    assign_by_segment_lengths(assigner, umis)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn strings(umis: &[&str]) -> Vec<String> {
         umis.iter().map(|s| (*s).to_string()).collect()
     }
 
     #[rstest]
-    #[case::none(&["ACGTACGT", "ACG"], None, &["ACGTACGT", "ACG"])]
-    #[case::none_keeps_dashes(&["ACG-TACGT", "ACG"], None, &["ACG-TACGT", "ACG"])]
-    #[case::empty(&[], Some(4), &[])]
-    #[case::to_option_when_shortest_equals_it(&["ACGTAC", "ACGTACGT"], Some(6), &["ACGTAC", "ACGTAC"])]
-    // fgbio semantics: truncate to the shortest UMI (8), not to the option value (6).
-    #[case::to_shortest_not_option(&["ACGTACGTAA", "ACGTACGT"], Some(6), &["ACGTACGT", "ACGTACGT"])]
-    #[case::all_longer_than_option(&["ACGTACGT", "ACGTACGA"], Some(6), &["ACGTACGT", "ACGTACGA"])]
-    // Lengths are counted in bases and dashes are removed: `ACGTACGT-A` has 9 bases.
-    #[case::dash_removed(&["ACGTACGT-A", "ACGTACGTAC"], Some(8), &["ACGTACGTA", "ACGTACGTA"])]
-    // Where the dash falls does not matter: both are the bases `ACGTACGTA...`.
-    #[case::interleaved_dash(&["ACGTACGTA-T", "ACG-TACGTA"], Some(8), &["ACGTACGTA", "ACGTACGTA"])]
+    #[case::empty(&[], 4, &[])]
+    #[case::already_that_length(&["ACGTAC", "TTTTTT"], 6, &["ACGTAC", "TTTTTT"])]
+    // fgbio#1198: truncate to the option value, not to the shortest UMI.
+    #[case::to_option_not_shortest(&["ACGTACGTAA", "ACGTACGT"], 6, &["ACGTAC", "ACGTAC"])]
+    #[case::mixed_lengths(&["ACTACT", "ACTAC", "ACTACTA"], 5, &["ACTAC", "ACTAC", "ACTAC"])]
+    // Lengths are counted in bases and dashes are removed before truncating.
+    #[case::dash_removed(&["ACGTACGT-A", "ACG-TACGTAC"], 8, &["ACGTACGT", "ACGTACGT"])]
+    #[case::trailing_dash(&["ACGT-"], 4, &["ACGT"])]
     // Every non-base character is removed, like fgbio's `basesOnly`.
-    #[case::other_characters_removed(&["AC+GT.AC", "ACGTACGT"], Some(4), &["ACGTAC", "ACGTAC"])]
-    #[case::lowercase_counts(&["acgtac", "ACGTACGT"], Some(4), &["acgtac", "ACGTAC"])]
-    fn test_truncate_umis(
-        #[case] umis: &[&str],
-        #[case] min_len: Option<usize>,
-        #[case] expected: &[&str],
-    ) {
-        let got = truncate_umis(strings(umis), min_len).expect("truncation should succeed");
-        assert_eq!(got, strings(expected));
+    #[case::other_characters_removed(&["AC+GT.AC", "ACGTACGT"], 4, &["ACGT", "ACGT"])]
+    #[case::lowercase_counts(&["acgtac", "ACGTACGT"], 4, &["acgt", "ACGT"])]
+    fn test_truncate_umis(#[case] umis: &[&str], #[case] length: usize, #[case] expected: &[&str]) {
+        let mut umis = strings(umis);
+        truncate_umis(&mut umis, length).expect("truncation should succeed");
+        assert_eq!(umis, strings(expected));
     }
 
     #[rstest]
@@ -216,35 +178,74 @@ mod tests {
     #[case::dash_not_a_base(&["ACGTACGT", "ACG-TACG"], 8, "(7 < 8)")]
     fn test_truncate_umis_too_short(
         #[case] umis: &[&str],
-        #[case] min_len: usize,
+        #[case] length: usize,
         #[case] detail: &str,
     ) {
-        let err = truncate_umis(strings(umis), Some(min_len)).expect_err("too short must fail");
+        let err = truncate_umis(&mut strings(umis), length).expect_err("too short must fail");
         assert!(err.to_string().ends_with(detail), "unexpected error: {err}");
     }
 
+    const PAIRED_ERROR: &str = "--min-umi-length and --truncate cannot be used with the paired \
+                                strategy; paired UMIs of different lengths are grouped by the \
+                                lengths of their two UMIs";
+
     #[rstest]
-    #[case::unset_identity(None, Strategy::Identity, None)]
-    #[case::unset_paired(None, Strategy::Paired, None)]
-    #[case::one(Some(1), Strategy::Adjacency, None)]
+    #[case::unset_identity(None, false, Strategy::Identity, None)]
+    #[case::unset_paired(None, false, Strategy::Paired, None)]
+    #[case::one(Some(1), false, Strategy::Adjacency, None)]
+    #[case::truncate(Some(6), true, Strategy::Edit, None)]
     // fgbio#1185: `--min-umi-length` must be at least 1.
-    #[case::zero(Some(0), Strategy::Identity, Some("--min-umi-length must be at least 1"))]
-    #[case::paired(
-        Some(4),
-        Strategy::Paired,
-        Some("Paired strategy cannot be used with --min-umi-length")
+    #[case::zero(Some(0), false, Strategy::Identity, Some("--min-umi-length must be at least 1"))]
+    // fgbio#1198: `--truncate` requires `--min-umi-length`.
+    #[case::truncate_without_min_length(
+        None,
+        true,
+        Strategy::Edit,
+        Some("--truncate requires --min-umi-length")
     )]
+    #[case::paired(Some(4), false, Strategy::Paired, Some(PAIRED_ERROR))]
+    #[case::paired_truncate(Some(4), true, Strategy::Paired, Some(PAIRED_ERROR))]
+    // The paired check comes first, so `--truncate` alone gets the paired message rather than
+    // "--truncate requires --min-umi-length".
+    #[case::paired_truncate_without_min_length(None, true, Strategy::Paired, Some(PAIRED_ERROR))]
+    #[case::paired_zero_truncate(Some(0), true, Strategy::Paired, Some(PAIRED_ERROR))]
     fn test_validate_min_umi_length(
         #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
         #[case] strategy: Strategy,
         #[case] expected_error: Option<&str>,
     ) {
-        let result = validate_min_umi_length(min_umi_length, strategy);
+        let result = validate_min_umi_length(min_umi_length, truncate, strategy);
         assert_eq!(result.err().map(|e| e.to_string()).as_deref(), expected_error);
     }
 
-    /// The assigners [`assign_umis`] is exercised with: every non-paired strategy, sequential
-    /// and parallel (two threads).
+    #[rstest]
+    #[case::unset(None, false, false, None)]
+    #[case::min_length_only(Some(6), false, false, Some(MIN_UMI_LENGTH_WITHOUT_TRUNCATE_NOTICE))]
+    #[case::truncate(Some(6), true, false, None)]
+    #[case::no_umi(Some(6), false, true, None)]
+    fn test_min_umi_length_notice(
+        #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
+        #[case] no_umi: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(min_umi_length_notice(min_umi_length, truncate, no_umi), expected);
+    }
+
+    #[rstest]
+    #[case::unset(None, false, None)]
+    #[case::min_length_only(Some(6), false, None)]
+    #[case::truncate(Some(6), true, Some(6))]
+    fn test_truncate_length(
+        #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(truncate_length(min_umi_length, truncate), expected);
+    }
+
+    /// The assigners [`assign_umis`] is exercised with, sequential and parallel (two threads).
     #[derive(Debug, Clone, Copy)]
     enum TestAssigner {
         Identity,
@@ -253,12 +254,15 @@ mod tests {
         ParallelEdit(u32),
         Adjacency(u32),
         ParallelAdjacency(u32),
+        Paired(u32),
+        ParallelPaired(u32),
     }
 
     impl TestAssigner {
         fn build(self) -> Box<dyn UmiAssigner> {
             use parallel_assigner::{
                 ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
+                ParallelPairedAssigner,
             };
             match self {
                 Self::Identity => Strategy::Identity.new_assigner(0),
@@ -269,22 +273,25 @@ mod tests {
                 Self::ParallelAdjacency(edits) => {
                     Box::new(ParallelAdjacencyAssigner::new(edits, 2))
                 }
+                Self::Paired(edits) => Strategy::Paired.new_assigner(edits),
+                Self::ParallelPaired(edits) => Box::new(ParallelPairedAssigner::new(edits, 2)),
             }
         }
     }
 
     /// Runs [`assign_umis`] and returns the partition it induces, as sets of input indices.
+    /// The two strands of a paired molecule (`/A` and `/B`) are in one set.
     fn partition(
         assigner: TestAssigner,
         umis: &[&str],
-        min_len: usize,
+        truncate_length: Option<usize>,
     ) -> BTreeSet<BTreeSet<usize>> {
-        let ids = assign_umis(assigner.build().as_ref(), strings(umis), Some(min_len))
+        let ids = assign_umis(assigner.build().as_ref(), strings(umis), truncate_length)
             .expect("assignment should succeed");
         assert!(ids.iter().all(|id| *id != MoleculeId::None), "every UMI must be assigned");
-        let mut by_id: BTreeMap<Option<usize>, BTreeSet<usize>> = BTreeMap::new();
+        let mut by_id: BTreeMap<Option<u64>, BTreeSet<usize>> = BTreeMap::new();
         for (i, id) in ids.iter().enumerate() {
-            by_id.entry(id.to_vec_index()).or_default().insert(i);
+            by_id.entry(id.id()).or_default().insert(i);
         }
         by_id.into_values().collect()
     }
@@ -293,28 +300,88 @@ mod tests {
         groups.iter().map(|g| g.iter().copied().collect()).collect()
     }
 
-    /// Ports of fgbio#1185's identity / `--edits 0` tests (`GroupReadsByUmiTest.scala`, "... with
-    /// the $strategy strategy, edits=$edits and $sortOrder input"): UMIs are split by their first
-    /// `--min-umi-length` bases and each split is truncated to its own shortest UMI, so the result
-    /// is the same for every input order. Each case is checked in the given and reversed order.
+    /// Port of fgbio#1198's "group single-end reads with UMIs of different lengths
+    /// separately": `AAAAAAA` (index 4) is one edit from `AAAAAAAA` but shorter, so it is its
+    /// own molecule.
     #[rstest]
-    // "truncate UMIs without dashes to the shortest UMI sharing their first bases": TTTT does not
-    // share ACGT, so its length does not shorten ACGTA/ACGTC to ACGT.
-    #[case::shortest_sharing_prefix(&["ACGTA", "ACGTC", "TTTT"], 4, vec![vec![0], vec![1], vec![2]])]
-    // "compare only the bases of UMIs containing dashes when truncating": among the ACGTACGT split
-    // the shortest UMI has nine bases, so 0 and 3 are identical wherever their dashes fall.
+    fn test_assign_umis_keeps_umis_of_different_lengths_apart(
+        #[values(
+            TestAssigner::Edit(1),
+            TestAssigner::ParallelEdit(1),
+            TestAssigner::Adjacency(1),
+            TestAssigner::ParallelAdjacency(1)
+        )]
+        assigner: TestAssigner,
+    ) {
+        let umis = ["AAAAAAAA", "AAAAAAAA", "ACACACA", "ACACACC", "AAAAAAA"];
+        assert_eq!(partition(assigner, &umis, None), sets(&[vec![0, 1], vec![2, 3], vec![4]]));
+    }
+
+    /// Port of fgbio#1198's "not group UMIs with the same number of bases but different segment
+    /// lengths": the 8+8 and 7+7 dual UMIs, the 6+3 and 5+4 dual UMIs, and `ACGT` and `ACGT-`
+    /// are never compared with each other.
+    #[rstest]
+    #[case::identity(
+        TestAssigner::Identity,
+        vec![vec![0, 1], vec![2], vec![3, 4], vec![5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    #[case::parallel_identity(
+        TestAssigner::ParallelIdentity,
+        vec![vec![0, 1], vec![2], vec![3, 4], vec![5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    #[case::edit(
+        TestAssigner::Edit(1),
+        vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    #[case::parallel_edit(
+        TestAssigner::ParallelEdit(1),
+        vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    #[case::adjacency(
+        TestAssigner::Adjacency(1),
+        vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    #[case::parallel_adjacency(
+        TestAssigner::ParallelAdjacency(1),
+        vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7], vec![8, 9], vec![10], vec![11]]
+    )]
+    fn test_assign_umis_keeps_different_segment_lengths_apart(
+        #[case] assigner: TestAssigner,
+        #[case] expected: Vec<Vec<usize>>,
+    ) {
+        let umis = [
+            "AAAAAAAA-CCCCCCCC",
+            "AAAAAAAA-CCCCCCCC",
+            "AAAAAAAA-CCCCCCCG",
+            "AAAAAAA-CCCCCCC",
+            "AAAAAAA-CCCCCCC",
+            "AAAAAAA-CCCCCCG",
+            "ACTACT-GGG",
+            "ACTACT-GGG",
+            "ACTAC-TGGG",
+            "ACTAC-TGGG",
+            "ACGT",
+            "ACGT-",
+        ];
+        assert_eq!(partition(assigner, &umis, None), sets(&expected));
+    }
+
+    /// With `--truncate`, UMIs of different lengths are truncated to `--min-umi-length` bases
+    /// and grouped together (ports of fgbio#1198's `--truncate` tests).
+    #[rstest]
+    // "truncate to the specified minimum length with --truncate".
+    #[case::mixed_lengths(&["ACTACT", "ACTAC", "ACTACTA"], 5, vec![vec![0, 1, 2]])]
+    // "truncate to --min-umi-length even when every UMI is longer".
+    #[case::all_longer(&["ACTACTC", "ACTACTC", "ACTACTG", "ACTACTG"], 6, vec![vec![0, 1, 2, 3]])]
+    // "truncate UMIs to --min-umi-length with --truncate".
+    #[case::to_min_length(&["ACGTA", "ACGTC", "TTTT", "ACGT"], 4, vec![vec![0, 1, 3], vec![2]])]
+    // "compare only the first --min-umi-length bases of UMIs containing dashes".
     #[case::dashed(
         &["ACG-TACGTA", "ACG-TACGTC", "ACG-TACGA", "ACGT-ACGTA"],
         8,
-        vec![vec![0, 3], vec![1], vec![2]]
-    )]
-    // "truncate UMIs without dashes to the minimum UMI length".
-    #[case::to_minimum(
-        &["ACGTACGTA", "ACGTACGTC", "ACGTACGA", "ACGTACGT"],
-        8,
         vec![vec![0, 1, 3], vec![2]]
     )]
-    fn test_assign_umis_splits_identical_only_assigners_by_prefix(
+    fn test_assign_umis_truncates_identical_only(
         #[values(
             TestAssigner::Identity,
             TestAssigner::ParallelIdentity,
@@ -325,33 +392,54 @@ mod tests {
         )]
         assigner: TestAssigner,
         #[case] umis: &[&str],
-        #[case] min_len: usize,
+        #[case] length: usize,
         #[case] expected: Vec<Vec<usize>>,
     ) {
-        assert_eq!(partition(assigner, umis, min_len), sets(&expected), "given order");
-
-        let reversed: Vec<&str> = umis.iter().rev().copied().collect();
-        let last = umis.len() - 1;
-        let expected_reversed: Vec<Vec<usize>> =
-            expected.iter().map(|g| g.iter().map(|i| last - i).collect()).collect();
-        assert_eq!(
-            partition(assigner, &reversed, min_len),
-            sets(&expected_reversed),
-            "reversed order"
-        );
+        assert_eq!(partition(assigner, umis, Some(length)), sets(&expected));
     }
 
-    /// Ports of fgbio#1185's "compare only the bases of UMIs containing dashes when truncating
-    /// with the $strategy strategy" (edit and adjacency, `--edits 1`). With edits, the whole set
-    /// is truncated to its shortest UMI, and dashes are removed first.
+    /// Without `--truncate`, the identity / `--edits 0` cases above keep every length (and every
+    /// dash layout) apart (fgbio#1198's "not truncate UMIs containing dashes without
+    /// --truncate" and "group only identical UMIs of the same length").
+    #[rstest]
+    #[case::dashed(
+        &["ACG-TACGTA", "ACG-TACGTC", "ACG-TACGA", "ACGT-ACGTA"],
+        vec![vec![0], vec![1], vec![2], vec![3]]
+    )]
+    #[case::same_length_only(
+        &["ACGTA", "ACGTA", "ACGT", "ACGT-", "ACGTAC"],
+        vec![vec![0, 1], vec![2], vec![3], vec![4]]
+    )]
+    fn test_assign_umis_without_truncate_identical_only(
+        #[values(
+            TestAssigner::Identity,
+            TestAssigner::ParallelIdentity,
+            TestAssigner::Edit(0),
+            TestAssigner::ParallelEdit(0),
+            TestAssigner::Adjacency(0),
+            TestAssigner::ParallelAdjacency(0)
+        )]
+        assigner: TestAssigner,
+        #[case] umis: &[&str],
+        #[case] expected: Vec<Vec<usize>>,
+    ) {
+        assert_eq!(partition(assigner, umis, None), sets(&expected));
+    }
+
+    /// Ports of fgbio#1198's "compare only the bases of UMIs containing dashes when truncating"
+    /// and "not group UMIs whose segments have different lengths without --truncate" (edit
+    /// and adjacency, `--edits 1`).
     #[rstest]
     // ACGTT vs ACGTA: one mismatch. Comparing characters ("AC-GTT" vs "ACGTA-") would give four.
-    #[case::one_mismatch(&["AC-GTT", "ACGTA-T"], 5, vec![vec![0, 1]])]
-    #[case::one_mismatch_trailing_dash(&["ACGTAC-", "TCGTACG-TT"], 6, vec![vec![0, 1]])]
-    // The shortest UMI has six bases, more than `--min-umi-length`: ACGTTA vs ACGTAC is two
-    // mismatches, so they stay apart. Truncating to five bases (ACGTT vs ACGTA) would merge them.
-    #[case::shortest_longer_than_option(&["AC-GTTA", "ACGTA-C"], 5, vec![vec![0], vec![1]])]
-    fn test_assign_umis_compares_bases_with_edits(
+    #[case::one_mismatch(&["AC-GTT", "ACGTA-T"], Some(5), vec![vec![0, 1]])]
+    #[case::one_mismatch_trailing_dash(&["ACGTAC-", "TCGTACG-TT"], Some(6), vec![vec![0, 1]])]
+    // Both have six bases, more than `--min-umi-length`, and ACGTTA vs ACGTAC is two
+    // mismatches. UMIs are truncated to `--min-umi-length`, not to the shortest UMI, so ACGTT
+    // vs ACGTA (one mismatch) are grouped.
+    #[case::truncated_to_option(&["AC-GTTA", "ACGTA-C"], Some(5), vec![vec![0, 1]])]
+    // One mismatch apart if the dashes are ignored, but the segment lengths differ (2+4 vs 5+1).
+    #[case::segment_lengths_differ(&["AC-GTTA", "ACGTA-A"], None, vec![vec![0], vec![1]])]
+    fn test_assign_umis_dashed_with_edits(
         #[values(
             TestAssigner::Edit(1),
             TestAssigner::ParallelEdit(1),
@@ -360,30 +448,100 @@ mod tests {
         )]
         assigner: TestAssigner,
         #[case] umis: &[&str],
-        #[case] min_len: usize,
+        #[case] truncate_length: Option<usize>,
         #[case] expected: Vec<Vec<usize>>,
     ) {
-        assert_eq!(partition(assigner, umis, min_len), sets(&expected));
+        assert_eq!(partition(assigner, umis, truncate_length), sets(&expected));
     }
 
-    /// With edits, UMIs are not split by prefix: `ACGTA`/`ACGTC`/`TTTT` with `--min-umi-length 4`
-    /// truncate together to `ACGT`, `ACGT` and `TTTT`.
+    /// The paired strategy groups mixed-length UMI pairs without error. Both orientations of a
+    /// pair share their canonical segment lengths, so `A-B` and `B-A` are still the two strands
+    /// of one molecule, including when the two halves differ in length.
     #[rstest]
-    fn test_assign_umis_does_not_split_with_edits(
-        #[values(TestAssigner::Edit(1), TestAssigner::ParallelEdit(1))] assigner: TestAssigner,
+    #[case::two_lengths(
+        &["ACTACT-GGGGGG", "GGGGGG-ACTACT", "ACT-GGG", "GGG-ACT"],
+        vec![vec![0, 1], vec![2, 3]]
+    )]
+    #[case::halves_of_different_lengths(&["ACTACT-GGG", "GGG-ACTACT"], vec![vec![0, 1]])]
+    fn test_assign_umis_paired_mixed_lengths(
+        #[values(TestAssigner::Paired(1), TestAssigner::ParallelPaired(1))] assigner: TestAssigner,
+        #[case] umis: &[&str],
+        #[case] expected: Vec<Vec<usize>>,
     ) {
-        assert_eq!(
-            partition(assigner, &["ACGTA", "ACGTC", "TTTT"], 4),
-            sets(&[vec![0, 1], vec![2]])
-        );
+        assert_eq!(partition(assigner, umis, None), sets(&expected));
     }
 
-    #[test]
-    fn test_assign_umis_without_min_length_assigns_as_given() {
-        let assigner = Strategy::Identity.new_assigner(0);
-        let ids = assign_umis(assigner.as_ref(), strings(&["ACGTA", "ACGTC"]), None)
+    /// Paired molecule ids across several length buckets are pinned, including the strand, and
+    /// are the same for the sequential and parallel paired assigners. The keys carry the
+    /// orientation prefixes `group` adds (`aa:`/`bb:` at `--edits 1`). The 3+3 bucket is
+    /// numbered first; its two keys are the two strands of one molecule.
+    #[rstest]
+    #[case::unordered(
+        &["aa:ACTACT-bb:GGGGGG", "aa:ACT-bb:GGG", "bb:GGG-aa:ACT"],
+        vec![MoleculeId::PairedA(1), MoleculeId::PairedA(0), MoleculeId::PairedB(0)]
+    )]
+    #[case::halves_of_different_lengths(
+        &["aa:ACTACT-bb:GGG", "bb:GGG-aa:ACTACT", "aa:ACT-bb:GGG", "aa:ACT-bb:GGGGGG"],
+        vec![
+            MoleculeId::PairedA(2),
+            MoleculeId::PairedB(2),
+            MoleculeId::PairedA(0),
+            MoleculeId::PairedA(1),
+        ]
+    )]
+    fn test_assign_umis_paired_ids_across_buckets(
+        #[values(TestAssigner::Paired(1), TestAssigner::ParallelPaired(1))] assigner: TestAssigner,
+        #[case] umis: &[&str],
+        #[case] expected: Vec<MoleculeId>,
+    ) {
+        let ids = assign_umis(assigner.build().as_ref(), strings(umis), None)
             .expect("assignment should succeed");
-        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, expected);
+    }
+
+    /// Buckets are assigned in ascending order of their segment lengths, from one id counter, so
+    /// molecule ids are deterministic and unique across buckets whatever the input order.
+    #[rstest]
+    fn test_assign_umis_numbers_buckets_in_ascending_length_order(
+        #[values(
+            TestAssigner::Identity,
+            TestAssigner::ParallelIdentity,
+            TestAssigner::Edit(1),
+            TestAssigner::ParallelEdit(1),
+            TestAssigner::Adjacency(1),
+            TestAssigner::ParallelAdjacency(1)
+        )]
+        assigner: TestAssigner,
+    ) {
+        let ids = assign_umis(
+            assigner.build().as_ref(),
+            strings(&["AAAAAA", "CCC", "AAAA", "CCC"]),
+            None,
+        )
+        .expect("assignment should succeed");
+        let expected: Vec<Option<u64>> = vec![Some(2), Some(0), Some(1), Some(0)];
+        assert_eq!(ids.iter().map(MoleculeId::id).collect::<Vec<_>>(), expected);
+    }
+
+    /// When every UMI has the same segment lengths, [`assign_umis`] is exactly one `assign`
+    /// call, so same-length data gets the same ids it did before UMIs were bucketed.
+    #[rstest]
+    fn test_assign_umis_same_lengths_match_a_single_assign(
+        #[values(
+            TestAssigner::Identity,
+            TestAssigner::ParallelIdentity,
+            TestAssigner::Edit(1),
+            TestAssigner::ParallelEdit(1),
+            TestAssigner::Adjacency(1),
+            TestAssigner::ParallelAdjacency(1)
+        )]
+        assigner: TestAssigner,
+    ) {
+        let umis = strings(&["ACGT-TTGA", "ACGT-TTGA", "ACGA-TTGA", "GGCC-AATT"]);
+        let direct = assigner.build().assign(&umis).expect("assignment should succeed");
+        let bucketed =
+            assign_umis(assigner.build().as_ref(), umis, None).expect("assignment should succeed");
+        assert_eq!(bucketed, direct);
     }
 
     #[test]

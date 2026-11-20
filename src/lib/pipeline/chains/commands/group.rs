@@ -141,6 +141,7 @@ pub(crate) fn build_group_process_step(
     effective_edits: u32,
     index_threshold: IndexThreshold,
     raw_tag: [u8; 2],
+    truncate_length: Option<usize>,
     no_umi: bool,
     allow_unmapped: bool,
     parallel_group_min_templates: Option<ParallelMinTemplates>,
@@ -252,7 +253,7 @@ pub(crate) fn build_group_process_step(
                     &mut templates,
                     assigner,
                     raw_tag,
-                    filter_config.min_umi_length,
+                    truncate_length,
                     no_umi,
                 ) {
                     // A failed assignment means this position group's reads cannot be

@@ -72,13 +72,19 @@ fgumi sort -i input.bam -o sorted.bam --order template-coordinate
 ## `fgumi group` rejects `--strategy paired` with another flag
 
 ```text
-Paired strategy cannot be used with --min-umi-length
+--min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs of different lengths are grouped by the lengths of their two UMIs
 --no-umi cannot be used with --strategy paired
 ```
 
-**Cause.** The `paired` strategy (for duplex data) is incompatible with `--min-umi-length` and `--no-umi`.
+**Cause.** The `paired` strategy (for duplex data) is incompatible with `--min-umi-length`, `--truncate` and `--no-umi`. Paired UMIs of different lengths need neither option: they are grouped with the UMIs whose two halves have the same lengths.
 
 **Fix.** Drop the conflicting flag. Use `paired` only for duplex workflows; use `adjacency` for simplex and CODEC.
+
+## UMIs of different lengths are not grouped together
+
+**Cause.** `fgumi group` and `fgumi dedup` only compare UMIs of the same length (and, for UMIs with several `-`-separated segments, the same length in every segment), so UMIs of different lengths are always separate molecules. `--min-umi-length` on its own only discards reads with too few UMI bases; it does not shorten the others.
+
+**Fix.** To group UMIs of different lengths, add `--truncate` together with `--min-umi-length` (see [UMI Grouping](umi-grouping.md#umis-of-different-lengths)).
 
 ## `fgumi realign` rejects the input: no `rw` tag
 

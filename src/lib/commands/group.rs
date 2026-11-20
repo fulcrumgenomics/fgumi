@@ -203,7 +203,7 @@ pub(crate) fn assign_umi_groups_impl(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
-    min_umi_length: Option<usize>,
+    truncate_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
     // All templates are in raw-byte mode (Template always uses RawRecord)
@@ -236,7 +236,7 @@ pub(crate) fn assign_umi_groups_impl(
                 indices,
                 assigner,
                 raw_tag,
-                min_umi_length,
+                truncate_length,
                 no_umi,
             )?;
         }
@@ -248,7 +248,7 @@ pub(crate) fn assign_umi_groups_impl(
             &all_indices,
             assigner,
             raw_tag,
-            min_umi_length,
+            truncate_length,
             no_umi,
         )?;
     }
@@ -265,7 +265,7 @@ fn assign_umi_groups_for_indices_impl(
     indices: &[usize],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
-    min_umi_length: Option<usize>,
+    truncate_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
     if indices.is_empty() {
@@ -316,9 +316,9 @@ fn assign_umi_groups_for_indices_impl(
         umis.push(processed_umi);
     }
 
-    // Assign UMI groups, applying --min-umi-length (skipped in no-umi mode) - returns
+    // Assign UMI groups, applying --truncate (skipped in no-umi mode) - returns
     // Vec<MoleculeId> indexed by input position
-    let assignments = assign_umis(assigner, umis, if no_umi { None } else { min_umi_length })?;
+    let assignments = assign_umis(assigner, umis, if no_umi { None } else { truncate_length })?;
 
     // Store MoleculeId enum in Template.mi field
     // The actual MI tag string is set during serialization with global offset
@@ -412,21 +412,25 @@ Grouping of UMIs is performed by one of four strategies:
 Strategies edit, adjacency, and paired make use of the --edits parameter to control the matching of
 non-identical UMIs.
 
-By default, with the edit, adjacency, and paired strategies, the UMIs grouped together must all be
-the same length, or the command exits with an error. UMIs are grouped together when their reads are
-at the same position and, for edit and adjacency, also have the same pair orientation, so UMIs of
-different lengths on reads with different pair orientations do not cause an error. UMIs that
-cannot be encoded as bases are not checked: single UMIs longer than 32 bases, paired UMIs with a
-half longer than 32 bases, and UMIs with a character other than A, C, G, T in either case (or
-the dash between UMI segments). If --min-umi-length=len is specified (len must be at
-least 1) then reads that have a UMI shorter than len bases will be discarded, and when comparing
-UMIs of different lengths, the first m bases will be compared, where m is the number of bases in
-the shortest UMI being compared. The UMI length is the number of bases (A, C, G, T) in the UMI;
-dashes and all other characters are not counted. When comparing, these other characters are
-removed, so the bases of a multi-segment UMI (e.g. ACG-TACGT) are compared as one sequence and the
-position of the dash is ignored. For the identity strategy, and for other strategies with
---edits=0, UMIs are first split by their first len bases and m is computed separately for each
-split. This option is not implemented for reads with UMI pairs (i.e. using the paired assigner).
+UMIs may have different lengths, but only UMIs with the same length are compared, so reads whose
+UMIs have different lengths are never assigned to the same molecule. For UMIs with multiple
+segments separated by `-`, each segment must have the same length (e.g. ACGT-CCGGA is never grouped
+with ACGTC-CGGA or ACGT-CCGG). For the paired strategy, the two orientations of a UMI pair (e.g.
+ACGT-CCGGA and CCGGA-ACGT) are compared with each other as usual.
+
+If --min-umi-length=len is specified (len must be at least 1) then reads that have fewer than len
+bases in their UMI are discarded. The number of bases is the number of A, C, G and T characters in
+the UMI: dashes and other characters are not counted, and reads with an N in their UMI are
+discarded earlier. The UMIs of the remaining reads are not changed, so UMIs of different lengths
+are still never grouped together.
+
+To group UMIs of different lengths together, specify --truncate together with
+--min-umi-length=len. Each UMI then has its dashes and other non-base characters removed and is
+truncated to its first len bases before it is compared, so the position of a dash does not
+matter. For example, with --min-umi-length=6 --truncate the UMIs ACGTAC, ACGTACGT and ACG-TACG are
+all compared as ACGTAC. Only the UMIs used for grouping are truncated: the raw UMI tag is not
+changed. --min-umi-length and --truncate cannot be used with the paired strategy.
+
 UMIs are compared case-insensitively.
 
 Note: the --min-map-q parameter defaults to 1 and is directly settable on the command line.
@@ -582,11 +586,19 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'e', long = "edits", default_value = "1")]
     pub edits: u32,
 
-    /// The minimum UMI length in bases (at least 1). Shorter UMIs are discarded; the rest are
-    /// truncated to the shortest UMI they are compared with. Dashes and other non-base
-    /// characters are not counted, and are ignored when comparing UMIs.
+    /// The minimum UMI length, in bases (at least 1). Discard reads whose UMI has fewer bases
+    /// (A, C, G, T) than this; dashes and other characters are not counted. UMIs are not
+    /// truncated unless `--truncate` is also given, so UMIs of different lengths are still
+    /// never grouped together.
     #[arg(short = 'l', long = "min-umi-length")]
     pub min_umi_length: Option<usize>,
+
+    /// Truncate every UMI to its first `--min-umi-length` bases, ignoring dashes and other
+    /// non-base characters, before grouping, so that UMIs of different lengths can be grouped
+    /// together. Requires `--min-umi-length`. The raw UMI tag is not changed. Has no effect
+    /// with `--no-umi`, which ignores UMIs (and so `--min-umi-length`) entirely.
+    #[arg(long = "truncate", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub truncate: bool,
 
     /// Threading options for parallel processing.
     #[command(flatten)]
@@ -677,9 +689,13 @@ pub struct GroupOptions {
     /// The edit distance as requested on the command line.
     #[arg(short = 'e', long = "edits", default_value = "1")]
     pub edits: u32,
-    /// Minimum UMI length to accept.
+    /// Minimum UMI length to accept, in bases.
     #[arg(short = 'l', long = "min-umi-length")]
     pub min_umi_length: Option<usize>,
+    /// Truncate UMIs to `--min-umi-length` bases before grouping. Has no effect with
+    /// `--no-umi`.
+    #[arg(long = "truncate", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub truncate: bool,
     /// When to build the N-gram/BK-tree index instead of scanning linearly.
     ///
     /// This is [`fgumi_umi::IndexThreshold`] rather than a bare count: the
@@ -739,6 +755,7 @@ impl Default for GroupOptions {
             strategy: Strategy::Identity,
             edits: 1,
             min_umi_length: None,
+            truncate: false,
             index_threshold: IndexThreshold::default(),
             no_umi: false,
             parallel_group_min_templates: None,
@@ -817,6 +834,7 @@ impl GroupReadsByUmi {
             strategy: self.strategy,
             edits: self.edits,
             min_umi_length: self.min_umi_length,
+            truncate: self.truncate,
             index_threshold: self.index_threshold,
             no_umi: self.no_umi,
             parallel_group_min_templates: self.parallel_group_min_templates.clone(),
@@ -900,7 +918,7 @@ impl Command for GroupReadsByUmi {
         crate::commands::common::reject_output_collisions(&outputs)?;
 
         // Validate inputs
-        crate::umi::validate_min_umi_length(self.min_umi_length, self.strategy)?;
+        crate::umi::validate_min_umi_length(self.min_umi_length, self.truncate, self.strategy)?;
 
         // Validate --no-umi is not used with paired strategy
         if self.no_umi && matches!(self.strategy, Strategy::Paired) {
@@ -1201,6 +1219,7 @@ mod tests {
             "30",
             "--min-umi-length",
             "8",
+            "--truncate",
             "--index-threshold",
             "250",
             "--family-size-histogram",
@@ -1228,6 +1247,7 @@ mod tests {
         assert_eq!(opts.strategy, Strategy::Adjacency);
         assert_eq!(opts.edits, 2);
         assert_eq!(opts.min_umi_length, Some(8));
+        assert!(opts.truncate);
         assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(250));
         assert_eq!(opts.parallel_group_min_templates, Some(ParallelMinTemplates::Fixed(500)));
         assert!(!opts.no_umi);
@@ -1272,6 +1292,7 @@ mod tests {
         assert!(!opts.realign_window, "an absent --realign-window defaults to false");
         assert_eq!(opts.edits, 1);
         assert_eq!(opts.min_umi_length, None);
+        assert!(!opts.truncate, "an absent --truncate defaults to false");
         assert_eq!(opts.index_threshold, IndexThreshold::MinUmis(100));
         assert_eq!(opts.parallel_group_min_templates, None);
         assert!(!opts.no_umi);
@@ -1320,6 +1341,7 @@ mod tests {
         assert_eq!(multi.strategy, base.strategy);
         assert_eq!(multi.edits, base.edits);
         assert_eq!(multi.min_umi_length, base.min_umi_length);
+        assert_eq!(multi.truncate, base.truncate);
         assert_eq!(multi.index_threshold, base.index_threshold);
         assert_eq!(multi.no_umi, base.no_umi);
         assert_eq!(multi.parallel_group_min_templates, base.parallel_group_min_templates);
@@ -1375,6 +1397,7 @@ mod tests {
             "3",
             "--group::min-umi-length",
             "5",
+            "--group::truncate=true",
             "--group::index-threshold",
             "42",
             "--group::no-umi=true",
@@ -1399,6 +1422,7 @@ mod tests {
         assert_eq!(multi.strategy, Strategy::Adjacency);
         assert_eq!(multi.edits, 3);
         assert_eq!(multi.min_umi_length, Some(5));
+        assert!(multi.truncate, "--group::truncate=true must round-trip");
         assert_eq!(multi.index_threshold, IndexThreshold::MinUmis(42));
         assert!(multi.no_umi, "--group::no-umi=true must round-trip");
         assert_eq!(multi.parallel_group_min_templates, Some(ParallelMinTemplates::Fixed(16)));
@@ -1434,6 +1458,7 @@ mod tests {
         assert_eq!(d.allow_unmapped, parsed.allow_unmapped);
         assert_eq!(d.edits, parsed.edits);
         assert_eq!(d.min_umi_length, parsed.min_umi_length);
+        assert_eq!(d.truncate, parsed.truncate);
         assert_eq!(d.index_threshold, parsed.index_threshold);
         assert_eq!(d.no_umi, parsed.no_umi);
         assert_eq!(d.parallel_group_min_templates, parsed.parallel_group_min_templates);
@@ -1647,6 +1672,7 @@ mod tests {
             strategy,
             edits,
             min_umi_length: None,
+            truncate: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: IndexThreshold::default(),
@@ -1967,49 +1993,34 @@ mod tests {
         assert_eq!(result, "ACGTACGT");
     }
 
-    #[test]
-    fn test_truncate_umis_to_minimum_length() {
-        let tool =
-            GroupReadsByUmi { min_umi_length: Some(5), ..test_group_cmd(Strategy::Identity, 0) };
-
-        let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
-        let truncated =
-            truncate_umis(umis, tool.min_umi_length).expect("Should truncate successfully");
-
-        assert_eq!(truncated.len(), 3);
-        assert!(truncated.iter().all(|u| u.len() == 5));
-    }
-
-    /// `--min-umi-length` truncates every UMI to a common length before assignment,
-    /// which is what lets variable-length UMIs pass the assigner's uniform-length
-    /// guard (`check_uniform_umi_length`, tracker GRP-01). Exercise the full
-    /// truncate -> assign composition so a regression in truncation would trip the
-    /// guard here rather than in production.
+    /// `--truncate` truncates every UMI to exactly `--min-umi-length` bases before assignment,
+    /// which is what lets variable-length UMIs be compared by one assigner call. Exercise the
+    /// full truncate -> assign composition so a regression in truncation would trip the
+    /// assigner's uniform-length guard (`check_uniform_umi_length`, tracker GRP-01) here.
     #[test]
     fn test_variable_length_umis_group_after_truncation() {
         // Variable-length single-segment UMIs. After truncating to 6 bases the near-neighbor
         // stays DISTINCT (AACCGA vs AACCGG — a single mismatch) rather than collapsing to the
         // same bytes, so grouping it relies on real adjacency (edit-distance) clustering, not
         // exact match. A 3:1 count gradient makes the low-count neighbor get absorbed.
-        let umis = vec![
+        let mut umis = vec![
             "AACCGGT".to_string(),  // -> AACCGG (parent, x3)
             "AACCGGA".to_string(),  // -> AACCGG
             "AACCGG".to_string(),   // -> AACCGG
             "AACCGATT".to_string(), // -> AACCGA (1 mismatch from AACCGG, x1 -> merges)
             "TTGGAAC".to_string(),  // -> TTGGAA (distinct -> its own molecule)
         ];
-        let truncated =
-            truncate_umis(umis, Some(6)).expect("truncation to a present minimum succeeds");
-        assert!(truncated.iter().all(|u| u.len() == 6), "truncation must yield uniform lengths");
+        truncate_umis(&mut umis, 6).expect("truncation to a present minimum succeeds");
+        assert!(umis.iter().all(|u| u.len() == 6), "truncation must yield uniform lengths");
         // The near-neighbor is distinct after truncation (not byte-identical) — so it can only
         // group with the parent via adjacency, not exact match.
-        assert_eq!(truncated[3], "AACCGA");
-        assert_ne!(truncated[0], truncated[3], "truncated UMIs must stay distinct");
+        assert_eq!(umis[3], "AACCGA");
+        assert_ne!(umis[0], umis[3], "truncated UMIs must stay distinct");
 
         // Sequential adjacency assigner, max 1 mismatch (num_threads = 1, use_parallel = false).
         let assigner =
             create_umi_assigner(Strategy::Adjacency, 1, IndexThreshold::default(), 1, false);
-        let assignments = assigner.assign(&truncated).expect("assign should succeed");
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
 
         assert_eq!(assignments.len(), 5);
         // All four AACCGG/AACCGA reads cluster into one molecule via 1-mismatch adjacency.
@@ -2018,27 +2029,6 @@ mod tests {
             "the 1-mismatch neighbor must be adjacency-clustered with the parent: {assignments:?}"
         );
         assert_ne!(assignments[0], assignments[4], "the distinct UMI forms its own molecule");
-    }
-
-    #[test]
-    fn test_truncate_umis_none_returns_unchanged() {
-        let tool = test_group_cmd(Strategy::Identity, 0);
-
-        let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
-        let original = umis.clone();
-        let result = truncate_umis(umis, tool.min_umi_length).expect("Should succeed");
-
-        assert_eq!(result, original);
-    }
-
-    #[test]
-    fn test_truncate_umis_fails_when_too_short() {
-        let tool =
-            GroupReadsByUmi { min_umi_length: Some(6), ..test_group_cmd(Strategy::Identity, 0) };
-
-        let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
-        let result = truncate_umis(umis, tool.min_umi_length);
-        assert!(result.is_err());
     }
 
     // ========================================================================
@@ -2889,19 +2879,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_truncates_to_min_length() -> Result<()> {
+    /// Port of fgbio#1198's "truncate to the specified minimum length with --truncate": with
+    /// `--min-umi-length 5 --truncate` the 5, 6 and 7 base UMIs are one molecule, and the raw
+    /// UMI tag (RX) is not changed.
+    #[rstest]
+    fn test_truncates_to_min_length(
+        #[values(Strategy::Identity, Strategy::Edit, Strategy::Adjacency)] strategy: Strategy,
+    ) -> Result<()> {
         let mut records = Vec::new();
-
-        // UMI of length 6
-        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "ACTACT");
-        records.push(r1);
-        records.push(r2);
-
-        // UMI of length 5 (will be truncated to 5)
-        let (r1, r2) = build_test_pair("a02", 0, 100, 300, 60, 60, "ACTAC");
-        records.push(r1);
-        records.push(r2);
+        for (name, umi) in [("a01", "ACTACT"), ("a02", "ACTAC"), ("a03", "ACTACTA")] {
+            let (r1, r2) = build_test_pair(name, 0, 100, 300, 60, 60, umi);
+            records.push(r1);
+            records.push(r2);
+        }
 
         let input = create_test_bam(records)?;
         let paths = TestPaths::new()?;
@@ -2915,17 +2905,22 @@ mod tests {
                 no_check_crc: false,
             },
             min_umi_length: Some(5),
-            ..test_group_cmd(Strategy::Edit, 0)
+            truncate: true,
+            ..test_group_cmd(strategy, 0)
         };
 
         cmd.execute("test")?;
 
         let output_records = read_bam_records(&paths.output)?;
-        assert_eq!(output_records.len(), 4, "Should have all 4 records");
-
-        // Both should be grouped together (truncated UMIs match)
-        let unique_groups = count_unique_mi_tags(&output_records);
-        assert_eq!(unique_groups, 1, "Should have 1 group after truncation");
+        assert_eq!(output_records.len(), 6, "Should have all 6 records");
+        assert_eq!(count_unique_mi_tags(&output_records), 1, "all should be one molecule");
+        let raw_umis: BTreeSet<String> =
+            output_records.iter().filter_map(|r| get_string_tag(r, "RX")).collect();
+        assert_eq!(
+            raw_umis,
+            BTreeSet::from(["ACTAC".to_string(), "ACTACT".to_string(), "ACTACTA".to_string()]),
+            "the raw UMIs must not be changed"
+        );
 
         Ok(())
     }
@@ -2956,6 +2951,7 @@ mod tests {
         strategy: Strategy,
         edits: u32,
         min_umi_length: Option<usize>,
+        truncate: bool,
         path: AssignerPath,
     ) -> Result<BTreeSet<BTreeSet<String>>> {
         let mut records = Vec::new();
@@ -2976,6 +2972,7 @@ mod tests {
                 no_check_crc: false,
             },
             min_umi_length,
+            truncate,
             threading,
             parallel_group_min_templates,
             ..test_group_cmd(strategy, edits)
@@ -2997,16 +2994,40 @@ mod tests {
         spec.split('|').map(|g| g.split_whitespace().map(str::to_string).collect()).collect()
     }
 
-    /// Like fgbio's `truncateUmis`, `--min-umi-length` truncates to the shortest UMI, not to
-    /// the option value: two 8-base UMIs that share their first 6 bases stay distinct with
-    /// `--min-umi-length 6`.
+    /// Port of fgbio#1198's "truncate to --min-umi-length even when every UMI is longer with
+    /// --truncate": UMIs are truncated to `--min-umi-length`, not to the shortest UMI, so two
+    /// 7-base UMIs that differ only in the seventh base are one molecule with
+    /// `--min-umi-length 6 --truncate`. Without `--truncate` they stay apart.
     #[rstest]
-    fn test_truncates_to_shortest_umi_not_min_length(
+    #[case::truncate(true, "a01 a02 a03 a04")]
+    #[case::no_truncate(false, "a01 a02 | a03 a04")]
+    fn test_truncates_to_min_length_when_every_umi_is_longer(
+        #[values((Strategy::Identity, 0), (Strategy::Edit, 0), (Strategy::Adjacency, 0))]
+        strategy_and_edits: (Strategy, u32),
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+        #[case] truncate: bool,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (strategy, edits) = strategy_and_edits;
+        let umis = [("a01", "ACTACTC"), ("a02", "ACTACTC"), ("a03", "ACTACTG"), ("a04", "ACTACTG")];
+        let got = group_families(&umis, strategy, edits, Some(6), truncate, path)?;
+        assert_eq!(got, families(expected));
+        Ok(())
+    }
+
+    /// Port of fgbio#1198's "discard reads with UMIs shorter than the specified minimum length":
+    /// without `--truncate`, the too-short UMI is dropped and the 6 and 7 base UMIs are separate
+    /// molecules.
+    #[rstest]
+    fn test_min_umi_length_without_truncate_keeps_lengths_apart(
+        #[values((Strategy::Identity, 0), (Strategy::Edit, 0), (Strategy::Adjacency, 0))]
+        strategy_and_edits: (Strategy, u32),
         #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
     ) -> Result<()> {
-        let umis = [("a01", "ACGTACGT"), ("a02", "ACGTACGA")];
-        let got = group_families(&umis, Strategy::Identity, 0, Some(6), path)?;
-        assert_eq!(got, families("a01 | a02"));
+        let (strategy, edits) = strategy_and_edits;
+        let umis = [("a01", "ACTACT"), ("a02", "ACTAC"), ("a03", "ACTACTA")];
+        let got = group_families(&umis, strategy, edits, Some(6), false, path)?;
+        assert_eq!(got, families("a01 | a03"));
         Ok(())
     }
 
@@ -3021,68 +3042,170 @@ mod tests {
             ("a02", "ACGTACGTACGTACGTA-TTGCATTGCATTGCATT"),
             ("a03", "GCGTACGTACGTACGTA-TTGCATTGCATTGCATT"),
         ];
-        let got = group_families(&umis, Strategy::Paired, 1, None, path)?;
+        let got = group_families(&umis, Strategy::Paired, 1, None, false, path)?;
         assert_eq!(got, families("a01 a02 a03"));
         Ok(())
     }
 
-    /// Ports of fgbio#1185's "compare only the bases of UMIs containing dashes when truncating
-    /// with the $strategy strategy" (`GroupReadsByUmiTest.scala`, edit and adjacency,
-    /// `--edits 1`): dashes are removed before truncating, so bases are compared with bases.
+    /// Port of fgbio#1198's "group single-end reads with UMIs of different lengths separately"
+    /// (at one position): `AAAAAAA` (a05) is one edit from `AAAAAAAA` but shorter, so it is its
+    /// own molecule.
+    #[rstest]
+    fn test_umis_of_different_lengths_are_separate_molecules(
+        #[values(Strategy::Edit, Strategy::Adjacency)] strategy: Strategy,
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+    ) -> Result<()> {
+        let umis = [
+            ("a01", "AAAAAAAA"),
+            ("a02", "AAAAAAAA"),
+            ("a03", "ACACACA"),
+            ("a04", "ACACACC"),
+            ("a05", "AAAAAAA"),
+        ];
+        let got = group_families(&umis, strategy, 1, None, false, path)?;
+        assert_eq!(got, families("a01 a02 | a03 a04 | a05"));
+        Ok(())
+    }
+
+    /// Ports of fgbio#1198's "discard reads with UMIs shorter than --min-umi-length but not
+    /// group UMIs of different lengths without --truncate" and "group reads with UMIs of
+    /// different lengths with --min-umi-length and --truncate" (edit strategy, `--edits 1`).
+    #[rstest]
+    #[case::without_truncate(false, "a01 a02 | a03 a04")]
+    #[case::with_truncate(true, "a01 a02 a03 a04")]
+    fn test_min_umi_length_with_and_without_truncate(
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+        #[case] truncate: bool,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let umis = [
+            ("a01", "AGTAGGCC"),
+            ("a02", "AGTAGGCC"),
+            ("a03", "AGTAGGC"),
+            ("a04", "AGTAGGC"),
+            ("a05", "AGTAGG"),
+            ("a06", "AGTAGG"),
+        ];
+        let got = group_families(&umis, Strategy::Edit, 1, Some(7), truncate, path)?;
+        assert_eq!(got, families(expected));
+        Ok(())
+    }
+
+    /// Port of fgbio#1198's "not group UMIs with the same number of bases but different segment
+    /// lengths": the 8+8 vs 7+7 and 6+3 vs 5+4 dual UMIs, and `ACGT` vs `ACGT-`, are never
+    /// compared with each other.
+    #[rstest]
+    #[case::identity(
+        Strategy::Identity,
+        0,
+        "a01 a02 | a03 | b01 b02 | b03 | c01 c02 | d01 d02 | e01 | e02"
+    )]
+    #[case::edit(Strategy::Edit, 1, "a01 a02 a03 | b01 b02 b03 | c01 c02 | d01 d02 | e01 | e02")]
+    #[case::adjacency(
+        Strategy::Adjacency,
+        1,
+        "a01 a02 a03 | b01 b02 b03 | c01 c02 | d01 d02 | e01 | e02"
+    )]
+    fn test_same_bases_different_segment_lengths_are_not_grouped(
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+        #[case] strategy: Strategy,
+        #[case] edits: u32,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let umis = [
+            ("a01", "AAAAAAAA-CCCCCCCC"),
+            ("a02", "AAAAAAAA-CCCCCCCC"),
+            ("a03", "AAAAAAAA-CCCCCCCG"),
+            ("b01", "AAAAAAA-CCCCCCC"),
+            ("b02", "AAAAAAA-CCCCCCC"),
+            ("b03", "AAAAAAA-CCCCCCG"),
+            ("c01", "ACTACT-GGG"),
+            ("c02", "ACTACT-GGG"),
+            ("d01", "ACTAC-TGGG"),
+            ("d02", "ACTAC-TGGG"),
+            ("e01", "ACGT"),
+            ("e02", "ACGT-"),
+        ];
+        let got = group_families(&umis, strategy, edits, None, false, path)?;
+        assert_eq!(got, families(expected));
+        Ok(())
+    }
+
+    /// Ports of fgbio#1198's "compare only the bases of UMIs containing dashes when truncating"
+    /// and "not group UMIs whose segments have different lengths without --truncate" (edit and
+    /// adjacency, `--edits 1`).
     #[rstest]
     // ACGTT vs ACGTA: one mismatch. Comparing characters ("AC-GTT" vs "ACGTA-") would give four.
-    #[case::one_mismatch("AC-GTT", "ACGTA-T", 5, true)]
-    #[case::one_mismatch_trailing_dash("ACGTAC-", "TCGTACG-TT", 6, true)]
-    // The shortest UMI has six bases, more than `--min-umi-length`: ACGTTA vs ACGTAC is two
-    // mismatches, so they stay apart. Truncating to five bases (ACGTT vs ACGTA) would merge them.
-    #[case::shortest_longer_than_option("AC-GTTA", "ACGTA-C", 5, false)]
-    // Different dash positions, same bases: both are ACGTACGTA after truncation to nine bases.
-    #[case::dash_position_ignored("ACGTACGTA-T", "ACG-TACGTA", 8, true)]
-    fn test_min_umi_length_compares_bases_of_dashed_umis(
+    #[case::one_mismatch("AC-GTT", "ACGTA-T", 5, true, true)]
+    #[case::one_mismatch_trailing_dash("ACGTAC-", "TCGTACG-TT", 6, true, true)]
+    // Both have six bases, more than `--min-umi-length`, and ACGTTA vs ACGTAC is two
+    // mismatches. UMIs are truncated to `--min-umi-length`, not to the shortest UMI, so ACGTT
+    // vs ACGTA (one mismatch) are grouped.
+    #[case::truncated_to_option("AC-GTTA", "ACGTA-C", 5, true, true)]
+    // Different dash positions, same bases: both are ACGTACGT after truncation to eight bases.
+    #[case::dash_position_ignored("ACGTACGTA-T", "ACG-TACGTA", 8, true, true)]
+    // One mismatch apart if the dashes are ignored, but the segment lengths differ (2+4 vs
+    // 5+1), so without --truncate they are never compared.
+    #[case::segment_lengths_differ("AC-GTTA", "ACGTA-A", 5, false, false)]
+    fn test_dashed_umis_with_and_without_truncate(
         #[values(Strategy::Edit, Strategy::Adjacency)] strategy: Strategy,
         #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
         #[case] umi_a: &str,
         #[case] umi_b: &str,
         #[case] min_umi_length: usize,
+        #[case] truncate: bool,
         #[case] merged: bool,
     ) -> Result<()> {
         let umis = [("a01", umi_a), ("a02", umi_b)];
-        let got = group_families(&umis, strategy, 1, Some(min_umi_length), path)?;
+        let got = group_families(&umis, strategy, 1, Some(min_umi_length), truncate, path)?;
         let expected = if merged { families("a01 a02") } else { families("a01 | a02") };
         assert_eq!(got, expected);
         Ok(())
     }
 
-    /// Ports of fgbio#1185's identity / `--edits 0` tests (`GroupReadsByUmiTest.scala`, "... with
-    /// the $strategy strategy, edits=$edits and $sortOrder input"): UMIs are split by their first
-    /// `--min-umi-length` bases and each split is truncated to its own shortest UMI, so the
-    /// grouping is the same in either input order and on either assigner path.
+    /// Ports of fgbio#1198's identity / `--edits 0` tests (`GroupReadsByUmiTest.scala`, "... with
+    /// the $strategy strategy, edits=$edits and $sortOrder input"). fgumi requires
+    /// template-coordinate input and never pre-splits by UMI while reading, so there is one
+    /// input path; the grouping must instead be the same in either input order and on either
+    /// assigner path.
     #[rstest]
-    // "truncate UMIs without dashes to the shortest UMI sharing their first bases".
-    #[case::shortest_sharing_prefix(
-        &[("a01", "ACGTA"), ("a02", "ACGTC"), ("a03", "TTTT")],
-        4,
-        "a01 | a02 | a03"
-    )]
-    // "compare only the bases of UMIs containing dashes when truncating".
-    #[case::dashed(
+    // "compare only the first --min-umi-length bases of UMIs containing dashes with --truncate":
+    // the first eight bases are ACGTACGT for a01, a02 and a04, and ACGTACGA for a03.
+    #[case::dashed_truncate(
         &[("a01", "ACG-TACGTA"), ("a02", "ACG-TACGTC"), ("a03", "ACG-TACGA"), ("a04", "ACGT-ACGTA")],
-        8,
-        "a01 a04 | a02 | a03"
-    )]
-    // "truncate UMIs without dashes to the minimum UMI length".
-    #[case::to_minimum(
-        &[("a01", "ACGTACGTA"), ("a02", "ACGTACGTC"), ("a03", "ACGTACGA"), ("a04", "ACGTACGT")],
-        8,
+        Some(8),
+        true,
         "a01 a02 a04 | a03"
     )]
-    fn test_min_umi_length_splits_identical_grouping_by_prefix(
+    // "not truncate UMIs containing dashes without --truncate".
+    #[case::dashed_no_truncate(
+        &[("a01", "ACG-TACGTA"), ("a02", "ACG-TACGTC"), ("a03", "ACG-TACGA"), ("a04", "ACGT-ACGTA")],
+        Some(8),
+        false,
+        "a01 | a02 | a03 | a04"
+    )]
+    // "truncate UMIs to --min-umi-length with --truncate".
+    #[case::to_min_length(
+        &[("a01", "ACGTA"), ("a02", "ACGTC"), ("a03", "TTTT"), ("a04", "ACGT")],
+        Some(4),
+        true,
+        "a01 a02 a04 | a03"
+    )]
+    // "group only identical UMIs of the same length without --min-umi-length".
+    #[case::same_length_only(
+        &[("a01", "ACGTA"), ("a02", "ACGTA"), ("a03", "ACGT"), ("a04", "ACGT-"), ("a05", "ACGTAC")],
+        None,
+        false,
+        "a01 a02 | a03 | a04 | a05"
+    )]
+    fn test_identical_grouping_with_and_without_truncate(
         #[values((Strategy::Identity, 0), (Strategy::Edit, 0), (Strategy::Adjacency, 0))]
         strategy_and_edits: (Strategy, u32),
         #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
         #[values(false, true)] reversed: bool,
         #[case] umis: &[(&str, &str)],
-        #[case] min_umi_length: usize,
+        #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
         #[case] expected: &str,
     ) -> Result<()> {
         let (strategy, edits) = strategy_and_edits;
@@ -3090,20 +3213,24 @@ mod tests {
         if reversed {
             umis.reverse();
         }
-        let got = group_families(&umis, strategy, edits, Some(min_umi_length), path)?;
+        let got = group_families(&umis, strategy, edits, min_umi_length, truncate, path)?;
         assert_eq!(got, families(expected));
         Ok(())
     }
 
-    /// Port of fgbio#1185's "group UMIs that differ only by case with the adjacency strategy":
-    /// UMIs are upper-cased before grouping, with or without `--min-umi-length`.
+    /// Port of fgbio#1198's "group UMIs that differ only by case with the adjacency strategy,
+    /// --min-umi-length and --truncate": UMIs are upper-cased before grouping.
     #[rstest]
+    #[case::no_min_length(None, false)]
+    #[case::min_length(Some(8), false)]
+    #[case::min_length_truncate(Some(8), true)]
     fn test_adjacency_groups_umis_differing_only_by_case(
-        #[values(None, Some(8))] min_umi_length: Option<usize>,
         #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+        #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
     ) -> Result<()> {
         let umis = [("a01", "aaaaaaaa"), ("a02", "AAAAAAAA")];
-        let got = group_families(&umis, Strategy::Adjacency, 1, min_umi_length, path)?;
+        let got = group_families(&umis, Strategy::Adjacency, 1, min_umi_length, truncate, path)?;
         assert_eq!(got, families("a01 a02"));
         Ok(())
     }
@@ -3112,7 +3239,8 @@ mod tests {
     #[test]
     fn test_discards_umis_with_lowercase_n() -> Result<()> {
         let umis = [("a01", "ACGTn"), ("a02", "ACGTA")];
-        let got = group_families(&umis, Strategy::Identity, 0, None, AssignerPath::Sequential)?;
+        let got =
+            group_families(&umis, Strategy::Identity, 0, None, false, AssignerPath::Sequential)?;
         assert_eq!(got, families("a02"));
         Ok(())
     }
@@ -3122,20 +3250,156 @@ mod tests {
     #[rstest]
     fn test_min_umi_length_counts_only_bases(
         #[values(Strategy::Identity, Strategy::Edit, Strategy::Adjacency)] strategy: Strategy,
+        #[values(false, true)] truncate: bool,
     ) -> Result<()> {
         let umis = [("a01", "ACG-TA"), ("a02", "ACG-TAC")];
-        let got = group_families(&umis, strategy, 0, Some(6), AssignerPath::Sequential)?;
+        let got = group_families(&umis, strategy, 0, Some(6), truncate, AssignerPath::Sequential)?;
         assert_eq!(got, families("a02"));
         Ok(())
     }
 
-    /// Port of fgbio#1185's "reject a --min-umi-length less than one".
-    #[test]
-    fn test_rejects_min_umi_length_zero() {
-        let cmd =
-            GroupReadsByUmi { min_umi_length: Some(0), ..test_group_cmd(Strategy::Identity, 0) };
-        let err = cmd.execute("test").expect_err("--min-umi-length 0 must be rejected");
-        assert_eq!(err.to_string(), "--min-umi-length must be at least 1");
+    /// Ports of fgbio#1185's "reject a --min-umi-length less than one" and fgbio#1198's "reject
+    /// --truncate without --min-umi-length" and "reject --min-umi-length with the paired
+    /// strategy and --truncate=$truncate".
+    #[rstest]
+    #[case::zero(Strategy::Identity, Some(0), false, "--min-umi-length must be at least 1")]
+    #[case::truncate_without_min_length(
+        Strategy::Edit,
+        None,
+        true,
+        "--truncate requires --min-umi-length"
+    )]
+    #[case::paired(
+        Strategy::Paired,
+        Some(4),
+        false,
+        "--min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs \
+         of different lengths are grouped by the lengths of their two UMIs"
+    )]
+    #[case::paired_truncate(
+        Strategy::Paired,
+        Some(4),
+        true,
+        "--min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs \
+         of different lengths are grouped by the lengths of their two UMIs"
+    )]
+    fn test_rejects_invalid_min_umi_length_and_truncate(
+        #[case] strategy: Strategy,
+        #[case] min_umi_length: Option<usize>,
+        #[case] truncate: bool,
+        #[case] expected: &str,
+    ) {
+        let cmd = GroupReadsByUmi { min_umi_length, truncate, ..test_group_cmd(strategy, 1) };
+        let err = cmd.execute("test").expect_err("the options must be rejected");
+        assert_eq!(err.to_string(), expected);
+    }
+
+    /// Runs `group --strategy paired --edits 1` on duplex templates, one per
+    /// `(name, r1_pos, r2_pos, umi, r1_reverse)` (see `build_duplex_pair`), and returns each
+    /// template name's distinct MI values.
+    fn group_paired_mis(
+        templates: &[(&str, i32, i32, &str, bool)],
+        path: AssignerPath,
+    ) -> Result<BTreeMap<String, BTreeSet<String>>> {
+        let mut records = Vec::new();
+        for &(name, r1_pos, r2_pos, umi, r1_reverse) in templates {
+            let (r1, r2) = build_duplex_pair(name, 0, r1_pos, r2_pos, umi, r1_reverse);
+            records.push(r1);
+            records.push(r2);
+        }
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+        let (threading, parallel_group_min_templates) = path.threading();
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+                check_crc: false,
+                no_check_crc: false,
+            },
+            threading,
+            parallel_group_min_templates,
+            ..test_group_cmd(Strategy::Paired, 1)
+        };
+        cmd.execute("test")?;
+
+        let mut mis: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for record in read_bam_records(&paths.output)? {
+            let mi = get_string_tag(&record, "MI").expect("every output record has an MI tag");
+            let name = String::from_utf8_lossy(record.name().expect("record has a name"));
+            mis.entry(name.into_owned()).or_default().insert(mi);
+        }
+        Ok(mis)
+    }
+
+    /// Port of fgbio#1198's "group paired UMIs of different lengths separately with the paired
+    /// strategy": molecule 1 has two 6bp UMIs and molecule 2 two 3bp UMIs, each seen from both
+    /// strands. Each molecule's strands share a base MI with different `/A`|`/B` suffixes, and
+    /// the two molecules differ.
+    #[rstest]
+    fn test_paired_umis_of_different_lengths_group_separately(
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+    ) -> Result<()> {
+        let mut templates = Vec::new();
+        let names: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .flat_map(|prefix| (1..=4).map(move |i| format!("{prefix}0{i}")))
+            .collect();
+        for name in &names {
+            let (umi, r1_pos, r2_pos, r1_reverse) = match &name[..1] {
+                "a" => ("ACTACT-GGGGGG", 100, 300, false),
+                "c" => ("ACT-GGG", 100, 300, false),
+                "b" => ("GGGGGG-ACTACT", 300, 100, true),
+                _ => ("GGG-ACT", 300, 100, true),
+            };
+            templates.push((name.as_str(), r1_pos, r2_pos, umi, r1_reverse));
+        }
+        let mis = group_paired_mis(&templates, path)?;
+
+        let mut by_prefix: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (name, name_mis) in &mis {
+            by_prefix.entry(&name[..1]).or_default().extend(name_mis.iter().map(String::as_str));
+        }
+        let mi = |prefix: &str| -> String {
+            let ids = &by_prefix[prefix];
+            assert_eq!(ids.len(), 1, "every {prefix} read must have one MI: {by_prefix:?}");
+            (*ids.first().expect("one MI")).to_string()
+        };
+        let base = |mi: &str| mi.split('/').next().expect("MI has a base").to_string();
+        let (a, b, c, d) = (mi("a"), mi("b"), mi("c"), mi("d"));
+        assert_eq!(base(&a), base(&b), "a and b are the two strands of molecule 1");
+        assert_eq!(base(&c), base(&d), "c and d are the two strands of molecule 2");
+        assert_ne!(a, b);
+        assert_ne!(c, d);
+        assert_ne!(base(&a), base(&c), "the 6bp and 3bp molecules must differ");
+        Ok(())
+    }
+
+    /// Port of fgbio#1198's "group the two strands of a paired UMI whose two UMIs have different
+    /// lengths with the paired strategy": the 6bp UMI is always on the read at the lower
+    /// coordinate, so F1R2 reads are `ACTACT-GGG` and F2R1 reads `GGG-ACTACT`.
+    #[rstest]
+    fn test_paired_umi_with_halves_of_different_lengths(
+        #[values(AssignerPath::Sequential, AssignerPath::Parallel)] path: AssignerPath,
+    ) -> Result<()> {
+        let mut templates = Vec::new();
+        let names: Vec<String> =
+            ["a", "b"].iter().flat_map(|p| (1..=4).map(move |i| format!("{p}0{i}"))).collect();
+        for name in &names {
+            if name.starts_with('a') {
+                templates.push((name.as_str(), 100, 300, "ACTACT-GGG", false));
+            } else {
+                templates.push((name.as_str(), 300, 100, "GGG-ACTACT", true));
+            }
+        }
+        let mis = group_paired_mis(&templates, path)?;
+        for (name, name_mis) in &mis {
+            let expected = if name.starts_with('a') { "0/A" } else { "0/B" };
+            assert_eq!(name_mis, &BTreeSet::from([expected.to_string()]), "MI of {name}");
+        }
+        assert_eq!(mis.len(), 8, "every template must be written");
+        Ok(())
     }
 
     #[test]
@@ -4458,93 +4722,80 @@ mod tests {
         Ok(())
     }
 
-    /// Port of fgbio `GroupReadsByUmiTest.scala:513` ("fail when umis have different length"):
-    /// two templates at the same position whose UMIs differ in length must make `group` fail
-    /// with an error rather than panic or silently under-group. fgbio's `Paired` / `edits=1`
-    /// case (`ACT-ACT` vs `ACT-AC`) is the first case; `Edit` and `Adjacency` cover the
-    /// non-paired assigners. Run with no worker threads, as a one-thread pipeline, and through
-    /// the parallel per-group assigners (`--threads 4` with every group above the template
-    /// threshold) since each path reaches the length guard separately.
-    ///
-    /// fgbio only asserts that an exception is thrown; its message lists the UMIs
-    /// (`Multiple UMI lengths: ACT-ACT, ACT-AC`). fgumi's lists the distinct base lengths
-    /// (dashes excluded) in ascending order, so the message is the same on every path and in
-    /// every run, and is pinned exactly here.
+    /// fgbio `GroupReadsByUmiTest.scala:513` ("fail when umis have different length") was
+    /// replaced in fgbio#1198: two templates at the same position whose UMIs differ in length
+    /// are now separate molecules, not an error. fgbio's `Paired` / `edits=1` case (`ACT-ACT`
+    /// vs `ACT-AC`) is the first case; `Edit` and `Adjacency` cover the non-paired assigners.
+    /// Run with no worker threads, as a one-thread pipeline, and through the parallel
+    /// per-group assigners (`--threads 4` with every group above the template threshold),
+    /// since each path assigns UMIs separately.
     #[rstest]
     #[case::paired_sequential(
         Strategy::Paired,
         "ACT-ACT",
         "ACT-AC",
         ThreadingOptions::none(),
-        None,
-        "5, 6"
+        None
     )]
     #[case::paired_pipeline_1(
         Strategy::Paired,
         "ACT-ACT",
         "ACT-AC",
         ThreadingOptions::new(1),
-        None,
-        "5, 6"
+        None
     )]
     #[case::paired_parallel(
         Strategy::Paired,
         "ACT-ACT",
         "ACT-AC",
         ThreadingOptions::new(4),
-        Some(ParallelMinTemplates::Fixed(1)),
-        "5, 6"
+        Some(ParallelMinTemplates::Fixed(1))
     )]
     // Paired UMIs over 32 bases in total (17 + 17 vs 17 + 18), which do not fit in one
-    // 2-bit encoding: the parallel assigner must still length-check them.
+    // 2-bit encoding.
     #[case::paired_long_sequential(
         Strategy::Paired,
         "ACGTACGTACGTACGTA-TTGCATTGCATTGCATT",
         "ACGTACGTACGTACGTA-TTGCATTGCATTGCATTG",
         ThreadingOptions::none(),
-        None,
-        "34, 35"
+        None
     )]
     #[case::paired_long_parallel(
         Strategy::Paired,
         "ACGTACGTACGTACGTA-TTGCATTGCATTGCATT",
         "ACGTACGTACGTACGTA-TTGCATTGCATTGCATTG",
         ThreadingOptions::new(4),
-        Some(ParallelMinTemplates::Fixed(1)),
-        "34, 35"
+        Some(ParallelMinTemplates::Fixed(1))
     )]
-    #[case::edit_sequential(Strategy::Edit, "AAAA", "AAA", ThreadingOptions::none(), None, "3, 4")]
+    #[case::edit_sequential(Strategy::Edit, "AAAA", "AAA", ThreadingOptions::none(), None)]
+    #[case::edit_pipeline_1(Strategy::Edit, "AAAA", "AAA", ThreadingOptions::new(1), None)]
     #[case::edit_parallel(
         Strategy::Edit,
         "AAAA",
         "AAA",
         ThreadingOptions::new(4),
-        Some(ParallelMinTemplates::Fixed(1)),
-        "3, 4"
+        Some(ParallelMinTemplates::Fixed(1))
     )]
     #[case::adjacency_sequential(
         Strategy::Adjacency,
         "AAAA",
         "AAA",
         ThreadingOptions::none(),
-        None,
-        "3, 4"
+        None
     )]
     #[case::adjacency_parallel(
         Strategy::Adjacency,
         "AAAA",
         "AAA",
         ThreadingOptions::new(4),
-        Some(ParallelMinTemplates::Fixed(1)),
-        "3, 4"
+        Some(ParallelMinTemplates::Fixed(1))
     )]
-    fn group_with_mixed_umi_lengths_returns_error(
+    fn group_with_mixed_umi_lengths_assigns_separate_molecules(
         #[case] strategy: Strategy,
         #[case] umi_a: &str,
         #[case] umi_b: &str,
         #[case] threading: ThreadingOptions,
         #[case] parallel_group_min_templates: Option<ParallelMinTemplates>,
-        #[case] lengths: &str,
     ) -> Result<()> {
         let mut records = Vec::new();
         for (name, umi) in [("a01", umi_a), ("a02", umi_b)] {
@@ -4567,20 +4818,15 @@ mod tests {
             parallel_group_min_templates,
             ..test_group_cmd(strategy, 1)
         };
+        cmd.execute("test")?;
 
-        // edit and adjacency suggest --min-umi-length; paired rejects that option.
-        let hint = if matches!(strategy, Strategy::Paired) {
-            ""
-        } else {
-            " (use --min-umi-length to truncate UMIs to a common length)"
-        };
-        let err = cmd.execute("test").expect_err("mixed UMI lengths must be an error");
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "every record must be written");
         assert_eq!(
-            format!("{err:#}"),
-            format!(
-                "Pipeline::run: step \"GroupProcess\" failed: Failed to assign UMI groups: \
-                 Multiple UMI lengths: {lengths}{hint}"
-            )
+            distinct_mi_bases(&output_records).len(),
+            2,
+            "UMIs of different lengths must be separate molecules: {:?}",
+            get_mi_tags(&output_records)
         );
         Ok(())
     }

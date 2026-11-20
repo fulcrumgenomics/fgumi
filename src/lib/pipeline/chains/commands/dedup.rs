@@ -215,7 +215,7 @@ pub(crate) fn build_process_step(
     effective_edits: u32,
     index_threshold: fgumi_umi::IndexThreshold,
     raw_tag: SamTag,
-    min_umi_length: Option<usize>,
+    truncate_length: Option<usize>,
     no_umi: bool,
     include_unmapped: bool,
     accumulators: Arc<PerThreadAccumulator<CollectedDedupMetrics>>,
@@ -242,7 +242,7 @@ pub(crate) fn build_process_step(
                     &filter_config,
                     assigner.as_ref(),
                     raw_tag,
-                    min_umi_length,
+                    truncate_length,
                     no_umi,
                     include_unmapped,
                 )?;
