@@ -33,6 +33,8 @@ use clap::Args;
 use fgumi_cli_macros::multi_options;
 use fgumi_consensus::MethylationMode;
 
+use crate::commands::common::{EM_SEQ_MODE_NAME, TAPS_MODE_NAME};
+
 mod scoring;
 pub(crate) use scoring::{BwaScoring, command_passes_meth};
 use scoring::{mem_option_words, mem_word_end};
@@ -472,10 +474,10 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 /// subprocess aligner), `bwa` (legacy reference), and `bwa-mem3-inproc`
 /// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
 /// build feature; see `AlignerOptions::resolve`). Under runall's
-/// `--methylation-mode em-seq`, both bwa-mem3 presets align bisulfite-aware
-/// with `bwa-mem3 mem --meth` (see `AlignerPreset::validate_with_methylation`);
+/// `--methylation-mode`, both bwa-mem3 presets align conversion-aware with
+/// `bwa-mem3 mem --meth` (EM-seq) or `--meth=taps` (TAPS; see
+/// `bwa_mem3_meth_flags` and `AlignerPreset::validate_with_methylation`);
 /// other bisulfite aligners (e.g. bwameth) go through `--aligner::command`.
-/// TAPS reads align with the plain presets.
 ///
 /// The CLI value for each subprocess variant matches the on-disk binary
 /// name (`bwa`, `bwa-mem3`). Variant identifiers (`Bwa`, `BwaMem3`) are
@@ -571,6 +573,28 @@ impl AlignerPreset {
         }
     }
 
+    /// The conversion-aware `mem` flags this preset aligns `methylation` with:
+    /// [`bwa_mem3_meth_flags`] for the bwa-mem3 presets, and `None` for `bwa`,
+    /// which has no conversion-aware mode (it aligns TAPS plain, and
+    /// [`Self::validate_with_methylation`] rejects it for EM-seq).
+    #[must_use]
+    pub(crate) fn meth_flags(self, methylation: MethylationMode) -> Option<&'static str> {
+        match self {
+            Self::BwaMem3 | Self::BwaMem3InProc => bwa_mem3_meth_flags(methylation),
+            Self::Bwa => None,
+        }
+    }
+
+    /// Whether this preset consumes `methylation` (`--methylation-mode`): it
+    /// aligns conversion-aware ([`Self::meth_flags`]), or is rejected by
+    /// [`Self::validate_methylation`] (`bwa` under EM-seq). `bwa` under TAPS
+    /// aligns plain, so does not consume it.
+    #[must_use]
+    pub(crate) fn consumes_methylation(self, methylation: MethylationMode) -> bool {
+        self.meth_flags(methylation).is_some()
+            || (self == Self::Bwa && methylation == MethylationMode::EmSeq)
+    }
+
     /// Build the aligner shell command for this preset.
     ///
     /// The command reads FASTQ from `/dev/stdin` and writes its alignments to
@@ -590,10 +614,11 @@ impl AlignerPreset {
     ///   When `Some`, replaces the preset's default binary name; when
     ///   `None`, the bare binary name is used and the shell resolves it
     ///   via `PATH`.
-    /// * `methylation` - The chemistry from `--methylation-mode`. EM-seq adds
-    ///   bwa-mem3's `--meth` (see [`bwa_mem3_meth_flags`]), so it must not reach
-    ///   `bwa`, which has no bisulfite mode ([`Self::validate_with_methylation`]
-    ///   rejects that combination first).
+    /// * `methylation` - The chemistry from `--methylation-mode`. The bwa-mem3
+    ///   presets add bwa-mem3's `--meth` flags for EM-seq or TAPS (see
+    ///   [`bwa_mem3_meth_flags`]). `bwa` has no conversion-aware mode: it aligns
+    ///   TAPS plain, and [`Self::validate_with_methylation`] rejects it for
+    ///   EM-seq first.
     // `pub(crate)`, not `pub`: this interpolates `reference` / `binary_override`
     // into a string later run via `/bin/bash -c`, and it does not itself validate
     // those paths — it trusts that `validate_with_methylation` (which runs
@@ -618,8 +643,7 @@ impl AlignerPreset {
             Self::BwaMem3 | Self::BwaMem3InProc => " --bam=0",
             Self::Bwa => "",
         };
-        let meth =
-            bwa_mem3_meth_flags(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
+        let meth = self.meth_flags(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
         format!("{binary} mem{output}{meth} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
     }
 
@@ -657,11 +681,13 @@ impl AlignerPreset {
     /// for `methylation` (`--methylation-mode`) are present.
     ///
     /// Runs [`Self::validate`]'s checks, except that the index files required
-    /// beside the reference depend on the chemistry: disabled and TAPS need
-    /// the plain index ([`Self::index_extensions`]); EM-seq aligns with
-    /// `bwa-mem3 mem --meth` and needs the files
-    /// [`Self::validate_methylation`] checks instead. Under EM-seq, `bwa` is
-    /// rejected before anything else, since no index or binary fixes it.
+    /// beside the reference depend on the chemistry: when the preset aligns
+    /// conversion-aware ([`Self::meth_flags`]: the bwa-mem3 presets under
+    /// EM-seq or TAPS) it needs the `bwa-mem3 index --meth` files
+    /// [`Self::validate_methylation`] checks; otherwise (disabled, or `bwa`
+    /// under TAPS) the plain index ([`Self::index_extensions`]). Under EM-seq,
+    /// `bwa` is rejected before anything else, since no index or binary fixes
+    /// it.
     ///
     /// # Errors
     ///
@@ -672,13 +698,10 @@ impl AlignerPreset {
         binary_override: Option<&Path>,
         methylation: MethylationMode,
     ) -> Result<()> {
-        let emseq = bwa_mem3_meth_flags(methylation).is_some();
-        if emseq {
-            self.reject_without_bisulfite_mode()?;
-        }
+        self.reject_without_bisulfite_mode(methylation)?;
         self.validate_reference_and_binary(reference, binary_override)?;
-        if emseq {
-            self.require_meth_index_files(reference)
+        if self.meth_flags(methylation).is_some() {
+            self.require_meth_index_files(reference, methylation)
         } else {
             Self::require_index_files(reference, self.index_extensions(), || {
                 format!("run `{} index {}`", self.index_binary_hint(), reference.display())
@@ -785,11 +808,12 @@ impl AlignerPreset {
         Ok(())
     }
 
-    /// Reject `bwa` under EM-seq: it has no bisulfite mode.
-    fn reject_without_bisulfite_mode(self) -> Result<()> {
-        if self == Self::Bwa {
+    /// Reject `bwa` under EM-seq: it has no bisulfite mode. (It aligns TAPS
+    /// plain, since TAPS converts only the methylated cytosines.)
+    fn reject_without_bisulfite_mode(self, methylation: MethylationMode) -> Result<()> {
+        if self == Self::Bwa && methylation == MethylationMode::EmSeq {
             bail!(
-                "--methylation-mode em-seq needs a bisulfite-aware aligner, and `bwa` has \
+                "--methylation-mode {EM_SEQ_MODE_NAME} needs a bisulfite-aware aligner, and `bwa` has \
                  none; use --aligner::preset bwa-mem3 or bwa-mem3-inproc (which align with \
                  bwa-mem3's --meth), or --aligner::command"
             );
@@ -798,7 +822,8 @@ impl AlignerPreset {
     }
 
     /// Index file extensions the original (un-converted) `<ref>` prefix needs
-    /// when aligning with `bwa-mem3 mem --meth`.
+    /// when aligning with `bwa-mem3 mem --meth` (EM-seq) or `--meth=taps`
+    /// (TAPS).
     ///
     /// `bwa-mem3 mem --meth` seeds against the converted `<ref>.meth` index and
     /// reads only the original reference's contigs and sequence (`.amb`,
@@ -817,8 +842,8 @@ impl AlignerPreset {
     fn meth_original_index_extensions(self) -> &'static [&'static str] {
         match self {
             Self::BwaMem3 => &[".amb", ".ann", ".pac"],
-            // `Bwa` is unreachable here: it is rejected under EM-seq
-            // (`reject_without_bisulfite_mode`) before any index is checked.
+            // `Bwa` is unreachable here: it has no `--meth` flags
+            // (`meth_flags`), so no dual index is ever checked for it.
             Self::BwaMem3InProc | Self::Bwa => self.index_extensions(),
         }
     }
@@ -832,24 +857,35 @@ impl AlignerPreset {
     /// `index --meth` also builds the plain index and refuses to replace
     /// existing index files without `--force`, which older releases do not
     /// accept, so the hint passes `--force` and says when to drop it.
-    fn meth_index_hint(self, reference: &Path) -> String {
+    ///
+    /// TAPS converts only the methylated cytosines, so its reads also align
+    /// plain; the TAPS hint names that fallback.
+    fn meth_index_hint(self, reference: &Path, methylation: MethylationMode) -> String {
         let binary = self.index_binary_hint();
+        let mode = methylation_mode_name(methylation);
+        let flag = bwa_mem3_meth_flag_name(methylation);
         let reference = reference.display();
         let run = format!(
             "run `{binary} index --meth --force {reference}`, which also rebuilds the plain \
              index; drop `--force` for bwa-mem3 before 0.18.0, which does not accept it"
         );
+        let plain_fallback = if methylation == MethylationMode::Taps {
+            "; TAPS reads also align plain without it, with --aligner::preset bwa (which \
+             needs a bwa index) or an --aligner::command running plain `bwa-mem3 mem`"
+        } else {
+            ""
+        };
         match self {
             Self::BwaMem3InProc => format!(
-                "--methylation-mode em-seq aligns with bwa-mem3 --meth, and the in-process \
+                "--methylation-mode {mode} aligns with bwa-mem3 {flag}, and the in-process \
                  backend needs the full dual index, including the plain \
-                 `{reference}.bwt.2bit.64`; {run}"
+                 `{reference}.bwt.2bit.64`; {run}{plain_fallback}"
             ),
-            // `Bwa` is unreachable here: it is rejected under EM-seq
-            // (`reject_without_bisulfite_mode`) before any index is checked.
+            // `Bwa` is unreachable here: it has no `--meth` flags
+            // (`meth_flags`), so no dual index is ever checked for it.
             Self::BwaMem3 | Self::Bwa => format!(
-                "--methylation-mode em-seq aligns with bwa-mem3 --meth, which needs the dual \
-                 index; {run}"
+                "--methylation-mode {mode} aligns with bwa-mem3 {flag}, which needs the dual \
+                 index; {run}{plain_fallback}"
             ),
         }
     }
@@ -858,51 +894,56 @@ impl AlignerPreset {
     ///
     /// EM-seq reads must be aligned conversion-aware: every unmethylated C reads
     /// as T, so a plain aligner scores most cytosines as mismatches, heavily
-    /// converted reads map worse, and the methylation calls are biased.
-    /// bwa-mem3's `--meth` aligns them against a dual index built by
-    /// `bwa-mem3 index --meth`: the converted seed index
+    /// converted reads map worse, and the methylation calls are biased. TAPS
+    /// converts only the methylated cytosines, so its reads align plain too, but
+    /// bwa-mem3's `--meth=taps` places them better. The bwa-mem3 presets align
+    /// both with bwa-mem3's `--meth` flags (see `bwa_mem3_meth_flags`) against a
+    /// dual index built by `bwa-mem3 index --meth`: the converted seed index
     /// `<ref>.meth.{amb,ann,bwt.2bit.64,pac}` plus the original reference's
-    /// `<ref>.{amb,ann,pac}`. This checks for those files and rejects `bwa`,
-    /// which has no bisulfite mode. The plain `<ref>.bwt.2bit.64` is not
-    /// required for the `bwa-mem3` preset, so a `bwa-mem3 index --meth
-    /// --meth-only` index (which omits it) is accepted; `bwa-mem3-inproc`
-    /// still requires it (see `meth_original_index_extensions`).
+    /// `<ref>.{amb,ann,pac}`. This checks for those files. The plain
+    /// `<ref>.bwt.2bit.64` is not required for the `bwa-mem3` preset, so a
+    /// `bwa-mem3 index --meth --meth-only` index (which omits it) is accepted;
+    /// `bwa-mem3-inproc` still requires it (see `meth_original_index_extensions`).
     ///
-    /// A no-op for [`MethylationMode::Disabled`] and [`MethylationMode::Taps`]:
-    /// TAPS converts only the (rare) methylated cytosines, so its reads align
-    /// with a standard aligner.
+    /// `bwa` has no conversion-aware mode: it is rejected for EM-seq, and aligns
+    /// TAPS plain (no `.meth` index needed). A no-op for
+    /// [`MethylationMode::Disabled`].
     ///
     /// # Errors
     ///
-    /// Returns an error, under EM-seq, if the preset is `bwa` or a dual index
-    /// file is missing.
+    /// Returns an error if the preset is `bwa` under EM-seq, or a bwa-mem3 preset
+    /// under EM-seq or TAPS is missing a dual index file.
     ///
     /// # Pairing with `validate`
     ///
-    /// This checks the EM-seq index files only, and is meant to be paired with
+    /// This checks the dual index files only, and is meant to be paired with
     /// [`Self::validate`], which requires the plain index (including
     /// `<ref>.bwt.2bit.64`). The pair therefore rejects a `--meth-only` index.
     /// In-crate resolution uses `validate_with_methylation` instead, which
     /// picks the required index files by chemistry and accepts a `--meth-only`
-    /// index for the `bwa-mem3` preset under EM-seq.
+    /// index for the `bwa-mem3` preset under EM-seq or TAPS.
     pub fn validate_methylation(
         self,
         reference: &Path,
         methylation: MethylationMode,
     ) -> Result<()> {
-        if bwa_mem3_meth_flags(methylation).is_none() {
+        self.reject_without_bisulfite_mode(methylation)?;
+        if self.meth_flags(methylation).is_none() {
             return Ok(());
         }
-        self.reject_without_bisulfite_mode()?;
-        self.require_meth_index_files(reference)
+        self.require_meth_index_files(reference, methylation)
     }
 
     /// Require the `bwa-mem3 index --meth` files this preset reads under
-    /// EM-seq: the original reference's files
+    /// `methylation` (EM-seq or TAPS): the original reference's files
     /// ([`Self::meth_original_index_extensions`]) and the converted
     /// `<ref>.meth` seed index.
-    fn require_meth_index_files(self, reference: &Path) -> Result<()> {
-        let fix = || self.meth_index_hint(reference);
+    fn require_meth_index_files(
+        self,
+        reference: &Path,
+        methylation: MethylationMode,
+    ) -> Result<()> {
+        let fix = || self.meth_index_hint(reference, methylation);
         Self::require_index_files(reference, self.meth_original_index_extensions(), fix)?;
         let seed_prefix = append_extension(reference, BWA_MEM3_METH_INDEX_SUFFIX);
         Self::require_index_files(&seed_prefix, self.index_extensions(), fix)
@@ -914,26 +955,67 @@ impl AlignerPreset {
 pub(crate) const BWA_MEM3_METH_INDEX_SUFFIX: &str = ".meth";
 
 /// bwa-mem3's `mem` flags for `methylation`, as one space-separated string to
-/// splice into a command line: `--meth --meth-scoring genomic` (bisulfite-aware
-/// alignment, EM-seq chemistry, genomic scoring) for EM-seq, `None` otherwise.
-/// This is the one place that decides whether a chemistry aligns
-/// bisulfite-aware; the index check, the in-process options and the `@PG`
+/// splice into a command line: `--meth --meth-scoring genomic` (conversion-aware
+/// alignment, EM-seq chemistry, genomic scoring) for EM-seq,
+/// `--meth=taps --meth-scoring neutral` for TAPS, `None` when disabled. This is
+/// the one place that decides whether a chemistry aligns conversion-aware with
+/// the bwa-mem3 presets; the index check, the in-process options and the `@PG`
 /// record all follow it.
 ///
-/// Genomic scoring is bwa-mem3's default from 0.17.0 (collapsed, `-B 2`,
-/// before), and the in-process backend sets it explicitly too. Spelling it out
-/// pins the scoring mode, though not every other `--meth` default, for any
-/// subprocess `bwa-mem3` from 0.4.0 (the first release with `--meth-scoring`),
-/// so it scores as the in-process backend does and as realign rescores.
+/// The scoring is bwa-mem3's default for each chemistry from 0.17.0 (EM-seq
+/// was collapsed, `-B 2`, before), and the in-process backend sets it
+/// explicitly too. Spelling it out pins the scoring mode, though not every
+/// other `--meth` default, for any subprocess `bwa-mem3` from 0.4.0 (the first
+/// release with `--meth-scoring`), so it scores as the in-process backend does
+/// and as realign rescores.
 ///
-/// TAPS gets `None`: it converts only methylated cytosines, a few percent of
-/// them, so its reads look like the reference and align best with a standard
-/// aligner, as the methylation guide recommends.
+/// TAPS converts only the methylated cytosines, so its reads also align plain,
+/// but `--meth=taps` (same `--meth` index, seeding and `XR`/`XG` tags, neutral
+/// conversion scoring by default) places them better. It must be `--meth=taps`:
+/// a bare `--meth` inverts every `XM` call on TAPS reads, and bwa-mem3 binds the
+/// chemistry only in the `=` form (in `--meth taps`, `taps` is a positional).
 #[must_use]
 pub(crate) fn bwa_mem3_meth_flags(methylation: MethylationMode) -> Option<&'static str> {
     match methylation {
         MethylationMode::EmSeq => Some("--meth --meth-scoring genomic"),
-        MethylationMode::Disabled | MethylationMode::Taps => None,
+        MethylationMode::Taps => Some("--meth=taps --meth-scoring neutral"),
+        MethylationMode::Disabled => None,
+    }
+}
+
+/// The bare `--meth` flag (without `--meth-scoring`) `methylation` aligns
+/// with, for messages: `--meth` for EM-seq, `--meth=taps` for TAPS.
+///
+/// # Panics
+///
+/// On [`MethylationMode::Disabled`], which aligns with no `--meth` flag; the
+/// only caller, `AlignerPreset::meth_index_hint`, runs only for a chemistry
+/// [`bwa_mem3_meth_flags`] aligns conversion-aware.
+fn bwa_mem3_meth_flag_name(methylation: MethylationMode) -> &'static str {
+    match methylation {
+        MethylationMode::EmSeq => "--meth",
+        MethylationMode::Taps => "--meth=taps",
+        MethylationMode::Disabled => {
+            unreachable!("no dual index is checked for --methylation-mode disabled")
+        }
+    }
+}
+
+/// The `--methylation-mode` value that selects `methylation`, for messages.
+///
+/// # Panics
+///
+/// On [`MethylationMode::Disabled`], which no `--methylation-mode` value
+/// selects; the only caller, `AlignerPreset::meth_index_hint`, runs only for a
+/// chemistry [`bwa_mem3_meth_flags`] aligns conversion-aware.
+fn methylation_mode_name(methylation: MethylationMode) -> &'static str {
+    match methylation {
+        MethylationMode::EmSeq => EM_SEQ_MODE_NAME,
+        MethylationMode::Taps => TAPS_MODE_NAME,
+        MethylationMode::Disabled => unreachable!(
+            "no dual index is checked for --methylation-mode disabled, which aligns with \
+             no conversion-aware flag"
+        ),
     }
 }
 
@@ -1107,8 +1189,8 @@ pub struct AlignerOptions {
 
     /// The chemistry to align for. `#[arg(skip)]`: it is runall's top-level
     /// `--methylation-mode`, which runall copies here so the align stage and
-    /// the consensus callers it feeds agree. Under EM-seq a preset aligns with
-    /// bwa-mem3's `--meth`; TAPS aligns plain.
+    /// the consensus callers it feeds agree. A bwa-mem3 preset aligns with
+    /// bwa-mem3's `--meth` under EM-seq and `--meth=taps` under TAPS.
     #[arg(skip)]
     pub methylation_mode: MethylationMode,
 }
@@ -1338,10 +1420,11 @@ impl AlignerOptions {
     ///   `aligner-bwa-mem3` feature.
     /// - Preset-mode index files / binary missing (delegated to
     ///   [`AlignerPreset::validate_with_methylation`]).
-    /// - `methylation_mode` EM-seq with the `bwa` preset, or with a bwa-mem3
-    ///   preset whose `bwa-mem3 index --meth` files are missing (also delegated
-    ///   to [`AlignerPreset::validate_with_methylation`]). Command mode is not
-    ///   checked: the command picks its own (bisulfite-aware) aligner and flags.
+    /// - `methylation_mode` EM-seq with the `bwa` preset, or EM-seq or TAPS
+    ///   with a bwa-mem3 preset whose `bwa-mem3 index --meth` files are missing
+    ///   (also delegated to [`AlignerPreset::validate_with_methylation`]).
+    ///   Command mode is not checked: the command picks its own aligner and
+    ///   flags.
     pub(crate) fn resolve(
         self,
         reference: &Path,
@@ -2643,7 +2726,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // --methylation-mode (bisulfite-aware alignment)
+    // --methylation-mode (conversion-aware alignment)
     // ------------------------------------------------------------------
 
     /// A reference whose plain bwa-mem3 index files exist, plus the
@@ -2662,37 +2745,64 @@ mod tests {
     }
 
     #[rstest]
-    #[case::disabled(MethylationMode::Disabled, "bwa-mem3 mem --bam=0 -p -K 1000")]
+    #[case::disabled(
+        AlignerPreset::BwaMem3,
+        MethylationMode::Disabled,
+        "bwa-mem3 mem --bam=0 -p -K 1000"
+    )]
     #[case::emseq(
+        AlignerPreset::BwaMem3,
         MethylationMode::EmSeq,
         "bwa-mem3 mem --bam=0 --meth --meth-scoring genomic -p -K 1000"
     )]
-    #[case::taps_aligns_plain(MethylationMode::Taps, "bwa-mem3 mem --bam=0 -p -K 1000")]
-    fn build_command_adds_meth_for_emseq_only(
+    #[case::taps(
+        AlignerPreset::BwaMem3,
+        MethylationMode::Taps,
+        "bwa-mem3 mem --bam=0 --meth=taps --meth-scoring neutral -p -K 1000"
+    )]
+    #[case::bwa_disabled(AlignerPreset::Bwa, MethylationMode::Disabled, "bwa mem -p -K 1000")]
+    #[case::bwa_taps_aligns_plain(AlignerPreset::Bwa, MethylationMode::Taps, "bwa mem -p -K 1000")]
+    fn build_command_adds_the_meth_flags_for_bwa_mem3(
+        #[case] preset: AlignerPreset,
         #[case] methylation: MethylationMode,
         #[case] expected_prefix: &str,
     ) {
-        let cmd = AlignerPreset::BwaMem3.build_command(
-            Path::new("/refs/ref.fa"),
-            4,
-            1000,
-            None,
-            methylation,
-        );
+        let cmd = preset.build_command(Path::new("/refs/ref.fa"), 4, 1000, None, methylation);
         assert!(cmd.starts_with(expected_prefix), "got: {cmd}");
     }
 
-    /// Only EM-seq aligns bisulfite-aware, so disabled and TAPS need neither a
-    /// `.meth` index nor a bwa-mem3 preset.
+    /// Disabled needs no `.meth` index with any preset; neither does `bwa` under
+    /// TAPS, which it aligns plain.
     #[rstest]
-    fn validate_methylation_is_a_no_op_unless_emseq(
-        #[values(AlignerPreset::Bwa, AlignerPreset::BwaMem3, AlignerPreset::BwaMem3InProc)]
-        preset: AlignerPreset,
-        #[values(MethylationMode::Disabled, MethylationMode::Taps)] methylation: MethylationMode,
+    #[case::disabled_bwa(AlignerPreset::Bwa, MethylationMode::Disabled)]
+    #[case::disabled_bwa_mem3(AlignerPreset::BwaMem3, MethylationMode::Disabled)]
+    #[case::disabled_inproc(AlignerPreset::BwaMem3InProc, MethylationMode::Disabled)]
+    #[case::taps_bwa(AlignerPreset::Bwa, MethylationMode::Taps)]
+    fn validate_methylation_needs_no_meth_index(
+        #[case] preset: AlignerPreset,
+        #[case] methylation: MethylationMode,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), false);
         preset.validate_methylation(&ref_path, methylation).unwrap();
+    }
+
+    /// A preset consumes `--methylation-mode` when it aligns conversion-aware or
+    /// validation rejects it (`bwa` under EM-seq); `bwa` aligns TAPS plain.
+    #[rstest]
+    #[case::bwa_mem3_emseq(AlignerPreset::BwaMem3, MethylationMode::EmSeq, true)]
+    #[case::bwa_mem3_taps(AlignerPreset::BwaMem3, MethylationMode::Taps, true)]
+    #[case::inproc_taps(AlignerPreset::BwaMem3InProc, MethylationMode::Taps, true)]
+    #[case::bwa_mem3_disabled(AlignerPreset::BwaMem3, MethylationMode::Disabled, false)]
+    #[case::bwa_emseq_rejected(AlignerPreset::Bwa, MethylationMode::EmSeq, true)]
+    #[case::bwa_taps_plain(AlignerPreset::Bwa, MethylationMode::Taps, false)]
+    #[case::bwa_disabled(AlignerPreset::Bwa, MethylationMode::Disabled, false)]
+    fn consumes_methylation_cases(
+        #[case] preset: AlignerPreset,
+        #[case] methylation: MethylationMode,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(preset.consumes_methylation(methylation), expected);
     }
 
     #[test]
@@ -2706,21 +2816,38 @@ mod tests {
         assert!(err.contains("`bwa` has none"), "got: {err}");
     }
 
+    /// Both bwa-mem3 presets align EM-seq and TAPS against the `--meth` dual
+    /// index, so both chemistries need it; the error names the mode and flag.
     #[rstest]
-    #[case::subprocess(AlignerPreset::BwaMem3)]
-    #[case::inproc(AlignerPreset::BwaMem3InProc)]
-    fn validate_methylation_requires_the_meth_dual_index(#[case] preset: AlignerPreset) {
+    fn validate_methylation_requires_the_meth_dual_index(
+        #[values(AlignerPreset::BwaMem3, AlignerPreset::BwaMem3InProc)] preset: AlignerPreset,
+        #[values((MethylationMode::EmSeq, "em-seq", "--meth,"), (MethylationMode::Taps, "taps", "--meth=taps,"))]
+        mode: (MethylationMode, &str, &str),
+    ) {
+        let (methylation, mode_name, flag) = mode;
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), false);
-        let err =
-            preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap_err().to_string();
+        let err = preset.validate_methylation(&ref_path, methylation).unwrap_err().to_string();
         assert!(err.contains("ref.fa.meth."), "names the missing .meth file; got: {err}");
         assert!(err.contains("bwa-mem3 index --meth --force"), "gives the fix; got: {err}");
         assert!(err.contains("before 0.18.0"), "says which releases lack --force; got: {err}");
+        assert!(err.contains(&format!("--methylation-mode {mode_name} ")), "got: {err}");
+        assert!(err.contains(&format!("bwa-mem3 {flag}")), "got: {err}");
+        // Only TAPS, whose reads also align plain, points at the plain fallback.
+        assert_eq!(
+            err.contains("--aligner::preset bwa (which needs a bwa index)"),
+            methylation == MethylationMode::Taps,
+            "got: {err}"
+        );
+        assert_eq!(
+            err.contains("running plain `bwa-mem3 mem`"),
+            methylation == MethylationMode::Taps,
+            "got: {err}"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), true);
-        preset.validate_methylation(&ref_path, MethylationMode::EmSeq).unwrap();
+        preset.validate_methylation(&ref_path, methylation).unwrap();
     }
 
     /// A reference with a `--meth-only` index ([`METH_ONLY_INDEX_FILES`]),
@@ -2734,35 +2861,44 @@ mod tests {
         ref_path
     }
 
-    /// `bwa-mem3 mem --meth` never reads the plain `<ref>.bwt.2bit.64`, so the
-    /// subprocess preset accepts a `--meth-only` index under EM-seq.
-    #[test]
-    fn validate_with_methylation_accepts_a_meth_only_index_for_emseq() {
+    /// `bwa-mem3 mem --meth` and `--meth=taps` never read the plain
+    /// `<ref>.bwt.2bit.64`, so the subprocess preset accepts a `--meth-only`
+    /// index under EM-seq and TAPS.
+    #[rstest]
+    #[case::emseq(MethylationMode::EmSeq)]
+    #[case::taps(MethylationMode::Taps)]
+    fn validate_with_methylation_accepts_a_meth_only_index(#[case] methylation: MethylationMode) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_meth_only_index(tmp.path(), None);
         let bin = make_existing_binary(tmp.path());
         AlignerPreset::BwaMem3
-            .validate_with_methylation(&ref_path, Some(&bin), MethylationMode::EmSeq)
+            .validate_with_methylation(&ref_path, Some(&bin), methylation)
             .unwrap();
     }
 
-    /// Under EM-seq every file of the `--meth-only` layout is still required;
-    /// the error names the missing file and suggests the full dual index (not
-    /// `--meth-only`, which cannot align plain), with `--force` to replace one.
+    /// Under EM-seq and TAPS every file of the `--meth-only` layout is still
+    /// required; the error names the missing file and suggests the full dual
+    /// index (not `--meth-only`, which cannot align plain), with `--force` to
+    /// replace one.
     #[rstest]
-    #[case::orig_amb(".amb")]
-    #[case::orig_ann(".ann")]
-    #[case::orig_pac(".pac")]
-    #[case::seed_amb(".meth.amb")]
-    #[case::seed_ann(".meth.ann")]
-    #[case::seed_bwt(".meth.bwt.2bit.64")]
-    #[case::seed_pac(".meth.pac")]
-    fn validate_with_methylation_requires_each_meth_only_file_for_emseq(#[case] missing: &str) {
+    fn validate_with_methylation_requires_each_meth_only_file(
+        #[values(MethylationMode::EmSeq, MethylationMode::Taps)] methylation: MethylationMode,
+        #[values(
+            ".amb",
+            ".ann",
+            ".pac",
+            ".meth.amb",
+            ".meth.ann",
+            ".meth.bwt.2bit.64",
+            ".meth.pac"
+        )]
+        missing: &str,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_meth_only_index(tmp.path(), Some(missing));
         let bin = make_existing_binary(tmp.path());
         let err = AlignerPreset::BwaMem3
-            .validate_with_methylation(&ref_path, Some(&bin), MethylationMode::EmSeq)
+            .validate_with_methylation(&ref_path, Some(&bin), methylation)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("ref.fa{missing} ")), "names {missing}; got: {err}");
@@ -2773,35 +2909,41 @@ mod tests {
         assert!(!err.contains("--meth-only"), "does not suggest --meth-only; got: {err}");
     }
 
-    /// Plain and TAPS alignment read the plain index, so a `--meth-only` index
-    /// (no `<ref>.bwt.2bit.64`) is still rejected for them.
+    /// Plain alignment reads the plain index, so a `--meth-only` index (no
+    /// `<ref>.bwt.2bit.64`) is still rejected for it, as it is for `bwa` under
+    /// TAPS, which aligns plain.
     #[rstest]
-    #[case::disabled(MethylationMode::Disabled)]
-    #[case::taps(MethylationMode::Taps)]
-    fn validate_with_methylation_requires_the_plain_index_unless_emseq(
+    #[case::disabled(AlignerPreset::BwaMem3, MethylationMode::Disabled)]
+    #[case::bwa_taps(AlignerPreset::Bwa, MethylationMode::Taps)]
+    fn validate_with_methylation_requires_the_plain_index_when_aligning_plain(
+        #[case] preset: AlignerPreset,
         #[case] methylation: MethylationMode,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_meth_only_index(tmp.path(), None);
         let bin = make_existing_binary(tmp.path());
-        let err = AlignerPreset::BwaMem3
+        let err = preset
             .validate_with_methylation(&ref_path, Some(&bin), methylation)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("ref.fa.bwt.2bit.64 "), "names the plain index; got: {err}");
+        assert!(err.contains("required index file not found: "), "got: {err}");
         assert!(!err.contains("--meth"), "plain mode suggests a plain index; got: {err}");
     }
 
     /// The in-process backend's index loader checks for the plain
     /// `<ref>.bwt.2bit.64` even for a dual index, so it rejects a `--meth-only`
-    /// index up front, says it needs the full dual index, and suggests building
-    /// it (with `--force` to replace the existing files).
-    #[test]
-    fn validate_with_methylation_inproc_rejects_a_meth_only_index() {
+    /// index up front under EM-seq and TAPS, says it needs the full dual index,
+    /// and suggests building it (with `--force` to replace the existing files).
+    #[rstest]
+    #[case::emseq(MethylationMode::EmSeq)]
+    #[case::taps(MethylationMode::Taps)]
+    fn validate_with_methylation_inproc_rejects_a_meth_only_index(
+        #[case] methylation: MethylationMode,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_meth_only_index(tmp.path(), None);
         let err = AlignerPreset::BwaMem3InProc
-            .validate_with_methylation(&ref_path, None, MethylationMode::EmSeq)
+            .validate_with_methylation(&ref_path, None, methylation)
             .unwrap_err()
             .to_string();
         assert!(err.contains("ref.fa.bwt.2bit.64 "), "names the plain index; got: {err}");
@@ -2825,19 +2967,64 @@ mod tests {
         assert!(err.contains("`bwa` has none"), "got: {err}");
     }
 
-    /// The subprocess preset carries `--methylation-mode` into its command:
-    /// `--meth --meth-scoring genomic` for EM-seq, nothing for TAPS (which also
-    /// needs no `.meth` index).
+    /// The subprocess presets carry `--methylation-mode` into their command:
+    /// bwa-mem3 gets `--meth --meth-scoring genomic` for EM-seq and
+    /// `--meth=taps --meth-scoring neutral` for TAPS (both need the `.meth`
+    /// index); `bwa` aligns TAPS plain and needs none.
     #[rstest]
-    #[case::emseq(MethylationMode::EmSeq, true, true)]
-    #[case::taps(MethylationMode::Taps, false, false)]
-    fn resolve_preset_aligns_bisulfite_aware_for_emseq_only(
+    #[case::emseq(
+        AlignerPreset::BwaMem3,
+        MethylationMode::EmSeq,
+        true,
+        Some("--meth --meth-scoring genomic")
+    )]
+    #[case::taps(
+        AlignerPreset::BwaMem3,
+        MethylationMode::Taps,
+        true,
+        Some("--meth=taps --meth-scoring neutral")
+    )]
+    #[case::bwa_taps(AlignerPreset::Bwa, MethylationMode::Taps, false, None)]
+    fn resolve_preset_adds_the_meth_flags(
+        #[case] preset: AlignerPreset,
         #[case] methylation: MethylationMode,
         #[case] with_meth_index: bool,
-        #[case] expect_meth: bool,
+        #[case] expected_flags: Option<&str>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), with_meth_index);
+        if preset == AlignerPreset::Bwa {
+            for ext in AlignerPreset::Bwa.index_extensions() {
+                std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+            }
+        }
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions {
+            preset: Some(preset),
+            methylation_mode: methylation,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
+        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
+            panic!("a subprocess preset resolves to a subprocess");
+        };
+        match expected_flags {
+            Some(flags) => assert!(command.contains(&format!(" {flags} ")), "got: {command}"),
+            None => assert!(!command.contains("--meth"), "got: {command}"),
+        }
+    }
+
+    /// `--aligner::preset bwa-mem3` resolves against a
+    /// `bwa-mem3 index --meth --meth-only` index under EM-seq and TAPS.
+    #[rstest]
+    #[case::emseq(MethylationMode::EmSeq, "--meth --meth-scoring genomic")]
+    #[case::taps(MethylationMode::Taps, "--meth=taps --meth-scoring neutral")]
+    fn resolve_preset_accepts_a_meth_only_index(
+        #[case] methylation: MethylationMode,
+        #[case] flags: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = reference_with_meth_only_index(tmp.path(), None);
         let bin = make_existing_binary(tmp.path());
         let opts = AlignerOptions {
             preset: Some(AlignerPreset::BwaMem3),
@@ -2848,27 +3035,23 @@ mod tests {
         let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
             panic!("the bwa-mem3 preset resolves to a subprocess");
         };
-        assert_eq!(command.contains(" --meth"), expect_meth, "got: {command}");
-        assert_eq!(command.contains(" --meth --meth-scoring genomic "), expect_meth, "{command}");
+        assert!(command.contains(&format!(" {flags} ")), "got: {command}");
     }
 
-    /// `--aligner::preset bwa-mem3 --methylation-mode em-seq` resolves against a
-    /// `bwa-mem3 index --meth --meth-only` index.
+    /// TAPS with the bwa-mem3 preset aligns with `--meth=taps`, so a reference
+    /// without the `.meth` index is rejected at resolve time.
     #[test]
-    fn resolve_preset_accepts_a_meth_only_index_for_emseq() {
+    fn resolve_taps_preset_requires_the_meth_index() {
         let tmp = tempfile::tempdir().unwrap();
-        let ref_path = reference_with_meth_only_index(tmp.path(), None);
+        let ref_path = reference_with_index(tmp.path(), false);
         let bin = make_existing_binary(tmp.path());
         let opts = AlignerOptions {
             preset: Some(AlignerPreset::BwaMem3),
-            methylation_mode: MethylationMode::EmSeq,
+            methylation_mode: MethylationMode::Taps,
             ..AlignerOptions::default()
         };
-        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
-        let ResolvedBackend::Subprocess { command, .. } = resolved.backend else {
-            panic!("the bwa-mem3 preset resolves to a subprocess");
-        };
-        assert!(command.contains(" --meth "), "got: {command}");
+        let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err().to_string();
+        assert!(err.contains("bwa-mem3 index --meth"), "got: {err}");
     }
 
     /// `bwa` cannot align bisulfite reads, so `--methylation-mode em-seq` rejects it at
@@ -2891,21 +3074,23 @@ mod tests {
         assert!(err.contains("`bwa` has none"), "got: {err}");
     }
 
-    #[test]
+    #[rstest]
     #[cfg(feature = "aligner-bwa-mem3")]
-    fn resolve_inproc_carries_methylation_mode() {
+    fn resolve_inproc_carries_methylation_mode(
+        #[values(MethylationMode::EmSeq, MethylationMode::Taps)] methylation: MethylationMode,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = reference_with_index(tmp.path(), true);
         let opts = AlignerOptions {
             preset: Some(AlignerPreset::BwaMem3InProc),
-            methylation_mode: MethylationMode::EmSeq,
+            methylation_mode: methylation,
             ..AlignerOptions::default()
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
         assert!(
             matches!(
                 resolved.backend,
-                ResolvedBackend::InProcessBwaMem3 { methylation: MethylationMode::EmSeq, .. }
+                ResolvedBackend::InProcessBwaMem3 { methylation: m, .. } if m == methylation
             ),
             "got: {:?}",
             resolved.backend

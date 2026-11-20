@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
-use engine::{BwaIndex, MemOpts};
+use engine::{BwaIndex, MemOpts, MethChem, MethScoring};
 use fgumi_consensus::MethylationMode;
 
 use crate::aligner::{BWA_MEM3_METH_INDEX_SUFFIX, bwa_mem3_meth_flags};
@@ -77,9 +77,9 @@ pub(crate) struct InProcessBwaMem3Backend {
     /// The aligner's `-K` chunk size in bases, driving [`AlignPrepareStep`]'s
     /// cohort cutter and gate, and the synthesized `@PG CL`.
     pub(crate) chunk_size: u64,
-    /// The chemistry to align for (`--methylation-mode`). Under EM-seq the
-    /// backend loads the `bwa-mem3 index --meth` dual index and aligns as
-    /// `bwa-mem3 mem --meth` does; TAPS aligns plain (see
+    /// The chemistry to align for (`--methylation-mode`). Under EM-seq or TAPS
+    /// the backend loads the `bwa-mem3 index --meth` dual index and aligns as
+    /// the subprocess preset's `bwa-mem3 mem` flags do (see
     /// [`bwa_mem3_meth_flags`]).
     pub(crate) methylation: MethylationMode,
     /// bwa's `-h <primary>,<alt>` (the realign stage's `--xa-max-hits`), or
@@ -166,12 +166,13 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // wall time and whether a staged shm segment was attached. A staged
         // segment means bwa-mem3 attached to it instead of reading from disk; the
         // probe is best-effort (failure => assume disk). It checks the prefix
-        // the FM-index loads from, which under EM-seq is the `.meth` seed index.
+        // the FM-index loads from, which under EM-seq or TAPS is the `.meth` seed
+        // index.
         //
         // The index comes through the chain's `SharedIndex`, so a chain with both
         // an in-process `Align` and `Realign` stage holds one copy when both
         // align with the same index: the second stage reuses the first's `Arc`.
-        // For duplex consensus under EM-seq the `Align` stage loads the `--meth`
+        // For duplex consensus under EM-seq or TAPS the `Align` stage loads the `--meth`
         // dual index and `Realign` (which aligns duplex reads plain) the plain
         // one; the keys differ, so the second load replaces the cached slot while
         // the first backend keeps its `Arc`, and both stay resident.
@@ -282,7 +283,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
 }
 
 /// The prefix the in-process backend loads its FM-index from: `<reference>`,
-/// or when `methylation` aligns bisulfite-aware (EM-seq, per
+/// or when `methylation` aligns conversion-aware (EM-seq or TAPS, per
 /// [`bwa_mem3_meth_flags`]) the converted seed index `<reference>.meth`.
 fn index_prefix(reference: &std::path::Path, methylation: MethylationMode) -> std::path::PathBuf {
     let mut prefix = reference.as_os_str().to_owned();
@@ -293,7 +294,7 @@ fn index_prefix(reference: &std::path::Path, methylation: MethylationMode) -> st
 }
 
 /// Load the index the in-process backend aligns against: the plain bwa-mem3
-/// index, or when `methylation` aligns bisulfite-aware (EM-seq, per
+/// index, or when `methylation` aligns conversion-aware (EM-seq or TAPS, per
 /// [`bwa_mem3_meth_flags`]) the `bwa-mem3 index --meth` dual index — the
 /// converted seed index `<reference>.meth` plus the original `<reference>`
 /// that alignment, pairing and output coordinates use. Either way the FM-index
@@ -312,24 +313,37 @@ fn load_index(
 }
 
 /// The options every in-process alignment shares: paired-end, and when
-/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flags`])
-/// what `bwa-mem3 mem --meth --meth-scoring genomic` sets. EM-seq is bwa-mem3's
-/// default chemistry, so there is none to set. The scoring is set explicitly,
-/// as the subprocess preset's flags and the `@PG` record spell it, rather than
-/// left to the library default (which was collapsed before bwa-mem3 0.17.0); it
-/// is set before [`MemOpts::apply_meth_defaults`], which reads it. `xa_max_hits`
-/// sets bwa's `-h` when given.
+/// `methylation` aligns conversion-aware (EM-seq or TAPS, per
+/// [`bwa_mem3_meth_flags`]) what `bwa-mem3 mem --meth --meth-scoring genomic`
+/// or `--meth=taps --meth-scoring neutral` sets. EM-seq is bwa-mem3's default
+/// chemistry, so only TAPS sets one. The scoring is set explicitly, as the
+/// subprocess preset's flags and the `@PG` record spell it, rather than left to
+/// the library default (which for EM-seq was collapsed before bwa-mem3 0.17.0).
+/// Chemistry and scoring are set before [`MemOpts::apply_meth_defaults`], which
+/// reads them. `xa_max_hits` sets bwa's `-h` when given.
 fn build_opts(
     methylation: MethylationMode,
     xa_max_hits: Option<(u32, u32)>,
 ) -> anyhow::Result<MemOpts> {
     let mut opts = MemOpts::new()?;
     opts.set_pe(true);
-    if bwa_mem3_meth_flags(methylation).is_some() {
-        opts.set_meth(true)
-            .set_meth_scoring(engine::MethScoring::Genomic)
-            .apply_meth_defaults()
-            .context("applying bwa-mem3's --meth defaults for --methylation-mode em-seq")?;
+    // Exhaustive, so a new chemistry has to decide how it aligns here (and in
+    // `bwa_mem3_meth_flags`, which the subprocess preset follows).
+    match methylation {
+        MethylationMode::Disabled => {}
+        MethylationMode::EmSeq => {
+            opts.set_meth(true)
+                .set_meth_scoring(MethScoring::Genomic)
+                .apply_meth_defaults()
+                .context("applying bwa-mem3's --meth defaults for --methylation-mode em-seq")?;
+        }
+        MethylationMode::Taps => {
+            opts.set_meth(true)
+                .set_meth_chem(MethChem::Taps)
+                .set_meth_scoring(MethScoring::Neutral)
+                .apply_meth_defaults()
+                .context("applying bwa-mem3's --meth=taps defaults for --methylation-mode taps")?;
+        }
     }
     if let Some((primary, alt)) = xa_max_hits {
         opts.set_xa_max_hits(
@@ -341,9 +355,11 @@ fn build_opts(
 }
 
 /// The scoring the in-process backend aligns with for `methylation`: `-A`/`-B`
-/// read from the [`build_opts`] options. Gap penalties are bwa-mem3's defaults:
-/// `MemOpts` has no getter for them, and neither fgumi nor `--meth`'s defaults
-/// change them.
+/// read from the [`build_opts`] options, and the score of a freed conversion
+/// ([`crate::aligner::BwaScoring::conversion`]): 0 under `--meth`'s neutral
+/// scoring (TAPS's default), `-A` otherwise. Gap penalties are bwa-mem3's
+/// defaults: `MemOpts` has no getter for them, and neither fgumi nor `--meth`'s
+/// defaults change them.
 ///
 /// # Errors
 ///
@@ -352,9 +368,12 @@ pub(crate) fn bwa_scoring(
     methylation: MethylationMode,
 ) -> anyhow::Result<crate::aligner::BwaScoring> {
     let opts = build_opts(methylation, None)?;
+    let a = opts.match_score();
+    let neutral = opts.meth() && opts.meth_scoring()? == engine::MethScoring::Neutral;
     Ok(crate::aligner::BwaScoring {
-        a: opts.match_score(),
+        a,
         b: opts.mismatch_penalty(),
+        conversion: if neutral { 0 } else { a },
         ..crate::aligner::BwaScoring::default()
     })
 }
@@ -407,13 +426,13 @@ mod tests {
         assert!(prefers_drain_first);
     }
 
-    /// The FM-index loads from `<reference>.meth` only when the chemistry
-    /// aligns bisulfite-aware (EM-seq); the shm probe checks the same prefix.
+    /// The FM-index loads from `<reference>.meth` when the chemistry aligns
+    /// conversion-aware (EM-seq or TAPS); the shm probe checks the same prefix.
     #[rstest]
     #[case::disabled(MethylationMode::Disabled, "/refs/ref.fa")]
     #[case::emseq(MethylationMode::EmSeq, "/refs/ref.fa.meth")]
-    #[case::taps(MethylationMode::Taps, "/refs/ref.fa")]
-    fn index_prefix_is_the_seed_index_under_emseq(
+    #[case::taps(MethylationMode::Taps, "/refs/ref.fa.meth")]
+    fn index_prefix_is_the_seed_index_under_methylation(
         #[case] methylation: MethylationMode,
         #[case] expected: &str,
     ) {
@@ -423,12 +442,10 @@ mod tests {
         );
     }
 
-    /// Disabled and TAPS align with plain bwa-mem3 options.
-    #[rstest]
-    #[case::disabled(MethylationMode::Disabled)]
-    #[case::taps(MethylationMode::Taps)]
-    fn build_opts_is_plain_bwa_mem3_unless_emseq(#[case] methylation: MethylationMode) {
-        let opts = build_opts(methylation, None).unwrap();
+    /// Disabled aligns with plain bwa-mem3 options.
+    #[test]
+    fn build_opts_is_plain_bwa_mem3_when_disabled() {
+        let opts = build_opts(MethylationMode::Disabled, None).unwrap();
         assert!(!opts.meth());
     }
 
@@ -442,5 +459,39 @@ mod tests {
         assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Genomic);
         assert_eq!(opts.meth_seed_prune().unwrap(), engine::MethSeedPrune::Spec30);
         assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
+    }
+
+    /// The in-process TAPS options must match what the subprocess preset's
+    /// `bwa-mem3 mem --meth=taps --meth-scoring neutral` sets: TAPS chemistry (inverted `XM` polarity)
+    /// and neutral scoring, with `--meth`'s other defaults.
+    #[test]
+    fn build_opts_applies_the_cli_meth_taps_defaults_for_taps() {
+        let opts = build_opts(MethylationMode::Taps, None).unwrap();
+        assert!(opts.meth());
+        assert_eq!(opts.meth_chem().unwrap(), engine::MethChem::Taps);
+        assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Neutral);
+        assert_eq!(opts.meth_seed_prune().unwrap(), engine::MethSeedPrune::Spec30);
+        assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
+    }
+
+    /// The in-process scoring matches what `BwaScoring::from_command` reads from
+    /// the subprocess preset's flags: TAPS's neutral scoring frees a conversion
+    /// to 0, EM-seq's genomic scoring to `-A` (keeping `-B 4`).
+    #[rstest]
+    #[case::disabled(MethylationMode::Disabled, 4, 1)]
+    #[case::emseq(MethylationMode::EmSeq, 4, 1)]
+    #[case::taps(MethylationMode::Taps, 4, 0)]
+    fn bwa_scoring_models_the_conversion_score(
+        #[case] methylation: MethylationMode,
+        #[case] mismatch: i32,
+        #[case] conversion: i32,
+    ) {
+        let scoring = super::bwa_scoring(methylation).unwrap();
+        assert_eq!(scoring.a, 1);
+        assert_eq!(scoring.b, mismatch);
+        assert_eq!(scoring.conversion, conversion);
+        let flag = crate::aligner::bwa_mem3_meth_flags(methylation).unwrap_or_default();
+        let command = format!("bwa-mem3 mem {flag} -p ref.fa -");
+        assert_eq!(scoring, crate::aligner::BwaScoring::from_command(&command));
     }
 }

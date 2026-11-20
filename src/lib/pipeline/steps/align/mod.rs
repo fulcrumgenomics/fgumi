@@ -256,9 +256,10 @@ impl Ordered for ZipperBatch {
 /// [`Self::get_or_load`]: the first stage loads, later stages with the same key
 /// share its `Arc`. A different key (another reference, or the `--meth` seed
 /// index) replaces the cached index, while a backend that already holds the
-/// old `Arc` keeps it: duplex consensus under `--methylation-mode em-seq`, whose
-/// `Align` stage loads the `--meth` dual index and whose `Realign` stage loads
-/// the plain one, holds both for the whole run.
+/// old `Arc` keeps it: duplex consensus under `--methylation-mode em-seq` or
+/// `taps`, whose `Align` stage loads the `--meth` dual index (aligning with
+/// `--meth` or `--meth=taps`) and whose `Realign` stage loads the plain one,
+/// holds both for the whole run.
 ///
 /// Generic over the index type so the sharing is testable without a real
 /// bwa-mem3 index; only the in-process backend instantiates it.
@@ -342,9 +343,10 @@ pub(crate) struct AlignWiringCtx {
     pub(crate) merge: Arc<merge::MergeConfig>,
     /// The chain's one shared in-process index (see [`SharedIndex`]), so an
     /// `Align` and a `Realign` stage in one chain load it once when they align
-    /// with the same index. Duplex consensus under `--methylation-mode em-seq` is
-    /// the exception: `Align` loads the `bwa-mem3 index --meth` dual index and
-    /// `Realign` the plain one, so both stay resident for the whole run.
+    /// with the same index. Duplex consensus under `--methylation-mode em-seq` or
+    /// `taps` is the exception: `Align` loads the `bwa-mem3 index --meth` dual
+    /// index (for `--meth` or `--meth=taps`) and `Realign` the plain one, so both
+    /// stay resident for the whole run.
     #[cfg(feature = "aligner-bwa-mem3")]
     pub(crate) index: Arc<SharedIndex<inproc::engine::BwaIndex>>,
 }
@@ -609,12 +611,71 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
     builder.build()
 }
 
+/// The first bwa-mem3 release whose `NM` (and the `NM` in its `XA` alternatives)
+/// excludes `--meth` conversions; earlier releases count each one as a mismatch.
+pub(crate) const BWA_MEM3_METH_NM_FLOOR: (u32, u32, u32) = (0, 8, 0);
+
+/// bwa-mem3's version as its `@PG` (`PN:bwa-mem3`, matched on the name, not the
+/// ID) records it in `VN`: the leading `major.minor.patch`, so git-describe forms
+/// such as `0.8.0-dirty` or `0.8.0-<sha>-dirty` read as `0.8.0`. `None` when the
+/// header has no bwa-mem3 `@PG`, or its `VN` is missing or does not start with
+/// one.
+pub(crate) fn bwa_mem3_version(header: &Header) -> Option<(u32, u32, u32)> {
+    use noodles::sam::header::record::value::map::program::tag as pg_tag;
+    header.programs().as_ref().values().find_map(|pg| {
+        let fields = pg.other_fields();
+        if fields.get(&pg_tag::NAME)?.as_slice() != b"bwa-mem3" {
+            return None;
+        }
+        parse_version_triple(fields.get(&pg_tag::VERSION)?.as_slice())
+    })
+}
+
+/// The leading `major.minor.patch` of `vn`, ending at its end or at a `-`.
+fn parse_version_triple(vn: &[u8]) -> Option<(u32, u32, u32)> {
+    let core = vn.split(|&b| b == b'-').next()?;
+    let mut parts = std::str::from_utf8(core).ok()?.split('.');
+    let mut next = || parts.next()?.parse::<u32>().ok();
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// With `--meth` in the aligner command, refuse a bwa-mem3 whose header names a
+/// release before [`BWA_MEM3_METH_NM_FLOOR`]: its `NM`, and the `NM` realign
+/// rescores `XA` alternatives with, counts methylation conversions as mismatches.
+/// A header without a readable bwa-mem3 version (another aligner, a wrapper, a
+/// stripped `@PG`) is not checked.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` naming the version found and the floor.
+pub(crate) fn check_meth_aligner_version(aligner_header: &Header) -> io::Result<()> {
+    let floor = BWA_MEM3_METH_NM_FLOOR;
+    match bwa_mem3_version(aligner_header) {
+        Some(v) if v < floor => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the aligner is bwa-mem3 {}.{}.{} run with --meth, which needs bwa-mem3 \
+                 {}.{}.{} or later: earlier releases count methylation conversions as \
+                 mismatches in NM, including the NM of XA alternatives, so NM and \
+                 realign's rescored alternatives would be wrong",
+                v.0, v.1, v.2, floor.0, floor.1, floor.2
+            ),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            log::debug!("no bwa-mem3 version in the aligner's @PG; not checking the --meth floor");
+            Ok(())
+        }
+    }
+}
+
 /// The scoring `resolved` aligns with, which the realign stage recomputes a
 /// promoted alignment's `AS` with: for the in-process backend, the `MemOpts` it
-/// builds (with `--meth`'s defaults under EM-seq); for a subprocess backend
-/// (preset or `--aligner::command`), what its command line sets
-/// ([`BwaScoring::from_command`]), which for a preset is bwa-mem3's defaults or,
-/// with `--meth`, its bisulfite defaults.
+/// builds (with `--meth`'s defaults under EM-seq, `--meth=taps`'s under TAPS);
+/// for a subprocess backend (preset or `--aligner::command`), what its command
+/// line sets ([`BwaScoring::from_command`]), which for a preset is bwa-mem3's
+/// defaults or, with `--meth` / `--meth=taps`, its bisulfite defaults.
 ///
 /// # Errors
 ///
@@ -692,23 +753,36 @@ mod tests {
     }
 
     /// The subprocess preset scores with bwa-mem3's defaults: under EM-seq its
-    /// `--meth --meth-scoring genomic` keeps `-B 4`.
+    /// `--meth --meth-scoring genomic` keeps `-B 4`, and under TAPS its
+    /// `--meth=taps --meth-scoring neutral` scores a freed conversion 0.
     #[rstest::rstest]
-    #[case::plain(fgumi_consensus::MethylationMode::Disabled)]
-    #[case::taps(fgumi_consensus::MethylationMode::Taps)]
-    #[case::emseq(fgumi_consensus::MethylationMode::EmSeq)]
-    fn bwa_scoring_for_subprocess_preset(#[case] methylation: fgumi_consensus::MethylationMode) {
+    #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
+    #[case::taps(
+        fgumi_consensus::MethylationMode::Taps,
+        BwaScoring { conversion: 0, ..BwaScoring::default() }
+    )]
+    #[case::emseq(fgumi_consensus::MethylationMode::EmSeq, BwaScoring::default())]
+    fn bwa_scoring_for_subprocess_preset(
+        #[case] methylation: fgumi_consensus::MethylationMode,
+        #[case] expected: BwaScoring,
+    ) {
         let backend = subprocess(&preset_command(methylation));
-        assert_eq!(bwa_scoring_for(&resolved(backend, true)).unwrap(), BwaScoring::default());
+        assert_eq!(bwa_scoring_for(&resolved(backend, true)).unwrap(), expected);
     }
 
     /// `--aligner::command` scores with the scoring options it passes; a bare
-    /// `--meth` is read as bwa-mem3 0.17.0+'s genomic scoring.
+    /// `--meth` is read as bwa-mem3 0.17.0+'s genomic scoring, and a bare
+    /// `--meth=taps` as its neutral scoring.
     #[rstest::rstest]
     #[case::command_bare_meth(
         "bwa-mem3 mem --meth -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
         false,
         BwaScoring::default()
+    )]
+    #[case::command_bare_meth_taps(
+        "bwa-mem3 mem --meth=taps -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
+        false,
+        BwaScoring { conversion: 0, ..BwaScoring::default() }
     )]
     #[case::command_defaults("bwa mem -p ref.fa /dev/stdin", false, BwaScoring::default())]
     #[case::command_options(
@@ -750,7 +824,10 @@ mod tests {
     #[cfg(feature = "aligner-bwa-mem3")]
     #[rstest::rstest]
     #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
-    #[case::taps(fgumi_consensus::MethylationMode::Taps, BwaScoring::default())]
+    #[case::taps(
+        fgumi_consensus::MethylationMode::Taps,
+        BwaScoring { conversion: 0, ..BwaScoring::default() }
+    )]
     #[case::emseq(fgumi_consensus::MethylationMode::EmSeq, BwaScoring::default())]
     fn bwa_scoring_for_inproc(
         #[case] methylation: fgumi_consensus::MethylationMode,
@@ -998,6 +1075,74 @@ mod tests {
         assert!(msg.contains("aligner @SQ name mismatch at position 1"), "got: {msg}");
         assert!(msg.contains("dict='chr2'"), "dict name in message: {msg}");
         assert!(msg.contains("aligner='chrZ'"), "aligner name in message: {msg}");
+    }
+
+    /// A header with the given `(PN, VN)` `@PG` records, IDs `pg0`, `pg1`, ...
+    fn header_with_programs(programs: &[(Option<&str>, Option<&str>)]) -> Header {
+        use bstr::BString;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::Program;
+        use noodles::sam::header::record::value::map::program::tag as pg_tag;
+
+        let mut builder = Header::builder();
+        for (i, (name, version)) in programs.iter().enumerate() {
+            let mut pg = Map::<Program>::builder();
+            if let Some(name) = name {
+                pg = pg.insert(pg_tag::NAME, *name);
+            }
+            if let Some(version) = version {
+                pg = pg.insert(pg_tag::VERSION, *version);
+            }
+            builder = builder.add_program(BString::from(format!("pg{i}")), pg.build().unwrap());
+        }
+        builder.build()
+    }
+
+    #[rstest::rstest]
+    #[case::release(&[(Some("bwa-mem3"), Some("0.8.0"))], Some((0, 8, 0)))]
+    #[case::dirty(&[(Some("bwa-mem3"), Some("0.7.0-dirty"))], Some((0, 7, 0)))]
+    #[case::git_describe(&[(Some("bwa-mem3"), Some("0.18.0-g1a2b3c4-dirty"))], Some((0, 18, 0)))]
+    #[case::found_after_another_program(
+        &[(Some("samtools"), Some("1.21")), (Some("bwa-mem3"), Some("0.9.1"))],
+        Some((0, 9, 1))
+    )]
+    #[case::no_programs(&[], None)]
+    #[case::another_program(&[(Some("bwa"), Some("0.7.18"))], None)]
+    #[case::no_name(&[(None, Some("0.7.0"))], None)]
+    #[case::no_version(&[(Some("bwa-mem3"), None)], None)]
+    #[case::two_parts(&[(Some("bwa-mem3"), Some("0.8"))], None)]
+    #[case::four_parts(&[(Some("bwa-mem3"), Some("0.8.0.1"))], None)]
+    #[case::not_numeric(&[(Some("bwa-mem3"), Some("v0.8.0"))], None)]
+    fn bwa_mem3_version_cases(
+        #[case] programs: &[(Option<&str>, Option<&str>)],
+        #[case] expected: Option<(u32, u32, u32)>,
+    ) {
+        assert_eq!(bwa_mem3_version(&header_with_programs(programs)), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::before_the_floor(&[(Some("bwa-mem3"), Some("0.7.0"))], Some("bwa-mem3 0.7.0 run with --meth"))]
+    #[case::before_the_floor_dirty(&[(Some("bwa-mem3"), Some("0.7.9-dirty"))], Some("bwa-mem3 0.7.9 run with --meth"))]
+    #[case::at_the_floor(&[(Some("bwa-mem3"), Some("0.8.0"))], None)]
+    #[case::after_the_floor(&[(Some("bwa-mem3"), Some("0.18.0"))], None)]
+    #[case::no_program(&[], None)]
+    #[case::another_program(&[(Some("bwameth"), Some("0.2.7"))], None)]
+    #[case::unparseable_version(&[(Some("bwa-mem3"), Some("unknown"))], None)]
+    fn check_meth_aligner_version_cases(
+        #[case] programs: &[(Option<&str>, Option<&str>)],
+        #[case] error: Option<&str>,
+    ) {
+        let result = check_meth_aligner_version(&header_with_programs(programs));
+        match error {
+            None => result.expect("no error"),
+            Some(needle) => {
+                let err = result.expect_err("must refuse an old bwa-mem3");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                let msg = err.to_string();
+                assert!(msg.contains(needle), "{msg}");
+                assert!(msg.contains("needs bwa-mem3 0.8.0 or later"), "{msg}");
+            }
+        }
     }
 
     /// `merge_aligner_header` must keep the *partial* header's `@PG` on a

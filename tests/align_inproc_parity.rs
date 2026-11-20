@@ -575,6 +575,27 @@ impl Case {
     /// is: R1 (and a single-end read) C→T, R2 G→A, at every cytosine outside a
     /// `CpG` (EM-seq leaves methylated `CpG` cytosines unconverted).
     fn with_emseq(bin: &str) -> Self {
+        Self::with_conversions(bin, "em-seq", emseq_convert)
+    }
+
+    /// [`Case::new`] over directional TAPS reads, with the
+    /// `bwa-mem3 index --meth` dual index built beside the fixture's plain one.
+    ///
+    /// Each read is converted in its own orientation, as for
+    /// [`Case::with_emseq`], but only at the methylated cytosines (every `CpG`
+    /// here): TAPS converts methylated C and leaves unmethylated C as C.
+    fn with_taps(bin: &str) -> Self {
+        Self::with_conversions(bin, "taps", taps_convert)
+    }
+
+    /// [`Case::new`] over reads converted by `convert` (given each read and
+    /// whether it is an R2), aligned under `--methylation-mode methylation`, with
+    /// the `bwa-mem3 index --meth` dual index built.
+    fn with_conversions(
+        bin: &str,
+        methylation: &'static str,
+        convert: fn(&[u8], bool) -> Vec<u8>,
+    ) -> Self {
         let dir = TempDir::new().expect("create temp dir");
         let fixture = write_fixture_reference(dir.path(), bin);
         let status = Command::new(bin)
@@ -591,12 +612,12 @@ impl Case {
             for (i, read) in t.reads.iter_mut().enumerate() {
                 // R2 reads the complementary strand, so its conversions are G→A.
                 let r2 = t.paired && i == 1;
-                *read = emseq_convert(read, r2);
+                *read = convert(read, r2);
             }
         }
         let unmapped = dir.path().join("unmapped.bam");
         write_unmapped_bam(&unmapped, &templates);
-        Self { reference: fixture.fasta, unmapped, templates, dir, methylation: Some("em-seq") }
+        Self { reference: fixture.fasta, unmapped, templates, dir, methylation: Some(methylation) }
     }
 }
 
@@ -605,12 +626,25 @@ impl Case {
 /// G converts to A. A `CpG` stays unconverted, tested in the read's own
 /// orientation: C followed by G for an R1, G preceded by C for an R2.
 fn emseq_convert(read: &[u8], r2: bool) -> Vec<u8> {
+    convert_cytosines(read, r2, false)
+}
+
+/// Convert one read as sequenced under TAPS: as [`emseq_convert`], but only the
+/// methylated (`CpG`) cytosines convert.
+fn taps_convert(read: &[u8], r2: bool) -> Vec<u8> {
+    convert_cytosines(read, r2, true)
+}
+
+/// Convert the cytosines of `read` (C→T for an R1, G→A for an R2, in the
+/// read's own orientation) that are in a `CpG` when `at_cpg`, or outside one
+/// otherwise.
+fn convert_cytosines(read: &[u8], r2: bool, at_cpg: bool) -> Vec<u8> {
     let (from, to) = if r2 { (b'G', b'A') } else { (b'C', b'T') };
     (0..read.len())
         .map(|i| {
             let cpg =
                 if r2 { i > 0 && read[i - 1] == b'C' } else { read.get(i + 1) == Some(&b'G') };
-            if read[i] == from && !cpg { to } else { read[i] }
+            if read[i] == from && cpg == at_cpg { to } else { read[i] }
         })
         .collect()
 }
@@ -626,8 +660,8 @@ fn meth_tagged(bam: &Bam) -> usize {
 
 /// Under `runall --methylation-mode em-seq`, the in-process backend aligns
 /// bisulfite-aware exactly as the subprocess preset's `bwa-mem3 mem --meth`
-/// does, record for record. (TAPS aligns plain, which the parity tests above
-/// already cover; on an align-only chain runall rejects it as dead.)
+/// does, record for record. TAPS is covered by
+/// [`inproc_matches_subprocess_under_taps`].
 #[rstest]
 #[case::base(1, 256, Chunk::One, Scheduler::DrainFirst)]
 #[case::threads4_sb7_many(4, 7, Chunk::Many, Scheduler::Auto)]
@@ -675,5 +709,60 @@ fn inproc_matches_subprocess_under_emseq(
         &for_parity(&subprocess),
         &for_parity(&inproc),
         &format!("{label}: in-process diverged from the subprocess bwa-mem3 --meth preset"),
+    );
+}
+
+/// Under `runall --methylation-mode taps`, the in-process backend aligns
+/// conversion-aware exactly as the subprocess preset's `bwa-mem3 mem
+/// --meth=taps` does, record for record.
+#[rstest]
+#[case::base(1, 256, Chunk::One, Scheduler::DrainFirst)]
+#[case::threads4_sb7_many(4, 7, Chunk::Many, Scheduler::Auto)]
+#[case::threads4_sb64_several(4, 64, Chunk::Several, Scheduler::ChainOrder)]
+fn inproc_matches_subprocess_under_taps(
+    #[case] threads: usize,
+    #[case] sub_batch_templates: usize,
+    #[case] chunk: Chunk,
+    #[case] scheduler: Scheduler,
+) {
+    let label = format!(
+        "inproc_matches_subprocess_under_taps[t{threads} sb{sub_batch_templates} {chunk:?} {}]",
+        scheduler.label()
+    );
+    let reference_bin = bin_or_skip!(label);
+    let case = Case::with_taps(&reference_bin);
+
+    let subprocess = run_leg(
+        &case,
+        &case.out("subprocess.bam"),
+        Leg::Subprocess { reference_bin: &reference_bin },
+        threads,
+        chunk,
+        scheduler,
+    );
+    let inproc = run_leg(
+        &case,
+        &case.out("inproc.bam"),
+        Leg::InProcess { sub_batch_templates, dedup: None },
+        threads,
+        chunk,
+        scheduler,
+    );
+
+    // Both legs really aligned with --meth=taps: only --meth writes XG:Z.
+    for (leg, bam) in [("subprocess", &subprocess), ("in-process", &inproc)] {
+        assert!(
+            meth_tagged(bam) > 0,
+            "{label}: the {leg} leg wrote no XG:Z, so it ignored --meth=taps"
+        );
+    }
+    assert_tags_transferred(&subprocess, &case.templates, &format!("{label} subprocess"));
+    assert_tags_transferred(&inproc, &case.templates, &format!("{label} in-process"));
+    assert_reads_preserved(&subprocess, &case.templates, &format!("{label} subprocess"));
+    assert_reads_preserved(&inproc, &case.templates, &format!("{label} in-process"));
+    assert_same_bam(
+        &for_parity(&subprocess),
+        &for_parity(&inproc),
+        &format!("{label}: in-process diverged from the subprocess bwa-mem3 --meth=taps preset"),
     );
 }

@@ -219,7 +219,9 @@ that does not parse means the input was damaged or written by another tool.
 
 A promoted alignment's AS is the score bwa lists for the hit in a six-field list
 (`-u`). With the usual four-field `XA` it is rescored from its CIGAR and the `XA`
-hit's edit distance (so bisulfite conversions bwa did not count are not penalised),
+hit's edit distance (so bisulfite conversions bwa did not count are not penalised; bwa-mem3
+before 0.8.0 counted them in `NM` under `--meth`, so use 0.8.0 or later; with `--meth`, a
+bwa-mem3 `@PG` naming an earlier release stops the run),
 with the aligner's scoring, and never below 0 (bwa reports no negative AS): the in-process backend's
 options, or for a subprocess preset or `--aligner::command` what the command passes
 after its `mem` word: `-A`, `-B`, `-O`, `-E`, an `-x` preset, and `--meth` (`--meth-scoring
@@ -254,11 +256,12 @@ pub struct Realign {
     #[arg(long = "aligner-bin")]
     pub aligner_bin: Option<PathBuf>,
 
-    /// Methylation chemistry. With `em-seq`, the bwa-mem3 presets align
-    /// bisulfite-aware (`bwa-mem3 mem --meth`, against a `bwa-mem3 index --meth` index),
-    /// which suits simplex consensus reads. Do not pass it for duplex consensus
-    /// reads: their sequence is the molecule's own (methylation is in `MM`/`ML`),
-    /// so they align with a standard aligner.
+    /// Methylation chemistry. The bwa-mem3 presets align conversion-aware against a
+    /// `bwa-mem3 index --meth` index: `bwa-mem3 mem --meth` for `em-seq`, and
+    /// `bwa-mem3 mem --meth=taps` for `taps` (the `bwa` preset aligns `taps` plain).
+    /// This suits simplex consensus reads, which keep their conversions. Do not pass
+    /// it for duplex consensus reads: their sequence is the molecule's own
+    /// (methylation is in `MM`/`ML`), so they align with a standard aligner.
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<MethylationModeArg>,
 

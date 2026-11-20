@@ -82,8 +82,9 @@ use crate::pipeline::core::{
 use crate::pipeline::steps::align::merge::MergeAlignedStep;
 use crate::pipeline::steps::align::{
     AlignBackend, AlignWired, AlignWiringCtx, ConsumerGoneGuard, InFlightGate, ZipperBatch,
-    in_flight_budget_for_chunk_size, is_primary_for_alignment, merge_aligner_header,
-    no_primary_records_message, split_pair_into_singles, validate_sq_consistency,
+    check_meth_aligner_version, in_flight_budget_for_chunk_size, is_primary_for_alignment,
+    merge_aligner_header, no_primary_records_message, split_pair_into_singles,
+    validate_sq_consistency,
 };
 use crate::pipeline::steps::types::BamTemplateBatch;
 use crate::template::Template;
@@ -163,6 +164,12 @@ pub(crate) struct SubprocessConfig {
     /// fails `Template::from_records`'s "multiple primaries" check, as it did
     /// before the split was recognized.
     pub(crate) accept_mid_pair_split: bool,
+
+    /// Whether the aligner command passes bwa-mem3's `--meth`
+    /// ([`crate::aligner::command_passes_meth`]): the reader thread then
+    /// refuses a bwa-mem3 older than the `--meth` `NM` fix
+    /// ([`check_meth_aligner_version`]).
+    pub(crate) passes_meth: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -618,6 +625,9 @@ fn reader_loop_inner(
     //    would silently point at the wrong contig. Catch it here
     //    rather than emit a corrupt BAM.
     validate_sq_consistency(&cfg.partial_output_header, &aligner_header)?;
+    if cfg.passes_meth {
+        check_meth_aligner_version(&aligner_header)?;
+    }
 
     // 4. Merge aligner header into the partial output header, then
     //    resolve the HeaderHandle so the downstream writer can start.
@@ -1474,6 +1484,7 @@ impl AlignBackend for SubprocessBackend {
                 output_byte_limit: ctx.per_step_byte_limit,
                 in_flight_unmapped_budget: in_flight_budget_for_chunk_size(self.chunk_size),
                 accept_mid_pair_split: self.accept_mid_pair_split,
+                passes_meth: crate::aligner::command_passes_meth(&self.command),
             },
             &self.command,
         )
@@ -1505,6 +1516,7 @@ mod tests {
             output_byte_limit: 1024 * 1024,
             in_flight_unmapped_budget: in_flight_budget_for_chunk_size(150_000_000),
             accept_mid_pair_split: true,
+            passes_meth: false,
         }
     }
 
