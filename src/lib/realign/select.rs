@@ -2489,6 +2489,36 @@ mod tests {
         merged.swap_primary_with_split_piece(true, piece).expect("R1 piece");
     }
 
+    /// A split-piece swap keeps each alignment's own QC-fail flag: when the aligner
+    /// flagged only one of the primary and its piece (kept by `--keep-aligner-qc-fail`),
+    /// the flag moves with that alignment, not with the primary slot, and R2 stays
+    /// clear.
+    #[rstest]
+    fn split_piece_swap_keeps_each_alignment_qc_fail(
+        fx: Fixture,
+        #[values(false, true)] primary_qc_fail: bool,
+    ) {
+        let alns = [aln(1, 51, false, "12M8S", 60), aln(0, 101, false, "12H8M", 30).supp()];
+        let mut records = chimeric_records(Seg::R1, &alns, PIECE_RW_FWD, None);
+        let flagged = &mut records[usize::from(!primary_qc_fail)];
+        flagged.set_flags(flagged.flags() | fgumi_raw_bam::flags::QC_FAIL);
+        records.extend(plain_r2().records(Seg::R2, false));
+        let mut merged = Template::from_records(records).expect("template");
+        merged.fix_mate_info().expect("fix_mate_info");
+        let got = select_primary(&mut merged, &fx.reference, &fx.header, &BwaScoring::default())
+            .expect("select_primary");
+        assert_eq!(got.ends, [Selection::SwappedSupplementary, Selection::Kept]);
+
+        let qc_fail = |record: &RawRecord| record.flags() & fgumi_raw_bam::flags::QC_FAIL != 0;
+        let promoted = merged.r1().expect("r1");
+        let demoted = &merged.records[merged.split_piece_indices(true)[0]];
+        assert_eq!(rec_of(promoted).0, "chr1,101,+,12S8M", "the piece is promoted");
+        assert_eq!(rec_of(demoted).0, "chr2,51,+,12M8H", "the old primary is demoted");
+        assert_eq!(qc_fail(promoted), !primary_qc_fail, "the promoted piece keeps its flag");
+        assert_eq!(qc_fail(demoted), primary_qc_fail, "the demoted primary keeps its flag");
+        assert!(!qc_fail(merged.r2().expect("r2")), "R2 was flagged by no one");
+    }
+
     /// The bisulfite tags of a split-piece swap under `bwa-mem3 mem --meth`:
     /// the promoted piece keeps the `XG`/`YD` bwa computed for its own
     /// placement, and its `XM` only if it has a call for every base of the full

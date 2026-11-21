@@ -797,9 +797,12 @@ impl Template {
     /// read; otherwise R2) and its split piece at index `piece` (one of
     /// [`Self::split_piece_indices`]). The piece's record moves into the primary
     /// slot and becomes the primary: its supplementary/secondary flag is cleared
-    /// and it takes the old primary's other flags, keeping its own strand. The
-    /// old primary's record moves into the piece's slot and takes the piece's
-    /// supplementary or secondary flag, keeping its own strand and other flags.
+    /// and it takes the old primary's other flags, keeping its own strand and
+    /// QC-fail flag. The old primary's record moves into the piece's slot and
+    /// takes the piece's supplementary or secondary flag, keeping its own strand,
+    /// QC-fail flag and other flags. Each alignment keeps its own QC-fail flag
+    /// because it can differ between an end's records (zipper or realign with
+    /// `--keep-aligner-qc-fail`, where the aligner flagged only one alignment).
     /// The index ranges therefore describe the records when this returns. Only
     /// the flags change: SEQ, QUAL, CIGAR and tags are the caller's to adjust.
     ///
@@ -812,7 +815,7 @@ impl Template {
         first: bool,
         piece: usize,
     ) -> Result<()> {
-        use fgumi_raw_bam::flags::{REVERSE, SECONDARY, SUPPLEMENTARY};
+        use fgumi_raw_bam::flags::{QC_FAIL, REVERSE, SECONDARY, SUPPLEMENTARY};
         let primary = if first { self.r1 } else { self.r2 };
         let Some((primary, _)) = primary else {
             bail!("cannot swap a split piece into an end without a primary");
@@ -824,8 +827,11 @@ impl Template {
         let old_flags = self.records[primary].flags();
         let piece_flags = self.records[piece].flags();
         self.records.swap(primary, piece);
-        self.records[primary].set_flags((old_flags & !(kind | REVERSE)) | (piece_flags & REVERSE));
-        self.records[piece].set_flags((old_flags & !kind) | (piece_flags & kind));
+        let own = REVERSE | QC_FAIL;
+        self.records[primary].set_flags((old_flags & !(kind | own)) | (piece_flags & own));
+        self.records[piece].set_flags(
+            (old_flags & !(kind | QC_FAIL)) | (piece_flags & kind) | (old_flags & QC_FAIL),
+        );
         self.cached_umi_position = None;
         Ok(())
     }
@@ -1572,6 +1578,31 @@ mod tests {
         let (p, d) = (t.records[primary].flags(), t.records[piece].flags());
         assert_eq!(p, FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE | raw_flags::PROPER_PAIR);
         assert_eq!(d, FLAG_PAIRED | FLAG_READ1 | kind | raw_flags::PROPER_PAIR);
+        Ok(())
+    }
+
+    /// Each alignment keeps its own QC-fail flag across the swap: when only one of
+    /// the primary and its split piece is QC-fail (an aligner-set flag kept with
+    /// `--keep-aligner-qc-fail`), the flag stays with that alignment rather than
+    /// with the primary slot.
+    #[rstest]
+    fn swap_primary_with_split_piece_keeps_each_qc_fail(
+        #[values(FLAG_SUPPLEMENTARY, FLAG_SECONDARY)] kind: u16,
+        #[values(false, true)] primary_qc_fail: bool,
+    ) -> Result<()> {
+        let mut records = split_read(&[(1, kind, 10), (2, FLAG_SUPPLEMENTARY, 50)]);
+        let qc_record = if primary_qc_fail { 0 } else { 2 };
+        let flags = records[qc_record].flags() | raw_flags::QC_FAIL;
+        records[qc_record].set_flags(flags);
+        let mut t = Template::from_records(records)?;
+        let piece = t.split_piece_indices(true)[0];
+        t.swap_primary_with_split_piece(true, piece)?;
+        assert_ranges_match_flags(&t);
+        let primary = t.r1.expect("r1").0;
+        let qc_fail = |i: usize| t.records[i].flags() & raw_flags::QC_FAIL != 0;
+        assert_eq!(fgumi_raw_bam::pos(&t.records[piece]) + 1, 1, "the old primary is the piece");
+        assert_eq!(qc_fail(piece), primary_qc_fail, "the old primary keeps its QC-fail flag");
+        assert_eq!(qc_fail(primary), !primary_qc_fail, "the promoted piece keeps its QC-fail flag");
         Ok(())
     }
 

@@ -17,7 +17,7 @@
 //!    - Remove specified tags from mapped reads
 //!    - Copy all tags from unmapped to mapped reads
 //!    - Apply reverse/revcomp transformations for negative strand reads
-//!    - Transfer QC pass/fail flags
+//!    - Transfer QC pass/fail flags (optionally keeping a QC-fail the aligner set)
 //! 3. Write merged records to output
 //!
 //! # Tag Manipulation
@@ -92,7 +92,9 @@ grouped, and have the same read name ordering.
 
 The tool transfers tags from the unmapped reads to their corresponding mapped reads. For reads
 mapped to the negative strand, tags can be optionally reversed or reverse-complemented. All
-QC pass/fail flags are also transferred from the unmapped to mapped reads.
+QC pass/fail flags are also transferred from the unmapped to mapped reads, overwriting the
+mapped read's flag as fgbio's ZipperBams does; --keep-aligner-qc-fail keeps a QC-fail flag
+the aligner set.
 
 ## Tag Manipulation
 
@@ -131,6 +133,7 @@ will re-compress anyway.
 "#
 )]
 #[command(verbatim_doc_comment)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Zipper {
     /// Input mapped SAM or BAM file (or `-` for stdin; SAM or BAM is auto-detected).
     /// For streaming pipelines, uncompressed BAM (e.g. `bwa-mem3 mem --bam=0`) is the
@@ -230,6 +233,23 @@ pub struct Zipper {
     #[arg(long = "skip-tc-tags", alias = "skip-pa-tags", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub skip_tc_tags: bool,
 
+    /// Keep a QC-fail flag (0x200) that the aligner set on a mapped record.
+    ///
+    /// By default zipper copies the QC-fail flag from each unmapped read onto its mapped
+    /// records, setting or clearing it, as fgbio's `ZipperBams` does. That clears a QC-fail
+    /// the aligner set whenever the unmapped read passed QC. With this flag, a mapped record
+    /// is QC-fail if the aligner flagged it or its unmapped read was flagged; the flag is
+    /// only ever added, never cleared. Use it with aligners that flag reads as QC-fail, such
+    /// as bwameth.py (suspected chimeras, and `--set-as-failed`) or `bwa-mem3 mem --meth`
+    /// with `--chimera-qc` or `--set-as-failed`: methylation callers such as `MethylDackel`
+    /// skip QC-fail reads by default. Each record keeps its own flag; those aligners already
+    /// flag every record of a template when they flag one. Note that `fgumi group` and
+    /// `fgumi dedup` drop a template whose primary read is QC-fail (counted as not passing
+    /// filter) unless given `--include-non-pf-reads`, so for consensus reads use
+    /// `fgumi realign --keep-aligner-qc-fail` to carry the aligner's flag to the caller.
+    #[arg(long = "keep-aligner-qc-fail", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub keep_aligner_qc_fail: bool,
+
     /// Removed; kept hidden only so that passing it fails with a pointer to the methylation
     /// guide rather than clap's bare "unexpected argument".
     #[arg(long = "restore-unconverted-bases", hide = true, value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
@@ -257,6 +277,7 @@ pub struct Zipper {
 /// [`Zipper::to_zipper_options`]; that path is untouched.
 #[fgumi_cli_macros::multi_options("zipper", "Zipper Options")]
 #[derive(Debug, Clone, Default, clap::Args)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ZipperOptions {
     /// Tags to remove from mapped reads before copying unmapped tags.
     #[arg(long, value_delimiter = ',')]
@@ -292,6 +313,19 @@ pub struct ZipperOptions {
         hide_possible_values = true
     )]
     pub skip_tc_tags: bool,
+    /// Keep a QC-fail flag (0x200) the aligner set on a mapped record, rather than
+    /// overwriting it with the unmapped read's (see `fgumi zipper --keep-aligner-qc-fail`).
+    #[arg(
+        long = "keep-aligner-qc-fail",
+        value_name = "true|false",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide_possible_values = true
+    )]
+    pub keep_aligner_qc_fail: bool,
     /// Removed; kept hidden so that passing it fails with a pointer to the methylation guide
     /// (see `ZipperOptions::merge_rules`).
     #[arg(
@@ -326,6 +360,9 @@ pub(crate) struct ZipperMergeRules {
     pub(crate) tag_info: std::sync::Arc<TagInfo>,
     /// Whether to skip adding `tc` tags to secondary/supplementary records.
     pub(crate) skip_tc_tags: bool,
+    /// Whether a mapped record keeps a QC-fail flag the aligner set (OR with the
+    /// unmapped read's) instead of taking the unmapped read's flag outright.
+    pub(crate) keep_aligner_qc_fail: bool,
 }
 
 impl ZipperOptions {
@@ -357,6 +394,7 @@ impl ZipperOptions {
         Ok(ZipperMergeRules {
             tag_info: std::sync::Arc::new(tag_info),
             skip_tc_tags: self.skip_tc_tags,
+            keep_aligner_qc_fail: self.keep_aligner_qc_fail,
         })
     }
 }
@@ -371,6 +409,7 @@ impl Zipper {
             tags_to_revcomp: self.tags_to_revcomp.clone(),
             exclude_missing_reads: self.exclude_missing_reads,
             skip_tc_tags: self.skip_tc_tags,
+            keep_aligner_qc_fail: self.keep_aligner_qc_fail,
             restore_unconverted_bases: self.restore_unconverted_bases,
         }
     }
@@ -628,6 +667,10 @@ impl ZipperTags {
 /// allocations) on **every** call, so a caller merging many templates should
 /// build the lookups once and reuse them rather than calling this in a loop —
 /// which is exactly what `process_raw` does.
+///
+/// Step 4 always uses the default QC-flag transfer: the unmapped read's flag replaces
+/// the mapped record's, matching fgbio's `ZipperBams`. This wrapper has no option to
+/// keep a QC-fail flag the aligner set.
 pub fn merge_raw(
     unmapped: &Template,
     mapped: &mut Template,
@@ -640,6 +683,7 @@ pub fn merge_raw(
         mapped,
         &ZipperTags::from_tag_info(tag_info),
         skip_tc_tags,
+        false,
         &mut aux_scratch,
     )
 }
@@ -654,11 +698,16 @@ pub fn merge_raw(
 /// step for the step's whole lifetime rather than rebuilding it (three
 /// `TagBitset` allocations) on every call. Returned errors are bare — callers
 /// add their own context at the call site.
+///
+/// With `keep_aligner_qc_fail`, Step 4 ORs the unmapped read's QC-fail flag into each
+/// mapped record's own flag instead of replacing it (see
+/// [`ZipperMergeRules::keep_aligner_qc_fail`]); `false` is fgbio `ZipperBams` parity.
 pub(crate) fn merge_raw_with(
     unmapped: &Template,
     mapped: &mut Template,
     tags: &ZipperTags,
     skip_tc_tags: bool,
+    keep_aligner_qc_fail: bool,
     aux_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     // Step 1: Fix mate info
@@ -742,7 +791,7 @@ pub(crate) fn merge_raw_with(
             let is_qc_fail = (u_flags & fgumi_raw_bam::flags::QC_FAIL) != 0;
             let rr = mapped.records_mut();
             for &i in &mapped_indices {
-                transfer_qc_flag(&mut rr[i], is_qc_fail);
+                transfer_qc_flag(&mut rr[i], is_qc_fail, keep_aligner_qc_fail);
                 // No copyable tags, so the Step-3 rebuild (which folds AS/XS
                 // normalization) is skipped for these records — normalize them
                 // standalone here via the same single-pass helper the Step-5
@@ -822,7 +871,7 @@ pub(crate) fn merge_raw_with(
         let is_qc_fail = (u_flags & fgumi_raw_bam::flags::QC_FAIL) != 0;
         let rr = mapped.records_mut();
         for &i in &mapped_indices {
-            transfer_qc_flag(&mut rr[i], is_qc_fail);
+            transfer_qc_flag(&mut rr[i], is_qc_fail, keep_aligner_qc_fail);
         }
     }
 
@@ -850,9 +899,17 @@ pub(crate) fn merge_raw_with(
     Ok(())
 }
 
-/// Sets or clears the QC-fail flag on a mapped record to match its unmapped
-/// mate (Step 4). Shared by the tag-copy path and the no-tags-to-copy fast path.
-fn transfer_qc_flag(record: &mut RawRecord, is_qc_fail: bool) {
+/// Transfers the QC-fail flag from an unmapped read to one of its mapped records
+/// (Step 4). Shared by the tag-copy path and the no-tags-to-copy fast path.
+///
+/// By default the mapped record takes the unmapped read's flag outright (set or
+/// cleared), matching fgbio's `ZipperBams`. With `keep_aligner_qc_fail`, the flag is
+/// only ever added: a QC-fail the aligner set survives an unmapped read that passed.
+fn transfer_qc_flag(record: &mut RawRecord, is_qc_fail: bool, keep_aligner_qc_fail: bool) {
+    if !is_qc_fail && keep_aligner_qc_fail {
+        // OR with a clear flag: leave the aligner's flag as it is.
+        return;
+    }
     let mut f = RawRecordView::new(record).flags();
     if is_qc_fail {
         f |= fgumi_raw_bam::flags::QC_FAIL;
@@ -1215,6 +1272,7 @@ impl Zipper {
                         mapped_template,
                         tags,
                         rules.skip_tc_tags,
+                        rules.keep_aligner_qc_fail,
                         &mut aux_scratch,
                     )?;
                     for rec in mapped_template.records() {
@@ -1521,6 +1579,9 @@ pub(crate) mod merge_step {
     pub struct ZipperMergeConfig {
         pub tag_info: Arc<TagInfo>,
         pub skip_tc_tags: bool,
+        /// Keep a QC-fail flag the aligner set (see
+        /// [`super::ZipperMergeRules::keep_aligner_qc_fail`]).
+        pub keep_aligner_qc_fail: bool,
         pub exclude_missing_reads: bool,
         /// Unmapped @PG IDs renamed in the output header, so read `PG` tags follow them
         /// (see [`super::program_id_renames`]).
@@ -1719,6 +1780,7 @@ pub(crate) mod merge_step {
                 &mut mapped,
                 &self.tags,
                 self.cfg.skip_tc_tags,
+                self.cfg.keep_aligner_qc_fail,
                 &mut self.aux_scratch,
             )
             .map_err(|e| io::Error::other(format!("ZipperMergeStep: {e}")))?;
@@ -2312,6 +2374,7 @@ pub(crate) mod merge_step {
                             &mut mapped,
                             &self.tags,
                             self.cfg.skip_tc_tags,
+                            self.cfg.keep_aligner_qc_fail,
                             &mut self.aux_scratch,
                         )
                         .map_err(|e| io::Error::other(format!("ZipperMerge: {e}")))?;
@@ -2362,6 +2425,7 @@ pub(crate) mod merge_step {
             ZipperMergeConfig {
                 tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
                 skip_tc_tags: true,
+                keep_aligner_qc_fail: false,
                 exclude_missing_reads: exclude,
                 pg_renames: Arc::default(),
                 missing_count: Arc::new(AtomicU64::new(0)),
@@ -2446,6 +2510,7 @@ pub(crate) mod merge_step {
                     &mut mapped,
                     &step.tags,
                     step.cfg.skip_tc_tags,
+                    step.cfg.keep_aligner_qc_fail,
                     &mut Vec::new(),
                 )
                 .expect("merge ok");
@@ -2504,6 +2569,7 @@ pub(crate) mod merge_step {
                     &mut mapped,
                     &step.tags,
                     step.cfg.skip_tc_tags,
+                    step.cfg.keep_aligner_qc_fail,
                     &mut Vec::new(),
                 )
                 .expect("merge ok");
@@ -2746,6 +2812,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -2793,6 +2860,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -3446,6 +3514,112 @@ mod tests {
         Ok(())
     }
 
+    /// `transfer_qc_flag` over every combination of aligner-set and unmapped-set
+    /// QC-fail. By default the mapped record takes the unmapped read's flag
+    /// outright (fgbio `ZipperBams` parity); with `keep_aligner_qc_fail` the two
+    /// are combined with OR, so only an unmapped read that passed on a record the aligner
+    /// did not flag leaves it clear.
+    #[rstest]
+    #[case::default_neither(false, false, false, false)]
+    #[case::default_aligner_only_is_cleared(false, true, false, false)]
+    #[case::default_unmapped_only(false, false, true, true)]
+    #[case::default_both(false, true, true, true)]
+    #[case::keep_neither(true, false, false, false)]
+    #[case::keep_aligner_only_is_kept(true, true, false, true)]
+    #[case::keep_unmapped_only(true, false, true, true)]
+    #[case::keep_both(true, true, true, true)]
+    fn test_transfer_qc_flag(
+        #[case] keep_aligner_qc_fail: bool,
+        #[case] aligner_qc_fail: bool,
+        #[case] unmapped_qc_fail: bool,
+        #[case] expected: bool,
+    ) {
+        let other_flags = flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE;
+        let mut record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(other_flags | if aligner_qc_fail { flags::QC_FAIL } else { 0 })
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
+        transfer_qc_flag(&mut record, unmapped_qc_fail, keep_aligner_qc_fail);
+        let out = RawRecordView::new(&record).flags();
+        assert_eq!(out & flags::QC_FAIL != 0, expected);
+        assert_eq!(out & !flags::QC_FAIL, other_flags, "no other flag bit may change");
+    }
+
+    /// `merge_raw_with` honours `keep_aligner_qc_fail` on both of its QC-transfer
+    /// paths: the tag-copy path (the unmapped reads carry `RX`) and the
+    /// no-tags-to-copy path. The mapped pair has an aligner-set QC-fail on R1's
+    /// primary only (not on its supplementary); the unmapped R1 passed and the
+    /// unmapped R2 failed. Each record keeps its own aligner flag: the flag is not
+    /// spread to the rest of the template.
+    #[rstest]
+    fn test_merge_keep_aligner_qc_fail(
+        #[values(false, true)] keep_aligner_qc_fail: bool,
+        #[values(false, true)] unmapped_has_tags: bool,
+    ) -> Result<()> {
+        use crate::template::Template;
+
+        let mapped_record = |flag: u16, pos: i32| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flag)
+                .ref_id(0)
+                .pos(pos)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
+        let mut mapped = Template::from_records(vec![
+            mapped_record(flags::FIRST_SEGMENT | flags::QC_FAIL, 99),
+            mapped_record(flags::FIRST_SEGMENT | flags::SUPPLEMENTARY, 4999),
+            mapped_record(flags::LAST_SEGMENT | flags::REVERSE, 199),
+        ])?;
+
+        let unmapped_record = |flag: u16| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(flags::PAIRED | flags::UNMAPPED | flag);
+            if unmapped_has_tags {
+                b.add_string_tag(SamTag::RX, b"AAAA");
+            }
+            b.sequence(b"ACGT").qualities(&[30u8; 4]);
+            b.build()
+        };
+        let unmapped = Template::from_records(vec![
+            unmapped_record(flags::FIRST_SEGMENT),
+            unmapped_record(flags::LAST_SEGMENT | flags::QC_FAIL),
+        ])?;
+
+        let tags = ZipperTags::from_tag_info(&TagInfo::new(vec![], vec![], vec![]));
+        merge_raw_with(&unmapped, &mut mapped, &tags, true, keep_aligner_qc_fail, &mut Vec::new())?;
+
+        let qc_fail = |want: u16, unwanted: u16| {
+            let record = mapped
+                .records()
+                .iter()
+                .find(|r| {
+                    let f = RawRecordView::new(r).flags();
+                    f & want == want && f & unwanted == 0
+                })
+                .expect("record present");
+            RawRecordView::new(record).flags() & flags::QC_FAIL != 0
+        };
+        // R1 primary: aligner-flagged, unmapped passed -> kept only when opted in.
+        assert_eq!(qc_fail(flags::FIRST_SEGMENT, flags::SUPPLEMENTARY), keep_aligner_qc_fail);
+        // R1 supplementary: neither flagged -> clear either way.
+        assert!(!qc_fail(flags::FIRST_SEGMENT | flags::SUPPLEMENTARY, 0));
+        // R2: unmapped failed -> set either way.
+        assert!(qc_fail(flags::LAST_SEGMENT, 0));
+        Ok(())
+    }
+
     /// Tests tag removal, reversal, and reverse complementation on secondary and supplementary alignments
     ///
     /// Verifies that:
@@ -3675,6 +3849,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -3753,6 +3928,7 @@ mod tests {
                 bwa_chunk_size: 150_000_000,
                 exclude_missing_reads: false,
                 skip_tc_tags: false,
+                keep_aligner_qc_fail: false,
                 restore_unconverted_bases: false,
             };
             zipper.execute("test")?;
@@ -3831,6 +4007,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: exclude_missing,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -3973,6 +4150,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
         zipper.execute("fgumi zipper")?;
@@ -4489,6 +4667,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -4579,6 +4758,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             restore_unconverted_bases: false,
         };
 
@@ -6307,6 +6487,22 @@ mod tests {
         );
     }
 
+    /// `--keep-aligner-qc-fail` is a boolish flag: off by default, `true` bare,
+    /// and takes an explicit value; it reaches the merge rules.
+    #[rstest]
+    #[case::absent(&[], false)]
+    #[case::bare(&["--keep-aligner-qc-fail"], true)]
+    #[case::explicit_true(&["--keep-aligner-qc-fail", "true"], true)]
+    #[case::explicit_false(&["--keep-aligner-qc-fail", "false"], false)]
+    fn test_keep_aligner_qc_fail_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let mut argv = vec!["zipper", "-i", "m.bam", "-u", "u.bam", "-r", "r.fa"];
+        argv.extend_from_slice(args);
+        let cmd = Zipper::try_parse_from(argv).expect("parses");
+        assert_eq!(cmd.keep_aligner_qc_fail, expected);
+        let rules = cmd.to_zipper_options().merge_rules().expect("valid rules");
+        assert_eq!(rules.keep_aligner_qc_fail, expected);
+    }
+
     /// The flag is named for the tag it actually controls (`tc`); the former
     /// `--skip-pa-tags` spelling stays accepted as an alias so existing scripts
     /// keep working. Repo precedent for that is the `--queue-memory*` aliases.
@@ -6359,6 +6555,7 @@ mod tests {
             "4242",
             "--exclude-missing-reads=true",
             "--skip-tc-tags=true",
+            "--keep-aligner-qc-fail=true",
         ])
         .expect("failed to parse Zipper arguments");
 
@@ -6369,6 +6566,7 @@ mod tests {
         assert_eq!(opts.tags_to_revcomp, vec!["OX".to_string(), "ZA".to_string()]);
         assert!(opts.exclude_missing_reads);
         assert!(opts.skip_tc_tags);
+        assert!(opts.keep_aligner_qc_fail);
     }
 
     /// The projection must also carry defaults faithfully — a field hard-coded
@@ -6386,6 +6584,7 @@ mod tests {
         assert!(opts.tags_to_revcomp.is_empty());
         assert!(!opts.exclude_missing_reads);
         assert!(!opts.skip_tc_tags);
+        assert!(!opts.keep_aligner_qc_fail);
         assert!(!opts.restore_unconverted_bases);
     }
 
@@ -6609,6 +6808,7 @@ mod tests {
             PrefixedZipper::try_parse_from(["x"]).expect("parses").opts.validate().expect("valid");
         assert_eq!(multi.exclude_missing_reads, base.exclude_missing_reads);
         assert_eq!(multi.skip_tc_tags, base.skip_tc_tags);
+        assert_eq!(multi.keep_aligner_qc_fail, base.keep_aligner_qc_fail);
         assert_eq!(multi.restore_unconverted_bases, base.restore_unconverted_bases);
         assert!(
             multi.tags_to_remove.is_empty()
@@ -6627,6 +6827,13 @@ mod tests {
                 .validate()
                 .expect("valid");
         assert!(multi.exclude_missing_reads);
+
+        let multi = PrefixedZipper::try_parse_from(["x", "--zipper::keep-aligner-qc-fail"])
+            .expect("parses")
+            .opts
+            .validate()
+            .expect("valid");
+        assert!(multi.keep_aligner_qc_fail);
 
         // A value-taking, comma-delimited field round-trips too.
         let multi = PrefixedZipper::try_parse_from(["x", "--zipper::tags-to-remove", "RX,MI"])
@@ -6677,6 +6884,7 @@ mod tests {
         let d = ZipperOptions::default();
         assert_eq!(d.exclude_missing_reads, parsed.exclude_missing_reads);
         assert_eq!(d.skip_tc_tags, parsed.skip_tc_tags);
+        assert_eq!(d.keep_aligner_qc_fail, parsed.keep_aligner_qc_fail);
         assert_eq!(d.restore_unconverted_bases, parsed.restore_unconverted_bases);
     }
 }

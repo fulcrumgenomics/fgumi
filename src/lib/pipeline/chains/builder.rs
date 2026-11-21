@@ -3492,10 +3492,12 @@ impl<'a> ChainBuilder<'a> {
         // The zipper merge every aligned template goes through, run by the
         // backend (the subprocess backend's shared `Parallel` merge step, or the
         // in-process pair/emit step).
-        let ZipperMergeRules { tag_info, skip_tc_tags } = self.fused_merge_rules()?;
+        let ZipperMergeRules { tag_info, skip_tc_tags, keep_aligner_qc_fail } =
+            self.fused_merge_rules()?;
         let merge_config = std::sync::Arc::new(MergeConfig {
             tag_info,
             skip_tc_tags,
+            keep_aligner_qc_fail,
             lone_mates: false,
             records_emitted: std::sync::Arc::clone(&records_emitted),
             output_byte_limit: self.tuning.per_step_byte_limit,
@@ -3764,6 +3766,7 @@ impl<'a> ChainBuilder<'a> {
         let merge_config = Arc::new(MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], consensus(), consensus())),
             skip_tc_tags: false,
+            keep_aligner_qc_fail: realign_opts.keep_aligner_qc_fail,
             lone_mates: true,
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: self.tuning.per_step_byte_limit,
@@ -8656,6 +8659,7 @@ mod tests {
             xa_max_hits: None,
             xa_max_hits_option: "--xa-max-hits",
             in_memory_reference: false,
+            keep_aligner_qc_fail: false,
         });
         crate::pipeline::chains::validate::validate_stage_progression(&spec)
             .expect("a chain runall builds");

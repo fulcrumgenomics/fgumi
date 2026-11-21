@@ -76,11 +76,13 @@ pub(crate) fn build_zipper_merge_config(
     let ZipperMergeCaptures { zipper_opts, pg_renames, tuning, missing_count, records_emitted } =
         caps;
 
-    let ZipperMergeRules { tag_info, skip_tc_tags } = zipper_opts.merge_rules()?;
+    let ZipperMergeRules { tag_info, skip_tc_tags, keep_aligner_qc_fail } =
+        zipper_opts.merge_rules()?;
 
     let cfg = merge_step::ZipperMergeConfig {
         tag_info,
         skip_tc_tags,
+        keep_aligner_qc_fail,
         exclude_missing_reads: zipper_opts.exclude_missing_reads,
         pg_renames,
         missing_count,

@@ -278,6 +278,17 @@ pub struct Realign {
     #[arg(long = "in-memory-reference", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub in_memory_reference: bool,
 
+    /// Keep a QC-fail flag (0x200) that the aligner set on a re-aligned record.
+    /// By default each record takes its consensus read's QC-fail flag, set or
+    /// cleared, as `fgumi zipper` does; that clears a QC-fail the aligner set, such
+    /// as `bwa-mem3 mem --meth` with `--chimera-qc` or `--set-as-failed`. With this
+    /// flag a record is QC-fail if the aligner flagged it or its consensus read was
+    /// flagged. The aligner's QC-fail stays on a record even when realign promotes an
+    /// `XA` alternative onto it, since the aligner set the flag for its original
+    /// placement. See `fgumi zipper --keep-aligner-qc-fail`.
+    #[arg(long = "keep-aligner-qc-fail", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub keep_aligner_qc_fail: bool,
+
     /// Threading options for the parallel pipeline.
     #[command(flatten)]
     pub threading: ThreadingOptions,
@@ -310,6 +321,10 @@ pub struct RealignOptions {
     /// through its `.fai` index (`--in-memory-reference` /
     /// `--realign::in-memory-reference`).
     pub in_memory_reference: bool,
+    /// Keep a QC-fail flag the aligner set on a re-aligned record instead of
+    /// overwriting it with the consensus read's (`--keep-aligner-qc-fail` /
+    /// `--realign::keep-aligner-qc-fail`).
+    pub keep_aligner_qc_fail: bool,
 }
 
 impl Realign {
@@ -330,6 +345,7 @@ impl Realign {
             xa_max_hits: self.xa_max_hits,
             xa_max_hits_option: "--xa-max-hits",
             in_memory_reference: self.in_memory_reference,
+            keep_aligner_qc_fail: self.keep_aligner_qc_fail,
         })
     }
 
