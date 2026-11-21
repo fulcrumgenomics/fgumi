@@ -188,10 +188,13 @@ nix = { workspace = true }
 # In-process bwa-mem3 aligner backend (feature `aligner-bwa-mem3`). Gated on the
 # only two architectures whose vendored C++ SIMD tiers build (`x86_64`/`aarch64`);
 # enabling the feature elsewhere hits a `compile_error!` in
-# `pipeline::steps::align`. 0.3.0 is the first
-# release with the three-phase (`seed_extend` / `infer_cohort` / `pair_emit`) API.
+# `pipeline::steps::align`. 0.6.1 is the floor: it vendors bwa-mem3 v0.18.0,
+# whose commit `.github/workflows/check.yml` pins in its e2e-parity job and whose
+# release it pins as the conda `bwa-mem3=` version (bump all three together),
+# and its `MemOpts::apply_meth_defaults` returns the `Result` that the in-process
+# `build_opts` propagates.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-bwa-mem3-rs = { version = "0.4.4", optional = true }
+bwa-mem3-rs = { version = "0.6.1", optional = true }
 
 [features]
 default = ["consensus"]

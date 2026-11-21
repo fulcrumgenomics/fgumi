@@ -680,18 +680,35 @@ mod tests {
         ResolvedBackend::Subprocess { command: command.to_string(), accept_mid_pair_split: true }
     }
 
-    /// A subprocess preset scores with bwa-mem3's defaults (`--meth`'s under
-    /// EM-seq); `--aligner::command` with the scoring options it passes.
+    /// The command the subprocess `bwa-mem3` preset builds for `methylation`.
+    fn preset_command(methylation: fgumi_consensus::MethylationMode) -> String {
+        crate::aligner::AlignerPreset::BwaMem3.build_command(
+            std::path::Path::new("ref.fa"),
+            4,
+            150_000_000,
+            None,
+            methylation,
+        )
+    }
+
+    /// The subprocess preset scores with bwa-mem3's defaults: under EM-seq its
+    /// `--meth --meth-scoring genomic` keeps `-B 4`.
     #[rstest::rstest]
-    #[case::preset(
-        "bwa-mem3 mem -t 4 -p -K 150000000 -Y ref.fa /dev/stdin -h 5,200",
-        true,
-        BwaScoring::default()
-    )]
-    #[case::preset_meth(
+    #[case::plain(fgumi_consensus::MethylationMode::Disabled)]
+    #[case::taps(fgumi_consensus::MethylationMode::Taps)]
+    #[case::emseq(fgumi_consensus::MethylationMode::EmSeq)]
+    fn bwa_scoring_for_subprocess_preset(#[case] methylation: fgumi_consensus::MethylationMode) {
+        let backend = subprocess(&preset_command(methylation));
+        assert_eq!(bwa_scoring_for(&resolved(backend, true)).unwrap(), BwaScoring::default());
+    }
+
+    /// `--aligner::command` scores with the scoring options it passes; a bare
+    /// `--meth` is read as bwa-mem3 0.17.0+'s genomic scoring.
+    #[rstest::rstest]
+    #[case::command_bare_meth(
         "bwa-mem3 mem --meth -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
-        true,
-        BwaScoring { b: 2, ..BwaScoring::default() }
+        false,
+        BwaScoring::default()
     )]
     #[case::command_defaults("bwa mem -p ref.fa /dev/stdin", false, BwaScoring::default())]
     #[case::command_options(
@@ -717,28 +734,47 @@ mod tests {
         assert_eq!(bwa_scoring_for(&resolved(subprocess(command), preset)).unwrap(), expected);
     }
 
-    /// The in-process backend scores with its own `MemOpts`, which under EM-seq
-    /// matches what the subprocess preset's `--meth` gives.
+    /// The in-process backend for `methylation`.
     #[cfg(feature = "aligner-bwa-mem3")]
-    #[rstest::rstest]
-    #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
-    #[case::taps(fgumi_consensus::MethylationMode::Taps, BwaScoring::default())]
-    #[case::emseq(
-        fgumi_consensus::MethylationMode::EmSeq,
-        BwaScoring { b: 2, ..BwaScoring::default() }
-    )]
-    fn bwa_scoring_for_inproc(
-        #[case] methylation: fgumi_consensus::MethylationMode,
-        #[case] expected: BwaScoring,
-    ) {
-        let backend = ResolvedBackend::InProcessBwaMem3 {
+    fn inproc_backend(methylation: fgumi_consensus::MethylationMode) -> ResolvedBackend {
+        ResolvedBackend::InProcessBwaMem3 {
             reference: std::path::PathBuf::from("ref.fa"),
             sub_batch_templates: 1,
             dedup_reads: true,
             methylation,
             xa_max_hits: None,
-        };
+        }
+    }
+
+    /// The in-process backend scores with its own `MemOpts`.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[rstest::rstest]
+    #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
+    #[case::taps(fgumi_consensus::MethylationMode::Taps, BwaScoring::default())]
+    #[case::emseq(fgumi_consensus::MethylationMode::EmSeq, BwaScoring::default())]
+    fn bwa_scoring_for_inproc(
+        #[case] methylation: fgumi_consensus::MethylationMode,
+        #[case] expected: BwaScoring,
+    ) {
+        let backend = inproc_backend(methylation);
         assert_eq!(bwa_scoring_for(&resolved(backend, true)).unwrap(), expected);
+    }
+
+    /// The subprocess preset's command (from
+    /// [`bwa_mem3_meth_flags`](crate::aligner::bwa_mem3_meth_flags)) and the
+    /// in-process `MemOpts` give realign the same scoring for every chemistry,
+    /// so changing the scoring on one side alone fails here.
+    #[cfg(feature = "aligner-bwa-mem3")]
+    #[rstest::rstest]
+    #[case::plain(fgumi_consensus::MethylationMode::Disabled)]
+    #[case::taps(fgumi_consensus::MethylationMode::Taps)]
+    #[case::emseq(fgumi_consensus::MethylationMode::EmSeq)]
+    fn subprocess_preset_and_inproc_score_alike(
+        #[case] methylation: fgumi_consensus::MethylationMode,
+    ) {
+        let preset = bwa_scoring_for(&resolved(subprocess(&preset_command(methylation)), true));
+        let inproc = bwa_scoring_for(&resolved(inproc_backend(methylation), true));
+        assert_eq!(preset.unwrap(), inproc.unwrap());
     }
 
     /// The second stage asking for the same index shares the first's `Arc`;

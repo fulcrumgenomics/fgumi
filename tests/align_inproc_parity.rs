@@ -30,8 +30,8 @@
 //! ## Version-parity is only defined against the vendored commit
 //!
 //! Byte-parity is defined ONLY against a `bwa-mem3` CLI built from the SAME
-//! commit the in-process backend links (the vendored v0.15.0 `7754ecce…`, via
-//! `bwa-mem3-rs` 0.4.4). A *different* CLI version — e.g. the pixi
+//! commit the in-process backend links (the vendored v0.18.0 `e0903cb9…`, via
+//! `bwa-mem3-rs` 0.6.1). A *different* CLI version — e.g. the pixi
 //! `bwa-mem3` a dev box happens to carry — will show spurious divergence, so
 //! this test must never be pointed at an arbitrary PATH binary and trusted. The
 //! reference binary is supplied by the CI e2e-parity job, which builds it from
@@ -567,7 +567,9 @@ fn inproc_is_thread_invariant(
 
 impl Case {
     /// [`Case::new`] over directional EM-seq reads, with the
-    /// `bwa-mem3 index --meth` dual index built beside the fixture's plain one.
+    /// `bwa-mem3 index --meth` dual index built beside the fixture's plain one
+    /// (`--force`: bwa-mem3 0.18.0+ will not otherwise replace the plain index
+    /// the fixture already built).
     ///
     /// Each read is converted in its own orientation, as a directional library
     /// is: R1 (and a single-end read) C→T, R2 G→A, at every cytosine outside a
@@ -576,7 +578,7 @@ impl Case {
         let dir = TempDir::new().expect("create temp dir");
         let fixture = write_fixture_reference(dir.path(), bin);
         let status = Command::new(bin)
-            .args(["index", "--meth"])
+            .args(["index", "--meth", "--force"])
             .arg(&fixture.fasta)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
