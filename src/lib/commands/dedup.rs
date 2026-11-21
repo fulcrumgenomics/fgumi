@@ -31,8 +31,7 @@ use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
 use crate::template::Template;
 use crate::template_filter::{
-    TemplateFilterConfig, filter_template, template_has_malformed_record,
-    template_is_fully_unmapped,
+    TemplateFilterConfig, check_template, template_has_malformed_record, template_is_fully_unmapped,
 };
 use crate::umi::assign_umis;
 use ahash::AHashMap;
@@ -91,7 +90,13 @@ pub struct DedupCounts {
     /// Per-reason counts from the template filter
     pub filter_counts: TemplateFilterCounts,
     /// Templates emitted untouched by `--include-unmapped` (bypass the filter)
-    pub passthrough_templates: u64,
+    pub passthrough_unmapped: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` for a missing UMI tag
+    pub passthrough_missing_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` for an N in the UMI
+    pub passthrough_ns_in_umi: u64,
+    /// Templates emitted untouched by `--include-invalid-umis` for a too-short UMI
+    pub passthrough_umi_too_short: u64,
     /// Mapped primary reads whose mate is also mapped, i.e. one half of a mapped
     /// pair. Accumulated in read (pair-half) units — a mapped pair's two primary
     /// reads are each counted here — and halved to `mapped_pairs`
@@ -126,7 +131,10 @@ impl DedupCounts {
         self.supplementary_reads += other.supplementary_reads;
         self.missing_tc_tag += other.missing_tc_tag;
         self.filter_counts.merge(&other.filter_counts);
-        self.passthrough_templates += other.passthrough_templates;
+        self.passthrough_unmapped += other.passthrough_unmapped;
+        self.passthrough_missing_umi += other.passthrough_missing_umi;
+        self.passthrough_ns_in_umi += other.passthrough_ns_in_umi;
+        self.passthrough_umi_too_short += other.passthrough_umi_too_short;
         self.mapped_pair_reads += other.mapped_pair_reads;
         self.duplicate_pair_reads += other.duplicate_pair_reads;
         self.mapped_orphans += other.mapped_orphans;
@@ -134,6 +142,37 @@ impl DedupCounts {
         self.unmapped_pairs += other.unmapped_pairs;
         self.unmapped_orphans += other.unmapped_orphans;
         self.unmated_templates += other.unmated_templates;
+    }
+
+    /// Templates emitted untouched by `--include-unmapped` or `--include-invalid-umis`,
+    /// for any reason. Derived from the per-reason counts so the total cannot drift.
+    #[must_use]
+    pub fn passthrough_templates(&self) -> u64 {
+        self.passthrough_unmapped
+            + self.passthrough_missing_umi
+            + self.passthrough_ns_in_umi
+            + self.passthrough_umi_too_short
+    }
+
+    /// Counts one pass-through template under the filter `reason` it bypassed.
+    ///
+    /// Only the reasons a pass-through flag can route are valid: `Unmapped`
+    /// (`--include-unmapped`) and the three UMI reasons (`--include-invalid-umis`).
+    fn record_passthrough(&mut self, reason: TemplateFilterReason) {
+        use TemplateFilterReason as Reason;
+        match reason {
+            Reason::Unmapped => self.passthrough_unmapped += 1,
+            Reason::MissingUmi => self.passthrough_missing_umi += 1,
+            Reason::NsInUmi => self.passthrough_ns_in_umi += 1,
+            Reason::UmiTooShort => self.passthrough_umi_too_short += 1,
+            Reason::MalformedRecord
+            | Reason::NoPrimaryReads
+            | Reason::NotPassingFilter
+            | Reason::LowMappingQuality
+            | Reason::LowMateMappingQuality => {
+                unreachable!("no pass-through flag routes templates rejected for {reason:?}")
+            }
+        }
     }
 
     /// Calculate duplicate rate.
@@ -177,7 +216,10 @@ fn to_deduplication_metrics(
         filtered_missing_umi: filter.rejected_templates(Reason::MissingUmi),
         filtered_ns_in_umi: filter.rejected_templates(Reason::NsInUmi),
         filtered_umi_too_short: filter.rejected_templates(Reason::UmiTooShort),
-        passthrough_templates: counts.passthrough_templates,
+        passthrough_unmapped: counts.passthrough_unmapped,
+        passthrough_missing_umi: counts.passthrough_missing_umi,
+        passthrough_ns_in_umi: counts.passthrough_ns_in_umi,
+        passthrough_umi_too_short: counts.passthrough_umi_too_short,
         total_templates: counts.total_templates,
         unique_templates: counts.unique_templates,
         duplicate_templates: counts.duplicate_templates,
@@ -519,6 +561,94 @@ fn template_is_unmapped_passthrough(template: &Template) -> bool {
     !template_has_malformed_record(template) && template_is_fully_unmapped(template)
 }
 
+/// How [`process_position_group`] routes one candidate template (one not already split
+/// off by `--include-unmapped`), decided by a single [`check_template`] pass against the
+/// configured filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateRoute {
+    /// Passed the filter, carrying its primary-read count: UMI-assign and deduplicate it.
+    Accepted(u64),
+    /// Rejected only for this UMI reason and `--include-invalid-umis` is set: emit it
+    /// untouched and count it under this reason's `passthrough_*` column.
+    InvalidUmiPassthrough(TemplateFilterReason),
+    /// Rejected for this reason, carrying its primary-read count: drop it and count it
+    /// under the reason's `filtered_*` column.
+    Rejected(TemplateFilterReason, u64),
+}
+
+/// Routes one candidate template (see [`CandidateRoute`]) without recording anything; the
+/// caller records the outcome.
+///
+/// The configured filter runs once. A template it accepts or rejects for a non-UMI reason
+/// is settled by that pass. A template it rejects for a UMI reason — the UMI tag is missing
+/// ([`TemplateFilterReason::MissingUmi`]), contains an N
+/// ([`TemplateFilterReason::NsInUmi`]), or is shorter than `--min-umi-length`
+/// ([`TemplateFilterReason::UmiTooShort`]) — is passed through only when
+/// `relaxed_config` is given (i.e. `--include-invalid-umis` is set; it is the configured
+/// filter with the UMI checks switched off) and also accepts it, so a template that fails
+/// any other check as well (unmapped, QC-fail, below `--min-map-q`, ...) is still dropped
+/// under the configured filter's reason. The routed reason is the one the configured
+/// filter rejected for, which is the first failing check: when both mates have a bad UMI,
+/// or one mate a bad UMI and the other a non-UMI failure, that can be the UMI reason.
+///
+/// Fails closed: only the three UMI reasons can ever route to a pass-through. Comparing
+/// the two passes' verdicts alone is not enough, because `no_umi` also changes which `MQ`
+/// value the aux scan reports when a record carries the tag twice, so the relaxed pass can
+/// accept a template the configured pass rejected for its mate mapping quality.
+fn route_candidate(
+    template: &Template,
+    filter_config: &TemplateFilterConfig,
+    relaxed_config: Option<&TemplateFilterConfig>,
+) -> CandidateRoute {
+    use TemplateFilterReason as Reason;
+    let (reason, primary_reads) = match check_template(template, filter_config) {
+        Ok(primary_reads) => return CandidateRoute::Accepted(primary_reads),
+        Err(rejection) => rejection,
+    };
+    let is_umi_reason =
+        matches!(reason, Reason::MissingUmi | Reason::NsInUmi | Reason::UmiTooShort);
+    if is_umi_reason
+        && relaxed_config.is_some_and(|relaxed| check_template(template, relaxed).is_ok())
+    {
+        CandidateRoute::InvalidUmiPassthrough(reason)
+    } else {
+        CandidateRoute::Rejected(reason, primary_reads)
+    }
+}
+
+/// Resets the dedup state a pass-through template may carry from the input, so that what
+/// is written matches what is counted.
+///
+/// Clears the duplicate flag (0x400) on every record, as the deduplicated templates have
+/// theirs cleared before re-marking and as Picard `MarkDuplicates` does for every read: a
+/// stale flag would otherwise get the template dropped under `--remove-duplicates` while
+/// the metrics count it as unique output. Also removes any `MI` tag (the assign tag, which
+/// the serialize step writes only for templates with an assigned molecule ID), so a
+/// pass-through is never MI-tagged.
+fn reset_passthrough_template(template: &mut Template) {
+    for raw in template.records_mut() {
+        let flg = RawRecordView::new(raw.as_ref()).flags();
+        fgumi_raw_bam::set_flags(raw, flg & !DUPLICATE_FLAG);
+        fgumi_raw_bam::remove_tag(raw.as_mut_vec(), SamTag::MI);
+    }
+}
+
+/// Which templates `dedup` emits untouched instead of filtering them.
+///
+/// Pass-through templates bypass the filter, UMI assignment and duplicate marking: they are
+/// written with their duplicate flag cleared and any `MI` tag removed but otherwise
+/// verbatim (see [`reset_passthrough_template`]), kept under `--remove-duplicates`, and
+/// counted in `passthrough_templates` plus the `passthrough_*` column for the filter reason
+/// they bypassed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DedupPassthrough {
+    /// `--include-unmapped`: templates with no mapped primary read.
+    pub include_unmapped: bool,
+    /// `--include-invalid-umis`: templates rejected only for a missing, N-containing,
+    /// or too-short UMI (see [`route_candidate`]).
+    pub include_invalid_umis: bool,
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // UMI assignment (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
@@ -548,6 +678,30 @@ fn count_record(raw: &RawRecord, tc_tag_bytes: [u8; 2], counts: &mut DedupCounts
         if fgumi_raw_bam::find_tag_type(aux, tc_tag_bytes).is_none() {
             counts.missing_tc_tag += 1;
         }
+    }
+}
+
+/// Count one pass-through template (`--include-unmapped` or `--include-invalid-umis`) into
+/// `counts` as unique output, so the record totals match what is written, and under the
+/// filter `reason` it bypassed (see [`DedupCounts::record_passthrough`]).
+///
+/// Every record goes through [`count_record`], `tc` check included: the pass-through
+/// predicates inspect only the primary r1/r2, so a template routed here can still carry
+/// secondary/supplementary records, and if those were counted but not checked a
+/// pass-through flag would be a way to slip a `tc`-less non-primary read past the hard
+/// failure on missing `tc` tags.
+fn count_passthrough_template(
+    template: &Template,
+    reason: TemplateFilterReason,
+    tc_tag_bytes: [u8; 2],
+    counts: &mut DedupCounts,
+) {
+    counts.record_passthrough(reason);
+    counts.total_templates += 1;
+    counts.unique_templates += 1;
+    count_template_pair_orphan(template, counts);
+    for raw in template.records() {
+        count_record(raw, tc_tag_bytes, counts);
     }
 }
 
@@ -889,7 +1043,7 @@ pub(crate) fn process_position_group(
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
-    include_unmapped: bool,
+    passthrough: DedupPassthrough,
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
@@ -904,23 +1058,46 @@ pub(crate) fn process_position_group(
     // bypass filtering and deduplication entirely and are emitted untouched. They carry
     // no coordinate, so passing them through leaves the dedup result unchanged while
     // preserving a complete record set (mirrors Picard MarkDuplicates).
-    let (passthrough_templates, candidate_templates): (Vec<Template>, Vec<Template>) =
-        if include_unmapped {
+    let (mut unmapped_templates, candidate_templates): (Vec<Template>, Vec<Template>) =
+        if passthrough.include_unmapped {
             all_templates.into_iter().partition(template_is_unmapped_passthrough)
         } else {
             (Vec::new(), all_templates)
         };
 
-    // Filter templates
+    // Filter the remaining templates, routing each with one filter pass. When
+    // --include-invalid-umis is set, a template the filter rejects only for a UMI reason
+    // (missing, N-containing, or too short) is split off as a pass-through, keeping the UMI
+    // reason it bypassed for its per-reason metrics column; it is recorded in no
+    // `filter_counts` bucket. This runs after the unmapped split, so a no-mapped-read
+    // template is routed by --include-unmapped alone.
+    let relaxed_config = passthrough
+        .include_invalid_umis
+        .then(|| TemplateFilterConfig { no_umi: true, ..filter_config.clone() });
     let mut filter_counts = TemplateFilterCounts::new();
-    let filtered_templates: Vec<Template> = candidate_templates
-        .into_iter()
-        .filter(|t| filter_template(t, filter_config, &mut filter_counts))
-        .collect();
+    let mut invalid_umi_templates: Vec<(Template, TemplateFilterReason)> = Vec::new();
+    let mut filtered_templates: Vec<Template> = Vec::with_capacity(candidate_templates.len());
+    for template in candidate_templates {
+        match route_candidate(&template, filter_config, relaxed_config.as_ref()) {
+            CandidateRoute::Accepted(primary_reads) => {
+                filter_counts.record_accepted(primary_reads);
+                filtered_templates.push(template);
+            }
+            CandidateRoute::InvalidUmiPassthrough(reason) => {
+                invalid_umi_templates.push((template, reason));
+            }
+            CandidateRoute::Rejected(reason, primary_reads) => {
+                filter_counts.record_rejected(reason, primary_reads);
+            }
+        }
+    }
 
     dedup_counts.filter_counts = filter_counts;
 
-    if filtered_templates.is_empty() && passthrough_templates.is_empty() {
+    if filtered_templates.is_empty()
+        && unmapped_templates.is_empty()
+        && invalid_umi_templates.is_empty()
+    {
         return Ok(ProcessedDedupGroup {
             templates: Vec::new(),
             family_sizes: AHashMap::with_hasher(crate::hashing::deterministic_state()),
@@ -1015,26 +1192,30 @@ pub(crate) fn process_position_group(
 
     // Emit --include-unmapped pass-through templates untouched. They were never
     // filtered, marked, or MI-assigned, so their `MoleculeId` stays `None` and the
-    // serialize step writes them verbatim (no MI tag, duplicate flag left as in the
-    // input). Count them as unique output so the record totals match what is written.
-    for template in &passthrough_templates {
+    // serialize step writes them verbatim apart from the reset below (duplicate flag
+    // cleared, any stale MI tag removed). Count them as unique output so the record
+    // totals match what is written. The reset must run before counting, which reads
+    // each record's duplicate flag.
+    for template in &mut unmapped_templates {
+        reset_passthrough_template(template);
         // Counted separately from `filter_counts`: these templates were split off
         // before the filter ran, so they appear in no rejection bucket and in no
         // accepted count. Without this they would be invisible in the accounting.
-        dedup_counts.passthrough_templates += 1;
-        dedup_counts.total_templates += 1;
-        dedup_counts.unique_templates += 1;
-        count_template_pair_orphan(template, &mut dedup_counts);
-        for raw in template.records() {
-            // Same accounting as the filtered templates above, `tc` check included.
-            // `template_is_unmapped_passthrough` only inspects the primary r1/r2, so a
-            // template routed here can still carry secondary/supplementary records; if
-            // they were counted but not checked, --include-unmapped would be a way to
-            // slip a `tc`-less non-primary read past the hard failure below.
-            count_record(raw, tc_tag_bytes, &mut dedup_counts);
-        }
+        count_passthrough_template(
+            template,
+            TemplateFilterReason::Unmapped,
+            tc_tag_bytes,
+            &mut dedup_counts,
+        );
     }
-    templates.extend(passthrough_templates);
+    // --include-invalid-umis pass-throughs: same emission, reset and accounting as the
+    // --include-unmapped ones above, each under the UMI reason it bypassed.
+    for (template, reason) in &mut invalid_umi_templates {
+        reset_passthrough_template(template);
+        count_passthrough_template(template, *reason, tc_tag_bytes, &mut dedup_counts);
+    }
+    templates.extend(unmapped_templates);
+    templates.extend(invalid_umi_templates.into_iter().map(|(template, _)| template));
 
     dedup_counts.unique_reads = dedup_counts.total_reads - dedup_counts.duplicate_reads;
 
@@ -1095,8 +1276,9 @@ not pass the criteria below are dropped entirely and never reach the output, so 
 record count can be lower than the input. This matches fgbio, which applies exactly these
 filters before grouping regardless of whether `--mark-duplicates` is set. It does, however,
 differ from Picard `MarkDuplicates`, which passes every record through and only sets the
-duplicate flag — so `fgumi dedup` is NOT a Picard record-count drop-in. A template is
-discarded (not marked) when:
+duplicate flag — so by default `fgumi dedup` is NOT a Picard record-count drop-in (see
+"Complete record set" below for the flags that make it one). A template is discarded (not
+marked) when:
 
 - Both mates are unmapped (a template with no mapped read), unless --include-unmapped is
   given, in which case such templates are emitted untouched instead of discarded.
@@ -1105,28 +1287,63 @@ discarded (not marked) when:
 - A mapped read has mapping quality below -q/--min-map-q (default 0, i.e. no reads are
   dropped for mapping quality unless a threshold is set).
 - The mate mapping quality (MQ tag) is below -q/--min-map-q, when the mate is mapped.
-- The UMI contains an N or n base (unless --no-umi is given).
-- The UMI is shorter than -l/--min-umi-length, when that option is set.
-- The RX UMI tag is missing (unless --no-umi is given).
+- The UMI contains an N or n base (unless --no-umi or --include-invalid-umis is given).
+- The UMI is shorter than -l/--min-umi-length, when that option is set (unless
+  --include-invalid-umis is given).
+- The RX UMI tag is missing (unless --no-umi or --include-invalid-umis is given).
 - A record is truncated/corrupt (shorter than the minimum BAM record length).
 
 To retain as many templates as possible, leave -q/--min-map-q at its default of 0, do not
 set -l/--min-umi-length, pass -n/--include-non-pf-reads to keep QC-fail reads, add
---include-unmapped to emit no-mapped-read templates untouched, and, when the input has no
-usable UMIs, use --no-umi to bypass the UMI checks entirely. Unlike fgbio, --include-unmapped
-lets you keep no-mapped-read templates; only truncated/corrupt records are always discarded.
-Pass-through templates are written verbatim: never marked, never MI-tagged, and counted as
-unique in the metrics.
+--include-unmapped to emit no-mapped-read templates untouched, add --include-invalid-umis to
+emit templates with a missing, N-containing, or too-short UMI untouched, and, when the input
+has no usable UMIs, use --no-umi to bypass the UMI checks entirely. Unlike fgbio,
+--include-unmapped and --include-invalid-umis let you keep those templates; only
+truncated/corrupt records and templates with no primary read are always discarded.
+Pass-through templates are written as read except that any input duplicate flag (0x400) is
+cleared and any MI tag removed: they are never marked, never MI-tagged, kept under
+--remove-duplicates, and counted as unique in the metrics.
+
+# Complete record set (Picard MarkDuplicates drop-in)
+
+Pipelines that use `fgumi dedup` in place of Picard `MarkDuplicates` usually expect every
+input record in the output. Pass -n/--include-non-pf-reads, --include-unmapped and
+--include-invalid-umis (and leave -q/--min-map-q at 0) to get there: QC-fail reads are then
+deduplicated like any other, while templates with no mapped read or no usable UMI cannot be
+grouped and are passed through unmarked rather than silently dropped. What is still dropped
+is input no tool should pass on: templates with no primary read and truncated/corrupt records.
+One more case remains even at -q 0: a negative mate mapping quality (e.g. `MQ:i:-1`) is
+below any threshold, so such a template is still rejected as low mate mapping quality.
+
+--include-invalid-umis covers the three UMI reasons together — a missing RX tag, an N in the
+UMI, and a UMI shorter than -l/--min-umi-length — because they share a single consequence:
+the template has no UMI that can be grouped on, so it cannot join a UMI family and has no
+duplicate status to mark. It only applies to templates that would be dropped *solely* for
+a UMI reason; a template that also fails another filter (mapping quality, QC-fail, unmapped,
+truncated) is still dropped, and counted under whichever rejection the filter reaches first,
+which may be the UMI reason (e.g. R1 has a bad UMI and R2 a low mate mapping quality). It has
+no effect with --no-umi, which never checks the UMI.
 
 The count of templates dropped for each reason is reported in the metrics output
 (--metrics), one `filtered_*` column per reason above, plus `filtered_templates` for the
-total and `passthrough_templates` for the --include-unmapped templates that bypass the
-filter. These count *templates*; the `discarded_*` columns of `fgumi group`'s metrics count
-primary records, so the two files are not directly comparable. Templates read from the input
-are `filtered_templates + total_templates` — note that `total_templates` counts the templates
+total, `passthrough_templates` for the templates --include-unmapped and --include-invalid-umis
+emit untouched, and one `passthrough_*` column per reason those templates bypassed
+(`passthrough_unmapped`, `passthrough_missing_umi`, `passthrough_ns_in_umi`,
+`passthrough_umi_too_short`, which sum to `passthrough_templates` and come last in the
+row). These count
+*templates*; the `discarded_*` columns of `fgumi group`'s metrics count primary records, so
+the two files are not directly comparable. Templates read from the input are
+`filtered_templates + total_templates` — note that `total_templates` counts the templates
 that *passed the filter*, not the templates read, and not the templates written either: under
 --remove-duplicates the duplicates are dropped at write time, after they have been counted.
 A per-reason summary is also logged, so the drops are visible even without --metrics.
+
+Pass-through templates count as unique (non-duplicate) templates and reads, and their primary
+reads enter the Picard-style pair/orphan columns like any other: a mapped --include-invalid-umis
+pass-through adds to `mapped_pairs` or `mapped_orphans` (Picard READ_PAIRS_EXAMINED /
+UNPAIRED_READS_EXAMINED) as a non-duplicate, so it lowers `percent_duplication` and changes
+`estimated_library_size`, as Picard does for every mapped read it examines. Unmapped
+pass-throughs land in `unmapped_pairs`/`unmapped_orphans` and do not affect either.
 
 For the templates that remain, representative selection (the duplicate score), the 0x400
 flag, and --remove-duplicates follow Picard `MarkDuplicates` semantics; the grouping key does
@@ -1186,8 +1403,8 @@ pathological high-coverage position group is still processed whole.
 "#
 )]
 // Each bool is an independent CLI toggle (--remove-duplicates, --include-non-pf-reads,
-// --no-umi, --include-unmapped); a state machine or enum would obscure, not clarify, the
-// flat argument surface clap expects.
+// --no-umi, --include-unmapped, --include-invalid-umis); a state machine or enum would
+// obscure, not clarify, the flat argument surface clap expects.
 #[allow(clippy::struct_excessive_bools)]
 pub struct MarkDuplicates {
     /// Input and output BAM files
@@ -1255,6 +1472,15 @@ pub struct MarkDuplicates {
     /// `MarkDuplicates`). Truncated/corrupt records are still dropped.
     #[arg(long = "include-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub include_unmapped: bool,
+
+    /// Emit templates whose UMI is missing (no RX tag), contains an N, or is shorter than
+    /// `--min-umi-length` untouched instead of discarding them. Such templates have no
+    /// usable UMI to group on; passing them through (never marked, never MI-tagged, kept
+    /// under `--remove-duplicates`) preserves a complete record set, as needed when dedup
+    /// replaces Picard `MarkDuplicates`. Only templates rejected solely for a UMI reason
+    /// are passed through; every other filter still applies. No effect with `--no-umi`.
+    #[arg(long = "include-invalid-umis", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub include_invalid_umis: bool,
 
     /// UMI grouping strategy
     #[arg(short = 's', long = "strategy", value_enum, default_value = "adjacency")]
@@ -1333,6 +1559,15 @@ impl Command for MarkDuplicates {
         // Validate --no-umi is not used with paired strategy
         if self.no_umi && matches!(self.strategy, Strategy::Paired) {
             bail!("--no-umi cannot be used with --strategy paired");
+        }
+
+        // --no-umi never checks the UMI, so nothing is rejected for a UMI reason and
+        // --include-invalid-umis has nothing to pass through. Harmless, so warn rather
+        // than reject (a pipeline may set both unconditionally).
+        if self.no_umi && self.include_invalid_umis {
+            log::warn!(
+                "--include-invalid-umis has no effect with --no-umi, which skips the UMI checks"
+            );
         }
 
         // Resolve the effective strategy/edits (identity forces edits=0; `--no-umi`
@@ -1493,6 +1728,27 @@ pub(crate) fn log_filtered_templates(filter_counts: &TemplateFilterCounts) {
     }
 }
 
+/// Logs the templates `--include-unmapped` and `--include-invalid-umis` emitted untouched,
+/// listing only the non-zero reasons, named like the `passthrough_*` metrics columns (the
+/// pass-through counterpart of [`log_filtered_templates`]).
+pub(crate) fn log_passthrough_templates(counts: &DedupCounts) {
+    use TemplateFilterReason as Reason;
+    let passthroughs = counts.passthrough_templates();
+    if passthroughs > 0 {
+        let reasons: Vec<String> = [
+            (Reason::Unmapped, counts.passthrough_unmapped),
+            (Reason::MissingUmi, counts.passthrough_missing_umi),
+            (Reason::NsInUmi, counts.passthrough_ns_in_umi),
+            (Reason::UmiTooShort, counts.passthrough_umi_too_short),
+        ]
+        .into_iter()
+        .filter(|&(_, count)| count > 0)
+        .map(|(reason, count)| format!("{count} {}", reason.column_suffix()))
+        .collect();
+        info!("Passed through {passthroughs} templates untouched: {}", reasons.join(", "));
+    }
+}
+
 /// Writes the `--duplication-ladder` TSV: one row per (library, snapshot),
 /// sorted deterministically by library name then ascending `templates_seen`.
 pub(crate) fn write_duplication_ladder(
@@ -1552,6 +1808,7 @@ impl crate::pipeline::core::item::Ordered for BatchedProcessedDedupGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template_filter::filter_template;
     use crate::umi::IdentityUmiAssigner;
     use crate::umi::truncate_umis;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
@@ -1974,6 +2231,223 @@ mod tests {
     fn test_unmapped_passthrough_single(#[case] extra_flags: u16, #[case] expected: bool) {
         let template = create_single_read_template("q1", extra_flags);
         assert_eq!(template_is_unmapped_passthrough(&template), expected);
+    }
+
+    // ========================================================================
+    // route_candidate tests (--include-invalid-umis)
+    // ========================================================================
+
+    /// The UMI reason `route_candidate` passes `template` through for with
+    /// `--include-invalid-umis` set, building the relaxed config the same way
+    /// `process_position_group` does; `None` when it is accepted or rejected instead.
+    fn invalid_umi_passthrough_reason(
+        template: &Template,
+        config: &TemplateFilterConfig,
+    ) -> Option<TemplateFilterReason> {
+        let relaxed = TemplateFilterConfig { no_umi: true, ..config.clone() };
+        match route_candidate(template, config, Some(&relaxed)) {
+            CandidateRoute::InvalidUmiPassthrough(reason) => Some(reason),
+            CandidateRoute::Accepted(_) | CandidateRoute::Rejected(..) => None,
+        }
+    }
+
+    /// Build a mapped primary read for `segment_flag`, OR-ing in `extra_flags`, with an
+    /// optional `RX` UMI (`None` omits the tag) and an optional mate `MQ` tag.
+    fn invalid_umi_read(
+        segment_flag: u16,
+        extra_flags: u16,
+        mapq: u8,
+        umi: Option<&[u8]>,
+        mate_mq: Option<i32>,
+    ) -> RawRecord {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(mapq)
+            .flags(flags::PAIRED | segment_flag | extra_flags);
+        if let Some(umi) = umi {
+            b.add_string_tag(SamTag::RX, umi);
+        }
+        if let Some(mq) = mate_mq {
+            b.add_int_tag(*SamTag::MQ, mq);
+        }
+        b.build()
+    }
+
+    /// A single-read template is passed through only when the filter rejects it solely
+    /// for its UMI, and the predicate names that UMI reason. Any other rejection — mapping
+    /// quality, QC-fail, unmapped — wins, and `--no-umi` disables the UMI checks, so nothing
+    /// is passed through for a UMI reason.
+    #[rstest]
+    #[case::valid_umi(Some(&b"ACGTACGT"[..]), 30, 0, None, false, None)]
+    #[case::n_in_umi(Some(&b"ACNTACGT"[..]), 30, 0, None, false, Some(TemplateFilterReason::NsInUmi))]
+    #[case::lowercase_n_in_umi(Some(&b"ACnTACGT"[..]), 30, 0, None, false, Some(TemplateFilterReason::NsInUmi))]
+    #[case::missing_umi(None, 30, 0, None, false, Some(TemplateFilterReason::MissingUmi))]
+    #[case::umi_too_short(Some(&b"ACGT"[..]), 30, 0, Some(8), false, Some(TemplateFilterReason::UmiTooShort))]
+    #[case::umi_long_enough(Some(&b"ACGTACGT"[..]), 30, 0, Some(8), false, None)]
+    #[case::n_in_umi_and_low_mapq(Some(&b"ACNTACGT"[..]), 10, 0, None, false, None)]
+    #[case::missing_umi_and_qc_fail(None, 30, flags::QC_FAIL, None, false, None)]
+    #[case::missing_umi_and_unmapped(None, 0, flags::UNMAPPED | flags::MATE_UNMAPPED, None, false, None)]
+    #[case::no_umi_mode(None, 30, 0, None, true, None)]
+    fn test_invalid_umi_passthrough_single(
+        #[case] umi: Option<&[u8]>,
+        #[case] mapq: u8,
+        #[case] extra_flags: u16,
+        #[case] min_umi_length: Option<usize>,
+        #[case] no_umi: bool,
+        #[case] expected: Option<TemplateFilterReason>,
+    ) {
+        let read = invalid_umi_read(
+            flags::FIRST_SEGMENT,
+            flags::MATE_UNMAPPED | extra_flags,
+            mapq,
+            umi,
+            None,
+        );
+        let template =
+            Template::from_records(vec![read]).expect("test template construction should not fail");
+        let config = TemplateFilterConfig { min_umi_length, no_umi, ..default_filter_config() };
+        assert_eq!(invalid_umi_passthrough_reason(&template, &config), expected);
+    }
+
+    /// In a pair, the filter returns at the first failing check, so R1's bad UMI can be
+    /// reported before R2's low mate `MQ` is ever looked at. The predicate must still see
+    /// the `MQ` failure and refuse the pass-through, while a pair whose only problem is
+    /// a UMI is passed through under the first UMI reason the filter reaches.
+    #[rstest]
+    #[case::r2_n_in_umi(Some(&b"ACGTACGT"[..]), Some(&b"ACGNACGT"[..]), None, Some(TemplateFilterReason::NsInUmi))]
+    #[case::r1_missing_umi(None, Some(&b"ACGTACGT"[..]), None, Some(TemplateFilterReason::MissingUmi))]
+    #[case::r1_missing_umi_r2_n_in_umi(None, Some(&b"ACGNACGT"[..]), None, Some(TemplateFilterReason::MissingUmi))]
+    #[case::r1_n_in_umi_r2_low_mate_mq(Some(&b"ACNTACGT"[..]), Some(&b"ACGTACGT"[..]), Some(5), None)]
+    #[case::both_valid(Some(&b"ACGTACGT"[..]), Some(&b"ACGTACGT"[..]), None, None)]
+    fn test_invalid_umi_passthrough_paired(
+        #[case] r1_umi: Option<&[u8]>,
+        #[case] r2_umi: Option<&[u8]>,
+        #[case] r2_mate_mq: Option<i32>,
+        #[case] expected: Option<TemplateFilterReason>,
+    ) {
+        let r1 = invalid_umi_read(flags::FIRST_SEGMENT, 0, 30, r1_umi, Some(30));
+        let r2 = invalid_umi_read(flags::LAST_SEGMENT, 0, 30, r2_umi, r2_mate_mq.or(Some(30)));
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
+        assert_eq!(invalid_umi_passthrough_reason(&template, &default_filter_config()), expected);
+    }
+
+    /// A truncated record fails the filter with UMI checks on or off, so it is never
+    /// passed through by `--include-invalid-umis` and is still dropped as malformed.
+    #[test]
+    fn test_invalid_umi_passthrough_rejects_truncated() {
+        let r1 = invalid_umi_read(flags::FIRST_SEGMENT, flags::MATE_UNMAPPED, 30, None, None);
+        let truncated_r2 = RawRecord::from(vec![0u8; 16]); // < MIN_BAM_RECORD_LEN (32)
+        let template = Template {
+            records: vec![r1, truncated_r2],
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: None,
+            r2_secondaries: None,
+            mi: crate::umi::MoleculeId::None,
+            cached_umi_position: None,
+        };
+        assert_eq!(invalid_umi_passthrough_reason(&template, &default_filter_config()), None);
+    }
+
+    /// Without `--include-invalid-umis` (no relaxed config) a UMI rejection is just a
+    /// rejection, carrying its primary-read count, exactly as `filter_template` records it.
+    #[test]
+    fn test_route_candidate_without_flag_rejects_invalid_umi() {
+        let read = invalid_umi_read(flags::FIRST_SEGMENT, flags::MATE_UNMAPPED, 30, None, None);
+        let template =
+            Template::from_records(vec![read]).expect("test template construction should not fail");
+        assert_eq!(
+            route_candidate(&template, &default_filter_config(), None),
+            CandidateRoute::Rejected(TemplateFilterReason::MissingUmi, 1)
+        );
+    }
+
+    /// A pair whose R1 carries two `MQ` tags on either side of `min_mapq` (`MQ:i:60` then
+    /// `MQ:i:5`) ahead of a valid UMI, R2 a valid UMI and a passing `MQ`.
+    fn duplicated_mq_pair() -> (RawRecord, RawRecord) {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"q1")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(30)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_int_tag(*SamTag::MQ, 60);
+        b.add_int_tag(*SamTag::MQ, 5);
+        b.add_string_tag(SamTag::RX, b"ACGTACGT");
+        let r1 = b.build();
+        let r2 = invalid_umi_read(flags::LAST_SEGMENT, 0, 30, Some(b"ACGTACGT"), Some(30));
+        (r1, r2)
+    }
+
+    /// Regression: with the UMI checks on, the aux scan keeps reading past R1's first `MQ`
+    /// (it is still looking for the UMI) and reports the second, failing one; with them off
+    /// it stops at the first, passing one. The relaxed pass therefore accepts a template the
+    /// configured pass rejected for its mate mapping quality, which used to trip an
+    /// assertion. A non-UMI rejection must never become a pass-through: it stays a
+    /// `LowMateMappingQuality` rejection with or without the flag.
+    #[test]
+    fn test_route_candidate_duplicated_mq_is_rejected_not_passed_through() {
+        let (r1, r2) = duplicated_mq_pair();
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
+        let config = TemplateFilterConfig { min_mapq: 10, ..default_filter_config() };
+        let relaxed = TemplateFilterConfig { no_umi: true, ..config.clone() };
+        assert!(check_template(&template, &relaxed).is_ok(), "fixture: relaxed pass accepts");
+
+        let expected = CandidateRoute::Rejected(TemplateFilterReason::LowMateMappingQuality, 2);
+        assert_eq!(route_candidate(&template, &config, None), expected);
+        assert_eq!(route_candidate(&template, &config, Some(&relaxed)), expected);
+    }
+
+    /// The same duplicated-`MQ` pair through `process_position_group`: it must not panic,
+    /// and must be counted as `filtered_low_mate_mapping_quality` and not emitted, exactly
+    /// as without `--include-invalid-umis`.
+    #[rstest]
+    #[case::default(false)]
+    #[case::include_invalid_umis(true)]
+    fn test_process_position_group_duplicated_mq_is_filtered(#[case] include_invalid_umis: bool) {
+        use fgumi_bam_io::{DecodedRecord, GroupKey};
+
+        let (r1, r2) = duplicated_mq_pair();
+        let group = RawPositionGroup {
+            group_key: GroupKey::default(),
+            records: vec![
+                DecodedRecord::from_raw_bytes(r1, GroupKey::default()),
+                DecodedRecord::from_raw_bytes(r2, GroupKey::default()),
+            ],
+        };
+        let filter_config = TemplateFilterConfig { min_mapq: 10, ..default_filter_config() };
+        let processed = process_position_group(
+            group,
+            &filter_config,
+            &IdentityUmiAssigner::new(),
+            SamTag::RX,
+            None,
+            false,
+            DedupPassthrough { include_unmapped: false, include_invalid_umis },
+        )
+        .expect("process_position_group should succeed");
+
+        let counts = &processed.dedup_counts;
+        assert!(processed.templates.is_empty(), "the template must be dropped");
+        assert_eq!(
+            counts.filter_counts.rejected_templates(TemplateFilterReason::LowMateMappingQuality),
+            1
+        );
+        assert_eq!(counts.filter_counts.total_rejected_templates(), 1);
+        assert_eq!(counts.passthrough_templates(), 0);
+        assert_eq!(counts.total_templates, 0);
     }
 
     // ========================================================================
@@ -3077,7 +3551,10 @@ mod tests {
             secondary_reads: 10,
             supplementary_reads: 5,
             missing_tc_tag: 2,
-            passthrough_templates: 3,
+            passthrough_unmapped: 3,
+            passthrough_missing_umi: 4,
+            passthrough_ns_in_umi: 5,
+            passthrough_umi_too_short: 6,
             filter_counts,
             ..DedupCounts::default()
         };
@@ -3094,7 +3571,11 @@ mod tests {
         assert_eq!(output.filtered_ns_in_umi, 8);
         assert_eq!(output.filtered_umi_too_short, 9);
         assert_eq!(output.filtered_templates, 45);
-        assert_eq!(output.passthrough_templates, 3);
+        assert_eq!(output.passthrough_unmapped, 3);
+        assert_eq!(output.passthrough_missing_umi, 4);
+        assert_eq!(output.passthrough_ns_in_umi, 5);
+        assert_eq!(output.passthrough_umi_too_short, 6);
+        assert_eq!(output.passthrough_templates, 18, "total of the per-reason pass-throughs");
         assert_eq!(output.total_templates, 100);
         assert_eq!(output.unique_templates, 75);
         assert_eq!(output.duplicate_templates, 25);
@@ -3113,15 +3594,23 @@ mod tests {
         assert_eq!(library_display_name(0, &library_index), "Unknown Library");
     }
 
-    /// Nothing may vanish silently: everything read is either filtered or written.
+    /// Nothing may vanish silently: everything read is either filtered or written, and
+    /// every pass-through lands in exactly one per-reason column of the total.
     #[rstest]
-    #[case::nothing_filtered(0, 10, 0)]
-    #[case::everything_filtered(7, 0, 0)]
-    #[case::mixed(3, 5, 2)]
+    #[case::nothing_filtered(0, 10, &[])]
+    #[case::everything_filtered(7, 0, &[])]
+    #[case::mixed(3, 5, &[TemplateFilterReason::Unmapped, TemplateFilterReason::Unmapped])]
+    #[case::every_passthrough_reason(2, 4, &[
+        TemplateFilterReason::Unmapped,
+        TemplateFilterReason::MissingUmi,
+        TemplateFilterReason::NsInUmi,
+        TemplateFilterReason::NsInUmi,
+        TemplateFilterReason::UmiTooShort,
+    ])]
     fn dedup_metrics_output_reconciles(
         #[case] rejected: u64,
         #[case] accepted: u64,
-        #[case] passthrough: u64,
+        #[case] passthrough_reasons: &[TemplateFilterReason],
     ) {
         let mut filter_counts = TemplateFilterCounts::new();
         for _ in 0..rejected {
@@ -3131,18 +3620,45 @@ mod tests {
             filter_counts.record_accepted(2);
         }
 
-        let counts = DedupCounts {
+        let passthrough = passthrough_reasons.len() as u64;
+        let mut counts = DedupCounts {
             total_templates: accepted + passthrough,
-            passthrough_templates: passthrough,
             filter_counts,
             ..DedupCounts::default()
         };
+        for &reason in passthrough_reasons {
+            counts.record_passthrough(reason);
+        }
         let output = to_deduplication_metrics("smpl".to_string(), "lib1".to_string(), &counts);
 
         assert_eq!(
             output.filtered_templates + output.total_templates,
             rejected + accepted + passthrough
         );
+        assert_eq!(output.passthrough_templates, passthrough);
+        assert_eq!(
+            output.passthrough_unmapped
+                + output.passthrough_missing_umi
+                + output.passthrough_ns_in_umi
+                + output.passthrough_umi_too_short,
+            output.passthrough_templates
+        );
+        // Each reason lands in its own column, so swapping two reasons' columns fails here.
+        let count_of = |reason: TemplateFilterReason| {
+            passthrough_reasons.iter().filter(|&&r| r == reason).count() as u64
+        };
+        assert_eq!(output.passthrough_unmapped, count_of(TemplateFilterReason::Unmapped));
+        assert_eq!(output.passthrough_missing_umi, count_of(TemplateFilterReason::MissingUmi));
+        assert_eq!(output.passthrough_ns_in_umi, count_of(TemplateFilterReason::NsInUmi));
+        assert_eq!(output.passthrough_umi_too_short, count_of(TemplateFilterReason::UmiTooShort));
+    }
+
+    /// Only `Unmapped` and the three UMI reasons can be passed through; a pass-through
+    /// recorded under any other reason is a routing bug and must not be silently dropped.
+    #[test]
+    #[should_panic(expected = "no pass-through flag routes")]
+    fn record_passthrough_rejects_non_passthrough_reason() {
+        DedupCounts::default().record_passthrough(TemplateFilterReason::LowMappingQuality);
     }
 
     /// `duplicate_rate` serializes through the fgbio-style float formatter, so a
@@ -3867,7 +4383,7 @@ mod tests {
             SamTag::RX,
             None,
             false,
-            false,
+            DedupPassthrough::default(),
         )
         .expect("process_position_group should succeed on this well-formed fixture");
 

@@ -14,9 +14,9 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 
 use crate::commands::dedup::{
-    BatchedProcessedDedupGroups, CollectedDedupMetrics, DedupCounts, DuplicationLadderRecorder,
-    ProcessedDedupGroup, process_position_group, write_dedup_metrics, write_duplication_ladder,
-    write_family_size_histogram,
+    BatchedProcessedDedupGroups, CollectedDedupMetrics, DedupCounts, DedupPassthrough,
+    DuplicationLadderRecorder, ProcessedDedupGroup, process_position_group, write_dedup_metrics,
+    write_duplication_ladder, write_family_size_histogram,
 };
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
@@ -184,6 +184,7 @@ impl FinalizeHook for DedupFinalizeHook {
         // Report filtered templates identically to the non-chain path (shared
         // helper, so the two paths cannot drift).
         crate::commands::dedup::log_filtered_templates(&final_counts.filter_counts);
+        crate::commands::dedup::log_passthrough_templates(&final_counts);
 
         timer.log_completion(final_counts.total_reads);
 
@@ -217,7 +218,7 @@ pub(crate) fn build_process_step(
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
-    include_unmapped: bool,
+    passthrough: DedupPassthrough,
     accumulators: Arc<PerThreadAccumulator<CollectedDedupMetrics>>,
 ) -> ProcessOrdered<
     BatchedRawPositionGroups,
@@ -244,7 +245,7 @@ pub(crate) fn build_process_step(
                     raw_tag,
                     min_umi_length,
                     no_umi,
-                    include_unmapped,
+                    passthrough,
                 )?;
                 accumulators.with_slot(|acc| {
                     // A position group is always single-library, so its counts

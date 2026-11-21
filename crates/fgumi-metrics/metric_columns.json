@@ -83,7 +83,11 @@
     "unmapped_orphans",
     "unmated_templates",
     "percent_duplication",
-    "estimated_library_size"
+    "estimated_library_size",
+    "passthrough_unmapped",
+    "passthrough_missing_umi",
+    "passthrough_ns_in_umi",
+    "passthrough_umi_too_short"
   ],
   "downsample.histogram_kept": [
     "family_size",
