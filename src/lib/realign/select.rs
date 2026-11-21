@@ -193,10 +193,16 @@ pub(crate) enum Selection {
 /// improper pairs are never guarded, so one end of an improper pair can move
 /// alone.
 ///
+/// The hits are read from `XA`, or, on a record without `XA`, from `XB`: the
+/// six-field list (`chr,pos,CIGAR,NM,score,mapq;`) that `-u` writes in place of
+/// `XA` in bwa and in bwa-mem3 0.17.0 and later (before 0.17.0, bwa-mem3 wrote
+/// it as a six-field `XA`). The remaining hits and the old primary are written
+/// back to the tag the hits came from.
+///
 /// An `XA` promotion:
 ///
 /// - moves the primary to the hit with MAPQ 0. Its `AS` is the score bwa lists
-///   for the hit in a six-field `XA` (`bwa-mem3 mem -u`). With the four-field
+///   for the hit in a six-field list (`-u`). With the four-field
 ///   `XA` it is recomputed with `scoring` from its CIGAR and `XA`'s edit distance
 ///   (mismatches = `NM` minus indel bases), so bisulfite conversions bwa did not
 ///   count are not penalised. That approximates bwa's score: bwa scores a base
@@ -216,12 +222,12 @@ pub(crate) enum Selection {
 ///   zipper merge gave it, which include its own MAPQ, `NM`, `MD`, `AS` and `XS`
 ///   (the MAPQ is not zeroed: bwa scored this piece's placement itself) and the
 ///   consensus tags, which the merge copies onto every record of the end with
-///   the per-base ones oriented for that record's strand. `XA` is removed (on a
-///   piece it described that piece's alternatives, not the read's), and so are
-///   `tc` and `pa`. The bisulfite tags bwa computed for the piece's own
-///   placement stay: `XG` and `YD`, and `XM` when it has one call per base of
-///   the full read (a hard-clipped piece's `XM` covers only its own bases, so
-///   it is removed).
+///   the per-base ones oriented for that record's strand. `XA` and `XB` are
+///   removed (on a piece they described that piece's alternatives, not the
+///   read's), and so are `tc` and `pa`. The bisulfite tags bwa computed for the
+///   piece's own placement stay: `XG` and `YD`, and `XM` when it has one call
+///   per base of the full read (a hard-clipped piece's `XM` covers only its own
+///   bases, so it is removed).
 /// - makes the old primary the piece, flagged as the piece was (supplementary,
 ///   or secondary under `-M`). If the piece was hard-clipped, so is it: its SEQ
 ///   and QUAL are trimmed to the soft-clipped CIGAR's aligned bases, and so is
@@ -284,8 +290,8 @@ pub(crate) fn select_primary(
         outcome.ends[slot] = match (state, guards[slot]) {
             (EndState::Settled(selection), _) => selection,
             (EndState::Movable(_), Some(kept)) => kept,
-            (EndState::Movable(Candidate::XaHit(hits, i, ops)), None) => {
-                promote(&mut merged.records[idx], &hits, i, &ops, reference, header, scoring)?;
+            (EndState::Movable(Candidate::XaHit(alt)), None) => {
+                promote(&mut merged.records[idx], &alt, reference, header, scoring)?;
                 Selection::Swapped
             }
             (EndState::Movable(Candidate::SplitPiece(piece)), None) => {
@@ -369,7 +375,7 @@ fn classify_end(
         return Ok(EndState::Settled(Selection::Kept));
     }
     Ok(match in_window_xa_hit(record, &window, outcome) {
-        Some((hits, i, ops)) => EndState::Movable(Candidate::XaHit(hits, i, ops)),
+        Some(alt) => EndState::Movable(Candidate::XaHit(alt)),
         None => match in_window_split_piece(merged, idx, first, &window, header)? {
             Some(piece) => EndState::Movable(Candidate::SplitPiece(piece)),
             None => EndState::Settled(Selection::OutsideWindow),
@@ -379,8 +385,8 @@ fn classify_end(
 
 /// What an end outside its window could be swapped to.
 enum Candidate {
-    /// An in-window `XA` hit: the parsed hits, the hit's index and its CIGAR.
-    XaHit(Vec<XaHit>, usize, Vec<u32>),
+    /// An in-window `XA` (or `XB`) hit.
+    XaHit(AltHit),
     /// The index of an in-window split piece of the end.
     SplitPiece(usize),
 }
@@ -396,20 +402,39 @@ fn placement<'h>(record: &[u8], header: &'h Header) -> Result<(&'h str, u32, u32
     Ok((contig, start, end, view.flags() & flags::REVERSE != 0))
 }
 
-/// The first in-window `XA` hit of `record` whose CIGAR covers the read, as
-/// `(hits, index of the hit, its CIGAR ops)`, or `None` without one. A
-/// malformed `XA` tag or hit CIGAR is counted in `outcome` and treated as
-/// absent.
+/// An in-window alternative hit of an end: the tag its list was read from
+/// (`XA`, or `XB` for `bwa-mem3 mem -u` from 0.17.0 and `bwa mem -u`), the
+/// parsed hits, the index of the hit and its CIGAR ops.
+struct AltHit {
+    tag: SamTag,
+    hits: Vec<XaHit>,
+    index: usize,
+    ops: Vec<u32>,
+}
+
+/// The tag holding `record`'s alternative-hit list and its value: `XA`, else
+/// `XB`, the six-field list (`chr,pos,CIGAR,NM,score,mapq;`) that `-u` writes in
+/// place of `XA` in bwa and in bwa-mem3 0.17.0 and later.
+fn alt_hits_tag(record: &RawRecord) -> Option<(SamTag, &[u8])> {
+    let aux = fgumi_raw_bam::aux_data_slice(record);
+    [SamTag::XA, SamTag::XB]
+        .into_iter()
+        .find_map(|tag| fgumi_raw_bam::find_string_tag(aux, tag).map(|value| (tag, value)))
+}
+
+/// The first in-window `XA` (or `XB`, see [`alt_hits_tag`]) hit of `record`
+/// whose CIGAR covers the read, or `None` without one. A malformed tag or hit
+/// CIGAR is counted in `outcome` and treated as absent.
 fn in_window_xa_hit(
     record: &RawRecord,
     window: &RealignWindow<'_>,
     outcome: &mut SelectOutcome,
-) -> Option<(Vec<XaHit>, usize, Vec<u32>)> {
-    let xa = fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::XA)?;
+) -> Option<AltHit> {
+    let (tag, xa) = alt_hits_tag(record)?;
     let hits = match parse_xa(xa) {
         Ok(hits) => hits,
         Err(e) => {
-            log::debug!("{}: {e:#}; treating it as absent", invalid_tag(record, "XA"));
+            log::debug!("{}: {e:#}; treating it as absent", invalid_tag(record, &tag.to_string()));
             outcome.malformed_xa += 1;
             return None;
         }
@@ -418,7 +443,11 @@ fn in_window_xa_hit(
     let mut candidate = None;
     for (i, hit) in hits.iter().enumerate() {
         let Some(ops) = hit.cigar_ops() else {
-            log::debug!("{}: skipping hit with CIGAR '{}'", invalid_tag(record, "XA"), hit.cigar);
+            log::debug!(
+                "{}: skipping hit with CIGAR '{}'",
+                invalid_tag(record, &tag.to_string()),
+                hit.cigar
+            );
             outcome.skipped_xa_hits += 1;
             continue;
         };
@@ -430,19 +459,19 @@ fn in_window_xa_hit(
             break;
         }
     }
-    candidate.map(|(i, ops)| (hits, i, ops))
+    candidate.map(|(index, ops)| AltHit { tag, hits, index, ops })
 }
 
-/// Replaces the primary alignment of `record` with `hits[i]` (whose CIGAR is `ops`).
+/// Replaces the primary alignment of `record` with the hit `alt` names, and
+/// writes the remaining hits and the old primary back to the tag they came from.
 fn promote(
     record: &mut RawRecord,
-    hits: &[XaHit],
-    i: usize,
-    ops: &[u32],
+    alt: &AltHit,
     reference: &impl ReferenceProvider,
     header: &Header,
     scoring: &BwaScoring,
 ) -> Result<()> {
+    let (tag, hits, i, ops) = (alt.tag, &alt.hits, alt.index, alt.ops.as_slice());
     let hit = &hits[i];
     let new_ref_id = header
         .reference_sequences()
@@ -455,8 +484,8 @@ fn promote(
     let mut old = old_primary_hit(record, header, reference)?;
     let aux = fgumi_raw_bam::aux_data_slice(record);
     let old_score = fgumi_raw_bam::find_int_tag(aux, SamTag::AS);
-    // In the six-field `XA` of `bwa-mem3 mem -u`, the old primary lists its own
-    // score and MAPQ like the other hits.
+    // In the six-field list of `-u` (`XB`, or `XA` before bwa-mem3 0.17.0), the
+    // old primary lists its own score and MAPQ like the other hits.
     if hits.iter().any(|h| h.score_mapq.is_some()) {
         let score = old_score.and_then(|v| i32::try_from(v).ok()).unwrap_or(0);
         old.score_mapq = Some((score, u32::from(RawRecordView::new(record).mapq())));
@@ -512,7 +541,7 @@ fn promote(
     alternatives.push(old);
     let mut xa = Vec::new();
     write_xa(&alternatives, &mut xa);
-    fgumi_raw_bam::update_string_tag(record, SamTag::XA, &xa);
+    fgumi_raw_bam::update_string_tag(record, tag, &xa);
     // Tags the aligner computed for the old placement, which the XA hit carries
     // nothing to recompute: the split (`SA`) and the per-alignment tags of
     // [`PLACEMENT_TAGS`].
@@ -638,7 +667,7 @@ fn swap_with_split_piece(
     promoted.set_cigar_ops(&ops);
     promoted.set_sequence_and_qualities(&seq, &qual);
     let aux = promoted.as_mut_vec();
-    for tag in [SamTag::XA, SamTag::TC, SamTag::PA] {
+    for tag in [SamTag::XA, SamTag::XB, SamTag::TC, SamTag::PA] {
         fgumi_raw_bam::remove_tag(aux, tag);
     }
     let covers_read =
@@ -1741,7 +1770,7 @@ mod tests {
         }
     }
 
-    /// A promoted six-field (`bwa-mem3 mem -u`) hit's `AS` is the score bwa
+    /// A promoted six-field (`-u`) hit's `AS` is the score bwa
     /// lists for it, not the rescored value; four-field hits are rescored. Either
     /// way `AS` and `XS` are stored in the smallest signed type, as the zipper
     /// merge stores them.
@@ -1798,7 +1827,7 @@ mod tests {
 
     /// A malformed `XA` never fails selection: a tag that does not parse is
     /// treated as absent, and a hit with an invalid CIGAR is skipped; each is
-    /// counted. A six-field (`bwa-mem3 mem -u`) `XA` is promoted from and
+    /// counted. A six-field `XA` (`-u` before bwa-mem3 0.17.0) is promoted from and
     /// rewritten in the six-field form.
     #[rstest]
     #[case::unparsable_tag("chr1,+101,20M;", Selection::OutsideWindow, 1, 0, "chr1,+101,20M;")]
@@ -1845,6 +1874,51 @@ mod tests {
             fgumi_raw_bam::find_string_tag(aux(r1), SamTag::XA),
             Some(expected_xa.as_bytes())
         );
+    }
+
+    /// `-u` in bwa and in bwa-mem3 0.17.0 and later writes the six-field list as
+    /// `XB` instead of `XA`. A record without `XA` is promoted from its `XB`, which
+    /// is rewritten (and no `XA` added); a record with both is promoted from `XA`
+    /// and its `XB` is left as it was.
+    #[rstest]
+    #[case::xb_only(
+        None,
+        Some("chr2,+181,20M,4,4,0;chr1,+101,20M,0,20,0;"),
+        None,
+        Some("chr2,+181,20M,4,4,0;chr2,+51,20M,0,20,60;")
+    )]
+    #[case::xa_wins_over_xb(
+        Some("chr1,+101,20M,0;"),
+        Some("chr2,+181,20M,4,4,0;"),
+        Some("chr2,+51,20M,0;"),
+        Some("chr2,+181,20M,4,4,0;")
+    )]
+    fn select_primary_promotes_from_xb(
+        fx: Fixture,
+        #[case] xa: Option<&'static str>,
+        #[case] xb: Option<&'static str>,
+        #[case] expected_xa: Option<&str>,
+        #[case] expected_xb: Option<&str>,
+    ) {
+        let r1 = end(Some((1, 51, false, "20M")), 0, 20, xa, Some(RW1));
+        let r2 = end(Some((0, 161, true, "20M")), 0, 20, None, Some(RW2));
+        let mut merged = build_template(&r1, Some(&r2), false);
+        let idx = merged.r1.expect("r1").0;
+        if let Some(xb) = xb {
+            fgumi_raw_bam::update_string_tag(
+                merged.records[idx].as_mut_vec(),
+                SamTag::XB,
+                xb.as_bytes(),
+            );
+        }
+        let got = select_primary(&mut merged, &fx.reference, &fx.header, &BwaScoring::default())
+            .expect("select_primary");
+        assert_eq!(got.ends, [Selection::Swapped, Selection::Kept]);
+        let r1 = merged.r1().expect("r1");
+        assert_eq!(rec_of(r1).0, "chr1,101,+,20M", "promoted hit");
+        let tag = |t| fgumi_raw_bam::find_string_tag(aux(r1), t);
+        assert_eq!(tag(SamTag::XA), expected_xa.map(str::as_bytes), "XA");
+        assert_eq!(tag(SamTag::XB), expected_xb.map(str::as_bytes), "XB");
     }
 
     /// The bases of the chimeric test read in read (sequencing) orientation.

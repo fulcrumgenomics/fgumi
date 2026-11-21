@@ -165,7 +165,7 @@ jobs:
           environment-name: cpu-floor
           # Keep in step with the vendored bwa-mem3 (the sha pinned in the
           # e2e-parity job below) so the index it builds matches the linked code.
-          create-args: bwa-mem3=0.15.0 samtools
+          create-args: bwa-mem3=0.18.0 samtools
           condarc: |
             channels:
               - conda-forge
@@ -259,8 +259,8 @@ jobs:
           tool: nextest
       - name: Build reference bwa-mem3 from upstream at the vendored COMMIT
         # Byte-parity is only defined against the exact bwa-mem3 the crate
-        # vendors. This SHA is the full 40-hex of the vendored v0.15.0 release
-        # (`7754ecce`), fixed by the `bwa-mem3-rs` 0.4.4 Cargo pin (its
+        # vendors. This SHA is the full 40-hex of the vendored v0.18.0 release
+        # (`e0903cb9`), fixed by the `bwa-mem3-rs` 0.6.1 Cargo pin (its
         # bwa-mem3-sys/vendor/COMMIT). If the Cargo pin is bumped, update this to
         # match; the check below fails fast on a mismatch rather than letting it
         # surface as spurious parity divergence. The fetch is tagless
@@ -268,7 +268,7 @@ jobs:
         # suffix; the parity test strips it.
         run: |
           set -euo pipefail
-          sha="7754eccedc97fe4a1833b9b59413f841a4b6ac35"
+          sha="e0903cb9395bc755059358f916b2efdb58a30073"
           # Resolve the locked bwa-mem3-sys checkout (cargo metadata fetches the
           # git dep) and compare its vendor/COMMIT against `sha`.
           sys_manifest="$(cargo metadata --format-version 1 --locked --features aligner-bwa-mem3 \

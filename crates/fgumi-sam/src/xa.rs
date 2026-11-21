@@ -1,9 +1,11 @@
 //! Parser and writer for bwa's `XA` (alternative hits) tag.
 //!
 //! The value is a list of hits, each terminated by `;`, of the form
-//! `chr,[+-]pos,CIGAR,NM;` where `pos` is 1-based. `bwa-mem3 mem -u` appends
-//! each hit's alignment score and mapping quality (`chr,[+-]pos,CIGAR,NM,score,mapq;`)
-//! and still names the tag `XA`; both forms are accepted and written back as read.
+//! `chr,[+-]pos,CIGAR,NM;` where `pos` is 1-based. `-u` appends each hit's
+//! alignment score and mapping quality (`chr,[+-]pos,CIGAR,NM,score,mapq;`) and
+//! names the tag `XB` (bwa, and bwa-mem3 0.17.0 and later; bwa-mem3 before 0.17.0
+//! kept the name `XA`). Both forms are accepted and written back as read, so these
+//! functions parse and write an `XB` value as well.
 
 use std::fmt::Write as _;
 
@@ -23,7 +25,7 @@ pub struct XaHit {
     /// Edit distance of the hit.
     pub nm: u32,
     /// The hit's alignment score and mapping quality, present when the aligner
-    /// wrote the six-field form (`bwa-mem3 mem -u`).
+    /// wrote the six-field form (`-u`).
     pub score_mapq: Option<(i32, u32)>,
 }
 
