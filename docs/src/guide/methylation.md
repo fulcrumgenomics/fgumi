@@ -13,7 +13,7 @@ This guide shows how to run EM-seq and TAPs (Illumina 5-base) data through fgumi
 
 - **Directional libraries only.** Read 1 (and unpaired reads) must sequence the converted original strand and Read 2 the copy made from it, so that Read 1 shows conversions as C→T and Read 2 as G→A in read orientation ([What Each Read Sees](methylation-concepts.md#what-each-read-sees)). Non-directional libraries (PBAT, single-cell bisulfite) are not supported.
 - **Consensus callers.** `simplex` and `duplex` support methylation mode, enabled with `--methylation-mode em-seq|taps` and `--ref`. `codec` does not.
-- **Reference.** The FASTA needs a `.dict` file (`samtools dict`). For EM-seq alignment, `bwa-mem3 mem --meth` needs an index built with `bwa-mem3 index --meth ref.fa`; bwameth works as well.
+- **Reference.** The FASTA needs a `.dict` file (`samtools dict`). For EM-seq alignment, `bwa-mem3 mem --meth` needs an index built with `bwa-mem3 index --meth ref.fa`; bwameth works as well. A methylation-only index (`bwa-mem3 index --meth --meth-only ref.fa`, which skips the plain `ref.fa.bwt.2bit.64`) is accepted under `--methylation-mode em-seq` with the `bwa-mem3` preset, but not with `bwa-mem3-inproc`, which also loads the plain index, nor for steps that align plain (such as `realign` of duplex consensus reads).
 - **UMIs.** For EM-seq, synthesize the UMIs with methylated cytosines (5mC) so that conversion leaves them intact; an unmethylated C in a UMI is converted like any other. TAPs leaves synthetic UMIs unchanged, since their cytosines are unmethylated.
 
 ## Pipeline Overview

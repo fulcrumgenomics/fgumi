@@ -4439,6 +4439,81 @@ mod realign_tests {
         assert!(err.contains(error), "{err}");
     }
 
+    /// A reference with a `.dict` and a `bwa-mem3 index --meth --meth-only`
+    /// index ([`crate::aligner::METH_ONLY_INDEX_FILES`]), plus an executable `--aligner-bin` stand-in.
+    /// Returns `(reference, binary)`.
+    fn meth_only_reference_and_binary(dir: &std::path::Path) -> (String, String) {
+        let fasta = dir.join("ref.fa");
+        std::fs::write(&fasta, ">chr1\nACGT\n").unwrap();
+        std::fs::write(dir.join("ref.dict"), "@SQ\tSN:chr1\tLN:4\n").unwrap();
+        for ext in crate::aligner::METH_ONLY_INDEX_FILES {
+            std::fs::write(dir.join(format!("ref.fa{ext}")), b"x").unwrap();
+        }
+        let bin = dir.join("mock-bwa-mem3");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (fasta.to_str().unwrap().to_string(), bin.to_str().unwrap().to_string())
+    }
+
+    /// `--start-from align --consensus duplex` under `--methylation-mode em-seq`
+    /// with the `bwa-mem3` preset, against `reference` and the `binary`
+    /// stand-in, adding `extra`.
+    fn emseq_duplex_chain(reference: &str, binary: &str, extra: &[&str]) -> RunAll {
+        let mut args = vec![
+            "--start-from",
+            "align",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "duplex",
+            "--group::strategy",
+            "paired",
+            "--duplex::min-reads",
+            "1",
+            "--methylation-mode",
+            "em-seq",
+            "--ref",
+            reference,
+            "--aligner::preset",
+            "bwa-mem3",
+            "--aligner-bin",
+            binary,
+        ];
+        args.extend_from_slice(extra);
+        parse_io(&args)
+    }
+
+    /// `--realign` re-aligns duplex consensus reads plain (without `--meth`),
+    /// which needs the plain `<ref>.bwt.2bit.64`, so a `--meth-only` index is
+    /// rejected at startup, naming that file, even though the EM-seq align
+    /// stage alone accepts it.
+    #[test]
+    fn emseq_duplex_realign_rejects_a_meth_only_index_at_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (reference, binary) = meth_only_reference_and_binary(tmp.path());
+        let r = emseq_duplex_chain(&reference, &binary, &["--realign"]);
+        let err = format!("{:#}", r.execute("runall test").expect_err("no plain index"));
+        assert!(err.contains("ref.fa.bwt.2bit.64 "), "names the plain index; got: {err}");
+        assert!(err.contains("the --realign stage aligns the consensus"), "got: {err}");
+    }
+
+    /// Without `--realign`, the same chain's EM-seq align stage (which aligns with
+    /// `bwa-mem3 mem --meth`) passes the align preflight against a `--meth-only`
+    /// index.
+    #[test]
+    fn emseq_duplex_align_accepts_a_meth_only_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (reference, binary) = meth_only_reference_and_binary(tmp.path());
+        let r = emseq_duplex_chain(&reference, &binary, &[]);
+        let stages = r.derive_stages().unwrap();
+        assert!(stages.contains(&Stage::Align) && !stages.contains(&Stage::Realign), "{stages:?}");
+        r.validate_align_and_merge(&stages).unwrap();
+    }
+
     /// `--zipper::tags-to-*` do not reach the realign stage's merge (it always
     /// uses zipper's `Consensus` sets), so runall says so when they are set.
     #[rstest]
