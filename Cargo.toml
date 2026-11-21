@@ -56,20 +56,20 @@ crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 csv = "1.1"
 dhat = "0.3"
-fgoxide = "0.6.0"
+fgoxide = "0.7.0"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-itertools = "0.14.0"
+itertools = "0.15.0"
 libdeflater = "1.22"
 libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0.4"
-mach2 = "0.6"
+mach2 = "0.7"
 memchr = "2"
 mimalloc = { version = "0.1.52", default-features = false }
 # Built on every Unix target: `fgumi-bam-io` needs `unistd::close`, the only safe
 # checked close (std's `File` drop discards the error), to surface errors the OS
 # reports only when an output file is closed. Other members still scope it to
 # Linux for Linux-only APIs (`posix_fadvise`, ...).
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 # The noodles crates are bumped together: `noodles`, `noodles-bgzf` and `noodles-csi` must
 # resolve to the same sub-crate versions or their types (e.g. `bgzf::VirtualPosition`,
 # `csi::binning_index::Indexer`) do not unify. When bumping, check that
@@ -95,11 +95,11 @@ rand = "0.10"
 # feature-unification trap documented on `flate2` above.
 rustix = { version = "1.1", default-features = false, features = ["std"] }
 rayon = "1.10"
-rstest = "0.26"
+rstest = "0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 syn = { version = "3", features = ["full"] }
-statrs = "0.18"
+statrs = "0.19"
 # sysinfo >=0.39 requires rustc 1.95. Centralized so `fgumi` and `fgumi-cli-common` cannot drift
 # onto different versions and silently raise the effective MSRV.
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }

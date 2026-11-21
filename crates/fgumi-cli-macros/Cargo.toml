@@ -13,7 +13,7 @@ proc-macro = true
 [dependencies]
 # `syn` is NOT centralized: this crate pins the 2.x line, while `xtask` pins 3.x
 # with `extra-traits`. A single workspace entry cannot represent both majors.
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 quote = { workspace = true }
 proc-macro2 = "1"
 
