@@ -206,20 +206,28 @@ near the best, so the most repetitive reads have no candidates at all. Unset, th
 aligner keeps its own default (bwa's `5,200`) and an `--aligner::command` is passed
 through unchanged.
 
+The hits are read from `XA`, or, on a record without `XA`, from `XB`: under `-u`, bwa
+and bwa-mem3 0.17.0 and later write the hit list, with each hit's score and MAPQ
+(`chr,pos,CIGAR,NM,score,mapq;`), as `XB` instead of `XA` (bwa-mem3 before 0.17.0
+wrote it as a six-field `XA`). After a promotion the remaining hits and the old
+primary are written back to the tag they came from; "`XA`" below means either.
+
 A malformed `XA` never fails the run: an `XA` tag that does not parse is treated as
 absent and a hit whose CIGAR is invalid is skipped; both are counted in the summary.
 A malformed `rw` does fail it, naming the read: `rw` is fgumi's own tag, so a value
 that does not parse means the input was damaged or written by another tool.
 
-A promoted alignment's AS is the score bwa lists for the hit in a six-field `XA`
-(`bwa-mem3 mem -u`). With the usual four-field `XA` it is rescored from its CIGAR and
-the `XA` hit's edit distance
-(so bisulfite conversions bwa did not count are not penalised), with the aligner's
-scoring, and never below 0 (bwa reports no negative AS): the in-process backend's
+A promoted alignment's AS is the score bwa lists for the hit in a six-field list
+(`-u`). With the usual four-field `XA` it is rescored from its CIGAR and the `XA`
+hit's edit distance (so bisulfite conversions bwa did not count are not penalised),
+with the aligner's scoring, and never below 0 (bwa reports no negative AS): the in-process backend's
 options, or for a subprocess preset or `--aligner::command` what the command passes
-after its `mem` word: `-A`, `-B`, `-O`, `-E`, an `-x` preset, and `--meth` (whose
-collapsed scoring, the default except for `--meth=taps`, sets `-B 2`; `--meth-scoring
-genomic|neutral` keeps bwa's `-B`). Options it does not pass keep bwa-mem3's defaults.
+after its `mem` word: `-A`, `-B`, `-O`, `-E`, an `-x` preset, and `--meth` (`--meth-scoring
+collapsed` sets `-B 2`; the default genomic scoring, or neutral for `--meth=taps`, keeps
+bwa's `-B`, as in bwa-mem3 0.17.0 and later). Options it does not pass keep bwa-mem3's defaults.
+bwa-mem3 before 0.17.0 aligns a bare `--meth` with collapsed scoring (`-B 2`), which
+realign cannot tell from the command, so an `--aligner::command` that runs an older
+bwa-mem3 with `--meth` should pass `--meth-scoring` explicitly.
 An `--aligner::command` is read for these options (and for `-h`, above) by splitting
 it on whitespace up to the first `|`, `;`, `&&` or `||`: shell quoting is not
 interpreted, so an option-like word inside a quoted argument (say, in `-R '...'`) is

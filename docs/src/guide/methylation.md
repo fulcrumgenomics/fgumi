@@ -13,7 +13,8 @@ This guide shows how to run EM-seq and TAPs (Illumina 5-base) data through fgumi
 
 - **Directional libraries only.** Read 1 (and unpaired reads) must sequence the converted original strand and Read 2 the copy made from it, so that Read 1 shows conversions as C→T and Read 2 as G→A in read orientation ([What Each Read Sees](methylation-concepts.md#what-each-read-sees)). Non-directional libraries (PBAT, single-cell bisulfite) are not supported.
 - **Consensus callers.** `simplex` and `duplex` support methylation mode, enabled with `--methylation-mode em-seq|taps` and `--ref`. `codec` does not.
-- **Reference.** The FASTA needs a `.dict` file (`samtools dict`). For EM-seq alignment, `bwa-mem3 mem --meth` needs an index built with `bwa-mem3 index --meth ref.fa`; bwameth works as well. A methylation-only index (`bwa-mem3 index --meth --meth-only ref.fa`, which skips the plain `ref.fa.bwt.2bit.64`) is accepted under `--methylation-mode em-seq` with the `bwa-mem3` preset, but not with `bwa-mem3-inproc`, which also loads the plain index, nor for steps that align plain (such as `realign` of duplex consensus reads).
+- **Reference.** The FASTA needs a `.dict` file (`samtools dict`). For EM-seq alignment, `bwa-mem3 mem --meth` needs the dual index built by `bwa-mem3 index --meth ref.fa`; bwameth works as well. A methylation-only index (`bwa-mem3 index --meth --meth-only ref.fa`, which skips the plain `ref.fa.bwt.2bit.64`) is accepted under `--methylation-mode em-seq` with the `bwa-mem3` preset, but not with `bwa-mem3-inproc`, which also loads the plain index, nor for steps that align plain (such as `realign` of duplex consensus reads). From bwa-mem3 0.18.0, `index --meth` builds the plain index too and will not replace one that already exists unless given `--force` (`bwa-mem3 index --meth --force ref.fa`); earlier releases do not accept `--force`, and do not need it.
+- **Scoring.** From bwa-mem3 0.17.0, `--meth` scores EM-seq with genomic scoring (mismatch penalty `-B 4`); before 0.17.0 its default was bwameth's collapsed scoring (`-B 2`). fgumi's in-process aligner uses genomic scoring, and its `bwa-mem3` presets pass `--meth --meth-scoring genomic`, which gives the same scoring with bwa-mem3 0.4.0 and later (the first release with `--meth-scoring`); other `--meth` defaults can still differ between versions. The EM-seq commands on this page pass `--meth-scoring genomic` too. In your own commands, pass `--meth-scoring` so the scoring does not depend on the installed bwa-mem3.
 - **UMIs.** For EM-seq, synthesize the UMIs with methylated cytosines (5mC) so that conversion leaves them intact; an unmethylated C in a UMI is converted like any other. TAPs leaves synthetic UMIs unchanged, since their cytosines are unmethylated.
 
 ## Pipeline Overview
@@ -24,9 +25,9 @@ The methylation pipeline has the same structure as the [standard consensus pipel
 
 | Step | EM-seq | TAPs |
 |------|--------|------|
-| First alignment | `bwa-mem3 mem --meth` (bisulfite-aware) | `bwa-mem3 mem` (standard) |
+| First alignment | `bwa-mem3 mem --meth --meth-scoring genomic` (bisulfite-aware) | `bwa-mem3 mem` (standard) |
 | Consensus | `--methylation-mode em-seq --ref` | `--methylation-mode taps --ref` |
-| Simplex re-alignment | `bwa-mem3 mem --meth -Y` | `bwa-mem3 mem -Y` |
+| Simplex re-alignment | `bwa-mem3 mem --meth --meth-scoring genomic -Y` | `bwa-mem3 mem -Y` |
 | Duplex re-alignment | `bwa-mem3 mem -Y` | `bwa-mem3 mem -Y` |
 | Filter | `--methylation-mode em-seq` | `--methylation-mode taps` |
 
@@ -74,7 +75,7 @@ fgumi extract \
 
 ```bash
 fgumi fastq --input unmapped.bam \
-  | bwa-mem3 mem --meth -p -t 16 ref.fa /dev/stdin \
+  | bwa-mem3 mem --meth --meth-scoring genomic -p -t 16 ref.fa /dev/stdin \
   | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
 ```
 
@@ -167,7 +168,7 @@ Consensus reads are unaligned and must be aligned again. Always pass `-Y`, so th
 
 ```bash
 fgumi fastq --input consensus.bam \
-  | bwa-mem3 mem --meth -p -Y -t 16 ref.fa /dev/stdin \
+  | bwa-mem3 mem --meth --meth-scoring genomic -p -Y -t 16 ref.fa /dev/stdin \
   | fgumi zipper --unmapped consensus.bam --reference ref.fa --output consensus.mapped.bam
 ```
 
@@ -188,11 +189,11 @@ fgumi realign \
   --input consensus.bam \
   --output consensus.mapped.bam \
   --ref ref.fa \
-  --aligner::command "bwa-mem3 mem --bam=0 --meth -p -Y -K 150000000 -t {threads} {ref} /dev/stdin" \
+  --aligner::command "bwa-mem3 mem --bam=0 --meth --meth-scoring genomic -p -Y -K 150000000 -t {threads} {ref} /dev/stdin" \
   --threads 16
 ```
 
-For simplex TAPs reads, and duplex reads of either chemistry, drop `--meth` from the command. `--aligner::preset bwa-mem3 --methylation-mode em-seq` aligns with `--meth` too, but without `-Y`, so the supplementary records it writes are hard-clipped and filter leaves their methylation unchecked; for duplex reads, pass the preset without `--methylation-mode`. `realign` always reverses the per-base tags of reverse-strand reads, methylation counts included, so on this route omit `--reverse-per-base-tags` in Step 7 (filter's end-of-run warning about it is then expected, as for zipper). Its output is in input order, as zipper's is.
+For simplex TAPs reads, and duplex reads of either chemistry, drop `--meth --meth-scoring genomic` from the command. `--aligner::preset bwa-mem3 --methylation-mode em-seq` aligns with `--meth` too, but without `-Y`, so the supplementary records it writes are hard-clipped and filter leaves their methylation unchecked; for duplex reads, pass the preset without `--methylation-mode`. `realign` always reverses the per-base tags of reverse-strand reads, methylation counts included, so on this route omit `--reverse-per-base-tags` in Step 7 (filter's end-of-run warning about it is then expected, as for zipper). Its output is in input order, as zipper's is.
 
 `fgumi runall --realign` runs re-alignment in the same command as grouping and consensus calling (see [Running Pipelines](running-pipelines.md#re-aligning-consensus-reads-with---realign)). Under `--methylation-mode em-seq` it aligns simplex consensus reads bisulfite-aware and duplex consensus reads without `--meth`; this applies to its presets, and an `--aligner::command` runs as written. `--realign` re-aligns after filter, so it does not lift the limit on simplex methylation filters (see [Methylation Filters Skip Unmapped Reads](#methylation-filters-skip-unmapped-reads)): end the run at `consensus` and filter the re-aligned BAM with `fgumi filter`. After `duplex`, filter's methylation options work in the same run.
 
@@ -274,11 +275,11 @@ When the UMIs come from a fixed set (for example a synthesized pool of known seq
 
    ```bash
    fgumi fastq --input corrected.bam \
-     | bwa-mem3 mem --meth -p -t 16 ref.fa /dev/stdin \
+     | bwa-mem3 mem --meth --meth-scoring genomic -p -t 16 ref.fa /dev/stdin \
      | fgumi zipper --unmapped corrected.bam --reference ref.fa --output aligned.bam
    ```
 
-   For TAPs, drop `--meth`.
+   For TAPs, drop `--meth --meth-scoring genomic`.
 4. **Sort through final sort**: Workflow A, Steps 3-8.
 
 ---
