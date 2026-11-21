@@ -54,9 +54,11 @@ use crate::pipeline::core::runtime::elapsed_ns;
 // Re-exports for the rest of the `inproc` module tree: these are the only
 // `bwa_mem3_rs` names it references, and they go through here so `engine.rs`
 // stays the sole module that names the binding crate.
-pub(crate) use bwa_mem3_rs::{BwaIndex, IdBases, MemOpts, RecordOrigin, RecordSink, shm, version};
 #[cfg(test)]
-pub(crate) use bwa_mem3_rs::{MethChem, MethScoring, MethSeedPrune};
+pub(crate) use bwa_mem3_rs::MethSeedPrune;
+pub(crate) use bwa_mem3_rs::{
+    BwaIndex, IdBases, MemOpts, MethChem, MethScoring, RecordOrigin, RecordSink, shm, version,
+};
 
 // ---------------------------------------------------------------------------
 // Borrowed input batch (fgumi side)

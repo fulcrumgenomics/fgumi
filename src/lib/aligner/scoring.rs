@@ -20,17 +20,24 @@ pub(crate) struct BwaScoring {
     pub(crate) o_ins: i32,
     /// Insertion extension penalty (`-E`, second value).
     pub(crate) e_ins: i32,
+    /// Score of an aligned base whose only difference from the reference is a
+    /// conversion the aligner freed (`--meth`'s C->T / G->A cell): `a` under
+    /// collapsed and genomic scoring, 0 under neutral (bwa-mem3's
+    /// `mem_opt_fill_meth_mat`). Unused without `--meth`, where it is `a`.
+    pub(crate) conversion: i32,
 }
 
 impl Default for BwaScoring {
     /// bwa-mem3 defaults: `-A 1 -B 4 -O 6,6 -E 1,1`.
     fn default() -> Self {
-        Self { a: 1, b: 4, o_del: 6, e_del: 1, o_ins: 6, e_ins: 1 }
+        Self { a: 1, b: 4, o_del: 6, e_del: 1, o_ins: 6, e_ins: 1, conversion: 1 }
     }
 }
 
-/// bwa-mem3's `--meth-scoring` modes. Only `Collapsed` changes the scoring this
-/// module models (its `-B 2`); `Genomic` and `Neutral` keep bwa's `-B`.
+/// bwa-mem3's `--meth-scoring` modes. `Collapsed` sets `-B 2` and `Genomic`
+/// keeps bwa's `-B`; both score a freed conversion as a match (`a`). `Neutral`
+/// keeps bwa's `-B` and scores a freed conversion 0 (neither rewarded nor
+/// penalised), which [`BwaScoring::conversion`] models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MethScoring {
     Collapsed,
@@ -47,7 +54,8 @@ struct ScoringWords<'a> {
     extend: Option<(i32, i32)>,
     /// `-x <mode>`.
     mode: Option<&'a str>,
-    /// `--meth` (`Some(false)`) or `--meth=taps` (`Some(true)`).
+    /// `--meth` (`Some(false)`) or a TAPS chemistry, `--meth=taps|5base|5-base`
+    /// (`Some(true)`).
     meth_taps: Option<bool>,
     meth_scoring: Option<MethScoring>,
 }
@@ -66,10 +74,12 @@ impl BwaScoring {
     ///   override, unless an `-x` preset is given (bwa then skips that scaling).
     /// - `-x intractg|pacbio|pbref|ont2d`, whose presets set `-B`/`-O`/`-E` (as
     ///   absolute values) where those options are not given.
-    /// - `--meth` / `--meth=emseq|em-seq|bisulfite|taps` and `--meth-scoring
-    ///   collapsed|genomic|neutral`: bisulfite alignment with collapsed scoring
-    ///   (the default, except for `--meth=taps`, whose default is neutral) sets
-    ///   `-B 2` (scaled by `-A`) unless `-B` is given.
+    /// - `--meth` / `--meth=emseq|em-seq|bisulfite|taps|5base|5-base` and
+    ///   `--meth-scoring collapsed|genomic|neutral`: bisulfite alignment with
+    ///   collapsed scoring (the default, except for the TAPS chemistries `taps`,
+    ///   `5base` and `5-base`, whose default is neutral) sets `-B 2` (scaled by
+    ///   `-A`) unless `-B` is given; neutral scoring scores a freed conversion 0
+    ///   ([`BwaScoring::conversion`]).
     ///
     /// A value that does not parse is ignored, as is an unknown `-x` mode. Words
     /// are split on whitespace without interpreting shell quoting, so an
@@ -83,7 +93,7 @@ impl BwaScoring {
         while at < words.len() {
             let word = words[at];
             if let Some(chem) = word.strip_prefix("--meth=") {
-                set.meth_taps = Some(chem == "taps");
+                set.meth_taps = Some(matches!(chem, "taps" | "5base" | "5-base"));
             } else if word == "--meth" {
                 set.meth_taps = Some(false);
             } else if let Some(rest) = word.strip_prefix("--meth-scoring") {
@@ -160,23 +170,29 @@ impl BwaScoring {
             }
             _ => {}
         }
+        let mut conversion = a;
         if let Some(taps) = set.meth_taps {
             let default_mode = if taps { MethScoring::Neutral } else { MethScoring::Collapsed };
-            if set.meth_scoring.unwrap_or(default_mode) == MethScoring::Collapsed && set.b.is_none()
-            {
-                b = Self::METH_MISMATCH * a;
+            match set.meth_scoring.unwrap_or(default_mode) {
+                MethScoring::Collapsed if set.b.is_none() => b = Self::METH_MISMATCH * a,
+                MethScoring::Neutral => conversion = 0,
+                MethScoring::Collapsed | MethScoring::Genomic => {}
             }
         }
-        Self { a, b, o_del, e_del, o_ins, e_ins }
+        Self { a, b, o_del, e_del, o_ins, e_ins, conversion }
     }
 
-    /// Scores an alignment from its BAM CIGAR ops and the number of mismatching
-    /// aligned bases: `a` per matching aligned base, `-b` per mismatch, and
-    /// `-(o + e * len)` per insertion or deletion run. Clipped bases score 0, and
+    /// Scores an alignment from its BAM CIGAR ops, the number of mismatching
+    /// aligned bases, and the number of aligned bases whose only difference from
+    /// the reference is a conversion `--meth` freed (which bwa's `NM`, and so
+    /// `mismatches`, does not count): `a` per matching aligned base,
+    /// [`Self::conversion`] per conversion, `-b` per mismatch, and
+    /// `-(o + e * len)` per insertion or deletion run. `conversions` is clamped
+    /// to the aligned bases left after the mismatches. Clipped bases score 0, and
     /// so does an alignment whose total is negative: bwa never reports a
     /// negative `AS`.
     #[must_use]
-    pub(crate) fn score(&self, ops: &[u32], mismatches: u32) -> i32 {
+    pub(crate) fn score(&self, ops: &[u32], mismatches: u32, conversions: u32) -> i32 {
         let mut aligned: i64 = 0;
         let mut penalty: i64 = 0;
         for &op in ops {
@@ -189,8 +205,11 @@ impl BwaScoring {
             }
         }
         let mismatches = i64::from(mismatches).min(aligned);
-        let score =
-            (aligned - mismatches) * i64::from(self.a) - mismatches * i64::from(self.b) - penalty;
+        let conversions = i64::from(conversions).min(aligned - mismatches);
+        let score = (aligned - mismatches - conversions) * i64::from(self.a)
+            + conversions * i64::from(self.conversion)
+            - mismatches * i64::from(self.b)
+            - penalty;
         i32::try_from(score.max(0)).unwrap_or(i32::MAX)
     }
 }
@@ -246,7 +265,8 @@ mod tests {
 
     use super::*;
 
-    const D: BwaScoring = BwaScoring { a: 1, b: 4, o_del: 6, e_del: 1, o_ins: 6, e_ins: 1 };
+    const D: BwaScoring =
+        BwaScoring { a: 1, b: 4, o_del: 6, e_del: 1, o_ins: 6, e_ins: 1, conversion: 1 };
 
     /// The scoring read from a bwa-mem3 command line.
     #[rstest]
@@ -254,11 +274,11 @@ mod tests {
     #[case::mismatch("bwa-mem3 mem -B 6 ref.fa -", BwaScoring { b: 6, ..D })]
     #[case::attached_values(
         "bwa mem -A2 -B3 -O5,7 -E2 ref.fa -",
-        BwaScoring { a: 2, b: 3, o_del: 5, e_del: 2, o_ins: 7, e_ins: 2 }
+        BwaScoring { a: 2, b: 3, o_del: 5, e_del: 2, o_ins: 7, e_ins: 2, conversion: 2 }
     )]
     #[case::match_scales_defaults(
         "bwa mem -A 2 ref.fa -",
-        BwaScoring { a: 2, b: 8, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2 }
+        BwaScoring { a: 2, b: 8, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2, conversion: 2 }
     )]
     #[case::single_gap_values(
         "bwa mem -O 5 -E 3 ref.fa -",
@@ -273,16 +293,40 @@ mod tests {
     #[case::meth_emseq_chemistry("bwa-mem3 mem --meth=emseq ref.fa -", BwaScoring { b: 2, ..D })]
     #[case::meth_scaled_by_match(
         "bwa-mem3 mem --meth -A 2 ref.fa -",
-        BwaScoring { a: 2, b: 4, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2 }
+        BwaScoring { a: 2, b: 4, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2, conversion: 2 }
     )]
     #[case::meth_explicit_mismatch("bwa-mem3 mem --meth -B 3 ref.fa -", BwaScoring { b: 3, ..D })]
     #[case::meth_genomic("bwa-mem3 mem --meth --meth-scoring genomic ref.fa -", D)]
-    #[case::meth_neutral_attached("bwa-mem3 mem --meth --meth-scoring=neutral ref.fa -", D)]
+    #[case::meth_neutral_attached(
+        "bwa-mem3 mem --meth --meth-scoring=neutral ref.fa -",
+        BwaScoring { conversion: 0, ..D }
+    )]
+    #[case::meth_neutral_scaled_by_match(
+        "bwa-mem3 mem --meth --meth-scoring neutral -A 2 ref.fa -",
+        BwaScoring { a: 2, b: 8, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2, conversion: 0 }
+    )]
     #[case::meth_collapsed_explicit(
         "bwa-mem3 mem --meth --meth-scoring collapsed ref.fa -",
         BwaScoring { b: 2, ..D }
     )]
-    #[case::taps_defaults_to_neutral("bwa-mem3 mem --meth=taps ref.fa -", D)]
+    #[case::taps_defaults_to_neutral(
+        "bwa-mem3 mem --meth=taps ref.fa -",
+        BwaScoring { conversion: 0, ..D }
+    )]
+    #[case::five_base_is_taps("bwa-mem3 mem --meth=5base ref.fa -", BwaScoring { conversion: 0, ..D })]
+    #[case::five_dash_base_is_taps(
+        "bwa-mem3 mem --meth=5-base ref.fa -",
+        BwaScoring { conversion: 0, ..D }
+    )]
+    #[case::taps_explicit_neutral(
+        "bwa-mem3 mem --meth=taps --meth-scoring neutral -B 6 ref.fa -",
+        BwaScoring { b: 6, conversion: 0, ..D }
+    )]
+    #[case::taps_genomic("bwa-mem3 mem --meth=taps --meth-scoring genomic ref.fa -", D)]
+    #[case::five_base_collapsed(
+        "bwa-mem3 mem --meth=5base --meth-scoring collapsed ref.fa -",
+        BwaScoring { b: 2, ..D }
+    )]
     #[case::taps_collapsed(
         "bwa-mem3 mem --meth=taps --meth-scoring collapsed ref.fa -",
         BwaScoring { b: 2, ..D }
@@ -294,17 +338,17 @@ mod tests {
     )]
     #[case::preset_pacbio_attached(
         "bwa-mem3 mem -xpacbio ref.fa -",
-        BwaScoring { a: 1, b: 1, o_del: 1, e_del: 1, o_ins: 1, e_ins: 1 }
+        BwaScoring { a: 1, b: 1, o_del: 1, e_del: 1, o_ins: 1, e_ins: 1, conversion: 1 }
     )]
     #[case::preset_ont2d_explicit_wins(
         "bwa-mem3 mem -x ont2d -B 3 -O 2 ref.fa -",
-        BwaScoring { a: 1, b: 3, o_del: 2, e_del: 1, o_ins: 2, e_ins: 1 }
+        BwaScoring { a: 1, b: 3, o_del: 2, e_del: 1, o_ins: 2, e_ins: 1, conversion: 1 }
     )]
     #[case::preset_unknown("bwa-mem3 mem -x short ref.fa -", D)]
     // Under a preset bwa does not scale by `-A`: intractg leaves `-E` at 1.
     #[case::preset_intractg_with_match_score(
         "bwa-mem3 mem -x intractg -A 2 ref.fa -",
-        BwaScoring { a: 2, b: 9, o_del: 16, e_del: 1, o_ins: 16, e_ins: 1 }
+        BwaScoring { a: 2, b: 9, o_del: 16, e_del: 1, o_ins: 16, e_ins: 1, conversion: 2 }
     )]
     fn from_command_cases(#[case] command: &str, #[case] expected: BwaScoring) {
         assert_eq!(BwaScoring::from_command(command), expected);
@@ -322,7 +366,30 @@ mod tests {
     #[case::negative_clamps_to_zero("20M", 16, 0)]
     fn score_cases(#[case] cigar: &str, #[case] mismatches: u32, #[case] expected: i32) {
         let ops = fgumi_raw_bam::parse_cigar_string_ops(cigar).expect("cigar");
-        assert_eq!(D.score(&ops, mismatches), expected);
+        assert_eq!(D.score(&ops, mismatches, 0), expected);
+    }
+
+    /// A freed conversion scores [`BwaScoring::conversion`]: `a` under collapsed
+    /// (and genomic) scoring, 0 under neutral, where every other column scores
+    /// as without conversions.
+    #[rstest]
+    #[case::collapsed_counts_conversions_as_matches("--meth", "20M", 0, 3, 20)]
+    #[case::genomic_counts_conversions_as_matches("--meth --meth-scoring genomic", "20M", 0, 3, 20)]
+    #[case::neutral_scores_conversions_zero("--meth --meth-scoring neutral", "20M", 0, 3, 17)]
+    #[case::taps_default_is_neutral("--meth=taps", "20M", 0, 3, 17)]
+    #[case::taps_with_mismatch_and_deletion("--meth=taps", "10M2D10M", 1, 2, 5)]
+    #[case::more_conversions_than_aligned_bases("--meth=taps", "20M", 0, 25, 0)]
+    #[case::no_conversions_is_score("--meth=taps", "20M", 1, 0, 15)]
+    fn score_conversions_cases(
+        #[case] meth: &str,
+        #[case] cigar: &str,
+        #[case] mismatches: u32,
+        #[case] conversions: u32,
+        #[case] expected: i32,
+    ) {
+        let scoring = BwaScoring::from_command(&format!("bwa-mem3 mem {meth} ref.fa -"));
+        let ops = fgumi_raw_bam::parse_cigar_string_ops(cigar).expect("cigar");
+        assert_eq!(scoring.score(&ops, mismatches, conversions), expected);
     }
 
     #[rstest]

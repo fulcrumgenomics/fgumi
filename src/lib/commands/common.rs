@@ -27,6 +27,11 @@ use fgumi_umi::IndexThreshold;
 use log::{info, warn};
 use noodles::sam::Header;
 
+/// The `--methylation-mode` value for [`MethylationModeArg::EmSeq`].
+pub(crate) const EM_SEQ_MODE_NAME: &str = "em-seq";
+/// The `--methylation-mode` value for [`MethylationModeArg::Taps`].
+pub(crate) const TAPS_MODE_NAME: &str = "taps";
+
 /// CLI argument value for `--methylation-mode`.
 ///
 /// Maps to [`fgumi_consensus::MethylationMode`] variants (excluding `Disabled`,
@@ -35,11 +40,11 @@ use noodles::sam::Header;
 pub enum MethylationModeArg {
     /// EM-Seq (enzymatic methyl-seq): unmethylated C is converted to T.
     /// C in read at ref-C = methylated (protected); T = unmethylated (converted).
-    #[value(name = "em-seq")]
+    #[value(name = EM_SEQ_MODE_NAME)]
     EmSeq,
     /// TAPs/Illumina 5-base: methylated C is converted to T.
     /// C in read at ref-C = unmethylated (not a target); T = methylated (converted).
-    #[value(name = "taps")]
+    #[value(name = TAPS_MODE_NAME)]
     Taps,
 }
 

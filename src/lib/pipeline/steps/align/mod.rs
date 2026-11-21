@@ -256,9 +256,10 @@ impl Ordered for ZipperBatch {
 /// [`Self::get_or_load`]: the first stage loads, later stages with the same key
 /// share its `Arc`. A different key (another reference, or the `--meth` seed
 /// index) replaces the cached index, while a backend that already holds the
-/// old `Arc` keeps it: duplex consensus under `--methylation-mode em-seq`, whose
-/// `Align` stage loads the `--meth` dual index and whose `Realign` stage loads
-/// the plain one, holds both for the whole run.
+/// old `Arc` keeps it: duplex consensus under `--methylation-mode em-seq` or
+/// `taps`, whose `Align` stage loads the `--meth` dual index (aligning with
+/// `--meth` or `--meth=taps`) and whose `Realign` stage loads the plain one,
+/// holds both for the whole run.
 ///
 /// Generic over the index type so the sharing is testable without a real
 /// bwa-mem3 index; only the in-process backend instantiates it.
@@ -342,9 +343,10 @@ pub(crate) struct AlignWiringCtx {
     pub(crate) merge: Arc<merge::MergeConfig>,
     /// The chain's one shared in-process index (see [`SharedIndex`]), so an
     /// `Align` and a `Realign` stage in one chain load it once when they align
-    /// with the same index. Duplex consensus under `--methylation-mode em-seq` is
-    /// the exception: `Align` loads the `bwa-mem3 index --meth` dual index and
-    /// `Realign` the plain one, so both stay resident for the whole run.
+    /// with the same index. Duplex consensus under `--methylation-mode em-seq` or
+    /// `taps` is the exception: `Align` loads the `bwa-mem3 index --meth` dual
+    /// index (for `--meth` or `--meth=taps`) and `Realign` the plain one, so both
+    /// stay resident for the whole run.
     #[cfg(feature = "aligner-bwa-mem3")]
     pub(crate) index: Arc<SharedIndex<inproc::engine::BwaIndex>>,
 }
@@ -611,10 +613,10 @@ pub(crate) fn merge_aligner_header(partial: &Header, aligner: &Header) -> Header
 
 /// The scoring `resolved` aligns with, which the realign stage recomputes a
 /// promoted alignment's `AS` with: for the in-process backend, the `MemOpts` it
-/// builds (with `--meth`'s defaults under EM-seq); for a subprocess backend
-/// (preset or `--aligner::command`), what its command line sets
-/// ([`BwaScoring::from_command`]), which for a preset is bwa-mem3's defaults or,
-/// with `--meth`, its bisulfite defaults.
+/// builds (with `--meth`'s defaults under EM-seq, `--meth=taps`'s under TAPS);
+/// for a subprocess backend (preset or `--aligner::command`), what its command
+/// line sets ([`BwaScoring::from_command`]), which for a preset is bwa-mem3's
+/// defaults or, with `--meth` / `--meth=taps`, its bisulfite defaults.
 ///
 /// # Errors
 ///
@@ -681,7 +683,8 @@ mod tests {
     }
 
     /// A subprocess preset scores with bwa-mem3's defaults (`--meth`'s under
-    /// EM-seq); `--aligner::command` with the scoring options it passes.
+    /// EM-seq, `--meth=taps`'s under TAPS); `--aligner::command` with the scoring
+    /// options it passes.
     #[rstest::rstest]
     #[case::preset(
         "bwa-mem3 mem -t 4 -p -K 150000000 -Y ref.fa /dev/stdin -h 5,200",
@@ -692,6 +695,11 @@ mod tests {
         "bwa-mem3 mem --meth -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
         true,
         BwaScoring { b: 2, ..BwaScoring::default() }
+    )]
+    #[case::preset_meth_taps(
+        "bwa-mem3 mem --meth=taps -t 4 -p -K 150000000 -Y ref.fa /dev/stdin",
+        true,
+        BwaScoring { conversion: 0, ..BwaScoring::default() }
     )]
     #[case::command_defaults("bwa mem -p ref.fa /dev/stdin", false, BwaScoring::default())]
     #[case::command_options(
@@ -718,11 +726,15 @@ mod tests {
     }
 
     /// The in-process backend scores with its own `MemOpts`, which under EM-seq
-    /// matches what the subprocess preset's `--meth` gives.
+    /// and TAPS matches what the subprocess preset's `--meth` / `--meth=taps`
+    /// gives.
     #[cfg(feature = "aligner-bwa-mem3")]
     #[rstest::rstest]
     #[case::plain(fgumi_consensus::MethylationMode::Disabled, BwaScoring::default())]
-    #[case::taps(fgumi_consensus::MethylationMode::Taps, BwaScoring::default())]
+    #[case::taps(
+        fgumi_consensus::MethylationMode::Taps,
+        BwaScoring { conversion: 0, ..BwaScoring::default() }
+    )]
     #[case::emseq(
         fgumi_consensus::MethylationMode::EmSeq,
         BwaScoring { b: 2, ..BwaScoring::default() }

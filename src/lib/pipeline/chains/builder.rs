@@ -719,8 +719,8 @@ pub struct ChainBuilder<'a> {
     /// The chain's one in-process bwa-mem3 index, shared by every in-process
     /// align-like stage it wires (`Align` and `Realign`), so a chain holding
     /// both loads the index once (see [`SharedIndex`]) when both align with the
-    /// same index. For duplex consensus under `--methylation-mode em-seq`, `Align`
-    /// loads the `--meth` dual index and `Realign` the plain one, so both are
+    /// same index. For duplex consensus under `--methylation-mode` (em-seq or
+    /// taps), `Align` loads the `--meth` dual index and `Realign` the plain one, so both are
     /// resident for the whole run.
     ///
     /// [`SharedIndex`]: crate::pipeline::steps::align::SharedIndex
