@@ -99,6 +99,60 @@ Cell barcodes are detected automatically across the entire pipeline — no addit
 needed. The consensus callers validate that all source reads in a group share the same cell
 barcode and propagate it to the output consensus read.
 
+## Single-End Reads
+
+A single-end (unpaired) read is grouped by its unclipped 5' position only, as in fgbio's
+`GroupReadsByUmi`: its length mostly reflects trimming and base quality, not the molecule, so its
+aligned 3' end would split real families.
+
+When single-end reads span the whole insert (e.g. reads that run through to the adapter, or
+small-RNA reads), the far end of the insert is a real molecular coordinate. A tool upstream of
+`fgumi group` or `fgumi dedup` can record it in a `tc` tag on the read's primary record, written
+as the template coordinate of a read pair spanning the same insert. The tag must be a `B:i` array
+of six values `[tid1,pos1,neg1,tid2,pos2,neg2]` with 1-based positions (other integer array
+subtypes, such as `B:S`, are rejected):
+
+- one slot is the read itself: its reference, its unclipped 5' position and its strand;
+- the other slot is a "virtual mate": the same reference, the opposite strand, and the insert's
+  far end as that mate's unclipped 5' position. It must lie at or beyond the read's aligned
+  extent (clips excluded): for a forward read, at or after the read's aligned end (its last
+  aligned reference base); for a reverse read, at or before its aligned start.
+
+For example, a forward 50M read aligned at 1-based position 100 (aligned end 149) of an insert
+ending at 300 on reference 0 carries `tc:B:i,0,100,0,0,300,1`.
+
+Reads at the same 5' position whose insert ends differ are then never assigned the same `MI`,
+with or without `--no-umi`. The tag does not change the position grouping or the
+template-coordinate sort, which still key the read by its 5' end.
+
+The hint is read only from a mapped, unpaired, primary record. It is not used as a hint, and the
+read is grouped by its 5' end only, when:
+
+- the record is paired, secondary, supplementary or unmapped;
+- the record has no `tc` tag, or its tag has one primary (`[tid,pos,neg,2147483647,2147483647,0]`,
+  or the legacy form with the read in both slots).
+
+A `tc` tag on a mapped, unpaired primary is instead **rejected**, and the read is likewise grouped
+by its 5' end only, when:
+
+- it is not a `B:i` array of six values;
+- neither slot is the read's own reference, unclipped 5' position and strand (e.g. a tag written
+  with 0-based positions), or the read has no unclipped 5' position (an empty CIGAR);
+- the virtual mate is on another reference, on the read's own strand, at an unknown or negative
+  position, or not at or beyond the read's aligned extent (e.g. inside the read, or before a
+  forward read's 5' end).
+
+`group` and `dedup` warn about the first rejected tag of a run, naming the read and the reason,
+and log how many tags were rejected at the end of the run. A read without a usable tag has no
+known insert end and is never grouped with a read that has one, even at the same 5' position and
+with the same UMI.
+
+On secondary and supplementary records, `tc` keeps its meaning as `fgumi zipper`'s
+template-coordinate key, which the sort and grouping use to place the record with its primary.
+An upstream tool must therefore **not** copy the two-slot virtual-mate form onto a single-end
+read's secondary or supplementary records: they would sort and group away from their primary,
+and `dedup` would drop them.
+
 ## Metrics Output
 
 `fgumi group` can emit three types of metrics files. They can be specified individually or all at

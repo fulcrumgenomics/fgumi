@@ -16,8 +16,12 @@ pub use fgumi_umi::assigner::{
 pub mod parallel_assigner;
 pub mod read_name;
 
+use crate::template::Template;
 use anyhow::{Result, bail};
+use fgumi_raw_bam::SingleEndInsertEnd;
+use log::warn;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Prefix of the error `group` and `dedup` report when UMI assignment fails for a
 /// position group (e.g. mixed UMI lengths, or an unparseable UMI for the strategy).
@@ -161,6 +165,116 @@ pub(crate) fn assign_umis(
     Ok(assignments)
 }
 
+/// The single-end insert-end hints (`tc` tags on unpaired primaries) that
+/// [`partition_for_umi_assignment`] rejected; see [`Template::single_end_insert_end`].
+///
+/// A rejected hint is not an error: the read is grouped by its 5' end only, as without a
+/// tag. It usually means the upstream tool wrote the tag wrongly (e.g. 0-based), so `group`
+/// and `dedup` warn once per run with the first rejected read and log the run's total.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RejectedInsertEndHints {
+    /// Templates whose hint was rejected.
+    pub(crate) count: u64,
+    /// The first rejected template's read name and the reason it was rejected.
+    pub(crate) first: Option<(Vec<u8>, &'static str)>,
+}
+
+impl RejectedInsertEndHints {
+    /// Records one rejected hint, on the template named `name`, for `reason`.
+    fn record(&mut self, name: &[u8], reason: &'static str) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((name.to_vec(), reason));
+        }
+    }
+
+    /// Warns about the first rejected hint, unless `warned` (the run's flag) says a warning
+    /// was already logged. Called after each position group, so a run warns at most once.
+    pub(crate) fn warn_first_once(&self, warned: &AtomicBool) {
+        if let Some((name, reason)) = &self.first
+            && !warned.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                "Ignoring the tc insert-end hint on single-end read {}: {reason}. Reads whose \
+                 hint is rejected are grouped by their 5' end only; the run's total is logged \
+                 at the end. See the \"Single-End Reads\" section of the UMI grouping guide.",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+}
+
+/// Logs the run's total of rejected single-end insert-end hints, when there were any.
+pub(crate) fn log_rejected_insert_end_hints(total: u64) {
+    if total > 0 {
+        warn!(
+            "Rejected the tc insert-end hint on {total} single-end reads; they were grouped by \
+             their 5' end only."
+        );
+    }
+}
+
+/// The key [`partition_for_umi_assignment`] splits templates by: the pair orientation (when
+/// split by orientation) and the single-end insert end `(tid, 1-based position, is_reverse)`.
+type AssignmentSubgroupKey = (Option<(bool, bool)>, Option<(i32, i32, bool)>);
+
+/// Partitions a position group's templates into the subgroups `group` and `dedup` assign
+/// molecule ids in separately, returning each subgroup's template indices, in input order.
+///
+/// Templates are split:
+///
+/// - by pair orientation ([`Template::pair_strand_orientation`]), when `split_by_orientation`. Each
+///   command decides whether to split by orientation (see `group::assign_umi_groups_impl` and
+///   `dedup::splits_by_strand_of_origin`);
+/// - always, by the single-end insert end ([`Template::single_end_insert_end`]): single-end
+///   reads at the same 5' position whose insert ends differ come from different molecules,
+///   whatever their UMIs. A template without a valid insert end (every paired template, and
+///   every single-end template without a `tc` tag or whose tag is rejected) has insert end
+///   `None`, so it is never grouped with a single-end template that has one. Rejected tags
+///   are recorded in `rejected`.
+///
+/// The position key and the template-coordinate sort stay 5'-only; splitting here, inside the
+/// position group, is what lets reads whose insert ends differ interleave in the input without
+/// splitting molecules.
+///
+/// Subgroups are returned in ascending `(orientation, insert end)` order (a `None` insert end
+/// first), so molecule ids are reproducible. When every template has the same key (the common
+/// case, e.g. no orientation split and no insert ends), the result is one subgroup of every
+/// index, exactly as without partitioning.
+pub(crate) fn partition_for_umi_assignment(
+    templates: &[Template],
+    split_by_orientation: bool,
+    rejected: &mut RejectedInsertEndHints,
+) -> Vec<Vec<usize>> {
+    let keys: Vec<AssignmentSubgroupKey> = templates
+        .iter()
+        .map(|template| {
+            let insert_end = match template.single_end_insert_end() {
+                SingleEndInsertEnd::End(end) => Some(end),
+                SingleEndInsertEnd::NotApplicable => None,
+                SingleEndInsertEnd::Rejected(reason) => {
+                    rejected.record(template.name(), reason);
+                    None
+                }
+            };
+            (split_by_orientation.then(|| template.pair_strand_orientation()), insert_end)
+        })
+        .collect();
+
+    // Common case: one subgroup, without building a map.
+    if let Some(first) = keys.first()
+        && keys.iter().all(|key| key == first)
+    {
+        return vec![(0..templates.len()).collect()];
+    }
+
+    let mut subgroups: BTreeMap<AssignmentSubgroupKey, Vec<usize>> = BTreeMap::new();
+    for (idx, key) in keys.into_iter().enumerate() {
+        subgroups.entry(key).or_default().push(idx);
+    }
+    subgroups.into_values().collect()
+}
+
 /// Splits the indices of bases-only `umis`, each at least `len` bases long, by their first
 /// `len` bases, in ascending key order. Returns `None`, without allocating, when every UMI
 /// shares the same first `len` bases (one split).
@@ -174,6 +288,58 @@ fn split_by_prefix(umis: &[String], len: usize) -> Option<Vec<Vec<usize>>> {
         by_prefix.entry(&umi[..len]).or_default().push(i);
     }
     Some(by_prefix.into_values().collect())
+}
+
+/// Test helpers shared by the `group` and `dedup` unit tests of single-end insert-end grouping.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::sam::SamTag;
+    use crate::template::Template;
+    use crate::umi::MoleculeId;
+    use fgumi_raw_bam::{SamBuilder, flags, testutil::encode_op};
+
+    /// An unpaired, 50-base (`50M`) single-end template named `name` aligned at 1-based
+    /// position 100 on reference 0 with UMI `umi`, on the reverse strand when `reverse`. Its
+    /// unclipped 5' position is 100 forward and 149 reverse. When `insert_end` is `Some(end)`,
+    /// its primary carries a `tc` tag whose virtual mate (opposite strand) places the
+    /// insert's far end at `end`.
+    pub(crate) fn single_end_template(
+        name: &str,
+        umi: &str,
+        reverse: bool,
+        insert_end: Option<i32>,
+    ) -> Template {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(if reverse { flags::REVERSE } else { 0 })
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 50)])
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50]);
+        b.add_string_tag(SamTag::RX, umi.as_bytes());
+        if let Some(end) = insert_end {
+            let tc = if reverse { [0, end, 0, 0, 149, 1] } else { [0, 100, 0, 0, end, 1] };
+            b.add_array_i32(SamTag::TC, &tc);
+        }
+        Template::from_records(vec![b.build()]).expect("single-end template")
+    }
+
+    /// Relabels molecule ids by first appearance, so `[7, 3, 7]` becomes `[0, 1, 0]`.
+    pub(crate) fn molecule_classes(templates: &[Template]) -> Vec<usize> {
+        let mut seen: Vec<MoleculeId> = Vec::new();
+        templates
+            .iter()
+            .map(|t| {
+                assert!(t.mi.is_assigned(), "every template is assigned a molecule");
+                seen.iter().position(|mi| *mi == t.mi).unwrap_or_else(|| {
+                    seen.push(t.mi);
+                    seen.len() - 1
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -403,5 +569,160 @@ mod tests {
             io.to_string(),
             "Failed to assign UMI groups: outer: Multiple UMI lengths: 3, 4"
         );
+    }
+
+    // ========================================================================
+    // partition_for_umi_assignment
+    // ========================================================================
+
+    use crate::umi::test_support::single_end_template;
+
+    /// A forward/reverse paired template named `name` at 1-based 100 (R1) and 300 (R2), with
+    /// R1 on the reverse strand when `r1_reverse` (R2 then forward).
+    fn paired_template(name: &str, r1_reverse: bool) -> Template {
+        use fgumi_raw_bam::{SamBuilder, flags, testutil::encode_op};
+        let build = |first: bool, reverse: bool, pos: i32, mate_pos: i32, mate_reverse: bool| {
+            let mut f =
+                flags::PAIRED | if first { flags::FIRST_SEGMENT } else { flags::LAST_SEGMENT };
+            if reverse {
+                f |= flags::REVERSE;
+            }
+            if mate_reverse {
+                f |= flags::MATE_REVERSE;
+            }
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(f)
+                .ref_id(0)
+                .pos(pos - 1)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 50)])
+                .sequence(&[b'A'; 50])
+                .qualities(&[30; 50])
+                .mate_ref_id(0)
+                .mate_pos(mate_pos - 1);
+            b.add_string_tag(crate::sam::SamTag::RX, b"AAAA");
+            b.add_string_tag(crate::sam::SamTag::MC, b"50M");
+            b.build()
+        };
+        Template::from_records(vec![
+            build(true, r1_reverse, 100, 300, !r1_reverse),
+            build(false, !r1_reverse, 300, 100, r1_reverse),
+        ])
+        .expect("paired template")
+    }
+
+    /// One input template for [`test_partition_for_umi_assignment`].
+    #[derive(Clone, Copy, Debug)]
+    enum Input {
+        /// A single-end template: reverse strand when `true`, and its `tc` insert end.
+        SingleEnd(bool, Option<i32>),
+        /// A paired template with R1 on the reverse strand when `true`.
+        Paired(bool),
+    }
+
+    /// Subgroups come back in ascending `(orientation, insert end)` order: orientation
+    /// `(r1_positive, r2_positive)` with `false` (reverse) before `true`, then a `None` insert
+    /// end before any `Some`. Each subgroup's indices are in input order.
+    #[rstest]
+    #[case::one_subgroup_when_all_keys_equal(
+        &[Input::SingleEnd(false, None), Input::SingleEnd(false, None)],
+        false,
+        vec![vec![0, 1]]
+    )]
+    #[case::insert_ends_ascending_none_first(
+        &[
+            Input::SingleEnd(false, Some(300)),
+            Input::SingleEnd(false, None),
+            Input::SingleEnd(false, Some(250)),
+            Input::SingleEnd(false, Some(300)),
+            Input::SingleEnd(false, None),
+        ],
+        false,
+        vec![vec![1, 4], vec![2], vec![0, 3]]
+    )]
+    #[case::forward_and_reverse_without_orientation_split(
+        &[
+            Input::SingleEnd(true, Some(20)),
+            Input::SingleEnd(false, Some(300)),
+            Input::SingleEnd(true, None),
+            Input::SingleEnd(true, Some(50)),
+            Input::SingleEnd(false, None),
+        ],
+        false,
+        vec![vec![2, 4], vec![0], vec![3], vec![1]]
+    )]
+    #[case::forward_and_reverse_with_orientation_split(
+        &[
+            Input::SingleEnd(true, Some(20)),
+            Input::SingleEnd(false, Some(300)),
+            Input::SingleEnd(true, None),
+            Input::SingleEnd(true, Some(50)),
+            Input::SingleEnd(false, None),
+        ],
+        true,
+        vec![vec![2], vec![0], vec![3], vec![4], vec![1]]
+    )]
+    #[case::paired_and_single_end_with_orientation_split(
+        &[
+            Input::Paired(false),
+            Input::SingleEnd(false, Some(300)),
+            Input::Paired(true),
+            Input::SingleEnd(false, None),
+            Input::Paired(false),
+        ],
+        true,
+        vec![vec![2], vec![0, 4], vec![3], vec![1]]
+    )]
+    #[case::paired_and_single_end_without_orientation_split(
+        &[
+            Input::Paired(false),
+            Input::SingleEnd(false, Some(300)),
+            Input::Paired(true),
+            Input::SingleEnd(false, None),
+        ],
+        false,
+        vec![vec![0, 2, 3], vec![1]]
+    )]
+    #[case::empty(&[], true, vec![])]
+    fn test_partition_for_umi_assignment(
+        #[case] inputs: &[Input],
+        #[case] split_by_orientation: bool,
+        #[case] expected: Vec<Vec<usize>>,
+    ) {
+        let templates: Vec<Template> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| match *input {
+                Input::SingleEnd(reverse, end) => {
+                    single_end_template(&format!("q{i}"), "AAAA", reverse, end)
+                }
+                Input::Paired(r1_reverse) => paired_template(&format!("q{i}"), r1_reverse),
+            })
+            .collect();
+        let mut rejected = RejectedInsertEndHints::default();
+        let actual = partition_for_umi_assignment(&templates, split_by_orientation, &mut rejected);
+        assert_eq!(actual, expected);
+        assert_eq!(rejected, RejectedInsertEndHints::default(), "no hint is rejected");
+    }
+
+    /// A rejected hint is counted, its first template named, and the template partitioned as
+    /// if it had no insert end.
+    #[test]
+    fn test_partition_for_umi_assignment_counts_rejected_hints() {
+        let templates = vec![
+            single_end_template("valid", "AAAA", false, Some(300)),
+            // The far end lies inside the read (aligned 100-149), so the hint is rejected.
+            single_end_template("inside", "AAAA", false, Some(120)),
+            single_end_template("untagged", "AAAA", false, None),
+            single_end_template("inside2", "AAAA", false, Some(110)),
+        ];
+        let mut rejected = RejectedInsertEndHints::default();
+        let actual = partition_for_umi_assignment(&templates, false, &mut rejected);
+        assert_eq!(actual, vec![vec![1, 2, 3], vec![0]]);
+        assert_eq!(rejected.count, 2);
+        let (name, reason) = rejected.first.expect("a rejection is recorded");
+        assert_eq!(name, b"inside");
+        assert!(reason.contains("not at or beyond the read's aligned extent"), "reason: {reason}");
     }
 }

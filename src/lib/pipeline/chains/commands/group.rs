@@ -79,6 +79,7 @@ impl FinalizeHook for GroupFinalizeHook {
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::new();
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::new();
         let mut total_filter_counts = TemplateFilterCounts::new();
+        let mut rejected_insert_end_hints: u64 = 0;
         for slot in accumulators.slots() {
             let acc = slot.lock();
             for (&size, &count) in &acc.family_sizes {
@@ -88,12 +89,14 @@ impl FinalizeHook for GroupFinalizeHook {
                 *position_group_size_counter.entry(size).or_insert(0) += count;
             }
             total_filter_counts.merge(&acc.filter_counts);
+            rejected_insert_end_hints += acc.rejected_insert_end_hints;
         }
 
         let metrics = build_grouping_metrics(&total_filter_counts, &family_size_counter);
 
         // Log summary banner (verbatim from the original execute).
         log_umi_grouping_summary(&metrics);
+        crate::umi::log_rejected_insert_end_hints(rejected_insert_end_hints);
 
         // Write individual flag outputs and --metrics prefix outputs when any
         // output path was requested.
@@ -167,6 +170,8 @@ pub(crate) fn build_group_process_step(
     // Name the contigs once for the whole run, not once per batch.
     let realign_contigs = realign_window_header
         .map(|h| Arc::new(crate::realign::window_group::ContigNames::from_header(&h)));
+    // One run-wide flag, so a rejected single-end insert-end hint is warned about once.
+    let insert_end_hint_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
     process_ordered::<BatchedRawPositionGroups, BatchedProcessedPositionGroups, _>(
         "GroupProcess",
         limit_bytes,
@@ -248,21 +253,25 @@ pub(crate) fn build_group_process_step(
                 assigner.reset();
 
                 let mut templates = filtered_templates;
-                if let Err(e) = assign_umi_groups_impl(
+                let rejected_hints = match assign_umi_groups_impl(
                     &mut templates,
                     assigner,
                     raw_tag,
                     filter_config.min_umi_length,
                     no_umi,
                 ) {
-                    // A failed assignment means this position group's reads cannot be
-                    // grouped at all — an unparseable UMI for the chosen strategy, a
-                    // missing `RX` tag, mixed UMI lengths. Substituting an empty group
-                    // would silently drop every read in it and still exit 0, so fail
-                    // the run and let the user fix the input or the strategy. (Matches
-                    // the non-chain `Group::execute` path.)
-                    return Err(crate::umi::assign_umi_groups_error(&e));
-                }
+                    Ok(rejected_hints) => rejected_hints,
+                    Err(e) => {
+                        // A failed assignment means this position group's reads cannot be
+                        // grouped at all — an unparseable UMI for the chosen strategy, a
+                        // missing `RX` tag, mixed UMI lengths. Substituting an empty group
+                        // would silently drop every read in it and still exit 0, so fail
+                        // the run and let the user fix the input or the strategy. (Matches
+                        // the non-chain `Group::execute` path.)
+                        return Err(crate::umi::assign_umi_groups_error(&e));
+                    }
+                };
+                rejected_hints.warn_first_once(&insert_end_hint_warned);
 
                 let distinct_mi_count: u64 =
                     templates.iter().filter_map(|t| t.mi.id()).max().map_or(0, |max_id| max_id + 1);
@@ -301,6 +310,7 @@ pub(crate) fn build_group_process_step(
                 }
                 accumulators.with_slot(|acc| {
                     acc.record_group(family_sizes.clone(), &filter_counts);
+                    acc.rejected_insert_end_hints += rejected_hints.count;
                 });
 
                 // T1 fused inline-metrics tap: when a downstream consensus
