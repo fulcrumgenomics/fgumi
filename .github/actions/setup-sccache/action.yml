@@ -1,0 +1,38 @@
+name: Set up sccache
+description: >-
+  Install a pinned sccache and start its server against the GitHub Actions
+  cache, then route rustc through it. When the server cannot start, build
+  uncached instead of failing.
+
+# sccache is pinned: sccache-action otherwise installs the latest release, and
+# sccache v0.20.0 (released 2026-11-23) made this server time out at startup
+# ("Timed out waiting for server startup") in a large share of jobs, where
+# v0.19.0 started reliably. Bump `version` deliberately, watching CI for
+# startup warnings from the step below.
+#
+# The fallback is defense in depth for any server that will not start: every
+# rustc it wraps would fail, including the `rustc -vV` probe that `cargo
+# metadata` runs, so a cache problem would fail builds that need no cache.
+# `SCCACHE_IGNORE_SERVER_IO_ERROR` does not help: it covers errors reading a
+# compile response, not a server that never starts (`connect_or_start_server`
+# in sccache's src/commands.rs bails).
+#
+# So `RUSTC_WRAPPER` is set here, through `$GITHUB_ENV`, and only after the
+# server has started; a failed start sets it empty, which cargo reads as "no
+# wrapper". Workflows should not set `RUSTC_WRAPPER` or `SCCACHE_GHA_ENABLED`
+# themselves, and never in a step's `env:`, which takes precedence over
+# `$GITHUB_ENV` and would defeat the fallback.
+#
+# Only the server start falls back. A failed install still fails the job: the
+# action's post step runs `sccache --show-stats` and fails without a binary.
+
+runs:
+  using: composite
+  steps:
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v0.19.0
+    - name: Start the sccache server, or fall back to an uncached build
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/start-server.sh"

@@ -26,11 +26,11 @@ concurrency:
   group: nightly-stress-tests
   cancel-in-progress: false
 
+# RUSTC_WRAPPER and SCCACHE_GHA_ENABLED are set by ./.github/actions/setup-sccache;
+# do not set them here or in a step `env:` (see that action).
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   stress-tests:
@@ -47,7 +47,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       - name: Install nextest
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
