@@ -57,8 +57,9 @@
 //! Implements the directed adjacency graph method from Smith et al. (2017). This method
 //! prevents over-correction by using a count gradient: a UMI can only be "captured" by
 //! another UMI if (a) they are within edit distance and (b) the child UMI has count
-//! strictly less than `parent_count / 2 + 1`. This ensures that two similarly abundant
-//! UMIs are never merged.
+//! at most `parent_count / 2 + 1` (integer division). This keeps UMIs with
+//! similar high counts apart, though the `+ 1` lets near-equal low counts merge
+//! (e.g. 2 and 2, or 4 and 3).
 //!
 //! **Algorithm**:
 //! 1. Count UMIs and sort by decreasing abundance
@@ -66,12 +67,12 @@
 //!    - Process UMIs in order of abundance (most abundant first)
 //!    - Each unassigned UMI becomes a root node
 //!    - Search remaining unassigned UMIs for potential children
-//!    - Add directed edge if distance <= threshold AND `child_count` < `parent_count/2` + 1
+//!    - Add directed edge if distance <= threshold AND `child_count` <= `parent_count/2` + 1
 //!    - Recursively process children as potential parents
 //! 3. Assign same molecule ID to each root and all its descendants
 //!
 //! **Mathematical basis**: The count gradient condition approximates a 2:1 evidence ratio.
-//! If a true UMI appears 100 times and an error appears 45 times, they will merge (45 < 51).
+//! If a true UMI appears 100 times and an error appears 45 times, they will merge (45 <= 51).
 //! But if both appear 50 times, they stay separate, preventing false merges of distinct
 //! molecules that happen to have similar UMIs.
 //!
@@ -115,7 +116,7 @@
 //!   *Genome Research*, 27(3), 491-499.
 //!   DOI: [10.1101/gr.209601.116](https://doi.org/10.1101/gr.209601.116)
 //!
-//! The count gradient approach (`child_count < parent_count / 2 + 1`) is key to
+//! The count gradient approach (`child_count <= parent_count / 2 + 1`) is key to
 //! preventing over-correction while still allowing error correction.
 //!
 //! ## Usage Examples
@@ -160,7 +161,7 @@
 //!
 //! let assignments = assigner.assign(&umis)?;
 //! // ACGT appears 3 times, ACTT appears 1 time
-//! // Since 1 < 3/2 + 1 = 2.5, ACTT will be captured by ACGT
+//! // Since 1 <= 3/2 + 1 = 2 (integer division), ACTT will be captured by ACGT
 //! // All reads get the same molecule ID
 //! # Ok::<(), anyhow::Error>(())
 //! ```
@@ -591,7 +592,7 @@ pub enum Strategy {
     ///
     /// Implements the directed adjacency graph method where high-abundance UMIs can "capture"
     /// lower-abundance UMIs that are within edit distance. A UMI can only be assigned to
-    /// another UMI if its count is less than half of the parent's count. This prevents
+    /// another UMI if its count is at most half of the parent's count plus one. This prevents
     /// over-correction and is more conservative than the simple edit distance method.
     Adjacency,
 
@@ -1522,10 +1523,11 @@ struct Node {
 /// Implements the directed adjacency graph method from UMI-tools. This method builds a
 /// directed graph where high-abundance UMIs can "capture" lower-abundance UMIs that are
 /// within edit distance. A key constraint is that a UMI can only be a child of another
-/// UMI if its count is less than half of the parent's count (`child_count < parent_count / 2 + 1`).
+/// UMI if its count is at most half of the parent's count plus one (`child_count <= parent_count / 2 + 1`).
 ///
-/// This prevents over-correction by ensuring that two similarly abundant UMIs are not
-/// incorrectly merged, even if they are within edit distance. The method is more
+/// This prevents over-correction by keeping UMIs with similar high counts apart, even if
+/// they are within edit distance; the `+ 1` still lets near-equal low counts merge (e.g.
+/// 2 and 2, or 4 and 3). The method is more
 /// conservative than simple edit distance clustering.
 ///
 /// # Algorithm
@@ -1533,7 +1535,7 @@ struct Node {
 /// 1. Count UMIs and sort by decreasing abundance
 /// 2. Process UMIs in order of abundance
 /// 3. For each unassigned UMI (becomes a root):
-///    - Search for unassigned UMIs with `count < root_count / 2 + 1`
+///    - Search for unassigned UMIs with `count <= root_count / 2 + 1`
 ///    - If within edit distance, add as child and continue recursively
 /// 4. Assign same molecule ID to root and all its descendants
 ///
@@ -3582,7 +3584,7 @@ mod tests {
         let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
 
         // Construct input with counts: AAAA(100), CCAA(1), GGGG(2), ACAA(2)
-        // Note: CCAA count=1 so it satisfies count constraint: 1 < ACAA_count/2+1 = 2
+        // Note: CCAA count=1 so it satisfies count constraint: 1 <= ACAA_count/2+1 = 2
         let mut umis = Vec::new();
         umis.extend(std::iter::repeat_n("AAAA".to_string(), 100));
         umis.extend(std::iter::repeat_n("CCAA".to_string(), 1));
@@ -3643,7 +3645,7 @@ mod tests {
     #[test]
     fn test_paired_assigns_ab_and_ba_with_errors() {
         // Original UMIs have count=3, error variants have count=1
-        // Count constraint: child < parent/2+1 means 1 < 3/2+1=2 ✓
+        // Count constraint: child <= parent/2+1 means 1 <= 3/2+1=2 ✓
         let mut umis = Vec::new();
         umis.extend(std::iter::repeat_n("AAAA-CCCC".to_string(), 3));
         umis.extend(std::iter::repeat_n("CCCC-CAAA".to_string(), 1));
@@ -4057,7 +4059,7 @@ mod tests {
     /// - Target: "CCAA-XXXX" (count=1) - 2 edits from root, won't be captured by root
     /// - Intermediate: "ACAA-XXXX" (count=2) - 1 edit from root, 1 edit from target
     ///
-    /// Note: Target count=1 satisfies count constraint: `1 < intermediate_count/2+1 = 2`
+    /// Note: Target count=1 satisfies count constraint: `1 <= intermediate_count/2+1 = 2`
     /// Expected: Root captures intermediate, intermediate captures target via backward search
     #[test]
     fn test_paired_backward_capture() {
@@ -4617,9 +4619,9 @@ mod tests {
     #[test]
     fn test_adjacency_threshold_zero_always_uses_linear() {
         // threshold=0 should never use the index (always linear scan)
-        // Need enough duplicates for count gradient: child < parent/2 + 1
+        // Need enough duplicates for count gradient: child <= parent/2 + 1
         let mut umis = vec!["AAAAAAAA".to_string(); 10]; // Parent with 10 reads
-        umis.push("AAAAAAAC".to_string()); // Child with 1 read (1 < 10/2 + 1 = 6)
+        umis.push("AAAAAAAC".to_string()); // Child with 1 read (1 <= 10/2 + 1 = 6)
         umis.extend(vec!["TTTTTTTT".to_string(); 5]); // Distinct UMI
 
         let assignments =
@@ -4644,7 +4646,7 @@ mod tests {
         // Verify that Strategy::new_assigner_full creates assigners with the correct threshold
         use crate::assigner::Strategy as UmiStrategy;
 
-        // Need count gradient for adjacency merging: child < parent/2 + 1
+        // Need count gradient for adjacency merging: child <= parent/2 + 1
         let mut umis = vec!["AAAAAA".to_string(); 10]; // Parent with 10 reads
         umis.push("AAAAAC".to_string()); // Child with 1 read
         umis.extend(vec!["TTTTTT".to_string(); 5]); // Distinct UMI

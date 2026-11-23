@@ -1424,7 +1424,7 @@ fn extract_rejects_stdin_when_more_than_one_input_is_given() {
     assert!(!result.status.success(), "extract accepted stdin alongside a second input");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("exactly one --input"),
+        stderr.contains("exactly one input (--inputs"),
         "error should explain the single-input restriction, got: {stderr}"
     );
 }
