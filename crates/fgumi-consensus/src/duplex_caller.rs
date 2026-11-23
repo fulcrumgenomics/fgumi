@@ -4505,6 +4505,82 @@ mod tests {
         reads
     }
 
+    /// Builds one molecule whose pooled AB-R1 and BA-R2 reads split between a full-length match
+    /// (named `ref_*`) and a 1-base insertion after the fifth base (named `ins_*`). AB reads are
+    /// `ab_len` bases long and BA reads `ba_len`, so the two alignments are `{len}M` and
+    /// `5M1I{len - 6}M` on each strand.
+    fn split_molecule(
+        ab_len: usize,
+        ba_len: usize,
+        ab_ref: usize,
+        ab_ins: usize,
+        ba_ref: usize,
+        ba_ins: usize,
+    ) -> Vec<RawRecord> {
+        let ref_cigar = |len: usize| vec![encode_op(0, len)];
+        let ins_cigar = |len: usize| vec![encode_op(0, 5), encode_op(1, 1), encode_op(0, len - 6)];
+        let mut b = SamBuilder::new();
+        let mut reads = Vec::new();
+
+        let (ab_a, ab_c, ab_q) = (vec![b'A'; ab_len], vec![b'C'; ab_len], vec![30u8; ab_len]);
+        let mut ab = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
+            reads.push(ab_r1(b, name.as_bytes(), &ab_a, &ab_q, cigar, b"foo/A", &[]));
+            reads.push(ab_r2(b, name.as_bytes(), &ab_c, &ab_q, &ref_cigar(ab_len), b"foo/A", &[]));
+        };
+        (0..ab_ref).for_each(|i| ab(&mut b, format!("ref_ab{i}"), &ref_cigar(ab_len)));
+        (0..ab_ins).for_each(|i| ab(&mut b, format!("ins_ab{i}"), &ins_cigar(ab_len)));
+
+        let (ba_a, ba_c, ba_q) = (vec![b'A'; ba_len], vec![b'C'; ba_len], vec![30u8; ba_len]);
+        let mut ba = |b: &mut SamBuilder, name: String, cigar: &[u32]| {
+            reads.push(ba_r1(b, name.as_bytes(), &ba_c, &ba_q, &ref_cigar(ba_len), b"foo/B", &[]));
+            reads.push(ba_r2(b, name.as_bytes(), &ba_a, &ba_q, cigar, b"foo/B", &[]));
+        };
+        (0..ba_ref).for_each(|i| ba(&mut b, format!("ref_ba{i}"), &ref_cigar(ba_len)));
+        (0..ba_ins).for_each(|i| ba(&mut b, format!("ins_ba{i}"), &ins_cigar(ba_len)));
+        reads
+    }
+
+    /// Pins the duplex alignment-group ordering: the larger group wins; on a size tie the group
+    /// with more reads on its weaker strand wins; on a further tie the smaller CIGAR wins.
+    ///
+    /// Each case gives the AB and BA read lengths, then the `(ref, ins)` read counts on AB and on BA.
+    ///
+    /// Every case keeps one alignment and rejects all `rejected` AB-R1/BA-R2 reads of the other,
+    /// whose names start with `rejected_prefix`. The CIGAR comparison is element by element, so
+    /// `5M1I4M` is smaller than `10M`.
+    ///
+    /// `mixed_read_lengths` uses longer BA reads, which the descending-length sort moves ahead of
+    /// the AB reads, so each read's strand must be looked up by its own index, not its position in
+    /// sorted order.
+    #[rstest]
+    // `10M` (6 AB + 4 BA) over `5M1I4M` (9 AB + 1 BA).
+    #[case::reference_on_both_strands((10, 10), (6, 9), (4, 1), 10, b"ins_")]
+    // `5M1I4M` (5 AB + 5 BA) over `10M` (9 AB + 1 BA).
+    #[case::indel_on_both_strands((10, 10), (9, 5), (1, 5), 10, b"ref_")]
+    // `5M1I4M`/`5M1I6M` (5 AB + 5 BA) over `10M`/`12M` (9 AB + 1 BA).
+    #[case::mixed_read_lengths((10, 12), (9, 5), (1, 5), 10, b"ref_")]
+    // Sizes and weaker strands tie (5 AB + 5 BA each): the smaller CIGAR, `5M1I4M`, wins.
+    #[case::strand_tie_falls_back_to_smaller_cigar((10, 10), (5, 5), (5, 5), 10, b"ref_")]
+    // Size outranks strand support: `5M1I4M` (10 AB + 1 BA) over `10M` (6 AB + 4 BA).
+    #[case::larger_group_wins_despite_weaker_strand((10, 10), (6, 10), (4, 1), 10, b"ref_")]
+    fn test_alignment_group_selection(
+        #[case] (ab_len, ba_len): (usize, usize),
+        #[case] (ab_ref, ab_ins): (usize, usize),
+        #[case] (ba_ref, ba_ins): (usize, usize),
+        #[case] rejected: usize,
+        #[case] rejected_prefix: &[u8],
+    ) -> Result<()> {
+        let mut caller = rejection_accounting_caller(vec![1], true)?;
+        let reads = split_molecule(ab_len, ba_len, ab_ref, ab_ins, ba_ref, ba_ins);
+        let result = caller.consensus_reads(reads)?;
+        assert_eq!(result.count, 2);
+        assert_eq!(caller.rejected_reads.len(), rejected);
+        for record in &caller.rejected_reads {
+            assert!(fgumi_raw_bam::read_name(record).starts_with(rejected_prefix));
+        }
+        Ok(())
+    }
+
     /// Builds a duplex caller for the #757 fixtures above.
     fn rejection_accounting_caller(
         min_reads: Vec<usize>,
