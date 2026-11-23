@@ -691,16 +691,23 @@ mod tests {
     /// the content size has nothing to size from. Both spill writers compress
     /// each block in one `bulk::compress` call, which always records it — so a
     /// size-less frame did not come from fgumi, and guessing at its size is the
-    /// wrong response. `stream::encode_all` produces exactly that shape (verified
-    /// against zstd 0.13: bulk records the size, the streaming APIs do not), so
-    /// this is a real frame rather than a hand-forged header.
+    /// wrong response. The frame comes from the streaming encoder with the
+    /// content-size flag turned off, so it is a real frame rather than a
+    /// hand-forged header. The flag is turned off explicitly rather than relying
+    /// on a helper's default: as of `zstd` 0.14.4, `stream::encode_all` records
+    /// the content size of a short (under 128 KiB) source.
     #[test]
     fn a_zstd_frame_without_a_content_size_is_rejected() {
+        use std::io::Write;
+
         let payload = vec![9u8; 5000];
-        let sizeless = zstd::stream::encode_all(&payload[..], 1).expect("stream-compress");
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).expect("create encoder");
+        encoder.include_contentsize(false).expect("disable the content-size flag");
+        encoder.write_all(&payload).expect("stream-compress");
+        let sizeless = encoder.finish().expect("finish the frame");
         assert!(
             zstd::zstd_safe::get_frame_content_size(&sizeless).expect("readable header").is_none(),
-            "precondition: the streaming API must omit the content size",
+            "precondition: the frame must omit the content size",
         );
 
         let mut d = SpillBlockDecompressor::new();
