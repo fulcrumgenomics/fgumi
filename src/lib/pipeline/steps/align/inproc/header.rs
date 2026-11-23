@@ -34,7 +34,7 @@ use noodles::sam::header::record::value::map::{Program, ReferenceSequence};
 use fgumi_consensus::MethylationMode;
 
 use super::engine;
-use crate::aligner::bwa_mem3_meth_flag;
+use crate::aligner::bwa_mem3_meth_flags;
 
 /// The `@PG ID` of the synthesized bwa-mem3 program line, mirroring the CLI's
 /// `@PG\tID:bwa-mem3` (`main.cpp:243`).
@@ -113,7 +113,7 @@ pub(crate) fn load_index_header_sidecar(prefix: &Path) -> io::Result<Option<Head
 /// Synthesize the aligner-emitted header from the index's `contigs`, the
 /// index header `sidecar`'s `@RG`/`@PG`/`@CO` lines (see
 /// [`load_index_header_sidecar`]), one `@PG ID:bwa-mem3` line, and when
-/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flag`])
+/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flags`])
 /// the `@PG ID:bwa-mem3-meth` line `bwa-mem3 mem --meth` adds.
 ///
 /// Takes the contigs as `(name, length)` pairs — an iterator, not the whole
@@ -172,7 +172,7 @@ where
     // Honest in-process command line: describes the invocation shape
     // (`mem -p -K <K>` against the reference) and that it ran in-process via
     // bwa-mem3-rs, rather than forging the subprocess `bwa-mem3 mem ... /dev/stdin`.
-    let meth = bwa_mem3_meth_flag(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
+    let meth = bwa_mem3_meth_flags(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
     let command_line = format!(
         "bwa-mem3 mem{meth} -p -K {chunk_size} {reference} (in-process via bwa-mem3-rs {version})",
         reference = reference.display(),
@@ -187,7 +187,7 @@ where
 
     // `bwa-mem3 mem --meth` writes a second `@PG` for the bisulfite writer; the
     // subprocess preset's header carries it, so the in-process one must too.
-    if let Some(flag) = bwa_mem3_meth_flag(methylation) {
+    if let Some(flag) = bwa_mem3_meth_flags(methylation) {
         let meth_program = Map::<Program>::builder()
             .insert(pg_tag::NAME, BWA_MEM3_METH_PG_ID)
             .insert(pg_tag::VERSION, format!("{version}-meth"))
@@ -415,7 +415,10 @@ mod tests {
         let ids: Vec<String> = synth.programs().as_ref().keys().map(ToString::to_string).collect();
         assert_eq!(ids, ["bwa-mem3", "bwa-mem3-meth"]);
         let (_, _, bwa_cl) = pg_fields(&synth, "bwa-mem3").expect("bwa-mem3 @PG");
-        assert!(bwa_cl.starts_with("bwa-mem3 mem --meth -p -K 1000"), "got: {bwa_cl}");
+        assert!(
+            bwa_cl.starts_with("bwa-mem3 mem --meth --meth-scoring genomic -p -K 1000"),
+            "got: {bwa_cl}"
+        );
         let (name, version, _) = pg_fields(&synth, "bwa-mem3-meth").expect("bwa-mem3-meth @PG");
         assert_eq!(name, "bwa-mem3-meth");
         assert_eq!(version, format!("{}-meth", engine::version()));

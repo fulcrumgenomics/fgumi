@@ -35,10 +35,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context as _;
 use engine::{BwaIndex, MemOpts};
 use fgumi_consensus::MethylationMode;
 
-use crate::aligner::{BWA_MEM3_METH_INDEX_SUFFIX, bwa_mem3_meth_flag};
+use crate::aligner::{BWA_MEM3_METH_INDEX_SUFFIX, bwa_mem3_meth_flags};
 use crate::pipeline::core::builder::PipelineBuilder;
 use crate::pipeline::core::step::StepOutcome;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
@@ -79,7 +80,7 @@ pub(crate) struct InProcessBwaMem3Backend {
     /// The chemistry to align for (`--methylation-mode`). Under EM-seq the
     /// backend loads the `bwa-mem3 index --meth` dual index and aligns as
     /// `bwa-mem3 mem --meth` does; TAPS aligns plain (see
-    /// [`bwa_mem3_meth_flag`]).
+    /// [`bwa_mem3_meth_flags`]).
     pub(crate) methylation: MethylationMode,
     /// bwa's `-h <primary>,<alt>` (the realign stage's `--xa-max-hits`), or
     /// `None` for bwa-mem3's default.
@@ -146,7 +147,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
             chunk = self.chunk_size,
             dedup = if self.dedup_reads { "on" } else { "off" },
             meth =
-                bwa_mem3_meth_flag(self.methylation).map(|f| format!(", {f}")).unwrap_or_default(),
+                bwa_mem3_meth_flags(self.methylation).map(|f| format!(", {f}")).unwrap_or_default(),
         )
     }
 
@@ -175,7 +176,7 @@ impl AlignBackend for InProcessBwaMem3Backend {
         // one; the keys differ, so the second load replaces the cached slot while
         // the first backend keeps its `Arc`, and both stay resident.
         let prefix = index_prefix(&self.reference, self.methylation);
-        let meth = bwa_mem3_meth_flag(self.methylation).is_some();
+        let meth = bwa_mem3_meth_flags(self.methylation).is_some();
         let shm_attached = engine::shm::is_staged(&prefix).unwrap_or(false);
         let load_start = Instant::now();
         let (idx, shared) = ctx.index.get_or_load(&prefix, meth, || {
@@ -282,10 +283,10 @@ impl AlignBackend for InProcessBwaMem3Backend {
 
 /// The prefix the in-process backend loads its FM-index from: `<reference>`,
 /// or when `methylation` aligns bisulfite-aware (EM-seq, per
-/// [`bwa_mem3_meth_flag`]) the converted seed index `<reference>.meth`.
+/// [`bwa_mem3_meth_flags`]) the converted seed index `<reference>.meth`.
 fn index_prefix(reference: &std::path::Path, methylation: MethylationMode) -> std::path::PathBuf {
     let mut prefix = reference.as_os_str().to_owned();
-    if bwa_mem3_meth_flag(methylation).is_some() {
+    if bwa_mem3_meth_flags(methylation).is_some() {
         prefix.push(BWA_MEM3_METH_INDEX_SUFFIX);
     }
     prefix.into()
@@ -293,7 +294,7 @@ fn index_prefix(reference: &std::path::Path, methylation: MethylationMode) -> st
 
 /// Load the index the in-process backend aligns against: the plain bwa-mem3
 /// index, or when `methylation` aligns bisulfite-aware (EM-seq, per
-/// [`bwa_mem3_meth_flag`]) the `bwa-mem3 index --meth` dual index — the
+/// [`bwa_mem3_meth_flags`]) the `bwa-mem3 index --meth` dual index — the
 /// converted seed index `<reference>.meth` plus the original `<reference>`
 /// that alignment, pairing and output coordinates use. Either way the FM-index
 /// loads with `num_threads` threads, as `bwa-mem3 mem -t` loads it.
@@ -302,7 +303,7 @@ fn load_index(
     methylation: MethylationMode,
     num_threads: usize,
 ) -> anyhow::Result<BwaIndex> {
-    if bwa_mem3_meth_flag(methylation).is_some() {
+    if bwa_mem3_meth_flags(methylation).is_some() {
         let seed = index_prefix(reference, methylation);
         Ok(BwaIndex::load_meth_with_threads(&seed, reference, num_threads)?)
     } else {
@@ -311,17 +312,24 @@ fn load_index(
 }
 
 /// The options every in-process alignment shares: paired-end, and when
-/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flag`])
-/// what `bwa-mem3 mem --meth` sets. EM-seq is bwa-mem3's default chemistry, so
-/// there is none to set. `xa_max_hits` sets bwa's `-h` when given.
+/// `methylation` aligns bisulfite-aware (EM-seq, per [`bwa_mem3_meth_flags`])
+/// what `bwa-mem3 mem --meth --meth-scoring genomic` sets. EM-seq is bwa-mem3's
+/// default chemistry, so there is none to set. The scoring is set explicitly,
+/// as the subprocess preset's flags and the `@PG` record spell it, rather than
+/// left to the library default (which was collapsed before bwa-mem3 0.17.0); it
+/// is set before [`MemOpts::apply_meth_defaults`], which reads it. `xa_max_hits`
+/// sets bwa's `-h` when given.
 fn build_opts(
     methylation: MethylationMode,
     xa_max_hits: Option<(u32, u32)>,
 ) -> anyhow::Result<MemOpts> {
     let mut opts = MemOpts::new()?;
     opts.set_pe(true);
-    if bwa_mem3_meth_flag(methylation).is_some() {
-        opts.set_meth(true).apply_meth_defaults();
+    if bwa_mem3_meth_flags(methylation).is_some() {
+        opts.set_meth(true)
+            .set_meth_scoring(engine::MethScoring::Genomic)
+            .apply_meth_defaults()
+            .context("applying bwa-mem3's --meth defaults for --methylation-mode em-seq")?;
     }
     if let Some((primary, alt)) = xa_max_hits {
         opts.set_xa_max_hits(
@@ -431,7 +439,7 @@ mod tests {
         let opts = build_opts(MethylationMode::EmSeq, None).unwrap();
         assert!(opts.meth());
         assert_eq!(opts.meth_chem().unwrap(), engine::MethChem::EmSeq);
-        assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Collapsed);
+        assert_eq!(opts.meth_scoring().unwrap(), engine::MethScoring::Genomic);
         assert_eq!(opts.meth_seed_prune().unwrap(), engine::MethSeedPrune::Spec30);
         assert_eq!(opts.minimum_score(), 40, "bwameth -T 40");
     }

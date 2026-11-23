@@ -53,8 +53,8 @@ struct ScoringWords<'a> {
 }
 
 impl BwaScoring {
-    /// The mismatch penalty `bwa-mem3 mem --meth` sets under its default
-    /// collapsed bisulfite scoring (bwameth's `-B 2`), scaled by `-A`.
+    /// The mismatch penalty `bwa-mem3 mem --meth` sets under collapsed bisulfite
+    /// scoring (bwameth's `-B 2`), scaled by `-A`.
     const METH_MISMATCH: i32 = 2;
 
     /// The scoring a bwa-mem3 command line aligns with, read from the words after
@@ -68,8 +68,9 @@ impl BwaScoring {
     ///   absolute values) where those options are not given.
     /// - `--meth` / `--meth=emseq|em-seq|bisulfite|taps` and `--meth-scoring
     ///   collapsed|genomic|neutral`: bisulfite alignment with collapsed scoring
-    ///   (the default, except for `--meth=taps`, whose default is neutral) sets
-    ///   `-B 2` (scaled by `-A`) unless `-B` is given.
+    ///   sets `-B 2` (scaled by `-A`) unless `-B` is given. Collapsed applies only
+    ///   when `--meth-scoring collapsed` is given: since bwa-mem3 0.17.0 the
+    ///   default is genomic (EM-seq) or neutral (`--meth=taps`), which keep `-B`.
     ///
     /// A value that does not parse is ignored, as is an unknown `-x` mode. Words
     /// are split on whitespace without interpreting shell quoting, so an
@@ -161,7 +162,8 @@ impl BwaScoring {
             _ => {}
         }
         if let Some(taps) = set.meth_taps {
-            let default_mode = if taps { MethScoring::Neutral } else { MethScoring::Collapsed };
+            // bwa-mem3 0.17.0+: genomic for EM-seq, neutral for TAPS.
+            let default_mode = if taps { MethScoring::Neutral } else { MethScoring::Genomic };
             if set.meth_scoring.unwrap_or(default_mode) == MethScoring::Collapsed && set.b.is_none()
             {
                 b = Self::METH_MISMATCH * a;
@@ -269,10 +271,14 @@ mod tests {
     #[case::tab_before_mem("bwa\tmem -B 6 ref.fa -", BwaScoring { b: 6, ..D })]
     #[case::no_mem_word("my-aligner -B 5 {ref}", BwaScoring { b: 5, ..D })]
     #[case::unparsable_ignored("bwa mem -B x ref.fa -", D)]
-    #[case::meth_defaults("bwa-mem3 mem --meth ref.fa -", BwaScoring { b: 2, ..D })]
-    #[case::meth_emseq_chemistry("bwa-mem3 mem --meth=emseq ref.fa -", BwaScoring { b: 2, ..D })]
+    #[case::meth_defaults_to_genomic("bwa-mem3 mem --meth ref.fa -", D)]
+    #[case::meth_emseq_chemistry("bwa-mem3 mem --meth=emseq ref.fa -", D)]
     #[case::meth_scaled_by_match(
         "bwa-mem3 mem --meth -A 2 ref.fa -",
+        BwaScoring { a: 2, b: 8, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2 }
+    )]
+    #[case::meth_collapsed_scaled_by_match(
+        "bwa-mem3 mem --meth --meth-scoring collapsed -A 2 ref.fa -",
         BwaScoring { a: 2, b: 4, o_del: 12, e_del: 2, o_ins: 12, e_ins: 2 }
     )]
     #[case::meth_explicit_mismatch("bwa-mem3 mem --meth -B 3 ref.fa -", BwaScoring { b: 3, ..D })]
