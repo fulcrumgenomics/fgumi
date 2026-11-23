@@ -442,7 +442,7 @@ mod tests {
     use crate::pipeline::steps::align::inproc::cohort::SubBatchId;
     use crate::pipeline::steps::align::inproc::engine::IdBases;
     use crate::pipeline::steps::align::inproc::engine::fake::{
-        FakeEngine, TaggedRead, fake_record_name,
+        FakeEngine, QcFailFakeEngine, TaggedRead, fake_record_name,
     };
     use crate::pipeline::steps::align::inproc::gate::{CohortGate, CohortLease};
     use crate::pipeline::steps::align::merge::MergeConfig;
@@ -677,6 +677,64 @@ mod tests {
         assert_eq!(merge.records_emitted.load(AtomicOrdering::Relaxed), n_records as u64);
     }
 
+    /// The in-process align stage's merge honours `keep_aligner_qc_fail`: the
+    /// aligner flags pair 0's R1 QC-fail while every unmapped read passed QC, so
+    /// that record stays QC-fail only when the flag is kept (fgbio `ZipperBams`
+    /// parity clears it by default), and no other record is QC-fail either way.
+    #[rstest]
+    fn merge_keeps_an_aligner_qc_fail_only_when_asked(
+        #[values(false, true)] keep_aligner_qc_fail: bool,
+    ) {
+        let (layout, unmapped, regs, _) = inputs_for(Shape::AllPairs);
+        let PairWork { id, layout, unmapped, lease, ranges, pestat, ids } =
+            make_pair_work(0, layout, unmapped, regs);
+        let work: PairWork<QcFailFakeEngine> =
+            PairWork { id, layout, unmapped, lease, ranges, pestat, ids };
+        let merge = Arc::new(MergeConfig {
+            tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
+            skip_tc_tags: false,
+            keep_aligner_qc_fail,
+            lone_mates: false,
+            records_emitted: Arc::new(AtomicU64::new(0)),
+            output_byte_limit: 4 * 1024 * 1024,
+        });
+
+        let collected: Arc<Mutex<Vec<BamTemplateBatch>>> = Arc::new(Mutex::new(Vec::new()));
+        let builder = Pipeline::builder();
+        builder
+            .chain(WorkSource { items: VecDeque::from([work]), held: HeldSlot::new() })
+            .chain(AlignPairEmitStep::new(
+                Arc::new(QcFailFakeEngine),
+                Arc::default(),
+                merge,
+                4 * 1024 * 1024,
+            ))
+            .chain(CollectSink { collected: Arc::clone(&collected) })
+            .into_sink_marker();
+        let pipeline = builder.build().expect("chain builds");
+        pipeline.run(PipelineConfig { threads: 1, ..Default::default() }).expect("chain runs");
+
+        let out = collected.lock().expect("mutex not poisoned");
+        let mut qc_fail: Vec<(Vec<u8>, bool, bool)> = out
+            .iter()
+            .flat_map(|b| b.templates().iter().flat_map(|t| t.records.iter()))
+            .map(|r| {
+                let f = r.flags();
+                (r.read_name().to_vec(), f & flags::FIRST_SEGMENT != 0, f & flags::QC_FAIL != 0)
+            })
+            .collect();
+        qc_fail.sort();
+        let pair0 = fake_record_name(RecordOrigin::Pair(0));
+        let expected: Vec<(Vec<u8>, bool, bool)> = (0..3)
+            .flat_map(|i| {
+                let name = fake_record_name(RecordOrigin::Pair(i));
+                let r1_qc_fail = keep_aligner_qc_fail && name == pair0;
+                [(name.clone(), false, false), (name, true, r1_qc_fail)]
+            })
+            .collect();
+        assert_eq!(qc_fail, expected);
+    }
+
     // ----- (b) zero-emitted-records guard ----------------------------------
 
     /// An input template with zero emitted records is a hard error (the engine
@@ -884,14 +942,14 @@ mod tests {
     // ----- test source / sink (real-runtime tests) -------------------------
 
     /// Replays pre-built `PairWork`s into the chain. `Exclusive` (owns cursor).
-    struct WorkSource {
-        items: VecDeque<PairWork<FakeEngine>>,
-        held: HeldSlot<Unpushed<PairWork<FakeEngine>>>,
+    struct WorkSource<E: AlignEngine = FakeEngine> {
+        items: VecDeque<PairWork<E>>,
+        held: HeldSlot<Unpushed<PairWork<E>>>,
     }
 
-    impl Step for WorkSource {
+    impl<E: AlignEngine> Step for WorkSource<E> {
         type Input = ();
-        type Outputs = Single<PairWork<FakeEngine>>;
+        type Outputs = Single<PairWork<E>>;
 
         fn profile(&self) -> StepProfile {
             StepProfile {
@@ -930,6 +988,7 @@ mod tests {
         Arc::new(MergeConfig {
             tag_info: Arc::new(TagInfo::new(vec![], vec![], vec![])),
             skip_tc_tags: false,
+            keep_aligner_qc_fail: false,
             lone_mates: false,
             records_emitted: Arc::new(AtomicU64::new(0)),
             output_byte_limit: 4 * 1024 * 1024,

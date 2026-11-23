@@ -159,6 +159,55 @@ fn realign_ends_without_rw_are_counted() {
     assert_eq!(primary_ends(&tmp.path().join("out.bam")), want);
 }
 
+/// [`UNMAPPED_ALIGNER`], but flagging every R1 QC-fail (589 = 77 | 0x200), as an
+/// aligner that QC-fails reads (`bwa-mem3 mem --meth --set-as-failed`) would.
+fn qc_failing_aligner() -> String {
+    let aligner = UNMAPPED_ALIGNER.replace("? 77 :", "? 589 :");
+    assert_ne!(aligner, UNMAPPED_ALIGNER, "the R1 flag must be rewritten");
+    aligner
+}
+
+/// The merge onto the consensus reads overwrites an aligner-set QC-fail with the
+/// consensus read's flag (clear here) by default, as `fgumi zipper` does; with
+/// `--keep-aligner-qc-fail` the aligner's flag on each R1 is kept, and the R2s,
+/// flagged by neither, stay clear.
+#[rstest::rstest]
+fn realign_keep_aligner_qc_fail(#[values(false, true)] keep_aligner_qc_fail: bool) {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = write_consensus(dir, 2, |_| (Some("chr1:1-100:+"), None));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let mut cmd = fgumi();
+    cmd.args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", qc_failing_aligner().as_str()]);
+    if keep_aligner_qc_fail {
+        cmd.arg("--keep-aligner-qc-fail");
+    }
+    let result = cmd.output().expect("spawn fgumi realign");
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+
+    let mut reader = noodles::bam::io::Reader::new(std::io::BufReader::new(
+        std::fs::File::open(&output).expect("open output"),
+    ));
+    reader.read_header().expect("header");
+    let mut observed: Vec<(bool, bool)> = reader
+        .records()
+        .map(|r| {
+            let r = r.expect("record");
+            (r.flags().is_first_segment(), r.flags().is_qc_fail())
+        })
+        .collect();
+    observed.sort_unstable();
+    let expected = vec![
+        (false, false),
+        (false, false),
+        (true, keep_aligner_qc_fail),
+        (true, keep_aligner_qc_fail),
+    ];
+    assert_eq!(observed, expected);
+}
+
 /// A stand-in aligner that places R1 outside its window (chr1:5001, forward)
 /// with an in-window `XA` alternative (chr1:101), and R2 inside its window
 /// (chr1:121, reverse), so realign keeps R2 and swaps R1. It echoes SEQ/QUAL,

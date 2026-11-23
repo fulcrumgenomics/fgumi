@@ -888,7 +888,7 @@ pub struct RunAll {
     /// `#[multi_options]` on `ZipperOptions` in `commands::zipper`).
     /// With `--start-from zipper` they configure the zipper stage; on any
     /// chain that aligns (`--start-from extract`, `correct` or `align`), the
-    /// merge rules (`tags-to-*`, `skip-tc-tags`)
+    /// merge rules (`tags-to-*`, `skip-tc-tags`, `keep-aligner-qc-fail`)
     /// configure the fused align-and-merge. Ignored on any other chain.
     #[command(flatten)]
     pub zipper_opts: crate::commands::zipper::MultiZipperOptions,
@@ -1093,6 +1093,16 @@ pub struct RunAll {
     #[arg(long = "realign::in-memory-reference", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, help_heading = "Realign Options")]
     pub realign_in_memory_reference: bool,
 
+    /// Keep a QC-fail flag (0x200) that the `--realign` stage's aligner set on a
+    /// re-aligned consensus record, instead of overwriting it with the consensus
+    /// read's flag (the default, as `fgumi zipper` does). The aligner's QC-fail stays
+    /// on a record even when realign promotes an `XA` alternative onto it, since the
+    /// aligner set the flag for its original placement. Requires `--realign`.
+    /// See `fgumi realign --keep-aligner-qc-fail`; the align stage's equivalent is
+    /// `--zipper::keep-aligner-qc-fail`.
+    #[arg(long = "realign::keep-aligner-qc-fail", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true, help_heading = "Realign Options")]
+    pub realign_keep_aligner_qc_fail: bool,
+
     /// Convenience: fills in every applicable metrics-output option (group's
     /// `--metrics` prefix, correct's metrics, filter's stats, and each
     /// present consensus stage's metrics) for every stage in this run, under
@@ -1211,6 +1221,12 @@ impl RunAll {
         if self.realign_in_memory_reference && !self.realign {
             bail!(
                 "--realign::in-memory-reference applies to the --realign stage, so it requires \
+                 --realign"
+            );
+        }
+        if self.realign_keep_aligner_qc_fail && !self.realign {
+            bail!(
+                "--realign::keep-aligner-qc-fail applies to the --realign stage, so it requires \
                  --realign"
             );
         }
@@ -2017,6 +2033,7 @@ impl RunAll {
                         xa_max_hits: self.realign_xa_max_hits,
                         xa_max_hits_option: "--realign::xa-max-hits",
                         in_memory_reference: self.realign_in_memory_reference,
+                        keep_aligner_qc_fail: self.realign_keep_aligner_qc_fail,
                     });
                 }
 
@@ -2260,8 +2277,9 @@ impl Command for RunAll {
         // options apply only to the raw-read merge (the align or zipper stage).
         if self.realign {
             let zipper = self.zipper_opts.clone().validate()?;
+            let aligns_raw_reads = stages.iter().any(|s| matches!(s, Stage::Align | Stage::Zipper));
             if !zipper.tags_to_reverse.is_empty() || !zipper.tags_to_revcomp.is_empty() {
-                let effect = if stages.iter().any(|s| matches!(s, Stage::Align | Stage::Zipper)) {
+                let effect = if aligns_raw_reads {
                     "they apply only to the raw-read align/zipper stage's merge"
                 } else {
                     "this run does not align raw reads, so they have no effect"
@@ -2270,6 +2288,20 @@ impl Command for RunAll {
                     "--zipper::tags-to-reverse / --zipper::tags-to-revcomp do not change the \
                      --realign stage, which always reverses and reverse-complements the per-base \
                      consensus tags (zipper's Consensus sets) of reverse-strand reads; {effect}"
+                );
+            }
+            // Likewise `--zipper::keep-aligner-qc-fail`: the realign stage's merge
+            // takes `--realign::keep-aligner-qc-fail` instead.
+            if zipper.keep_aligner_qc_fail {
+                let effect = if aligns_raw_reads {
+                    "it applies only to the raw-read align/zipper stage's merge"
+                } else {
+                    "this run does not align raw reads, so it has no effect"
+                };
+                log::warn!(
+                    "--zipper::keep-aligner-qc-fail does not change the --realign stage; use \
+                     --realign::keep-aligner-qc-fail to keep a QC-fail flag its aligner set; \
+                     {effect}"
                 );
             }
         }
@@ -4572,6 +4604,62 @@ mod realign_tests {
         }
     }
 
+    /// `--zipper::keep-aligner-qc-fail` does not reach the realign stage's merge
+    /// (it takes `--realign::keep-aligner-qc-fail`), so runall says so when it is
+    /// set alongside `--realign`.
+    #[rstest]
+    #[case::unset("group", &[], None)]
+    #[case::realign_only("group", &["--zipper::keep-aligner-qc-fail"], Some("has no effect"))]
+    #[case::with_raw_align(
+        "align",
+        &["--zipper::keep-aligner-qc-fail"],
+        Some("applies only to the raw-read align/zipper stage's merge")
+    )]
+    #[case::realign_option_only("group", &["--realign::keep-aligner-qc-fail"], None)]
+    fn realign_warns_on_zipper_keep_aligner_qc_fail(
+        #[case] start_from: &str,
+        #[case] extra: &[&str],
+        #[case] expected: Option<&str>,
+    ) {
+        use crate::commands::common::test_log_capture::{capture_logs, captured};
+
+        let mut args = vec![
+            "--start-from",
+            start_from,
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--group::strategy",
+            "adjacency",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "--realign",
+        ];
+        args.extend_from_slice(extra);
+        let r = parse_io(&args);
+        let _session = capture_logs();
+        // Fails later, past the warning, on the missing reference.
+        let err = format!("{:#}", r.execute("runall test").expect_err("no ref.fa"));
+        assert!(err.contains(PAST_VALIDATION), "{err}");
+        let warnings: Vec<String> = captured()
+            .into_iter()
+            .filter(|line| line.contains("--zipper::keep-aligner-qc-fail does not change"))
+            .collect();
+        match expected {
+            Some(needle) => {
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(warnings[0].contains(needle), "{warnings:?}");
+                assert!(warnings[0].contains("--realign::keep-aligner-qc-fail"), "{warnings:?}");
+            }
+            None => assert!(warnings.is_empty(), "{warnings:?}"),
+        }
+    }
+
     /// `--start-from consensus --realign` needs `--ref` and the `--aligner::*`
     /// selection just as an align stage does (`{ref}` names a FASTA with a
     /// `.dict` beside it).
@@ -4715,6 +4803,52 @@ mod realign_tests {
         let stages = r.derive_stages().unwrap();
         let realign = r.build_stage_options_bag(&stages).unwrap().realign.unwrap();
         assert_eq!(realign.in_memory_reference, expected);
+    }
+
+    /// `--realign::keep-aligner-qc-fail` reaches the realign stage's options (off
+    /// by default), and like the other `--realign::*` options needs `--realign`.
+    #[rstest]
+    #[case::unset(&["--realign"], Some(false))]
+    #[case::bare(&["--realign", "--realign::keep-aligner-qc-fail"], Some(true))]
+    #[case::explicit_false(
+        &["--realign", "--realign::keep-aligner-qc-fail", "false"],
+        Some(false)
+    )]
+    #[case::without_realign(&["--realign::keep-aligner-qc-fail"], None)]
+    fn realign_keep_aligner_qc_fail_reaches_the_stage(
+        #[case] extra: &[&str],
+        #[case] expected: Option<bool>,
+    ) {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "consensus",
+            "--stop-after",
+            "consensus",
+            "--consensus",
+            "simplex",
+            "--simplex::min-reads",
+            "1",
+            "--ref",
+            "ref.fa",
+            "--aligner::preset",
+            "bwa-mem3",
+            "-i",
+            "in.bam",
+            "-o",
+            "out.bam",
+        ];
+        args.extend_from_slice(extra);
+        let r = RunAll::try_parse_from(args).expect("parse");
+        let Some(expected) = expected else {
+            let err = r.derive_stages().expect_err("needs --realign").to_string();
+            assert!(err.contains("--realign::keep-aligner-qc-fail"), "{err}");
+            assert!(err.contains("requires --realign"), "{err}");
+            return;
+        };
+        let stages = r.derive_stages().unwrap();
+        let realign = r.build_stage_options_bag(&stages).unwrap().realign.unwrap();
+        assert_eq!(realign.keep_aligner_qc_fail, expected);
     }
 
     /// Without `--realign` the derived chain and its options are exactly as before.

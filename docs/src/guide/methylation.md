@@ -78,6 +78,8 @@ fgumi fastq --input unmapped.bam \
   | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
 ```
 
+zipper sets or clears the QC-fail flag (0x200) on every mapped read to match the unmapped BAM, as fgbio's `ZipperBams` does, so a QC-fail set by the aligner is lost. bwameth flags suspected chimeras this way, and `bwa-mem3 mem --meth` does with `--chimera-qc` or `--set-as-failed`; methylation callers such as MethylDackel skip QC-fail reads by default. To keep the aligner's flag, add `--keep-aligner-qc-fail` to zipper (`--zipper::keep-aligner-qc-fail` in `runall`, and `--keep-aligner-qc-fail` or `--realign::keep-aligner-qc-fail` for re-alignment in Step 6). With the flag at this step, `fgumi group` (Step 4) and `fgumi dedup` drop a template before consensus calling when the aligner flagged either primary read QC-fail, counting it as not passing filter, unless you give them `--include-non-pf-reads` (`--group::include-non-pf-reads` in `runall`). For consensus reads, the flag that carries a QC-fail through to the methylation caller is the re-alignment one: `fgumi realign --keep-aligner-qc-fail` or `--realign::keep-aligner-qc-fail`.
+
 **TAPs**: only methylated cytosines are converted, which leaves most of the read unchanged, so a standard aligner works:
 
 ```bash

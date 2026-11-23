@@ -1087,6 +1087,7 @@ fn zipper_split_matches_zippermergestep_bytes(
     let make_cfg = || ZipperMergeConfig {
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
+        keep_aligner_qc_fail: false,
         exclude_missing_reads: exclude_missing,
         pg_renames: Arc::default(),
         missing_count: Arc::new(AtomicU64::new(0)),
@@ -1258,6 +1259,7 @@ fn zipper_split_cfg(
     crate::commands::zipper::merge_step::ZipperMergeConfig {
         tag_info: Arc::new(crate::umi::TagInfo::new(vec![], vec![], vec![])),
         skip_tc_tags: true,
+        keep_aligner_qc_fail: false,
         exclude_missing_reads,
         pg_renames: Arc::default(),
         missing_count: Arc::new(AtomicU64::new(0)),
