@@ -745,15 +745,15 @@ pub fn count_mismatches(a: &str, b: &str) -> usize {
     a.as_bytes().iter().zip(b.as_bytes()).filter(|(x, y)| x != y).count()
 }
 
-/// Check that every UMI in a position group shares the same length.
+/// Check that every UMI passed to one `assign` call shares the same length.
 ///
-/// Mirrors fgbio's `require(orderedNodes.forall(_.umi.length == umiLength),
-/// "Multiple UMI lengths: ...")` in `GroupReadsByUmi` (and the `require` in
-/// `Sequences.countMismatches`). [`count_mismatches`] returns [`usize::MAX`] for
-/// UMIs of differing length, which every mismatch-based matcher reads as "no
-/// match"; without this guard a differing-length UMI would silently form its own
-/// molecule (under-grouping) instead of surfacing the malformed input as an
-/// error the way fgbio does (tracker GRP-01).
+/// `group` and `dedup` only ever pass UMIs with the same segment lengths (see
+/// [`UmiAssigner::segment_lengths`]), so for them this is an internal invariant. It
+/// guards library callers that pass UMIs of different lengths directly:
+/// [`count_mismatches`] returns [`usize::MAX`] for UMIs of differing length, which
+/// every mismatch-based matcher reads as "no match", so without this guard such a
+/// UMI would silently form its own molecule instead of surfacing as an error
+/// (tracker GRP-01). The message keeps fgbio's `"Multiple UMI lengths: ..."` wording.
 ///
 /// `lengths` are base counts (dashes in paired UMIs excluded). For the
 /// single-dash paired UMIs the `Paired` strategy enforces, the base count
@@ -777,20 +777,124 @@ pub fn check_uniform_umi_length(lengths: impl IntoIterator<Item = usize>) -> Res
     bail!("Multiple UMI lengths: {}", listed.join(", "))
 }
 
-/// Hint appended to the mixed-length error for the single-UMI strategies (edit, adjacency).
-pub const MIN_UMI_LENGTH_HINT: &str = "(use --min-umi-length to truncate UMIs to a common length)";
-
-/// [`check_uniform_umi_length`] for the single-UMI strategies (edit, adjacency).
+/// Writes the length of each `-`-delimited segment of `umi` into `lengths`, keeping empty
+/// segments (e.g. `ACGT-` has the lengths `4` and `0`). `lengths` is cleared first.
 ///
-/// The message starts with fgbio's `"Multiple UMI lengths: ..."` wording and ends with
-/// [`MIN_UMI_LENGTH_HINT`]. The paired strategy calls [`check_uniform_umi_length`] directly,
-/// because `group` and `dedup` reject `--min-umi-length` for it.
+/// This is the default [`UmiAssigner::segment_lengths`], for assigners whose canonical UMI is
+/// the UMI itself.
+pub fn umi_segment_lengths(umi: &str, lengths: &mut Vec<usize>) {
+    lengths.clear();
+    lengths.extend(umi.split('-').map(str::len));
+}
+
+/// Whether the forward orientation `first-second` of a paired UMI is its canonical form, i.e.
+/// whether `first` sorts at or before `second` (ASCII case-insensitively).
+///
+/// This is the one rule that decides which half of a paired UMI comes first in its canonical
+/// form, shared by the sequential paired assigner's canonicalization, the parallel paired
+/// assigner's, and [`paired_umi_segment_lengths`], so a UMI's length bucket always matches the
+/// canonical form it is grouped by. It mirrors fgbio, which takes the lower of `A-B` and `B-A`.
+/// Comparing the halves rather than the whole `A-B` and `B-A` strings only differs when one half
+/// is a prefix of the other and the next character sorts before `-`, which no base, orientation
+/// prefix letter or `:` does.
+#[must_use]
+pub fn paired_forward_is_canonical(first: &str, second: &str) -> bool {
+    let upper = |b: &u8| b.to_ascii_uppercase();
+    first.as_bytes().iter().map(upper).le(second.as_bytes().iter().map(upper))
+}
+
+/// The UMI bases of one half of a paired key: the text after the last `:` (the orientation
+/// prefix `group` and `dedup` add, e.g. `aa:`), or the whole half when it has no prefix.
+fn paired_half_bases(half: &str) -> &str {
+    half.rsplit_once(':').map_or(half, |(_, bases)| bases)
+}
+
+/// Writes the segment lengths of the canonical form of the paired UMI `umi` into `lengths`
+/// (see [`UmiAssigner::segment_lengths`]); `lengths` is cleared first.
+///
+/// The canonical form of `A-B` is `A-B` or `B-A` as decided by [`paired_forward_is_canonical`],
+/// so both orientations of a UMI pair get the same lengths. The canonical form is not built:
+/// only which half comes first is decided. Each half is measured by its UMI bases, after any
+/// orientation prefix (the text up to the last `:`), as the paired assigners measure it when
+/// checking that every UMI in one `assign` call has the same length. A UMI without exactly one
+/// `-` is not a paired UMI, and gets the lengths of its own segments (the paired assigners
+/// reject it).
+pub fn paired_umi_segment_lengths(umi: &str, lengths: &mut Vec<usize>) {
+    let Some((first, second)) = umi.split_once('-').filter(|(_, second)| !second.contains('-'))
+    else {
+        umi_segment_lengths(umi, lengths);
+        return;
+    };
+    let (first, second) =
+        if paired_forward_is_canonical(first, second) { (first, second) } else { (second, first) };
+    lengths.clear();
+    lengths.extend([paired_half_bases(first).len(), paired_half_bases(second).len()]);
+}
+
+/// Splits the indices of `umis` by the segment lengths of each UMI's canonical form (see
+/// [`UmiAssigner::segment_lengths`]), in ascending order of the segment lengths. Returns
+/// `None`, allocating only two small length buffers, when every UMI has the same segment
+/// lengths (one bucket, including when `umis` is empty).
+#[must_use]
+pub fn split_by_segment_lengths(
+    assigner: &dyn UmiAssigner,
+    umis: &[Umi],
+) -> Option<Vec<Vec<usize>>> {
+    let (first, rest) = umis.split_first()?;
+    let mut first_lengths = Vec::new();
+    assigner.segment_lengths(first, &mut first_lengths);
+    let mut lengths = Vec::new();
+    let all_same = rest.iter().all(|umi| {
+        assigner.segment_lengths(umi, &mut lengths);
+        lengths == first_lengths
+    });
+    if all_same {
+        return None;
+    }
+
+    let mut by_lengths: BTreeMap<Vec<usize>, Vec<usize>> = BTreeMap::new();
+    for (i, umi) in umis.iter().enumerate() {
+        assigner.segment_lengths(umi, &mut lengths);
+        if let Some(indices) = by_lengths.get_mut(&lengths) {
+            indices.push(i);
+        } else {
+            by_lengths.insert(lengths.clone(), vec![i]);
+        }
+    }
+    Some(by_lengths.into_values().collect())
+}
+
+/// Assigns molecule ids to `umis` the way fgbio's `GroupReadsByUmi.assignUmiGroups` does
+/// without `--truncate` (as of fulcrumgenomics/fgbio#1198): the UMIs are bucketed by the
+/// segment lengths of their canonical form (see [`split_by_segment_lengths`]) and each bucket
+/// is assigned with its own [`UmiAssigner::assign`] call, so UMIs of different lengths are
+/// never assigned to the same molecule.
+///
+/// Buckets are assigned in ascending order of their segment lengths, so molecule ids are
+/// deterministic. Every assigner numbers molecules across `assign` calls from one counter
+/// (zeroed only by [`UmiAssigner::reset`]), so ids stay unique across buckets. When every UMI
+/// has the same segment lengths (the common case) they are assigned in one call, without
+/// building buckets, so the ids are exactly those of a single `assign` call.
 ///
 /// # Errors
 ///
-/// Returns `"Multiple UMI lengths: {lengths} {MIN_UMI_LENGTH_HINT}"` if any length differs.
-pub fn check_uniform_single_umi_length(lengths: impl IntoIterator<Item = usize>) -> Result<()> {
-    check_uniform_umi_length(lengths).map_err(|e| anyhow::anyhow!("{e} {MIN_UMI_LENGTH_HINT}"))
+/// Returns an error if the assigner fails on any bucket.
+pub fn assign_by_segment_lengths(
+    assigner: &dyn UmiAssigner,
+    mut umis: Vec<Umi>,
+) -> Result<Vec<MoleculeId>> {
+    let Some(buckets) = split_by_segment_lengths(assigner, &umis) else {
+        return assigner.assign(&umis);
+    };
+
+    let mut assignments = vec![MoleculeId::None; umis.len()];
+    for indices in buckets {
+        let bucket: Vec<Umi> = indices.iter().map(|&i| std::mem::take(&mut umis[i])).collect();
+        for (i, id) in indices.into_iter().zip(assigner.assign(&bucket)?) {
+            assignments[i] = id;
+        }
+    }
+    Ok(assignments)
 }
 
 /// Build the per-input `MoleculeId` vector, resolving each raw UMI with `resolve` and falling
@@ -990,15 +1094,21 @@ pub trait UmiAssigner: Send + Sync {
         true
     }
 
-    /// Whether this assigner groups only identical UMIs: the identity strategy, or a
-    /// mismatch-based single-UMI strategy with zero edits.
+    /// Writes the length of each `-`-delimited segment of the canonical form of `umi` into
+    /// `lengths` (cleared first), keeping empty segments (e.g. `ACGT-` has the lengths `4` and
+    /// `0`).
     ///
-    /// With `--min-umi-length`, `group` and `dedup` split such an assigner's UMIs by their
-    /// first `--min-umi-length` bases and truncate each split on its own, matching fgbio's
-    /// `GroupReadsByUmi.assignUmiGroups`. Default `false`. The paired strategy keeps the
-    /// default because it rejects `--min-umi-length`.
-    fn groups_identical_umis_only(&self) -> bool {
-        false
+    /// `group` and `dedup` only pass UMIs with the same segment lengths to one
+    /// [`assign`](Self::assign) call, so UMIs of different lengths are never assigned to the
+    /// same molecule (fgbio's `Assigner.segmentLengths`). Because the canonical form is used,
+    /// the two orientations of a paired UMI (`A-B` and `B-A`) have the same lengths. The
+    /// lengths are written into a caller-owned buffer so a caller can compare many UMIs
+    /// without allocating per UMI.
+    ///
+    /// The default is [`umi_segment_lengths`], correct for assigners whose canonical form is
+    /// the UMI itself; the paired assigners override it with [`paired_umi_segment_lengths`].
+    fn segment_lengths(&self, umi: &str, lengths: &mut Vec<usize>) {
+        umi_segment_lengths(umi, lengths);
     }
 
     /// Downcast to concrete type (for pattern matching)
@@ -1057,10 +1167,6 @@ impl Default for IdentityUmiAssigner {
 impl UmiAssigner for IdentityUmiAssigner {
     fn reset(&self) {
         self.counter.store(0, Ordering::SeqCst);
-    }
-
-    fn groups_identical_umis_only(&self) -> bool {
-        true
     }
 
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
@@ -1325,10 +1431,6 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         self.counter.store(0, Ordering::SeqCst);
     }
 
-    fn groups_identical_umis_only(&self) -> bool {
-        self.max_mismatches == 0
-    }
-
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
             return Ok(Vec::new());
@@ -1351,9 +1453,7 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
         // mixed valid/invalid input such as ["AAAA", "NNN"] fails here on differing lengths
         // while the parallel path silently continues on the valid subset (GRP-01 parity).
         // Genuinely differing-length *valid* UMIs (e.g. ["AAAA", "CCC"]) still trip the guard.
-        check_uniform_single_umi_length(
-            encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())),
-        )?;
+        check_uniform_umi_length(encodings.iter().filter_map(|enc| enc.map(|enc| enc.len())))?;
 
         // Group the distinct UMIs into connected components under the
         // "within `max_mismatches`" relation, in a single pass over the records.
@@ -2004,10 +2104,6 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         self.counter.store(0, Ordering::SeqCst);
     }
 
-    fn groups_identical_umis_only(&self) -> bool {
-        self.max_mismatches == 0
-    }
-
     fn assign(&self, raw_umis: &[Umi]) -> Result<Vec<MoleculeId>> {
         if raw_umis.is_empty() {
             return Ok(Vec::new());
@@ -2104,7 +2200,7 @@ impl UmiAssigner for AdjacencyUmiAssigner {
 
         // Reject differing-length UMIs the way fgbio does (see check_uniform_umi_length).
         // `BitEnc::len` is the base count (dashes excluded), so this checks base length.
-        check_uniform_single_umi_length(umi_counts.iter().map(|(enc, _, _)| enc.len()))?;
+        check_uniform_umi_length(umi_counts.iter().map(|(enc, _, _)| enc.len()))?;
 
         // Build adjacency graph using BitEnc-based matching
         let (nodes, roots) = self.build_adjacency_graph_bitenc(&umi_counts, raw_umis);
@@ -2439,10 +2535,10 @@ impl PairedUmiAssigner {
     /// Returns error if UMI is not a valid paired UMI
     fn canonicalize_paired(umi: &str) -> Result<String> {
         let (first, second) = Self::split(umi)?;
-        // Compare parts directly to avoid allocating reversed string when not needed
-        // If first <= second, original "first-second" is canonical
-        // If first > second, reversed "second-first" is canonical
-        if first <= second {
+        // Compare the halves (see `paired_forward_is_canonical`) to avoid allocating the reversed
+        // string when the forward form is canonical. Callers pass upper-cased UMIs, for which the
+        // case-insensitive comparison is a plain `first <= second`.
+        if paired_forward_is_canonical(first, second) {
             Ok(umi.to_string())
         } else {
             // Only allocate when we need the reversed form
@@ -2743,6 +2839,10 @@ impl UmiAssigner for PairedUmiAssigner {
         Self::canonicalize_paired(&upper).unwrap_or(upper)
     }
 
+    fn segment_lengths(&self, umi: &str, lengths: &mut Vec<usize>) {
+        paired_umi_segment_lengths(umi, lengths);
+    }
+
     fn split_templates_by_pair_orientation(&self) -> bool {
         false
     }
@@ -2849,6 +2949,165 @@ mod tests {
         assert_eq!(base_umi_length(umi), expected, "Failed for: {description}");
     }
 
+    /// fgbio#1198's `segmentLengths`: one length per `-`-delimited segment, keeping empty ones.
+    #[rstest]
+    #[case::single("ACGTAC", vec![6])]
+    #[case::empty("", vec![0])]
+    #[case::two_segments("ACGT-CCGGA", vec![4, 5])]
+    #[case::trailing_dash("ACGT-", vec![4, 0])]
+    #[case::leading_dash("-ACGT", vec![0, 4])]
+    #[case::three_segments("AC-G-TTT", vec![2, 1, 3])]
+    fn test_umi_segment_lengths(#[case] umi: &str, #[case] expected: Vec<usize>) {
+        let mut lengths = vec![99];
+        umi_segment_lengths(umi, &mut lengths);
+        assert_eq!(lengths, expected);
+        // The single-UMI assigners use the default, since their canonical form is the UMI.
+        let assigner = SimpleErrorUmiAssigner::new(1);
+        assigner.segment_lengths(umi, &mut lengths);
+        assert_eq!(lengths, expected);
+    }
+
+    /// The paired lengths are those of the canonical form (the lower of `A-B` and `B-A`, case
+    /// insensitively), so both orientations of a pair get the same lengths.
+    #[rstest]
+    #[case::same_lengths("ACGT-CCGG", vec![4, 4])]
+    #[case::forward_is_canonical("ACTACT-GGG", vec![6, 3])]
+    #[case::reverse_is_canonical("GGG-ACTACT", vec![6, 3])]
+    #[case::lowercase_reverse("ggg-actact", vec![6, 3])]
+    #[case::mixed_case("GGG-actact", vec![6, 3])]
+    // Each half is measured by its bases, after the orientation prefix.
+    #[case::prefixed_lower_first("aa:ACT-bb:GGGGGG", vec![3, 6])]
+    #[case::prefixed_higher_first("bb:GGGGGG-aa:ACT", vec![3, 6])]
+    #[case::prefixed_lower_first_longer("aa:ACTACT-bb:GGG", vec![6, 3])]
+    #[case::absent_half("ACGT-", vec![0, 4])]
+    #[case::absent_half_reversed("-ACGT", vec![0, 4])]
+    // Not a paired UMI: the lengths of its own segments.
+    #[case::no_dash("ACGT", vec![4])]
+    #[case::two_dashes("AC-GT-T", vec![2, 2, 1])]
+    fn test_paired_umi_segment_lengths(#[case] umi: &str, #[case] expected: Vec<usize>) {
+        let mut lengths = Vec::new();
+        paired_umi_segment_lengths(umi, &mut lengths);
+        assert_eq!(lengths, expected);
+        let assigner = PairedUmiAssigner::new(1);
+        assigner.segment_lengths(umi, &mut lengths);
+        assert_eq!(lengths, expected);
+        // The canonical form agrees, for the UMIs `canonicalize` accepts.
+        if umi.matches('-').count() == 1 {
+            let canonical = assigner.canonicalize(umi);
+            let canonical_lengths: Vec<usize> =
+                canonical.split('-').map(|half| paired_half_bases(half).len()).collect();
+            assert_eq!(canonical_lengths, expected, "canonical form {canonical}");
+        }
+    }
+
+    /// `A-B` and `B-A` get the same length bucket, which matches the canonical form the
+    /// paired assigner groups by, including where comparing the whole `A-B` and `B-A` strings
+    /// would put the other half first (a half that is a prefix of the other, followed by a
+    /// character that sorts before `-`, such as `+`).
+    #[rstest]
+    #[case::unprefixed("ACTACT-GGG", vec![6, 3])]
+    #[case::unprefixed_lower_second("GGG-ACTACT", vec![6, 3])]
+    #[case::prefixed("aa:ACTACT-bb:GGG", vec![6, 3])]
+    #[case::prefixed_higher_first("bb:GGG-aa:ACTACT", vec![6, 3])]
+    // Halves: `AC` <= `AC+`, so `AC` is first. Whole strings: `AC+-AC` < `AC-AC+`.
+    #[case::whole_string_disagrees("AC-AC+", vec![2, 3])]
+    #[case::whole_string_disagrees_prefixed("x:AC-x:AC+", vec![2, 3])]
+    fn test_paired_segment_lengths_match_both_orientations_and_canonical(
+        #[case] umi: &str,
+        #[case] expected: Vec<usize>,
+    ) {
+        let (first, second) = umi.split_once('-').expect("test UMIs are paired");
+        let reversed = format!("{second}-{first}");
+        let mut forward_lengths = Vec::new();
+        let mut reverse_lengths = Vec::new();
+        paired_umi_segment_lengths(umi, &mut forward_lengths);
+        paired_umi_segment_lengths(&reversed, &mut reverse_lengths);
+        assert_eq!(forward_lengths, expected);
+        assert_eq!(reverse_lengths, expected);
+
+        let canonical = PairedUmiAssigner::canonicalize_paired(&umi.to_uppercase())
+            .expect("test UMIs are paired");
+        let canonical_lengths: Vec<usize> =
+            canonical.split('-').map(|half| paired_half_bases(half).len()).collect();
+        assert_eq!(canonical_lengths, expected, "canonical form {canonical}");
+    }
+
+    /// The halves rule is case-insensitive and picks the forward form when the halves tie.
+    #[rstest]
+    #[case::lower_first("ACG", "TTT", true)]
+    #[case::higher_first("TTT", "ACG", false)]
+    #[case::equal("ACG", "ACG", true)]
+    #[case::shorter_prefix_first("AC", "ACG", true)]
+    #[case::longer_first("ACG", "AC", false)]
+    #[case::case_insensitive("tTT", "Acg", false)]
+    #[case::prefix_decides("aa:TTT", "bb:ACG", true)]
+    #[case::character_below_dash("AC", "AC+", true)]
+    fn test_paired_forward_is_canonical(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(paired_forward_is_canonical(first, second), expected);
+    }
+
+    /// [`split_by_segment_lengths`] returns `None` for one bucket, and otherwise the indices
+    /// of each bucket in ascending order of segment lengths.
+    #[rstest]
+    #[case::empty(&[], None)]
+    #[case::one(&["ACGT"], None)]
+    #[case::same_lengths(&["ACGT-TT", "GGCC-AA"], None)]
+    #[case::two_lengths(&["AAAAAA", "CCC", "AAAA", "CCC"], Some(vec![vec![1, 3], vec![2], vec![0]]))]
+    #[case::dash_layout(&["ACGT-", "ACGT", "AC-GT"], Some(vec![vec![2], vec![1], vec![0]]))]
+    fn test_split_by_segment_lengths(
+        #[case] umis: &[&str],
+        #[case] expected: Option<Vec<Vec<usize>>>,
+    ) {
+        let umis: Vec<Umi> = umis.iter().map(|umi| (*umi).to_string()).collect();
+        let assigner = IdentityUmiAssigner::new();
+        assert_eq!(split_by_segment_lengths(&assigner, &umis), expected);
+    }
+
+    /// Buckets are assigned in ascending order of their segment lengths from the assigner's one
+    /// id counter, so ids are unique across buckets and do not depend on input order.
+    #[rstest]
+    #[case::identity(crate::assigner::Strategy::Identity, 0)]
+    #[case::edit(crate::assigner::Strategy::Edit, 1)]
+    #[case::adjacency(crate::assigner::Strategy::Adjacency, 1)]
+    fn test_assign_by_segment_lengths_numbers_buckets_in_ascending_order(
+        #[case] strategy: crate::assigner::Strategy,
+        #[case] edits: u32,
+    ) {
+        let umis: Vec<Umi> =
+            ["AAAAAA", "CCC", "AAAA", "CCC"].iter().map(|umi| (*umi).to_string()).collect();
+        let ids = assign_by_segment_lengths(strategy.new_assigner(edits).as_ref(), umis)
+            .expect("assignment should succeed");
+        let expected: Vec<Option<u64>> = vec![Some(2), Some(0), Some(1), Some(0)];
+        assert_eq!(ids.iter().map(MoleculeId::id).collect::<Vec<_>>(), expected);
+    }
+
+    /// Paired keys whose halves carry a `:` are bucketed by their bases, as the paired
+    /// assigner's length guard measures them, so keys with equally long halves but different
+    /// numbers of bases (`aa:ACG` and `a:ACGT` are both six characters) are separate buckets
+    /// rather than tripping "Multiple UMI lengths".
+    #[rstest]
+    #[case::prefixed_halves(&["aa:ACG-bb:GGG", "a:ACGT-bb:GGG"], vec![
+        MoleculeId::PairedA(0),
+        MoleculeId::PairedA(1),
+    ])]
+    #[case::both_strands(&["aa:ACTACT-bb:GGG", "bb:GGG-aa:ACTACT"], vec![
+        MoleculeId::PairedA(0),
+        MoleculeId::PairedB(0),
+    ])]
+    fn test_assign_by_segment_lengths_paired_prefixed(
+        #[case] umis: &[&str],
+        #[case] expected: Vec<MoleculeId>,
+    ) {
+        let umis: Vec<Umi> = umis.iter().map(|umi| (*umi).to_string()).collect();
+        let assigner = PairedUmiAssigner::new(1);
+        let ids = assign_by_segment_lengths(&assigner, umis).expect("paired keys must not error");
+        assert_eq!(ids, expected);
+    }
+
     #[rstest]
     #[case::empty(vec![])]
     #[case::single(vec![4])]
@@ -2869,22 +3128,21 @@ mod tests {
         assert_eq!(err.to_string(), expected);
     }
 
-    /// fgbio's `GroupReadsByUmi` throws on UMIs of differing length
-    /// (`GroupReadsByUmiTest.scala:513`, `Sequences.countMismatches`'s `require`).
-    /// Every sequential mismatch-based assigner must reject them the same way
-    /// rather than silently under-group via `count_mismatches` -> `usize::MAX`
-    /// (tracker GRP-01). `Identity` groups by exact match and has no length
-    /// constraint, matching fgbio's identity assigner.
+    /// A library caller that passes UMIs of differing length to one `assign` call
+    /// (`group` and `dedup` never do: they bucket UMIs by segment lengths first) must get
+    /// an error from every sequential mismatch-based assigner, rather than a silent
+    /// under-grouping via `count_mismatches` -> `usize::MAX` (tracker GRP-01). `Identity`
+    /// groups by exact match and has no length constraint.
     #[rstest]
     #[case::edit(
         crate::assigner::Strategy::Edit,
         vec!["AAAA".to_string(), "AAA".to_string()],
-        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+        "Multiple UMI lengths: 3, 4"
     )]
     #[case::adjacency(
         crate::assigner::Strategy::Adjacency,
         vec!["AAAA".to_string(), "AAA".to_string()],
-        "Multiple UMI lengths: 3, 4 (use --min-umi-length to truncate UMIs to a common length)"
+        "Multiple UMI lengths: 3, 4"
     )]
     #[case::paired(
         crate::assigner::Strategy::Paired,

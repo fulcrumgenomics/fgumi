@@ -1599,58 +1599,36 @@ fn test_dedup_missing_tc_fails_on_every_template(#[case] name: &str, #[case] pla
     );
 }
 
-/// End-to-end counterpart of the `assign_umi_groups_rejects_mixed_umi_lengths` unit test:
-/// UMIs of different lengths at one position (fgbio `GroupReadsByUmiTest.scala:513`) must make
-/// `dedup` exit with the same "Failed to assign UMI groups" error `group` reports, not a panic.
+/// End-to-end counterpart of the `assign_umi_groups_keeps_mixed_umi_lengths_apart` unit test:
+/// UMIs of different lengths at one position (fgbio `GroupReadsByUmiTest.scala:513`, replaced
+/// in fgbio#1198) are separate families, not an error.
 #[rstest]
-#[case::edit(
-    "edit",
-    "AAAA",
-    "AAA",
-    "3, 4 (use --min-umi-length to truncate UMIs to a common length)"
-)]
-#[case::adjacency(
-    "adjacency",
-    "AAAA",
-    "AAA",
-    "3, 4 (use --min-umi-length to truncate UMIs to a common length)"
-)]
-#[case::paired("paired", "ACT-ACT", "ACT-AC", "5, 6")]
-fn test_dedup_mixed_umi_lengths_fails(
+#[case::edit("edit", "AAAA", "AAA")]
+#[case::adjacency("adjacency", "AAAA", "AAA")]
+#[case::paired("paired", "ACT-ACT", "ACT-AC")]
+fn test_dedup_mixed_umi_lengths_are_separate_families(
     #[case] strategy: &str,
     #[case] umi_a: &str,
     #[case] umi_b: &str,
-    #[case] lengths: &str,
 ) {
-    let temp_dir = TempDir::new().unwrap();
-    let input_bam = temp_dir.path().join("input.bam");
-    let output_bam = temp_dir.path().join("output.bam");
+    // Group by the MI base (without `/A` or `/B`), so the paired case fails if the two UMIs
+    // were made the two strands of one duplex molecule.
+    let output = dedup_output(&[("a", umi_a), ("b", umi_b)], &["--strategy", strategy]);
+    assert!(output.iter().all(|(_, mi)| mi.is_some()), "every record must have an MI");
+    assert_eq!(mi_base_families(&output), families("a | b"));
+}
 
-    let mut records = create_duplicate_group("a", umi_a, 1, 100);
-    records.extend(create_duplicate_group("b", umi_b, 1, 100));
-    create_sorted_bam(&input_bam, records);
-
-    let cmd = MarkDuplicates::try_parse_from([
-        "dedup",
-        "--input",
-        input_bam.to_str().unwrap(),
-        "--output",
-        output_bam.to_str().unwrap(),
-        "--strategy",
-        strategy,
-        "--compression-level",
-        "1",
-    ])
-    .expect("failed to parse dedup args");
-
-    let err = cmd.execute("fgumi dedup").expect_err("mixed UMI lengths must fail dedup");
-    assert_eq!(
-        format!("{err:#}"),
-        format!(
-            "Pipeline::run: step \"DedupProcess\" failed: Failed to assign UMI groups: \
-             Multiple UMI lengths: {lengths}"
-        )
-    );
+/// Like [`mi_families`], but groups by the MI base: the MI without a paired strand suffix
+/// (`/A` or `/B`), so both strands of a duplex molecule are one family.
+fn mi_base_families(output: &[(String, Option<String>)]) -> BTreeSet<BTreeSet<String>> {
+    let mut families: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (name, mi) in output {
+        if let Some(mi) = mi {
+            let base = mi.strip_suffix("/A").or_else(|| mi.strip_suffix("/B")).unwrap_or(mi);
+            families.entry(base).or_default().insert(name.clone());
+        }
+    }
+    families.into_values().collect()
 }
 
 /// Runs `dedup` on one template per `(name, umi)` at one position, with `extra_args` appended
@@ -1724,69 +1702,113 @@ fn families(spec: &str) -> BTreeSet<BTreeSet<String>> {
     spec.split('|').map(|g| g.split_whitespace().map(str::to_string).collect()).collect()
 }
 
-/// End-to-end ports of fgbio#1185's "compare only the bases of UMIs containing dashes when
-/// truncating with the $strategy strategy" (`GroupReadsByUmiTest.scala`): with
-/// `--min-umi-length`, dashes are removed before truncating, so bases are compared with bases.
+/// End-to-end ports of fgbio#1198's "compare only the bases of UMIs containing dashes when
+/// truncating" and "not group UMIs whose segments have different lengths without --truncate"
+/// (`GroupReadsByUmiTest.scala`): with `--truncate`, dashes are removed before truncating to
+/// `--min-umi-length`, so bases are compared with bases.
 #[rstest]
 // ACGTT vs ACGTA: one mismatch. Comparing characters ("AC-GTT" vs "ACGTA-") would give four.
-#[case::one_mismatch("AC-GTT", "ACGTA-T", "5", "a01 a02")]
-#[case::one_mismatch_trailing_dash("ACGTAC-", "TCGTACG-TT", "6", "a01 a02")]
-// The shortest UMI has six bases, more than `--min-umi-length`: ACGTTA vs ACGTAC is two
-// mismatches, so they stay apart. Truncating to five bases (ACGTT vs ACGTA) would merge them.
-#[case::shortest_longer_than_option("AC-GTTA", "ACGTA-C", "5", "a01 | a02")]
-fn test_dedup_min_umi_length_compares_bases_of_dashed_umis(
+#[case::one_mismatch("AC-GTT", "ACGTA-T", "5", true, "a01 a02")]
+#[case::one_mismatch_trailing_dash("ACGTAC-", "TCGTACG-TT", "6", true, "a01 a02")]
+// Both have six bases, more than `--min-umi-length`, and ACGTTA vs ACGTAC is two mismatches.
+// UMIs are truncated to `--min-umi-length`, not to the shortest UMI, so ACGTT vs ACGTA (one
+// mismatch) are grouped.
+#[case::truncated_to_option("AC-GTTA", "ACGTA-C", "5", true, "a01 a02")]
+// One mismatch apart if the dashes are ignored, but the segment lengths differ (2+4 vs 5+1).
+#[case::segment_lengths_differ("AC-GTTA", "ACGTA-A", "5", false, "a01 | a02")]
+fn test_dedup_dashed_umis_with_and_without_truncate(
     #[values("edit", "adjacency")] strategy: &str,
     #[case] umi_a: &str,
     #[case] umi_b: &str,
     #[case] min_umi_length: &str,
+    #[case] truncate: bool,
     #[case] expected: &str,
 ) {
-    let got = dedup_families(
-        &[("a01", umi_a), ("a02", umi_b)],
-        &["--strategy", strategy, "--edits", "1", "--min-umi-length", min_umi_length],
-    );
+    let mut args = vec!["--strategy", strategy, "--edits", "1", "--min-umi-length", min_umi_length];
+    if truncate {
+        args.push("--truncate");
+    }
+    let got = dedup_families(&[("a01", umi_a), ("a02", umi_b)], &args);
     assert_eq!(got, families(expected));
 }
 
-/// End-to-end ports of fgbio#1185's identity / `--edits 0` tests: UMIs are split by their first
-/// `--min-umi-length` bases and each split is truncated to its own shortest UMI.
+/// End-to-end ports of fgbio#1198's identity / `--edits 0` tests.
 #[rstest]
-#[case::shortest_sharing_prefix(
-    &[("a01", "ACGTA"), ("a02", "ACGTC"), ("a03", "TTTT")],
-    "4",
-    "a01 | a02 | a03"
-)]
-#[case::dashed(
+// "compare only the first --min-umi-length bases of UMIs containing dashes with --truncate".
+#[case::dashed_truncate(
     &[("a01", "ACG-TACGTA"), ("a02", "ACG-TACGTC"), ("a03", "ACG-TACGA"), ("a04", "ACGT-ACGTA")],
-    "8",
-    "a01 a04 | a02 | a03"
-)]
-#[case::to_minimum(
-    &[("a01", "ACGTACGTA"), ("a02", "ACGTACGTC"), ("a03", "ACGTACGA"), ("a04", "ACGTACGT")],
-    "8",
+    &["--min-umi-length", "8", "--truncate"],
     "a01 a02 a04 | a03"
 )]
-fn test_dedup_min_umi_length_splits_identical_grouping_by_prefix(
+// "not truncate UMIs containing dashes without --truncate".
+#[case::dashed_no_truncate(
+    &[("a01", "ACG-TACGTA"), ("a02", "ACG-TACGTC"), ("a03", "ACG-TACGA"), ("a04", "ACGT-ACGTA")],
+    &["--min-umi-length", "8"],
+    "a01 | a02 | a03 | a04"
+)]
+// "truncate UMIs to --min-umi-length with --truncate".
+#[case::to_min_length(
+    &[("a01", "ACGTA"), ("a02", "ACGTC"), ("a03", "TTTT"), ("a04", "ACGT")],
+    &["--min-umi-length", "4", "--truncate"],
+    "a01 a02 a04 | a03"
+)]
+// "group only identical UMIs of the same length without --min-umi-length".
+#[case::same_length_only(
+    &[("a01", "ACGTA"), ("a02", "ACGTA"), ("a03", "ACGT"), ("a04", "ACGT-"), ("a05", "ACGTAC")],
+    &[],
+    "a01 a02 | a03 | a04 | a05"
+)]
+fn test_dedup_identical_grouping_with_and_without_truncate(
     #[values(("identity", "0"), ("edit", "0"), ("adjacency", "0"))] strategy_and_edits: (
         &str,
         &str,
     ),
     #[case] umis: &[(&str, &str)],
-    #[case] min_umi_length: &str,
+    #[case] extra: &[&str],
     #[case] expected: &str,
 ) {
     let (strategy, edits) = strategy_and_edits;
-    let got = dedup_families(
-        umis,
-        &["--strategy", strategy, "--edits", edits, "--min-umi-length", min_umi_length],
-    );
-    assert_eq!(got, families(expected));
+    let mut args = vec!["--strategy", strategy, "--edits", edits];
+    args.extend_from_slice(extra);
+    assert_eq!(dedup_families(umis, &args), families(expected));
 }
 
-/// Port of fgbio#1185's "group UMIs that differ only by case with the adjacency strategy".
+/// Ports of fgbio#1198's "discard reads with UMIs shorter than --min-umi-length but not group
+/// UMIs of different lengths without --truncate" and "group reads with UMIs of different
+/// lengths with --min-umi-length and --truncate", plus "group single-end reads with UMIs of
+/// different lengths separately" (edit strategy, `--edits 1`).
+#[rstest]
+#[case::without_truncate(
+    &[("a01", "AGTAGGCC"), ("a02", "AGTAGGCC"), ("a03", "AGTAGGC"), ("a04", "AGTAGGC"), ("a05", "AGTAGG")],
+    &["--min-umi-length", "7"],
+    "a01 a02 | a03 a04"
+)]
+#[case::with_truncate(
+    &[("a01", "AGTAGGCC"), ("a02", "AGTAGGCC"), ("a03", "AGTAGGC"), ("a04", "AGTAGGC"), ("a05", "AGTAGG")],
+    &["--min-umi-length", "7", "--truncate"],
+    "a01 a02 a03 a04"
+)]
+#[case::no_min_length(
+    &[("a01", "AAAAAAAA"), ("a02", "AAAAAAAA"), ("a03", "ACACACA"), ("a04", "ACACACC"), ("a05", "AAAAAAA")],
+    &[],
+    "a01 a02 | a03 a04 | a05"
+)]
+fn test_dedup_umis_of_different_lengths(
+    #[case] umis: &[(&str, &str)],
+    #[case] extra: &[&str],
+    #[case] expected: &str,
+) {
+    let mut args = vec!["--strategy", "edit", "--edits", "1"];
+    args.extend_from_slice(extra);
+    assert_eq!(dedup_families(umis, &args), families(expected));
+}
+
+/// Port of fgbio#1198's "group UMIs that differ only by case with the adjacency strategy,
+/// --min-umi-length and --truncate".
 #[rstest]
 #[case::no_min_length(&[])]
 #[case::min_length_8(&["--min-umi-length", "8"])]
+#[case::min_length_8_truncate(&["--min-umi-length", "8", "--truncate"])]
 fn test_dedup_adjacency_groups_umis_differing_only_by_case(#[case] extra: &[&str]) {
     let mut args = vec!["--strategy", "adjacency", "--edits", "1"];
     args.extend_from_slice(extra);
@@ -1819,28 +1841,45 @@ fn test_dedup_min_umi_length_counts_only_bases(
     assert_eq!(mi_families(&output), families("a02"));
 }
 
-/// Port of fgbio#1185's "reject a --min-umi-length less than one".
-#[test]
-fn test_dedup_rejects_min_umi_length_zero() {
+/// Ports of fgbio#1185's "reject a --min-umi-length less than one" and fgbio#1198's "reject
+/// --truncate without --min-umi-length" and "reject --min-umi-length with the paired strategy
+/// and --truncate=$truncate".
+#[rstest]
+#[case::zero(&["--strategy", "identity", "--min-umi-length", "0"], "--min-umi-length must be at least 1")]
+#[case::truncate_without_min_length(
+    &["--strategy", "edit", "--truncate"],
+    "--truncate requires --min-umi-length"
+)]
+#[case::paired(
+    &["--strategy", "paired", "--min-umi-length", "4"],
+    "--min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs of \
+     different lengths are grouped by the lengths of their two UMIs"
+)]
+#[case::paired_truncate(
+    &["--strategy", "paired", "--min-umi-length", "4", "--truncate"],
+    "--min-umi-length and --truncate cannot be used with the paired strategy; paired UMIs of \
+     different lengths are grouped by the lengths of their two UMIs"
+)]
+fn test_dedup_rejects_invalid_min_umi_length_and_truncate(
+    #[case] extra: &[&str],
+    #[case] expected: &str,
+) {
     let temp_dir = TempDir::new().unwrap();
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
     create_sorted_bam(&input_bam, create_duplicate_group("a", "ACGT", 1, 100));
 
-    let cmd = MarkDuplicates::try_parse_from([
+    let mut command_line = vec![
         "dedup",
         "--input",
         input_bam.to_str().unwrap(),
         "--output",
         output_bam.to_str().unwrap(),
-        "--strategy",
-        "identity",
-        "--min-umi-length",
-        "0",
-    ])
-    .expect("failed to parse dedup args");
-    let err = cmd.execute("fgumi dedup").expect_err("--min-umi-length 0 must be rejected");
-    assert_eq!(err.to_string(), "--min-umi-length must be at least 1");
+    ];
+    command_line.extend_from_slice(extra);
+    let cmd = MarkDuplicates::try_parse_from(&command_line).expect("failed to parse dedup args");
+    let err = cmd.execute("fgumi dedup").expect_err("the options must be rejected");
+    assert_eq!(err.to_string(), expected);
 }
 
 /// Regression test for OOM with large position groups in `--no-umi` mode.
