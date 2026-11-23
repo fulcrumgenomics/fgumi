@@ -6,6 +6,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Bumped by .github/workflows/bwa-mem3-rs-bump.yml instead, which also
+    # updates the CI pins that track the vendored bwa-mem3. Compatible
+    # bwa-mem3-sys patches can change that commit too, so neither crate may
+    # advance independently of the synchronized updater.
+    ignore:
+      - dependency-name: "bwa-mem3-rs"
+      - dependency-name: "bwa-mem3-sys"
     groups:
       all-cargo-deps:
         patterns: ["*"]

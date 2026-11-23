@@ -1,0 +1,269 @@
+name: bwa-mem3-rs bump
+
+# Nightly check for a new `bwa-mem3-rs` release on crates.io. On finding one,
+# bump the Cargo pin and every CI pin that tracks the bwa-mem3 it vendors
+# (scripts/ci/bwa-mem3-rs-bump.sh), then open a draft PR. The PR may fail CI
+# when the crate's API changed; the adaptation is pushed onto its branch.
+#
+# A new fg-labs/bwa-mem3 release is NOT handled here: fgumi links bwa-mem3 only
+# through bwa-mem3-rs, whose own nightly `vendor-bump` workflow picks it up. The
+# PR this job opens once that bwa-mem3-rs release ships names the bwa-mem3
+# version it carries.
+#
+# Dependabot ignores both bwa-mem3-rs and bwa-mem3-sys (see
+# .github/dependabot.yml). Even compatible sys patches can change the vendored
+# commit, so both crates advance here alongside the corresponding CI pins.
+#
+# Token: writes use a token minted for the fulcrumgenomics `fg-bot` GitHub App
+# (org variable FG_BOT_CLIENT_ID, org secret FG_BOT_PRIVATE_KEY), not
+# GITHUB_TOKEN, because a PR opened with GITHUB_TOKEN does not trigger the
+# `Check and Test` workflow. Each bump edits `.github/workflows/check.yml`, so
+# the App installation needs Workflows: write alongside Contents and Pull
+# requests: write; the token is narrowed to exactly those three.
+#
+# On a pull request that touches this workflow or its script, the job runs the
+# detect and bump steps without pushing, as a smoke test.
+on:
+  schedule:
+    # 10:23 UTC (03:23 Arizona), off the hour.
+    - cron: '23 10 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Bump to this bwa-mem3-rs version instead of the latest (e.g. 0.6.0).
+          Retries a closed bump PR only after its existing branch is inspected
+          and deleted; otherwise reopen that PR or open the leftover branch's PR.
+        required: false
+        type: string
+      dry_run:
+        description: 'Run the bump and print the summary; push nothing.'
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - .github/workflows/bwa-mem3-rs-bump.yml
+      - scripts/ci/bwa-mem3-rs-bump.sh
+      - scripts/ci/test-bwa-mem3-rs-bump.sh
+
+concurrency:
+  group: bwa-mem3-rs-bump-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+# GITHUB_TOKEN only reads (the existing-PR lookup); every write uses the
+# fg-bot App token.
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  BRANCH_PREFIX: deps/bwa-mem3-rs-
+  # Marker the PR body carries so later runs can tell whether anyone pushed
+  # onto the branch (an amended bot commit keeps the bot as author, so commit
+  # authorship cannot answer that).
+  MARKER: bwa-mem3-rs-bump:pushed-sha
+
+jobs:
+  bump:
+    if: github.repository == 'fulcrumgenomics/fgumi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && inputs.dry_run != true }}
+    steps:
+      # Skipped on pull-request smoke runs and dry runs, which never write (and
+      # fork PRs get no secrets).
+      - name: Generate fg-bot token
+        id: app-token
+        if: env.PUBLISH == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FG_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FG_BOT_PRIVATE_KEY }}
+          # Narrowed to what this job uses, so a missing installation
+          # permission fails here rather than mid-run after a push.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          persist-credentials: ${{ env.PUBLISH == 'true' }}
+
+      - name: Offline updater regression tests
+        run: bash scripts/ci/test-bwa-mem3-rs-bump.sh
+
+      - name: Detect a newer release
+        id: detect
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          args=(--check)
+          if [ -n "$VERSION" ]; then args+=(--version "$VERSION"); fi
+          scripts/ci/bwa-mem3-rs-bump.sh "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for an existing PR
+        id: existing
+        if: steps.detect.outputs.needs_bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+          RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+        run: |
+          set -euo pipefail
+          branch="${BRANCH_PREFIX}${LATEST}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          [ "$PUBLISH" = true ] || exit 0
+          # An open or merged PR always stops the run. A closed one means a
+          # human declined this release, so the nightly run leaves it alone; a
+          # manual dispatch naming the version permits retrying it, but an
+          # existing branch must first be inspected/deleted, or its PR reopened.
+          states="$(gh pr list --head "$branch" --state all --json number,state,isCrossRepository \
+                      --jq '.[] | select(.isCrossRepository == false) | "#\(.number) \(.state)"')"
+          if grep -qE ' (OPEN|MERGED)$' <<< "$states" \
+              || { [ -n "$states" ] && [ "$RETRY" != true ]; }; then
+            echo "A PR for $branch already exists ($(tr '\n' ' ' <<< "$states")); nothing to do." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Bump
+        id: bump
+        if: steps.detect.outputs.needs_bump == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          scripts/ci/bwa-mem3-rs-bump.sh --version "$LATEST" --summary "$RUNNER_TEMP/summary.md"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat
+
+      - name: Commit, push, and open the draft PR
+        id: pr
+        if: steps.bump.outcome == 'success' && env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          CURRENT: ${{ steps.detect.outputs.current }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # Attribute the commit to the App's bot user. The noreply address
+          # needs the bot USER id (not the App id); look it up from the slug so
+          # renaming or reinstalling the App cannot leave a stale number.
+          bot_user_id="$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          title="build(deps): bump bwa-mem3-rs from ${CURRENT} to ${LATEST}"
+          git switch -c "$BRANCH"
+          git add Cargo.toml Cargo.lock .github/workflows/check.yml tests/align_inproc_parity.rs
+          git commit -m "$title"
+          # Fail rather than open a PR that is missing an edit the script made.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The bump left uncommitted changes; add them to the 'git add' list above:"
+            git status --porcelain
+            exit 1
+          fi
+
+          # A leftover branch may contain maintainer edits even without a PR.
+          # Never replace it: a maintainer can open its PR, or inspect/delete
+          # it before retrying. The empty lease also guards branch creation
+          # against a push that races this lookup (including a fast-forward).
+          remote_sha="$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)"
+          if [ -n "$remote_sha" ]; then
+            echo "::error::Branch $BRANCH already exists at $remote_sha; open its PR or inspect it before deleting it and retrying."
+            exit 1
+          fi
+          git push --force-with-lease="refs/heads/$BRANCH:" origin "HEAD:refs/heads/$BRANCH"
+          pushed="$(git rev-parse HEAD)"
+
+          { cat "$RUNNER_TEMP/summary.md"; echo; echo "<!-- ${MARKER}=${pushed} -->"; } > "$RUNNER_TEMP/body.md"
+          gh pr create --draft --base main --head "$BRANCH" \
+            --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # Runs last, once the replacement PR exists. Only OLDER bump PRs are
+      # superseded, and one is closed only if its head is still the commit
+      # this workflow pushed; otherwise it gets a comment and stays open.
+      - name: Supersede older bump PRs
+        if: steps.pr.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --state open --limit 200 --json number,headRefName,headRefOid,body,isCrossRepository)"
+          # Fork PRs can copy upstream branch names and public SHAs; their
+          # body markers must never authorize writes to an origin branch.
+          jq -r --arg p "$BRANCH_PREFIX" \
+              '.[] | select(.isCrossRepository == false) | select(.headRefName | startswith($p)) | [.number, .headRefName, .headRefOid, .body] | @base64' \
+              <<< "$prs" \
+          | while read -r row; do
+              field() { base64 -d <<< "$row" | jq -r ".[$1]"; }
+              num="$(field 0)"; head_ref="$(field 1)"; head_oid="$(field 2)"; body="$(field 3)"
+              [ "$head_ref" = "$BRANCH" ] && continue
+              ver="${head_ref#"$BRANCH_PREFIX"}"
+              # Leave equal or newer versions alone (e.g. after a manual
+              # dispatch for an older version).
+              if [ "$ver" = "$LATEST" ] || [ "$(printf '%s\n%s\n' "$ver" "$LATEST" | sort -V | head -1)" != "$ver" ]; then
+                continue
+              fi
+              marker="$(grep -oE "${MARKER}=[0-9a-f]{40}" <<< "$body" | head -1 | cut -d= -f2 || true)"
+              if [ -z "$marker" ] || [ "$marker" != "$head_oid" ]; then
+                gh pr comment "$num" --body "A newer bump to \`${LATEST}\` exists (branch \`${BRANCH}\`). Leaving this open because its branch no longer matches the workflow's pushed-SHA marker (or the marker is missing)."
+                continue
+              fi
+              if git push --force-with-lease="refs/heads/$head_ref:$marker" origin ":refs/heads/$head_ref"; then
+                gh pr close "$num" \
+                  --comment "Superseded by the bump to \`${LATEST}\` (branch \`${BRANCH}\`)."
+              else
+                delete_rc=$?
+                # A rejected lease is benign only if the remote really changed.
+                # Permission and transport failures must not look like races.
+                if remote_sha="$(git ls-remote --heads origin "refs/heads/$head_ref" | cut -f1)"; then
+                  if [ "$remote_sha" != "$marker" ]; then
+                    gh pr comment "$num" --body "A newer bump to \`${LATEST}\` exists (branch \`${BRANCH}\`). Leaving this open because its branch changed during cleanup (expected \`${marker}\`, now \`${remote_sha:-absent}\`)."
+                  else
+                    echo "::error::Failed to delete unchanged branch $head_ref at $marker (git push exit $delete_rc)." >&2
+                    exit "$delete_rc"
+                  fi
+                else
+                  lookup_rc=$?
+                  echo "::error::Could not read remote head for $head_ref after failed deletion (git push exit $delete_rc; lookup exit $lookup_rc)." >&2
+                  exit "$lookup_rc"
+                fi
+              fi
+            done
+
+  # Independent checkout and result checks also report checkout failures/timeouts.
+  report-failure:
+    needs: bump
+    if: >-
+      always()
+      && (needs.bump.result == 'failure' || needs.bump.result == 'cancelled')
+      && github.event_name == 'schedule'
+      && github.repository == 'fulcrumgenomics/fgumi'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report failure
+        uses: ./.github/actions/report-cron-failure
+        with:
+          token: ${{ github.token }}
