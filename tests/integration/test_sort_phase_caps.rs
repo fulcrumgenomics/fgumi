@@ -511,32 +511,14 @@ fn sam_sourced_sort_caps_every_ingest_step_with_the_phase1_counter() {
     built.run().expect("SAM-sourced sort runs");
 }
 
-/// A CRAM-sourced sort decodes slices on the pool in `DecodeCramSlices`: that
-/// is phase-1 work, so under `--sort-threads` it shares the single phase-1
-/// counter with the sort, as the SAM parse does. Without the flag the decode
-/// is uncapped.
+/// Write `records` to a reference-free CRAM at `path` under `header_text`.
 #[cfg(feature = "cram")]
-#[rstest]
-#[case::sort_threads(Some(3), Some("sort-phase1(3)"))]
-#[case::unset(None, None)]
-fn cram_sourced_sort_caps_slice_decoding_with_the_phase1_counter(
-    #[case] sort_threads: Option<usize>,
-    #[case] expected: Option<&str>,
-) {
+fn write_cram(path: &Path, header_text: &str, records: &[RawRecord]) {
     use fgumi_htslib::{CramWriteOptions, CramWriter};
 
-    let dir = TempDir::new().expect("tempdir");
-    let input = dir.path().join("in.cram");
     let options = CramWriteOptions { no_ref: true, ..CramWriteOptions::default() };
-    let mut writer =
-        CramWriter::create(&input, "@HD\tVN:1.6\tSO:unsorted\n", &options).expect("create CRAM");
-    for i in 0..5 {
-        let record = SamBuilder::new()
-            .read_name(format!("q{i}").as_bytes())
-            .flags(flags::UNMAPPED)
-            .sequence(b"ACGT")
-            .qualities(&[30; 4])
-            .build();
+    let mut writer = CramWriter::create(path, header_text, &options).expect("create CRAM");
+    for record in records {
         writer.write_raw(record.as_ref()).expect("write CRAM record");
     }
     let (jobs, finisher) = writer.seal().expect("seal CRAM");
@@ -544,26 +526,112 @@ fn cram_sourced_sort_caps_slice_decoding_with_the_phase1_counter(
         job.encode().expect("encode").write().expect("write container");
     }
     finisher.finish().expect("finish CRAM");
+}
+
+/// A CRAM-sourced sort decodes slices on the pool in `DecodeCramSlices` and
+/// parses them into record batches in `ParseBamRecords`: both are phase-1
+/// work, so under `--sort-threads` each shares the single phase-1 counter
+/// with the sort, as the SAM parse does. Without the flag both are uncapped.
+#[cfg(feature = "cram")]
+#[rstest]
+#[case::sort_threads(Some(3), Some("sort-phase1(3)"))]
+#[case::unset(None, None)]
+fn cram_sourced_sort_caps_slice_decoding_and_parsing_with_the_phase1_counter(
+    #[case] sort_threads: Option<usize>,
+    #[case] expected: Option<&str>,
+    #[values("DecodeCramSlices", "ParseBamRecords")] step: &str,
+) {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("in.cram");
+    let records: Vec<RawRecord> = (0..5)
+        .map(|i| {
+            SamBuilder::new()
+                .read_name(format!("q{i}").as_bytes())
+                .flags(flags::UNMAPPED)
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .build()
+        })
+        .collect();
+    write_cram(&input, "@HD\tVN:1.6\tSO:unsorted\n", &records);
     let output = dir.path().join("out.bam");
 
     let built =
         build_for(spec(vec![Stage::Sort], &input, &output, 8, sort_options(sort_threads, None)))
             .expect("CRAM-sourced sort chain builds");
     let dag = built.pipeline.dag();
-    assert_eq!(cap_of(&dag, "DecodeCramSlices").as_deref(), expected, "{dag}");
+    assert_eq!(cap_of(&dag, step).as_deref(), expected, "{step}: {dag}");
     if expected.is_some() {
         let caps = built.pipeline.phase_caps();
-        let cap = |step: &str| {
+        let cap = |name: &str| {
             caps.iter()
-                .find(|(name, _)| *name == step)
-                .map_or_else(|| panic!("{step} has no phase cap"), |(_, cap)| *cap)
+                .find(|(n, _)| *n == name)
+                .map_or_else(|| panic!("{name} has no phase cap"), |(_, cap)| *cap)
         };
         assert!(
-            std::ptr::eq(cap("DecodeCramSlices"), cap("SortBuffer")),
-            "the decode must share the sort's phase-1 counter"
+            std::ptr::eq(cap(step), cap("SortBuffer")),
+            "{step} must share the sort's phase-1 counter"
         );
     }
     built.run().expect("CRAM-sourced sort runs");
+}
+
+/// A CRAM-sourced sort whose decode and parse run under `--sort-threads 1`
+/// (so the single phase-1 permit is contended by the decode, the parse and the
+/// sort) writes exactly the records of the uncapped `--threads 4` sort: the
+/// same bytes (ties included), every input record once. 40,000 records span
+/// several CRAM containers, so the capped decode and parse each run several
+/// times, and the tiny budget makes the sort spill and merge.
+#[cfg(feature = "cram")]
+#[rstest]
+fn cram_sourced_capped_sort_writes_the_uncapped_sorts_records(
+    #[values("coordinate", "template-coordinate", "queryname::natural")] order: &str,
+) {
+    use crate::helpers::merge_fixtures::read_raw;
+
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("in.cram");
+    let records = unsorted_records(40_000);
+    write_cram(&input, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:1000000\n", &records);
+
+    let (reference, _) =
+        sort_subprocess(&input, dir.path(), "reference", order, &["--threads", "4"]);
+    let (capped, stderr) = sort_subprocess(
+        &input,
+        dir.path(),
+        "capped",
+        order,
+        &["--threads", "4", "--sort-threads", "1"],
+    );
+
+    assert_eq!(
+        decompressed_records_without_pg(&capped),
+        decompressed_records_without_pg(&reference),
+        "{order}: the capped CRAM sort must be byte-identical to the uncapped one"
+    );
+    // A reference-free CRAM round-trips each record byte for byte, except that
+    // decoding fills in the BAM `bin` the generated records leave at 0. So the
+    // sorted output holds exactly the generated records with their bins set.
+    // Both mates of a template share a name, so comparing names alone would
+    // miss one mate replacing the other.
+    let mut written: Vec<Vec<u8>> = read_raw(&capped).1;
+    let mut expected: Vec<Vec<u8>> = records
+        .iter()
+        .map(|r| {
+            let mut bytes = r.as_ref().to_vec();
+            let pos = i32::from_le_bytes(bytes[4..8].try_into().expect("pos"));
+            let bin = fgumi_raw_bam::reg2bin(pos, pos + 4); // every record is 4M
+            bytes[10..12].copy_from_slice(&bin.to_le_bytes());
+            bytes
+        })
+        .collect();
+    written.sort_unstable();
+    expected.sort_unstable();
+    assert!(written == expected, "{order}: every input record must be written exactly once");
+    assert!(
+        stderr.lines().any(|l| l.contains("Phase caps") && l.contains("sort-phase1 peak 1 of 1,")),
+        "{order}: the phase-1 cap must be reported at its limit of 1:\n{stderr}"
+    );
 }
 
 /// The record-buffer budget the BUILT chain uses follows `--sort-threads`: an

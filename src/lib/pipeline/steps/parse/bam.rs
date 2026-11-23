@@ -11,12 +11,12 @@ use std::sync::Arc;
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::RawRecord;
 
-use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
 use crate::pipeline::core::outputs::OrderedBytesSingle;
 use crate::pipeline::core::queues::QueueSpec;
 use crate::pipeline::core::reorder::BranchOrdering;
 use crate::pipeline::core::step::{Step, StepCtx, StepKind, StepOutcome, StepProfile};
+use crate::pipeline::core::{PhaseCap, Unpushed, admit_input};
 use crate::pipeline::steps::types::{DecompressedBlock, RecordBatch};
 
 /// `Parallel + ByItemOrdinal` parser. Walks record-aligned bytes (one
@@ -31,6 +31,9 @@ pub struct ParseBamRecords {
     /// 1M under `RUST_LOG=info`. Compared against `SortBuffer`'s ingest rate,
     /// this splits the read-supply (decode chain) cost from `SortBuffer.push`.
     parse_progress: Arc<ProgressTracker>,
+    /// Phase-1 admission cap, set by the chain builder only when this step
+    /// is sort ingest (`None` = uncapped, every other chain).
+    cap: Option<Arc<PhaseCap>>,
 }
 
 impl ParseBamRecords {
@@ -42,7 +45,15 @@ impl ParseBamRecords {
             parse_progress: Arc::new(
                 ProgressTracker::new("Parse records").with_interval(1_000_000),
             ),
+            cap: None,
         }
+    }
+
+    /// Share the sort's phase-1 admission cap (see `ChainBuilder::add_sort`).
+    #[must_use]
+    pub fn with_phase_cap(mut self, cap: Option<Arc<PhaseCap>>) -> Self {
+        self.cap = cap;
+        self
     }
 }
 
@@ -53,6 +64,7 @@ impl Clone for ParseBamRecords {
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
             parse_progress: Arc::clone(&self.parse_progress),
+            cap: self.cap.clone(),
         }
     }
 }
@@ -87,6 +99,14 @@ impl Step for ParseBamRecords {
             }
         }
 
+        // Phase-1 admission when the chain builder capped this step (sort
+        // ingest under `--sort-threads`); a no-op otherwise. See the
+        // pipeline-core `admission` module.
+        let _permit = match admit_input(ctx.input, self.cap.as_deref()) {
+            Ok(permit) => permit,
+            Err(outcome) => return Ok(outcome),
+        };
+
         let Some(block) = ctx.input.pop() else {
             // No input this call. If upstream is drained, every item has been
             // processed (held output was flushed by the Contention preamble
@@ -120,6 +140,10 @@ impl Step for ParseBamRecords {
 
     fn new_worker_copy(&self) -> Self {
         self.clone()
+    }
+
+    fn step_cap(&self) -> Option<fgumi_pipeline_core::StepCapRef<'_>> {
+        self.cap.as_deref().map(fgumi_pipeline_core::StepCapRef::Fixed)
     }
 }
 
@@ -307,6 +331,17 @@ pub(crate) fn parse_records(bytes: &[u8]) -> io::Result<Vec<RawRecord>> {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// Sort-first CRAM ingest under `--sort-threads`: the phase-1 admission
+    /// contract.
+    #[test]
+    fn capped_step_follows_the_admission_contract() {
+        crate::pipeline::core::testing::assert_admission_contract(
+            "sort-phase1",
+            |cap| ParseBamRecords::new(1 << 20).with_phase_cap(cap),
+            DecompressedBlock { batch_serial: 0, bytes: framed(&[0u8; 32]) },
+        );
+    }
 
     #[test]
     fn profile_advertises_parallel_byordinal() {
