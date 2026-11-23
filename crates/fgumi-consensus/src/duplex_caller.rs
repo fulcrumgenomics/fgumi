@@ -4509,7 +4509,7 @@ mod tests {
     /// (named `ref_*`) and a 1-base insertion after the fifth base (named `ins_*`). AB reads are
     /// `ab_len` bases long and BA reads `ba_len`, so the two alignments are `{len}M` and
     /// `5M1I{len - 6}M` on each strand.
-    fn tied_molecule(
+    fn split_molecule(
         ab_len: usize,
         ba_len: usize,
         ab_ref: usize,
@@ -4540,46 +4540,43 @@ mod tests {
         reads
     }
 
-    /// On a tie, the alignment both strands support must win: `10M` (6 AB + 4 BA) over
-    /// `5M1I4M` (9 AB + 1 BA).
-    #[test]
-    fn test_alignment_tie_prefers_the_group_supported_by_both_strands() -> Result<()> {
+    /// Pins the duplex alignment-group ordering: the larger group wins; on a size tie the group
+    /// with more reads on its weaker strand wins; on a further tie the smaller CIGAR wins.
+    ///
+    /// Each case gives the AB and BA read lengths, then the `(ref, ins)` read counts on AB and on BA.
+    ///
+    /// Every case keeps one alignment and rejects all `rejected` AB-R1/BA-R2 reads of the other,
+    /// whose names start with `rejected_prefix`. The CIGAR comparison is element by element, so
+    /// `5M1I4M` is smaller than `10M`.
+    ///
+    /// `mixed_read_lengths` uses longer BA reads, which the descending-length sort moves ahead of
+    /// the AB reads, so each read's strand must be looked up by its own index, not its position in
+    /// sorted order.
+    #[rstest]
+    // `10M` (6 AB + 4 BA) over `5M1I4M` (9 AB + 1 BA).
+    #[case::reference_on_both_strands((10, 10), (6, 9), (4, 1), 10, b"ins_")]
+    // `5M1I4M` (5 AB + 5 BA) over `10M` (9 AB + 1 BA).
+    #[case::indel_on_both_strands((10, 10), (9, 5), (1, 5), 10, b"ref_")]
+    // `5M1I4M`/`5M1I6M` (5 AB + 5 BA) over `10M`/`12M` (9 AB + 1 BA).
+    #[case::mixed_read_lengths((10, 12), (9, 5), (1, 5), 10, b"ref_")]
+    // Sizes and weaker strands tie (5 AB + 5 BA each): the smaller CIGAR, `5M1I4M`, wins.
+    #[case::strand_tie_falls_back_to_smaller_cigar((10, 10), (5, 5), (5, 5), 10, b"ref_")]
+    // Size outranks strand support: `5M1I4M` (10 AB + 1 BA) over `10M` (6 AB + 4 BA).
+    #[case::larger_group_wins_despite_weaker_strand((10, 10), (6, 10), (4, 1), 10, b"ref_")]
+    fn test_alignment_group_selection(
+        #[case] (ab_len, ba_len): (usize, usize),
+        #[case] (ab_ref, ab_ins): (usize, usize),
+        #[case] (ba_ref, ba_ins): (usize, usize),
+        #[case] rejected: usize,
+        #[case] rejected_prefix: &[u8],
+    ) -> Result<()> {
         let mut caller = rejection_accounting_caller(vec![1], true)?;
-        let result = caller.consensus_reads(tied_molecule(10, 10, 6, 9, 4, 1))?;
+        let reads = split_molecule(ab_len, ba_len, ab_ref, ab_ins, ba_ref, ba_ins);
+        let result = caller.consensus_reads(reads)?;
         assert_eq!(result.count, 2);
-        assert_eq!(caller.rejected_reads.len(), 10);
+        assert_eq!(caller.rejected_reads.len(), rejected);
         for record in &caller.rejected_reads {
-            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ins_"));
-        }
-        Ok(())
-    }
-
-    /// An indel both strands support wins: `5M1I4M` (5 AB + 5 BA) over `10M` (9 AB + 1 BA),
-    /// even though `10M` is the smaller CIGAR.
-    #[test]
-    fn test_alignment_tie_prefers_a_two_strand_indel_over_a_one_strand_reference() -> Result<()> {
-        let mut caller = rejection_accounting_caller(vec![1], true)?;
-        let result = caller.consensus_reads(tied_molecule(10, 10, 9, 5, 1, 5))?;
-        assert_eq!(result.count, 2);
-        assert_eq!(caller.rejected_reads.len(), 10);
-        for record in &caller.rejected_reads {
-            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ref_"));
-        }
-        Ok(())
-    }
-
-    /// The two-strand indel must still win when the BA reads are longer than the AB reads:
-    /// `5M1I4M`/`5M1I6M` (5 AB + 5 BA) over `10M`/`12M` (9 AB + 1 BA). The pooled reads are sorted
-    /// by descending length before grouping, which moves the BA reads ahead of the AB reads, so
-    /// each read's strand must be looked up by its own index, not its position in sorted order.
-    #[test]
-    fn test_alignment_tie_prefers_both_strands_with_mixed_read_lengths() -> Result<()> {
-        let mut caller = rejection_accounting_caller(vec![1], true)?;
-        let result = caller.consensus_reads(tied_molecule(10, 12, 9, 5, 1, 5))?;
-        assert_eq!(result.count, 2);
-        assert_eq!(caller.rejected_reads.len(), 10);
-        for record in &caller.rejected_reads {
-            assert!(fgumi_raw_bam::read_name(record).starts_with(b"ref_"));
+            assert!(fgumi_raw_bam::read_name(record).starts_with(rejected_prefix));
         }
         Ok(())
     }
