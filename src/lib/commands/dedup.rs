@@ -1469,8 +1469,8 @@ pub struct MarkDuplicates {
     pub remove_duplicates: bool,
 
     /// Minimum mapping quality for a read to be included
-    #[arg(short = 'q', long = "min-map-q")]
-    pub min_map_q: Option<u8>,
+    #[arg(short = 'q', long = "min-map-q", default_value_t = 0)]
+    pub min_map_q: u8,
 
     /// Include reads flagged as not passing QC
     #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
@@ -1834,6 +1834,19 @@ mod tests {
     use super::*;
     use crate::template_filter::filter_template;
     use crate::umi::IdentityUmiAssigner;
+
+    /// `--min-map-q` defaults to 0 (no mapping-quality filter) when absent.
+    #[rstest]
+    #[case::absent_defaults_to_zero(&[], 0)]
+    #[case::explicit_value(&["--min-map-q", "30"], 30)]
+    fn min_map_q_defaults_to_zero(#[case] extra: &[&str], #[case] expected: u8) {
+        use clap::Parser;
+        let mut args = vec!["dedup", "-i", "in.bam", "-o", "out.bam"];
+        args.extend_from_slice(extra);
+        let cmd = MarkDuplicates::try_parse_from(args).expect("parses");
+
+        assert_eq!(cmd.min_map_q, expected);
+    }
     use crate::umi::truncate_umis;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use rstest::rstest;
