@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use crate::helpers::assertions::assert_bam_sorted;
 use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 use crate::helpers::cli::run_and_capture_logs;
+use crate::helpers::merge_fixtures::read_raw;
 
 /// Create a template-coordinate sorted BAM with UMI-tagged reads.
 ///
@@ -117,13 +118,15 @@ struct DuplicateGroupOptions<'a> {
     /// Number of throwaway integer filler tags (`Z0`, `Z1`, ...) inserted
     /// before `RX`, shifting its aux-data byte offset.
     filler_tags: u8,
+    /// Omit the `RX` tag from every record (the `umi` argument is then ignored).
+    omit_umi: bool,
 }
 
 impl Default for DuplicateGroupOptions<'_> {
     /// Matches [`create_duplicate_group`]'s plain case: no `RG`, MAPQ 60, base
     /// quality 30, `RX` at aux offset 0 (no filler tags).
     fn default() -> Self {
-        Self { rg_id: None, mapq: 60, base_qual: 30, filler_tags: 0 }
+        Self { rg_id: None, mapq: 60, base_qual: 30, filler_tags: 0, omit_umi: false }
     }
 }
 
@@ -142,7 +145,7 @@ fn create_duplicate_group_inner(
     start: i32,
     opts: DuplicateGroupOptions<'_>,
 ) -> Vec<RawRecord> {
-    let DuplicateGroupOptions { rg_id, mapq, base_qual, filler_tags } = opts;
+    let DuplicateGroupOptions { rg_id, mapq, base_qual, filler_tags, omit_umi } = opts;
     let mut records = Vec::new();
     for i in 0..count {
         let name = format!("{base_name}_{i}");
@@ -167,7 +170,10 @@ fn create_duplicate_group_inner(
             for f in 0..filler_tags {
                 b.add_int_tag([b'Z', b'0' + f], i32::from(f));
             }
-            b.add_string_tag(SamTag::RX, umi.as_bytes()).add_string_tag(SamTag::MC, b"8M");
+            if !omit_umi {
+                b.add_string_tag(SamTag::RX, umi.as_bytes());
+            }
+            b.add_string_tag(SamTag::MC, b"8M");
             if let Some(rg_id) = rg_id {
                 b.add_string_tag(SamTag::RG, rg_id.as_bytes());
             }
@@ -190,7 +196,10 @@ fn create_duplicate_group_inner(
             for f in 0..filler_tags {
                 b.add_int_tag([b'Z', b'0' + f], i32::from(f));
             }
-            b.add_string_tag(SamTag::RX, umi.as_bytes()).add_string_tag(SamTag::MC, b"8M");
+            if !omit_umi {
+                b.add_string_tag(SamTag::RX, umi.as_bytes());
+            }
+            b.add_string_tag(SamTag::MC, b"8M");
             if let Some(rg_id) = rg_id {
                 b.add_string_tag(SamTag::RG, rg_id.as_bytes());
             }
@@ -1503,9 +1512,24 @@ fn test_dedup_include_unmapped(
     let rows: Vec<DeduplicationMetrics> =
         DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
     let metrics = rows.first().expect("one metrics row");
+    // With only --include-unmapped, `passthrough_templates` is exactly the
+    // --include-unmapped count it has always been, and all of it is `passthrough_unmapped`.
     assert_eq!(
         metrics.passthrough_templates, expected_passthrough,
         "unexpected passthrough_templates"
+    );
+    assert_eq!(
+        metrics.passthrough_unmapped, expected_passthrough,
+        "unexpected passthrough_unmapped"
+    );
+    assert_eq!(
+        (
+            metrics.passthrough_missing_umi,
+            metrics.passthrough_ns_in_umi,
+            metrics.passthrough_umi_too_short
+        ),
+        (0, 0, 0),
+        "--include-unmapped must not count any invalid-UMI pass-through"
     );
     assert_eq!(
         metrics.filtered_unmapped, expected_filtered_unmapped,
@@ -1533,6 +1557,386 @@ fn test_dedup_include_unmapped(
         reconciliation_reads, metrics.total_reads,
         "pair/orphan buckets must reconcile with total_reads: {metrics:?}"
     );
+}
+
+/// `(queryname, segment)` naming one record of a template: segment 2 for R2, else 1.
+type RecordIdentity = (String, u8);
+
+/// The [`RecordIdentity`] of a raw BAM record.
+fn record_identity(raw: &[u8]) -> RecordIdentity {
+    let name = String::from_utf8(fgumi_raw_bam::RawRecordView::new(raw).read_name().to_vec())
+        .expect("UTF-8 name");
+    let segment = if fgumi_raw_bam::RawRecordView::new(raw).flags() & flags::LAST_SEGMENT != 0 {
+        2
+    } else {
+        1
+    };
+    (name, segment)
+}
+
+/// The R1 and R2 identities of each named template.
+fn pair_identities(names: &[&str]) -> Vec<RecordIdentity> {
+    names.iter().flat_map(|n| [(n.to_string(), 1), (n.to_string(), 2)]).collect()
+}
+
+/// Asserts the exact record set `dedup` wrote to `output_bam`, read from `input_bam`.
+///
+/// The multiset of `(queryname, segment)` pairs written must equal `expected` (so output
+/// that repeats R1 and drops R2 fails), and every written record whose name satisfies
+/// `is_passthrough` must be byte-identical to its input record except for the two changes
+/// a pass-through may make: the duplicate flag cleared and any `MI` tag removed.
+fn assert_records_written(
+    input_bam: &Path,
+    output_bam: &Path,
+    mut expected: Vec<RecordIdentity>,
+    is_passthrough: impl Fn(&str) -> bool,
+) {
+    let (_, input) = read_raw(input_bam);
+    let (_, output) = read_raw(output_bam);
+
+    let mut written: Vec<RecordIdentity> = output.iter().map(|r| record_identity(r)).collect();
+    written.sort();
+    expected.sort();
+    assert_eq!(written, expected, "(queryname, segment) records written");
+
+    let input_by_identity: BTreeMap<RecordIdentity, &Vec<u8>> =
+        input.iter().map(|r| (record_identity(r), r)).collect();
+    for record in &output {
+        let identity = record_identity(record);
+        if !is_passthrough(&identity.0) {
+            continue;
+        }
+        let mut expected_bytes = RawRecord::from(input_by_identity[&identity].clone());
+        let cleared = expected_bytes.flags() & !flags::DUPLICATE;
+        expected_bytes.set_flags(cleared);
+        fgumi_raw_bam::remove_tag(expected_bytes.as_mut_vec(), SamTag::MI);
+        assert_eq!(
+            record.as_slice(),
+            expected_bytes.as_ref(),
+            "pass-through record {identity:?} must match its input but for the duplicate flag and MI"
+        );
+    }
+}
+
+/// `--include-invalid-umis` emits templates the filter would drop only for their UMI
+/// untouched, while the default drops them. Input is 3 mapped duplicate pairs (6 reads),
+/// one pair at the *same* position whose UMI contains an N, and one pair elsewhere with
+/// no `RX` tag at all (2 reads each). The default keeps the 6 duplicate-group reads; the
+/// flag keeps all 10, without marking or MI-tagging the 4 invalid-UMI reads and without
+/// changing how the duplicate group is marked — also under `--remove-duplicates`, which
+/// drops the 4 duplicate reads but keeps the pass-throughs.
+#[rstest]
+#[case::default_drops_invalid_umis(false, false, 6, 0, (0, 0), (1, 1), 4)]
+#[case::include_invalid_umis_keeps(true, false, 10, 4, (1, 1), (0, 0), 4)]
+#[case::include_invalid_umis_remove_duplicates(true, true, 6, 4, (1, 1), (0, 0), 0)]
+fn test_dedup_include_invalid_umis(
+    #[case] include_invalid_umis: bool,
+    #[case] remove_duplicates: bool,
+    #[case] expected_total: usize,
+    #[case] expected_invalid_umi_reads: usize,
+    #[case] expected_passthrough_ns_and_missing_umi: (u64, u64),
+    #[case] expected_filtered_ns_and_missing_umi: (u64, u64),
+    #[case] expected_duplicate_reads_written: usize,
+) {
+    use noodles::sam::alignment::record_buf::RecordBuf;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("nUmi", "ACGTNCGT", 1, 100));
+    records.extend(create_duplicate_group_inner(
+        "noUmi",
+        "",
+        1,
+        500,
+        DuplicateGroupOptions { omit_umi: true, ..Default::default() },
+    ));
+    create_sorted_bam(&input_bam, records);
+
+    // The duplicate group's representative under the default options, the reference every
+    // case's retained representative is compared with.
+    let reference_bam = temp_dir.path().join("reference.bam");
+    MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        reference_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args")
+    .execute("fgumi dedup")
+    .expect("reference dedup failed");
+    let (_, reference_records) = read_raw(&reference_bam);
+    let reference_representative: BTreeSet<String> = reference_records
+        .iter()
+        .filter(|r| fgumi_raw_bam::RawRecordView::new(r).flags() & flags::DUPLICATE == 0)
+        .map(|r| record_identity(r).0)
+        .filter(|name| name.starts_with("dup1_"))
+        .collect();
+    assert_eq!(reference_representative.len(), 1, "{reference_representative:?}");
+
+    let mut args: Vec<String> = vec![
+        "dedup".into(),
+        "--input".into(),
+        input_bam.to_str().unwrap().into(),
+        "--output".into(),
+        output_bam.to_str().unwrap().into(),
+        "--strategy".into(),
+        "identity".into(),
+        "--compression-level".into(),
+        "1".into(),
+        "--metrics".into(),
+        metrics_path.to_str().unwrap().into(),
+    ];
+    if include_invalid_umis {
+        args.push("--include-invalid-umis".into());
+    }
+    if remove_duplicates {
+        args.push("--remove-duplicates".into());
+    }
+    let cmd = MarkDuplicates::try_parse_from(&args).expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let out_header = reader.read_header().unwrap();
+
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut total = 0usize;
+    let mut invalid_umi_reads = 0usize;
+    let mut duplicate_reads = 0usize;
+    let mut dup1_names_with_mi = BTreeSet::new();
+    let mut dup1_representative = BTreeSet::new();
+    for result in reader.record_bufs(&out_header) {
+        let record: RecordBuf = result.expect("read record");
+        total += 1;
+        let name = record.name().map(ToString::to_string).unwrap_or_default();
+        let is_duplicate = record.flags().is_duplicate();
+        duplicate_reads += usize::from(is_duplicate);
+        let has_mi = matches!(record.data().get(&mi_tag), Some(Value::String(_)));
+        if name.starts_with("dup1_") {
+            assert!(has_mi, "deduplicated read {name} must carry an MI tag");
+            if !is_duplicate {
+                dup1_representative.insert(name.clone());
+            }
+            dup1_names_with_mi.insert(name);
+        } else {
+            invalid_umi_reads += 1;
+            // Pass-through reads are emitted untouched: never duplicate-marked, never MI-tagged.
+            assert!(!is_duplicate, "invalid-UMI pass-through read {name} must not be marked");
+            assert!(!has_mi, "invalid-UMI pass-through read {name} must not carry an MI tag");
+        }
+    }
+
+    assert_eq!(total, expected_total, "unexpected output record count");
+    assert_eq!(invalid_umi_reads, expected_invalid_umi_reads, "unexpected invalid-UMI reads");
+    assert_eq!(duplicate_reads, expected_duplicate_reads_written, "unexpected duplicate reads");
+    // The duplicate group is one molecule either way: the N-UMI pair at the same position
+    // neither joins it nor changes which template represents it.
+    let expected_dup1_templates = if remove_duplicates { 1 } else { 3 };
+    assert_eq!(dup1_names_with_mi.len(), expected_dup1_templates, "{dup1_names_with_mi:?}");
+    assert_eq!(dup1_representative, reference_representative, "duplicate-group representative");
+
+    // Exactly R1 and R2 of each expected template are written, and each pass-through record
+    // is its input record but for the duplicate flag and MI.
+    let mut expected_templates: Vec<&str> = if remove_duplicates {
+        reference_representative.iter().map(String::as_str).collect()
+    } else {
+        vec!["dup1_0", "dup1_1", "dup1_2"]
+    };
+    if include_invalid_umis {
+        expected_templates.extend(["nUmi_0", "noUmi_0"]);
+    }
+    assert_records_written(&input_bam, &output_bam, pair_identities(&expected_templates), |n| {
+        !n.starts_with("dup1_")
+    });
+
+    // Each invalid-UMI template is accounted in exactly one column: passed through under
+    // its UMI reason with the flag, or filtered under that reason without it.
+    let rows: Vec<DeduplicationMetrics> =
+        DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+    let metrics = rows.first().expect("one metrics row");
+    let (expected_passthrough_ns, expected_passthrough_missing) =
+        expected_passthrough_ns_and_missing_umi;
+    let expected_passthrough = expected_passthrough_ns + expected_passthrough_missing;
+    assert_eq!(
+        (metrics.passthrough_ns_in_umi, metrics.passthrough_missing_umi),
+        expected_passthrough_ns_and_missing_umi,
+        "(passthrough_ns_in_umi, passthrough_missing_umi)"
+    );
+    assert_eq!(metrics.passthrough_umi_too_short, 0, "passthrough_umi_too_short");
+    assert_eq!(metrics.passthrough_unmapped, 0, "--include-unmapped column must be untouched");
+    assert_eq!(metrics.passthrough_templates, expected_passthrough, "passthrough_templates");
+    assert_eq!(
+        (metrics.filtered_ns_in_umi, metrics.filtered_missing_umi),
+        expected_filtered_ns_and_missing_umi,
+        "(filtered_ns_in_umi, filtered_missing_umi)"
+    );
+    // Duplicate marking of the mapped group is identical in every mode: 1 of 3 kept.
+    assert_eq!(metrics.duplicate_templates, 2, "duplicate_templates");
+    assert_eq!(metrics.duplicate_reads, 4, "duplicate_reads");
+    // Pass-throughs count as unique, so input templates still reconcile.
+    assert_eq!(metrics.filtered_templates + metrics.total_templates, 5, "{metrics:?}");
+    assert_eq!(metrics.unique_templates, 1 + expected_passthrough, "unique_templates");
+
+    // The two invalid-UMI pairs are mapped, so as pass-throughs they enter the Picard
+    // pair units as examined, non-duplicate pairs: `mapped_pairs` goes from 3 to 5 while
+    // `duplicate_pairs` stays 2, so `percent_duplication` drops from 4/6 to 4/10 and the
+    // library-size estimate is taken over 5 pairs (3 unique) instead of 3 (1 unique).
+    let (expected_mapped_pairs, expected_percent_duplication) =
+        if include_invalid_umis { (5, 4.0 / 10.0) } else { (3, 4.0 / 6.0) };
+    assert_eq!(metrics.mapped_pairs, expected_mapped_pairs, "mapped_pairs");
+    assert_eq!(metrics.duplicate_pairs, 2, "duplicate_pairs");
+    assert!(
+        (metrics.percent_duplication - expected_percent_duplication).abs() < 1e-4,
+        "percent_duplication: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.estimated_library_size,
+        fgumi_metrics::library_size::estimate_library_size(
+            expected_mapped_pairs,
+            expected_mapped_pairs - 2
+        ),
+        "estimated_library_size"
+    );
+}
+
+/// Every pass-through reason is counted in its own `passthrough_*` column, the columns sum
+/// to `passthrough_templates`, and each problem template lands in exactly one of its
+/// `passthrough_*` or `filtered_*` column. Input is 3 mapped duplicate pairs plus one pair
+/// each with an N in the UMI, no `RX` tag, a UMI shorter than `--min-umi-length 8`, and no
+/// mapped read. Expected tuples are `(unmapped, missing_umi, ns_in_umi, umi_too_short)`.
+#[rstest]
+#[case::neither_flag(false, false, 6, (0, 0, 0, 0), (1, 1, 1, 1))]
+#[case::include_unmapped(true, false, 8, (1, 0, 0, 0), (0, 1, 1, 1))]
+#[case::include_invalid_umis(false, true, 12, (0, 1, 1, 1), (1, 0, 0, 0))]
+#[case::both_flags(true, true, 14, (1, 1, 1, 1), (0, 0, 0, 0))]
+fn test_dedup_passthrough_reason_columns(
+    #[case] include_unmapped: bool,
+    #[case] include_invalid_umis: bool,
+    #[case] expected_reads_written: usize,
+    #[case] expected_passthrough: (u64, u64, u64, u64),
+    #[case] expected_filtered: (u64, u64, u64, u64),
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    records.extend(create_duplicate_group("nUmi", "ACGTNCGT", 1, 100));
+    records.extend(create_duplicate_group_inner(
+        "noUmi",
+        "",
+        1,
+        500,
+        DuplicateGroupOptions { omit_umi: true, ..Default::default() },
+    ));
+    records.extend(create_duplicate_group("shortUmi", "ACGT", 1, 700));
+    records.extend(create_unmapped_pair("unmapped1", "TGCATGCA"));
+    create_sorted_bam(&input_bam, records);
+
+    let mut args: Vec<String> = vec![
+        "dedup".into(),
+        "--input".into(),
+        input_bam.to_str().unwrap().into(),
+        "--output".into(),
+        output_bam.to_str().unwrap().into(),
+        "--strategy".into(),
+        "identity".into(),
+        "--compression-level".into(),
+        "1".into(),
+        "--min-umi-length".into(),
+        "8".into(),
+        "--metrics".into(),
+        metrics_path.to_str().unwrap().into(),
+    ];
+    if include_unmapped {
+        args.push("--include-unmapped".into());
+    }
+    if include_invalid_umis {
+        args.push("--include-invalid-umis".into());
+    }
+    let cmd = MarkDuplicates::try_parse_from(&args).expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let out_header = reader.read_header().unwrap();
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut reads_written = 0usize;
+    let mut names_written = BTreeSet::new();
+    for result in reader.record_bufs(&out_header) {
+        let record = result.expect("read record");
+        reads_written += 1;
+        let name = record.name().map(ToString::to_string).unwrap_or_default();
+        if !name.starts_with("dup1_") {
+            // Every template outside the duplicate group is a pass-through.
+            assert!(!record.flags().is_duplicate(), "pass-through read {name} must not be marked");
+            assert!(
+                record.data().get(&mi_tag).is_none(),
+                "pass-through read {name} must not carry an MI tag"
+            );
+        }
+        names_written.insert(name);
+    }
+    assert_eq!(reads_written, expected_reads_written, "unexpected output record count");
+
+    // Each flag adds exactly the templates it routes, and no other.
+    let mut expected_names: BTreeSet<String> =
+        ["dup1_0", "dup1_1", "dup1_2"].into_iter().map(String::from).collect();
+    if include_unmapped {
+        expected_names.insert("unmapped1".to_string());
+    }
+    if include_invalid_umis {
+        expected_names.extend(["nUmi_0", "noUmi_0", "shortUmi_0"].map(String::from));
+    }
+    assert_eq!(names_written, expected_names, "templates written");
+    let expected_names: Vec<&str> = expected_names.iter().map(String::as_str).collect();
+    assert_records_written(&input_bam, &output_bam, pair_identities(&expected_names), |n| {
+        !n.starts_with("dup1_")
+    });
+
+    let rows: Vec<DeduplicationMetrics> =
+        DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+    let metrics = rows.first().expect("one metrics row");
+    let passthrough = (
+        metrics.passthrough_unmapped,
+        metrics.passthrough_missing_umi,
+        metrics.passthrough_ns_in_umi,
+        metrics.passthrough_umi_too_short,
+    );
+    let filtered = (
+        metrics.filtered_unmapped,
+        metrics.filtered_missing_umi,
+        metrics.filtered_ns_in_umi,
+        metrics.filtered_umi_too_short,
+    );
+    assert_eq!(passthrough, expected_passthrough, "per-reason passthrough_* columns");
+    assert_eq!(filtered, expected_filtered, "per-reason filtered_* columns");
+
+    // `passthrough_templates` totals the per-reason columns, as `filtered_templates` does.
+    let (unmapped, missing_umi, ns_in_umi, umi_too_short) = passthrough;
+    let passthrough_total = unmapped + missing_umi + ns_in_umi + umi_too_short;
+    assert_eq!(metrics.passthrough_templates, passthrough_total, "{metrics:?}");
+    let (f_unmapped, f_missing_umi, f_ns_in_umi, f_umi_too_short) = filtered;
+    assert_eq!(
+        metrics.filtered_templates,
+        f_unmapped + f_missing_umi + f_ns_in_umi + f_umi_too_short,
+        "{metrics:?}"
+    );
+
+    // Pass-throughs count as surviving, unique templates, so the 7 input templates
+    // reconcile as filtered + total.
+    assert_eq!(metrics.filtered_templates + metrics.total_templates, 7, "{metrics:?}");
+    assert_eq!(metrics.total_templates, 3 + passthrough_total, "total_templates");
+    assert_eq!(metrics.unique_templates, 1 + passthrough_total, "unique_templates");
+    assert_eq!(metrics.duplicate_templates, 2, "duplicate_templates");
 }
 
 /// Create a secondary alignment for `name` with no `tc` tag.
@@ -1587,6 +1991,166 @@ fn test_dedup_missing_tc_fails_on_every_template(#[case] name: &str, #[case] pla
         "--strategy",
         "identity",
         "--include-unmapped",
+        "--compression-level",
+        "1",
+    ])
+    .expect("failed to parse dedup args");
+
+    let err = cmd.execute("fgumi dedup").expect_err("a tc-less secondary read must fail dedup");
+    assert!(
+        err.to_string().contains("missing the `tc` tag"),
+        "expected the tc-tag failure, got: {err}"
+    );
+}
+
+/// Mark a record as a duplicate and give it a stale `MI` tag, as an input that has already
+/// been through a duplicate marker would carry.
+fn with_stale_dedup_state(mut record: RawRecord) -> RawRecord {
+    let stale_flags = record.flags() | flags::DUPLICATE;
+    record.set_flags(stale_flags);
+    fgumi_raw_bam::update_string_tag(record.as_mut_vec(), SamTag::MI, b"stale");
+    record
+}
+
+/// Pass-through templates (`--include-unmapped` and `--include-invalid-umis`) whose input
+/// records are already duplicate-flagged and carry an `MI` tag are written with the flag
+/// cleared and the `MI` removed, so a stale flag can neither drop them under
+/// `--remove-duplicates` nor count them as duplicates in the metrics.
+///
+/// Input is 3 mapped duplicate pairs, plus a mapped pair with no `RX` tag and a fully
+/// unmapped pair, both with every record flagged 0x400 and tagged `MI:Z:stale`.
+#[rstest]
+#[case::mark(false)]
+#[case::remove_duplicates(true)]
+fn test_dedup_passthrough_clears_stale_duplicate_state(#[case] remove_duplicates: bool) {
+    use noodles::sam::alignment::record_buf::RecordBuf;
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let metrics_path = temp_dir.path().join("metrics.txt");
+
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 100);
+    let no_umi = create_duplicate_group_inner(
+        "noUmi",
+        "",
+        1,
+        500,
+        DuplicateGroupOptions { omit_umi: true, ..Default::default() },
+    );
+    records.extend(no_umi.into_iter().map(with_stale_dedup_state));
+    records.extend(
+        create_unmapped_pair("unmapped1", "TGCATGCA").into_iter().map(with_stale_dedup_state),
+    );
+    create_sorted_bam(&input_bam, records);
+
+    let mut args: Vec<String> = vec![
+        "dedup".into(),
+        "--input".into(),
+        input_bam.to_str().unwrap().into(),
+        "--output".into(),
+        output_bam.to_str().unwrap().into(),
+        "--strategy".into(),
+        "identity".into(),
+        "--compression-level".into(),
+        "1".into(),
+        "--metrics".into(),
+        metrics_path.to_str().unwrap().into(),
+        "--include-unmapped".into(),
+        "--include-invalid-umis".into(),
+    ];
+    if remove_duplicates {
+        args.push("--remove-duplicates".into());
+    }
+    let cmd = MarkDuplicates::try_parse_from(&args).expect("failed to parse dedup args");
+    cmd.execute("fgumi dedup").expect("Dedup command failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let out_header = reader.read_header().unwrap();
+    let mi_tag = Tag::from(SamTag::MI);
+    let mut passthrough_reads = 0usize;
+    let mut unique_reads_written = 0u64;
+    for result in reader.record_bufs(&out_header) {
+        let record: RecordBuf = result.expect("read record");
+        let name = record.name().map(ToString::to_string).unwrap_or_default();
+        let is_duplicate = record.flags().is_duplicate();
+        unique_reads_written += u64::from(!is_duplicate);
+        if !name.starts_with("dup1_") {
+            passthrough_reads += 1;
+            assert!(!is_duplicate, "pass-through read {name} kept its stale duplicate flag");
+            assert!(
+                record.data().get(&mi_tag).is_none(),
+                "pass-through read {name} kept its stale MI tag"
+            );
+        }
+    }
+    // Both pass-through pairs are written in full, also under --remove-duplicates.
+    assert_eq!(passthrough_reads, 4, "pass-through reads written");
+    // Exactly R1 and R2 of each template; under --remove-duplicates one duplicate-group
+    // template remains, whichever is the representative.
+    let (_, output_records) = read_raw(&output_bam);
+    let dup1_written: BTreeSet<String> = output_records
+        .iter()
+        .map(|r| record_identity(r).0)
+        .filter(|name| name.starts_with("dup1_"))
+        .collect();
+    assert_eq!(dup1_written.len(), if remove_duplicates { 1 } else { 3 }, "{dup1_written:?}");
+    let mut expected_templates: Vec<&str> = dup1_written.iter().map(String::as_str).collect();
+    expected_templates.extend(["noUmi_0", "unmapped1"]);
+    assert_records_written(&input_bam, &output_bam, pair_identities(&expected_templates), |n| {
+        !n.starts_with("dup1_")
+    });
+
+    let rows: Vec<DeduplicationMetrics> =
+        DelimFile::default().read_tsv(&metrics_path).expect("failed to read dedup metrics");
+    let metrics = rows.first().expect("one metrics row");
+    assert_eq!((metrics.passthrough_unmapped, metrics.passthrough_missing_umi), (1, 1));
+    // Only the duplicate group's 2 extra pairs are duplicates; the pass-throughs are unique,
+    // and every unique read counted is one written.
+    assert_eq!(metrics.duplicate_reads, 4, "{metrics:?}");
+    assert_eq!(metrics.unique_reads, 2 + 4, "{metrics:?}");
+    assert_eq!(metrics.unique_reads, unique_reads_written, "unique reads counted vs written");
+    assert_eq!(
+        2 * metrics.duplicate_pairs + metrics.duplicate_orphans,
+        metrics.duplicate_reads,
+        "duplicate pair/orphan units must reconcile with duplicate_reads: {metrics:?}"
+    );
+}
+
+/// `--include-invalid-umis` must not be a way around the hard failure on a `tc`-less
+/// secondary read either (see [`test_dedup_missing_tc_fails_on_every_template`]): the
+/// pass-through decision looks only at the primary reads, so a template with no `RX` tag
+/// is passed through carrying whatever non-primary records came with it, and those must
+/// still be checked.
+#[test]
+fn test_dedup_missing_tc_fails_on_invalid_umi_passthrough() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // The duplicate group sits elsewhere; the no-`RX` pair alone takes the coordinates of
+    // the placed secondary below, so the secondary is stream-adjacent to it after sorting
+    // and travels in its template.
+    let mut records = create_duplicate_group("dup1", "ACGTACGT", 3, 1000);
+    records.extend(create_duplicate_group_inner(
+        "noUmi",
+        "",
+        1,
+        100,
+        DuplicateGroupOptions { omit_umi: true, ..Default::default() },
+    ));
+    records.push(create_secondary_without_tc("noUmi_0", "TGCATGCA", true));
+    create_sorted_bam(&input_bam, records);
+
+    let cmd = MarkDuplicates::try_parse_from([
+        "dedup",
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--strategy",
+        "identity",
+        "--include-invalid-umis",
         "--compression-level",
         "1",
     ])

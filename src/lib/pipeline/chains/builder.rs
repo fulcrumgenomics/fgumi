@@ -7400,6 +7400,9 @@ impl<'a> ChainBuilder<'a> {
             // Always false: `--include-unmapped` splits no-mapped-read templates
             // off *before* the filter runs, so an unmapped template reaching the
             // filter is always a rejection (matches the non-chain dedup path).
+            // `--include-invalid-umis` likewise leaves this config untouched: its
+            // pass-throughs are split off before the filter by a predicate that
+            // runs the filter with this config and with the UMI checks off.
             allow_unmapped: false,
         };
 
@@ -7417,7 +7420,10 @@ impl<'a> ChainBuilder<'a> {
             raw_tag,
             dedup.min_umi_length,
             dedup.no_umi,
-            dedup.include_unmapped,
+            crate::commands::dedup::DedupPassthrough {
+                include_unmapped: dedup.include_unmapped,
+                include_invalid_umis: dedup.include_invalid_umis,
+            },
             accumulators_for_process,
         );
         // Duplication ladder recorder (`--duplication-ladder`).
