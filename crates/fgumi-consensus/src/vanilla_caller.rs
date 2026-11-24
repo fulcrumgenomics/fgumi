@@ -1937,9 +1937,13 @@ impl VanillaUmiConsensusCaller {
             self.bam_builder.append_string_tag(SamTag::RW, value);
         }
 
-        // RX tag — consensus UMI from all reads
+        // RX tag — consensus UMI from all reads, or those with a mapped mate if there are any
+        let mate_mapped =
+            |raw: &&&[u8]| RawRecordView::new(raw).flags() & flags::MATE_UNMAPPED == 0;
+        let any_mate_mapped = original_raws.iter().any(|raw| mate_mapped(&raw));
         let umis: Vec<String> = original_raws
             .iter()
+            .filter(|raw| !any_mate_mapped || mate_mapped(raw))
             .filter_map(|raw| {
                 RawRecordView::new(raw)
                     .tags()

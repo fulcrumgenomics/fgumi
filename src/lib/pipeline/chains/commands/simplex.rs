@@ -305,6 +305,7 @@ fn run_simplex_consensus_batch(
     let mut total_input_records: u64 = 0;
     for MiGroup { mi, records: mut raw_records } in groups {
         state.caller.clear();
+        crate::commands::common::drop_unmapped_ends(&mut raw_records);
         total_input_records += raw_records.len() as u64;
 
         if raw_records.len() < min_reads {
