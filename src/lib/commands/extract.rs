@@ -1326,8 +1326,8 @@ pub struct ExtractOptions {
 /// [`ExtractOptions`] exactly as [`Extract::to_extract_options`] does; in
 /// particular `platform` (default `"illumina"`) becomes `Some(..)` and
 /// `quality_encoding` is the [`QualityEncoding::Standard`] placeholder the chain
-/// FASTQ source overrides at runtime. `--read-structures` is `required` here
-/// (unlike the standalone's `+T` default): a fused `runall` always demands it.
+/// FASTQ source overrides at runtime. `--extract::read-structures` is `required`
+/// here (unlike the standalone's `+T` default): a fused `runall` always demands it.
 ///
 /// The three cross-field `conflicts_with` attrs on [`Extract`]
 /// (`--store-umi-quals` vs `--extract-umis-from-read-names`, and the
@@ -1349,10 +1349,10 @@ pub struct ExtractRunallOptions {
     pub read_structures: Vec<ReadStructure>,
 
     /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
-    /// de-interleaving it into the two reads. Requires exactly one input (`--inputs`: a
-    /// file or `-` for stdin) and describes both reads with two `--read-structures`
-    /// (required for this runall variant — unlike the standalone `Extract`, there
-    /// is no `+T +T` default). This lets a streaming trimmer or converter pipe
+    /// de-interleaving it into the two reads. Requires exactly one input
+    /// (`--extract::inputs`: a file or `-` for stdin) and describes both reads with
+    /// two `--extract::read-structures` (required for this runall variant — unlike
+    /// the standalone `Extract`, there is no `+T +T` default). This lets a streaming trimmer or converter pipe
     /// interleaved pairs straight into extract without staging two FASTQ files.
     #[arg(long = "interleaved", default_value_t = false)]
     pub interleaved: bool,
@@ -1446,16 +1446,16 @@ pub struct ExtractRunallOptions {
     /// verification defaults on for file input and off for trusted stdin (a
     /// freshly-piped stream is trusted; a file may have been archived or
     /// transferred since it was written, where a flipped bit is what CRC32 exists
-    /// to catch). Pass `--check-crc` to force it on. Mutually exclusive with
-    /// `--no-check-crc`.
+    /// to catch). Pass `--extract::check-crc` to force it on. Mutually exclusive
+    /// with `--extract::no-check-crc`.
     #[arg(long = "check-crc", default_value_t = false)]
     pub check_crc: bool,
 
     /// Skip CRC32 verification while decoding BGZF FASTQ input.
     ///
     /// Trades the CRC32 integrity check for faster BGZF decode (which then runs
-    /// single-threaded). See `--check-crc` for the default policy this overrides.
-    /// Mutually exclusive with `--check-crc`.
+    /// single-threaded). See `--extract::check-crc` for the default policy this
+    /// overrides. Mutually exclusive with `--extract::check-crc`.
     #[arg(long = "no-check-crc", default_value_t = false)]
     pub no_check_crc: bool,
 }
@@ -1564,17 +1564,17 @@ impl ExtractRunallOptions {
     ///
     /// # Errors
     ///
-    /// Returns an error if `--store-umi-quals` is combined with
-    /// `--extract-umis-from-read-names`, or if `--check-crc` and `--no-check-crc`
-    /// are both set.
+    /// Returns an error if `--extract::store-umi-quals` is combined with
+    /// `--extract::extract-umis-from-read-names`, or if `--extract::check-crc` and
+    /// `--extract::no-check-crc` are both set.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.extract_umis_from_read_names || !self.store_umi_quals,
-            "Cannot store UMI qualities (--store-umi-quals) when also extracting UMIs from read names (--extract-umis-from-read-names)."
+            "Cannot store UMI qualities (--extract::store-umi-quals) when also extracting UMIs from read names (--extract::extract-umis-from-read-names)."
         );
         ensure!(
             !(self.check_crc && self.no_check_crc),
-            "--check-crc and --no-check-crc are mutually exclusive."
+            "--extract::check-crc and --extract::no-check-crc are mutually exclusive."
         );
         Ok(())
     }
@@ -5957,7 +5957,12 @@ mod tests {
             .opts
             .validate()
             .expect("staged-required lifting passes");
-        assert!(opts.validate().is_err());
+        let err = opts.validate().expect_err("the conflict is rejected").to_string();
+        assert!(
+            err.contains("--extract::store-umi-quals")
+                && err.contains("--extract::extract-umis-from-read-names"),
+            "the error must name runall's flags: {err}"
+        );
     }
 
     /// `--clipping-attribute` adjusts a clipping position that exists only on
@@ -6006,7 +6011,8 @@ mod tests {
         assert_unknown(&err, "--extract::clipping-attribute");
     }
 
-    /// `--check-crc` with `--no-check-crc` is rejected by `validate()`.
+    /// `--extract::check-crc` with `--extract::no-check-crc` is rejected by
+    /// `validate()`, naming runall's flags.
     #[test]
     fn extract_runall_options_check_crc_conflicts_with_no_check_crc() {
         let mut args = minimal_runall_args();
@@ -6017,7 +6023,8 @@ mod tests {
             .opts
             .validate()
             .expect("staged-required lifting passes");
-        assert!(opts.validate().is_err());
+        let err = opts.validate().expect_err("the conflict is rejected").to_string();
+        assert_eq!(err, "--extract::check-crc and --extract::no-check-crc are mutually exclusive.");
     }
 
     /// `ExtractRunallOptions::default()` must match the CLI defaults

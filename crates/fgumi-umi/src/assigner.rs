@@ -61,6 +61,12 @@
 //! similar high counts apart, though the `+ 1` lets near-equal low counts merge
 //! (e.g. 2 and 2, or 4 and 3).
 //!
+//! The count rule is fgbio's (`GroupReadsByUmi`), not UMI-tools'. UMI-tools links a
+//! child only when `parent_count >= 2 * child_count - 1`, i.e. `child_count <=
+//! (parent_count + 1) / 2`; the two agree for odd parent counts, and for even ones
+//! fgumi and fgbio admit a child one count larger (2 and 2, or 4 and 3, merge here but
+//! not in UMI-tools).
+//!
 //! **Algorithm**:
 //! 1. Count UMIs and sort by decreasing abundance
 //! 2. Build directed graph where edges represent "captures":
@@ -116,8 +122,11 @@
 //!   *Genome Research*, 27(3), 491-499.
 //!   DOI: [10.1101/gr.209601.116](https://doi.org/10.1101/gr.209601.116)
 //!
-//! The count gradient approach (`child_count <= parent_count / 2 + 1`) is key to
-//! preventing over-correction while still allowing error correction.
+//! The count gradient approach is key to preventing over-correction while still
+//! allowing error correction. fgumi uses fgbio's form of it (`child_count <=
+//! parent_count / 2 + 1`), which is slightly looser than the paper's and UMI-tools'
+//! `parent_count >= 2 * child_count - 1` at even parent counts (see the Adjacency
+//! Strategy section above).
 //!
 //! ## Usage Examples
 //!
@@ -163,6 +172,7 @@
 //! // ACGT appears 3 times, ACTT appears 1 time
 //! // Since 1 <= 3/2 + 1 = 2 (integer division), ACTT will be captured by ACGT
 //! // All reads get the same molecule ID
+//! assert!(assignments.iter().all(|id| *id == assignments[0]));
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
@@ -592,7 +602,8 @@ pub enum Strategy {
     ///
     /// Implements the directed adjacency graph method where high-abundance UMIs can "capture"
     /// lower-abundance UMIs that are within edit distance. A UMI can only be assigned to
-    /// another UMI if its count is at most half of the parent's count plus one. This prevents
+    /// another UMI if its count is at most half of the parent's count plus one (fgbio's rule,
+    /// slightly looser than `umi_tools`' at even parent counts). This prevents
     /// over-correction and is more conservative than the simple edit distance method.
     Adjacency,
 
@@ -1520,7 +1531,8 @@ struct Node {
 
 /// Adjacency UMI assigner using directed graph method
 ///
-/// Implements the directed adjacency graph method from UMI-tools. This method builds a
+/// Implements the directed adjacency graph method from UMI-tools, with fgbio's count rule
+/// (see the module docs for how it differs from UMI-tools'). This method builds a
 /// directed graph where high-abundance UMIs can "capture" lower-abundance UMIs that are
 /// within edit distance. A key constraint is that a UMI can only be a child of another
 /// UMI if its count is at most half of the parent's count plus one (`child_count <= parent_count / 2 + 1`).
@@ -3563,6 +3575,30 @@ mod tests {
         assert_eq!(groups.len(), 2);
     }
 
+    /// The documented count rule, `child_count <= parent_count / 2 + 1` (fgbio's), at its
+    /// boundary. The even-parent cases (2/2, 4/3) are the ones UMI-tools'
+    /// `parent >= 2 * child - 1` would keep apart.
+    #[rstest]
+    #[case::two_and_two_merge(2, 2, true)]
+    #[case::four_and_three_merge(4, 3, true)]
+    #[case::three_and_two_merge(3, 2, true)]
+    #[case::three_and_three_stay_apart(3, 3, false)]
+    #[case::four_and_four_stay_apart(4, 4, false)]
+    #[case::fifty_and_twenty_six_merge(50, 26, true)]
+    #[case::fifty_and_twenty_seven_stay_apart(50, 27, false)]
+    fn test_adjacency_count_rule_boundary(
+        #[case] parent_count: usize,
+        #[case] child_count: usize,
+        #[case] merged: bool,
+    ) {
+        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let mut umis = vec!["AAAAAA".to_string(); parent_count];
+        umis.extend(std::iter::repeat_n("AAAAAT".to_string(), child_count));
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
+        let groups = group_assignments(&umis, &assignments, false);
+        assert_eq!(groups.len(), if merged { 1 } else { 2 });
+    }
+
     /// Test for the backward capture bug fix.
     ///
     /// This tests a scenario where during BFS traversal, a child node should be able
@@ -3724,6 +3760,31 @@ mod tests {
 
         // umis2: combined count of AAAA-CCCG/CCCG-AAAA is 256, which is > 256/2 + 1, so should NOT merge
         assert_eq!(groups2_strip.len(), 2);
+    }
+
+    /// The paired assigner's graph applies the same count rule,
+    /// `child_count <= parent_count / 2 + 1` (fgbio's), to a child's combined A/B
+    /// and B/A count, at the even-parent boundary where UMI-tools' rule differs.
+    #[rstest]
+    #[case::two_and_two_merge(2, 2, 0, true)]
+    #[case::four_and_three_merge(4, 3, 0, true)]
+    #[case::four_and_three_split_across_orientations_merge(4, 2, 1, true)]
+    #[case::three_and_three_stay_apart(3, 3, 0, false)]
+    #[case::four_and_four_stay_apart(4, 4, 0, false)]
+    #[case::four_and_four_split_across_orientations_stay_apart(4, 2, 2, false)]
+    fn test_paired_adjacency_count_rule_boundary(
+        #[case] parent_count: usize,
+        #[case] child_ab_count: usize,
+        #[case] child_ba_count: usize,
+        #[case] merged: bool,
+    ) {
+        let mut umis = vec!["AAAA-CCCC".to_string(); parent_count];
+        umis.extend(repeat_n("AAAA-CCCG".to_string(), child_ab_count));
+        umis.extend(repeat_n("CCCG-AAAA".to_string(), child_ba_count));
+        let assigner = PairedUmiAssigner::new(1);
+        let assignments = assigner.assign(&umis).expect("assign should succeed");
+        let groups = group_assignments(&umis, &assignments, true);
+        assert_eq!(groups.len(), if merged { 1 } else { 2 });
     }
 
     /// Port of fgbio `GroupReadsByUmiTest.scala:189` ("fail if supplied non-paired UMIs").
