@@ -22,6 +22,7 @@
 //! wiring, and the header helpers (`validate_sq_consistency`,
 //! `merge_aligner_header`) shared by both backends.
 
+mod in_flight_gate;
 #[cfg(feature = "aligner-bwa-mem3")]
 pub(crate) mod inproc;
 // `bwa-mem3-rs` is a target-gated dependency, so on any other architecture the
@@ -94,126 +95,11 @@ pub(crate) fn no_primary_records_message(name: &[u8]) -> String {
 /// aligner's real buffering (under-shooting risks a writer stall).
 const IN_FLIGHT_BYTES_PER_BASE: u64 = 3;
 
-/// Multiplier over a single `-K` chunk for the in-flight budget. bwa's
-/// `kt_pipeline` double-buffers (`p_nt=2`: one chunk aligning, one
-/// queued), so the aligner can hold ~2 chunks before emitting; 4× adds
-/// slack for the FASTQ-write buffer and pipeline jitter so the writer
-/// never blocks before the aligner has a full chunk to emit (which
-/// would deadlock — see `InFlightGate`).
-const IN_FLIGHT_CHUNK_MULTIPLIER: u64 = 4;
-
-/// Floor for the in-flight-unmapped budget. Keeps the budget workable
-/// for small `-K` values (custom aligner commands, tests) where the
-/// `-K`-derived value would be tiny, and covers aligners whose internal
-/// buffering exceeds their nominal `-K`.
-const IN_FLIGHT_MIN_BUDGET: u64 = 512 * 1024 * 1024;
-
-/// Derive the in-flight-unmapped byte budget for the subprocess align path from
-/// the aligner's `-K` chunk size (bases per batch). The budget bounds the
-/// otherwise unbounded writer→reader token backlog: the writer blocks once the
-/// in-flight unmapped bytes reach this, so a fast-draining aligner can't
-/// accumulate the whole input's unmapped reads in RAM (issue #382).
-///
-/// Sized `≥` the aligner's real buffering so a **streaming** aligner
-/// (one that emits output after ≤ `-K` bases — every real aligner)
-/// always has a full chunk to emit before the writer blocks, so the
-/// block is transient, not a deadlock. A non-streaming aligner (one that
-/// reads all stdin before emitting) is out of contract: it would stall
-/// the writer here rather than OOM. For the default `-K` of 150M bases
-/// this is ~1.8 GiB.
-#[must_use]
-pub(crate) fn in_flight_budget_for_chunk_size(chunk_size_bases: u64) -> u64 {
-    chunk_size_bases
-        .saturating_mul(IN_FLIGHT_BYTES_PER_BASE)
-        .saturating_mul(IN_FLIGHT_CHUNK_MULTIPLIER)
-        .max(IN_FLIGHT_MIN_BUDGET)
-}
-
-/// Byte-budget gate bounding the subprocess align path's in-flight unmapped
-/// reads (the writer→reader token backlog). The writer
-/// [`acquire`](InFlightGate::acquire)s before feeding a batch to the aligner and
-/// the reader [`release`](InFlightGate::release)s when it consumes the matching
-/// token, so resident in-flight unmapped bytes stay near `budget`.
-///
-/// Deadlock-safety: the gate blocks the writer only while in-flight is at
-/// budget AND non-empty — a single oversized batch always passes when the
-/// gate is empty. Because the budget is sized `≥` a streaming aligner's
-/// `-K` buffering (see [`in_flight_budget_for_chunk_size`]), the aligner
-/// always has a full chunk to emit before the writer blocks, so the
-/// reader drains and the block lifts. If the reader exits (EOF or error),
-/// it latches `consumer_gone` so a blocked writer wakes and bails rather
-/// than hanging.
-pub(crate) struct InFlightGate {
-    budget: u64,
-    inner: Mutex<GateInner>,
-    cond: parking_lot::Condvar,
-}
-
-struct GateInner {
-    in_flight: u64,
-    consumer_gone: bool,
-}
-
-impl InFlightGate {
-    pub(crate) fn new(budget: u64) -> Self {
-        Self {
-            budget,
-            inner: Mutex::new(GateInner { in_flight: 0, consumer_gone: false }),
-            cond: parking_lot::Condvar::new(),
-        }
-    }
-
-    /// Reserve `n` in-flight bytes, blocking while the gate is full and
-    /// non-empty. Returns `false` if the consumer (reader) has gone — the
-    /// caller (writer) should then stop.
-    pub(crate) fn acquire(&self, n: u64) -> bool {
-        let mut g = self.inner.lock();
-        // Block while non-empty AND this reservation would exceed budget.
-        // The `in_flight != 0` guard lets a single oversized batch through
-        // when the gate is empty (it can't be split, so holding it is
-        // unavoidable) — without it the writer would deadlock on a batch
-        // larger than the whole budget.
-        while !g.consumer_gone && g.in_flight != 0 && g.in_flight.saturating_add(n) > self.budget {
-            self.cond.wait(&mut g);
-        }
-        if g.consumer_gone {
-            return false;
-        }
-        g.in_flight = g.in_flight.saturating_add(n);
-        true
-    }
-
-    /// Release `n` in-flight bytes (reader consumed a token) and wake the
-    /// writer if it is blocked.
-    pub(crate) fn release(&self, n: u64) {
-        let mut g = self.inner.lock();
-        g.in_flight = g.in_flight.saturating_sub(n);
-        drop(g);
-        self.cond.notify_all();
-    }
-
-    /// Latch that the consumer (reader) has exited, so a blocked writer
-    /// wakes and bails instead of hanging forever.
-    pub(crate) fn mark_consumer_gone(&self) {
-        let mut g = self.inner.lock();
-        g.consumer_gone = true;
-        drop(g);
-        self.cond.notify_all();
-    }
-}
-
-/// RAII guard that latches consumer-gone on drop — on normal return, on an
-/// error return, AND on a panic unwinding out of `reader_loop`. Without the
-/// guard the panic path would skip `mark_consumer_gone`, leaving a writer
-/// parked in `gate.acquire` blocked forever and `Drop`'s `writer_thread.join()`
-/// hung with it.
-pub(crate) struct ConsumerGoneGuard<'a>(pub(crate) &'a InFlightGate);
-
-impl Drop for ConsumerGoneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.mark_consumer_gone();
-    }
-}
+pub(crate) use in_flight_gate::{
+    ConsumerGoneGuard, IN_FLIGHT_BUDGET_ENV, IN_FLIGHT_CEILING_TIMEOUT,
+    IN_FLIGHT_CEILING_TIMEOUT_ENV, IN_FLIGHT_STALL_GRACE, InFlightGate, ceiling_timeout_override,
+    in_flight_budget_for_chunk_size, in_flight_budget_override, read_ahead_ceiling,
+};
 
 /// Aligner-parsed but pre-merge templates paired with their original unmapped
 /// halves — the backend-agnostic edge every align backend produces, and the
@@ -404,11 +290,12 @@ pub(crate) trait AlignBackend: Send + 'static {
 /// `aligner` module does not depend on the pipeline's align stage.
 pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
     match resolved.backend {
-        ResolvedBackend::Subprocess { command, accept_mid_pair_split } => {
+        ResolvedBackend::Subprocess { command, accept_mid_pair_split, max_read_ahead } => {
             Box::new(subprocess::SubprocessBackend {
                 command,
                 chunk_size: resolved.chunk_size,
                 accept_mid_pair_split,
+                max_read_ahead,
             })
         }
         #[cfg(feature = "aligner-bwa-mem3")]
@@ -738,7 +625,11 @@ mod tests {
     }
 
     fn subprocess(command: &str) -> ResolvedBackend {
-        ResolvedBackend::Subprocess { command: command.to_string(), accept_mid_pair_split: true }
+        ResolvedBackend::Subprocess {
+            command: command.to_string(),
+            accept_mid_pair_split: true,
+            max_read_ahead: None,
+        }
     }
 
     /// The command the subprocess `bwa-mem3` preset builds for `methylation`.
@@ -938,87 +829,6 @@ mod tests {
         assert_eq!(unmapped_bytes, 8 * std::mem::size_of::<Template>());
         let batch = ZipperBatch { serial: 0, mapped: Vec::with_capacity(16), unmapped };
         assert_eq!(batch.heap_size(), 16 * std::mem::size_of::<Template>() + unmapped_bytes);
-    }
-
-    #[test]
-    fn in_flight_budget_derivation() {
-        // Default -K (150M bases) → 4 × 150M × 3 = 1.8 GiB.
-        assert_eq!(in_flight_budget_for_chunk_size(150_000_000), 4 * 150_000_000 * 3);
-        // Small / zero -K floors at IN_FLIGHT_MIN_BUDGET.
-        assert_eq!(in_flight_budget_for_chunk_size(0), IN_FLIGHT_MIN_BUDGET);
-        assert_eq!(in_flight_budget_for_chunk_size(1_000_000), IN_FLIGHT_MIN_BUDGET);
-    }
-
-    #[test]
-    fn consumer_gone_latched_even_when_reader_scope_panics() {
-        // A panic unwinding out of the reader scope must still latch
-        // consumer-gone via `ConsumerGoneGuard`, so a writer parked in
-        // `acquire` bails (returns false) instead of blocking forever. Without
-        // the guard the panic would skip `mark_consumer_gone`, deadlocking the
-        // writer and the `writer_thread.join()` in `Drop`.
-        let gate = InFlightGate::new(1024);
-        assert!(gate.acquire(10), "acquire succeeds before the consumer is gone");
-
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _consumer_gone = ConsumerGoneGuard(&gate);
-            panic!("simulated reader_loop panic");
-        }));
-        assert!(panicked.is_err(), "the panic must propagate out of the guarded scope");
-
-        // The guard's `Drop` latched consumer-gone during unwind, so a
-        // subsequent writer reservation bails instead of blocking.
-        assert!(!gate.acquire(10), "a writer must bail once the reader scope has panicked");
-    }
-
-    #[test]
-    fn in_flight_gate_oversized_single_batch_passes_when_empty() {
-        // A batch larger than the whole budget must still pass when the gate
-        // is empty — it can't be split, so holding it is unavoidable, and
-        // blocking would deadlock.
-        let gate = InFlightGate::new(100);
-        assert!(gate.acquire(1000), "oversized batch must pass when gate empty");
-    }
-
-    #[test]
-    fn in_flight_gate_blocks_until_release() {
-        use std::time::Duration;
-        let gate = Arc::new(InFlightGate::new(100));
-        assert!(gate.acquire(100), "first acquire fills the budget");
-
-        let g2 = Arc::clone(&gate);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let h = std::thread::spawn(move || {
-            // in_flight is 100 (full, non-empty) → this blocks until release.
-            assert!(g2.acquire(50));
-            tx.send(()).unwrap();
-        });
-        // Still blocked.
-        assert!(
-            rx.recv_timeout(Duration::from_millis(150)).is_err(),
-            "second acquire must block while the gate is full"
-        );
-        gate.release(100);
-        rx.recv_timeout(Duration::from_secs(5)).expect("acquire must unblock after release");
-        h.join().unwrap();
-    }
-
-    #[test]
-    fn in_flight_gate_consumer_gone_unblocks_and_bails() {
-        use std::time::Duration;
-        let gate = Arc::new(InFlightGate::new(100));
-        assert!(gate.acquire(100), "fill the budget");
-
-        let g2 = Arc::clone(&gate);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let h = std::thread::spawn(move || {
-            let ok = g2.acquire(50); // blocks (full) until consumer-gone
-            tx.send(ok).unwrap();
-        });
-        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err(), "must be blocked");
-        gate.mark_consumer_gone();
-        let ok = rx.recv_timeout(Duration::from_secs(5)).expect("must wake on consumer-gone");
-        assert!(!ok, "acquire must return false once the consumer is gone");
-        h.join().unwrap();
     }
 
     fn make_sq_header(refs: &[(&str, usize)]) -> Header {

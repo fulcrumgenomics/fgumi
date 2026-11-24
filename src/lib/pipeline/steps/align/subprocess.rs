@@ -81,9 +81,11 @@ use crate::pipeline::core::{
 };
 use crate::pipeline::steps::align::merge::MergeAlignedStep;
 use crate::pipeline::steps::align::{
-    AlignBackend, AlignWired, AlignWiringCtx, ConsumerGoneGuard, InFlightGate, ZipperBatch,
-    check_meth_aligner_version, in_flight_budget_for_chunk_size, is_primary_for_alignment,
-    merge_aligner_header, no_primary_records_message, split_pair_into_singles,
+    AlignBackend, AlignWired, AlignWiringCtx, ConsumerGoneGuard, IN_FLIGHT_BUDGET_ENV,
+    IN_FLIGHT_CEILING_TIMEOUT, IN_FLIGHT_CEILING_TIMEOUT_ENV, IN_FLIGHT_STALL_GRACE, InFlightGate,
+    ZipperBatch, ceiling_timeout_override, check_meth_aligner_version,
+    in_flight_budget_for_chunk_size, in_flight_budget_override, is_primary_for_alignment,
+    merge_aligner_header, no_primary_records_message, read_ahead_ceiling, split_pair_into_singles,
     validate_sq_consistency,
 };
 use crate::pipeline::steps::types::BamTemplateBatch;
@@ -155,8 +157,20 @@ pub(crate) struct SubprocessConfig {
     /// unmapped bytes reach this, bounding the otherwise-unbounded backlog
     /// so a fast-draining aligner can't accumulate the whole input's
     /// unmapped reads in RAM (issue #382). Derive it from the aligner's
-    /// `-K` chunk size via [`in_flight_budget_for_chunk_size`].
+    /// `-K` chunk size via [`in_flight_budget_for_chunk_size`]. It is where
+    /// the gate starts: a stalled aligner grows it up to
+    /// `in_flight_read_ahead_ceiling` (see [`InFlightGate`]).
     pub(crate) in_flight_unmapped_budget: u64,
+
+    /// Hard ceiling the in-flight budget may grow to when the aligner needs
+    /// more input than the budget before it emits; past it the run fails.
+    /// From [`read_ahead_ceiling`] (`--aligner::max-read-ahead`).
+    pub(crate) in_flight_read_ahead_ceiling: u64,
+
+    /// How long a batch at the ceiling may see no aligner output consumed
+    /// before the run fails: [`IN_FLIGHT_CEILING_TIMEOUT`], unless the hidden
+    /// [`IN_FLIGHT_CEILING_TIMEOUT_ENV`] overrides it.
+    pub(crate) in_flight_ceiling_timeout: std::time::Duration,
 
     /// Whether a same-queryname output group with two unpaired primaries is
     /// accepted as bwa's mid-pair split (see [`AlignedGroup::MidPairSplit`]).
@@ -306,7 +320,12 @@ impl SubprocessAlignStep {
         let (out_tx, out_rx) = sync_channel::<ZipperBatch>(OUT_CHAN_DEPTH);
 
         let shared = Arc::new(SharedState::new());
-        let gate = Arc::new(InFlightGate::new(cfg.in_flight_unmapped_budget));
+        let gate = Arc::new(InFlightGate::new(
+            cfg.in_flight_unmapped_budget,
+            cfg.in_flight_read_ahead_ceiling,
+            IN_FLIGHT_STALL_GRACE,
+            cfg.in_flight_ceiling_timeout,
+        ));
 
         let writer_thread = {
             let shared = Arc::clone(&shared);
@@ -395,8 +414,28 @@ fn writer_loop(
         // backlog is at budget; returns `false` only if the reader has
         // exited, in which case we stop (the channel send below would also
         // fail). Bounds the otherwise-unbounded token backlog (issue #382).
-        if !gate.acquire(batch.heap_size() as u64) {
-            return Ok(());
+        // Errs when the aligner reads past the read-ahead ceiling without
+        // emitting; nothing of this batch has been written then.
+        let batch_bytes = batch.heap_size() as u64;
+        // Before acquiring, hand the aligner everything already written: if the
+        // gate makes the writer wait, the tail of the previous batch must not
+        // sit in the FASTQ buffer, since an aligner that needs it to finish a
+        // chunk would emit nothing, so the gate would wait out its grace and
+        // grow for no reason (or fail at the ceiling). Flushing every batch
+        // costs at most one extra write per batch.
+        if let Err(e) = writer.flush() {
+            let msg = format!("align-and-merge writer: flush: {e}");
+            shared.record_error(io::Error::other(msg.clone()));
+            return Err(io::Error::other(msg));
+        }
+        match gate.acquire(batch_bytes) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                let msg = format!("align-and-merge writer: {e}");
+                shared.record_error(io::Error::other(msg.clone()));
+                return Err(io::Error::other(msg));
+            }
         }
         // Count only templates that contribute at least one record
         // to the FASTQ stream. A template whose every record is
@@ -641,8 +680,13 @@ fn reader_loop_inner(
     // test (where `from_header` was used) or a wiring bug. We log
     // the latter case at warn level so it surfaces in CI / prod
     // pipelines while letting tests proceed unchanged. The merged
-    // header is dropped in either case; the existing value wins.
-    if cfg.header_handle.set(merged).is_err() {
+    // header is dropped in either case; the existing value wins. A handle
+    // poisoned by teardown (the step failed, e.g. at the read-ahead ceiling,
+    // while this reader still waited for the header) is not a wiring bug, so
+    // it is not warned about.
+    if cfg.header_handle.set(merged).is_err()
+        && !matches!(cfg.header_handle.try_get(), Some(Err(_)))
+    {
         log::warn!(
             "SubprocessAlignStep: HeaderHandle was already resolved before the aligner \
              emitted its header — aligner @PG/@RG/@CO contributions will not appear \
@@ -676,7 +720,12 @@ fn reader_loop_inner(
             let empty_unmapped = BamTemplateBatch::new(token.serial, Vec::new());
             let zb =
                 ZipperBatch { serial: token.serial, mapped: Vec::new(), unmapped: empty_unmapped };
-            if out_tx.send(zb).is_err() {
+            // Blocked downstream is not an aligner stall (see `downstream_wait`).
+            let sent = {
+                let _downstream = gate.downstream_wait();
+                out_tx.send(zb)
+            };
+            if sent.is_err() {
                 return Ok(()); // downstream gone
             }
             continue;
@@ -688,7 +737,7 @@ fn reader_loop_inner(
         let mut split_indices: Vec<usize> = Vec::new();
 
         for i in 0..token.n_templates {
-            let mapped = template_stream.next_template()?;
+            let mapped = template_stream.next_template(gate)?;
 
             let mapped = mapped.ok_or_else(|| {
                 io::Error::other(format!(
@@ -736,7 +785,12 @@ fn reader_loop_inner(
             split_unmapped_pairs(token.unmapped, &split_indices)?
         };
         let zb = ZipperBatch { serial: token.serial, mapped: mapped_templates, unmapped };
-        if out_tx.send(zb).is_err() {
+        // Blocked downstream is not an aligner stall (see `downstream_wait`).
+        let sent = {
+            let _downstream = gate.downstream_wait();
+            out_tx.send(zb)
+        };
+        if sent.is_err() {
             // Downstream gone — bail. The dispatcher will observe
             // out_rx disconnected on its next try_run.
             return Ok(());
@@ -759,7 +813,7 @@ fn reader_loop_inner(
     // the first; the count isn't useful for the error message, so
     // we report "at least one" rather than a plural that would be
     // wrong for exactly-one cases.
-    if template_stream.probe_trailing().map_err(|e| {
+    if template_stream.probe_trailing(gate).map_err(|e| {
         io::Error::other(format!("align-and-merge reader: probing trailing aligner output: {e}"))
     })? {
         return Err(io::Error::other(
@@ -863,10 +917,10 @@ enum TemplateStream {
 }
 
 impl TemplateStream {
-    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
+    fn next_template(&mut self, gate: &InFlightGate) -> io::Result<Option<AlignedGroup>> {
         match self {
-            Self::Bam(s) => s.next_template(),
-            Self::Sam(s) => s.next_template(),
+            Self::Bam(s) => s.next_template(gate),
+            Self::Sam(s) => s.next_template(gate),
         }
     }
 
@@ -886,10 +940,10 @@ impl TemplateStream {
     /// boundary). Caller is expected to have already checked
     /// [`Self::has_peeked`]; this method does NOT take a peeked
     /// record into account, only the underlying reader.
-    fn probe_trailing(&mut self) -> io::Result<bool> {
+    fn probe_trailing(&mut self, gate: &InFlightGate) -> io::Result<bool> {
         match self {
-            Self::Bam(s) => s.probe_trailing(),
-            Self::Sam(s) => s.probe_trailing(),
+            Self::Bam(s) => s.probe_trailing(gate),
+            Self::Sam(s) => s.probe_trailing(gate),
         }
     }
 }
@@ -1016,7 +1070,7 @@ impl BamTemplateStream {
         }
     }
 
-    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
+    fn next_template(&mut self, gate: &InFlightGate) -> io::Result<Option<AlignedGroup>> {
         // Disjoint field capture (Rust 2021+): the closure borrows
         // `reader`/`scratch` while `peeked`/`name_buf` pass as sibling args, so
         // there's no whole-`self` aliasing conflict. `scratch` is reused across
@@ -1027,13 +1081,21 @@ impl BamTemplateStream {
             self.accept_mid_pair_split,
             || {
                 let n = self.reader.read_record(&mut self.scratch)?;
-                Ok(if n == 0 { None } else { Some(self.scratch.clone()) })
+                Ok(if n == 0 {
+                    None
+                } else {
+                    gate.record_progress();
+                    Some(self.scratch.clone())
+                })
             },
         )
     }
 
-    fn probe_trailing(&mut self) -> io::Result<bool> {
+    fn probe_trailing(&mut self, gate: &InFlightGate) -> io::Result<bool> {
         let n = self.reader.read_record(&mut self.scratch)?;
+        if n > 0 {
+            gate.record_progress();
+        }
         Ok(n > 0)
     }
 }
@@ -1071,11 +1133,15 @@ impl SamTemplateStream {
 
     /// Read one record-buf from the SAM stream and encode it into a
     /// fresh `RawRecord`. Returns `Ok(None)` on EOF.
-    fn read_next_raw(&mut self) -> io::Result<Option<fgumi_raw_bam::RawRecord>> {
+    fn read_next_raw(
+        &mut self,
+        gate: &InFlightGate,
+    ) -> io::Result<Option<fgumi_raw_bam::RawRecord>> {
         let n = self.reader.read_record_buf(&self.header, &mut self.scratch)?;
         if n == 0 {
             return Ok(None);
         }
+        gate.record_progress();
         // RecordBuf → RawRecord. `encode_record_buf_to_raw` allocates
         // a fresh output Vec per record (vs zero-copy on the BAM
         // path). For SAM-emitting aligners this is the cost-of-doing
@@ -1085,7 +1151,7 @@ impl SamTemplateStream {
         Ok(Some(raw))
     }
 
-    fn next_template(&mut self) -> io::Result<Option<AlignedGroup>> {
+    fn next_template(&mut self, gate: &InFlightGate) -> io::Result<Option<AlignedGroup>> {
         // Disjoint field capture (see BAM sibling): the closure borrows
         // `reader`/`header`/`scratch` while `peeked`/`name_buf` pass as sibling
         // args. The read primitive is inlined here rather than calling
@@ -1101,6 +1167,7 @@ impl SamTemplateStream {
                 if n == 0 {
                     Ok(None)
                 } else {
+                    gate.record_progress();
                     fgumi_raw_bam::encode_record_buf_to_raw(&self.scratch, &self.header)
                         .map(Some)
                         .map_err(|e| io::Error::other(format!("encode_record_buf_to_raw: {e}")))
@@ -1109,8 +1176,8 @@ impl SamTemplateStream {
         )
     }
 
-    fn probe_trailing(&mut self) -> io::Result<bool> {
-        Ok(self.read_next_raw()?.is_some())
+    fn probe_trailing(&mut self, gate: &InFlightGate) -> io::Result<bool> {
+        Ok(self.read_next_raw(gate)?.is_some())
     }
 }
 
@@ -1448,6 +1515,23 @@ pub(crate) struct SubprocessBackend {
     pub(crate) chunk_size: u64,
     /// See [`SubprocessConfig::accept_mid_pair_split`].
     pub(crate) accept_mid_pair_split: bool,
+    /// `--aligner::max-read-ahead`, or `None` for the default ceiling (see
+    /// [`read_ahead_ceiling`]).
+    pub(crate) max_read_ahead: Option<u64>,
+}
+
+/// The warning for an explicit `--aligner::max-read-ahead` below the in-flight
+/// budget `--aligner::chunk-size` derives: the gate starts at the ceiling then,
+/// so the budget itself is lowered, not just the room to grow.
+fn max_read_ahead_lowers_budget_warning(budget: u64, requested: Option<u64>) -> Option<String> {
+    requested.filter(|&ceiling| ceiling < budget).map(|ceiling| {
+        format!(
+            "--aligner::max-read-ahead {} is below the in-flight budget {} that \
+             --aligner::chunk-size sets, so the budget is lowered to it and the gate cannot grow",
+            bytesize::ByteSize(ceiling),
+            bytesize::ByteSize(budget)
+        )
+    })
 }
 
 impl SubprocessBackend {
@@ -1477,12 +1561,32 @@ impl AlignBackend for SubprocessBackend {
         // buffers (FASTQ out, BAM in, merge); the aligner child gets the same
         // setting through its environment (see `AlignerProcess::spawn`).
         crate::aligner::retain_freed_memory_unless_user_set("align");
+        let budget = in_flight_budget_override(std::env::var(IN_FLIGHT_BUDGET_ENV).ok().as_deref())
+            .unwrap_or_else(|| in_flight_budget_for_chunk_size(self.chunk_size));
+        let ceiling = read_ahead_ceiling(
+            budget,
+            self.max_read_ahead,
+            crate::system::detect_total_memory() as u64,
+        );
+        if let Some(warning) = max_read_ahead_lowers_budget_warning(budget, self.max_read_ahead) {
+            log::warn!("{warning}");
+        }
+        log::debug!(
+            "align: in-flight budget {}, read-ahead ceiling {}",
+            bytesize::ByteSize(budget),
+            bytesize::ByteSize(ceiling)
+        );
         let step = SubprocessAlignStep::new(
             SubprocessConfig {
                 partial_output_header: Arc::clone(&ctx.partial_output_header),
                 header_handle: ctx.header_handle.clone(),
                 output_byte_limit: ctx.per_step_byte_limit,
-                in_flight_unmapped_budget: in_flight_budget_for_chunk_size(self.chunk_size),
+                in_flight_unmapped_budget: budget,
+                in_flight_read_ahead_ceiling: ceiling,
+                in_flight_ceiling_timeout: ceiling_timeout_override(
+                    std::env::var(IN_FLIGHT_CEILING_TIMEOUT_ENV).ok().as_deref(),
+                )
+                .unwrap_or(IN_FLIGHT_CEILING_TIMEOUT),
                 accept_mid_pair_split: self.accept_mid_pair_split,
                 passes_meth: crate::aligner::command_passes_meth(&self.command),
             },
@@ -1506,6 +1610,21 @@ impl AlignBackend for SubprocessBackend {
 
 #[cfg(test)]
 mod tests {
+    /// An explicit `--aligner::max-read-ahead` below the derived budget is
+    /// warned about (it lowers the budget); at or above it, or unset, it is not.
+    #[rstest::rstest]
+    #[case::below(100, Some(50), true)]
+    #[case::equal(100, Some(100), false)]
+    #[case::above(100, Some(200), false)]
+    #[case::unset(100, None, false)]
+    fn max_read_ahead_below_the_budget_is_warned(
+        #[case] budget: u64,
+        #[case] requested: Option<u64>,
+        #[case] warned: bool,
+    ) {
+        assert_eq!(max_read_ahead_lowers_budget_warning(budget, requested).is_some(), warned);
+    }
+
     use super::*;
     use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED, REVERSE, SUPPLEMENTARY};
 
@@ -1515,6 +1634,8 @@ mod tests {
             header_handle: HeaderHandle::new(),
             output_byte_limit: 1024 * 1024,
             in_flight_unmapped_budget: in_flight_budget_for_chunk_size(150_000_000),
+            in_flight_read_ahead_ceiling: u64::MAX,
+            in_flight_ceiling_timeout: IN_FLIGHT_CEILING_TIMEOUT,
             accept_mid_pair_split: true,
             passes_meth: false,
         }
@@ -1654,7 +1775,8 @@ mod tests {
         // Non-engaging budget: this test has no reader to release the gate,
         // so size it so the single batch never blocks (the gate's blocking
         // behavior is covered by `in_flight_gate_*` unit tests).
-        let gate = InFlightGate::new(u64::MAX);
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
         let result = writer_loop(in_rx, token_tx, cat_stdin, Arc::clone(&shared), &gate);
 
         assert!(result.is_err(), "writer_loop should reject all-filtered template");
@@ -1671,6 +1793,74 @@ mod tests {
 
         let _ = cat.kill();
         let _ = cat.wait();
+    }
+
+    /// Before waiting on the gate the writer flushes what it has buffered, also
+    /// once the gate is stalled and the next batch would pass the ceiling: the
+    /// aligner may need that tail to finish a chunk, and holding it back would
+    /// fail the run at the ceiling. Batch A fills an empty gate; B waits out
+    /// the grace and grows the gate to exactly A + B (stalled); C would pass
+    /// that ceiling, so the writer waits again, and fails once no output has
+    /// been consumed for the ceiling timeout. During that wait B must already
+    /// have reached the aligner, and the failure is recorded for `try_run`.
+    #[test]
+    fn writer_loop_flushes_before_waiting_at_the_ceiling() {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let captured = dir.path().join("stdin.fq");
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&captured).expect("create capture file"))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let cat_stdin = cat.stdin.take().expect("cat stdin");
+
+        let batches: Vec<BamTemplateBatch> = ["read_A", "read_B", "read_C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                BamTemplateBatch::new(i as u64, vec![make_paired_primary_template(name.as_bytes())])
+            })
+            .collect();
+        let ceiling = batches[0].heap_size() as u64 + batches[1].heap_size() as u64;
+        let grace = Duration::from_secs(2);
+        let gate = Arc::new(InFlightGate::new(1, ceiling, grace, grace + Duration::from_secs(1)));
+
+        let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(4);
+        let (token_tx, _token_rx) = channel::<BatchToken>();
+        for batch in batches {
+            in_tx.send(batch).expect("queue batch");
+        }
+        drop(in_tx);
+        let writer_gate = Arc::clone(&gate);
+        let shared = Arc::new(SharedState::new());
+        let writer_shared = Arc::clone(&shared);
+        let writer = std::thread::spawn(move || {
+            writer_loop(in_rx, token_tx, cat_stdin, writer_shared, &writer_gate)
+        });
+
+        // B's stall grows the gate to the ceiling; C then waits on it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while gate.budget() != ceiling {
+            assert!(Instant::now() < deadline, "the gate never grew for batch B");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(grace / 4);
+        let seen = std::fs::read_to_string(&captured).expect("read capture");
+        assert!(
+            seen.contains("@read_B"),
+            "batch B must reach the aligner before the writer waits at the ceiling; saw:\n{seen}"
+        );
+
+        let err = writer.join().expect("writer thread").expect_err("C passes the ceiling");
+        assert!(err.to_string().contains("read ahead more than"), "unexpected: {err}");
+        let recorded = shared.take_error().expect("the ceiling error is recorded for try_run");
+        assert!(recorded.to_string().contains("read ahead more than"), "recorded: {recorded}");
+        cat.wait().expect("cat exits");
     }
 
     /// Regression for the AAM deadlock fixed in commit `069c265`.
@@ -1707,7 +1897,12 @@ mod tests {
         // is that `token_tx.send` (the unbounded channel) never blocks the
         // writer, which the gate's byte bound must not change for in-flight
         // below budget. The gate's blocking is covered by `in_flight_gate_*`.
-        let gate = Arc::new(InFlightGate::new(u64::MAX));
+        let gate = Arc::new(InFlightGate::new(
+            u64::MAX,
+            u64::MAX,
+            IN_FLIGHT_STALL_GRACE,
+            IN_FLIGHT_CEILING_TIMEOUT,
+        ));
         let gate_for_worker = Arc::clone(&gate);
         let writer_handle = std::thread::Builder::new()
             .name("writer-loop-deadlock-test".into())
@@ -2071,6 +2266,148 @@ mod tests {
         std::fs::write(path, text).expect("write sam fixture");
     }
 
+    /// Encode a header and one same-queryname record per independently readable
+    /// chunk, without EOF, so a pipe producer can pace the reader's progress.
+    fn same_queryname_output_chunks(sam: bool, record_count: usize) -> Vec<Vec<u8>> {
+        use fgumi_bgzf::InlineBgzfCompressor;
+        use fgumi_raw_bam::flags::UNMAPPED;
+
+        // Separate BGZF blocks let the real BAM reader consume each record
+        // immediately, just as newline-delimited SAM does.
+        let encode = |bytes: Vec<u8>| {
+            if sam {
+                bytes
+            } else {
+                let mut c = InlineBgzfCompressor::new(1);
+                c.write_all(&bytes).unwrap();
+                c.flush().unwrap();
+                let mut compressed = Vec::new();
+                c.write_blocks_to(&mut compressed).unwrap();
+                compressed
+            }
+        };
+        let mut header = Vec::new();
+        if sam {
+            header.extend_from_slice(b"@HD\tVN:1.6\n");
+        } else {
+            fgumi_bam_io::write_bam_header(&mut header, &Header::default()).unwrap();
+        }
+        let mut chunks = vec![encode(header)];
+        for i in 0..record_count {
+            let flags = UNMAPPED | if i == 0 { 0 } else { SUPPLEMENTARY };
+            let mut bytes = Vec::new();
+            if sam {
+                writeln!(bytes, "large\t{flags}\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII").unwrap();
+            } else {
+                fgumi_raw_bam::write_raw_record(&mut bytes, &make_record(b"large", flags)).unwrap();
+            }
+            chunks.push(encode(bytes));
+        }
+        chunks
+    }
+
+    /// A large same-queryname group must keep the ceiling waiter alive before
+    /// even one template completes. Removing either format's record-progress
+    /// signal must fail the active-output case; EOF is deliberately held back
+    /// in the stopped-output case so only the quiet timeout can end the wait.
+    #[rstest::rstest]
+    #[case::bam_active_output_outlasts_the_timeout(false, 30, false)]
+    #[case::sam_active_output_outlasts_the_timeout(true, 30, false)]
+    #[case::bam_output_stops_before_the_template_finishes(false, 30, true)]
+    #[case::sam_output_stops_before_the_template_finishes(true, 30, true)]
+    fn reader_loop_reports_record_progress_at_the_ceiling(
+        #[case] sam: bool,
+        #[case] record_count: usize,
+        #[case] stops: bool,
+    ) {
+        use fgumi_bgzf::BGZF_EOF;
+        use fgumi_raw_bam::flags::UNMAPPED;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::{TryRecvError, sync_channel};
+        use std::time::{Duration, Instant};
+
+        let chunks = same_queryname_output_chunks(sam, record_count);
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn streaming output");
+        let mut stdin = cat.stdin.take().unwrap();
+        let stdout = cat.stdout.take().unwrap();
+        let fail_after = Duration::from_millis(500);
+        let (active_tx, active_rx) = channel();
+        let producer = thread::spawn(move || {
+            for chunk in chunks {
+                stdin.write_all(&chunk).unwrap();
+                stdin.flush().unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+            active_tx.send(()).unwrap();
+            if stops {
+                thread::sleep(fail_after * 3);
+            }
+            if !sam {
+                stdin.write_all(&BGZF_EOF).unwrap();
+            }
+        });
+
+        let unmapped = BamTemplateBatch::new(
+            0,
+            vec![Template::from_records(vec![make_record(b"large", UNMAPPED)]).unwrap()],
+        );
+        let ceiling = unmapped.heap_size() as u64 + 100;
+        let gate =
+            Arc::new(InFlightGate::new(ceiling, ceiling, Duration::from_millis(50), fail_after));
+        assert!(gate.acquire(ceiling).unwrap());
+        let (token_tx, token_rx) = channel();
+        token_tx.send(BatchToken { unmapped, n_templates: 1, serial: 0 }).unwrap();
+        drop(token_tx);
+        let (out_tx, out_rx) = sync_channel(1);
+        let cfg = make_test_cfg();
+        let header_handle = cfg.header_handle.clone();
+        let reader_gate = Arc::clone(&gate);
+        let reader =
+            thread::spawn(move || reader_loop_inner(token_rx, &out_tx, stdout, &cfg, &reader_gate));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !header_handle.is_set() || gate.in_flight() != 100 {
+            assert!(Instant::now() < deadline, "reader did not start its token");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let waiter_gate = Arc::clone(&gate);
+        let (wait_tx, wait_rx) = channel();
+        let waiter = thread::spawn(move || {
+            wait_tx.send(waiter_gate.acquire(ceiling)).unwrap();
+        });
+
+        active_rx.recv_timeout(Duration::from_secs(10)).expect("output keeps flowing");
+        let while_active = wait_rx.try_recv();
+        producer.join().unwrap();
+        reader.join().unwrap().expect("reader completes the template");
+        cat.wait().unwrap();
+        let while_reserved = wait_rx.try_recv();
+        let reserved = gate.in_flight();
+        gate.release(100);
+        waiter.join().unwrap();
+
+        assert!(
+            matches!(while_active, Err(TryRecvError::Empty)),
+            "output must stay active longer than the timeout without failing: {while_active:?}"
+        );
+        assert_eq!(reserved, 100, "record progress must not release unmapped bytes");
+        if stops {
+            let err = while_reserved.expect("stopped output must time out").unwrap_err();
+            assert!(err.to_string().contains("read ahead more than"), "unexpected: {err}");
+        } else {
+            assert!(
+                matches!(while_reserved, Err(TryRecvError::Empty)),
+                "active output must neither time out nor admit bytes: {while_reserved:?}"
+            );
+            assert!(wait_rx.recv().unwrap().unwrap(), "release admits the waiting batch");
+        }
+        let batch = out_rx.recv().unwrap();
+        assert_eq!(batch.mapped[0].records().len(), record_count);
+    }
+
     /// End to end through `reader_loop_inner` for both aligner output formats: a
     /// pair the aligner split mid-pair (two unpaired primaries under one name)
     /// zips as two single-read mapped templates against its unmapped template
@@ -2109,8 +2446,19 @@ mod tests {
         drop(token_tx);
 
         let cfg = make_test_cfg();
-        reader_loop_inner(token_rx, &out_tx, stdout, &cfg, &InFlightGate::new(u64::MAX))
-            .expect("reader_loop_inner");
+        reader_loop_inner(
+            token_rx,
+            &out_tx,
+            stdout,
+            &cfg,
+            &InFlightGate::new(
+                u64::MAX,
+                u64::MAX,
+                IN_FLIGHT_STALL_GRACE,
+                IN_FLIGHT_CEILING_TIMEOUT,
+            ),
+        )
+        .expect("reader_loop_inner");
         drop(out_tx);
         let _ = cat.wait();
 
