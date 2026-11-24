@@ -1,6 +1,8 @@
 pub mod frame_bgzf_blocks;
 pub mod plan_input_reads;
 pub mod read_bam;
+#[cfg(feature = "cram")]
+pub mod read_cram;
 pub mod record_stream;
 
 #[cfg(test)]

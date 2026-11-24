@@ -329,6 +329,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -748,6 +758,7 @@ dependencies = [
  "fgumi-cli-macros",
  "fgumi-consensus",
  "fgumi-dna",
+ "fgumi-htslib",
  "fgumi-metrics",
  "fgumi-pipeline-core",
  "fgumi-pipeline-io",
@@ -801,7 +812,9 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "fgumi-bgzf",
+ "fgumi-htslib",
  "fgumi-raw-bam",
+ "fgumi-tag",
  "flate2",
  "log",
  "nix",
@@ -810,6 +823,7 @@ dependencies = [
  "noodles-csi",
  "parking_lot 0.13.0",
  "proptest",
+ "rayon",
  "rstest",
  "tempfile",
 ]
@@ -894,6 +908,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-htslib"
+version = "0.9.0"
+dependencies = [
+ "bzip2-sys",
+ "cc",
+ "fgumi-raw-bam",
+ "fgumi-tag",
+ "flate2",
+ "libdeflate-sys",
+ "libz-sys",
+ "log",
+ "lzma-sys",
+ "rstest",
+ "rustix",
+ "tempfile",
+]
+
+[[package]]
 name = "fgumi-metrics"
 version = "0.9.0"
 dependencies = [
@@ -939,6 +971,7 @@ dependencies = [
  "dhat",
  "fgumi-bam-io",
  "fgumi-bgzf",
+ "fgumi-htslib",
  "fgumi-pipeline-core",
  "fgumi-raw-bam",
  "fgumi-sort",
@@ -1543,6 +1576,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
 dependencies = [
  "hashbrown",
+]
+
+[[package]]
+name = "lzma-sys"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]

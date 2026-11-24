@@ -69,8 +69,25 @@ use crate::pipeline::chains::{
 ///
 /// Returns the first validator violation, or any underlying step
 /// construction error (header parse, file-open, etc.).
-#[allow(clippy::needless_pass_by_value)]
 pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
+    build_for_with_source_validation(spec, |_| Ok(()))
+}
+
+/// Build a chain after validating its detected source format. The source has
+/// been opened once and retains its prefix; no stage or sink output is opened
+/// before `validate_source` succeeds.
+///
+/// # Errors
+///
+/// Source validation or any normal [`build_for`] construction failure.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn build_for_with_source_validation<F>(
+    spec: ChainSpec,
+    validate_source: F,
+) -> Result<BuiltPipeline>
+where
+    F: FnOnce(bool) -> Result<()>,
+{
     validate_stage_progression(&spec)?;
     validate_stage_opts_present(&spec)?;
     validate_cross_stage_constraints(&spec)?;
@@ -89,6 +106,7 @@ pub fn build_for(spec: ChainSpec) -> Result<BuiltPipeline> {
     }
 
     let mut chain = ChainBuilder::new(&spec)?;
+    validate_source(chain.source_is_cram())?;
 
     // NOTE: `--threads 1` whole-chain fusion is NOT wired here. It is applied
     // generically by the runtime (`Pipeline::run` → `run_fused_single_thread`)
@@ -135,8 +153,10 @@ pub struct MergeSpec {
     /// A rewrite of each record before its key is extracted (read-tag
     /// renames), if any input needs one.
     pub rewrite: Option<fgumi_sort::RecordRewrite>,
-    /// Where the merged BAM is written (a staged temp, or stdout).
+    /// Where the merged alignment file is written (a staged temp, or stdout).
     pub output: std::path::PathBuf,
+    /// The user's destination, used to select the format and name errors.
+    pub output_name: std::path::PathBuf,
     /// Output BGZF compression level.
     pub compression: u32,
     /// `--threads`: how many threads compress the output. The pool adds up
@@ -190,6 +210,67 @@ fn merge_pool_threads(threads: usize, inputs: usize) -> usize {
     threads + inputs.clamp(1, threads)
 }
 
+/// Attach the merge's format-specific sink, encoding on the existing worker pool.
+fn add_merge_sink(
+    tail: fgumi_pipeline_core::builder::Chain<
+        '_,
+        fgumi_pipeline_core::Single<fgumi_pipeline_io::types::DecompressedBlock>,
+    >,
+    output: &std::path::Path,
+    output_name: &std::path::Path,
+    header: &noodles::sam::Header,
+    compression: u32,
+    threads: usize,
+    byte_limit: u64,
+) -> Result<()> {
+    use crate::pipeline::steps::bgzf::compress::BgzfCompress;
+    use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
+    #[cfg(feature = "cram")]
+    use std::sync::Arc;
+
+    // At most `threads` workers encode; the pool's extra ones read and decompress.
+    let cap = Some(fgumi_pipeline_core::PhaseCap::new("merge-compress", threads));
+    if fgumi_bam_io::is_cram_path(output_name) {
+        #[cfg(feature = "cram")]
+        {
+            use fgumi_pipeline_io::sink::write_cram::{
+                CramEncode, CramHeader, CramPack, CramSetup, CramWrite, FinisherSlot,
+            };
+            use fgumi_pipeline_io::types::DecompressedBlock;
+
+            let policy = fgumi_bam_io::CramOutputPolicy::new(
+                output_name,
+                !header.reference_sequences().is_empty(),
+                compression,
+            );
+            let setup = CramSetup {
+                path: output.to_path_buf(),
+                display: output_name.to_path_buf(),
+                header: CramHeader::Eager(Box::new(header.clone())),
+                reference: policy.reference,
+                no_ref: policy.no_ref,
+                file_id: policy.file_id,
+                crai: None,
+            };
+            let finisher: FinisherSlot = Arc::default();
+            tail.chain(CramPack::<DecompressedBlock>::new(
+                setup,
+                Arc::clone(&finisher),
+                byte_limit,
+            ))
+            .chain(CramEncode::new(byte_limit).with_phase_cap(cap))
+            .chain(CramWrite::new(finisher))
+            .into_sink_marker();
+        }
+    } else {
+        let compress = BgzfCompress::new(compression, byte_limit, false).with_phase_cap(cap);
+        let write = WriteBgzfFile::new(output, header, compression)
+            .map_err(|e| anyhow::anyhow!("WriteBgzfFile::new: {e}"))?;
+        tail.chain(compress).chain(write).into_sink_marker();
+    }
+    Ok(())
+}
+
 /// Build `fgumi merge`'s chain: the sort's phase 2 over the inputs.
 ///
 /// ```text
@@ -209,8 +290,6 @@ fn merge_pool_threads(threads: usize, inputs: usize) -> usize {
 pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
     use std::sync::Arc;
 
-    use crate::pipeline::steps::bgzf::compress::BgzfCompress;
-    use crate::pipeline::steps::sink::write_bgzf::WriteBgzfFile;
     use crate::pipeline::steps::tuning::BamPipelineTuning;
     use fgumi_pipeline_io::sort::{
         AnnounceMergeInputs, BlockOutput, MergeInputs, NoConsolidation, SortMerge,
@@ -225,11 +304,13 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         template_ctx,
         rewrite,
         output,
+        output_name,
         compression,
         threads,
         deadlock_timeout_secs,
         stats_slot,
     } = spec;
+    fgumi_bam_io::validate_alignment_output(&output_name)?;
     let threads = threads.max(1);
     let pool_threads = merge_pool_threads(threads, inputs.len());
     let byte_limit = BamPipelineTuning::auto_tuned(threads).per_step_byte_limit;
@@ -266,20 +347,14 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         .with_spill_supply(&supply)
         .with_stats_slot(stats_slot)
         .with_merge_inputs(MergeInputs { inputs: names, order_name, template_ctx, rewrite });
-    // At most `threads` workers compress; the pool's extra ones read and
-    // decompress.
-    let compress = BgzfCompress::new(compression, byte_limit, false)
-        .with_phase_cap(Some(fgumi_pipeline_core::PhaseCap::new("merge-compress", threads)));
-    let write = WriteBgzfFile::new(&output, &header, compression)
-        .map_err(|e| anyhow::anyhow!("WriteBgzfFile::new: {e}"))?;
-
     let builder = fgumi_pipeline_core::builder::PipelineBuilder::new();
     let fan =
         builder.chain(AnnounceMergeInputs::new(inputs, byte_limit)).chain(planner).into_multi();
     fan.b0.chain(pread).chain(decompress).into_sink_marker();
     // `fgumi merge` never takes the single-chunk fast path (its inputs are
     // slots), so the merge's job branch gets an idle `MergeWork`.
-    serial_merge_output(fan.b1.chain(merge)).chain(compress).chain(write).into_sink_marker();
+    let tail = serial_merge_output(fan.b1.chain(merge));
+    add_merge_sink(tail, &output, &output_name, &header, compression, threads, byte_limit)?;
     fan.b2.chain(NoConsolidation).into_sink_marker();
     let pipeline = builder.build().map_err(|e| anyhow::anyhow!("Pipeline::build: {e}"))?;
     // The runtime every sort-chain command shares (the deadlock monitor on),
@@ -352,11 +427,100 @@ mod tests {
             template_ctx: None,
             rewrite: None,
             output: dir.join("out.bam"),
+            output_name: dir.join("out.bam"),
             compression: 1,
             threads,
             deadlock_timeout_secs: crate::commands::common::DEFAULT_DEADLOCK_TIMEOUT_SECS,
             stats_slot: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    #[cfg(not(feature = "cram"))]
+    #[test]
+    fn merge_cram_refusal_names_user_destination_without_creating_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = merge_spec(dir.path(), 1, 2);
+        spec.output = dir.path().join("staged.tmp");
+        spec.output_name = dir.path().join("user.cram");
+        let output = spec.output.clone();
+        let named = spec.output_name.clone();
+        let err = build_merge(spec).err().expect("CRAM requires the opt-in feature");
+        assert!(err.to_string().contains(&named.display().to_string()));
+        assert!(err.to_string().contains("--features cram"));
+        assert!(!output.exists());
+    }
+
+    /// The merge emits CRAM directly, including the eager header, records,
+    /// user-facing file ID and encoder cap, even when its write path is staged.
+    #[cfg(feature = "cram")]
+    #[rstest::rstest]
+    fn merge_writes_cram(#[values(1, 4)] threads: usize, #[values(0, 12_050)] count: usize) {
+        use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
+        use noodles::sam::alignment::io::Write as _;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = merge_spec(dir.path(), threads, 0);
+        spec.header = noodles::sam::Header::builder().add_comment("merge header").build();
+        let mut expected = Vec::new();
+        for shard in 0..2 {
+            let path = dir.path().join(format!("in{shard}.bam"));
+            let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&path).unwrap());
+            writer.write_header(&spec.header).unwrap();
+            for i in (shard..count).step_by(2) {
+                let record = SamBuilder::new()
+                    .read_name(format!("read{i:07}").as_bytes())
+                    .flags(flags::UNMAPPED)
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .build();
+                let buf = fgumi_raw_bam::raw_record_to_record_buf(&record, &spec.header).unwrap();
+                writer.write_alignment_record(&spec.header, &buf).unwrap();
+                expected.push(record);
+            }
+            writer.try_finish().unwrap();
+            drop(writer);
+            let file = std::fs::File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            spec.inputs.push(fgumi_pipeline_io::sort::MergeInput {
+                path,
+                source: Arc::new(file),
+                len: Some(len),
+                prefix_len: None,
+            });
+        }
+        spec.order = fgumi_sort::SortOrder::Queryname(fgumi_sort::QuerynameComparator::Natural);
+        spec.order_name = "queryname";
+        spec.output = dir.path().join("staged.tmp");
+        spec.output_name = dir.path().join("merged.cram");
+        let output = spec.output.clone();
+        let header = spec.header.clone();
+        let built = build_merge(spec).unwrap();
+        let caps = built.pipeline.phase_caps();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].0, "CramEncode");
+        assert_eq!(caps[0].1.max(), threads);
+        built.run().expect("CRAM merge");
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..4], b"CRAM");
+        assert!(bytes[6..26].starts_with(b"merged.cram"));
+        let (mut reader, actual_header) = fgumi_bam_io::create_raw_bam_reader_with_opts(
+            &output,
+            1,
+            fgumi_bam_io::PipelineReaderOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(actual_header.comments(), header.comments());
+        expected.sort_by(|a, b| a.read_name().cmp(b.read_name()));
+        let mut record = RawRecord::default();
+        for expected in expected {
+            assert_ne!(reader.read_record(&mut record).unwrap(), 0);
+            assert_eq!(record.read_name(), expected.read_name());
+            assert_eq!(record.flags(), expected.flags());
+            assert_eq!(record.sequence_vec(), expected.sequence_vec());
+            assert_eq!(record.quality_scores(), expected.quality_scores());
+        }
+        assert_eq!(reader.read_record(&mut record).unwrap(), 0);
     }
 
     /// `fgumi merge --deadlock-timeout` reaches the merge pipeline's watchdog

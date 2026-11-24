@@ -1,8 +1,8 @@
 //! End-to-end no-op BAM round-trip helper. Wires the full block-level
 //! BAM chain (`ReadBgzfBlocks → BgzfDecompress → FindBamBoundaries →
 //! DecodeRecords → GroupBam → SerializeBamRecords → BgzfCompress →
-//! WriteBgzfFile`) and runs it against an input BAM, producing an output
-//! BAM. Convenience for the `fgumi compare bam-roundtrip <bam>`
+//! WriteBgzfFile`) and runs it against an input BAM, producing BAM or
+//! opt-in CRAM output. Convenience for the `fgumi compare bam-roundtrip <bam>`
 //! gate (Phase 3 bench-prep) and for any caller that wants to drive the
 //! framework end-to-end on a real BAM.
 
@@ -60,9 +60,11 @@ impl Default for RoundtripConfig {
 }
 
 /// Run the full block-level BAM chain on `input` and write the output to
-/// `output`. The output holds the same *set* of records as the input (same
-/// count, same per-record bytes) modulo header `@PG` (Phase 3 has no `@PG`
-/// mutation).
+/// `output`. A `.cram` output name selects CRAM (requires feature `cram`);
+/// other names select BAM. BAM output holds the same *set* of records as the
+/// input (same count and per-record bytes); CRAM follows htslib's record
+/// normalization, including regenerated `MD`/`NM` and reordered aux tags.
+/// Neither path adds a `@PG` record.
 ///
 /// Record order is **not** byte-for-byte preserved for multi-record templates:
 /// the chain routes through `GroupBam`, whose `Template::from_records`
@@ -89,6 +91,26 @@ impl Default for RoundtripConfig {
 /// partial file; direct library callers that need that guarantee must stage and
 /// rename themselves.
 pub fn run_bam_roundtrip(input: &Path, output: &Path, cfg: RoundtripConfig) -> io::Result<()> {
+    run_bam_roundtrip_named(input, output, output, cfg)
+}
+
+/// Run [`run_bam_roundtrip`] with a separate user-facing output name.
+///
+/// `output_write_path` may be a staged temporary; `named_path` selects BAM or
+/// CRAM by extension and identifies the destination in CRAM errors and headers.
+/// CRAM output uses the pipeline worker pool and does not write a BAM intermediate.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run_bam_roundtrip`], and refuses a CRAM name
+/// before creating output when the `cram` feature is disabled.
+pub fn run_bam_roundtrip_named(
+    input: &Path,
+    output_write_path: &Path,
+    named_path: &Path,
+    cfg: RoundtripConfig,
+) -> io::Result<()> {
+    fgumi_bam_io::validate_alignment_output(named_path).map_err(io::Error::other)?;
     let t = cfg.tuning;
     // Validate the compression level and thread count up front — before the
     // output file is created — so an out-of-range value returns an error
@@ -114,7 +136,7 @@ pub fn run_bam_roundtrip(input: &Path, output: &Path, cfg: RoundtripConfig) -> i
     let (read_step, header) = read_bam(input, opts, t.blocks_per_batch, t.per_step_byte_limit)?;
 
     let builder = Pipeline::builder();
-    builder
+    let tail = builder
         .chain(read_step)
         .chain(BgzfDecompress::new(t.per_step_byte_limit))
         .chain(FindBamBoundaries::new(t.per_step_byte_limit))
@@ -128,13 +150,51 @@ pub fn run_bam_roundtrip(input: &Path, output: &Path, cfg: RoundtripConfig) -> i
         // regardless), so the computed group key does not affect output bytes.
         .chain(DecodeRecords::new(GroupKeyConfig::default(), t.per_step_byte_limit))
         .chain(GroupBam::new(t.template_batch_size, t.per_step_byte_limit))
-        .chain(SerializeBamRecords::new(t.per_step_byte_limit))
-        .chain(BgzfCompress::new(t.compression_level, t.per_step_byte_limit, false))
-        .chain(
-            WriteBgzfFile::new(output, &header, t.compression_level)
-                .map_err(|e| io::Error::other(format!("WriteBgzfFile::new: {e}")))?,
-        )
-        .into_sink_marker();
+        .chain(SerializeBamRecords::new(t.per_step_byte_limit));
+    if fgumi_bam_io::is_cram_path(named_path) {
+        #[cfg(feature = "cram")]
+        {
+            use std::sync::Arc;
+
+            use fgumi_pipeline_io::sink::write_cram::{
+                CramEncode, CramHeader, CramPack, CramSetup, CramWrite, FinisherSlot,
+            };
+            use fgumi_pipeline_io::types::DecompressedBlock;
+
+            let policy = fgumi_bam_io::CramOutputPolicy::new(
+                named_path,
+                !header.reference_sequences().is_empty(),
+                t.compression_level,
+            );
+            let setup = CramSetup {
+                path: output_write_path.to_path_buf(),
+                display: named_path.to_path_buf(),
+                header: CramHeader::Eager(Box::new(header)),
+                reference: policy.reference,
+                no_ref: policy.no_ref,
+                file_id: policy.file_id,
+                crai: None,
+            };
+            let finisher: FinisherSlot = Arc::default();
+            tail.chain(CramPack::<DecompressedBlock>::new(
+                setup,
+                Arc::clone(&finisher),
+                t.per_step_byte_limit,
+            ))
+            .chain(CramEncode::new(t.per_step_byte_limit).with_phase_cap(Some(
+                fgumi_pipeline_core::PhaseCap::new("roundtrip-encode", t.threads),
+            )))
+            .chain(CramWrite::new(finisher))
+            .into_sink_marker();
+        }
+    } else {
+        tail.chain(BgzfCompress::new(t.compression_level, t.per_step_byte_limit, false))
+            .chain(
+                WriteBgzfFile::new(output_write_path, &header, t.compression_level)
+                    .map_err(|e| io::Error::other(format!("WriteBgzfFile::new: {e}")))?,
+            )
+            .into_sink_marker();
+    }
     let pipeline =
         builder.build().map_err(|e| io::Error::other(format!("Pipeline::build: {e:?}")))?;
     pipeline
@@ -157,7 +217,7 @@ mod tests {
     fn write_bam(records: &[RawRecord]) -> tempfile::NamedTempFile {
         use noodles::sam::alignment::io::Write as _;
         let tmp = tempfile::NamedTempFile::new().expect("create temp BAM");
-        let header = Header::default();
+        let header = Header::builder().add_comment("roundtrip header").build();
         let mut writer =
             noodles::bam::io::Writer::new(std::fs::File::create(tmp.path()).expect("create BAM"));
         writer.write_header(&header).expect("write header");
@@ -260,6 +320,80 @@ mod tests {
             .expect("run_bam_roundtrip on empty input");
 
         assert!(record_bodies(output.path()).is_empty(), "empty input must yield empty output");
+    }
+
+    /// CRAM selection follows the user name, not the staged filename, and both
+    /// empty and multi-container outputs preserve the header and record content.
+    #[cfg(feature = "cram")]
+    #[rstest]
+    fn roundtrip_writes_cram(
+        #[values(1, 4)] threads: usize,
+        #[values(0, 12_050)] count: usize,
+        #[values(false, true)] staged: bool,
+    ) {
+        let records: Vec<_> = (0..count)
+            .map(|i| {
+                SamBuilder::new()
+                    .read_name(format!("read{i:07}").as_bytes())
+                    .flags(flags::UNMAPPED)
+                    .sequence(b"ACGTACGT")
+                    .qualities(&[30; 8])
+                    .build()
+            })
+            .collect();
+        let input = write_bam(&records);
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("roundtrip.cram");
+        let output = if staged { dir.path().join("staged.tmp") } else { named.clone() };
+        if staged {
+            run_bam_roundtrip_named(
+                input.path(),
+                &output,
+                &named,
+                RoundtripConfig::auto_tuned(threads),
+            )
+        } else {
+            run_bam_roundtrip(input.path(), &output, RoundtripConfig::auto_tuned(threads))
+        }
+        .expect("CRAM roundtrip");
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..4], b"CRAM");
+        assert!(bytes[6..26].starts_with(b"roundtrip.cram"), "user basename in file ID");
+        let (mut reader, header) = fgumi_bam_io::create_raw_bam_reader_with_opts(
+            &output,
+            1,
+            PipelineReaderOpts::default(),
+        )
+        .unwrap();
+        let expected_header = Header::builder().add_comment("roundtrip header").build();
+        assert_eq!(header.comments(), expected_header.comments());
+        let mut record = RawRecord::default();
+        for expected in records {
+            assert_ne!(reader.read_record(&mut record).unwrap(), 0);
+            assert_eq!(record.read_name(), expected.read_name());
+            assert_eq!(record.flags(), expected.flags());
+            assert_eq!(record.sequence_vec(), expected.sequence_vec());
+            assert_eq!(record.quality_scores(), expected.quality_scores());
+        }
+        assert_eq!(reader.read_record(&mut record).unwrap(), 0);
+    }
+
+    #[cfg(not(feature = "cram"))]
+    #[test]
+    fn roundtrip_cram_refusal_names_user_destination_without_creating_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("staged.tmp");
+        let named = dir.path().join("user.cram");
+        let err = run_bam_roundtrip_named(
+            &dir.path().join("missing.bam"),
+            &output,
+            &named,
+            RoundtripConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(&named.display().to_string()));
+        assert!(err.to_string().contains("--features cram"));
+        assert!(!output.exists());
     }
 
     /// A compression level above 12 returns an error from the library API

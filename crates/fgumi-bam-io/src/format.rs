@@ -13,6 +13,9 @@
 /// specification restricts read names to printable ASCII.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
+/// CRAM file-definition magic.
+const CRAM_MAGIC: &[u8] = b"CRAM";
+
 /// Bytes needed to tell BGZF from plain gzip.
 ///
 /// A whole BGZF block header, because that is what the shared predicate reads:
@@ -39,6 +42,9 @@ pub enum InputFormat {
     /// decode — one deflate stream cannot be split across threads — so `bgzip` is
     /// a performance recommendation here rather than a requirement.
     Gzip,
+    /// CRAM (`CRAM` magic). Readable only when fgumi is built with the `cram`
+    /// feature, which decodes it through htslib at the normalization boundary.
+    Cram,
     /// Uncompressed text; for alignment inputs, SAM.
     Text,
     /// No bytes at all.
@@ -81,6 +87,11 @@ pub fn classify_input(prefix: &[u8]) -> InputFormat {
     if prefix.is_empty() {
         return InputFormat::Empty;
     }
+    // `CRAM` and a known major version (1-4). A SAM file cannot start this way:
+    // that would be a headerless read named `CRAM`, which SAM input rejects.
+    if prefix.starts_with(CRAM_MAGIC) && prefix.get(4).is_some_and(|v| (1..=4).contains(v)) {
+        return InputFormat::Cram;
+    }
     if !prefix.starts_with(&GZIP_MAGIC) {
         return InputFormat::Text;
     }
@@ -109,6 +120,10 @@ mod tests {
     #[case::plain_gzip(&PLAIN_GZIP, InputFormat::Gzip)]
     #[case::sam_header(b"@HD\tVN:1.6\tSO:queryname\n", InputFormat::Text)]
     #[case::empty(b"", InputFormat::Empty)]
+    #[case::cram(b"CRAM\x03\x01fgumi-test-file-id", InputFormat::Cram)]
+    // The magic alone, or with an unknown major version, is not CRAM.
+    #[case::cram_magic_only(b"CRAM", InputFormat::Text)]
+    #[case::cram_unknown_version(b"CRAM\x09\x00fgumi-test-file-id", InputFormat::Text)]
     // Too short to hold the BGZF extra field: gzip magic is all we can confirm,
     // and calling it BGZF would hand a truncated file to the block decoder.
     #[case::gzip_magic_but_truncated(&[0x1f, 0x8b, 0x08, 0x04], InputFormat::Gzip)]

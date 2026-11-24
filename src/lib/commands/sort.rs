@@ -30,7 +30,7 @@ use fgumi_bam_io::is_stdout_path;
 use fgumi_sort::{KeyTypesSpec, QuerynameComparator, SortOrder, verify_sort_order};
 
 use log::{debug, info, warn};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -463,16 +463,17 @@ pub struct Sort {
     #[arg(long = "max-temp-files", default_value = "auto", value_parser = parse_max_temp_files)]
     pub max_temp_files: MaxTempFiles,
 
-    /// Write BAM index (.bai) alongside output.
+    /// Write a coordinate index alongside the output: `.bai` for BAM, `.crai`
+    /// for a `*.cram` output (feature `cram`).
     ///
     /// Only valid for coordinate sort, and not with output to stdout (`-` /
     /// `/dev/stdout`): an index needs a seekable file and a sidecar path, so
     /// that combination is rejected rather than silently skipped.
     ///
-    /// The index file will be written to
-    /// `<output>.bai`. Output BGZF compression stays multi-threaded (scales
-    /// with `--threads`); the BAI virtual offsets are recovered from each BGZF
-    /// block as it finalizes, so indexing does not serialize compression.
+    /// The index file will be written to `<output>.bai` (or `<output>.crai`).
+    /// Output compression stays multi-threaded (scales with `--threads`); the
+    /// index is built as blocks or containers are written, so indexing does
+    /// not serialize compression.
     #[arg(long = "write-index", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub write_index: bool,
 
@@ -911,6 +912,9 @@ impl Sort {
     /// exercised through a full run, where a dropped knob is invisible (it does
     /// not change output bytes).
     ///
+    /// `sink` is the staged output's (`StagedSortOutput::sink`), the one place
+    /// the output format and index kind are derived from the destination name.
+    ///
     /// `resolved_tmp_dirs` is the already-resolved temp-dir list (CLI flags with
     /// the `FGUMI_TMP_DIRS` fallback applied); it is baked into the `SortOptions`
     /// verbatim because `add_sort` reads `SortOptions.tmp_dirs` and never consults
@@ -924,7 +928,7 @@ impl Sort {
     /// could disagree with the one used for the startup banner.
     fn build_sort_chain_spec(
         &self,
-        output: &Path,
+        sink: SinkSpec,
         resolved_tmp_dirs: Vec<PathBuf>,
         resolved_max_temp_files: usize,
         read_buffer: usize,
@@ -944,11 +948,6 @@ impl Sort {
         sort_options.max_temp_files = MaxTempFiles::Fixed(resolved_max_temp_files);
 
         let stage_opts = StageOptionsBag { sort: Some(sort_options), ..Default::default() };
-        let sink = if self.write_index {
-            SinkSpec::BamWithIndex(output.to_path_buf())
-        } else {
-            SinkSpec::Bam(output.to_path_buf())
-        };
         ChainSpec {
             stages: vec![Stage::Sort],
             source: SourceSpec::Bam(self.input.clone()),
@@ -1362,8 +1361,9 @@ impl Sort {
             self.write_index,
             "sort",
         )?;
+        staged.validate_input(&self.input)?;
         let spec = self.build_sort_chain_spec(
-            staged.path(),
+            staged.sink(),
             resolved_tmp_dirs,
             max_temp_files,
             read_buffer,
@@ -1466,6 +1466,7 @@ impl Sort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     // Memory-budget helpers moved to `commands::common`; import the `pub(crate)`
     // items these tests exercise that are not re-exported through `super::*`.
     use crate::commands::common::{MIN_MEMORY_PER_THREAD, detect_total_memory, resolve_reserve};
@@ -1744,11 +1745,12 @@ mod tests {
     /// `QueueMemoryOptions::default()` would keep every other test green. Assert on
     /// the built spec directly. `QueueMemoryOptions` has no `PartialEq`, so compare
     /// its fields rather than the whole struct.
-    #[rstest]
-    #[case::plain(false)]
-    #[case::write_index(true)]
-    fn build_sort_chain_spec_wires_flags_into_the_spec(#[case] write_index: bool) {
-        let mut args = vec![
+    ///
+    /// The sink the spec carries is the caller's (`StagedSortOutput::sink`,
+    /// whose flag-to-sink derivation is tested in `staged_output`).
+    #[test]
+    fn build_sort_chain_spec_wires_flags_into_the_spec() {
+        let args = vec![
             "sort",
             "-i",
             "in.bam",
@@ -1761,14 +1763,11 @@ mod tests {
             "-@",
             "3",
         ];
-        if write_index {
-            args.push("--write-index");
-        }
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
 
         let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
         let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
+            SinkSpec::Bam(PathBuf::from("out.bam")),
             Vec::new(),
             resolved_max_temp_files,
             0,
@@ -1804,10 +1803,7 @@ mod tests {
         // --read-streams reaches the chain's BAM source (defaulted to Auto here),
         // proving the field is wired even without an explicit flag.
         assert_eq!(spec.read_streams, sort.read_streams);
-        match (write_index, &spec.sink) {
-            (true, SinkSpec::BamWithIndex(_)) | (false, SinkSpec::Bam(_)) => {}
-            (wi, other) => panic!("write_index={wi} produced the wrong sink: {other:?}"),
-        }
+        assert_eq!(spec.sink.path().map(PathBuf::as_path), Some(Path::new("out.bam")));
     }
 
     /// `--check-crc` / `--no-check-crc` reach `ChainSpec.verify_crc` through the
@@ -1831,7 +1827,7 @@ mod tests {
         args.extend_from_slice(extra);
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
         let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
+            SinkSpec::Bam(PathBuf::from("out.bam")),
             Vec::new(),
             sort.resolved_max_temp_files(fgumi_sort::soft_nofile()),
             0,
@@ -1874,7 +1870,7 @@ mod tests {
         let sort = Sort::try_parse_from(args).expect("parse should succeed");
         let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
         let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
+            SinkSpec::Bam(PathBuf::from("out.bam")),
             Vec::new(),
             resolved_max_temp_files,
             0,
@@ -1906,7 +1902,7 @@ mod tests {
 
         let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
         let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
+            SinkSpec::Bam(PathBuf::from("out.bam")),
             Vec::new(),
             resolved_max_temp_files,
             0,
@@ -1964,12 +1960,46 @@ mod tests {
         .expect("parse should succeed");
         let resolved_max_temp_files = sort.resolved_max_temp_files(fgumi_sort::soft_nofile());
         sort.build_sort_chain_spec(
-            Path::new(output),
+            SinkSpec::Bam(PathBuf::from(output)),
             vec![dir.to_path_buf()],
             resolved_max_temp_files,
             0,
             "fgumi sort (test)",
         )
+    }
+
+    /// A final index must never overwrite the input, including through aliases.
+    #[cfg(feature = "cram")]
+    #[rstest]
+    #[case::direct("out.cram.crai", false)]
+    #[case::hard_link("in.bam", true)]
+    fn sort_rejects_input_aliasing_the_final_crai(#[case] input_name: &str, #[case] link: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join(input_name);
+        let output = dir.path().join("out.cram");
+        fgumi_bam_io::create_raw_bam_writer(&input, &noodles::sam::Header::default(), 1, 1)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let before = std::fs::read(&input).unwrap();
+        if link {
+            std::fs::hard_link(&input, fgumi_bam_io::crai_sidecar_path(&output)).unwrap();
+        }
+        let sort = Sort::try_parse_from([
+            "sort",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--order",
+            "coordinate",
+            "--write-index",
+        ])
+        .unwrap();
+        let err = sort.execute("fgumi sort (test)").unwrap_err();
+        assert!(err.to_string().contains("same file"), "{err:#}");
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert!(!output.exists());
     }
 
     /// A standalone sort (BAM arena front, drain-first) installs `refill-drain`
@@ -2391,7 +2421,7 @@ mod tests {
     fn build_sort_chain_spec_carries_the_read_buffer() {
         let sort = Sort::try_parse_from(["sort", "-i", "-", "-o", "out.bam"]).expect("parse");
         let spec = sort.build_sort_chain_spec(
-            Path::new("out.bam"),
+            SinkSpec::Bam(PathBuf::from("out.bam")),
             Vec::new(),
             sort.resolved_max_temp_files(fgumi_sort::soft_nofile()),
             12345,

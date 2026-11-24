@@ -1,4 +1,6 @@
 pub mod write_bgzf;
+#[cfg(feature = "cram")]
+pub mod write_cram;
 pub mod write_raw;
 
 /// Test doubles shared by the sink tests.

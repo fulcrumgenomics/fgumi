@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 /// Custom styles for CLI help output
 const STYLES: Styles = Styles::styled()
@@ -88,6 +88,18 @@ struct Args {
     /// Enable verbose (debug-level) logging. Equivalent to setting `RUST_LOG=debug`.
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Reference FASTA (with `.fai`) for CRAM input and output, given before
+    /// the subcommand: `fgumi --reference ref.fa sort ...`.
+    ///
+    /// Requires fgumi built with the `cram` feature. A subcommand's own
+    /// reference (`--ref`/`-r`) serves the same purpose, and the two must
+    /// agree; that is checked in every build, even one without `cram`, where
+    /// this flag otherwise has no effect. Without either, CRAM input falls
+    /// back to `FGUMI_REFERENCE`, then htslib's `REF_PATH`/`@SQ UR:` lookup;
+    /// CRAM output to `FGUMI_REFERENCE`, then `REF_PATH`/`REF_CACHE`, else it
+    /// is written reference-free.
+    #[arg(id = "cram_reference", long = "reference", value_name = "FASTA")]
+    reference: Option<std::path::PathBuf>,
     #[clap(subcommand)]
     subcommand: Subcommand,
 }
@@ -199,6 +211,63 @@ impl Subcommand {
             Self::Simulate(cmd) => cmd.execute(command_line),
         }
     }
+
+    /// The reference FASTA a subcommand already takes for its own purposes,
+    /// with the flag that names it, which also serves CRAM input and output.
+    ///
+    /// Only commands that read or write alignment files are listed. Simulation
+    /// commands also use their reference for CRAM output; `fastq-reads` is left
+    /// out because it writes FASTQ rather than alignment records.
+    fn reference(&self) -> Option<(&std::path::Path, &'static str)> {
+        match self {
+            Subcommand::Zipper(c) => Some((&c.reference, "--reference")),
+            Subcommand::Clip(c) => Some((&c.reference, "--reference")),
+            Subcommand::Realign(c) => Some((&c.reference, "--ref")),
+            Subcommand::Review(c) => Some((&c.reference, "--ref")),
+            Subcommand::Filter(c) => c.reference.as_deref().map(|r| (r, "--ref")),
+            Subcommand::RunAll(c) => c.reference.as_deref().map(|r| (r, "--ref")),
+            #[cfg(feature = "consensus")]
+            Subcommand::Simplex(c) => c.reference.as_deref().map(|r| (r, "--ref")),
+            #[cfg(feature = "consensus")]
+            Subcommand::Duplex(c) => c.reference.as_deref().map(|r| (r, "--ref")),
+            #[cfg(feature = "simulate")]
+            Subcommand::Simulate(s) => {
+                use fgumi_lib::commands::simulate::SimulateCommand;
+                match &s.command {
+                    SimulateCommand::MappedReads(c) => {
+                        Some((&c.reference.reference, "--reference"))
+                    }
+                    SimulateCommand::GroupedReads(c) => {
+                        Some((&c.reference.reference, "--reference"))
+                    }
+                    SimulateCommand::ConsensusReads(c) => Some((&c.reference, "--reference")),
+                    SimulateCommand::FastqReads(_)
+                    | SimulateCommand::CorrectReads(_)
+                    | SimulateCommand::Aligner(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The `--threads` value of the innermost subcommand that defines one
+/// (`fgumi sort --threads`, `fgumi compare bams --threads`), if it was given
+/// or has a default.
+///
+/// Read from the parsed matches by id rather than through a typed accessor so
+/// that a new command's `--threads` is picked up without being listed here.
+#[cfg(feature = "cram")]
+fn subcommand_threads(matches: &clap::ArgMatches) -> Option<usize> {
+    let mut sub = matches.subcommand()?.1;
+    loop {
+        match sub.try_get_raw("threads") {
+            // Defined at this level: given (or defaulted), or absent.
+            Ok(raw) => return raw?.next()?.to_str()?.parse().ok(),
+            // Not defined here: look in the nested subcommand, if any.
+            Err(_) => sub = sub.subcommand()?.1,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -208,8 +277,9 @@ fn main() -> Result<()> {
     // Capture full command line BEFORE clap parsing for @PG records
     let command_line = std::env::args().collect::<Vec<_>>().join(" ");
 
-    let args = match Args::try_parse() {
-        Ok(args) => args,
+    // Parsed once; the matches also serve `subcommand_threads`.
+    let matches = match Args::command().try_get_matches() {
+        Ok(matches) => matches,
         Err(e) => {
             // Check if this is an unrecognized subcommand that's behind a feature flag
             if let clap::error::ErrorKind::InvalidSubcommand = e.kind() {
@@ -245,9 +315,60 @@ fn main() -> Result<()> {
             e.exit();
         }
     };
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| {
+        let mut cmd = Args::command();
+        e.format(&mut cmd).exit()
+    });
+
+    // One reference per run: `fgumi --reference` and a subcommand's own
+    // reference (`--ref`/`-r`) both name the assembly the reads are aligned
+    // to, so they must agree.
+    // Checked in every build, not only with `cram`: two references for one
+    // run is a mistake whether or not CRAM is involved.
+    let subcommand_reference = args.subcommand.reference();
+    if let (Some(top), Some((own, flag))) = (&args.reference, subcommand_reference)
+        && !fgumi_lib::commands::common::paths_refer_to_same_file(top, own)
+    {
+        Args::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "two different references: --reference {} and the subcommand's {flag} {}; \
+                     pass one",
+                    top.display(),
+                    own.display()
+                ),
+            )
+            .exit();
+    }
+    #[cfg(feature = "cram")]
+    let reference = args
+        .reference
+        .as_deref()
+        .or(subcommand_reference.map(|(own, _)| own))
+        .map(std::path::Path::to_path_buf);
 
     let default_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
+
+    #[cfg(feature = "cram")]
+    {
+        if let Some(reference) = &reference {
+            fgumi_bam_io::cram_input::set_cram_reference(reference);
+        }
+        // Commands whose CRAM input is decoded outside the pipeline (at the
+        // normalization boundary) size that decode pool by their `--threads`.
+        if let Some(threads) = subcommand_threads(&matches) {
+            fgumi_bam_io::cram_input::set_cram_decode_threads(threads);
+        }
+    }
+    #[cfg(not(feature = "cram"))]
+    if args.reference.is_some() {
+        log::warn!(
+            "--reference has no effect: this fgumi was built without CRAM support \
+             (rebuild with `--features cram`)"
+        );
+    }
 
     info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
 

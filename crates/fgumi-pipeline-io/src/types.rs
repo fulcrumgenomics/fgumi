@@ -8,6 +8,8 @@
 use fgumi_bam_io::pread::RawFrame;
 use fgumi_pipeline_core::{HeapSize, Ordered};
 use fgumi_raw_bam::RawRecord;
+use fgumi_sort::RECORD_LEN_BYTES;
+use std::io;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BamIndexManifest / RecordIndexEntry — inline BAI sidecar metadata.
@@ -303,6 +305,40 @@ impl Ordered for RecordBatch {
     fn ordinal(&self) -> u64 {
         self.batch_serial
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Framed record walking.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Call `f` on each body of `framed` (whole `[u32 LE len][body]` records back
+/// to back) and return the record count.
+///
+/// # Errors
+///
+/// `framed` ends inside a record or its length prefix, or `f` fails.
+pub(crate) fn walk_framed_records(
+    framed: &[u8],
+    mut f: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut span = framed;
+    let mut records = 0u64;
+    while let Some((prefix, rest)) = span.split_first_chunk::<RECORD_LEN_BYTES>() {
+        let len = u32::from_le_bytes(*prefix) as usize;
+        let (body, rest) = rest.split_at_checked(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "batch segment ends inside a record")
+        })?;
+        f(body)?;
+        records += 1;
+        span = rest;
+    }
+    if !span.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch segment ends inside a record prefix",
+        ));
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
