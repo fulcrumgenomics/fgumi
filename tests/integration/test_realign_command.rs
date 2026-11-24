@@ -178,6 +178,97 @@ fn output_records(path: &Path) -> usize {
     reader.records().collect::<std::io::Result<Vec<_>>>().expect("written records decode").len()
 }
 
+/// [`UNMAPPED_ALIGNER`], but emitting each two templates in swapped order: the
+/// shape of an aligner run without an option that keeps input order.
+const REORDERING_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\"; print \"@HD\", \"VN:1.6\"; \
+    print \"@SQ\", \"SN:chr1\", \"LN:10000\" } \
+    NR % 4 == 1 { name = substr($1, 2) } NR % 4 == 2 { seq = $0 } \
+    NR % 4 == 0 { n++; rec[n % 4] = name \"\\t\" (n % 2 ? 77 : 141) \"\\t*\\t0\\t0\\t*\\t*\\t0\\t0\\t\" seq \"\\t\" $0; \
+      if (n % 4 == 0) { print rec[3]; print rec[0]; print rec[1]; print rec[2] } }' \
+    # {ref}";
+
+/// A broken stdin pipe must fail promptly even when stdout stays open and the
+/// pipeline's deadlock monitor is disabled. Without the failure-only drain
+/// deadline this waits for the stand-in aligner's full lifetime.
+#[rstest::rstest]
+#[case::input_exhausted(1)]
+#[case::input_remaining(50_000)]
+fn realign_bounds_a_broken_pipe_drain(#[case] templates: usize) {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = if templates == 1 {
+        // Keep the final flush larger than the OS pipe but smaller than the
+        // FASTQ writer buffer. Even if the writer runs before stdin closes,
+        // the flush cannot succeed by fitting entirely into the pipe.
+        let mut records = [
+            consensus_read("cons:0", flags::FIRST_SEGMENT, Some("chr1:1-100:+")),
+            consensus_read("cons:0", flags::LAST_SEGMENT, None),
+        ];
+        let sequence = vec![b'A'; 131_072];
+        let qualities = vec![30; 131_072];
+        for record in &mut records {
+            record.set_sequence_and_qualities(&sequence, &qualities);
+        }
+        let input = dir.join("consensus.bam");
+        write_bam(&input, &create_minimal_header("chr1", 10_000), &records);
+        input
+    } else {
+        write_consensus(dir, templates, |_| (Some("chr1:1-100:+"), None))
+    };
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let start = std::time::Instant::now();
+    let result = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", "exec 0<&-; exec sleep 8 # {ref}"])
+        .args(["--deadlock-timeout", "0", "--threads", "2"])
+        .output()
+        .expect("spawn fgumi realign");
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "unaligned input must fail:\n{stderr}");
+    assert!(elapsed < std::time::Duration::from_secs(5), "drain took {elapsed:?}:\n{stderr}");
+    assert!(stderr.contains("Broken pipe"), "the writer failure must be reported:\n{stderr}");
+}
+
+/// When the aligner returns templates out of input order, the run fails with
+/// the reader's error naming the order violation. The reader's rejection closes
+/// the aligner's stdout, so the aligner then dies of SIGPIPE and the stdin
+/// writer of a broken pipe; neither may mask the cause. The input is large
+/// enough that the writer is still feeding the aligner when the reader fails.
+#[test]
+fn realign_reports_out_of_order_aligner_output_not_the_broken_pipe() {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = write_consensus(dir, 50_000, |_| (Some("chr1:1-100:+"), None));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let result = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", REORDERING_ALIGNER])
+        .output()
+        .expect("spawn fgumi realign");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "realign must fail on reordered output:\n{stderr}");
+    // The final error, from the pipeline's step-failure line to the end. Only
+    // its first line is checked: the aligner's stderr tail may follow it, and
+    // that may legitimately mention a broken pipe.
+    let start = stderr
+        .find("Error: Pipeline::run")
+        .unwrap_or_else(|| panic!("no final pipeline error:\n{stderr}"));
+    let error = &stderr[start..];
+    let error_head = error.lines().next().unwrap_or_default();
+    assert!(
+        error_head.contains("queryname mismatch") && error_head.contains("out of input order"),
+        "the reported error must name the order violation:\n{stderr}"
+    );
+    assert!(
+        !error_head.contains("aligner subprocess failed")
+            && !error_head.to_ascii_lowercase().contains("broken pipe"),
+        "neither the aligner's exit nor a broken pipe may be reported as the cause:\n{stderr}"
+    );
+}
+
 /// A window-grouped input whose consensus ends lack `rw` where the raw reads
 /// never mapped (here: every R2, and one whole pair) realigns; those ends are
 /// counted as without a window.
