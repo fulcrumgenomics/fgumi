@@ -18,7 +18,7 @@
 //! - Remove: Exclude duplicate reads from output
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::batch_weight::BatchWeight;
@@ -1263,6 +1263,199 @@ pub(crate) fn process_position_group(
 // Command definition
 //////////////////////////////////////////////////////////////////////////////
 
+/// Dedup-stage options: every `fgumi dedup` flag except the input/output paths and
+/// the engine options (threading, compression, scheduler, queue memory).
+///
+/// Flattened into [`MarkDuplicates`], so the standalone command's flags are exactly
+/// these, and carries `#[fgumi_cli_macros::multi_options]` so `fgumi runall` re-exposes
+/// each one as a prefixed `--dedup::<flag>` via the generated `MultiDedupOptions`
+/// companion. This is also what the chain builder's dedup stage reads (the
+/// `StageOptionsBag::dedup` slot), so the standalone command and the fused `runall`
+/// stage configure dedup from one definition.
+#[fgumi_cli_macros::multi_options("dedup", "Dedup Options")]
+#[derive(Debug, Clone, clap::Args)]
+// Each bool is an independent CLI toggle (--remove-duplicates, --include-non-pf-reads,
+// --no-umi, --include-unmapped, --include-invalid-umis); a state machine or enum would
+// obscure, not clarify, the flat argument surface clap expects.
+#[allow(clippy::struct_excessive_bools)]
+pub struct DedupOptions {
+    /// Path to write deduplication metrics
+    #[arg(short = 'm', long = "metrics")]
+    pub metrics: Option<PathBuf>,
+
+    /// Sample name written to the `sample` column of the `--metrics` output.
+    /// Defaults to the comma-joined unique `@RG SM:` values from the input
+    /// header (empty when none are present).
+    #[arg(long = "sample")]
+    pub sample: Option<String>,
+
+    /// Path to write family size histogram
+    #[arg(short = 'H', long = "family-size-histogram")]
+    pub family_size_histogram: Option<PathBuf>,
+
+    /// Path to write the sampled duplication ladder: per-library cumulative
+    /// duplicate fraction vs. templates seen (in coordinate order),
+    /// snapshotted every `--ladder-interval` templates. Because templates are
+    /// counted in coordinate order, this shows how the duplicate rate varies
+    /// along the genome; it is not a saturation curve. Off by default (no
+    /// recorder is built, so no added work).
+    #[arg(long = "duplication-ladder")]
+    pub duplication_ladder: Option<PathBuf>,
+
+    /// Snapshot interval (in per-library cumulative templates) for
+    /// `--duplication-ladder`. Only meaningful when `--duplication-ladder`
+    /// is set.
+    #[arg(long = "ladder-interval", default_value = "1000000", value_parser = clap::value_parser!(u64).range(1..))]
+    pub ladder_interval: u64,
+
+    /// Remove duplicates instead of just marking them
+    #[arg(short = 'r', long = "remove-duplicates", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub remove_duplicates: bool,
+
+    /// Minimum mapping quality for a read to be included
+    #[arg(short = 'q', long = "min-map-q", default_value_t = 0)]
+    pub min_map_q: u8,
+
+    /// Include reads flagged as not passing QC
+    #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub include_non_pf_reads: bool,
+
+    /// Verify the input is in strict template-coordinate sort order.
+    ///
+    /// Off by default. Each record is checked against the exact ordering of
+    /// `fgumi sort --order template-coordinate` as it is read; the run aborts with
+    /// a non-zero exit on the first out-of-order record. This composes with
+    /// `--output` (a precondition gate, not a check-only mode): output is written
+    /// normally when the input is correctly ordered, and may be left partial if
+    /// the check fails mid-stream. The check is intentionally STRICTER than
+    /// deduplication requires (dedup only needs a template's mates adjacent by
+    /// position), which is why it is opt-in; for a standalone check with no output
+    /// use `fgumi sort --verify`.
+    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub verify: bool,
+
+    /// Emit templates with no mapped read (both mates unmapped) untouched instead of
+    /// discarding them. Such templates carry no alignment coordinate and no duplicate
+    /// signal; passing them through preserves a complete record set (like Picard
+    /// `MarkDuplicates`). Truncated/corrupt records are still dropped.
+    #[arg(long = "include-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub include_unmapped: bool,
+
+    /// Emit templates whose UMI is missing (no RX tag), contains an N, or is shorter than
+    /// `--min-umi-length` untouched instead of discarding them. Such templates have no
+    /// usable UMI to group on; passing them through (never marked, never MI-tagged, kept
+    /// under `--remove-duplicates`) preserves a complete record set, as needed when dedup
+    /// replaces Picard `MarkDuplicates`. Only templates rejected solely for a UMI reason
+    /// are passed through; every other filter still applies. No effect with `--no-umi`.
+    #[arg(long = "include-invalid-umis", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub include_invalid_umis: bool,
+
+    /// UMI grouping strategy
+    #[arg(short = 's', long = "strategy", value_enum, default_value = "adjacency")]
+    pub strategy: Strategy,
+
+    /// Maximum edit distance for UMI grouping
+    #[arg(short = 'e', long = "edits", default_value = "1")]
+    pub edits: u32,
+
+    /// Minimum UMI length in bases (at least 1). Shorter UMIs are discarded; the rest are
+    /// truncated to the shortest UMI they are compared with. Dashes and other non-base
+    /// characters are not counted, and are ignored when comparing UMIs. With `identity` or
+    /// `--edits 0`, UMIs are first split by their first `--min-umi-length` bases and each split
+    /// is truncated separately (as in `fgumi group`).
+    #[arg(short = 'l', long = "min-umi-length")]
+    pub min_umi_length: Option<usize>,
+
+    /// When to match UMIs through the N-gram/BK-tree index instead of comparing every
+    /// pair. Either `always`, `never`, or a minimum number of distinct UMIs at a
+    /// position. The number is a minimum, not a switch, so `0` gates the index on for
+    /// every group exactly as `always` does; only `always` additionally errors when the
+    /// strategy can never index. The index is a pure optimization: it never changes
+    /// which reads group together. Edit and Adjacency index only at --edits 1, and Edit
+    /// floors a numeric threshold at its own measured crossover (200 distinct UMIs);
+    /// Paired indexes at every --edits value.
+    #[arg(long = "index-threshold", default_value = "100")]
+    pub index_threshold: IndexThreshold,
+
+    /// Skip UMI-based grouping; group by template coordinate. Forces identity strategy
+    /// and ignores any existing UMI tags. Templates are NOT split by strand of origin in
+    /// this mode, so F1R2 and F2R1 at the same coordinates are one molecule, matching
+    /// Picard `MarkDuplicates`. Library and cell barcode still partition the grouping key
+    /// (see "Grouping key" in `fgumi dedup --help`).
+    #[arg(long = "no-umi", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
+    pub no_umi: bool,
+}
+
+impl DedupOptions {
+    /// The strategy and edit distance dedup actually runs with: `--no-umi` forces
+    /// the identity strategy, and identity forces zero edits.
+    #[must_use]
+    pub(crate) fn effective_strategy_and_edits(&self) -> (Strategy, u32) {
+        crate::commands::group::resolve_strategy_and_edits(self.no_umi, self.strategy, self.edits)
+    }
+
+    /// Reject flag combinations that cannot run, before any reader or writer opens:
+    /// a bad `--min-umi-length`, `--no-umi` with the paired strategy, and an
+    /// `--index-threshold always` the resolved strategy can never honor. Warns
+    /// (without failing) when `--include-invalid-umis` is combined with `--no-umi`,
+    /// where it has nothing to pass through. Shared by `fgumi dedup` and the `runall`
+    /// dedup stage so the two accept exactly the same flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the offending flag(s).
+    pub(crate) fn validate_combinations(&self) -> Result<()> {
+        crate::commands::group::validate_umi_grouping_flags(
+            self.no_umi,
+            self.strategy,
+            self.edits,
+            self.min_umi_length,
+            self.index_threshold,
+        )?;
+        // --no-umi never checks the UMI, so nothing is rejected for a UMI reason and
+        // --include-invalid-umis has nothing to pass through. Harmless, so warn rather
+        // than reject (a pipeline may set both unconditionally).
+        if self.no_umi && self.include_invalid_umis {
+            log::warn!(
+                "--include-invalid-umis has no effect with --no-umi, which skips the UMI checks"
+            );
+        }
+        Ok(())
+    }
+
+    /// The output files the dedup stage writes besides the BAM, each with the flag
+    /// that names it in standalone `fgumi dedup` and in `runall`: the one list both
+    /// commands' output-collision checks read. Unset outputs are omitted.
+    #[must_use]
+    pub(crate) fn metrics_outputs(&self) -> Vec<DedupOutput<'_>> {
+        [
+            (&self.metrics, "--metrics", "--dedup::metrics"),
+            (
+                &self.family_size_histogram,
+                "--family-size-histogram",
+                "--dedup::family-size-histogram",
+            ),
+            (&self.duplication_ladder, "--duplication-ladder", "--dedup::duplication-ladder"),
+        ]
+        .into_iter()
+        .filter_map(|(path, standalone_flag, runall_flag)| {
+            path.as_deref().map(|path| DedupOutput { path, standalone_flag, runall_flag })
+        })
+        .collect()
+    }
+}
+
+/// One of the files the dedup stage writes besides the BAM (see
+/// [`DedupOptions::metrics_outputs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DedupOutput<'a> {
+    pub(crate) path: &'a Path,
+    /// The flag naming it in standalone `fgumi dedup` (`--metrics`).
+    pub(crate) standalone_flag: &'static str,
+    /// The flag naming it in `runall` (`--dedup::metrics`).
+    pub(crate) runall_flag: &'static str,
+}
+
 /// UMI-aware duplicate marking command.
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -1426,101 +1619,14 @@ fixed-RAM host, prefer one of:
 pathological high-coverage position group is still processed whole.
 "#
 )]
-// Each bool is an independent CLI toggle (--remove-duplicates, --include-non-pf-reads,
-// --no-umi, --include-unmapped, --include-invalid-umis); a state machine or enum would
-// obscure, not clarify, the flat argument surface clap expects.
-#[allow(clippy::struct_excessive_bools)]
 pub struct MarkDuplicates {
     /// Input and output BAM files
     #[command(flatten)]
     pub io: BamIoOptions,
 
-    /// Path to write deduplication metrics
-    #[arg(short = 'm', long = "metrics")]
-    pub metrics: Option<PathBuf>,
-
-    /// Sample name written to the `sample` column of the `--metrics` output.
-    /// Defaults to the comma-joined unique `@RG SM:` values from the input
-    /// header (empty when none are present).
-    #[arg(long = "sample")]
-    pub sample: Option<String>,
-
-    /// Path to write family size histogram
-    #[arg(short = 'H', long = "family-size-histogram")]
-    pub family_size_histogram: Option<PathBuf>,
-
-    /// Path to write the sampled duplication ladder: per-library cumulative
-    /// duplicate fraction vs. templates seen (in coordinate order),
-    /// snapshotted every `--ladder-interval` templates. Because templates are
-    /// counted in coordinate order, this shows how the duplicate rate varies
-    /// along the genome; it is not a saturation curve. Off by default (no
-    /// recorder is built, so no added work).
-    #[arg(long = "duplication-ladder")]
-    pub duplication_ladder: Option<PathBuf>,
-
-    /// Snapshot interval (in per-library cumulative templates) for
-    /// `--duplication-ladder`. Only meaningful when `--duplication-ladder`
-    /// is set.
-    #[arg(long = "ladder-interval", default_value = "1000000", value_parser = clap::value_parser!(u64).range(1..))]
-    pub ladder_interval: u64,
-
-    /// Remove duplicates instead of just marking them
-    #[arg(short = 'r', long = "remove-duplicates", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub remove_duplicates: bool,
-
-    /// Minimum mapping quality for a read to be included
-    #[arg(short = 'q', long = "min-map-q", default_value_t = 0)]
-    pub min_map_q: u8,
-
-    /// Include reads flagged as not passing QC
-    #[arg(short = 'n', long = "include-non-pf-reads", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub include_non_pf_reads: bool,
-
-    /// Verify the input is in strict template-coordinate sort order.
-    ///
-    /// Off by default. Each record is checked against the exact ordering of
-    /// `fgumi sort --order template-coordinate` as it is read; the run aborts with
-    /// a non-zero exit on the first out-of-order record. This composes with
-    /// `--output` (a precondition gate, not a check-only mode): output is written
-    /// normally when the input is correctly ordered, and may be left partial if
-    /// the check fails mid-stream. The check is intentionally STRICTER than
-    /// deduplication requires (dedup only needs a template's mates adjacent by
-    /// position), which is why it is opt-in; for a standalone check with no output
-    /// use `fgumi sort --verify`.
-    #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub verify: bool,
-
-    /// Emit templates with no mapped read (both mates unmapped) untouched instead of
-    /// discarding them. Such templates carry no alignment coordinate and no duplicate
-    /// signal; passing them through preserves a complete record set (like Picard
-    /// `MarkDuplicates`). Truncated/corrupt records are still dropped.
-    #[arg(long = "include-unmapped", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub include_unmapped: bool,
-
-    /// Emit templates whose UMI is missing (no RX tag), contains an N, or is shorter than
-    /// `--min-umi-length` untouched instead of discarding them. Such templates have no
-    /// usable UMI to group on; passing them through (never marked, never MI-tagged, kept
-    /// under `--remove-duplicates`) preserves a complete record set, as needed when dedup
-    /// replaces Picard `MarkDuplicates`. Only templates rejected solely for a UMI reason
-    /// are passed through; every other filter still applies. No effect with `--no-umi`.
-    #[arg(long = "include-invalid-umis", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub include_invalid_umis: bool,
-
-    /// UMI grouping strategy
-    #[arg(short = 's', long = "strategy", value_enum, default_value = "adjacency")]
-    pub strategy: Strategy,
-
-    /// Maximum edit distance for UMI grouping
-    #[arg(short = 'e', long = "edits", default_value = "1")]
-    pub edits: u32,
-
-    /// Minimum UMI length in bases (at least 1). Shorter UMIs are discarded; the rest are
-    /// truncated to the shortest UMI they are compared with. Dashes and other non-base
-    /// characters are not counted, and are ignored when comparing UMIs. With `identity` or
-    /// `--edits 0`, UMIs are first split by their first `--min-umi-length` bases and each split
-    /// is truncated separately (as in `fgumi group`).
-    #[arg(short = 'l', long = "min-umi-length")]
-    pub min_umi_length: Option<usize>,
+    /// Dedup options.
+    #[command(flatten)]
+    pub opts: DedupOptions,
 
     /// Threading options for parallel processing
     #[command(flatten)]
@@ -1529,25 +1635,6 @@ pub struct MarkDuplicates {
     /// Compression options for output BAM
     #[command(flatten)]
     pub compression: CompressionOptions,
-
-    /// When to match UMIs through the N-gram/BK-tree index instead of comparing every
-    /// pair. Either `always`, `never`, or a minimum number of distinct UMIs at a
-    /// position. The number is a minimum, not a switch, so `0` gates the index on for
-    /// every group exactly as `always` does; only `always` additionally errors when the
-    /// strategy can never index. The index is a pure optimization: it never changes
-    /// which reads group together. Edit and Adjacency index only at --edits 1, and Edit
-    /// floors a numeric threshold at its own measured crossover (200 distinct UMIs);
-    /// Paired indexes at every --edits value.
-    #[arg(long = "index-threshold", default_value = "100")]
-    pub index_threshold: IndexThreshold,
-
-    /// Skip UMI-based grouping; group by template coordinate. Forces identity strategy
-    /// and ignores any existing UMI tags. Templates are NOT split by strand of origin in
-    /// this mode, so F1R2 and F2R1 at the same coordinates are one molecule, matching
-    /// Picard `MarkDuplicates`. Library and cell barcode still partition the grouping key
-    /// (see "Grouping key" in --help).
-    #[arg(long = "no-umi", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
-    pub no_umi: bool,
 
     /// Scheduler and pipeline options
     #[command(flatten)]
@@ -1566,53 +1653,12 @@ impl Command for MarkDuplicates {
         // Reject two outputs resolving to one destination before any writer opens.
         let mut outputs: Vec<(&std::path::Path, &str)> =
             vec![(self.io.output.as_path(), "--output")];
-        if let Some(path) = &self.metrics {
-            outputs.push((path.as_path(), "--metrics"));
-        }
-        if let Some(path) = &self.family_size_histogram {
-            outputs.push((path.as_path(), "--family-size-histogram"));
-        }
-        if let Some(path) = &self.duplication_ladder {
-            outputs.push((path.as_path(), "--duplication-ladder"));
-        }
+        outputs.extend(self.opts.metrics_outputs().iter().map(|o| (o.path, o.standalone_flag)));
         crate::commands::common::reject_output_collisions(&outputs)?;
 
-        // Validate --min-umi-length (at least 1, and not with the paired strategy)
-        crate::umi::validate_min_umi_length(self.min_umi_length, self.strategy)?;
-
-        // Validate --no-umi is not used with paired strategy
-        if self.no_umi && matches!(self.strategy, Strategy::Paired) {
-            bail!("--no-umi cannot be used with --strategy paired");
-        }
-
-        // --no-umi never checks the UMI, so nothing is rejected for a UMI reason and
-        // --include-invalid-umis has nothing to pass through. Harmless, so warn rather
-        // than reject (a pipeline may set both unconditionally).
-        if self.no_umi && self.include_invalid_umis {
-            log::warn!(
-                "--include-invalid-umis has no effect with --no-umi, which skips the UMI checks"
-            );
-        }
-
-        // Resolve the effective strategy/edits (identity forces edits=0; `--no-umi`
-        // forces identity) purely to validate `--index-threshold` below. The
-        // override notice itself is logged once, by `add_dedup`.
-        let (effective_strategy, no_umi_edits_override) =
-            if self.no_umi { (Strategy::Identity, true) } else { (self.strategy, false) };
-        let effective_edits =
-            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
-                0
-            } else {
-                self.edits
-            };
-
-        // `--index-threshold always` asserts that indexing will happen; reject it when
-        // the resolved strategy/edits can never index rather than ignoring the flag.
-        crate::commands::common::validate_index_threshold(
-            self.index_threshold,
-            effective_strategy,
-            effective_edits,
-        )?;
+        // Flag combinations that cannot run (min-umi-length, --no-umi with paired,
+        // --index-threshold always); shared with runall's dedup stage.
+        self.opts.validate_combinations()?;
 
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;
@@ -1650,7 +1696,7 @@ impl MarkDuplicates {
         // memory-debug knobs, so unlike group there is no warn block to add here.)
         self.io.log_effective_check_crc();
 
-        let stage_opts = StageOptionsBag { dedup: Some(self.clone()), ..Default::default() };
+        let stage_opts = StageOptionsBag { dedup: Some(self.opts.clone()), ..Default::default() };
         let ctx = SingleStageContext {
             io: &self.io,
             threading: &self.threading,
@@ -1831,6 +1877,40 @@ impl crate::pipeline::core::item::Ordered for BatchedProcessedDedupGroups {
 
 #[cfg(test)]
 mod tests {
+    /// `metrics_outputs` lists each set output with its standalone and runall
+    /// flag, in a fixed order, and omits the unset ones.
+    #[rstest::rstest]
+    #[case::all(
+        &["--metrics", "m.txt", "--family-size-histogram", "h.txt", "--duplication-ladder", "l.txt"],
+        &[
+            ("m.txt", "--metrics", "--dedup::metrics"),
+            ("h.txt", "--family-size-histogram", "--dedup::family-size-histogram"),
+            ("l.txt", "--duplication-ladder", "--dedup::duplication-ladder"),
+        ]
+    )]
+    #[case::ladder_only(
+        &["--duplication-ladder", "l.txt"],
+        &[("l.txt", "--duplication-ladder", "--dedup::duplication-ladder")]
+    )]
+    #[case::none(&[], &[])]
+    fn metrics_outputs_lists_the_set_outputs(
+        #[case] flags: &[&str],
+        #[case] expected: &[(&str, &str, &str)],
+    ) {
+        use clap::Parser as _;
+        let cmd = MarkDuplicates::try_parse_from(
+            ["dedup", "-i", "in.bam", "-o", "out.bam"].into_iter().chain(flags.iter().copied()),
+        )
+        .unwrap();
+        let got: Vec<(&str, &str, &str)> = cmd
+            .opts
+            .metrics_outputs()
+            .iter()
+            .map(|o| (o.path.to_str().unwrap(), o.standalone_flag, o.runall_flag))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
     use super::*;
     use crate::template_filter::filter_template;
     use crate::umi::IdentityUmiAssigner;
@@ -1845,7 +1925,7 @@ mod tests {
         args.extend_from_slice(extra);
         let cmd = MarkDuplicates::try_parse_from(args).expect("parses");
 
-        assert_eq!(cmd.min_map_q, expected);
+        assert_eq!(cmd.opts.min_map_q, expected);
     }
     use crate::umi::truncate_umis;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};

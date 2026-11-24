@@ -1,6 +1,6 @@
 # Running Pipelines
 
-Most fgumi work is a *pipeline*: extract UMIs, align, sort, group, call consensus, filter. You can run each stage as its own command — writing a BAM to disk between every step — or fuse a run of stages into a single streaming process with `fgumi runall`.
+Most fgumi work is a *pipeline*: extract UMIs, align, sort, group, call consensus, filter — or, when you want duplicate-marked reads rather than consensus reads, extract, align, sort, dedup. You can run each stage as its own command — writing a BAM to disk between every step — or fuse a run of stages into a single streaming process with `fgumi runall`.
 
 ## When to use `runall`
 
@@ -8,17 +8,20 @@ Most fgumi work is a *pipeline*: extract UMIs, align, sort, group, call consensu
 
 `runall` streams records directly from one stage to the next, so every intermediate BAM a sequential run would write is elided. Its output is **record-identical** to running the equivalent standalone commands in turn — the same aligned records in the same order, and the same `@HD` `SO`/`GO`/`SS`, `@SQ`, and `@RG` header fields. The output is *not* byte-for-byte identical: the fused chain writes a single `@PG` record where the staged run writes one per command, and the `@HD` `VN` and `@CO` fields are not compared. Same algorithm, just without the round-trips to disk.
 
-Reach for individual commands when you want to inspect or reuse an intermediate BAM (for example, to try several filter settings against one consensus BAM), or when you need a per-stage metrics file that `runall` does not emit (see [Caveats](#caveats)).
+Reach for individual commands when you want to inspect or reuse an intermediate BAM (for example, to try several filter settings against one consensus BAM), or when you need a metrics file that `runall` does not emit, such as `simplex-metrics` or `duplex-metrics` (see [Caveats](#caveats)).
 
 `runall` processes one input. If you have several BAMs from separate sequencing runs, combine them first with `fgumi merge --order template-coordinate`, then point `runall` at the merged file with `--start-from group`. Use `--start-from sort` only for raw aligned input that still needs sorting.
 
 ## The stage model
 
-`runall` understands a fixed, linearly ordered set of stages:
+`runall` understands a fixed, linearly ordered set of stages, with two alternative branches after `sort`:
 
 ```text
 extract < correct < align < zipper < sort < group < consensus < filter
+                                            sort < dedup
 ```
+
+A chain ends at either `dedup` or the group → consensus → filter branch, never both.
 
 | Stage | What it does | Reads |
 |-------|--------------|-------|
@@ -30,12 +33,13 @@ extract < correct < align < zipper < sort < group < consensus < filter
 | `group` | Group reads by UMI, assigning MI tags | template-coordinate-sorted BAM (`--input`) |
 | `consensus` | Call consensus (algorithm set by `--consensus`) | grouped, MI-tagged BAM (`--input`) |
 | `filter` | Filter/mask consensus reads | consensus BAM (`--input`) |
+| `dedup` | Mark (or remove) duplicates by UMI, instead of group → consensus → filter | template-coordinate-sorted BAM (`--input`) |
 
 `--realign` adds a `realign` stage and a coordinate `sort` after the last of these; see [Re-aligning consensus reads](#re-aligning-consensus-reads-with---realign).
 
 ## Selecting the slice to run
 
-Pick the slice with `--start-from` and `--stop-after` (both required). `--start-from` declares the state of your input; `--stop-after` names the last stage to run. They must satisfy `start-from ≤ stop-after` in the order above, and `--stop-after` cannot be `align` — it is start-only, so the valid stop stages are `extract`, `correct`, `zipper`, `sort`, `group`, `consensus`, and `filter`. Both are required because `runall` cannot infer either one: the same BAM could be valid input to several stages, and you may want to stop anywhere along the chain.
+Pick the slice with `--start-from` and `--stop-after` (both required). `--start-from` declares the state of your input; `--stop-after` names the last stage to run. They must satisfy `start-from ≤ stop-after` in the order above, and `--stop-after` cannot be `align` — it is start-only, so the valid stop stages are `extract`, `correct`, `zipper`, `sort`, `group`, `consensus`, `filter`, and `dedup`. `--stop-after dedup` accepts `--start-from` `extract`, `correct`, `align`, `zipper`, `sort`, or `dedup`; combining `dedup` with `group`, `consensus`, or `filter` in either flag is an error. Both are required because `runall` cannot infer either one: the same BAM could be valid input to several stages, and you may want to stop anywhere along the chain.
 
 > **Important — match the input to `--start-from`.** `runall` validates the stage *range* but **cannot** verify that your input file is actually in the state `--start-from` claims. If you pass, for example, a raw unsorted BAM to `--start-from group`, the run may fail in a later stage or silently produce incorrect output, depending on what the mismatched input trips. Confirm your input matches the declared start stage (the [stage model](#the-stage-model) table lists what each stage expects).
 
@@ -51,7 +55,7 @@ The algorithm is chosen by `--consensus`, **not** by the stage name. `--stop-aft
 
 ### Automatically inserted stages
 
-You only name the *first* and *last* stages; `runall` fills in any stages in between that the chain requires. The one case that surprises people: the `align` and `zipper` stages emit reads in queryname order, but `group` needs template-coordinate order, so `runall` always inserts a `sort` step between them. For example, `--start-from extract --stop-after consensus` expands to extract → align → sort → group → consensus, and `--start-from zipper --stop-after group` expands to zipper → sort → group. You never write the inserted `sort` yourself, but you can still tune it with `--sort::*` flags.
+You only name the *first* and *last* stages; `runall` fills in any stages in between that the chain requires. The one case that surprises people: the `align` and `zipper` stages emit reads in queryname order, but `group` needs template-coordinate order, so `runall` always inserts a `sort` step between them. For example, `--start-from extract --stop-after consensus` expands to extract → align → sort → group → consensus, `--start-from zipper --stop-after group` expands to zipper → sort → group, and `--start-from align --stop-after dedup` expands to align → sort → dedup (`dedup` needs template-coordinate order too). You never write the inserted `sort` yourself, but you can still tune it with `--sort::*` flags.
 
 ## Per-stage options
 
@@ -63,6 +67,7 @@ Tune any stage with prefixed flags of the form `--<stage>::<flag>`. These mirror
 | `fgumi group --strategy adjacency` | `--group::strategy adjacency` |
 | `fgumi duplex --min-reads 1,1,0` | `--duplex::min-reads 1,1,0` |
 | `fgumi extract --read-structures +T +T` | `--extract::read-structures +T +T` |
+| `fgumi dedup --remove-duplicates` | `--dedup::remove-duplicates` |
 
 Cross-cutting options stay at the top level: `--threads`, `--compression-level`, `--max-memory`, `--ref`, `--rejects`, `--stats`, `--methylation-mode`. Run `fgumi runall --help` for the full, grouped list.
 
@@ -118,6 +123,22 @@ fgumi runall \
   --threads 8
 ```
 
+**FASTQ → duplicate-marked BAM**, for UMI data where consensus calling is not wanted (for example as a UMI-aware replacement for Picard `MarkDuplicates`; choose an aligner that suits the data, such as a splice-aware one through `--aligner::command` for RNA-seq). `runall` inserts `align` and `sort`, and the sorted reads stream straight into `dedup`:
+
+```bash
+fgumi runall \
+  --start-from extract --stop-after dedup \
+  --extract::inputs R1.fq.gz R2.fq.gz \
+  --extract::read-structures 8M+T +T \
+  --extract::sample MySample --extract::library MyLibrary \
+  --ref ref.fa --aligner::preset bwa-mem3 --output deduped.bam \
+  --dedup::strategy adjacency \
+  --dedup::metrics deduped.metrics.txt \
+  --threads 8
+```
+
+`--stop-after dedup` produces the same BAM as `fgumi dedup` on the sorted reads, and its metrics outputs (`--dedup::metrics`, `--dedup::family-size-histogram`, `--dedup::duplication-ladder`) are the same files. Add `--dedup::remove-duplicates` to drop duplicates instead of marking them. To deduplicate a BAM that is already template-coordinate sorted, use `--start-from dedup --stop-after dedup`.
+
 ## Re-aligning consensus reads with `--realign`
 
 Consensus reads come out unmapped. `--realign` aligns them at the end of the same run: it appends a `realign` stage and a coordinate `sort` after the last stage, so a run ending at `consensus` or `filter` writes aligned, coordinate-sorted consensus reads (it is rejected for any other `--stop-after`). For example, `--start-from group --stop-after filter --realign` runs group → consensus → filter → realign → sort (coordinate), and `--start-from filter --stop-after filter --realign` filters an existing consensus BAM, then re-aligns and sorts the reads it keeps. Filter behaves as it does without `--realign`: it keeps the same reads, and `--filter::rejects` and `--filter::stats` are written as usual (the rejects are unaligned consensus reads).
@@ -137,7 +158,7 @@ Consensus reads come out unmapped. `--realign` aligns them at the end of the sam
 |---|----------|---------------------|
 | Intermediate BAMs | none (in-memory) | written to disk between stages |
 | Output | record-identical to the command chain (header `@PG`/`@HD VN` differ) | the same records |
-| Per-stage metrics/histograms | not emitted | available (e.g. `fgumi group --metrics`) |
+| Per-stage metrics/histograms | the stages' own, opt-in (`--correct::metrics`, `--group::metrics`, `--dedup::metrics`, or `--all-metrics`); not `simplex-metrics`/`duplex-metrics` | available (e.g. `fgumi group --metrics`) |
 | Inspect/reuse an intermediate | no | yes — the BAM is on disk |
 | Best for | production runs, multi-stage chains | single stages, debugging, metrics, experimentation |
 
@@ -145,7 +166,8 @@ For the recommended end-to-end pipelines and parameter choices, see [Best Practi
 
 ## Caveats
 
-- **No per-stage metrics.** Fused chains do not emit the metrics or histograms that standalone stages do (`fgumi group --metrics`, `simplex-metrics`, `duplex-metrics`). Run the standalone stage when you need them — see [Working with Metrics](working-with-metrics.md).
+- **Only the stages' own metrics.** A fused chain writes the metrics a stage exposes as a `--<stage>::` option (`--correct::metrics`, `--group::metrics`, dedup's `--dedup::metrics`, `--dedup::family-size-histogram` and `--dedup::duplication-ladder`), each only when asked for. `--all-metrics` derives the standard metrics and histogram paths, but dedup's duplication ladder remains opt-in via `--dedup::duplication-ladder`. It does not run the separate QC commands `simplex-metrics` and `duplex-metrics`; run those on the output when you need them — see [Working with Metrics](working-with-metrics.md).
+- **`dedup` replaces the consensus branch.** A chain ends at either `dedup` or group → consensus → filter, so `--start-from group|consensus|filter --stop-after dedup` and `--start-from dedup --stop-after group|consensus|filter` are rejected, as is `--realign` with `--stop-after dedup` (there are no consensus reads to re-align). Dedup is configured only by `--dedup::*`: `--group::*` options do not apply to it, and `--consensus` is ignored (with a warning).
 - **No `--stop-after align`.** Raw aligner output before the zipper-merge has lost every original tag, so the earliest stop after `--start-from align` is `zipper`.
 - **Input state is not validated** against `--start-from` — see the warning under [Selecting the slice to run](#selecting-the-slice-to-run).
 - **UMI rejects need `--correct::rejects` when `correct` is fused mid-chain.** On a chain that runs past `correct`, pass `--correct::rejects <path>` to capture correct's UMI rejects. The top-level `--rejects` does not capture them there: on a chain that reaches a consensus stage it is that stage's rejects file, and on one that does not it is unused (the run warns). On a `correct` self-pair (`--stop-after correct`), the top-level `--rejects` takes precedence over `--correct::rejects`.

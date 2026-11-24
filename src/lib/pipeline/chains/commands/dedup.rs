@@ -95,9 +95,32 @@ pub(crate) struct DedupFinalizeHook {
     /// Library index resolved from the input header, needed for the per-library
     /// metrics rows.
     pub(crate) library_index: LibraryIndex,
-    /// Metrics `sample` value (resolved from `--sample` or the read groups).
+    /// Metrics `sample` value (resolved from `--sample` or the read groups of
+    /// the header the chain was built with).
     pub(crate) sample: String,
+    /// On a fused align chain, resolve the library index and sample from the
+    /// same completed header used to decode the per-record library IDs.
+    pub(crate) runtime_header: Option<RuntimeHeader>,
     pub(crate) timer: OperationTimer,
+}
+
+/// The run-time output header a [`DedupFinalizeHook`] consults to resolve
+/// library IDs in the same order as decode and to resolve the metrics sample.
+pub(crate) struct RuntimeHeader {
+    pub(crate) handle: crate::pipeline::core::header::HeaderHandle,
+    /// `--dedup::sample`, which wins over the read groups.
+    pub(crate) sample_override: Option<String>,
+}
+
+impl RuntimeHeader {
+    /// The metrics `sample` from the resolved run-time header (`fallback` if
+    /// it never resolved).
+    fn resolve_sample(&self, fallback: String) -> String {
+        let Some(Ok(header)) = self.handle.try_get() else {
+            return fallback;
+        };
+        crate::commands::dedup::resolve_sample(header, self.sample_override.as_deref())
+    }
 }
 
 impl FinalizeHook for DedupFinalizeHook {
@@ -109,8 +132,17 @@ impl FinalizeHook for DedupFinalizeHook {
             duplication_ladder,
             library_index,
             sample,
+            runtime_header,
             timer,
         } = *self;
+        let library_index = match runtime_header.as_ref().and_then(|h| h.handle.try_get()) {
+            Some(header) => LibraryIndex::from_header(header?)?,
+            None => library_index,
+        };
+        let sample = match &runtime_header {
+            Some(runtime) => runtime.resolve_sample(sample),
+            None => sample,
+        };
 
         // Reduce per-thread accumulators into per-library counts + a grand total.
         let mut final_counts_by_library: AHashMap<u16, DedupCounts> = AHashMap::new();
@@ -424,6 +456,43 @@ mod tests {
     use super::*;
     use crate::template::Template;
     use fgumi_umi::MoleculeId;
+
+    /// A header with one `@RG` per `(id, sample)`.
+    fn header_with_read_groups(groups: &[(&str, &str)]) -> noodles::sam::Header {
+        use noodles::sam::header::record::value::map::read_group::tag;
+        use noodles::sam::header::record::value::{Map, map::ReadGroup};
+        groups
+            .iter()
+            .fold(noodles::sam::Header::builder(), |b, (id, sample)| {
+                let rg = Map::<ReadGroup>::builder()
+                    .insert(tag::SAMPLE, *sample)
+                    .build()
+                    .expect("read group");
+                b.add_read_group(*id, rg)
+            })
+            .build()
+    }
+
+    /// The metrics sample comes from the run-time header once it resolves
+    /// (`--dedup::sample` still wins), and from the build-time fallback while
+    /// it has not.
+    #[rstest::rstest]
+    #[case::resolved_runtime_header(true, None, "S2")]
+    #[case::override_wins(true, Some("mine"), "mine")]
+    #[case::unresolved_keeps_fallback(false, None, "fallback")]
+    fn runtime_header_resolves_the_sample(
+        #[case] resolved: bool,
+        #[case] sample_override: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let handle = crate::pipeline::core::header::HeaderHandle::new();
+        if resolved {
+            handle.set(header_with_read_groups(&[("rg2", "S2")])).expect("set once");
+        }
+        let runtime =
+            RuntimeHeader { handle, sample_override: sample_override.map(str::to_string) };
+        assert_eq!(runtime.resolve_sample("fallback".to_string()), expected);
+    }
 
     /// Build a [`ProcessedDedupGroup`] carrying `distinct_mi_count` and the
     /// given local-id templates (each as a `MoleculeId::Single`).

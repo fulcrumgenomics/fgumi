@@ -302,6 +302,7 @@ impl Step for DecodeRecords {
 ///   `... → DecodeRecords → GroupByPosition`.
 pub struct DecodeFromRecords {
     key_config: GroupKeyConfig,
+    runtime_header: Option<crate::pipeline::core::header::HeaderHandle>,
     held: HeldSlot<Unpushed<DecodedRecordBatch>>,
     output_byte_limit: u64,
     /// See `DecodeRecords::closed_batches`.
@@ -311,7 +312,24 @@ pub struct DecodeFromRecords {
 impl DecodeFromRecords {
     #[must_use]
     pub fn new(key_config: GroupKeyConfig, output_byte_limit: u64) -> Self {
-        Self { key_config, held: HeldSlot::new(), output_byte_limit, closed_batches: false }
+        Self {
+            key_config,
+            runtime_header: None,
+            held: HeldSlot::new(),
+            output_byte_limit,
+            closed_batches: false,
+        }
+    }
+
+    /// Resolve the library index from the aligner's completed header before
+    /// decoding any records. All worker copies use the same header/ID ordering.
+    #[must_use]
+    pub fn with_runtime_header(
+        mut self,
+        header: crate::pipeline::core::header::HeaderHandle,
+    ) -> Self {
+        self.runtime_header = Some(header);
+        self
     }
 
     /// See `DecodeRecords::with_closed_batches`.
@@ -326,6 +344,7 @@ impl Clone for DecodeFromRecords {
     fn clone(&self) -> Self {
         Self {
             key_config: self.key_config.clone(),
+            runtime_header: self.runtime_header.clone(),
             held: HeldSlot::new(),
             output_byte_limit: self.output_byte_limit,
             closed_batches: self.closed_batches,
@@ -356,6 +375,21 @@ impl Step for DecodeFromRecords {
                     return Ok(StepOutcome::Contention);
                 }
             }
+        }
+
+        if let Some(handle) = &self.runtime_header {
+            let Some(header) = handle.try_get() else {
+                if ctx.input.is_drained() {
+                    return Err(io::Error::other(
+                        "decode input drained before its header resolved",
+                    ));
+                }
+                return Ok(StepOutcome::NoProgress);
+            };
+            self.key_config.library_index = Arc::new(
+                fgumi_bam_io::LibraryIndex::from_header(header?).map_err(io::Error::other)?,
+            );
+            self.runtime_header = None;
         }
 
         let Some(batch) = ctx.input.pop() else {
@@ -429,6 +463,35 @@ mod tests {
         assert_eq!(p.name, "DecodeRecords");
         assert_eq!(p.kind, StepKind::Parallel);
         assert_eq!(p.branch_ordering, vec![BranchOrdering::ByItemOrdinal]);
+    }
+
+    #[rstest::rstest]
+    #[case::waiting(false, false, None)]
+    #[case::drained_without_header(true, false, Some("decode input drained"))]
+    #[case::poisoned_header(false, true, Some("aligner failed"))]
+    fn from_records_runtime_header_readiness(
+        #[case] drained: bool,
+        #[case] poisoned: bool,
+        #[case] error: Option<&str>,
+    ) {
+        let handle = crate::pipeline::core::header::HeaderHandle::new();
+        let mut step = DecodeFromRecords::new(GroupKeyConfig::default(), 1024)
+            .with_runtime_header(handle.clone());
+        let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
+        if drained {
+            probe.close_input();
+        }
+        if poisoned {
+            handle.poison(io::Error::other("aligner failed")).unwrap();
+        }
+        if let Some(message) = error {
+            assert!(probe.try_run(&mut step).unwrap_err().to_string().contains(message));
+        } else {
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
+            handle.set(noodles::sam::Header::default()).unwrap();
+            probe.close_input();
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Finished);
+        }
     }
 
     #[test]
