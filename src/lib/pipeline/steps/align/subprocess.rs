@@ -1714,7 +1714,29 @@ impl SubprocessAlignStep {
         let reader_result = reader_handle.join();
 
         // Wait for the subprocess to exit. `AlignerProcess::wait` consumes it.
-        let aligner_result = self.aligner.take().expect("aligner is Some until finalize").wait();
+        //
+        // If the reader failed (an error, or a panic), nothing reads the
+        // aligner's output any more and the aligner may not exit on its own:
+        // tear its process group down (bounded) instead of waiting without
+        // bound. An aligner that had already exited keeps its own exit status,
+        // reported first as below; one this kill ended reports only a signal,
+        // which would mask the reader's diagnostic, so its status is dropped.
+        let mut aligner = self.aligner.take().expect("aligner is Some until finalize");
+        let aligner_result = if matches!(reader_result, Ok(Ok(()))) {
+            aligner.wait()
+        } else {
+            let exited_on_its_own = aligner.has_exited();
+            match (aligner.kill(), exited_on_its_own) {
+                (true, true) => aligner.wait(),
+                (true, false) => {
+                    let _ = aligner.wait();
+                    Ok(())
+                }
+                // Not confirmed gone: skip the unbounded `wait()`, as `Drop`
+                // does; `AlignerProcess::drop` skips the stderr join too.
+                (false, _) => Ok(()),
+            }
+        };
 
         let reader_result = match reader_result {
             Ok(result) => result,
@@ -1782,9 +1804,10 @@ impl Drop for SubprocessAlignStep {
     /// `PipelineSignal::cancel` fires, workers exit at their next
     /// loop iteration, `Pipeline::run` returns, the step's
     /// `Arc` refcount hits zero, and `Drop` runs. `aligner.kill()`
-    /// here SIGKILLs bwa; its pipes close immediately so the reader
-    /// thread's stdout `read` unblocks within microseconds and the
-    /// daemon cascade completes.
+    /// here kills the aligner's whole process group (SIGTERM, then
+    /// SIGKILL after a short grace), not just its `/bin/bash -c`
+    /// wrapper, so every process holding the pipes exits, the reader
+    /// thread's stdout `read` unblocks, and the daemon cascade completes.
     ///
     /// Order is **disconnect-channels-then-kill-then-join** — the
     /// opposite of the clean `finalize` path. Two distinct blocking points
@@ -1829,7 +1852,8 @@ impl Drop for SubprocessAlignStep {
             // Bounded teardown: only issue the unbounded `wait()` once the child
             // has actually been reaped. If `kill()` timed out (stuck child, e.g.
             // uninterruptible I/O), calling `wait()` would block teardown
-            // forever — defeating the 1s kill deadline. In that case we skip
+            // forever — defeating kill()'s bound (the SIGTERM grace plus the
+            // reap deadline, about 1.5 s). In that case we skip
             // `wait()` and let `AlignerProcess::Drop` (itself bounded) clean up.
             if aligner.kill() {
                 let _ = aligner.wait();
@@ -2697,7 +2721,9 @@ mod tests {
             let _step = SubprocessAlignStep::new(cfg, "sleep 60").expect("spawn sleep");
         } // Drop runs here.
         let elapsed = start.elapsed();
-        // AlignerProcess::kill waits up to 1s; thread joins should
+        // AlignerProcess::kill waits up to the SIGTERM grace plus the reap
+        // deadline (about 1.5 s, or about 2.5 s if a group member outlives the
+        // SIGKILL); thread joins should
         // be near-instant once channels close. Generous bound.
         assert!(
             elapsed < std::time::Duration::from_secs(5),
