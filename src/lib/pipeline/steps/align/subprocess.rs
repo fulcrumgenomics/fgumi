@@ -8,9 +8,10 @@
 //! call removed: instead of merging on the dispatching worker, `try_run` now
 //! pushes the raw `ZipperBatch` to an
 //! `OrderedBytesSingle<ZipperBatch>` output. The reader still releases the
-//! in-flight gate at token consumption, so the memory profile is unchanged. The
-//! writer/reader threads, the byte-budget gate, header handling, and
-//! finalize/Drop teardown are unchanged from the pre-split step.
+//! in-flight gate at token consumption, preserving the unmapped-backlog budget.
+//! The reader thread, byte-budget gate, header handling, and finalize/Drop
+//! teardown are unchanged from the pre-split step. The writer also holds one
+//! encoded input batch and sends its token before writing it (see below).
 //!
 //! ## Shape
 //!
@@ -53,13 +54,18 @@
 //! mapped, unmapped }`, and sends that on `out_chan`.
 //! `try_run` pops `ZipperBatch`es and pushes them to the shared merge step.
 //!
+//! The writer sends a batch's token **before** writing any of the batch to
+//! the aligner's stdin, so the reader can drain the aligner's stdout while the
+//! batch is still being written. Sending it after the write deadlocks an
+//! aligner that writes output as it reads input (see `writer_loop`).
+//!
 //! This relies on the aligner preserving input record order (bwa-mem
 //! and bwa-mem3 do this when `-K` chunk size is set, which our presets
 //! require). A per-template queryname-equality check — always on, not a
 //! debug assertion — rejects out-of-order aligner output with a loud
 //! error rather than silently mismerging tags onto the wrong reads.
 
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::process::ChildStdout;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
@@ -122,10 +128,14 @@ const IN_CHAN_DEPTH: usize = 2;
 /// one downstream; backpressure cascades back when downstream stalls.
 const OUT_CHAN_DEPTH: usize = 2;
 
-/// FASTQ-writer [`BufWriter`] capacity. 1 MiB: bigger than the OS pipe buffer
-/// (~64 KiB) so we amortize `write` syscalls, but not so large that we delay the
-/// aligner's first chunk perceptibly.
-const FASTQ_WRITER_BUF_BYTES: usize = 1 << 20;
+/// Initial capacity of the writer thread's per-batch encode buffer. It holds
+/// one batch's FASTQ or SAM text at a time and is reused, keeping the capacity of the
+/// largest batch so far; each batch is written to the aligner's stdin in one
+/// `write_all`, so the pipe sees large writes. Its size is bounded by the
+/// upstream batch's template count (a pipeline setting) times the read length,
+/// not by the input's size. It is not counted in the in-flight budget, which
+/// bounds the unmapped templates held for pairing.
+const STDIN_ENCODE_BUF_BYTES: usize = 1 << 20;
 
 /// Stdout-side [`BufReader`] capacity for the aligner pipe. 64 KiB
 /// pairs with one OS pipe buffer's worth of pending bytes.
@@ -222,8 +232,9 @@ pub(crate) struct SubprocessConfig {
 /// Metadata carried alongside an in-flight unmapped batch from the
 /// stdin-writer to the stdout-reader.
 ///
-/// The writer pushes one `BatchToken` after writing all FASTQ records
-/// for an input batch. The reader pops one token, reads exactly
+/// The writer pushes one `BatchToken` per input batch after encoding the
+/// batch's FASTQ or SAM and before writing any of it to the aligner's stdin (see
+/// [`writer_loop`] for why that order matters). The reader pops one token, reads exactly
 /// `n_templates` templates from the aligner's stdout, and emits one
 /// `ZipperBatch { mapped, unmapped, serial }`.
 struct BatchToken {
@@ -484,7 +495,7 @@ impl SubprocessAlignStep {
         // The `token_chan` itself stays unbounded: a bounded *channel*
         // would deadlock the writer once full (writer blocks on
         // `token_tx.send(...)`, never observes `in_rx` disconnection,
-        // never drops its BufWriter, the aligner never sees stdin EOF,
+        // never drops the aligner's stdin, the aligner never sees EOF,
         // never flushes). Instead the writer→reader unmapped backlog is
         // bounded by *bytes* via `InFlightGate`: the writer reserves
         // before feeding a batch and the reader releases when it consumes
@@ -578,11 +589,19 @@ impl SubprocessAlignStep {
 /// `BatchToken` per batch to `token_tx` so the reader can pair alignments back
 /// by count.
 ///
+/// Each batch is encoded into a reused buffer first, then its token is sent,
+/// and only then is the buffer written to the aligner. The reader therefore
+/// holds a batch's token before any of its reads reach the aligner, and can
+/// drain the aligner's stdout while the batch is still being written. Writing
+/// first and sending the token after would hang an aligner that writes output
+/// as it reads input: once its stdout pipe filled, it would stop reading,
+/// the writer would block on its stdin before sending the token, and the
+/// reader, waiting for that token, would never drain its stdout.
+///
 /// Lifecycle:
-/// - When `in_rx` closes (sender dropped), flush + drop the
-///   [`BufWriter`] so the aligner sees stdin EOF. `token_tx` drops
-///   at the same time, signalling EOF to the reader after the last
-///   token is consumed.
+/// - When `in_rx` closes (sender dropped), drop stdin so the aligner sees
+///   EOF. `token_tx` drops at the same time, signalling EOF to the reader
+///   after the last token is consumed.
 /// - On any IO error, record it in `shared.error_slot` and exit.
 ///   Channels' drop closes them; reader / `try_run` notice via
 ///   `Disconnected`.
@@ -593,22 +612,21 @@ impl SubprocessAlignStep {
 fn writer_loop(
     in_rx: Receiver<BamTemplateBatch>,
     token_tx: Sender<BatchToken>,
-    aligner_stdin: std::process::ChildStdin,
+    mut aligner_stdin: std::process::ChildStdin,
     shared: Arc<SharedState>,
     gate: &InFlightGate,
     input_format: UnalignedReadFormat,
     require_complete_pairs: bool,
 ) -> io::Result<()> {
-    let mut writer = BufWriter::with_capacity(FASTQ_WRITER_BUF_BYTES, aligner_stdin);
+    let mut encoded: Vec<u8> = Vec::with_capacity(STDIN_ENCODE_BUF_BYTES);
     let mut fastq_buffers = FastqRecordBuffers::with_capacity(512);
     let mut next_serial: u64 = 0;
 
     if input_format == UnalignedReadFormat::Sam
-        && let Err(e) = writer.write_all(UNALIGNED_SAM_HEADER)
+        && let Err(e) = aligner_stdin.write_all(UNALIGNED_SAM_HEADER)
     {
         let msg = format!("align-and-merge writer: SAM header: {e}");
-        shared.record_error(io::Error::other(msg.clone()));
-        return Err(io::Error::other(msg));
+        return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
     }
 
     while let Ok(batch) = in_rx.recv() {
@@ -620,16 +638,8 @@ fn writer_loop(
         // Errs when the aligner reads past the read-ahead ceiling without
         // emitting; nothing of this batch has been written then.
         let batch_bytes = batch.heap_size() as u64;
-        // Before acquiring, hand the aligner everything already written: if the
-        // gate makes the writer wait, the tail of the previous batch must not
-        // sit in the FASTQ buffer, since an aligner that needs it to finish a
-        // chunk would emit nothing, so the gate would wait out its grace and
-        // grow for no reason (or fail at the ceiling). Flushing every batch
-        // costs at most one extra write per batch.
-        if let Err(e) = writer.flush() {
-            let msg = format!("align-and-merge writer: flush: {e}");
-            return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
-        }
+        // The previous batch's write_all completed before reaching this gate,
+        // so no buffered tail is withheld while waiting for aligner output.
         match gate.acquire(batch_bytes) {
             Ok(true) => {}
             Ok(false) => return Ok(()),
@@ -650,6 +660,7 @@ fn writer_loop(
         // fully-filtered template here means the user passed a
         // re-aligned BAM by mistake. Error out loudly with the
         // queryname so the misconfiguration is obvious.
+        encoded.clear();
         let mut n_templates = 0usize;
         for template in batch.templates() {
             if require_complete_pairs {
@@ -677,7 +688,7 @@ fn writer_loop(
                 }
                 let result = match input_format {
                     UnalignedReadFormat::Fastq => write_fastq_record(
-                        &mut writer,
+                        &mut encoded,
                         record,
                         flags,
                         /* no_suffix */ true,
@@ -685,7 +696,7 @@ fn writer_loop(
                         /* umi_header */ None,
                     ),
                     UnalignedReadFormat::Sam => {
-                        write_unaligned_sam_record(&mut writer, record, flags, &mut fastq_buffers)
+                        write_unaligned_sam_record(&mut encoded, record, flags, &mut fastq_buffers)
                     }
                 };
                 if let Err(e) = result {
@@ -739,12 +750,14 @@ fn writer_loop(
             n_templates += 1;
         }
 
-        let token = BatchToken { unmapped: batch, n_templates, serial: next_serial };
+        let serial = next_serial;
+        let token = BatchToken { unmapped: batch, n_templates, serial };
         next_serial = next_serial.wrapping_add(1);
 
-        // Send is bounded; block until the reader (or backpressure)
-        // makes room. If the reader has died, the channel disconnect
-        // surfaces here and we exit.
+        // The token goes to the reader before the batch goes to the aligner
+        // (see the function docs). The send never blocks (the channel is
+        // unbounded). If the reader has died, the channel disconnect surfaces
+        // here and we exit.
         if token_tx.send(token).is_err() {
             // Reader thread is gone — we cannot make progress. Its own error
             // (if any) is the root cause, but it records that only after
@@ -757,18 +770,18 @@ fn writer_loop(
             ));
             return Ok(());
         }
+
+        if let Err(e) = aligner_stdin.write_all(&encoded) {
+            // Record and return the SAME detailed message so `finalize`'s join
+            // path and the error_slot fallback both see the actionable text.
+            let msg = format!("align-and-merge writer: writing batch {serial}: {e}");
+            return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
+        }
     }
 
-    // in_rx closed → upstream is done. Flush + drop the writer to
-    // close the aligner's stdin → aligner flushes its output.
-    if let Err(e) = writer.flush() {
-        // Record and return the SAME detailed message so `finalize`'s join path
-        // and the error_slot fallback both see the actionable text (matching the
-        // write_fastq_record / no-primary paths above).
-        let msg = format!("align-and-merge writer: flush: {e}");
-        return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
-    }
-    drop(writer);
+    // in_rx closed → upstream is done. Every batch was written in full above,
+    // so dropping stdin closes the aligner's input → aligner flushes its output.
+    drop(aligner_stdin);
     Ok(())
 }
 
@@ -1627,7 +1640,7 @@ impl SubprocessAlignStep {
         // A finished reader does not imply a finished writer or child. In the
         // cascade case, keep dispatching until step 1 reports the reader's root
         // cause or the expired cascade; never enter finalize's blocking waits.
-        // Check the slot AFTER writer completion so its final flush cannot race
+        // Check the slot AFTER writer completion so its final write cannot race
         // this gate and publish a cascade after we have committed to finalize.
         if !self.held_out.is_held()
             && reader_finished
@@ -1798,9 +1811,12 @@ impl Drop for SubprocessAlignStep {
     ///   accepting batches before drain fired.
     /// * Writer blocked on `in_rx.recv()` → unblocked by dropping
     ///   `in_tx`.
-    /// * Writer blocked on `token_tx.send(...)` → unblocked by the
-    ///   reader exiting (drops its `token_rx`). The reader exiting
-    ///   is gated on the two cases above.
+    /// * Writer blocked in `aligner_stdin.write_all(...)` → unblocked
+    ///   by killing the subprocess (its stdin closes; step 3).
+    /// * Writer blocked in `gate.acquire(...)` → unblocked by the
+    ///   reader exiting (its consumer-gone guard releases the gate).
+    ///   The reader exiting is gated on the cases above. (`token_tx` is
+    ///   unbounded, so its `send` never blocks.)
     ///
     /// Steps:
     /// 1. Drop `in_tx` (unblocks writer's `recv`).
@@ -2242,10 +2258,13 @@ mod tests {
         #[case] cascade: bool,
         #[case] expected_kind: io::ErrorKind,
         #[case] expected_message: &str,
+        #[values(UnalignedReadFormat::Fastq, UnalignedReadFormat::Sam)]
+        input_format: UnalignedReadFormat,
     ) {
         use crate::pipeline::core::testing::StepProbe;
 
         let mut cfg = make_test_cfg();
+        cfg.input_format = input_format;
         cfg.startup_timeout = Some(Duration::ZERO);
         let mut step = SubprocessAlignStep::new(cfg, "exec sleep 8").expect("spawn sleep");
         if cascade {
@@ -2300,7 +2319,8 @@ mod tests {
     }
 
     /// An exited aligner's status and stderr must beat a cascade, even after
-    /// its deadline, when the writer failed before sending any batch token.
+    /// its deadline, when the writer fails after publishing a batch token.
+    /// Matching output keeps the reader successful for both input formats.
     #[rstest::rstest]
     #[case::before_deadline(0)]
     #[case::after_deadline(1100)]
@@ -2314,9 +2334,15 @@ mod tests {
         let mut cfg = make_test_cfg();
         cfg.input_format = input_format;
         cfg.require_complete_pairs = true;
+        let read_header =
+            if input_format == UnalignedReadFormat::Sam { "IFS= read -r header; " } else { "" };
         let mut step = SubprocessAlignStep::new(
             cfg,
-            "exec 0<&-; printf '@HD\\tVN:1.6\\n'; printf 'startup-failed\\n' >&2; exit 42",
+            &format!(
+                "{read_header}exec 0<&-; printf '@HD\\tVN:1.6\\n'; \
+                 printf 'early_exit\\t77\\t*\\t0\\t0\\t*\\t*\\t0\\t0\\tA\\tI\\nearly_exit\\t141\\t*\\t0\\t0\\t*\\t*\\t0\\t0\\tA\\tI\\n'; \
+                 printf 'startup-failed\\n' >&2; exit 42"
+            ),
         )
         .expect("spawn failing aligner");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2328,10 +2354,10 @@ mod tests {
             assert!(Instant::now() < deadline, "the failing aligner and stderr relay must finish");
             thread::sleep(Duration::from_millis(1));
         }
-        // Force a write before token publication rather than fitting into the
-        // buffer and letting a token turn the reader's clean EOF into an error.
-        let sequence = vec![b'A'; FASTQ_WRITER_BUF_BYTES];
-        let qualities = vec![b'I'; FASTQ_WRITER_BUF_BYTES];
+        // A nontrivial batch fails to write, but any published token has
+        // matching output, so only the writer cascade and aligner exit compete.
+        let sequence = vec![b'A'; STDIN_ENCODE_BUF_BYTES];
+        let qualities = vec![b'I'; STDIN_ENCODE_BUF_BYTES];
         let records = [FIRST_SEGMENT, LAST_SEGMENT]
             .into_iter()
             .map(|mate| {
@@ -2356,7 +2382,7 @@ mod tests {
             assert!(Instant::now() < deadline, "I/O threads must finish after the failed write");
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(step.shared.take_root_cause().is_none(), "no token reached the reader");
+        assert!(step.shared.take_root_cause().is_none(), "matching output leaves no reader root");
         step.shared.error_slot.lock().cascade.as_mut().expect("writer cascade").0 = Instant::now()
             .checked_sub(Duration::from_millis(elapsed_ms))
             .expect("backdate cascade");
@@ -2388,9 +2414,15 @@ mod tests {
         let mut cfg = make_test_cfg();
         cfg.input_format = input_format;
         cfg.require_complete_pairs = true;
+        let read_header =
+            if input_format == UnalignedReadFormat::Sam { "IFS= read -r header; " } else { "" };
         let mut step = SubprocessAlignStep::new(
             cfg,
-            "exec 0<&-; printf '@HD\\tVN:1.6\\n'; exec 1>&-; exec sleep 4",
+            &format!(
+                "{read_header}exec 0<&-; printf '@HD\\tVN:1.6\\n'; \
+                 printf 'closed_pipes\\t77\\t*\\t0\\t0\\t*\\t*\\t0\\t0\\tA\\tI\\nclosed_pipes\\t141\\t*\\t0\\t0\\t*\\t*\\t0\\t0\\tA\\tI\\n'; \
+                 exec 1>&-; exec sleep 4"
+            ),
         )
         .expect("spawn live closed-pipe aligner");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2398,8 +2430,8 @@ mod tests {
             assert!(Instant::now() < deadline, "the aligner must close stdin and write its header");
             thread::sleep(Duration::from_millis(1));
         }
-        let sequence = vec![b'A'; FASTQ_WRITER_BUF_BYTES];
-        let qualities = vec![b'I'; FASTQ_WRITER_BUF_BYTES];
+        let sequence = vec![b'A'; STDIN_ENCODE_BUF_BYTES];
+        let qualities = vec![b'I'; STDIN_ENCODE_BUF_BYTES];
         let records = [FIRST_SEGMENT, LAST_SEGMENT]
             .into_iter()
             .map(|mate| {
@@ -2426,7 +2458,7 @@ mod tests {
             assert!(Instant::now() < deadline, "I/O threads must finish while the child is live");
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(step.shared.take_root_cause().is_none(), "the real write failed before a token");
+        assert!(step.shared.take_root_cause().is_none(), "matching output leaves no reader root");
         step.shared.error_slot.lock().cascade.as_mut().expect("writer cascade").0 =
             Instant::now().checked_sub(CASCADE_DRAIN_TIMEOUT).expect("backdate cascade");
         if reader_root {
@@ -2537,15 +2569,15 @@ mod tests {
         }
     }
 
-    /// A flush before gate acquisition keeps a broken pipe as a cascade, so a
-    /// reader error published afterward still wins. FASTQ fails flushing batch
-    /// one before batch two; SAM fails flushing its buffered header before batch one.
+    /// A closed stdin fails after token publication for FASTQ, or before it
+    /// for the SAM header. Either failure is a cascade, so a later reader root wins.
     #[rstest::rstest]
-    #[case::fastq(UnalignedReadFormat::Fastq, 1)]
-    #[case::sam(UnalignedReadFormat::Sam, 0)]
-    fn writer_pre_batch_flush_keeps_a_broken_pipe_as_a_cascade(
+    #[case::fastq(UnalignedReadFormat::Fastq, 1, "writing batch 0:")]
+    #[case::sam(UnalignedReadFormat::Sam, 0, "SAM header:")]
+    fn writer_pipe_failure_keeps_a_broken_pipe_as_a_cascade(
         #[case] input_format: UnalignedReadFormat,
         #[case] expected_tokens: usize,
+        #[case] expected_context: &str,
         #[values(false, true)] require_complete_pairs: bool,
     ) {
         use std::io::BufRead;
@@ -2586,10 +2618,14 @@ mod tests {
         drop(stdout);
         drop(aligner);
 
-        let writer_error = result.expect_err("the pre-batch flush must fail");
+        let writer_error = result.expect_err("the closed stdin must fail");
         assert_eq!(writer_error.kind(), io::ErrorKind::BrokenPipe);
-        assert!(writer_error.to_string().starts_with("align-and-merge writer: flush:"));
-        assert_eq!(token_rx.try_iter().count(), expected_tokens, "the intended flush must fail");
+        assert!(writer_error.to_string().contains(expected_context), "{writer_error}");
+        assert_eq!(
+            token_rx.try_iter().count(),
+            expected_tokens,
+            "failure occurs on the intended side of publication"
+        );
         assert!(cascade_recorded, "the broken pipe must not occupy the root slot");
         assert_eq!(reported.kind(), io::ErrorKind::InvalidData);
         assert_eq!(reported.to_string(), "reader rejected output");
@@ -2788,7 +2824,12 @@ mod tests {
         let template = Template::from_records(records).unwrap();
         let (in_tx, in_rx) = sync_channel(1);
         let (token_tx, token_rx) = channel();
-        in_tx.send(BamTemplateBatch::new(0, vec![template])).unwrap();
+        in_tx
+            .send(BamTemplateBatch::new(
+                0,
+                vec![make_paired_primary_template(b"valid_prefix"), template],
+            ))
+            .unwrap();
         drop(in_tx);
         let shared = Arc::new(SharedState::new());
         let gate =
@@ -2806,7 +2847,7 @@ mod tests {
         assert_eq!(result.is_ok(), accepted);
         let captured = std::fs::read_to_string(captured).unwrap();
         if accepted {
-            assert_eq!(token_rx.recv().unwrap().n_templates, 1);
+            assert_eq!(token_rx.recv().unwrap().n_templates, 2);
             assert!(captured.contains("pair_check"));
         } else {
             let error = result.unwrap_err().to_string();
@@ -2818,7 +2859,7 @@ mod tests {
             assert_eq!(
                 captured,
                 std::str::from_utf8(UNALIGNED_SAM_HEADER).unwrap(),
-                "no record of the incomplete template may reach STAR"
+                "no record of a batch containing an incomplete template may reach STAR"
             );
             assert!(token_rx.recv().is_err());
         }
@@ -2953,16 +2994,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out_path).expect("read capture"), expected);
     }
 
-    /// Before waiting on the gate the writer flushes what it has buffered, also
-    /// once the gate is stalled and the next batch would pass the ceiling: the
-    /// aligner may need that tail to finish a chunk, and holding it back would
-    /// fail the run at the ceiling. Batch A fills an empty gate; B waits out
+    /// Each batch reaches the aligner before waiting on the next gate acquire,
+    /// including when the next batch would pass the ceiling: withholding a tail
+    /// needed to finish a chunk would fail the run at the ceiling. Batch A fills
+    /// an empty gate; B waits out
     /// the grace and grows the gate to exactly A + B (stalled); C would pass
     /// that ceiling, so the writer waits again, and fails once no output has
     /// been consumed for the ceiling timeout. During that wait B must already
     /// have reached the aligner, and the failure is recorded for `try_run`.
-    #[test]
-    fn writer_loop_flushes_before_waiting_at_the_ceiling() {
+    #[rstest::rstest]
+    #[case::fastq(UnalignedReadFormat::Fastq, "@read_B\n")]
+    #[case::sam(UnalignedReadFormat::Sam, "read_B\t")]
+    fn writer_loop_writes_before_waiting_at_the_ceiling(
+        #[case] input_format: UnalignedReadFormat,
+        #[case] expected_record: &str,
+    ) {
         use std::process::{Command, Stdio};
         use std::sync::mpsc::sync_channel;
         use std::time::{Duration, Instant};
@@ -3004,7 +3050,7 @@ mod tests {
                 cat_stdin,
                 writer_shared,
                 &writer_gate,
-                UnalignedReadFormat::Fastq,
+                input_format,
                 false,
             )
         });
@@ -3017,8 +3063,13 @@ mod tests {
         }
         std::thread::sleep(grace / 4);
         let seen = std::fs::read_to_string(&captured).expect("read capture");
+        assert_eq!(
+            seen.matches("@HD").count(),
+            usize::from(input_format == UnalignedReadFormat::Sam),
+            "the SAM header is written exactly once, never once per batch"
+        );
         assert!(
-            seen.contains("@read_B"),
+            seen.contains(expected_record),
             "batch B must reach the aligner before the writer waits at the ceiling; saw:\n{seen}"
         );
 
@@ -3027,6 +3078,122 @@ mod tests {
         let recorded = shared.take_error().expect("the ceiling error is recorded for try_run");
         assert!(recorded.to_string().contains("read ahead more than"), "recorded: {recorded}");
         cat.wait().expect("cat exits");
+    }
+
+    /// The writer sends a batch's token before writing the batch to the
+    /// aligner: with an aligner that never reads its stdin (so the write
+    /// blocks once the pipe fills), the reader still receives the token. Sending
+    /// it after the write would leave the reader waiting for a token while the
+    /// aligner waits for its stdout to be drained.
+    #[rstest::rstest]
+    #[case::fastq(UnalignedReadFormat::Fastq)]
+    #[case::sam(UnalignedReadFormat::Sam)]
+    fn writer_loop_sends_the_token_before_writing_the_batch(
+        #[case] input_format: UnalignedReadFormat,
+        #[values(false, true)] require_complete_pairs: bool,
+    ) {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        // Never reads stdin, so a write larger than the pipe buffer blocks.
+        let mut sleeper = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = sleeper.stdin.take().expect("sleep stdin");
+
+        // Well over the old 1 MiB stdin buffer plus a pipe buffer of FASTQ.
+        let n_templates = 60_000;
+        let templates = (0..n_templates)
+            .map(|i| make_paired_primary_template(format!("read_{i}").as_bytes()))
+            .collect();
+        let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(1);
+        in_tx.send(BamTemplateBatch::new(0, templates)).expect("send batch");
+        drop(in_tx);
+        let (token_tx, token_rx) = channel::<BatchToken>();
+        let shared = Arc::new(SharedState::new());
+        let gate = Arc::new(InFlightGate::new(
+            u64::MAX,
+            u64::MAX,
+            IN_FLIGHT_STALL_GRACE,
+            IN_FLIGHT_CEILING_TIMEOUT,
+        ));
+        let writer = {
+            let (shared, gate) = (Arc::clone(&shared), Arc::clone(&gate));
+            std::thread::spawn(move || {
+                writer_loop(
+                    in_rx,
+                    token_tx,
+                    stdin,
+                    shared,
+                    &gate,
+                    input_format,
+                    require_complete_pairs,
+                )
+            })
+        };
+
+        let token = token_rx.recv_timeout(Duration::from_secs(10));
+        let writer_blocked = !writer.is_finished();
+        // Unblock the writer's write (its stdin closes) before asserting.
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let result = writer.join().expect("writer thread panicked");
+
+        let token = token.expect("the token must arrive while the batch is being written");
+        assert_eq!(token.n_templates, n_templates);
+        assert!(writer_blocked, "the writer should still have been writing the batch");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert!(shared.has_cascade(), "a post-token write failure must remain a cascade");
+        assert!(shared.take_root_cause().is_none(), "the writer must not mask a reader root");
+    }
+
+    /// A closed stdin pipe retains its error kind and diagnostic. FASTQ fails
+    /// after sending the batch token; SAM fails earlier, while writing its header.
+    #[rstest::rstest]
+    #[case::fastq(UnalignedReadFormat::Fastq, "writing batch 0", 1)]
+    #[case::sam(UnalignedReadFormat::Sam, "SAM header", 0)]
+    fn writer_loop_reports_a_failed_write_to_the_aligner(
+        #[case] input_format: UnalignedReadFormat,
+        #[case] expected_message: &str,
+        #[case] expected_tokens: usize,
+    ) {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+
+        let mut exited = Command::new("true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let stdin = exited.stdin.take().expect("true stdin");
+        exited.wait().expect("wait for true");
+
+        let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(1);
+        in_tx
+            .send(BamTemplateBatch::new(0, vec![make_paired_primary_template(b"q")]))
+            .expect("send batch");
+        drop(in_tx);
+        let (token_tx, token_rx) = channel::<BatchToken>();
+        let shared = Arc::new(SharedState::new());
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
+
+        let err =
+            writer_loop(in_rx, token_tx, stdin, Arc::clone(&shared), &gate, input_format, false)
+                .expect_err("writing to an exited aligner fails");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(err.to_string().contains(expected_message), "got: {err}");
+        let recorded = shared.take_error().expect("the error is recorded");
+        assert_eq!(recorded.kind(), err.kind());
+        assert_eq!(recorded.to_string(), err.to_string());
+        assert_eq!(token_rx.try_iter().count(), expected_tokens);
     }
 
     /// Regression for the AAM deadlock fixed in commit `069c265`.
