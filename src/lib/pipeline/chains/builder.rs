@@ -7664,7 +7664,6 @@ impl<'a> ChainBuilder<'a> {
 
         let accumulators =
             PerThreadAccumulator::<crate::commands::dedup::CollectedDedupMetrics>::new(num_threads);
-        let accumulators_for_process = Arc::clone(&accumulators);
 
         // ── Step factories (see chains::commands::dedup) ──────────────────
         let process_step = build_process_step(
@@ -7680,7 +7679,7 @@ impl<'a> ChainBuilder<'a> {
                 include_unmapped: dedup.include_unmapped,
                 include_invalid_umis: dedup.include_invalid_umis,
             },
-            accumulators_for_process,
+            Arc::clone(&accumulators),
         );
         // Duplication ladder recorder (`--duplication-ladder`).
         // `Some` only when the flag is set; shared (via `Arc`) between the serial
@@ -7692,8 +7691,12 @@ impl<'a> ChainBuilder<'a> {
                 crate::commands::dedup::DuplicationLadderRecorder::new(dedup.ladder_interval),
             ))
         });
-        let mi_assign_step =
-            build_mi_assign_step(self.tuning.per_step_byte_limit, ladder_recorder.clone());
+        let mi_assign_step = build_mi_assign_step(
+            self.tuning.per_step_byte_limit,
+            effective_edits,
+            Arc::clone(&accumulators),
+            ladder_recorder.clone(),
+        );
         let serialize_step = build_serialize_step(
             self.tuning.per_step_byte_limit,
             dedup.remove_duplicates,

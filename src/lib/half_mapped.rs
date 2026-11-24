@@ -12,6 +12,8 @@ use fgumi_umi::MoleculeId;
 
 use crate::template::Template;
 
+pub(crate) mod pair_ends;
+
 /// Longest UMI that fits in a [`UmiCode`]; longer UMIs are kept as text.
 const MAX_PACKED_BASES: usize = 15;
 
