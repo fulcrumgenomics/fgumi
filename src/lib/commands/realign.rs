@@ -402,6 +402,7 @@ mod tests {
 
     use super::*;
     use crate::aligner::{AlignerPreset, DedupReads};
+    use crate::commands::fastq::UnalignedReadFormat;
     use fgumi_consensus::MethylationMode;
 
     fn parse(extra: &[&str]) -> Realign {
@@ -467,10 +468,24 @@ mod tests {
         assert_eq!(opts.align.aligner.chunk_size, defaults.chunk_size);
         assert_eq!(opts.align.aligner.sub_batch_templates, None);
         assert_eq!(opts.align.aligner.dedup_reads, None);
+        assert_eq!(opts.align.aligner.input_format, None);
         assert_eq!(opts.align.aligner.max_read_ahead, None);
         assert_eq!(opts.align.aligner.methylation_mode, MethylationMode::Disabled);
         assert_eq!(opts.xa_max_hits, None);
         assert!(!opts.in_memory_reference, "the reference is read on demand by default");
+    }
+
+    /// `--aligner::input-format` reaches the realign stage's aligner options.
+    #[rstest]
+    #[case::fastq("fastq", UnalignedReadFormat::Fastq)]
+    #[case::sam("sam", UnalignedReadFormat::Sam)]
+    fn to_realign_options_carries_input_format(
+        #[case] value: &str,
+        #[case] expected: UnalignedReadFormat,
+    ) {
+        let cmd = parse(&["--aligner::command", "aligner {ref}", "--aligner::input-format", value]);
+        let opts = cmd.to_realign_options().expect("options");
+        assert_eq!(opts.align.aligner.input_format, Some(expected));
     }
 
     /// `--in-memory-reference` alone opts out of on-demand reads; an explicit

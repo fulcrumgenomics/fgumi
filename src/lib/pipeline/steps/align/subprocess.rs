@@ -70,7 +70,10 @@ use noodles::sam::Header;
 use parking_lot::Mutex;
 
 use crate::aligner::AlignerProcess;
-use crate::commands::fastq::{FastqRecordBuffers, write_fastq_record};
+use crate::commands::fastq::{
+    FastqRecordBuffers, UNALIGNED_SAM_HEADER, UnalignedReadFormat, write_fastq_record,
+    write_unaligned_sam_record,
+};
 use crate::pipeline::core::builder::PipelineBuilder;
 use crate::pipeline::core::header::HeaderHandle;
 use crate::pipeline::core::item::HeapSize;
@@ -184,6 +187,11 @@ pub(crate) struct SubprocessConfig {
     /// refuses a bwa-mem3 older than the `--meth` `NM` fix
     /// ([`check_meth_aligner_version`]).
     pub(crate) passes_meth: bool,
+    /// Format the writer thread writes the reads in (`--aligner::input-format`):
+    /// interleaved FASTQ, or unaligned SAM (an `@HD` line, then one record per
+    /// read). Either way R1 precedes R2 and secondary/supplementary records are
+    /// skipped, so the reader's pairing is unchanged.
+    pub(crate) input_format: UnalignedReadFormat,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -328,11 +336,14 @@ impl SubprocessAlignStep {
         ));
 
         let writer_thread = {
+            let input_format = cfg.input_format;
             let shared = Arc::clone(&shared);
             let gate = Arc::clone(&gate);
             thread::Builder::new()
                 .name("aam-fastq-writer".into())
-                .spawn(move || writer_loop(in_rx, token_tx, aligner_stdin, shared, &gate))
+                .spawn(move || {
+                    writer_loop(in_rx, token_tx, aligner_stdin, shared, &gate, input_format)
+                })
                 .map_err(|e| {
                     io::Error::other(format!(
                         "SubprocessAlignStep::new: failed to spawn writer thread: {e}"
@@ -381,9 +392,10 @@ impl SubprocessAlignStep {
 // Writer thread
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Drain `in_rx` to the aligner's stdin as interleaved FASTQ, pushing
-/// one `BatchToken` per batch to `token_tx` so the reader can pair
-/// alignments back by count.
+/// Drain `in_rx` to the aligner's stdin as interleaved FASTQ or, per
+/// `input_format`, unaligned SAM (its `@HD` line first), pushing one
+/// `BatchToken` per batch to `token_tx` so the reader can pair alignments back
+/// by count.
 ///
 /// Lifecycle:
 /// - When `in_rx` closes (sender dropped), flush + drop the
@@ -403,10 +415,19 @@ fn writer_loop(
     aligner_stdin: std::process::ChildStdin,
     shared: Arc<SharedState>,
     gate: &InFlightGate,
+    input_format: UnalignedReadFormat,
 ) -> io::Result<()> {
     let mut writer = BufWriter::with_capacity(FASTQ_WRITER_BUF_BYTES, aligner_stdin);
     let mut fastq_buffers = FastqRecordBuffers::with_capacity(512);
     let mut next_serial: u64 = 0;
+
+    if input_format == UnalignedReadFormat::Sam
+        && let Err(e) = writer.write_all(UNALIGNED_SAM_HEADER)
+    {
+        let msg = format!("align-and-merge writer: SAM header: {e}");
+        shared.record_error(io::Error::other(msg.clone()));
+        return Err(io::Error::other(msg));
+    }
 
     while let Ok(batch) = in_rx.recv() {
         // Reserve this batch's unmapped bytes against the in-flight budget
@@ -458,21 +479,31 @@ fn writer_loop(
                 if !is_primary_for_alignment(flags) {
                     continue;
                 }
-                if let Err(e) = write_fastq_record(
-                    &mut writer,
-                    record,
-                    flags,
-                    /* no_suffix */ true,
-                    &mut fastq_buffers,
-                    /* umi_header */ None,
-                ) {
+                let result = match input_format {
+                    UnalignedReadFormat::Fastq => write_fastq_record(
+                        &mut writer,
+                        record,
+                        flags,
+                        /* no_suffix */ true,
+                        &mut fastq_buffers,
+                        /* umi_header */ None,
+                    ),
+                    UnalignedReadFormat::Sam => {
+                        write_unaligned_sam_record(&mut writer, record, flags, &mut fastq_buffers)
+                    }
+                };
+                if let Err(e) = result {
                     // Record + return the same full error message so
                     // `finalize`'s join path and the shared
                     // error_slot fallback path both see the same
                     // text — no information loss either way. Same
                     // pattern as the no-primary path below.
+                    let format = match input_format {
+                        UnalignedReadFormat::Fastq => "FASTQ",
+                        UnalignedReadFormat::Sam => "SAM",
+                    };
                     let msg = format!(
-                        "align-and-merge writer: write_fastq_record for template '{name}': {e:#}",
+                        "align-and-merge writer: writing {format} for template '{name}': {e:#}",
                         name = String::from_utf8_lossy(template.name()),
                     );
                     shared.record_error(io::Error::other(msg.clone()));
@@ -606,15 +637,16 @@ fn reader_loop_inner(
     if peek_filled == 0 {
         // Aligner exited before emitting any output — usually an
         // aligner crash or misconfiguration (wrong binary path,
-        // missing index files, segfault before reading FASTQ).
+        // missing index files, segfault before reading its input).
         // Distinguished from "non-BGZF content" so the message
         // doesn't misleadingly point at SAM/BAM format conversion.
         let marker = ERR_ALIGNER_EXITED_BEFORE_OUTPUT;
         return Err(io::Error::other(format!(
             "SubprocessAlignStep: aligner {marker}. Likely causes: subprocess \
              startup error (missing binary, missing index files), aligner \
-             argument error, or the aligner segfaulted before reading FASTQ. \
-             Check the aligner's stderr above for the specific failure."
+             argument error, the aligner reads a different input format than \
+             --aligner::input-format, or the aligner segfaulted before reading \
+             its input. Check the aligner's stderr above for the specific failure."
         )));
     }
 
@@ -1515,6 +1547,8 @@ pub(crate) struct SubprocessBackend {
     pub(crate) chunk_size: u64,
     /// See [`SubprocessConfig::accept_mid_pair_split`].
     pub(crate) accept_mid_pair_split: bool,
+    /// See [`SubprocessConfig::input_format`].
+    pub(crate) input_format: UnalignedReadFormat,
     /// `--aligner::max-read-ahead`, or `None` for the default ceiling (see
     /// [`read_ahead_ceiling`]).
     pub(crate) max_read_ahead: Option<u64>,
@@ -1589,6 +1623,7 @@ impl AlignBackend for SubprocessBackend {
                 .unwrap_or(IN_FLIGHT_CEILING_TIMEOUT),
                 accept_mid_pair_split: self.accept_mid_pair_split,
                 passes_meth: crate::aligner::command_passes_meth(&self.command),
+                input_format: self.input_format,
             },
             &self.command,
         )
@@ -1638,6 +1673,7 @@ mod tests {
             in_flight_ceiling_timeout: IN_FLIGHT_CEILING_TIMEOUT,
             accept_mid_pair_split: true,
             passes_meth: false,
+            input_format: UnalignedReadFormat::Fastq,
         }
     }
 
@@ -1777,7 +1813,14 @@ mod tests {
         // behavior is covered by `in_flight_gate_*` unit tests).
         let gate =
             InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
-        let result = writer_loop(in_rx, token_tx, cat_stdin, Arc::clone(&shared), &gate);
+        let result = writer_loop(
+            in_rx,
+            token_tx,
+            cat_stdin,
+            Arc::clone(&shared),
+            &gate,
+            UnalignedReadFormat::Fastq,
+        );
 
         assert!(result.is_err(), "writer_loop should reject all-filtered template");
         let msg = result.unwrap_err().to_string();
@@ -1793,6 +1836,69 @@ mod tests {
 
         let _ = cat.kill();
         let _ = cat.wait();
+    }
+
+    /// The bytes `writer_loop` writes to the aligner's stdin for one template
+    /// built from records given out of order (R2, a supplementary R1, then R1),
+    /// in each `--aligner::input-format`: R1 before R2, the supplementary record
+    /// skipped, no mate suffix, and for SAM the `@HD` line first.
+    #[rstest::rstest]
+    #[case::fastq(UnalignedReadFormat::Fastq, "@q1\nACGT\n+\nIIII\n@q1\nTTGC\n+\n5555\n")]
+    #[case::sam(
+        UnalignedReadFormat::Sam,
+        "@HD\tVN:1.6\tSO:unsorted\n\
+         q1\t77\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n\
+         q1\t141\t*\t0\t0\t*\t*\t0\t0\tTTGC\t5555\n"
+    )]
+    fn writer_loop_writes_primaries_in_input_format(
+        #[case] input_format: UnalignedReadFormat,
+        #[case] expected: &str,
+    ) {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_path = dir.path().join("stdin.txt");
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&out_path).expect("create capture file"))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let cat_stdin = cat.stdin.take().expect("cat stdin");
+
+        let r2 = {
+            let mut b = fgumi_raw_bam::SamBuilder::new();
+            b.read_name(b"q1")
+                .flags(PAIRED | LAST_SEGMENT)
+                .sequence(b"TTGC")
+                .qualities(&[20, 20, 20, 20]);
+            b.build()
+        };
+        let supplementary = make_record(b"q1", PAIRED | FIRST_SEGMENT | SUPPLEMENTARY);
+        let r1 = {
+            let mut b = fgumi_raw_bam::SamBuilder::new();
+            b.read_name(b"q1")
+                .flags(PAIRED | FIRST_SEGMENT)
+                .sequence(b"ACGT")
+                .qualities(&[40, 40, 40, 40]);
+            b.build()
+        };
+        let template = Template::from_records(vec![r2, supplementary, r1]).expect("template");
+
+        let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(1);
+        let (token_tx, token_rx) = channel::<BatchToken>();
+        in_tx.send(BamTemplateBatch::new(0, vec![template])).expect("send batch");
+        drop(in_tx);
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
+        writer_loop(in_rx, token_tx, cat_stdin, Arc::new(SharedState::new()), &gate, input_format)
+            .expect("writer_loop");
+        cat.wait().expect("cat exits");
+
+        let token = token_rx.recv().expect("one token");
+        assert_eq!(token.n_templates, 1);
+        assert_eq!(std::fs::read_to_string(&out_path).expect("read capture"), expected);
     }
 
     /// Before waiting on the gate the writer flushes what it has buffered, also
@@ -1840,7 +1946,14 @@ mod tests {
         let shared = Arc::new(SharedState::new());
         let writer_shared = Arc::clone(&shared);
         let writer = std::thread::spawn(move || {
-            writer_loop(in_rx, token_tx, cat_stdin, writer_shared, &writer_gate)
+            writer_loop(
+                in_rx,
+                token_tx,
+                cat_stdin,
+                writer_shared,
+                &writer_gate,
+                UnalignedReadFormat::Fastq,
+            )
         });
 
         // B's stall grows the gate to the ceiling; C then waits on it.
@@ -1907,7 +2020,14 @@ mod tests {
         let writer_handle = std::thread::Builder::new()
             .name("writer-loop-deadlock-test".into())
             .spawn(move || {
-                writer_loop(in_rx, token_tx, cat_stdin, shared_for_worker, &gate_for_worker)
+                writer_loop(
+                    in_rx,
+                    token_tx,
+                    cat_stdin,
+                    shared_for_worker,
+                    &gate_for_worker,
+                    UnalignedReadFormat::Fastq,
+                )
             })
             .expect("spawn writer worker");
 

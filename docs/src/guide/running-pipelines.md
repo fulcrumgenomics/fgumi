@@ -31,6 +31,10 @@ extract < correct < align < zipper < sort < group < consensus < filter
 | `consensus` | Call consensus (algorithm set by `--consensus`) | grouped, MI-tagged BAM (`--input`) |
 | `filter` | Filter/mask consensus reads | consensus BAM (`--input`) |
 
+The `align` stage writes the reads to the aligner's stdin as interleaved FASTQ (R1 then R2, with no `/1` `/2` suffix). For a custom STAR command using `--readFilesType SAM PE`, select `--aligner::input-format sam`: an `@HD` line, then one record per read with FLAG 77 (R1), 141 (R2) or 4 (an unpaired read), `*` for `RNAME`, `RNEXT` and `CIGAR`, `0` for `POS` and `PNEXT`, and no tags. Other custom aligners that read paired SAM input can use it too. The presets read FASTQ and reject `--aligner::input-format sam`.
+
+For a standalone pipe into STAR, `fgumi fastq --format sam` writes the same format without needing `samtools`. This is read export for alignment: reads are restored to their original orientation, marked unmapped, and written without alignment fields or tags, with only a minimal header. Unlike `samtools view -h`, it does not preserve the input's alignments, tags or header. `runall` writes this stream internally; it does not invoke `fgumi fastq`.
+
 `--realign` adds a `realign` stage and a coordinate `sort` after the last of these; see [Re-aligning consensus reads](#re-aligning-consensus-reads-with---realign).
 
 ## Selecting the slice to run

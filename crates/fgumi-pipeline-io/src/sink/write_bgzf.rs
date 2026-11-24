@@ -193,15 +193,11 @@ impl WriteBgzfFile {
         fgumi_bam_io::write_bam_header(&mut header_bytes, header)
             .map_err(|e| io::Error::other(format!("write_bam_header: {e}")))?;
 
-        let mut hc = InlineBgzfCompressor::new(compression_level);
-        hc.write_all(&header_bytes)?;
-        hc.flush()?;
-        // Compress to a `Vec` first (rather than `write_blocks_to(&mut out)`
-        // directly) so the header's compressed length is known up front — the
-        // starting point for `coffset`, the cumulative compressed-byte counter
-        // the inline BAI join uses to attribute blocks to physical offsets.
-        let mut header_blocks = Vec::new();
-        hc.write_blocks_to(&mut header_blocks)?;
+        // Compress to a `Vec` first (rather than straight into `out`) so the
+        // header's compressed length is known up front — the starting point for
+        // `coffset`, the cumulative compressed-byte counter the inline BAI join
+        // uses to attribute blocks to physical offsets.
+        let header_blocks = fgumi_bgzf::compress_to_vec(&header_bytes, compression_level)?;
         let coffset = header_blocks.len() as u64;
         out.write_all(&header_blocks)?;
 

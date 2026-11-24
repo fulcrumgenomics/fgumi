@@ -3784,3 +3784,159 @@ fn start_from_extract_rejects_mixed_length_umis_before_reading_fastqs() {
     );
     assert!(!out.exists(), "no output may be written when the UMI set is rejected");
 }
+
+// ══════════════════════ --aligner::input-format (SAM stdin) ══════════════════════
+
+/// A stand-in aligner that reads the interleaved FASTQ the align stage writes and
+/// reports every read unmapped (flag 77 for R1, 141 for R2) under the `@SQ` of
+/// [`create_test_reference`].
+const FASTQ_ECHO_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\"; print \"@HD\", \"VN:1.6\"; \
+    print \"@SQ\", \"SN:chr1\", \"LN:10000\" } \
+    NR % 4 == 1 { name = substr($1, 2) } NR % 4 == 2 { seq = $0 } \
+    NR % 4 == 0 { n++; print name, (n % 2 ? 77 : 141), \"*\", 0, 0, \"*\", \"*\", 0, 0, seq, $0 }' \
+    # {ref}";
+
+/// The same stand-in for `--aligner::input-format sam`: it requires the unaligned
+/// SAM `@HD` line first, then 11-column records with FLAG 77 or 141, and echoes
+/// each read back unmapped under the reference's `@SQ`. A malformed stream makes
+/// it exit non-zero, failing the run.
+const SAM_ECHO_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\" } \
+    NR == 1 { if ($0 != \"@HD\\tVN:1.6\\tSO:unsorted\") exit 3; \
+              print \"@HD\", \"VN:1.6\"; print \"@SQ\", \"SN:chr1\", \"LN:10000\"; next } \
+    NF != 11 || ($2 != 77 && $2 != 141) { exit 4 } \
+    { print $1, $2, \"*\", 0, 0, \"*\", \"*\", 0, 0, $10, $11 }' \
+    # {ref}";
+
+/// An unmapped, UMI-tagged paired BAM for the align stage: three templates, one
+/// with no stored base qualities.
+fn unmapped_pairs_bam(dir: &Path) -> PathBuf {
+    use fgumi_raw_bam::{SamBuilder, flags};
+    let header = create_minimal_header("chr1", 10_000);
+    let pairs: [(&str, &str, &str, Option<u8>); 3] = [
+        ("t1", "ACGTACGTAC", "TTGGCCAAGT", Some(30)),
+        ("t2", "GGGGCCCCAA", "CATCATCATC", Some(12)),
+        ("t3", "ACACACACAC", "GTGTGTGTGT", None),
+    ];
+    let mut records = Vec::new();
+    for (name, seq1, seq2, qual) in pairs {
+        for (seg, seq) in [(flags::FIRST_SEGMENT, seq1), (flags::LAST_SEGMENT, seq2)] {
+            let quals = vec![qual.unwrap_or(0xFF); seq.len()];
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | seg)
+                .sequence(seq.as_bytes())
+                .qualities(&quals);
+            b.add_string_tag(fgumi_lib::sam::SamTag::RX, b"ACGT");
+            records.push(b.build());
+        }
+    }
+    let path = dir.join("unmapped.bam");
+    write_bam(&path, &header, &records);
+    path
+}
+
+/// `--aligner::input-format sam` feeds the aligner unaligned SAM instead of
+/// interleaved FASTQ; an aligner that reads either and reports the same
+/// alignments must give record-for-record the same runall output.
+#[rstest::rstest]
+#[case::align_to_zipper("zipper")]
+#[case::align_to_sort("sort")]
+fn sam_input_format_matches_fastq_input(#[case] stop_after: &str) {
+    let tmp = TempDir::new().unwrap();
+    let input = unmapped_pairs_bam(tmp.path());
+    let reference = create_test_reference(tmp.path());
+    let run = |out: &Path, aligner: &str, format: &[&str]| {
+        let mut args = vec![
+            "runall",
+            "--start-from",
+            "align",
+            "--stop-after",
+            stop_after,
+            "-i",
+            p(&input),
+            "--ref",
+            p(&reference),
+            "--aligner::command",
+            aligner,
+            "-o",
+            p(out),
+        ];
+        args.extend_from_slice(format);
+        run_ok(args, &format!("runall align->{stop_after} {format:?}"));
+    };
+
+    let fastq_out = tmp.path().join("fastq.bam");
+    run(&fastq_out, FASTQ_ECHO_ALIGNER, &[]);
+    let sam_out = tmp.path().join("sam.bam");
+    run(&sam_out, SAM_ECHO_ALIGNER, &["--aligner::input-format", "sam"]);
+
+    assert_bams_record_equivalent_nonempty(&sam_out, &fastq_out);
+    let (sam_header, sam_records) = read_bam_output(&sam_out);
+    let (fastq_header, _) = read_bam_output(&fastq_out);
+    assert_eq!(sam_header.reference_sequences(), fastq_header.reference_sequences());
+    assert_eq!(sam_records.len(), 6, "every input read must reach the output");
+}
+
+/// The SAM-input stand-in really checks its input: given FASTQ (the default
+/// format), the run fails rather than passing vacuously.
+#[test]
+fn sam_echo_aligner_rejects_fastq_input() {
+    let tmp = TempDir::new().unwrap();
+    let input = unmapped_pairs_bam(tmp.path());
+    let reference = create_test_reference(tmp.path());
+    let output = fgumi([
+        "runall",
+        "--start-from",
+        "align",
+        "--stop-after",
+        "zipper",
+        "-i",
+        p(&input),
+        "--ref",
+        p(&reference),
+        "--aligner::command",
+        SAM_ECHO_ALIGNER,
+        "-o",
+        p(&tmp.path().join("out.bam")),
+    ]);
+    assert!(!output.status.success(), "a FASTQ stream must fail the SAM-input stand-in");
+    // The stand-in's `@HD` check (`exit 3` on the first line, before it prints
+    // anything) is what failed, not an earlier step of the run.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("aligner exited before emitting any output"),
+        "the stand-in must reject the FASTQ stream at its @HD check:\n{stderr}"
+    );
+}
+
+/// `--aligner::input-format sam` is rejected with a preset, which reads FASTQ.
+#[rstest::rstest]
+#[case::bwa("bwa")]
+#[case::bwa_mem3("bwa-mem3")]
+#[case::bwa_mem3_inproc("bwa-mem3-inproc")]
+fn sam_input_format_rejected_with_preset(#[case] preset: &str) {
+    let tmp = TempDir::new().unwrap();
+    let input = unmapped_pairs_bam(tmp.path());
+    let reference = create_test_reference(tmp.path());
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "align",
+            "--stop-after",
+            "zipper",
+            "-i",
+            p(&input),
+            "--ref",
+            p(&reference),
+            "--aligner::preset",
+            preset,
+            "--aligner::input-format",
+            "sam",
+            "-o",
+            p(&tmp.path().join("out.bam")),
+        ],
+        "--aligner::input-format sam is only valid with --aligner::command",
+        &format!("--aligner::preset {preset} --aligner::input-format sam"),
+    );
+}

@@ -26,4 +26,4 @@ pub use reader::{
 // required by `decompress_block_into_opts` without depending on libdeflater
 // directly.
 pub use libdeflater::Decompressor;
-pub use writer::{BGZF_MAX_BLOCK_SIZE, CompressedBlock, InlineBgzfCompressor};
+pub use writer::{BGZF_MAX_BLOCK_SIZE, CompressedBlock, InlineBgzfCompressor, compress_to_vec};
