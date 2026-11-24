@@ -172,6 +172,22 @@ same 5' start. `dedup` calls no consensus, so it needs no such split.
 > marks more duplicates (+~2 percentage points on a moderately duplicated panel). There is no flag
 > to restore the previous behavior; use the UMI grouping path if you need strand separation.
 
+### Half-Mapped Pairs
+
+A pair with one mapped and one unmapped read has a single known end. fgbio's `GroupReadsByUmi`
+groups such pairs, and marks duplicates among them, independently from fully mapped pairs. Picard
+`MarkDuplicates` marks the mapped read of one as a duplicate whenever a fully mapped pair has the
+same end.
+
+- `fgumi sort` writes a half-mapped pair beside the fully mapped pair it is a copy of, and
+  `fgumi group` gives it that pair's molecule. fgumi therefore reports fewer molecules. Input sorted
+  by another tool is grouped as fgbio groups it. See
+  [Half-Mapped Templates](umi-grouping.md#half-mapped-templates).
+- `fgumi dedup` marks it as a duplicate, whichever tool sorted the input, and never marks a fully
+  mapped pair because of it. With UMIs the end's UMI must match and the end must be read 1 in both
+  or read 2 in both. Without UMIs (`--no-umi`) neither is needed, as in Picard. fgumi marks every
+  record of the half-mapped pair, including its unmapped read.
+
 ### Group Metrics
 
 fgumi's `group` command now produces a third metrics file beyond family sizes and grouping

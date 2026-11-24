@@ -47,6 +47,29 @@ fgumi group \
   --allow-unmapped
 ```
 
+### Half-Mapped Templates
+
+A half-mapped template is a pair with only one primary read mapped. It has one known end, so it is
+not at the same position as the fully mapped pair it may be a copy of. `fgumi sort --order
+template-coordinate` writes it beside a fully mapped pair whose end has the same library, cell
+barcode, contig, unclipped 5' position, strand, and UMI, and records that pair's coordinate in its
+`tc` tag. `fgumi group` then gives it the pair's molecule:
+
+- Only the UMI of the mapped end is compared. It is the first segment of a two-segment UMI such as
+  `ACGT-CCGG` for read 1, and the second for read 2. The other segment was sequenced with the read
+  that did not map. Any other UMI is compared whole.
+- With `paired`, the strand suffix follows the template's own orientation, so it can supply the
+  strand that the molecule lacks. With the other strategies, the end must be read 1 in both or read
+  2 in both.
+- It never changes how fully mapped templates are grouped.
+
+A half-mapped template stays on its own when no pair has its end, when pairs with several second
+ends do, or when it is as close to two molecules as to any. Its mapped read can then still support a
+structural variant.
+
+Consensus uses the mapped read of a half-mapped template. Its unmapped read adds no bases or depth,
+and the consensus UMI comes from the molecule's fully mapped pairs.
+
 ## Recording Windows for Re-alignment
 
 `--realign-window` stamps each mapped primary read with an `rw` tag: the reference window
