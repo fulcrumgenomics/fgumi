@@ -1574,14 +1574,15 @@ impl<'a> ChainBuilder<'a> {
                         // `DecodedRecord` round trip.
                         let front = RecordFront::Cram(reader, label);
                         if sort_is_first_intermediate {
-                            // Decoding is sort ingest here, so it shares the
-                            // sort's phase-1 cap (`--sort-threads`), as the
-                            // BAM arena front and the SAM parse do.
-                            let decode_cap = self.sort_plan().and_then(|plan| plan.caps.phase1);
+                            // Decoding and parsing are sort ingest here, so
+                            // both share the sort's phase-1 cap
+                            // (`--sort-threads`), as the BAM arena front and
+                            // the SAM parse do.
+                            let ingest_cap = self.sort_plan().and_then(|plan| plan.caps.phase1);
                             let tail = self.build_bam_record_batch_preamble(
                                 front,
                                 self.header.clone(),
-                                decode_cap,
+                                ingest_cap,
                             );
                             self.current_tail = Some(tail);
                             self.chain_tail_kind = ChainTailKind::RecordBatch;
@@ -2369,22 +2370,34 @@ impl<'a> ChainBuilder<'a> {
     /// allocation, no `GroupKey`). Mirrors [`Self::build_bam_decode_preamble`]
     /// but ends in `ParseBamRecords` instead of `DecodeRecords`; used when
     /// [`Self::first_stage_uses_raw_record_fast_path`] holds, and for a CRAM
-    /// source feeding a sort-first chain's record-input front. `decode_cap` as
-    /// for [`Self::append_record_front`].
+    /// source feeding a sort-first chain's record-input front.
+    ///
+    /// `ingest_cap` caps `ParseBamRecords` for either front and, for a CRAM
+    /// front, `DecodeCramSlices` too (a sort-first chain passes the sort's
+    /// phase-1 cap); `None` leaves both unrestricted. A BGZF front's
+    /// `BgzfDecompress` is never capped here: a sort-first BAM source takes the
+    /// arena front instead, so only `None` reaches this with a BGZF front.
     ///
     /// [`RecordBatch`]: crate::pipeline::steps::types::RecordBatch
     fn build_bam_record_batch_preamble(
         &mut self,
         front: RecordFront,
         header: Header,
-        decode_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
+        ingest_cap: Option<Arc<fgumi_pipeline_core::PhaseCap>>,
     ) -> (crate::pipeline::core::topology::StepIdx, crate::pipeline::core::topology::BranchIdx)
     {
         use crate::pipeline::steps::boundaries::state::BatchCut;
         use crate::pipeline::steps::parse::bam::ParseBamRecords;
 
-        let tail = self.append_record_front(front, header, BatchCut::Record, decode_cap);
-        self.pipeline.append_step(ParseBamRecords::new(self.tuning.per_step_byte_limit), tail)
+        debug_assert!(
+            ingest_cap.is_none() || !matches!(front, RecordFront::Bgzf(_)),
+            "a capped BGZF front would leave BgzfDecompress uncapped"
+        );
+        // The parse is the same ingest as the decode, so it takes the same cap.
+        let parse = ParseBamRecords::new(self.tuning.per_step_byte_limit)
+            .with_phase_cap(ingest_cap.clone());
+        let tail = self.append_record_front(front, header, BatchCut::Record, ingest_cap);
+        self.pipeline.append_step(parse, tail)
     }
 
     /// Append the sort's chain-native input reads over `path`:
