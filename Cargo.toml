@@ -70,15 +70,15 @@ mimalloc = { version = "0.1.52", default-features = false }
 # checked close (std's `File` drop discards the error), to surface errors the OS
 # reports only when an output file is closed. Other members still scope it to
 # Linux for Linux-only APIs (`posix_fadvise`, ...).
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 # The noodles crates are bumped together: `noodles`, `noodles-bgzf` and `noodles-csi` must
 # resolve to the same sub-crate versions or their types (e.g. `bgzf::VirtualPosition`,
 # `csi::binning_index::Indexer`) do not unify. When bumping, check that
 # `bgzf::io::MultithreadedReader::with_worker_count` still sizes its own worker pool (it does in
 # noodles-bgzf 0.52), or `--threads` would stop bounding BGZF decompression in `fgumi extract`.
-noodles = "0.119.0"
-noodles-bgzf = { version = "0.52.0", features = ["libdeflate"] }
-noodles-csi = "0.62.0"
+noodles = "0.120.0"
+noodles-bgzf = { version = "0.53.0", features = ["libdeflate"] }
+noodles-csi = "0.63.0"
 num-format = "0.4"
 parking_lot = "0.13"
 proptest = "1.10"
