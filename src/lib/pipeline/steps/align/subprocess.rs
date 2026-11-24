@@ -69,7 +69,7 @@ use anyhow::anyhow;
 use noodles::sam::Header;
 use parking_lot::Mutex;
 
-use crate::aligner::AlignerProcess;
+use crate::aligner::{AlignerProcess, AlignerScratchDir, SubprocessRuntime};
 use crate::commands::fastq::{
     FastqRecordBuffers, UNALIGNED_SAM_HEADER, UnalignedReadFormat, write_fastq_record,
     write_unaligned_sam_record,
@@ -79,8 +79,8 @@ use crate::pipeline::core::header::HeaderHandle;
 use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::core::{
-    BranchOrdering, HeldSlot, OrderedBytesSingle, QueueSpec, Step, StepCtx, StepKind, StepOutcome,
-    StepProfile, Unpushed,
+    BranchOrdering, ExternalWaitClaim, HeldSlot, OrderedBytesSingle, QueueSpec, Step, StepCtx,
+    StepKind, StepOutcome, StepProfile, Unpushed,
 };
 use crate::pipeline::steps::align::merge::MergeAlignedStep;
 use crate::pipeline::steps::align::{
@@ -192,6 +192,21 @@ pub(crate) struct SubprocessConfig {
     /// read). Either way R1 precedes R2 and secondary/supplementary records are
     /// skipped, so the reader's pairing is unchanged.
     pub(crate) input_format: UnalignedReadFormat,
+
+    /// Require complete primary pairs before writing a template (STAR SAM PE).
+    pub(crate) require_complete_pairs: bool,
+
+    /// Maximum time from spawning a slow-starting aligner to its first output
+    /// (see [`SubprocessRuntime::startup_timeout`]). Until output arrives its
+    /// silence is an external wait for the watchdog, not a deadlock. Expiry
+    /// fails the run; `None` uses the normal watchdog from the outset.
+    pub(crate) startup_timeout: Option<std::time::Duration>,
+
+    /// A scratch directory the aligner writes into, held until the step (and
+    /// its reader thread) are gone, after the aligner has been reaped. Never
+    /// read: holding it is what keeps the directory alive.
+    #[allow(dead_code)]
+    pub(crate) work_dir: Option<AlignerScratchDir>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -224,11 +239,72 @@ struct BatchToken {
 /// downstream of a crashed reader).
 struct SharedState {
     error_slot: Mutex<Option<io::Error>>,
+    /// The aligner's start-up wait, for a [`SubprocessConfig::startup_timeout`]
+    /// aligner.
+    startup: Mutex<StartupWait>,
+}
+
+/// The external wait a [`SubprocessConfig::startup_timeout`] aligner's start-up is
+/// counted as. Only a pipeline worker can claim the watchdog's gauge, so
+/// `try_run` claims it and the reader thread, which sees the first output byte
+/// arrive, releases it.
+#[derive(Default)]
+struct StartupWait {
+    /// The aligner has written its first byte, or the reader has exited.
+    over: bool,
+    /// Time of the first successful stdout read, independent of dispatch timing.
+    first_output_at: Option<std::time::Instant>,
+    claim: Option<ExternalWaitClaim>,
 }
 
 impl SharedState {
     fn new() -> Self {
-        Self { error_slot: Mutex::new(None) }
+        Self { error_slot: Mutex::new(None), startup: Mutex::new(StartupWait::default()) }
+    }
+
+    /// From a pipeline worker: count the aligner's start-up as an external
+    /// wait, unless it is over or already counted.
+    fn claim_startup_wait(
+        &self,
+        started_at: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        let mut startup = self.startup.lock();
+        let observed_elapsed = startup.first_output_at.map(|at| at.duration_since(started_at));
+        let elapsed = observed_elapsed.or_else(|| (!startup.over).then(|| started_at.elapsed()));
+        if elapsed.is_some_and(|elapsed| elapsed >= timeout) {
+            startup.over = true;
+            startup.claim = None;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "aligner startup timed out after {timeout:?} without output; increase \
+                     --aligner::startup-timeout (seconds) for a slower genome load"
+                ),
+            ));
+        }
+        if !startup.over && startup.claim.is_none() {
+            startup.claim = ExternalWaitClaim::begin();
+        }
+        Ok(())
+    }
+
+    /// Record first output as soon as a read returns bytes, not after the
+    /// format probe has filled or the dispatcher runs again.
+    fn observe_output(&self) {
+        let observed_at = std::time::Instant::now();
+        let mut startup = self.startup.lock();
+        startup.first_output_at.get_or_insert(observed_at);
+        startup.over = true;
+        startup.claim = None;
+    }
+
+    /// End the aligner's start-up (first byte written, or reader gone), releasing any
+    /// external wait it was counted as.
+    fn end_startup_wait(&self) {
+        let mut startup = self.startup.lock();
+        startup.over = true;
+        startup.claim = None;
     }
 
     /// Record an error if none has been recorded yet. First writer wins.
@@ -274,6 +350,8 @@ pub(crate) struct SubprocessAlignStep {
     reader_thread: Option<JoinHandle<io::Result<()>>>,
 
     shared: Arc<SharedState>,
+    /// Startup deadline is measured from spawn, not from the first dispatch.
+    started_at: std::time::Instant,
 
     /// Held slot for a batch that was popped from `ctx.input` but
     /// couldn't be `try_send`'d to `in_chan` (writer thread is slow).
@@ -299,6 +377,7 @@ impl SubprocessAlignStep {
     ///   impossible given `Stdio::piped()` is used by `AlignerProcess`),
     /// - either I/O thread spawn fails.
     pub(crate) fn new(cfg: SubprocessConfig, aligner_command: &str) -> io::Result<Self> {
+        let started_at = std::time::Instant::now();
         let mut aligner = AlignerProcess::spawn(aligner_command, ALIGNER_STDERR_RING_SIZE)
             .map_err(|e| io::Error::other(format!("SubprocessAlignStep::new: spawn: {e:#}")))?;
 
@@ -337,12 +416,21 @@ impl SubprocessAlignStep {
 
         let writer_thread = {
             let input_format = cfg.input_format;
+            let require_complete_pairs = cfg.require_complete_pairs;
             let shared = Arc::clone(&shared);
             let gate = Arc::clone(&gate);
             thread::Builder::new()
                 .name("aam-fastq-writer".into())
                 .spawn(move || {
-                    writer_loop(in_rx, token_tx, aligner_stdin, shared, &gate, input_format)
+                    writer_loop(
+                        in_rx,
+                        token_tx,
+                        aligner_stdin,
+                        shared,
+                        &gate,
+                        input_format,
+                        require_complete_pairs,
+                    )
                 })
                 .map_err(|e| {
                     io::Error::other(format!(
@@ -381,6 +469,7 @@ impl SubprocessAlignStep {
             writer_thread: Some(writer_thread),
             reader_thread: Some(reader_thread),
             shared,
+            started_at,
             held_in: HeldSlot::new(),
             held_out: HeldSlot::new(),
             name: "SubprocessAlign",
@@ -416,6 +505,7 @@ fn writer_loop(
     shared: Arc<SharedState>,
     gate: &InFlightGate,
     input_format: UnalignedReadFormat,
+    require_complete_pairs: bool,
 ) -> io::Result<()> {
     let mut writer = BufWriter::with_capacity(FASTQ_WRITER_BUF_BYTES, aligner_stdin);
     let mut fastq_buffers = FastqRecordBuffers::with_capacity(512);
@@ -471,6 +561,21 @@ fn writer_loop(
         // queryname so the misconfiguration is obvious.
         let mut n_templates = 0usize;
         for template in batch.templates() {
+            if require_complete_pairs {
+                use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED};
+                let mask = PAIRED | FIRST_SEGMENT | LAST_SEGMENT;
+                let complete =
+                    template.r1().is_some_and(|r| r.flags() & mask == PAIRED | FIRST_SEGMENT)
+                        && template.r2().is_some_and(|r| r.flags() & mask == PAIRED | LAST_SEGMENT);
+                if !complete {
+                    let msg = format!(
+                        "align-and-merge writer: STAR requires a complete primary pair for template '{}'",
+                        String::from_utf8_lossy(template.name()),
+                    );
+                    shared.record_error(io::Error::other(msg.clone()));
+                    return Err(io::Error::other(msg));
+                }
+            }
             let mut wrote_any = false;
             for record in &template.records {
                 let flags = record.flags();
@@ -523,7 +628,8 @@ fn writer_loop(
                 return Err(io::Error::other(msg));
             }
             // KNOWN DIVERGENCE — resolve in the align-and-merge WIRING PR.
-            // This guard only rejects a template where EVERY record is filtered
+            // Outside STAR (which requires complete pairs above), this guard
+            // only rejects a template where EVERY record is filtered
             // (no primary at all). A *partially* filtered template — e.g. a
             // re-aligned BAM by mistake where one mate has a primary and the
             // other is only SECONDARY/SUPPLEMENTARY — writes fewer FASTQ records
@@ -597,7 +703,17 @@ fn reader_loop(
     shared: Arc<SharedState>,
     gate: &InFlightGate,
 ) -> io::Result<()> {
-    let result = reader_loop_inner(token_rx, &out_tx, aligner_stdout, &cfg, gate);
+    /// Ends the aligner's start-up wait on every reader exit, a panic
+    /// included, so the watchdog never keeps treating a dead reader's
+    /// start-up as an external wait.
+    struct EndStartup<'a>(&'a SharedState);
+    impl Drop for EndStartup<'_> {
+        fn drop(&mut self) {
+            self.0.end_startup_wait();
+        }
+    }
+    let _end_startup = EndStartup(&shared);
+    let result = reader_loop_inner(token_rx, &out_tx, aligner_stdout, &cfg, &shared, gate);
     match result {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -627,12 +743,17 @@ fn reader_loop_inner(
     out_tx: &SyncSender<ZipperBatch>,
     aligner_stdout: ChildStdout,
     cfg: &SubprocessConfig,
+    shared: &SharedState,
     gate: &InFlightGate,
 ) -> io::Result<()> {
-    // 1. Peek 4 bytes to detect BGZF (BAM) vs SAM text. Returns the
+    // 1. Peek a BGZF header to detect BAM vs SAM text. Returns the
     //    peeked bytes prepended to a chained Read so we don't lose
     //    the prefix.
-    let (is_bgzf, peek_filled, stdout) = peek_aligner_format(aligner_stdout)?;
+    let (is_bgzf, peek_filled, stdout) = peek_aligner_format(aligner_stdout, shared)?;
+    // The aligner has written (or exited without writing): its start-up is
+    // over, and from here on the watchdog judges the align stage by its
+    // progress.
+    shared.end_startup_wait();
 
     if peek_filled == 0 {
         // Aligner exited before emitting any output — usually an
@@ -897,7 +1018,10 @@ fn split_unmapped_pairs(
 /// The return type is `Box<dyn Read + Send>` so the same boxed reader
 /// can feed both the BGZF (BAM) path and the SAM-text path without
 /// changing every downstream type signature.
-fn peek_aligner_format(mut stdout: ChildStdout) -> io::Result<(bool, usize, Box<dyn Read + Send>)> {
+fn peek_aligner_format(
+    mut stdout: ChildStdout,
+    shared: &SharedState,
+) -> io::Result<(bool, usize, Box<dyn Read + Send>)> {
     // Peek a full BGZF header's worth so the shared validator has enough bytes
     // for a real verdict (a genuine BGZF header is exactly `BGZF_HEADER_SIZE`
     // bytes). A shorter (or empty) prefix simply fails validation and falls to
@@ -908,7 +1032,12 @@ fn peek_aligner_format(mut stdout: ChildStdout) -> io::Result<(bool, usize, Box<
     while peek_filled < peek_buf.len() {
         match stdout.read(&mut peek_buf[peek_filled..]) {
             Ok(0) => break, // aligner exited before filling the peek buffer
-            Ok(n) => peek_filled += n,
+            Ok(n) => {
+                if peek_filled == 0 {
+                    shared.observe_output();
+                }
+                peek_filled += n;
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
@@ -1246,6 +1375,9 @@ impl Step for SubprocessAlignStep {
         if let Some(e) = self.shared.take_error() {
             return Err(e);
         }
+        if let Some(timeout) = self.cfg.startup_timeout {
+            self.shared.claim_startup_wait(self.started_at, timeout)?;
+        }
 
         // Already finalized (the threads were joined and `out_rx` taken on a
         // prior pass). The shared `finished` latch normally stops other
@@ -1552,16 +1684,32 @@ pub(crate) struct SubprocessBackend {
     /// `--aligner::max-read-ahead`, or `None` for the default ceiling (see
     /// [`read_ahead_ceiling`]).
     pub(crate) max_read_ahead: Option<u64>,
+    /// What the preset knows about running its aligner (budget floor, slow
+    /// start-up, scratch directory).
+    pub(crate) runtime: SubprocessRuntime,
+}
+
+/// The in-flight budget: the [`IN_FLIGHT_BUDGET_ENV`] override (`env`) when it
+/// is set, else the larger of the `--aligner::chunk-size`-derived budget and
+/// the preset's read-ahead floor (`floor`, `star`'s estimate of what it reads
+/// before its first output). The override is a diagnostic knob and bypasses
+/// the floor.
+fn in_flight_budget(env: Option<&str>, chunk_size: u64, floor: u64) -> u64 {
+    in_flight_budget_override(env)
+        .unwrap_or_else(|| in_flight_budget_for_chunk_size(chunk_size).max(floor))
 }
 
 /// The warning for an explicit `--aligner::max-read-ahead` below the in-flight
-/// budget `--aligner::chunk-size` derives: the gate starts at the ceiling then,
-/// so the budget itself is lowered, not just the room to grow.
+/// budget: the gate starts at the ceiling then, so the budget itself is
+/// lowered, not just the room to grow. The budget comes from
+/// `--aligner::chunk-size` or a preset's read-ahead estimate (for `star`,
+/// `--aligner::threads` and `--limitIObufferSize`), so the message names both.
 fn max_read_ahead_lowers_budget_warning(budget: u64, requested: Option<u64>) -> Option<String> {
     requested.filter(|&ceiling| ceiling < budget).map(|ceiling| {
         format!(
-            "--aligner::max-read-ahead {} is below the in-flight budget {} that \
-             --aligner::chunk-size sets, so the budget is lowered to it and the gate cannot grow",
+            "--aligner::max-read-ahead {} is below the in-flight budget {} (set by \
+             --aligner::chunk-size or the preset's read-ahead estimate), so the budget is \
+             lowered to it and the gate cannot grow",
             bytesize::ByteSize(ceiling),
             bytesize::ByteSize(budget)
         )
@@ -1595,8 +1743,14 @@ impl AlignBackend for SubprocessBackend {
         // buffers (FASTQ out, BAM in, merge); the aligner child gets the same
         // setting through its environment (see `AlignerProcess::spawn`).
         crate::aligner::retain_freed_memory_unless_user_set("align");
-        let budget = in_flight_budget_override(std::env::var(IN_FLIGHT_BUDGET_ENV).ok().as_deref())
-            .unwrap_or_else(|| in_flight_budget_for_chunk_size(self.chunk_size));
+        let budget = in_flight_budget(
+            std::env::var(IN_FLIGHT_BUDGET_ENV).ok().as_deref(),
+            self.chunk_size,
+            self.runtime.min_in_flight_budget,
+        );
+        if let Some(dir) = &self.runtime.work_dir {
+            log::info!("align: aligner scratch directory {}", dir.path().display());
+        }
         let ceiling = read_ahead_ceiling(
             budget,
             self.max_read_ahead,
@@ -1624,6 +1778,9 @@ impl AlignBackend for SubprocessBackend {
                 accept_mid_pair_split: self.accept_mid_pair_split,
                 passes_meth: crate::aligner::command_passes_meth(&self.command),
                 input_format: self.input_format,
+                startup_timeout: self.runtime.startup_timeout,
+                require_complete_pairs: self.runtime.require_complete_pairs,
+                work_dir: self.runtime.work_dir.clone(),
             },
             &self.command,
         )
@@ -1660,8 +1817,64 @@ mod tests {
         assert_eq!(max_read_ahead_lowers_budget_warning(budget, requested).is_some(), warned);
     }
 
+    /// The budget is the larger of the chunk-size-derived budget and the
+    /// preset's floor, unless the environment override is set, which wins
+    /// outright (floor included).
+    #[rstest::rstest]
+    #[case::floor_above(None, 1, u64::MAX / 4, u64::MAX / 4)]
+    #[case::floor_below(None, 1_000_000, 1, in_flight_budget_for_chunk_size(1_000_000))]
+    #[case::floor_equal(
+        None,
+        1_000_000,
+        in_flight_budget_for_chunk_size(1_000_000),
+        in_flight_budget_for_chunk_size(1_000_000)
+    )]
+    #[case::no_floor(None, 1_000_000, 0, in_flight_budget_for_chunk_size(1_000_000))]
+    #[case::override_bypasses_floor(Some("4096"), 1_000_000, u64::MAX / 4, 4096)]
+    fn in_flight_budget_takes_the_floor_unless_overridden(
+        #[case] env: Option<&str>,
+        #[case] chunk_size: u64,
+        #[case] floor: u64,
+        #[case] expected: u64,
+    ) {
+        assert_eq!(in_flight_budget(env, chunk_size, floor), expected);
+    }
+
     use super::*;
     use fgumi_raw_bam::flags::{FIRST_SEGMENT, LAST_SEGMENT, PAIRED, REVERSE, SUPPLEMENTARY};
+
+    #[rstest::rstest]
+    #[case::before_deadline(9, None, false)]
+    #[case::at_deadline(10, None, true)]
+    #[case::after_deadline(11, None, true)]
+    #[case::timely_output_late_dispatch(11, Some(9), false)]
+    #[case::output_at_deadline(11, Some(10), true)]
+    #[case::late_output_late_dispatch(12, Some(11), true)]
+    fn startup_wait_deadline(
+        #[case] elapsed_secs: u64,
+        #[case] output_secs: Option<u64>,
+        #[case] expires: bool,
+    ) {
+        let shared = SharedState::new();
+        // Use seconds for a generous margin without sleeping: all observation
+        // and spawn instants are synthetic, on the same monotonic clock.
+        let started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(elapsed_secs))
+            .unwrap();
+        if let Some(output_secs) = output_secs {
+            shared.startup.lock().first_output_at =
+                Some(started_at + std::time::Duration::from_secs(output_secs));
+            shared.end_startup_wait();
+        }
+        let result = shared.claim_startup_wait(started_at, std::time::Duration::from_secs(10));
+        assert_eq!(result.is_err(), expires);
+        if let Err(error) = result {
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            let startup = shared.startup.lock();
+            assert!(startup.over);
+            assert!(startup.claim.is_none(), "expiry releases the watchdog claim");
+        }
+    }
 
     fn make_test_cfg() -> SubprocessConfig {
         SubprocessConfig {
@@ -1674,6 +1887,9 @@ mod tests {
             accept_mid_pair_split: true,
             passes_meth: false,
             input_format: UnalignedReadFormat::Fastq,
+            startup_timeout: None,
+            require_complete_pairs: false,
+            work_dir: None,
         }
     }
 
@@ -1781,6 +1997,68 @@ mod tests {
         Template::from_records(vec![r1, r2]).expect("paired primary template")
     }
 
+    #[rstest::rstest]
+    #[case::star_unpaired(true, &[0], false)]
+    #[case::star_missing_r1(true, &[PAIRED | LAST_SEGMENT], false)]
+    #[case::star_missing_r2(true, &[PAIRED | FIRST_SEGMENT], false)]
+    #[case::star_secondary_mate(true, &[PAIRED | FIRST_SEGMENT, PAIRED | LAST_SEGMENT | SUPPLEMENTARY], false)]
+    #[case::star_unpaired_r1(true, &[0, PAIRED | LAST_SEGMENT], false)]
+    #[case::star_pair(true, &[PAIRED | FIRST_SEGMENT, PAIRED | LAST_SEGMENT], true)]
+    #[case::command_single(false, &[0], true)]
+    #[case::command_orphan(false, &[PAIRED | FIRST_SEGMENT], true)]
+    fn writer_requires_complete_pairs_only_when_configured(
+        #[case] require_complete_pairs: bool,
+        #[case] flags: &[u16],
+        #[case] accepted: bool,
+    ) {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("stdin.sam");
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&captured).unwrap())
+            .spawn()
+            .unwrap();
+        let records = flags.iter().map(|&f| make_record(b"pair_check", f)).collect();
+        let template = Template::from_records(records).unwrap();
+        let (in_tx, in_rx) = sync_channel(1);
+        let (token_tx, token_rx) = channel();
+        in_tx.send(BamTemplateBatch::new(0, vec![template])).unwrap();
+        drop(in_tx);
+        let shared = Arc::new(SharedState::new());
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
+        let result = writer_loop(
+            in_rx,
+            token_tx,
+            cat.stdin.take().unwrap(),
+            Arc::clone(&shared),
+            &gate,
+            UnalignedReadFormat::Sam,
+            require_complete_pairs,
+        );
+        assert!(cat.wait().unwrap().success());
+        assert_eq!(result.is_ok(), accepted);
+        let captured = std::fs::read_to_string(captured).unwrap();
+        if accepted {
+            assert_eq!(token_rx.recv().unwrap().n_templates, 1);
+            assert!(captured.contains("pair_check"));
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("complete primary pair") && error.contains("pair_check"),
+                "{error}"
+            );
+            assert_eq!(shared.take_error().unwrap().to_string(), error);
+            assert_eq!(
+                captured,
+                std::str::from_utf8(UNALIGNED_SAM_HEADER).unwrap(),
+                "no record of the incomplete template may reach STAR"
+            );
+            assert!(token_rx.recv().is_err());
+        }
+    }
+
     #[test]
     fn writer_loop_errors_on_template_with_no_primary_records() {
         use std::process::{Command, Stdio};
@@ -1820,6 +2098,7 @@ mod tests {
             Arc::clone(&shared),
             &gate,
             UnalignedReadFormat::Fastq,
+            false,
         );
 
         assert!(result.is_err(), "writer_loop should reject all-filtered template");
@@ -1892,8 +2171,16 @@ mod tests {
         drop(in_tx);
         let gate =
             InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
-        writer_loop(in_rx, token_tx, cat_stdin, Arc::new(SharedState::new()), &gate, input_format)
-            .expect("writer_loop");
+        writer_loop(
+            in_rx,
+            token_tx,
+            cat_stdin,
+            Arc::new(SharedState::new()),
+            &gate,
+            input_format,
+            false,
+        )
+        .expect("writer_loop");
         cat.wait().expect("cat exits");
 
         let token = token_rx.recv().expect("one token");
@@ -1953,6 +2240,7 @@ mod tests {
                 writer_shared,
                 &writer_gate,
                 UnalignedReadFormat::Fastq,
+                false,
             )
         });
 
@@ -2027,6 +2315,7 @@ mod tests {
                     shared_for_worker,
                     &gate_for_worker,
                     UnalignedReadFormat::Fastq,
+                    false,
                 )
             })
             .expect("spawn writer worker");
@@ -2486,8 +2775,9 @@ mod tests {
         let cfg = make_test_cfg();
         let header_handle = cfg.header_handle.clone();
         let reader_gate = Arc::clone(&gate);
-        let reader =
-            thread::spawn(move || reader_loop_inner(token_rx, &out_tx, stdout, &cfg, &reader_gate));
+        let reader = thread::spawn(move || {
+            reader_loop_inner(token_rx, &out_tx, stdout, &cfg, &SharedState::new(), &reader_gate)
+        });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !header_handle.is_set() || gate.in_flight() != 100 {
             assert!(Instant::now() < deadline, "reader did not start its token");
@@ -2571,6 +2861,7 @@ mod tests {
             &out_tx,
             stdout,
             &cfg,
+            &SharedState::new(),
             &InFlightGate::new(
                 u64::MAX,
                 u64::MAX,

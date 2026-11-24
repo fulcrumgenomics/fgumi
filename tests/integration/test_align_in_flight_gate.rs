@@ -47,12 +47,16 @@ fn write_unmapped_pairs(path: &Path) {
     let records: Vec<RawRecord> = (0..PAIRS)
         .flat_map(|i| {
             let name = format!("q{i:06}");
-            [flags::FIRST_SEGMENT, flags::LAST_SEGMENT].map(|segment| {
+            [
+                (flags::FIRST_SEGMENT, b"ACGTACGTACGTACGTACGT", 30),
+                (flags::LAST_SEGMENT, b"TTGGCCAAGTTTGGCCAAGT", 20),
+            ]
+            .map(|(segment, seq, qual)| {
                 let mut b = SamBuilder::new();
                 b.read_name(name.as_bytes())
                     .flags(flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | segment)
-                    .sequence(b"ACGTACGTACGTACGTACGT")
-                    .qualities(&[30; 20]);
+                    .sequence(seq)
+                    .qualities(&[qual; 20]);
                 b.build()
             })
         })
@@ -143,6 +147,14 @@ fn aligner_reading_past_the_budget_before_output_completes() {
         assert_eq!(record.name().map(ToString::to_string), Some(expected), "record {i}");
         assert!(record.flags().is_unmapped(), "record {i} must be unmapped");
         assert_eq!(record.flags().is_first_segment(), i % 2 == 0, "record {i} segment");
+        assert_eq!(record.flags().is_last_segment(), i % 2 == 1, "record {i} segment");
+        let (seq, qual): (&[u8], &[u8]) = if i % 2 == 0 {
+            (b"ACGTACGTACGTACGTACGT", &[30; 20])
+        } else {
+            (b"TTGGCCAAGTTTGGCCAAGT", &[20; 20])
+        };
+        assert_eq!(record.sequence().as_ref(), seq, "record {i} SEQ");
+        assert_eq!(record.quality_scores().as_ref(), qual, "record {i} QUAL");
     }
 }
 

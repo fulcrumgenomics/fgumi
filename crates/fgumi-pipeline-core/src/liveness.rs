@@ -113,20 +113,40 @@ thread_local! {
 ///
 /// Outside a pipeline worker thread this is just `f()`.
 pub fn external_wait<R>(f: impl FnOnce() -> R) -> R {
-    // Decrement on unwind too, so a panicking call cannot pin the gauge.
-    struct Leave(Arc<AtomicUsize>);
-    impl Drop for Leave {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-    let gauge = EXTERNAL_WAITS.with(|g| g.borrow().clone());
-    let Some(gauge) = gauge else {
-        return f();
-    };
-    gauge.fetch_add(1, Ordering::Relaxed);
-    let _leave = Leave(gauge);
+    // The claim's drop decrements on unwind too, so a panicking call cannot pin
+    // the gauge; off a worker thread there is no claim and this is just `f()`.
+    let _claim = ExternalWaitClaim::begin();
     f()
+}
+
+/// An external wait that outlives one call: taken on a pipeline worker thread
+/// with [`ExternalWaitClaim::begin`] and counted, like an [`external_wait`]
+/// bracket, until it is dropped, on whatever thread that happens.
+///
+/// For a step whose blocking happens on a helper thread it owns rather than
+/// inside a dispatch: the dispatch takes the claim (only a worker thread can
+/// find the pipeline's gauge) and hands it to the helper, which drops it when
+/// the external wait is over. The same rule applies as for [`external_wait`]:
+/// claim only a wait on the outside world.
+#[derive(Debug)]
+pub struct ExternalWaitClaim(Arc<AtomicUsize>);
+
+impl ExternalWaitClaim {
+    /// Start counting an external wait against the pipeline whose worker loop
+    /// runs on the current thread. `None` off a pipeline worker thread, where
+    /// no monitor is watching.
+    #[must_use]
+    pub fn begin() -> Option<Self> {
+        let gauge = EXTERNAL_WAITS.with(|g| g.borrow().clone())?;
+        gauge.fetch_add(1, Ordering::Relaxed);
+        Some(Self(gauge))
+    }
+}
+
+impl Drop for ExternalWaitClaim {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Installs a pipeline's external-wait gauge on the current thread for its
@@ -306,6 +326,24 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(counter.external_waits(), 0);
+    }
+
+    /// A claim counts as an external wait from `begin` until it is dropped,
+    /// including when another thread drops it.
+    #[test]
+    fn a_claim_is_counted_until_dropped_on_any_thread() {
+        let counter = LivenessCounter::new(1);
+        let _scope = counter.enter_thread();
+        let claim = ExternalWaitClaim::begin().expect("a worker thread can claim");
+        assert_eq!(counter.external_waits(), 1, "the claim is counted while held");
+        std::thread::spawn(move || drop(claim)).join().expect("helper thread joins");
+        assert_eq!(counter.external_waits(), 0, "and released when dropped elsewhere");
+    }
+
+    /// Off a pipeline thread there is no gauge to claim.
+    #[test]
+    fn no_claim_outside_an_entered_thread() {
+        assert!(std::thread::spawn(ExternalWaitClaim::begin).join().unwrap().is_none());
     }
 
     /// Off a pipeline thread the bracket is a plain call; once a scope is

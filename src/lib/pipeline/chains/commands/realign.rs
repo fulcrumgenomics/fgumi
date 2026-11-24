@@ -270,6 +270,7 @@ pub(crate) fn resolve_realign_aligner(
     num_threads: usize,
 ) -> Result<ResolvedAligner> {
     let align = &opts.align;
+    align.aligner.check_realign_support()?;
     let resolved = align
         .aligner
         .clone()

@@ -4379,6 +4379,39 @@ fn sam_input_format_matches_fastq_input(#[case] stop_after: &str) {
     let (fastq_header, _) = read_bam_output(&fastq_out);
     assert_eq!(sam_header.reference_sequences(), fastq_header.reference_sequences());
     assert_eq!(sam_records.len(), 6, "every input read must reach the output");
+    let expected = [
+        ("t1".as_bytes(), true, b"ACGTACGTAC".as_slice()),
+        ("t1".as_bytes(), false, b"TTGGCCAAGT".as_slice()),
+        ("t2".as_bytes(), true, b"GGGGCCCCAA".as_slice()),
+        ("t2".as_bytes(), false, b"CATCATCATC".as_slice()),
+        ("t3".as_bytes(), true, b"ACACACACAC".as_slice()),
+        ("t3".as_bytes(), false, b"GTGTGTGTGT".as_slice()),
+    ];
+    for path in [&sam_out, &fastq_out] {
+        let (_, records) = read_bam_output(path);
+        let actual: Vec<_> = records
+            .iter()
+            .map(|record| {
+                assert!(record.flags().is_segmented());
+                assert_ne!(record.flags().is_first_segment(), record.flags().is_last_segment());
+                assert_eq!(
+                    record
+                        .data()
+                        .get(&noodles::sam::alignment::record::data::field::Tag::UMI_SEQUENCE),
+                    Some(&noodles::sam::alignment::record_buf::data::field::Value::String(
+                        "ACGT".into()
+                    )),
+                    "RX must survive the merge"
+                );
+                (
+                    record.name().unwrap().as_ref(),
+                    record.flags().is_first_segment(),
+                    record.sequence().as_ref(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "fixture oracle for {}", path.display());
+    }
 }
 
 /// The SAM-input stand-in really checks its input: given FASTQ (the default
