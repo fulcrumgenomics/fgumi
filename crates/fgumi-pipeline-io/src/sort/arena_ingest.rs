@@ -1456,6 +1456,15 @@ impl TemplateStrategy {
     pub fn new(acc: fgumi_sort::TemplateArenaAccumulator) -> Self {
         Self { acc }
     }
+
+    /// Places half-mapped pairs beside the fully mapped pairs they are copies of.
+    #[must_use]
+    pub fn with_half_mapped_placer(
+        self,
+        placer: Option<Arc<fgumi_sort::half_mapped::HalfMappedPlacer>>,
+    ) -> Self {
+        Self { acc: self.acc.with_half_mapped_placer(placer) }
+    }
 }
 
 impl ArenaSortStrategy for TemplateStrategy {

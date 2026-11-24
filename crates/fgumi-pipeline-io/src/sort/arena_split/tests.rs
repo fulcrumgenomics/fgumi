@@ -607,6 +607,7 @@ impl ArenaKeyExtractor for ProbeKeys {
         _byte_end: u64,
         n: u32,
         _first_index: u64,
+        _ordinal: u64,
     ) -> io::Result<(u32, Option<KeyViolation>)> {
         Ok((n, None))
     }
@@ -871,6 +872,7 @@ fn extract_queryname_keys_shares_the_one_extraction() {
             start + bytes,
             u32::try_from(batch.len()).unwrap(),
             (i * QN_CLASS_BATCH_RECORDS) as u64,
+            0,
         )
         .unwrap();
         assert!(violation.is_none(), "queryname keys have no lanes to violate");
@@ -907,6 +909,7 @@ fn queryname_extract_rejects_mismatched_frames() {
             at,
             end,
             n,
+            0,
             0,
         )
         .expect_err("mismatched frames");
@@ -961,6 +964,7 @@ fn coordinate_run_matches_the_copy_based_sorter(#[values(1usize, 3)] sort_thread
             start + bytes,
             u32::try_from(batch.len()).unwrap(),
             b as u64 * 64,
+            0,
         )
         .unwrap();
         assert!(violation.is_none());
@@ -1027,6 +1031,7 @@ fn coordinate_seal_pieces_split_the_run_in_order(
                     at,
                     at + bytes,
                     u32::try_from(n).unwrap(),
+                    0,
                     0,
                 )
                 .unwrap();
@@ -1147,7 +1152,7 @@ fn sort_run_stages_residual_before_all_announced_each_once() {
     let (arena, at) = arena_with(16, &data);
     let ctx = CoordinateKeys::provision(&2, &bodies[0]);
     let (refs, _) =
-        CoordinateKeys::extract_batch(&ctx, &mut (), &arena, at, at + data.len() as u64, 5, 0)
+        CoordinateKeys::extract_batch(&ctx, &mut (), &arena, at, at + data.len() as u64, 5, 0, 0)
             .unwrap();
     let now = Instant::now();
     let batch = RefBatch::<CoordinateKeys> {
@@ -1213,6 +1218,7 @@ fn sort_run_sizes_the_queryname_pool_to_sort_threads(#[values(1usize, 3)] sort_t
         at,
         at + data.len() as u64,
         4,
+        0,
         0,
     )
     .unwrap();
@@ -1304,9 +1310,17 @@ fn run_batch<X: ArenaKeyExtractor>(
     let data = frames(bodies);
     let (arena, at) = arena_with(16, &data);
     let n = u32::try_from(bodies.len()).unwrap();
-    let (refs, violation) =
-        X::extract_batch(ctx, &mut X::Scratch::default(), &arena, at, at + data.len() as u64, n, 0)
-            .unwrap();
+    let (refs, violation) = X::extract_batch(
+        ctx,
+        &mut X::Scratch::default(),
+        &arena,
+        at,
+        at + data.len() as u64,
+        n,
+        0,
+        ordinal,
+    )
+    .unwrap();
     let now = Instant::now();
     RefBatch {
         arena,

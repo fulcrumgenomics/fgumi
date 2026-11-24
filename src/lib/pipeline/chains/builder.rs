@@ -4729,6 +4729,15 @@ impl<'a> ChainBuilder<'a> {
                     .map_err(|e| anyhow!("create spill temp dirs: {e}"))?;
                 let temp_codec = sort.temp_codec;
                 let temp_compression = sort.temp_compression;
+                // A key tells only so many contigs apart.
+                let placer = (sort_order == SortOrder::TemplateCoordinate
+                    && self.header.reference_sequences().len()
+                        < fgumi_sort::half_mapped::MAX_REFERENCES)
+                    .then(|| {
+                        fgumi_sort::half_mapped::HalfMappedPlacer::new(
+                            temp_dirs[0].path().to_path_buf(),
+                        )
+                    });
                 let temp_dirs = Arc::new(temp_dirs);
                 let alloc = Arc::new(parking_lot::Mutex::new(alloc));
                 let byte_limit = self.tuning.per_step_byte_limit;
@@ -4763,7 +4772,8 @@ impl<'a> ChainBuilder<'a> {
                         &self.header,
                         cell_tag,
                         sort.key_types.unwrap_or_default(),
-                    );
+                    )
+                    .with_half_mapped_placer(placer.clone());
                     let known_width = match sort_order {
                         SortOrder::Coordinate => CoordinateKeys::known_ref_width(&n_ref),
                         SortOrder::Queryname(_) => {
@@ -4854,14 +4864,15 @@ impl<'a> ChainBuilder<'a> {
                         .with_queryname_keys(qn_keys.clone());
                     sort_buffer = sort_buffer
                         .with_phase_cap(phase1_cap.clone())
-                        .with_range_eligibility(range_eligibility);
+                        .with_range_eligibility(range_eligibility)
+                        .with_half_mapped_placer(placer.clone());
                     self.pipeline.append_step(sort_buffer, tail)
                 };
                 // `SpillGather` runs on the off-pool coordination driver
                 // (`StepKind::Detached`, group `sort-coord`) alongside the sort
                 // head, so it never contends a pool worker — the driver frames the
                 // just-sorted chunk into blocks while the pool inflates/compresses.
-                let serialize = SpillGather::new(byte_limit);
+                let serialize = SpillGather::new(byte_limit).with_half_mapped_placer(placer);
                 // Compressed spill-block buffers circulate compress -> write ->
                 // compress instead of being allocated per block.
                 let spill_bufs = fgumi_pipeline_io::sort::SpillBufPool::new();

@@ -30,6 +30,7 @@ pub mod arena_pool;
 pub(crate) mod chunk_sorter;
 pub mod codec;
 pub(crate) mod fd_limit;
+pub mod half_mapped;
 pub(crate) mod inline;
 pub(crate) mod keys;
 pub(crate) mod loser_tree;

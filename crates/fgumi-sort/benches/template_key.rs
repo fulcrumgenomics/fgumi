@@ -164,7 +164,7 @@ fn bench_extract_batch(c: &mut Criterion) {
     group.throughput(criterion::Throughput::Elements(N as u64));
     let warm = make();
     group.bench_function("4096-records-warm", |b| {
-        b.iter(|| black_box(ctx.extract_batch::<TemplateKey24>(&warm, 0, end, n, 0).unwrap()));
+        b.iter(|| black_box(ctx.extract_batch::<TemplateKey24>(&warm, 0, end, n, 0, 0).unwrap()));
     });
     // ~64 arenas × ~1.6 MiB ≈ 100 MiB > any LLC on the reference hosts.
     let cold: Vec<PooledSegmentedBuf> = (0..64).map(|_| make()).collect();
@@ -172,7 +172,7 @@ fn bench_extract_batch(c: &mut Criterion) {
     group.bench_function("4096-records-cold-arena", |b| {
         b.iter(|| {
             i = (i + 1) % cold.len();
-            black_box(ctx.extract_batch::<TemplateKey24>(&cold[i], 0, end, n, 0).unwrap())
+            black_box(ctx.extract_batch::<TemplateKey24>(&cold[i], 0, end, n, 0, 0).unwrap())
         });
     });
     group.finish();

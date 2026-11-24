@@ -36,6 +36,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
 use fgumi_raw_bam::SamTag;
+use fgumi_sort::half_mapped::HalfMappedPlacer;
 use fgumi_sort::{
     KeyTypesSpec, PooledSegmentedBuf, QnLex, QnNatural, QnSortState, QuerynameComparator,
     SegmentedBuf, SortOrder, SpillKeyKind, TemplateArenaAccumulator,
@@ -586,6 +587,19 @@ impl SortBuffer {
     pub fn with_queryname_keys(mut self, keys: QnSortState) -> Self {
         if let Some(sorter) = self.sorter.as_mut() {
             sorter.set_queryname_keys(keys);
+        }
+        self
+    }
+
+    /// Place half-mapped pairs beside the fully mapped pairs they are copies of. A no-op for
+    /// orders other than template-coordinate. Call before the step runs.
+    #[must_use]
+    pub fn with_half_mapped_placer(mut self, placer: Option<Arc<HalfMappedPlacer>>) -> Self {
+        if let Some(ChunkSorter::Template(accum)) =
+            self.sorter.take_if(|sorter| matches!(sorter, ChunkSorter::Template(_)))
+        {
+            let strategy = accum.strategy.with_half_mapped_placer(placer);
+            self.sorter = Some(ChunkSorter::Template(ArenaAccum { strategy, ..accum }));
         }
         self
     }

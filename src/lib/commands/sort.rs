@@ -159,6 +159,20 @@ SORT ORDERS:
   template-coordinate      Template-level position sort for UMI grouping.
                           Use for `fgumi group`, `fgumi dedup`, and `fgumi downsample` input.
 
+HALF-MAPPED PAIRS:
+
+  In template-coordinate order, a pair with one unmapped read (a half-mapped pair) has one known
+  end. It is written beside a fully mapped pair that has the same end: the same library, cell
+  barcode, contig, unclipped 5' position, strand, and UMI. The UMI of an end is the first segment
+  of a two-segment RX tag (e.g. ACGT-CCGG) for read 1 and the second for read 2, or the whole of
+  any other RX tag; it must be equal, in either case. If the pairs with that end have different
+  second ends, or there are none, it is written after the fully mapped pairs of its contig.
+
+  A placed pair's records carry the fully mapped pair's coordinate in the `tc` tag, by which
+  `fgumi sort`, `fgumi merge`, `fgumi group` and `fgumi dedup` place them. Sorting again decides
+  anew. Half-mapped pairs are held in memory, with 24 bytes in a temporary file for each fully
+  mapped pair (the first 16 MiB in memory). Not done with more than 65,534 reference sequences.
+
 PERFORMANCE:
 
   - 1.9x faster than samtools on template-coordinate sort

@@ -104,7 +104,7 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
     fn spill_key_kind(ctx: &Self::Ctx) -> SpillKeyKind;
     /// Re-walk `[byte_start, byte_end)` of `arena` as exactly `n`
     /// `[u32 len][body]` frames and extract one ref per record, with the
-    /// lowest-indexed violation of the batch.
+    /// lowest-indexed violation of the batch. `ordinal` is the batch's place in the input.
     ///
     /// # Errors
     ///
@@ -118,6 +118,7 @@ pub trait ArenaKeyExtractor: Send + Sync + 'static {
         byte_end: u64,
         n: u32,
         first_index: u64,
+        ordinal: u64,
     ) -> io::Result<(Self::Refs, Option<KeyViolation>)>;
     /// Refs in a batch.
     fn refs_len(refs: &Self::Refs) -> usize;
@@ -799,6 +800,7 @@ impl<X: ArenaKeyExtractor> ExtractKeys<X> {
                     batch.byte_end,
                     batch.n_records,
                     batch.first_record_index,
+                    batch.ordinal,
                 )?;
                 (Some(refs), violation)
             }
@@ -1314,8 +1316,9 @@ impl ArenaKeyExtractor for TemplateKeys {
         byte_end: u64,
         n: u32,
         first_index: u64,
+        ordinal: u64,
     ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
-        ctx.extract_batch_erased(arena, byte_start, byte_end, n, first_index)
+        ctx.extract_batch_erased(arena, byte_start, byte_end, n, first_index, ordinal)
     }
 
     fn refs_len(refs: &Self::Refs) -> usize {
@@ -1511,6 +1514,7 @@ impl ArenaKeyExtractor for CoordinateKeys {
         byte_end: u64,
         n: u32,
         first_index: u64,
+        _ordinal: u64,
     ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
         let mut refs: Vec<RecordRef> = Vec::with_capacity(n as usize);
         for_each_frame(arena, byte_start, byte_end, n, first_index, |body, offset, len| {
@@ -1665,6 +1669,7 @@ impl<C: QnChunkOrder> ArenaKeyExtractor for QuerynameKeys<C> {
         byte_end: u64,
         n: u32,
         first_index: u64,
+        _ordinal: u64,
     ) -> io::Result<(Self::Refs, Option<KeyViolation>)> {
         let table = &ctx.table;
         let mut lcp = QnBatchLcp::default();

@@ -637,6 +637,7 @@ fn record_relative_umi(
 /// reader / raw-record pipeline). Callers must not pass arbitrary external bytes;
 /// raw-field accessors will panic on malformed or truncated input.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn compute_group_key_and_umi_from_raw(
     raw: &[u8],
     library_index: &LibraryIndex,
@@ -730,6 +731,22 @@ pub(crate) fn compute_group_key_and_umi_from_raw(
 
     let cell_hash =
         if let Some(cb) = aux_tags.cell { LibraryIndex::hash_cell_barcode(Some(cb)) } else { 0 };
+
+    // A half-mapped pair placed beside a fully mapped pair is grouped with that pair.
+    if let Some(tc) = fgumi_raw_bam::TemplateCoordinateTag::from_half_mapped(raw) {
+        let key = GroupKey::paired(
+            tc.tid1,
+            tc.pos1,
+            u8::from(tc.neg1),
+            tc.tid2,
+            tc.pos2,
+            u8::from(tc.neg2),
+            library_idx,
+            cell_hash,
+            name_hash,
+        );
+        return (key, umi);
+    }
 
     // Check if paired
     let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;

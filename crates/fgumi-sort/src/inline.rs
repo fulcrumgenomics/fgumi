@@ -62,7 +62,12 @@ pub struct InMemoryChunk<K> {
     /// exceed 4 GiB at high `--max-memory` × `--threads`; `len` is
     /// `u32` because individual BAM records are < 4 GiB.
     records: Vec<(K, u64, u32)>,
+    /// Backs the records whose offset has [`MERGED_OFFSET`] set.
+    merged: Option<Arc<PooledSegmentedBuf>>,
 }
+
+/// Set in the offset of a record that [`InMemoryChunk::merge`] added.
+const MERGED_OFFSET: u64 = 1 << 63;
 
 impl<K> InMemoryChunk<K> {
     /// Construct an empty chunk backed by an empty shared buffer.
@@ -71,6 +76,7 @@ impl<K> InMemoryChunk<K> {
         Self {
             data: Arc::new(PooledSegmentedBuf::unpooled(SegmentedBuf::default())),
             records: Vec::new(),
+            merged: None,
         }
     }
 
@@ -78,7 +84,7 @@ impl<K> InMemoryChunk<K> {
     /// the same shared (possibly pooled) data buffer.
     #[must_use]
     pub(crate) fn from_parts(data: Arc<PooledSegmentedBuf>, records: Vec<(K, u64, u32)>) -> Self {
-        Self { data, records }
+        Self { data, records, merged: None }
     }
 
     /// Build a chunk from owned `(key, bytes)` records by packing the bytes into
@@ -103,7 +109,7 @@ impl<K> InMemoryChunk<K> {
                 (key, offset, len)
             })
             .collect();
-        Self { data: Arc::new(PooledSegmentedBuf::unpooled(data)), records }
+        Self { data: Arc::new(PooledSegmentedBuf::unpooled(data)), records, merged: None }
     }
 
     /// Records the chunk's tuple Vec holds without reallocating (tests that
@@ -148,7 +154,39 @@ impl<K> InMemoryChunk<K> {
     #[allow(clippy::cast_possible_truncation)] // offset/len fit in usize on all supported targets
     pub fn record_bytes(&self, i: usize) -> &[u8] {
         let (_, offset, len) = &self.records[i];
-        self.data.slice(*offset as usize, *len as usize)
+        match &self.merged {
+            Some(merged) if offset & MERGED_OFFSET != 0 => {
+                merged.slice((offset & !MERGED_OFFSET) as usize, *len as usize)
+            }
+            _ => self.data.slice(*offset as usize, *len as usize),
+        }
+    }
+
+    /// Merges the records of `other` into this chunk, after any with the same key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if records have been merged into either chunk before.
+    pub(crate) fn merge(&mut self, other: Self)
+    where
+        K: Copy + Ord,
+    {
+        assert!(self.merged.is_none() && other.merged.is_none(), "chunks merge only once");
+        self.merged = Some(other.data);
+        let mut left = self.records.len();
+        let mut added = other.records;
+        self.records.reserve_exact(added.len());
+        self.records.extend_from_slice(&added);
+        for slot in (0..self.records.len()).rev() {
+            let Some((key, offset, len)) = added.last() else { break };
+            if left > 0 && self.records[left - 1].0 > *key {
+                left -= 1;
+                self.records[slot] = self.records[left];
+            } else {
+                self.records[slot] = (*key, offset | MERGED_OFFSET, *len);
+                added.pop();
+            }
+        }
     }
 
     /// The `i`th record's body length in bytes, WITHOUT touching the shared
@@ -2293,6 +2331,31 @@ fn insertion_sort_template_refs<K: TemplateLaneKey>(refs: &mut [TemplateRecordRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Merged records go after those with the same key, and keep their bytes.
+    #[test]
+    fn chunks_merge_in_key_order() {
+        let chunk = |records: &[(u64, &[u8])]| {
+            let owned = records.iter().map(|(key, body)| (*key, body.to_vec())).collect();
+            InMemoryChunk::from_owned_records(owned)
+        };
+        let mut merged = chunk(&[(1, b"a"), (3, b"b"), (3, b"c"), (9, b"d")]);
+        merged.merge(chunk(&[(0, b"v"), (3, b"www"), (5, b"x"), (9, b"y"), (10, b"z")]));
+        let records: Vec<(u64, &[u8])> =
+            (0..merged.len()).map(|i| (*merged.key_at(i), merged.record_bytes(i))).collect();
+        let expected: [(u64, &[u8]); 9] = [
+            (0, b"v"),
+            (1, b"a"),
+            (3, b"b"),
+            (3, b"c"),
+            (3, b"www"),
+            (5, b"x"),
+            (9, b"d"),
+            (9, b"y"),
+            (10, b"z"),
+        ];
+        assert_eq!(records, expected);
+    }
 
     #[test]
     fn test_packed_coord_key_ordering() {

@@ -17,6 +17,7 @@ use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use std::collections::{HashMap, HashSet};
 
 use crate::arena_pool::PooledSegmentedBuf;
+use crate::half_mapped::{HalfMappedPlacer, PlacerBatch};
 use crate::inline::{
     CbKey32, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey, TemplateRecordRef,
     TertKey32,
@@ -110,6 +111,7 @@ pub struct TemplateKeySeed {
     cb_hasher: ahash::RandomState,
     key_types: KeyTypesSpec,
     header_library_varies: bool,
+    placer: Option<Arc<HalfMappedPlacer>>,
 }
 
 impl TemplateKeySeed {
@@ -120,7 +122,21 @@ impl TemplateKeySeed {
     pub fn from_header(header: &Header, cell_tag: Option<SamTag>, key_types: KeyTypesSpec) -> Self {
         let lib_lookup = LibraryLookup::from_header(header);
         let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
-        Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types, header_library_varies }
+        Self {
+            lib_lookup,
+            cell_tag,
+            cb_hasher: cb_hasher(),
+            key_types,
+            header_library_varies,
+            placer: None,
+        }
+    }
+
+    /// Places half-mapped pairs beside the fully mapped pairs they are copies of.
+    #[must_use]
+    pub fn with_half_mapped_placer(mut self, placer: Option<Arc<HalfMappedPlacer>>) -> Self {
+        self.placer = placer;
+        self
     }
 
     /// The seed's parts: library lookup, cell tag, CB hasher, `--key-types`, and
@@ -169,6 +185,7 @@ impl TemplateKeySeed {
             cb_hasher: self.cb_hasher.clone(),
             first_key: TemplateKey::default(),
             variant: select_template_variant(None, KeyTypesSpec::Full, self.header_library_varies),
+            placer: None,
         })
     }
 
@@ -181,13 +198,20 @@ impl TemplateKeySeed {
         );
         let variant =
             select_template_variant(Some(&first_key), self.key_types, self.header_library_varies);
-        Arc::new(TemplateKeyContext {
-            lib_lookup: self.lib_lookup.clone(),
-            cell_tag: self.cell_tag,
-            cb_hasher: self.cb_hasher.clone(),
-            first_key,
-            variant,
-        })
+        let context = |placer| {
+            Arc::new(TemplateKeyContext {
+                lib_lookup: self.lib_lookup.clone(),
+                cell_tag: self.cell_tag,
+                cb_hasher: self.cb_hasher.clone(),
+                first_key,
+                variant,
+                placer,
+            })
+        };
+        if let Some(placer) = &self.placer {
+            placer.set_context(|| context(None));
+        }
+        context(self.placer.clone())
     }
 }
 
@@ -201,6 +225,14 @@ pub struct TemplateKeyContext {
     pub first_key: TemplateKey,
     /// The lanes the narrowed key retains.
     pub variant: TemplateKeyVariant,
+    /// Takes the records of half-mapped pairs.
+    pub(crate) placer: Option<Arc<HalfMappedPlacer>>,
+}
+
+impl std::fmt::Debug for TemplateKeyContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateKeyContext").field("variant", &self.variant).finish_non_exhaustive()
+    }
 }
 
 /// One batch's refs and its lowest-indexed violation. A batch whose
@@ -282,7 +314,10 @@ impl TemplateKeyContext {
     /// batch's span, so the last few records of a batch get no lead
     /// (negligible at 4096 records).
     ///
-    /// Every record gets a ref, a violating one included: the violation is
+    /// The records of half-mapped pairs get no ref when the context has a placer, which takes
+    /// them; `ordinal` is the batch's place in the input.
+    ///
+    /// Every other record gets a ref, a violating one included: the violation is
     /// deferred because batches run out of order, and the caller must fail the
     /// run with the LOWEST-indexed violation across all of them. A batch whose
     /// `violation` is `Some` is therefore never sealed — the caller turns the
@@ -309,6 +344,7 @@ impl TemplateKeyContext {
         byte_end: u64,
         n_records: u32,
         first_record_index: u64,
+        ordinal: u64,
     ) -> io::Result<ExtractedBatch<K>> {
         let start = usize::try_from(byte_start)
             .map_err(|_| malformed(first_record_index, "start overflows usize"))?;
@@ -327,6 +363,7 @@ impl TemplateKeyContext {
         let mut refs: Vec<TemplateRecordRef<K>> =
             Vec::with_capacity(ref_reservation(n_records, span.len()));
         let mut violation: Option<KeyViolation> = None;
+        let mut placed = PlacerBatch::default();
         let mut cur = 0usize;
         for i in 0..u64::from(n_records) {
             let record = first_record_index + i;
@@ -375,13 +412,21 @@ impl TemplateKeyContext {
                     name: violation_read_name(body),
                 });
             }
+            cur = body_end;
+            if let Some(placer) = &self.placer
+                && placer.observe(body, &full, &mut placed)
+            {
+                continue;
+            }
             refs.push(TemplateRecordRef {
                 key: K::from_full(&full),
                 offset: byte_start + body_start as u64,
                 len: bs,
                 padding: 0,
             });
-            cur = body_end;
+        }
+        if let Some(placer) = &self.placer {
+            placer.commit(placed, ordinal);
         }
         if cur != span.len() {
             return Err(malformed(
@@ -411,6 +456,7 @@ impl TemplateKeyContext {
         byte_end: u64,
         n_records: u32,
         first_record_index: u64,
+        ordinal: u64,
     ) -> io::Result<(ExtractedRefs, Option<KeyViolation>)> {
         macro_rules! run {
             ($k:ty, $arm:ident) => {{
@@ -420,6 +466,7 @@ impl TemplateKeyContext {
                     byte_end,
                     n_records,
                     first_record_index,
+                    ordinal,
                 )?;
                 (ExtractedRefs::$arm(b.refs), b.violation)
             }};
@@ -646,6 +693,27 @@ pub fn extract_template_key_inline(
                 is_upper,
             );
         }
+    }
+
+    // A half-mapped pair placed beside a fully mapped pair sorts with that pair.
+    if is_paired
+        && is_unmapped != mate_unmapped
+        && let Some(tc) = TemplateCoordinateTag::from_half_mapped(bam_bytes)
+    {
+        let (pos1, pos2) = tc.zero_based_positions();
+        return TemplateKey::new(
+            tc.tid1,
+            pos1,
+            tc.neg1,
+            tc.tid2,
+            pos2,
+            tc.neg2,
+            cb_hash,
+            library,
+            mi,
+            name_hash,
+            is_unmapped,
+        );
     }
 
     // Handle unmapped reads
@@ -982,7 +1050,7 @@ mod tests {
         let (arena, start, end) = arena_with(&records, 0);
         macro_rules! check {
             ($k:ty) => {{
-                let batch = ctx.extract_batch::<$k>(&arena, start, end, 8, 0).unwrap();
+                let batch = ctx.extract_batch::<$k>(&arena, start, end, 8, 0, 0).unwrap();
                 assert!(batch.violation.is_none());
                 assert_eq!(batch.refs.len(), records.len());
                 let mut off = start + 4;
@@ -1025,7 +1093,7 @@ mod tests {
         // `None` drops the CB lane, so differing barcodes violate.
         let ctx = seed(Some(SamTag::CB), KeyTypesSpec::None).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
-        let batch = ctx.extract_batch::<TemplateKey24>(&arena, start, end, 5, 1000).unwrap();
+        let batch = ctx.extract_batch::<TemplateKey24>(&arena, start, end, 5, 1000, 0).unwrap();
         let v = batch.violation.expect("the dropped CB lane must be reported");
         assert_eq!(v.record_index, 1002, "r2a is record 2 of a batch starting at 1000");
         assert_eq!(v.name, "r2a");
@@ -1044,7 +1112,7 @@ mod tests {
         // `None` drops the CB lane; the bad record has no CB, so it violates.
         let ctx = seed(Some(SamTag::CB), KeyTypesSpec::None).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
-        let batch = ctx.extract_batch::<TemplateKey24>(&arena, start, end, 2, 0).unwrap();
+        let batch = ctx.extract_batch::<TemplateKey24>(&arena, start, end, 2, 0, 0).unwrap();
         let v = batch.violation.expect("the missing CB is a dropped-lane violation");
         assert_eq!((v.record_index, v.name.as_str()), (1, "<malformed read name>"));
     }
@@ -1059,7 +1127,7 @@ mod tests {
         let ctx = seed(None, KeyTypesSpec::Full).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, BASE);
         assert_eq!(start, BASE as u64);
-        let batch = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 4, 0).unwrap();
+        let batch = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 4, 0, 0).unwrap();
         assert_eq!(batch.refs.len(), records.len());
         for (r, original) in batch.refs.iter().zip(&records) {
             assert!(r.offset >= BASE as u64 + 4);
@@ -1091,7 +1159,7 @@ mod tests {
         let ctx = seed(None, KeyTypesSpec::Full).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
         let Err(err) =
-            ctx.extract_batch::<TemplateKey40>(&arena, start, end - trim_end, n_records, 77)
+            ctx.extract_batch::<TemplateKey40>(&arena, start, end - trim_end, n_records, 77, 0)
         else {
             panic!("malformed batch must be rejected");
         };
@@ -1112,7 +1180,7 @@ mod tests {
             (0..3).map(|i| rec(300 + i, format!("c{i}a").as_bytes(), &[])).collect();
         let ctx = seed(None, KeyTypesSpec::Full).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
-        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, u32::MAX - 1, 9)
+        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, u32::MAX - 1, 9, 0)
         else {
             panic!("a corrupt record count must be rejected");
         };
@@ -1129,14 +1197,14 @@ mod tests {
             (0..3).map(|i| rec(300 + i, format!("o{i}a").as_bytes(), &[])).collect();
         let ctx = seed(None, KeyTypesSpec::Full).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
-        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 3, u64::MAX - 1)
+        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 3, u64::MAX - 1, 0)
         else {
             panic!("an overflowing record index range must be rejected");
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("record index range overflows u64"), "{err}");
         // The last index of the range is exactly `u64::MAX`: still valid.
-        assert!(ctx.extract_batch::<TemplateKey40>(&arena, start, end, 3, u64::MAX - 2).is_ok());
+        assert!(ctx.extract_batch::<TemplateKey40>(&arena, start, end, 3, u64::MAX - 2, 0).is_ok());
     }
 
     /// The reservation never exceeds the frames the span can hold, and is the
@@ -1156,7 +1224,7 @@ mod tests {
         let first = rec(1, b"f0a", &[]);
         let ctx = seed(None, KeyTypesSpec::Full).provision(&first);
         let (arena, start, end) = arena_with(&[vec![0u8; 12]], 0);
-        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 1, 5) else {
+        let Err(err) = ctx.extract_batch::<TemplateKey40>(&arena, start, end, 1, 5, 0) else {
             panic!("a 12-byte frame must be rejected");
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -1190,7 +1258,7 @@ mod tests {
         let ctx = seed(None, spec).provision(&records[0]);
         assert_eq!(ctx.variant, want);
         let (arena, start, end) = arena_with(&records, 0);
-        let (refs, violation) = ctx.extract_batch_erased(&arena, start, end, 5, 0).unwrap();
+        let (refs, violation) = ctx.extract_batch_erased(&arena, start, end, 5, 0, 0).unwrap();
         assert!(violation.is_none());
         assert_eq!(refs.variant(), want);
         assert_eq!(refs.len(), 5);
@@ -1224,7 +1292,7 @@ mod tests {
 
         let ctx = seed(Some(SamTag::CB), KeyTypesSpec::None).provision(&records[0]);
         let (arena, start, end) = arena_with(&records, 0);
-        let (_, violation) = ctx.extract_batch_erased(&arena, start, end, 2, 0).unwrap();
+        let (_, violation) = ctx.extract_batch_erased(&arena, start, end, 2, 0, 0).unwrap();
         let batched = violation.expect("the batch reports the differing CB").into_io_error();
         assert_eq!(batched.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(batched.to_string(), format!("{serial:#}"));
@@ -1236,7 +1304,7 @@ mod tests {
         let first = rec(1, b"z0a", &[]);
         let ctx = seed(None, KeyTypesSpec::Auto).provision(&first);
         let (arena, start, _) = arena_with(&[first], 0);
-        let b = ctx.extract_batch::<TemplateKey24>(&arena, start, start, 0, 9).unwrap();
+        let b = ctx.extract_batch::<TemplateKey24>(&arena, start, start, 0, 9, 0).unwrap();
         assert!(b.refs.is_empty() && b.violation.is_none());
     }
 }

@@ -64,7 +64,8 @@ use std::io;
 use std::sync::Arc;
 
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
-use fgumi_sort::{RunBound, SpillKeyKind};
+use fgumi_sort::half_mapped::HalfMappedPlacer;
+use fgumi_sort::{RunBound, SpillKeyKind, TemplateMemChunk};
 use log::info;
 
 use crate::sort::protocol::{MemoryChunkErased, SortChunkEvent, SpillBlockEvent};
@@ -298,6 +299,11 @@ pub struct SpillGather {
     /// Frames (blocks of `block_size`) planned into one range.
     frames_per_range: usize,
     output_byte_limit: u64,
+    placer: Option<Arc<HalfMappedPlacer>>,
+    /// One more than the last spill's `seq`.
+    next_seq: u32,
+    /// The terminal event, while the half-mapped templates' chunk goes before it.
+    deferred: Option<SortChunkEvent>,
 }
 
 impl SpillGather {
@@ -318,6 +324,71 @@ impl SpillGather {
             block_size: BGZF_MAX_BLOCK_SIZE,
             frames_per_range: FRAMES_PER_RANGE,
             output_byte_limit,
+            placer: None,
+            next_seq: 0,
+            deferred: None,
+        }
+    }
+
+    /// Adds the records `placer` holds as the sort's last run.
+    #[must_use]
+    pub fn with_half_mapped_placer(mut self, placer: Option<Arc<HalfMappedPlacer>>) -> Self {
+        self.placer = placer;
+        self
+    }
+
+    /// Adds the half-mapped templates' chunk once every run has arrived. It is merged into the
+    /// only run of a sort that fits in memory. Otherwise it goes where the final run went, to
+    /// memory or to disk, and the terminal event follows it.
+    fn with_half_mapped_run(&mut self, event: SortChunkEvent) -> io::Result<SortChunkEvent> {
+        let mut event = event;
+        match &mut event {
+            SortChunkEvent::Spill { seq, .. } => self.next_seq = *seq + 1,
+            // A sort that fits in memory keeps its one chunk.
+            SortChunkEvent::Residual {
+                chunk: MemoryChunkErased::TemplateCoordinate(chunk),
+                ..
+            } if self.chunks_spilled == 0 && !chunk.is_empty() => {
+                if let Some(placed) = self.take_half_mapped()? {
+                    chunk.merge(placed);
+                }
+            }
+            SortChunkEvent::Residual { .. } | SortChunkEvent::AllAnnounced { .. } => {}
+        }
+        let SortChunkEvent::AllAnnounced {
+            slot_count,
+            memory_chunk_count,
+            total_records,
+            index_stride,
+        } = event
+        else {
+            return Ok(event);
+        };
+        let Some(chunk) = self.take_half_mapped()? else { return Ok(event) };
+        let chunk = MemoryChunkErased::TemplateCoordinate(chunk);
+        let spilled = slot_count > 0 && memory_chunk_count == 0;
+        self.deferred = Some(SortChunkEvent::AllAnnounced {
+            slot_count: slot_count + u32::from(spilled),
+            memory_chunk_count: memory_chunk_count + u32::from(!spilled),
+            total_records,
+            index_stride,
+        });
+        Ok(if spilled {
+            SortChunkEvent::Spill {
+                seq: self.next_seq,
+                chunk,
+                records_ingested_so_far: total_records,
+                index_stride,
+            }
+        } else {
+            SortChunkEvent::Residual { chunk, records_ingested_so_far: total_records }
+        })
+    }
+
+    fn take_half_mapped(&mut self) -> io::Result<Option<TemplateMemChunk>> {
+        match self.placer.take() {
+            Some(placer) => placer.take_chunk().map_err(io::Error::other),
+            None => Ok(None),
         }
     }
 
@@ -605,7 +676,11 @@ impl Step for SpillGather {
         }
 
         // No active chunk and nothing pending — ingest the next event.
-        if let Some(event) = ctx.input.pop() {
+        let event = match self.deferred.take() {
+            Some(event) => Some(event),
+            None => ctx.input.pop().map(|event| self.with_half_mapped_run(event)).transpose()?,
+        };
+        if let Some(event) = event {
             self.stage_event(event);
             // Plan the first blocks of a freshly-parked chunk so we make progress.
             if self.active.is_some() {

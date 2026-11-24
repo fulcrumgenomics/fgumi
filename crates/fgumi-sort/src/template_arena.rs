@@ -35,6 +35,7 @@ use noodles::sam::Header;
 
 use crate::arena_pool::PooledSegmentedBuf;
 use crate::frame_keyed_record_into;
+use crate::half_mapped::{HalfMappedPlacer, PlacerBatch};
 use crate::inline::{
     CbKey32, InMemoryChunk, TemplateKey, TemplateKey24, TemplateKey40, TemplateLaneKey,
     TemplateRecordRef, TertKey32, sort_template_refs_into_pieces, sort_template_refs_into_records,
@@ -48,6 +49,9 @@ use crate::template_key::{
     KeyTypesSpec, TemplateKeyVariant, dropped_lane_error, violation_read_name,
 };
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
+
+/// Records read before a [`TemplateArenaAccumulator`] gives its placer what they add.
+const PLACER_BATCH_RECORDS: usize = 4 * 1024;
 
 /// Variant-carrying erased template residual chunk: one arm per `--key-types`
 /// narrowed lane. Lets `MemoryChunkErased::TemplateCoordinate` hold whichever
@@ -158,6 +162,21 @@ impl TemplateMemChunk {
             TemplateMemChunk::Tert32(c) => RunBound::TemplateTert32(*c.key_at(last)),
             TemplateMemChunk::K40(c) => RunBound::TemplateK40(*c.key_at(last)),
         })
+    }
+
+    /// Merges the records of `other`, whose arm must be the same, into this chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the arms differ, or if records have been merged into either chunk before.
+    pub fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (Self::K24(chunk), Self::K24(other)) => chunk.merge(other),
+            (Self::Cb32(chunk), Self::Cb32(other)) => chunk.merge(other),
+            (Self::Tert32(chunk), Self::Tert32(other)) => chunk.merge(other),
+            (Self::K40(chunk), Self::K40(other)) => chunk.merge(other),
+            _ => panic!("the lane variant is per-sort, so chunks of one sort have the same arm"),
+        }
     }
 
     /// Frame the `i`th record into `out` in the spill layout
@@ -388,6 +407,9 @@ pub struct TemplateArenaAccumulator {
     /// provisions the context. One `Option` so "refs exist exactly when the
     /// context does" holds by construction.
     state: Option<(Arc<TemplateKeyContext>, TemplateArenaRefs)>,
+    /// What the latest records add to the half-mapped placer, and how many batches came before.
+    placed: PlacerBatch,
+    placed_batches: u64,
     /// See [`BoundedSortPool`].
     sort_pool: BoundedSortPool,
 }
@@ -401,8 +423,17 @@ impl TemplateArenaAccumulator {
         Self {
             seed: TemplateKeySeed::from_header(header, cell_tag, key_types),
             state: None,
+            placed: PlacerBatch::default(),
+            placed_batches: 0,
             sort_pool: BoundedSortPool::new("tmpl-sort"),
         }
+    }
+
+    /// Places half-mapped pairs beside the fully mapped pairs they are copies of.
+    #[must_use]
+    pub fn with_half_mapped_placer(mut self, placer: Option<Arc<HalfMappedPlacer>>) -> Self {
+        self.seed = self.seed.with_half_mapped_placer(placer);
+        self
     }
 
     /// Refs accumulated for the current run (what the next seal sorts).
@@ -438,19 +469,37 @@ impl TemplateArenaAccumulator {
                 body.len()
             );
         }
-        let Some((ctx, refs)) = self.state.as_mut() else {
+        let (ctx, refs) = self.state.get_or_insert_with(|| {
             let ctx = self.seed.provision(body);
-            let mut refs = TemplateArenaRefs::for_variant(ctx.variant);
-            refs.push_full(&ctx.first_key, body_off, len);
-            self.state = Some((ctx, refs));
-            return Ok(());
-        };
+            let refs = TemplateArenaRefs::for_variant(ctx.variant);
+            (ctx, refs)
+        });
         let (key, violation) = ctx.extract_one(body);
         if let Some(v) = violation {
             return Err(dropped_lane_error(&violation_read_name(body), v));
         }
+        if let Some(placer) = &ctx.placer {
+            let held = placer.observe(body, &key, &mut self.placed);
+            if self.placed.len() >= PLACER_BATCH_RECORDS {
+                placer.commit(std::mem::take(&mut self.placed), self.placed_batches);
+                self.placed_batches += 1;
+            }
+            if held {
+                return Ok(());
+            }
+        }
         refs.push_full(&key, body_off, len);
         Ok(())
+    }
+
+    /// Gives the placer what the records pushed so far add to it.
+    fn commit_placed(&mut self) {
+        if let Some((ctx, _)) = &self.state
+            && let Some(placer) = &ctx.placer
+        {
+            placer.commit(std::mem::take(&mut self.placed), self.placed_batches);
+            self.placed_batches += 1;
+        }
     }
 
     /// Sort the refs accumulated for the current run and drain them into an
@@ -482,6 +531,7 @@ impl TemplateArenaAccumulator {
         arena: Arc<PooledSegmentedBuf>,
         sort_threads: usize,
     ) -> TemplateMemChunk {
+        self.commit_placed();
         let Some((_, refs)) = self.state.as_mut() else {
             return TemplateMemChunk::K40(InMemoryChunk::default());
         };
@@ -503,6 +553,7 @@ impl TemplateArenaAccumulator {
         sort_threads: usize,
         pieces: usize,
     ) -> Vec<TemplateMemChunk> {
+        self.commit_placed();
         let Some((_, refs)) = self.state.as_mut() else {
             return vec![TemplateMemChunk::K40(InMemoryChunk::default())];
         };
@@ -762,7 +813,7 @@ mod tests {
             let start = chunk[0].0 - 4;
             let end = chunk.last().map(|&(o, l)| o + u64::from(l)).unwrap();
             let n = u32::try_from(chunk.len()).unwrap();
-            let (batch, v) = ctx.extract_batch_erased(&arena, start, end, n, idx).unwrap();
+            let (batch, v) = ctx.extract_batch_erased(&arena, start, end, n, idx, 0).unwrap();
             assert!(v.is_none());
             refs.append(batch);
             idx += u64::from(n);
