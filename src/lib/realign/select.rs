@@ -205,7 +205,12 @@ pub(crate) enum Selection {
 ///   for the hit in a six-field list (`-u`). With the four-field
 ///   `XA` it is recomputed with `scoring` from its CIGAR and `XA`'s edit distance
 ///   (mismatches = `NM` minus indel bases), so bisulfite conversions bwa did not
-///   count are not penalised. That approximates bwa's score: bwa scores a base
+///   count are not penalised (bwa-mem3 0.8.0 and later; before 0.8.0, `--meth`
+///   counted conversions in `NM`, so they would be scored as mismatches). The
+///   conversions are the substitutions the regenerated MD lists beyond those
+///   mismatches, and each scores
+///   [`BwaScoring::conversion`]: a match under collapsed or genomic scoring, 0
+///   under neutral (TAPS's default). That approximates bwa's score: bwa scores a base
 ///   against an `N` (in the read or the reference) as -1, while here every
 ///   mismatch counted in `NM` costs `-B`, and bwa's local-alignment clipping is
 ///   taken as given by the `XA` CIGAR. `AS` and `XS` are stored in the smallest
@@ -521,12 +526,20 @@ fn promote(
     }
     let indel: i64 =
         ops.iter().filter(|&&op| matches!(op & 0xF, 1 | 2)).map(|&op| i64::from(op >> 4)).sum();
-    let mismatches = u32::try_from((i64::from(hit.nm) - indel).max(0)).unwrap_or(u32::MAX);
+    let mismatches = (i64::from(hit.nm) - indel).max(0);
+    // The literal MD lists every substitution, conversions included; those
+    // beyond bwa's mismatches are the conversions it freed.
+    let substitutions =
+        fgumi_raw_bam::find_string_tag(fgumi_raw_bam::aux_data_slice(record), SamTag::MD)
+            .map_or(0, md_substitutions);
+    let conversions = u32::try_from((substitutions - mismatches).max(0)).unwrap_or(u32::MAX);
+    let mismatches = u32::try_from(mismatches).unwrap_or(u32::MAX);
     if !had_uq {
         fgumi_raw_bam::remove_tag(record, SamTag::UQ);
     }
     fgumi_raw_bam::update_int_tag(record, SamTag::NM, i32::try_from(hit.nm).unwrap_or(i32::MAX));
-    let score = hit.score_mapq.map_or_else(|| scoring.score(ops, mismatches), |(score, _)| score);
+    let score =
+        hit.score_mapq.map_or_else(|| scoring.score(ops, mismatches, conversions), |(s, _)| s);
     fgumi_raw_bam::update_int_tag(record, SamTag::AS, score);
     match old_score.and_then(|v| i32::try_from(v).ok()) {
         Some(v) => fgumi_raw_bam::update_int_tag(record, SamTag::XS, v),
@@ -550,6 +563,23 @@ fn promote(
         fgumi_raw_bam::remove_tag(record, tag);
     }
     Ok(())
+}
+
+/// The number of substituted bases an MD tag lists: its letters outside the
+/// `^` deletion runs.
+fn md_substitutions(md: &[u8]) -> i64 {
+    let mut count = 0;
+    let mut in_deletion = false;
+    for &c in md {
+        if c == b'^' {
+            in_deletion = true;
+        } else if c.is_ascii_digit() {
+            in_deletion = false;
+        } else if !in_deletion {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Per-alignment tags removed from a record promoted to primary: bwa-mem3's
@@ -1788,6 +1818,62 @@ mod tests {
         assert_eq!(fgumi_raw_bam::find_int_tag(aux(out), SamTag::XS), Some(150));
         assert_eq!(fgumi_raw_bam::find_tag_type(aux(out), SamTag::AS), Some(b'c'), "AS type");
         assert_eq!(fgumi_raw_bam::find_tag_type(aux(out), SamTag::XS), Some(b's'), "XS type");
+    }
+
+    /// A promoted four-field hit's conversions (the MD substitutions beyond
+    /// `XA`'s `NM`) score [`BwaScoring::conversion`]: a match under EM-seq's
+    /// genomic default (and collapsed scoring), 0 under TAPS's neutral default,
+    /// as bwa-mem3 scores them.
+    #[rstest]
+    #[case::emseq_conversions_score_as_matches("--meth", None, 0, "6C2C10", 20)]
+    #[case::taps_conversions_score_zero("--meth=taps", None, 0, "6C2C10", 18)]
+    #[case::taps_explicit_neutral("--meth --meth-scoring neutral", None, 0, "6C2C10", 18)]
+    // One real mismatch (NM 1) besides the two conversions: 17 matches, two
+    // conversions at 0, one mismatch at -4.
+    #[case::taps_mismatch_and_conversions("--meth=taps", Some(5), 1, "5T0C2C10", 13)]
+    // EM-seq's genomic default: 19 matches (conversions included), one mismatch
+    // at -4; collapsed scoring's -B 2 makes it -2.
+    #[case::emseq_mismatch_and_conversions("--meth", Some(5), 1, "5T0C2C10", 15)]
+    #[case::collapsed_mismatch_and_conversions(
+        "--meth --meth-scoring collapsed",
+        Some(5),
+        1,
+        "5T0C2C10",
+        17
+    )]
+    fn promoted_as_scores_conversions(
+        fx: Fixture,
+        #[case] meth: &str,
+        #[case] mismatch_at: Option<usize>,
+        #[case] nm: i32,
+        #[case] md: &str,
+        #[case] expected_as: i64,
+    ) {
+        let scoring = BwaScoring::from_command(&format!("bwa-mem3 mem {meth} -p ref.fa -"));
+        let xa: &'static str = if nm == 0 { "chr1,+101,20M,0;" } else { "chr1,+101,20M,1;" };
+        let mut r1 =
+            end(Some((1, 51, false, "20M")), 0, 20, Some(xa), Some(RW1)).with_conversions(&[6, 9]);
+        if let Some(at) = mismatch_at {
+            r1 = r1.with_mismatch(at);
+        }
+        let mut template = build_template(&r1, None, false);
+        let got = select_primary(&mut template, &fx.reference, &fx.header, &scoring)
+            .expect("select_primary");
+        assert_eq!(got.ends[0], Selection::Swapped);
+        let out = template.r1().expect("r1");
+        assert_eq!(fgumi_raw_bam::find_string_tag(aux(out), SamTag::MD), Some(md.as_bytes()), "MD");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux(out), SamTag::NM), Some(i64::from(nm)), "NM");
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux(out), SamTag::AS), Some(expected_as), "AS");
+    }
+
+    #[rstest]
+    #[case::none("20", 0)]
+    #[case::substitutions("6C2C10", 2)]
+    #[case::adjacent("5T0C2C10", 3)]
+    #[case::deletion_not_counted("5^AC3G4", 1)]
+    #[case::substitution_after_deletion("5^A0T4", 1)]
+    fn md_substitutions_cases(#[case] md: &str, #[case] expected: i64) {
+        assert_eq!(md_substitutions(md.as_bytes()), expected);
     }
 
     /// A lone mate (its other end filtered away) that is swapped stays one end

@@ -121,6 +121,50 @@ fn realign_input_without_rw_fails(#[case] templates: usize, #[case] checked: &st
     assert_eq!(output_records(&tmp.path().join("out.bam")), 0, "no read may be written");
 }
 
+/// [`UNMAPPED_ALIGNER`] with a bwa-mem3 `@PG` of version `vn` (none when
+/// `None`), and `--meth=taps` among its `mem` options when `meth` (the stand-in
+/// ignores its arguments; the command is what fgumi reads `--meth` from).
+fn versioned_unmapped_aligner(vn: Option<&str>, meth: bool) -> String {
+    let pg = vn.map_or(String::new(), |vn| {
+        format!("; print \"@PG\", \"ID:bwa-mem3\", \"PN:bwa-mem3\", \"VN:{vn}\"")
+    });
+    let with_pg = UNMAPPED_ALIGNER.replacen("\"LN:10000\" }", &format!("\"LN:10000\"{pg} }}"), 1);
+    let options = if meth { "mem --meth=taps " } else { "" };
+    with_pg.replacen("# {ref}", &format!("# {options}{{ref}}"), 1)
+}
+
+/// With `--meth` in the aligner command, a bwa-mem3 whose `@PG` names a release
+/// before 0.8.0 (whose `NM` counts methylation conversions as mismatches) is
+/// refused before any record is written; 0.8.0 or later, a version-less header,
+/// or no `--meth` runs.
+#[rstest::rstest]
+#[case::old_bwa_mem3_with_meth(Some("0.7.0"), true, false)]
+#[case::fixed_bwa_mem3_with_meth(Some("0.8.0-dirty"), true, true)]
+#[case::no_version_with_meth(None, true, true)]
+#[case::old_bwa_mem3_without_meth(Some("0.7.0"), false, true)]
+fn realign_refuses_meth_from_bwa_mem3_before_0_8(
+    #[case] vn: Option<&str>,
+    #[case] meth: bool,
+    #[case] runs: bool,
+) {
+    let tmp = TempDir::new().expect("tempdir");
+    let input = write_consensus(tmp.path(), 2, |_| (Some("chr1:1-100:+"), Some("chr1:1-100:-")));
+    let reference = create_test_reference(tmp.path());
+    let output = tmp.path().join("out.bam");
+    let result = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", &versioned_unmapped_aligner(vn, meth)])
+        .output()
+        .expect("spawn fgumi realign");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.success(), runs, "{stderr}");
+    if !runs {
+        assert!(stderr.contains("bwa-mem3 0.7.0 run with --meth"), "{stderr}");
+        assert!(stderr.contains("needs bwa-mem3 0.8.0 or later"), "{stderr}");
+        assert_eq!(output_records(&output), 0, "no read may be written");
+    }
+}
+
 /// The records in the BAM at `path`; 0 when nothing (or no complete header)
 /// was written, as when a run fails before its output header.
 fn output_records(path: &Path) -> usize {

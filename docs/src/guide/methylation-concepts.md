@@ -52,7 +52,7 @@ Copies of one strand must agree on everything. The two strands of a molecule mus
 
 A standard aligner counts every converted T as a mismatch, so a well-converted EM-seq read can look too different from the genome to place. A bisulfite-aware aligner, such as `bwa-mem3 mem --meth` or bwameth, matches the read with every C treated as a T and then scores it against the real reference. `bwa-mem3 mem --meth` also writes `XG` (the original strand: `CT` for top, `GA` for bottom), `XR`, and `XM`, a per-base methylation call in Bismark's format: upper case is methylated and lower case unmethylated, with `Z`/`z` for CpG, `X`/`x` for CHG and `H`/`h` for CHH (H is any base but G). bwameth writes `YC`/`YD` instead, which MethylDackel reads.
 
-The pipeline aligns twice. The raw reads are aligned first, so that the reads of each molecule can be grouped. The consensus reads are new, unaligned sequences and are aligned again, with the aligner that suits the consensus: a simplex read still shows its converted bases and goes back through the bisulfite-aware aligner, while a duplex read is the molecule's real sequence and goes through a standard aligner. TAPs converts only methylated cytosines, which are few, so TAPs reads align with a standard aligner throughout.
+The pipeline aligns twice. The raw reads are aligned first, so that the reads of each molecule can be grouped. The consensus reads are new, unaligned sequences and are aligned again, with the aligner that suits the consensus: a simplex read still shows its converted bases and goes back through the bisulfite-aware aligner, while a duplex read is the molecule's real sequence and goes through a standard aligner. TAPs converts only methylated cytosines, which are few, so a standard aligner can place TAPs reads, but bwa-mem3's TAPs mode (`--meth=taps`) places more of them correctly; it follows the same rule, raw and simplex reads through `--meth=taps` and duplex reads through a standard aligner.
 
 ## Simplex Consensus
 
@@ -116,10 +116,12 @@ fgumi never treats hemimethylation as an error. The filter option `--require-str
 | **Calls are** | Reference-anchored, one strand per read | Molecule-based, both strands in one read |
 | **The read shows** | The converted bases (T at an unmethylated C) | The molecule's real sequence |
 | **Methylation is in** | The sequence, plus `cu`/`ct` counts | `MM`/`ML` for each strand, plus counts |
-| **Re-align with** | `bwa-mem3 mem --meth -Y` (EM-seq) or `bwa-mem3 mem -Y` (TAPs) | `bwa-mem3 mem -Y` |
-| **Read with** | MethylDackel, Bismark's extractor, `XM` (`bwa-mem3 --meth`) | `modkit pileup-hemi`, variant callers |
+| **Re-align with** | `bwa-mem3 mem --meth -Y` (EM-seq) or `bwa-mem3 mem --meth=taps -Y` (TAPs) | `bwa-mem3 mem -Y` |
+| **Read with** | MethylDackel, Bismark's extractor, `XM` (`bwa-mem3 --meth` or `--meth=taps`) | `modkit pileup-hemi`, variant callers |
 | **Best for** | Methylation levels per CpG across a region or sample | Per-molecule patterns, hemimethylation, variants next to methylation |
 
 For libraries with UMIs on both ends, paired grouping followed by simplex is the recommended default. Run it as standalone commands: `runall --consensus simplex` does not accept `--group::strategy paired`. The `/A` and `/B` reads of one molecule cover different cytosines, so methylation calls are not counted twice. Coverage, molecule counts and variant evidence that pool both strands do count that molecule twice.
 
-Sequence-based callers such as MethylDackel and Bismark's extractor assume EM-seq or bisulfite chemistry, where an unconverted C is methylated. On TAPs simplex output their methylated and unmethylated calls are swapped: read TAPs simplex methylation from `cu`/`ct`, or invert the caller's columns. Duplex `MM`/`ML` already use the TAPs meaning.
+Sequence-based callers such as MethylDackel and Bismark's extractor assume EM-seq or bisulfite chemistry, where an unconverted C is methylated. On TAPs simplex output their methylated and unmethylated calls are swapped: read TAPs simplex methylation from `cu`/`ct`, from the `XM` tag of `bwa-mem3 mem --meth=taps`, or invert the caller's columns. Duplex `MM`/`ML` already use the TAPs meaning.
+
+`XM` is missing from some re-aligned reads: when `fgumi realign` promotes an alternative alignment from `XA`, it removes `XM` (the calls were made at the old placement) rather than recomputing it, and it also removes the `XM` of a hard-clipped supplementary piece it promotes. An analysis that reads only `XM` skips those reads; read their methylation from `cu`/`ct` instead.
