@@ -428,13 +428,13 @@ impl QualityEncoding {
 /// are a UMI and the second five bases should be skipped, you might specify:
 ///
 /// ```text
-/// --input r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
+/// --inputs r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
 /// ```
 ///
 /// Alternative if you know your reads are of fixed length you could specify:
 ///
 /// ```text
-/// --input r1.fq r2.fq i1.fq --read-structures 5M5S65T 75T 8B
+/// --inputs r1.fq r2.fq i1.fq --read-structures 5M5S65T 75T 8B
 /// ```
 ///
 /// For more information on read structures see the
@@ -512,11 +512,13 @@ varying length.
 For example, to convert a paired-end run with an index read and where the first 5 bases of R1 are
 a UMI and the second five bases should be skipped:
 
-  fgumi extract --input r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
+  fgumi extract --inputs r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B \
+    --output out.bam --sample s1 --library lib1
 
 Alternatively, if reads are fixed length:
 
-  fgumi extract --input r1.fq r2.fq i1.fq --read-structures 5M5S65T 75T 8B
+  fgumi extract --inputs r1.fq r2.fq i1.fq --read-structures 5M5S65T 75T 8B \
+    --output out.bam --sample s1 --library lib1
 
 ## UMI Extraction
 
@@ -560,7 +562,7 @@ pub struct Extract {
     read_structures: Vec<ReadStructure>,
 
     /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
-    /// de-interleaving it into the two reads. Requires exactly one `--input` (a
+    /// de-interleaving it into the two reads. Requires exactly one input (`--inputs`: a
     /// file or `-` for stdin) and describes both reads with two `--read-structures`
     /// (defaults to `+T +T`). This lets a streaming trimmer or converter pipe
     /// interleaved pairs straight into extract without staging two FASTQ files.
@@ -789,7 +791,7 @@ impl Extract {
     /// Get actual read structures (default to +T if none provided).
     ///
     /// For interleaved input the two reads share one physical stream, so the
-    /// default is two `+T` structures regardless of the single `--input`; the
+    /// default is two `+T` structures regardless of the single `--inputs`; the
     /// normal path defaults to one `+T` per FASTQ for 1-2 FASTQs.
     fn get_read_structures(&self) -> Result<Vec<ReadStructure>> {
         if self.read_structures.is_empty() {
@@ -813,7 +815,7 @@ impl Extract {
             // is split into exactly two reads.
             ensure!(
                 self.inputs.len() == 1,
-                "--interleaved requires exactly one --input (the interleaved stream); got {}.",
+                "--interleaved requires exactly one input (--inputs: the interleaved stream); got {}.",
                 self.inputs.len()
             );
             ensure!(
@@ -850,7 +852,7 @@ impl Extract {
         let stdin_inputs = self.inputs.iter().filter(|p| is_stdin_path(p)).count();
         ensure!(
             stdin_inputs == 0 || self.inputs.len() == 1,
-            "stdin (`-`) can only be used as the input when there is exactly one --input; \
+            "stdin (`-`) can only be used as the input when there is exactly one input (--inputs); \
              got {} inputs. Read the other FASTQs from paths, or interleave them first.",
             self.inputs.len()
         );
@@ -1347,7 +1349,7 @@ pub struct ExtractRunallOptions {
     pub read_structures: Vec<ReadStructure>,
 
     /// Treat a single input as interleaved paired-end FASTQ (`R1, R2, R1, R2, …`),
-    /// de-interleaving it into the two reads. Requires exactly one `--input` (a
+    /// de-interleaving it into the two reads. Requires exactly one input (`--inputs`: a
     /// file or `-` for stdin) and describes both reads with two `--read-structures`
     /// (required for this runall variant — unlike the standalone `Extract`, there
     /// is no `+T +T` default). This lets a streaming trimmer or converter pipe
@@ -5470,7 +5472,7 @@ mod tests {
         )
         .execute("test")
         .expect_err("two inputs with --interleaved must fail");
-        assert!(err.to_string().contains("exactly one --input"), "unexpected: {err}");
+        assert!(err.to_string().contains("exactly one input (--inputs"), "unexpected: {err}");
     }
 
     #[test]
