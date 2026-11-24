@@ -432,6 +432,17 @@ UMIs are compared case-insensitively.
 Note: the --min-map-q parameter defaults to 1 and is directly settable on the command line.
 (Duplicate marking is not performed by this command in fgumi; it is handled by `fgumi dedup`.)
 
+# Half-Mapped Templates
+
+`fgumi sort` writes a half-mapped template (only one of a pair's two primary reads is mapped)
+beside the fully mapped pair it is a copy of; see `fgumi sort --help`. Such a template gets the
+molecule of the pairs beside it whose UMI at the same end is closest, within --edits mismatches
+(identity: equal). Only the mapped read's UMI is compared, as the other segment was sequenced with
+the read that did not map. With the paired strategy the strand suffix follows the template's own
+orientation; with the others the end must be read 1 in both or read 2 in both. These templates
+never change how fully mapped templates are grouped. One that is as close to two molecules as to
+any is kept apart, as is one that `fgumi sort` did not place.
+
 # Cell Barcodes
 
 If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same

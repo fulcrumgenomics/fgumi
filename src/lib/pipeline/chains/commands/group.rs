@@ -22,6 +22,7 @@ use crate::commands::group::{
     create_umi_assigner, should_use_parallel, write_metrics_for_chain,
 };
 use crate::grouper::{ProcessedPositionGroup, build_templates_from_records};
+use crate::half_mapped::{EndReader, attach, split_off_placed};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
@@ -195,6 +196,7 @@ pub(crate) fn build_group_process_step(
                 };
 
             for group in groups {
+                let group_key = group.group_key;
                 let mut filter_counts = TemplateFilterCounts::new();
                 let all_templates =
                     build_templates_from_records(group.records).map_err(io::Error::other)?;
@@ -248,13 +250,42 @@ pub(crate) fn build_group_process_step(
                 assigner.reset();
 
                 let mut templates = filtered_templates;
+                let mut placed = split_off_placed(&mut templates, &group_key);
                 if let Err(e) = assign_umi_groups_impl(
                     &mut templates,
                     assigner,
                     raw_tag,
                     filter_config.min_umi_length,
                     no_umi,
-                ) {
+                )
+                .and_then(|()| {
+                    if placed.is_empty() {
+                        return Ok(());
+                    }
+                    let end_reader = EndReader::new(
+                        raw_tag,
+                        no_umi,
+                        assigner.split_templates_by_pair_orientation(),
+                        filter_config.min_umi_length,
+                    );
+                    let mut placements =
+                        attach(&templates, &mut placed, &group_key, end_reader, effective_edits)
+                            .into_iter();
+                    let (mut joined, mut alone): (Vec<Template>, Vec<Template>) =
+                        std::mem::take(&mut placed).into_iter().partition(|_| {
+                            placements.next().is_some_and(|placement| placement.attached)
+                        });
+                    templates.append(&mut joined);
+                    assign_umi_groups_impl(
+                        &mut alone,
+                        assigner,
+                        raw_tag,
+                        filter_config.min_umi_length,
+                        no_umi,
+                    )?;
+                    templates.append(&mut alone);
+                    Ok(())
+                }) {
                     // A failed assignment means this position group's reads cannot be
                     // grouped at all — an unparseable UMI for the chosen strategy, a
                     // missing `RX` tag, mixed UMI lengths. Substituting an empty group
