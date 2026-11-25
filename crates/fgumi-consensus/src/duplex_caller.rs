@@ -2417,6 +2417,8 @@ impl DuplexConsensusCaller {
             ba_r1_consensus.is_some(),
             ba_r2_consensus.is_some()
         );
+        let one_end_only =
+            |r1s: &[&RawRecord], r2s: &[&RawRecord]| r1s.is_empty() != r2s.is_empty();
         match (ab_r1_consensus, ab_r2_consensus, ba_r1_consensus, ba_r2_consensus) {
             (Some(ref r1_a), Some(ref r2_a), Some(ref r1_b), Some(ref r2_b)) => {
                 // Both strands have both R1 and R2 - create full duplex
@@ -2675,6 +2677,62 @@ impl DuplexConsensusCaller {
                         stats.record_consensus_pair();
                         return Ok((output, stats, DuplexGroupOutcome::Kept));
                     }
+                }
+            }
+            // One strand has only half-mapped pairs, at one end, which is called from both strands.
+            (ref r1_a, ref r2_a, ref r1_b, ref r2_b)
+                if min_yx_reads == 0
+                    && ((r1_a.is_some() && r2_a.is_some() && one_end_only(&ba_r1s, &ba_r2s))
+                        || (r1_b.is_some()
+                            && r2_b.is_some()
+                            && one_end_only(&ab_r1s, &ab_r2s))) =>
+            {
+                let call = |ab: &Option<VanillaConsensusRead>,
+                            ba: &Option<VanillaConsensusRead>| {
+                    let sources: Option<Vec<SourceRead>> =
+                        ab.as_ref().zip(ba.as_ref()).map(|(ab, ba)| {
+                            let reads = ab.source_reads.iter().chain(&ba.source_reads);
+                            reads.flatten().cloned().collect()
+                        });
+                    let sources = sources.as_deref().filter(|reads| !reads.is_empty());
+                    Self::duplex_consensus(ab.as_ref(), ba.as_ref(), sources)
+                };
+                let enough = |read: &DuplexConsensusRead| {
+                    Self::duplex_consensus_has_minimum_reads(
+                        read,
+                        min_total_reads,
+                        min_xy_reads,
+                        min_yx_reads,
+                    )
+                };
+                if let (Some(dr1), Some(dr2)) = (call(r1_a, r2_b), call(r2_a, r1_b))
+                    && enough(&dr1)
+                    && enough(&dr2)
+                {
+                    for (read, read_type, ab_raws, ba_raws) in [
+                        (&dr1, ReadType::R1, &filtered_ab_r1_raws, &filtered_ba_r2_raws),
+                        (&dr2, ReadType::R2, &filtered_ab_r2_raws, &filtered_ba_r1_raws),
+                    ] {
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut read_name_buf,
+                            &mut output,
+                            read,
+                            read_type,
+                            &base_mi,
+                            ab_raws,
+                            ba_raws,
+                            produce_per_base_tags,
+                            read_name_prefix,
+                            read_group_id,
+                            read_type == ReadType::R1,
+                            methylation_mode,
+                            cell_tag,
+                            cell_barcode.as_deref(),
+                        )?;
+                    }
+                    stats.record_consensus_pair();
+                    return Ok((output, stats, DuplexGroupOutcome::Kept));
                 }
             }
             _ => {
