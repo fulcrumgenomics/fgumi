@@ -179,8 +179,12 @@ impl TemplateKeySeed {
             self.cell_tag,
             &self.cb_hasher,
         );
-        let variant =
-            select_template_variant(Some(&first_key), self.key_types, self.header_library_varies);
+        let variant = select_first_record_variant(
+            &first_key,
+            first_body,
+            self.key_types,
+            self.header_library_varies,
+        );
         Arc::new(TemplateKeyContext {
             lib_lookup: self.lib_lookup.clone(),
             cell_tag: self.cell_tag,
@@ -815,6 +819,23 @@ pub fn select_template_variant(
     }
 }
 
+/// [`select_template_variant`] for the sort's first record, whose `MI` of `0` or `0/A` packs to
+/// the same key as no `MI`: under `Auto`, any `MI` on it keeps the tertiary lane.
+#[must_use]
+pub(crate) fn select_first_record_variant(
+    first_key: &TemplateKey,
+    first_body: &[u8],
+    spec: KeyTypesSpec,
+    header_library_varies: bool,
+) -> TemplateKeyVariant {
+    let mut variant = select_template_variant(Some(first_key), spec, header_library_varies);
+    if spec == KeyTypesSpec::Auto && !variant.tertiary {
+        let aux = fgumi_raw_bam::aux_data_slice(first_body);
+        variant.tertiary = fgumi_raw_bam::find_tag_type(aux, fgumi_raw_bam::SamTag::MI).is_some();
+    }
+    variant
+}
+
 // ============================================================================
 // Dropped-lane violation detection
 // ============================================================================
@@ -1228,6 +1249,30 @@ mod tests {
         let batched = violation.expect("the batch reports the differing CB").into_io_error();
         assert_eq!(batched.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(batched.to_string(), format!("{serial:#}"));
+    }
+
+    /// A first record with an MI keeps the MI lane, even if its MI packs as no MI does.
+    #[rstest::rstest]
+    #[case::no_mi(None, false)]
+    #[case::zero(Some("0"), true)]
+    #[case::zero_a(Some("0/A"), true)]
+    #[case::zero_b(Some("0/B"), true)]
+    #[case::seven(Some("7"), true)]
+    fn auto_keeps_the_mi_lane_of_a_first_record_with_mi(
+        #[case] mi: Option<&str>,
+        #[case] keeps: bool,
+    ) {
+        let aux = mi.map(|mi| mi_aux(mi.as_bytes())).unwrap_or_default();
+        let first = rec(1, b"z0a", &aux);
+        let expected = TemplateKeyVariant { cb: false, tertiary: keeps };
+        assert_eq!(seed(None, KeyTypesSpec::Auto).provision(&first).variant, expected);
+
+        let seed = seed(None, KeyTypesSpec::Auto);
+        let mut sorter = crate::TemplateChunkSorter::new(1 << 20, seed, 1).expect("sorter");
+        sorter.push(&first).expect("first record");
+        assert_eq!(sorter.chosen_variant(), Some(expected));
+        let next = sorter.push(&rec(1, b"z0b", &mi_aux(b"9")));
+        assert_eq!(next.is_ok(), keeps);
     }
 
     /// An empty batch (a run's empty terminal batch) is valid: no refs, no error.

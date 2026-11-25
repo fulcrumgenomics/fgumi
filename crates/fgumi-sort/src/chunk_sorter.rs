@@ -39,7 +39,7 @@ use crate::keys::RawCoordinateKey;
 use crate::memory_probe::force_mi_collect;
 use crate::template_key::{
     KeyTypesSpec, LibraryLookup, TemplateKeySeed, TemplateKeyVariant, dropped_lane_error,
-    extract_template_key_inline, select_template_variant, verify_dropped_lanes,
+    extract_template_key_inline, select_first_record_variant, verify_dropped_lanes,
     violation_read_name,
 };
 
@@ -260,7 +260,7 @@ fn sort_rayon_pool(threads: usize) -> Result<ThreadPool> {
 
 /// The narrowed lane-key buffer the [`TemplateChunkSorter`] sorts on. The
 /// variant is chosen on the first `push` from `--key-types` (via
-/// [`select_template_variant`]): `(cb, tertiary)` → `(false,false)`=`TemplateKey24`
+/// [`select_first_record_variant`]): `(cb, tertiary)` → `(false,false)`=`TemplateKey24`
 /// (3 lanes), `(true,false)`=`CbKey32`, `(false,true)`=`TertKey32` (4 lanes),
 /// `(true,true)`=`TemplateKey40` (5 lanes, the full key). The radix sort runs
 /// on the narrower key for speed; the emitted chunk re-widens to the full
@@ -549,8 +549,12 @@ impl TemplateChunkSorter {
             // matching narrowed-key buffer. Buffer the record BEFORE committing
             // `self.state`, so a `push_full` error leaves the sorter unprovisioned
             // rather than holding a first_key/variant from a never-buffered record.
-            let variant =
-                select_template_variant(Some(&key), self.key_types, self.header_library_varies);
+            let variant = select_first_record_variant(
+                &key,
+                bam_bytes,
+                self.key_types,
+                self.header_library_varies,
+            );
             let mut buffer = TemplateBuffer::from_variant(
                 variant,
                 self.estimated_records,

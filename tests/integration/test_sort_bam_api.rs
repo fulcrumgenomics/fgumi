@@ -69,8 +69,8 @@ fn cli_sort(input: &Path, output: &Path, args: &[&str]) -> bool {
 /// The library entry builds the CLI's chain, key types included: on records
 /// whose `CB` and `MI` vary, every `--key-types` either writes the same records
 /// through both or fails through both, as each case expects. A key that drops
-/// a lane that varies (`none`, `cb`, and `auto`, which takes its lanes from
-/// the first record) fails naming that lane. Catches: `sort_bam` ignoring
+/// a lane that varies (`none` and `cb`) fails naming that lane, and `auto`
+/// keeps the lanes of the first record's tags. Catches: `sort_bam` ignoring
 /// `key_types`, the order or the thread count, and a regression that fails
 /// both paths the same way.
 #[rstest]
@@ -79,7 +79,7 @@ fn sort_bam_matches_the_cli(
     #[values(
         ("coordinate", None, Ok(())),
         ("queryname", None, Ok(())),
-        ("template-coordinate", None, Err("MI")),
+        ("template-coordinate", None, Ok(())),
         ("template-coordinate", Some(("full", KeyTypesSpec::Full)), Ok(())),
         ("template-coordinate", Some(("none", KeyTypesSpec::None)), Err("CB")),
         (
