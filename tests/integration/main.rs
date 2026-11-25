@@ -6,6 +6,7 @@
 //! ensuring that module interactions work correctly.
 
 mod helpers;
+mod test_align_in_flight_gate;
 mod test_async_reader;
 mod test_bgzf_eof;
 mod test_chain_bam_with_index;

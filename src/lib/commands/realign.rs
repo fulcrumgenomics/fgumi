@@ -441,6 +441,19 @@ mod tests {
         assert_eq!(opts.xa_max_hits_option, "--xa-max-hits");
     }
 
+    /// `--aligner::max-read-ahead` parses as a memory size on the command line.
+    #[test]
+    fn to_realign_options_carries_max_read_ahead() {
+        let cmd = parse(&[
+            "--aligner::command",
+            "bwa-mem3 mem -p {ref} /dev/stdin",
+            "--aligner::max-read-ahead",
+            "6GiB",
+        ]);
+        let opts = cmd.to_realign_options().expect("options");
+        assert_eq!(opts.align.aligner.max_read_ahead, Some(6 << 30));
+    }
+
     #[test]
     fn to_realign_options_carries_defaults() {
         let cmd = parse(&["--aligner::command", "bwa-mem3 mem -p {ref} /dev/stdin"]);
@@ -454,6 +467,7 @@ mod tests {
         assert_eq!(opts.align.aligner.chunk_size, defaults.chunk_size);
         assert_eq!(opts.align.aligner.sub_batch_templates, None);
         assert_eq!(opts.align.aligner.dedup_reads, None);
+        assert_eq!(opts.align.aligner.max_read_ahead, None);
         assert_eq!(opts.align.aligner.methylation_mode, MethylationMode::Disabled);
         assert_eq!(opts.xa_max_hits, None);
         assert!(!opts.in_memory_reference, "the reference is read on demand by default");

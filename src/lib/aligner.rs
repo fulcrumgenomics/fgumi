@@ -1145,6 +1145,9 @@ pub(crate) fn default_sub_batch_templates() -> usize {
 ///   mode, and defaults it from `default_sub_batch_templates` when unset.
 /// - `dedup_reads` — `Option<DedupReads>`, likewise in-process only; `None`
 ///   means `on`.
+/// - `max_read_ahead` — `Option<u64>` bytes; `None` means the default ceiling,
+///   which depends on the host's memory (resolved when the align stage is wired).
+///   Subprocess aligners only (preset or command).
 #[multi_options("aligner", "Aligner Options")]
 #[derive(Args, Debug, Clone)]
 pub struct AlignerOptions {
@@ -1187,6 +1190,19 @@ pub struct AlignerOptions {
     #[arg(long = "dedup-reads", value_enum)]
     pub dedup_reads: Option<DedupReads>,
 
+    /// Most memory the unmapped reads sent to the aligner but not yet returned
+    /// by it may take, for an aligner that reads further ahead before its first
+    /// output than `--aligner::chunk-size` provides for. fgumi then admits more
+    /// input after a short pause instead of waiting on the aligner, up to this
+    /// limit; past it, fgumi waits for the aligner and fails only if no output
+    /// comes for five minutes. A value below the in-flight budget
+    /// `--aligner::chunk-size` sets lowers that budget too (with a warning).
+    /// Takes a size such as `8GiB` (a plain number is MiB). Not valid with
+    /// `--aligner::preset bwa-mem3-inproc`. [default: a quarter of the
+    /// machine's memory, and at least the in-flight budget]
+    #[arg(long = "max-read-ahead", value_name = "SIZE", value_parser = parse_max_read_ahead)]
+    pub max_read_ahead: Option<u64>,
+
     /// The chemistry to align for. `#[arg(skip)]`: it is runall's top-level
     /// `--methylation-mode`, which runall copies here so the align stage and
     /// the consensus callers it feeds agree. A bwa-mem3 preset aligns with
@@ -1212,9 +1228,16 @@ impl Default for AlignerOptions {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         }
     }
+}
+
+/// Parse `--aligner::max-read-ahead`: a memory size as `--max-memory` takes it
+/// (a plain number is MiB; zero is rejected).
+fn parse_max_read_ahead(s: &str) -> std::result::Result<u64, String> {
+    crate::validation::parse_memory_size(s).map_err(|e| e.to_string())
 }
 
 /// The alignment backend a [`ResolvedAligner`] will run: an external
@@ -1240,6 +1263,10 @@ pub(crate) enum ResolvedBackend {
         /// instead, because the same shape from an aligner that never pairs
         /// would otherwise split every pair silently.
         accept_mid_pair_split: bool,
+        /// `--aligner::max-read-ahead`: the ceiling the in-flight budget may
+        /// grow to, or `None` for the default. An explicit value below the
+        /// budget `--aligner::chunk-size` derives also lowers the budget.
+        max_read_ahead: Option<u64>,
     },
     /// `--aligner::preset bwa-mem3-inproc`. Constructed only when
     /// `resolve` runs under the `aligner-bwa-mem3` feature (it bails
@@ -1388,6 +1415,47 @@ const MAX_SUB_BATCH_TEMPLATES: usize = 1 << 16;
 const MAX_PRESET_CHUNK_SIZE: u64 = 2_147_483_647;
 
 impl AlignerOptions {
+    /// Reject the flags that only one kind of backend reads, before the
+    /// preset/command dispatch in [`Self::resolve`], so each is rejected
+    /// uniformly regardless of mode and of whether this binary was built with
+    /// `aligner-bwa-mem3`.
+    fn check_backend_specific_flags(&self) -> Result<()> {
+        // `--aligner::sub-batch-templates` is a hidden, in-process-only knob.
+        if self.sub_batch_templates.is_some()
+            && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
+        {
+            bail!(
+                "--aligner::sub-batch-templates is only valid with --aligner::preset \
+                 bwa-mem3-inproc; it configures the in-process backend's internal \
+                 batching and has no effect on the subprocess aligner or \
+                 --aligner::command"
+            );
+        }
+        // Likewise `--aligner::dedup-reads`: it configures the in-process
+        // backend's read-pair memo. A subprocess bwa-mem3 runs its own
+        // `--dedup-reads` default, which `--aligner::command` can set.
+        if self.dedup_reads.is_some() && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
+        {
+            bail!(
+                "--aligner::dedup-reads is only valid with --aligner::preset \
+                 bwa-mem3-inproc; it configures the in-process backend's read-pair \
+                 memo (a subprocess bwa-mem3 applies its own --dedup-reads, which \
+                 --aligner::command can set)"
+            );
+        }
+        // `--aligner::max-read-ahead` bounds the subprocess backend's in-flight
+        // gate; the in-process backend never blocks on aligner read-ahead.
+        if self.max_read_ahead.is_some()
+            && matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
+        {
+            bail!(
+                "--aligner::max-read-ahead is not valid with --aligner::preset bwa-mem3-inproc; \
+                 it bounds the input fgumi holds for a subprocess aligner"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate the option combination and produce a [`ResolvedAligner`]
     /// ready for the align stage's `backend_for` to construct.
     ///
@@ -1410,6 +1478,7 @@ impl AlignerOptions {
     ///   `MAX_SUB_BATCH_TEMPLATES`.
     /// - `--aligner::dedup-reads` set with any preset other than
     ///   `bwa-mem3-inproc`, or with command mode.
+    /// - `--aligner::max-read-ahead` set with `bwa-mem3-inproc`.
     /// - Command mode + a preset-only flag (`--aligner-bin` or
     ///   `--aligner::threads`).
     /// - Command mode template missing `{ref}`.
@@ -1454,32 +1523,7 @@ impl AlignerOptions {
                 self.chunk_size
             );
         }
-        // `--aligner::sub-batch-templates` is a hidden, in-process-only knob.
-        // Reject it early (before the preset/command dispatch below) so it is
-        // rejected uniformly regardless of mode, and regardless of whether
-        // this binary was built with `aligner-bwa-mem3`.
-        if self.sub_batch_templates.is_some()
-            && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
-        {
-            bail!(
-                "--aligner::sub-batch-templates is only valid with --aligner::preset \
-                 bwa-mem3-inproc; it configures the in-process backend's internal \
-                 batching and has no effect on the subprocess aligner or \
-                 --aligner::command"
-            );
-        }
-        // Likewise `--aligner::dedup-reads`: it configures the in-process
-        // backend's read-pair memo. A subprocess bwa-mem3 runs its own
-        // `--dedup-reads` default, which `--aligner::command` can set.
-        if self.dedup_reads.is_some() && !matches!(self.preset, Some(AlignerPreset::BwaMem3InProc))
-        {
-            bail!(
-                "--aligner::dedup-reads is only valid with --aligner::preset \
-                 bwa-mem3-inproc; it configures the in-process backend's read-pair \
-                 memo (a subprocess bwa-mem3 applies its own --dedup-reads, which \
-                 --aligner::command can set)"
-            );
-        }
+        self.check_backend_specific_flags()?;
         match (self.preset, self.command) {
             (None, None) => bail!(
                 "aligning requires one of `--aligner::preset` \
@@ -1520,7 +1564,11 @@ impl AlignerOptions {
                     // pairing splits a pair across a chunk cut (bwa and
                     // bwa-mem3 share `bseq_read`'s even-count cut and
                     // `bseq_classify`).
-                    backend: ResolvedBackend::Subprocess { command, accept_mid_pair_split: true },
+                    backend: ResolvedBackend::Subprocess {
+                        command,
+                        accept_mid_pair_split: true,
+                        max_read_ahead: self.max_read_ahead,
+                    },
                     chunk_size: self.chunk_size,
                     threads: Some(threads),
                     mode: ResolvedAlignerMode::Preset(preset),
@@ -1555,7 +1603,11 @@ impl AlignerOptions {
                 // hardcode any thread count).
                 let command = substitute_template(&template, reference, top_threads)?;
                 Ok(ResolvedAligner {
-                    backend: ResolvedBackend::Subprocess { command, accept_mid_pair_split: false },
+                    backend: ResolvedBackend::Subprocess {
+                        command,
+                        accept_mid_pair_split: false,
+                        max_read_ahead: self.max_read_ahead,
+                    },
                     chunk_size: self.chunk_size,
                     threads: None,
                     mode: ResolvedAlignerMode::Command,
@@ -2027,6 +2079,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
         let resolved = opts.resolve(&ref_path, 4, None).unwrap();
@@ -2053,6 +2106,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
@@ -2128,6 +2182,12 @@ mod tests {
                             .unwrap_or_else(|e| panic!("resolve_from_args: bad dedup-reads: {e}")),
                     );
                 }
+                "--aligner::max-read-ahead" => {
+                    opts.max_read_ahead =
+                        Some(parse_max_read_ahead(value).unwrap_or_else(|e| {
+                            panic!("resolve_from_args: bad max-read-ahead: {e}")
+                        }));
+                }
                 other => panic!("resolve_from_args: unrecognized flag {other}"),
             }
         }
@@ -2195,6 +2255,11 @@ mod tests {
         &["--aligner::chunk-size", "4294967296"],
         "--aligner::chunk-size must be at most 2147483647 (got 4294967296)"
     )]
+    #[case::inproc_rejects_max_read_ahead(
+        "bwa-mem3-inproc",
+        &["--aligner::max-read-ahead", "8GiB"],
+        "--aligner::max-read-ahead is not valid with --aligner::preset bwa-mem3-inproc"
+    )]
     fn resolve_inproc_errors(#[case] preset: &str, #[case] extra: &[&str], #[case] needle: &str) {
         let err = resolve_from_args(preset, extra).unwrap_err().to_string();
         assert!(err.contains(needle), "got: {err}");
@@ -2246,6 +2311,39 @@ mod tests {
             "got: {:?}",
             resolved.backend
         );
+    }
+
+    /// `--aligner::max-read-ahead` reaches the resolved subprocess aligner, as
+    /// the in-flight gate's ceiling; unset leaves the default to the backend.
+    #[rstest]
+    #[case::unset(None)]
+    #[case::set(Some(8 << 30))]
+    fn resolve_command_mode_carries_max_read_ahead(#[case] max_read_ahead: Option<u64>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions {
+            command: Some("bwa-mem3 mem -t {threads} {ref} /dev/stdin".to_string()),
+            max_read_ahead,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        let ResolvedBackend::Subprocess { max_read_ahead: resolved_max, .. } = resolved.backend
+        else {
+            panic!("command mode must resolve to ResolvedBackend::Subprocess");
+        };
+        assert_eq!(resolved_max, max_read_ahead);
+    }
+
+    /// `--aligner::max-read-ahead` takes a memory size as `--max-memory` does: a
+    /// plain number is MiB, and zero is rejected.
+    #[rstest]
+    #[case::binary_units("8GiB", Some(8 << 30))]
+    #[case::plain_mebibytes("768", Some(768 << 20))]
+    #[case::zero("0", None)]
+    #[case::not_a_size("lots", None)]
+    fn parse_max_read_ahead_sizes(#[case] value: &str, #[case] expected: Option<u64>) {
+        assert_eq!(parse_max_read_ahead(value).ok(), expected);
     }
 
     /// `--aligner::dedup-reads` with command mode is rejected like the other
@@ -2335,7 +2433,10 @@ mod tests {
     #[rstest]
     #[case::bwa_mem3(AlignerPreset::BwaMem3)]
     #[case::bwa(AlignerPreset::Bwa)]
-    fn resolve_preset_accepts_mid_pair_split(#[case] preset: AlignerPreset) {
+    fn resolve_preset_accepts_mid_pair_split(
+        #[case] preset: AlignerPreset,
+        #[values(None, Some(8 << 30))] max_read_ahead: Option<u64>,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let ref_path = tmp.path().join("ref.fa");
         std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
@@ -2343,13 +2444,19 @@ mod tests {
             std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
         }
         let bin = make_existing_binary(tmp.path());
-        let opts = AlignerOptions { preset: Some(preset), ..AlignerOptions::default() };
+        let opts =
+            AlignerOptions { preset: Some(preset), max_read_ahead, ..AlignerOptions::default() };
         let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
-        let ResolvedBackend::Subprocess { command, accept_mid_pair_split } = resolved.backend
+        let ResolvedBackend::Subprocess {
+            command,
+            accept_mid_pair_split,
+            max_read_ahead: resolved_max,
+        } = resolved.backend
         else {
             panic!("a subprocess preset must resolve to ResolvedBackend::Subprocess");
         };
         assert!(accept_mid_pair_split, "preset mode must accept bwa's mid-pair split");
+        assert_eq!(resolved_max, max_read_ahead, "--aligner::max-read-ahead reaches the preset");
         assert!(command.starts_with(&bin.display().to_string()), "got: {command}");
     }
 
@@ -2388,6 +2495,7 @@ mod tests {
             backend: ResolvedBackend::Subprocess {
                 command: command.to_string(),
                 accept_mid_pair_split: true,
+                max_read_ahead: None,
             },
             chunk_size: 10,
             threads: Some(4),
@@ -2637,6 +2745,7 @@ mod tests {
             chunk_size: 0,
             sub_batch_templates: None,
             dedup_reads: None,
+            max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, None).unwrap_err();
@@ -2663,6 +2772,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
         let err = opts.resolve(&ref_path, 4, Some(&bin)).unwrap_err();
