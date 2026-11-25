@@ -47,6 +47,38 @@ fgumi group \
   --allow-unmapped
 ```
 
+### Half-Mapped Templates
+
+A half-mapped template is a pair with only one primary read mapped. It has one known end, so it is
+not at the same position as the fully mapped pairs it may be a copy of. If fully mapped pairs have
+the same end (library, cell barcode, contig, unclipped 5' position, and strand), it gets the
+molecule whose UMI at that end is closest, within `--edits` mismatches:
+
+- Only the UMI of the mapped end is compared. It is the first segment of a two-segment UMI such as
+  `ACGT-CCGG` for read 1, and the second for read 2. The other segment was sequenced with the read
+  that did not map. Any other UMI is compared whole.
+- With `paired`, the strand suffix follows the template's own orientation, so it can supply the
+  strand that the molecule lacks. With the other strategies, the end must be read 1 in both or read
+  2 in both.
+- It never changes how fully mapped templates are grouped.
+
+A half-mapped template stays on its own when no pair has its end, or when it is as close to two
+molecules as to any. Its mapped read can then still support a structural variant.
+
+Consensus uses the mapped read of a half-mapped template. Its unmapped read adds no bases or depth,
+and the consensus UMI comes from the molecule's fully mapped pairs.
+
+The template is written within its molecule, with the molecule's template coordinate in its `tc` tag,
+so `fgumi sort --order template-coordinate` keeps it there. Other tools sort it by its own position,
+after its molecule. The `simplex`, `duplex`, `codec` and `downsample` commands then stop with an
+error, and `fgumi sort` puts it back.
+
+In the input, a half-mapped template comes after its molecule. An output file is therefore rewritten
+once it is complete, if there are any such templates; only the compressed blocks that they go into
+change. An output that is not a file, such as a pipe, is kept in a temporary file (in `TMPDIR`) until
+the input has been read. In `runall`, that is needed only if the input has half-mapped templates,
+or if the run starts from `group`.
+
 ## Recording Windows for Re-alignment
 
 `--realign-window` stamps each mapped primary read with an `rw` tag: the reference window

@@ -521,6 +521,9 @@ fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-l
     --output consensus.bam --threads 4 --compression-level 1
 ```
 
+In a pipe, `group` keeps its output in a temporary file until it has read its input, for the sake of
+[half-mapped templates](umi-grouping.md#half-mapped-templates).
+
 Both stages can also run as one `fgumi runall` command with `--realign`, which records the windows at grouping, filters, then re-aligns with `fgumi realign`'s window preference and coordinate-sorts (see [Running Pipelines](running-pipelines.md#re-aligning-consensus-reads-with---realign)):
 
 ```bash
