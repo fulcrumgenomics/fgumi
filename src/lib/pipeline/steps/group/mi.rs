@@ -14,6 +14,7 @@
 use std::io;
 
 use crate::half_mapped::copies::hold::HeldMiGroups;
+use crate::half_mapped::order::check_copies;
 use crate::mi_group::{MiGroup, MiKey, MiTransform};
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
@@ -156,6 +157,8 @@ pub struct GroupByMi {
     next_ordinal: u64,
     /// Accumulator: completed groups waiting to be packaged into a batch.
     accumulator: Vec<MiGroup>,
+    /// The last record of the last group emitted.
+    last_emitted: Option<fgumi_raw_bam::RawRecord>,
     /// Held output slot when downstream rejected the most recent push.
     held: HeldSlot<Unpushed<BatchedMiGroups>>,
     target_batch_count: usize,
@@ -197,6 +200,7 @@ impl GroupByMi {
             next_long_run_warn_at: LONG_RUN_WARN_INTERVAL,
             next_ordinal: 0,
             accumulator: Vec::with_capacity(target_batch_count),
+            last_emitted: None,
             held: HeldSlot::new(),
             target_batch_count: target_batch_count.max(1),
             output_byte_limit,
@@ -261,10 +265,10 @@ impl GroupByMi {
     /// (no-transform) path; the owned key is built only when a new run begins.
     /// Records that fail the optional filter, or that carry no MI tag, are
     /// dropped (matching `MiGrouper`).
-    fn process_record(&mut self, raw: fgumi_raw_bam::RawRecord) {
+    fn process_record(&mut self, raw: fgumi_raw_bam::RawRecord) -> io::Result<()> {
         // Optional filter (mirrors `MiGrouper::should_keep`).
         if !self.passes_filter(raw.as_ref()) {
-            return;
+            return Ok(());
         }
         let same_group = match &self.current_key {
             Some(key) => {
@@ -273,7 +277,7 @@ impl GroupByMi {
                     key.matches_record(raw.as_ref(), self.tag, self.cell_tag, self.transform())
                 else {
                     self.count_skipped_record(raw.as_ref());
-                    return;
+                    return Ok(());
                 };
                 matches
             }
@@ -289,9 +293,9 @@ impl GroupByMi {
                 MiKey::from_record(raw.as_ref(), self.tag, self.cell_tag, self.transform())
             else {
                 self.count_skipped_record(raw.as_ref());
-                return;
+                return Ok(());
             };
-            self.flush_current_group();
+            self.flush_current_group()?;
             self.current_key = Some(key);
             self.current_records.push(raw);
             // A new run starts the ladder over, so a file with many large-but-
@@ -299,6 +303,7 @@ impl GroupByMi {
             // rather than once and then never again.
             self.next_long_run_warn_at = LONG_RUN_WARN_INTERVAL;
         }
+        Ok(())
     }
 
     /// Warn every [`LONG_RUN_WARN_INTERVAL`] records retained for one MI key.
@@ -371,13 +376,21 @@ impl GroupByMi {
     /// Flush the run-in-progress into the accumulator (if non-empty). The owned
     /// display label is materialized here — once per group — from the stored key
     /// bytes, rather than per record.
-    fn flush_current_group(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run is of half-mapped reads that are separate from their pairs.
+    fn flush_current_group(&mut self) -> io::Result<()> {
         if let Some(key) = self.current_key.take()
             && !self.current_records.is_empty()
         {
             let records = std::mem::take(&mut self.current_records);
-            self.accumulator.push(MiGroup::new(key.label(), records));
+            let label = key.label();
+            let previous = self.accumulator.last().and_then(|group| group.records.last());
+            check_copies(&label, &records, previous.or(self.last_emitted.as_ref()))?;
+            self.accumulator.push(MiGroup::new(label, records));
         }
+        Ok(())
     }
 
     /// Take at most `target_batch_count` groups off the accumulator, leaving
@@ -395,6 +408,9 @@ impl GroupByMi {
     /// rather than delayed.
     fn drain_one_batch(&mut self) -> Vec<MiGroup> {
         let take = self.accumulator.len().min(self.target_batch_count);
+        if let Some(last) = self.accumulator[..take].last() {
+            self.last_emitted = last.records.last().cloned();
+        }
         self.accumulator.drain(..take).collect()
     }
 
@@ -455,7 +471,7 @@ impl Step for GroupByMi {
             did_work = true;
             let records = batch.into_records();
             for decoded in records {
-                self.process_record(decoded.into_raw_bytes());
+                self.process_record(decoded.into_raw_bytes())?;
             }
             if self.accumulator.len() >= self.target_batch_count {
                 break;
@@ -475,7 +491,7 @@ impl Step for GroupByMi {
         // returned `Contention` otherwise); a bounced `emit_batch` push is
         // parked in `held` for step 1 to retry next pass.
         if ctx.input.is_drained() {
-            self.flush_current_group();
+            self.flush_current_group()?;
             if !self.accumulator.is_empty() {
                 return Ok(self.emit_batch(ctx));
             }
@@ -491,6 +507,25 @@ mod tests {
     use super::*;
     use fgumi_raw_bam::RawRecord;
     use rstest::rstest;
+
+    /// Copies away from their molecule are found on both sides of the end of a batch.
+    #[rstest]
+    #[case::within(2)]
+    #[case::across(1)]
+    fn separate_copies_are_an_error(#[case] target_batch_count: usize) {
+        use crate::half_mapped::order::tests::read;
+        let mut step =
+            GroupByMi::with_target_batch_count(*crate::sam::SamTag::MI, 1024, target_batch_count);
+        for (mi, pos, half) in [("5", 100, false), ("6", 150, false), ("5", 100, true)] {
+            step.process_record(read(mi, pos, half)).expect("not known until the next");
+        }
+        if target_batch_count == 1 {
+            step.accumulator = step.accumulator.split_off(1);
+            assert_eq!(step.drain_one_batch().len(), 1);
+            assert!(step.accumulator.is_empty());
+        }
+        assert!(step.flush_current_group().is_err());
+    }
 
     /// Build a minimal unmapped raw BAM record carrying a single Z-type tag.
     #[allow(clippy::cast_possible_truncation)]
@@ -555,9 +590,9 @@ mod tests {
 
         // Open a run, then seed the threshold low enough to trip on the next
         // record rather than materializing 100k of them.
-        step.process_record(raw_with_tag("MI", "fam"));
+        step.process_record(raw_with_tag("MI", "fam")).expect("record");
         step.next_long_run_warn_at = 2;
-        step.process_record(raw_with_tag("MI", "fam"));
+        step.process_record(raw_with_tag("MI", "fam")).expect("record");
         assert_eq!(step.current_records.len(), 2, "both records are retained in one run");
         assert_eq!(
             step.next_long_run_warn_at,
@@ -566,7 +601,7 @@ mod tests {
         );
 
         // A different MI value starts a new run, which re-arms from scratch.
-        step.process_record(raw_with_tag("MI", "other"));
+        step.process_record(raw_with_tag("MI", "other")).expect("record");
         assert_eq!(
             step.next_long_run_warn_at, LONG_RUN_WARN_INTERVAL,
             "a run boundary resets the ladder so each family warns on its own merits",
@@ -633,9 +668,9 @@ mod tests {
     /// the final run, and return `(label, record_count)` per completed group.
     fn run_grouping(step: &mut GroupByMi, records: Vec<RawRecord>) -> Vec<(String, usize)> {
         for raw in records {
-            step.process_record(raw);
+            step.process_record(raw).expect("record");
         }
-        step.flush_current_group();
+        step.flush_current_group().expect("group");
         step.accumulator.iter().map(|g| (g.mi.clone(), g.records.len())).collect()
     }
 

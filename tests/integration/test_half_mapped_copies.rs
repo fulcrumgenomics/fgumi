@@ -1175,12 +1175,131 @@ fn sorting_again_keeps_copies_in_their_molecules(
     );
 }
 
+/// `records` with those of half-mapped templates after the rest, as another tool sorts them.
+fn as_other_tools_sort(records: Vec<RecordBuf>) -> Vec<RecordBuf> {
+    let (halves, mut rest): (Vec<_>, Vec<_>) =
+        records.into_iter().partition(|record| name_of(record).starts_with("half"));
+    rest.extend(halves);
+    rest
+}
+
 fn write_records(path: &Path, header: &noodles::sam::Header, records: &[RecordBuf]) {
     let raw: Vec<_> = records
         .iter()
         .map(|r| fgumi_raw_bam::encode_record_buf_to_raw(r, header).unwrap())
         .collect();
     write_bam(path, header, &raw);
+}
+
+fn three_molecules() -> Vec<Pair> {
+    vec![
+        Pair::full("AAAA-CCCC"),
+        Pair::full("AAAA-CCCC").named("full2"),
+        Pair::r1_only(LOWER, "AAAA-GTGT"),
+        Pair::full("GGGG-CCCC").named("other"),
+        Pair::new("later", Some(("chr1", 601, false)), Some(UPPER), "AAAA-CCCC"),
+    ]
+}
+
+/// The commands that read the records of a molecule together, with the options they need.
+#[cfg(feature = "consensus")]
+const MOLECULE_READERS: &[&[&str]] = &[
+    &["simplex", "--min-reads", "1"],
+    &["duplex", "--min-reads", "1,1,0"],
+    &["codec", "--min-reads", "1"],
+    &["downsample", "--fraction", "1.0"],
+];
+
+#[cfg(feature = "consensus")]
+fn read_molecules(reader: &[&str], input: &Path, output: &Path) -> Result<(), String> {
+    let args = [&reader[..1], &["-i", p(input), "-o", p(output)], &reader[1..]].concat();
+    let output =
+        std::process::Command::new(env!("CARGO_BIN_EXE_fgumi")).args(args).output().unwrap();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() { Ok(()) } else { Err(log) }
+}
+
+/// Copies that another tool has sorted away from their molecule are an error, wherever the
+/// molecule is, and sorting with `fgumi sort` puts it right.
+#[cfg(feature = "consensus")]
+#[rstest]
+fn copies_away_from_their_molecule_are_an_error(#[values(1, 2, 3)] molecules_kept: usize) {
+    let dir = TempDir::new().unwrap();
+    let file = |name: &str| dir.path().join(name);
+    let (grouped, output) = (file("grouped.bam"), file("output.bam"));
+    let sam = sam_of(&three_molecules());
+    run_command("group", &sort_sam(&dir, &sam), &grouped, PAIRED);
+    let (header, mut records) = read_bam_output(&grouped);
+    records.retain(|record| match name_of(record).as_str() {
+        "other" => molecules_kept > 1,
+        "later" => molecules_kept > 2,
+        _ => true,
+    });
+    let moved = file("moved.bam");
+    write_records(&moved, &header, &as_other_tools_sort(records));
+    for reader in MOLECULE_READERS {
+        read_molecules(reader, &grouped, &output).unwrap();
+        // Beside the last molecule, the copy is in place.
+        let found = read_molecules(reader, &moved, &output);
+        assert_eq!(found.is_ok(), molecules_kept == 1, "{reader:?}: {found:?}");
+        if let Err(log) = found {
+            assert!(log.contains("Run `fgumi sort --order template-coordinate`"), "{log}");
+        }
+    }
+    let sorted = file("sorted.bam");
+    sort(&moved, &sorted, &[]);
+    for reader in MOLECULE_READERS {
+        read_molecules(reader, &sorted, &output).unwrap();
+    }
+}
+
+/// The metrics count fully mapped templates only, so it does not matter to them where copies are.
+#[cfg(feature = "consensus")]
+#[rstest]
+fn metrics_do_not_depend_on_copies(
+    #[values("simplex-metrics", "duplex-metrics")] command: &str,
+    #[values("grouped", "moved", "without")] input: &str,
+) {
+    let dir = TempDir::new().unwrap();
+    let file = |name: &str| dir.path().join(name);
+    let grouped = file("grouped.bam");
+    run_command("group", &sort_sam(&dir, &sam_of(&three_molecules())), &grouped, PAIRED);
+    let (header, mut records) = read_bam_output(&grouped);
+    match input {
+        "moved" => records = as_other_tools_sort(records),
+        "without" => records.retain(|record| name_of(record) != "half"),
+        _ => {}
+    }
+    let changed = file("changed.bam");
+    write_records(&changed, &header, &records);
+    for (input, prefix) in [(&grouped, "expected"), (&changed, "found")] {
+        read_molecules(&[command], input, &file(prefix)).unwrap();
+    }
+    for suffix in [".family_sizes.txt", ".umi_counts.txt"] {
+        let read = |prefix: &str| fs::read_to_string(file(&format!("{prefix}{suffix}"))).unwrap();
+        assert_eq!(read("found"), read("expected"));
+    }
+}
+
+/// A copy whose pairs are not in the input is in order, so it is a molecule of its own.
+#[cfg(feature = "consensus")]
+#[test]
+fn a_subset_without_the_pairs_of_a_copy_is_read() {
+    let dir = TempDir::new().unwrap();
+    let file = |name: &str| dir.path().join(name);
+    let (grouped, subset, output) = (file("grouped.bam"), file("subset.bam"), file("output.bam"));
+    let mut pairs = three_molecules();
+    pairs.push(Pair::new("first", Some(("chr1", 401, false)), Some(UPPER), "AAAA-CCCC"));
+    run_command("group", &sort_sam(&dir, &sam_of(&pairs)), &grouped, PAIRED);
+    let (header, mut records) = read_bam_output(&grouped);
+    records.retain(|record| !["full", "full2"].contains(&name_of(record).as_str()));
+    assert!(records.iter().any(|record| name_of(record) == "half"));
+    write_records(&subset, &header, &records);
+    for reader in MOLECULE_READERS {
+        read_molecules(reader, &subset, &output).unwrap();
+    }
+    run(&["simplex", "-i", p(&subset), "-o", p(&output), "--min-reads", "1"]);
+    assert_eq!(read_bam_output(&output).1.len(), 6, "the other three molecules");
 }
 
 /// Merging sorted files keeps copies in their molecules.

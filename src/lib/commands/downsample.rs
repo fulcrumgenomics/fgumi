@@ -7,6 +7,7 @@
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
+use crate::half_mapped::order::check_copies;
 use crate::logging::OperationTimer;
 use crate::sam::{SamTag, is_template_coordinate_sorted};
 use anyhow::{Result, bail};
@@ -407,6 +408,8 @@ where
     /// (default), group by the molecule base MI so a duplex molecule's `<base>/A`
     /// and `<base>/B` strands fall into one family. See `Downsample::per_strand`.
     per_strand: bool,
+    /// The last record of the family before.
+    previous: Option<RawRecord>,
 }
 
 impl<I> FamilyIterator<I>
@@ -414,7 +417,7 @@ where
     I: Iterator<Item = Result<RawRecord>>,
 {
     fn new(records: I, per_strand: bool) -> Self {
-        Self { records: records.peekable(), per_strand }
+        Self { records: records.peekable(), per_strand, previous: None }
     }
 
     /// Get the next family of records sharing the same family key.
@@ -456,6 +459,8 @@ where
             }
         }
 
+        check_copies(&key, &family, self.previous.as_ref())?;
+        self.previous = family.last().cloned();
         Ok(Some((key, family)))
     }
 }
