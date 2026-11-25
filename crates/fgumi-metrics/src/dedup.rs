@@ -135,7 +135,8 @@ pub struct DeduplicationMetrics {
     pub duplicate_pairs: u64,
     /// Mapped reads with no mapped mate: single-end or mate unmapped (Picard `UNPAIRED_READS_EXAMINED`)
     pub mapped_orphans: u64,
-    /// Single-mapped-end reads marked duplicate (Picard `UNPAIRED_READ_DUPLICATES`)
+    /// Single-mapped-end reads marked duplicate, including copies of one end of a mapped pair
+    /// (Picard `UNPAIRED_READ_DUPLICATES`)
     pub duplicate_orphans: u64,
     /// Unmapped primary reads carrying the paired flag (diagnostic)
     pub unmapped_pairs: u64,

@@ -32,6 +32,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use fgumi_bam_io::pread::RawFrame;
@@ -1455,6 +1456,10 @@ impl TemplateStrategy {
     #[must_use]
     pub fn new(acc: fgumi_sort::TemplateArenaAccumulator) -> Self {
         Self { acc }
+    }
+
+    pub(crate) fn set_half_mapped_seen(&mut self, seen: Option<Arc<AtomicBool>>) {
+        self.acc.set_half_mapped_seen(seen);
     }
 }
 

@@ -179,6 +179,14 @@ impl<'a> RawRecordView<'a> {
         self.flags() & flags::MATE_UNMAPPED != 0
     }
 
+    /// Returns `true` if the read is the mapped read of a pair whose other read is unmapped.
+    #[inline]
+    #[must_use]
+    pub fn is_half_mapped(&self) -> bool {
+        self.flags() & (flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED)
+            == flags::PAIRED | flags::MATE_UNMAPPED
+    }
+
     /// Returns `true` if the read is reverse complemented.
     #[inline]
     #[must_use]

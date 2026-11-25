@@ -291,7 +291,8 @@ fn run_simplex_consensus_batch(
     accumulators: &Arc<PerThreadAccumulator<CollectedSimplexMetrics>>,
     progress: &Arc<AtomicU64>,
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
-    let BatchedMiGroups { batch_serial, groups } = item;
+    let batch_serial = item.batch_serial;
+    let groups = item.into_groups()?;
     let groups_count = groups.len() as u64;
 
     let input_len =

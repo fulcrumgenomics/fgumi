@@ -32,6 +32,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Result, anyhow};
 use fgumi_bam_io::ProgressTracker;
@@ -247,6 +248,12 @@ impl ChunkSorter {
             Self::QuerynameLex(s) => s.strategy.set_keys(keys),
             Self::QuerynameNatural(s) => s.strategy.set_keys(keys),
             Self::Coordinate(_) | Self::Template(_) => {}
+        }
+    }
+
+    fn set_half_mapped_seen(&mut self, seen: Option<Arc<AtomicBool>>) {
+        if let Self::Template(s) = self {
+            s.strategy.set_half_mapped_seen(seen);
         }
     }
 
@@ -586,6 +593,16 @@ impl SortBuffer {
     pub fn with_queryname_keys(mut self, keys: QnSortState) -> Self {
         if let Some(sorter) = self.sorter.as_mut() {
             sorter.set_queryname_keys(keys);
+        }
+        self
+    }
+
+    /// Set `seen` once a template-coordinate sort has keyed the mapped read of a half-mapped
+    /// pair. Call before the step runs.
+    #[must_use]
+    pub fn with_half_mapped_seen(mut self, seen: Option<Arc<AtomicBool>>) -> Self {
+        if let Some(sorter) = self.sorter.as_mut() {
+            sorter.set_half_mapped_seen(seen);
         }
         self
     }

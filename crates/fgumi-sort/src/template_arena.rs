@@ -29,6 +29,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use noodles::sam::Header;
@@ -403,6 +404,11 @@ impl TemplateArenaAccumulator {
             state: None,
             sort_pool: BoundedSortPool::new("tmpl-sort"),
         }
+    }
+
+    /// See [`TemplateKeySeed::with_half_mapped_seen`](crate::TemplateKeySeed::with_half_mapped_seen).
+    pub fn set_half_mapped_seen(&mut self, seen: Option<Arc<AtomicBool>>) {
+        self.seed = self.seed.clone().with_half_mapped_seen(seen);
     }
 
     /// Refs accumulated for the current run (what the next seal sorts).

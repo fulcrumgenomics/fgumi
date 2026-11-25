@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::batch_weight::BatchWeight;
 use crate::grouper::{RawPositionGroup, build_templates_from_records};
+use crate::half_mapped::pair_ends::{PairEndBuffer, PairEnds};
+use crate::half_mapped::{EndReader, HalfMapped, attach, is_half_mapped, split_off_placed};
 use crate::metrics::group::FamilySizeMetrics;
 use crate::metrics::writer::write_metrics;
 use crate::metrics::{DeduplicationCounts, DeduplicationMetrics, DuplicationLadderMetrics};
@@ -299,6 +301,21 @@ pub(crate) struct CollectedDedupCounts {
     pub(crate) family_sizes: AHashMap<usize, u64>,
 }
 
+impl CollectedDedupCounts {
+    /// Adds one position group's counts.
+    pub(crate) fn record(&mut self, processed: &ProcessedDedupGroup) {
+        // A position group is always single-library, so its counts
+        // belong entirely to `processed.library_idx`.
+        self.dedup_counts_by_library
+            .entry(processed.library_idx)
+            .or_default()
+            .merge(&processed.dedup_counts);
+        for (size, count) in &processed.family_sizes {
+            *self.family_sizes.entry(*size).or_insert(0) += count;
+        }
+    }
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Duplication ladder (--duplication-ladder)
 //////////////////////////////////////////////////////////////////////////////
@@ -451,6 +468,9 @@ pub struct ProcessedDedupGroup {
     /// the cumulative MI counter stays in lockstep with what `serialize_fn`
     /// emits even if the family-size histogram semantics change.
     pub distinct_mi_count: u64,
+    /// The half-mapped templates not marked as duplicates, which may yet be copies of a fully
+    /// mapped pair (see [`mark_half_mapped_copies`]).
+    pub(crate) half_mapped: Vec<HalfMapped>,
 }
 
 impl BatchWeight for ProcessedDedupGroup {
@@ -464,6 +484,7 @@ impl MemoryEstimate for ProcessedDedupGroup {
         self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.templates.capacity() * std::mem::size_of::<Template>()
             + self.family_sizes.capacity() * std::mem::size_of::<(usize, u64)>()
+            + self.half_mapped.capacity() * std::mem::size_of::<HalfMapped>()
     }
 }
 
@@ -1060,21 +1081,27 @@ fn count_template_pair_orphan(template: &Template, dedup_counts: &mut DedupCount
 // Position group processing
 //////////////////////////////////////////////////////////////////////////////
 
-/// Process a position group for deduplication.
+/// Process a position group for deduplication, adding the ends of its fully mapped pairs to
+/// `pair_ends`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_position_group(
     group: RawPositionGroup,
     filter_config: &TemplateFilterConfig,
     assigner: &dyn UmiAssigner,
+    edits: u32,
     raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
     passthrough: DedupPassthrough,
+    pair_ends: &mut PairEndBuffer<()>,
 ) -> io::Result<ProcessedDedupGroup> {
+    let group_key = group.group_key;
+    let end_reader = EndReader::new(*raw_tag, no_umi, !no_umi, min_umi_length);
     let mut dedup_counts = DedupCounts::default();
     let input_record_count = group.records.len() as u64;
     // One position group is always a single library (library partitions the
     // grouping key), so this is unambiguous.
-    let library_idx = group.group_key.library_idx;
+    let library_idx = group_key.library_idx;
 
     // Build templates from raw records (deferred from Group step)
     let all_templates = build_templates_from_records(group.records)?;
@@ -1127,8 +1154,13 @@ pub(crate) fn process_position_group(
             library_idx,
             input_record_count,
             distinct_mi_count: 0,
+            half_mapped: Vec::new(),
         });
     }
+
+    let mut placed = split_off_placed(&mut filtered_templates, &group_key);
+    let has_placed = !placed.is_empty();
+    pair_ends.add_group(end_reader, &group_key, 0, &filtered_templates);
 
     // Assign UMI groups before clearing duplicate flags, so this read runs while
     // `cached_umi_position` (recorded during the parallel Decode step; see
@@ -1140,6 +1172,28 @@ pub(crate) fn process_position_group(
     if let Err(e) = assign_umi_groups(&mut templates, assigner, raw_tag, min_umi_length, no_umi) {
         // Same wording as `group`'s chain step, with the full cause chain.
         return Err(crate::umi::assign_umi_groups_error(&e));
+    }
+
+    let mut several: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
+    if !placed.is_empty() {
+        let by_segment = splits_by_strand_of_origin(assigner, no_umi);
+        let reader = EndReader { by_segment, ..end_reader };
+        let placements = attach(&templates, &mut placed, &group_key, reader, edits);
+        let mut alone = Vec::new();
+        for (template, placement) in placed.into_iter().zip(placements) {
+            if placement.attached {
+                templates.push(template);
+                continue;
+            }
+            if placement.same_strand {
+                several.insert(template.name().to_vec());
+            }
+            alone.push(template);
+        }
+        if let Err(e) = assign_umi_groups(&mut alone, assigner, raw_tag, min_umi_length, no_umi) {
+            return Err(crate::umi::assign_umi_groups_error(&e));
+        }
+        templates.append(&mut alone);
     }
 
     // Clear existing duplicate flags before re-marking. This runs *after* UMI
@@ -1198,9 +1252,36 @@ pub(crate) fn process_position_group(
 
             // Get mutable references to family templates (single collection, not double)
             let mut family_refs: Vec<&mut Template> = templates[start..end].iter_mut().collect();
+            if has_placed {
+                let pairs = family_refs.extract_if(.., |template| !is_half_mapped(template));
+                let mut pairs: Vec<&mut Template> = pairs.collect();
+                if !pairs.is_empty() {
+                    mark_duplicates_in_family(&mut pairs, &mut dedup_counts);
+                    for copy in &mut family_refs {
+                        mark_template_as_duplicate(copy, &mut dedup_counts);
+                        dedup_counts.duplicate_templates += 1;
+                    }
+                    continue;
+                }
+            }
             mark_duplicates_in_family(&mut family_refs, &mut dedup_counts);
         }
     }
+
+    for template in templates.iter_mut().filter(|t| several.contains(t.name())) {
+        if template.mi.is_assigned() && !is_marked(template) {
+            mark_template_as_duplicate(template, &mut dedup_counts);
+            dedup_counts.unique_templates -= 1;
+            dedup_counts.duplicate_templates += 1;
+        }
+    }
+
+    let half_mapped: Vec<HalfMapped> = templates
+        .iter()
+        .enumerate()
+        .filter(|(_, template)| !has_placed && template.mi.is_assigned() && !is_marked(template))
+        .filter_map(|(index, template)| end_reader.read_half(template, index, &group_key))
+        .collect();
 
     // Count reads and check for missing tc tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
@@ -1256,7 +1337,45 @@ pub(crate) fn process_position_group(
         library_idx,
         input_record_count,
         distinct_mi_count,
+        half_mapped,
     })
+}
+
+/// Whether the template has been marked as a duplicate, which marks all of its records.
+fn is_marked(template: &Template) -> bool {
+    template
+        .records()
+        .first()
+        .is_some_and(|raw| (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0)
+}
+
+/// Marks the half-mapped templates of a batch that are copies of a fully mapped pair, and adds the
+/// batch's pairs to `known`. Batches must be given in input order.
+///
+/// Only the representative of a family can be unmarked, so this marks whole families; it never
+/// clears a mark, and never marks a fully mapped pair.
+pub(crate) fn mark_half_mapped_copies(
+    batch: &mut BatchedProcessedDedupGroups,
+    known: &mut PairEnds<()>,
+    edits: u32,
+) {
+    let pair_ends = std::mem::take(&mut batch.pair_ends);
+    known.add(&mut pair_ends.reader(), usize::MAX, |_| 0);
+    for group in &mut batch.groups {
+        let counts = &mut group.dedup_counts;
+        for half in &group.half_mapped {
+            if known.contains(half, edits) {
+                let template = &mut group.templates[half.index];
+                let records = template.records().len() as u64;
+                mark_template_as_duplicate(template, counts);
+                counts.unique_reads -= records;
+                counts.unique_templates -= 1;
+                counts.duplicate_templates += 1;
+                counts.duplicate_orphans += 1;
+            }
+        }
+    }
+    known.release(&pair_ends);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1397,6 +1516,25 @@ requires every read 1 in a molecule to be the same physical strand read from the
 start — which is why `fgumi group` keeps the split even under --no-umi, and why the two
 commands deliberately differ here. `dedup` runs no consensus and so needs no such split.
 
+# Half-mapped templates
+
+A half-mapped template (only one of a pair's two primary reads is mapped) is marked as a duplicate
+when a fully mapped pair has the same end, whatever their scores, as in Picard `MarkDuplicates`. The
+end is the same when its library, cell (CB tag), contig, unclipped 5' position and strand are and,
+unless --no-umi is given, when:
+
+- It is read 1 in both or read 2 in both. Otherwise the two are from opposite strands, which are
+  never duplicates of each other when UMIs are used (see above).
+- The UMIs of that end are within --edits mismatches (identity: equal). The UMI of an end is the
+  first segment of a two-segment UMI (e.g. ACGT-CCGG) for read 1 and the second for read 2: the
+  other segment was sequenced with the read that did not map. Any other UMI is compared whole.
+  UMIs of different lengths do not match, except that with --min-umi-length whole UMIs are compared
+  over the length of the shorter one.
+
+Only pairs that pass the filters count. A half-mapped template that matches no pair, or that has no
+UMI on its mapped end, is deduplicated only with the half-mapped templates at its position. It keeps
+an MI of its own, marked or not, unless `fgumi group` has put it into a molecule before.
+
 # Cell Barcodes
 
 If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
@@ -1407,14 +1545,17 @@ correction or error-handling is performed on cell barcodes; they must be correct
 
 # Memory
 
-dedup streams the input and processes one genomic position group at a time, so memory scales with
-parallelism, not input size. The two contributors are:
+dedup streams the input and processes one genomic position group at a time, so memory scales mostly
+with parallelism, not input size. The contributors are:
 
   - Pipeline queue: bounded by --max-memory, which is per thread by default. With the default
     (768 MiB/thread), --threads 16 budgets ~12 GiB of queue alone and --threads 8 budgets ~6 GiB.
   - Per-worker working set: each worker transiently holds the templates of the group it is
     processing (building, scoring, sorting). This is on top of the queue budget, so peak RSS is
     higher than --max-memory; empirically ~1-2 GiB/thread on WGS-scale input.
+  - Ends of fully mapped pairs: about 12 bytes for each end and UMI on one contig, released when the
+    input moves to the next contig, plus the same for the ends on later contigs of pairs that map to
+    two contigs. UMIs longer than 15 bases take more.
 
 A practical rule of thumb for WGS-scale input is to budget ~2 GiB per thread of total RSS. On a
 fixed-RAM host, prefer one of:
@@ -1813,6 +1954,8 @@ pub(crate) use self::CollectedDedupCounts as CollectedDedupMetrics;
 pub struct BatchedProcessedDedupGroups {
     pub batch_serial: u64,
     pub groups: Vec<ProcessedDedupGroup>,
+    /// The ends of the fully mapped pairs in `groups`.
+    pub(crate) pair_ends: PairEndBuffer<()>,
 }
 
 // ==== impls ported from feat-runall for the chain builder (R2) ====
@@ -1820,6 +1963,7 @@ impl crate::pipeline::core::item::HeapSize for BatchedProcessedDedupGroups {
     fn heap_size(&self) -> usize {
         self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.groups.capacity() * std::mem::size_of::<ProcessedDedupGroup>()
+            + self.pair_ends.heap_size()
     }
 }
 
@@ -2572,10 +2716,12 @@ mod tests {
             group,
             &filter_config,
             &IdentityUmiAssigner::new(),
+            0,
             SamTag::RX,
             None,
             false,
             DedupPassthrough { include_unmapped: false, include_invalid_umis },
+            &mut PairEndBuffer::default(),
         )
         .expect("process_position_group should succeed");
 
@@ -4238,6 +4384,7 @@ mod tests {
             library_idx: 0,
             input_record_count: 1,
             distinct_mi_count: 0,
+            half_mapped: Vec::new(),
         };
 
         let estimate = batch.estimate_heap_size();
@@ -4520,10 +4667,12 @@ mod tests {
             group,
             &filter_config,
             &assigner,
+            0,
             SamTag::RX,
             None,
             false,
             DedupPassthrough::default(),
+            &mut PairEndBuffer::default(),
         )
         .expect("process_position_group should succeed on this well-formed fixture");
 

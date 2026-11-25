@@ -6,6 +6,7 @@
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use fgumi_bam_io::{BaiBuilder, OutputSink, close_buffered, open_output_writer, write_bai_index};
@@ -76,6 +77,44 @@ impl SinkState {
     }
 }
 
+/// Where each block a [`WriteBgzfFile`] was given is in its file: block `i` is at offsets
+/// `ends[i]..ends[i + 1]`.
+#[derive(Debug, Default)]
+pub struct BlockEnds {
+    ends: Mutex<Vec<u64>>,
+    complete: AtomicBool,
+    without_eof: Arc<AtomicBool>,
+}
+
+impl BlockEnds {
+    /// No offsets yet. The file gets no EOF marker if `without_eof` is set when it ends, because it
+    /// is to be rewritten and must not be taken for complete before that.
+    #[must_use]
+    pub fn new(without_eof: Arc<AtomicBool>) -> Self {
+        Self { without_eof, ..Self::default() }
+    }
+
+    /// Whether every block has been written and the file is complete.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    /// Takes the offsets.
+    #[must_use]
+    pub fn take(&self) -> Vec<u64> {
+        std::mem::take(&mut self.ends.lock())
+    }
+
+    fn push(&self, start: u64, end: u64) {
+        let mut ends = self.ends.lock();
+        if ends.is_empty() {
+            ends.push(start);
+        }
+        ends.push(end);
+    }
+}
+
 struct WriterState {
     /// Boxed rather than a concrete `File` so a `-`/stdout path (opened via
     /// [`open_output_writer`]) and a regular file share one type: stdout is
@@ -89,6 +128,7 @@ struct WriterState {
     /// Present only when [`WriteBgzfFile::with_bai_index`] was called. `None`
     /// for every writer that doesn't build an inline index.
     bai: Option<BaiSink>,
+    block_ends: Option<Arc<BlockEnds>>,
 }
 
 /// Per-writer inline BAI indexing state: the [`BaiBuilder`] accumulating
@@ -205,7 +245,16 @@ impl WriteBgzfFile {
         let coffset = header_blocks.len() as u64;
         out.write_all(&header_blocks)?;
 
-        Ok(WriterState { out, pending_header: None, coffset, bai: None })
+        Ok(WriterState { out, pending_header: None, coffset, bai: None, block_ends: None })
+    }
+
+    /// Records in `ends`, if any, where each block is in the file. A no-op on a deferred sink.
+    #[must_use]
+    pub fn with_block_ends(self, ends: Option<Arc<BlockEnds>>) -> Self {
+        if let Some(state) = self.state.lock().as_mut() {
+            state.block_ends = ends;
+        }
+        self
     }
 
     /// Run this sink on a dedicated `StepKind::Detached` driver thread (in the
@@ -310,6 +359,7 @@ impl WriteBgzfFile {
             pending_header: Some(PendingHeader { handle, compression_level, transform }),
             coffset: 0,
             bai: None,
+            block_ends: None,
         })))
     }
 
@@ -472,7 +522,11 @@ impl Step for WriteBgzfFile {
             // One item (one BgzfBlock) per `try_run`, so this is already the
             // batch total for this call — no per-record loop involved.
             ctx.counters.add(BYTES_WRITTEN, block.bytes.len() as u64);
+            let start = state.coffset;
             state.coffset += block.bytes.len() as u64;
+            if let Some(ends) = &state.block_ends {
+                ends.push(start, state.coffset);
+            }
             return Ok(StepOutcome::Progress);
         }
 
@@ -497,10 +551,17 @@ impl WriteBgzfFile {
     /// cleanly.
     fn finish_stream(mut state: WriterState) -> io::Result<()> {
         // Only the writes are external waits; building the index is CPU work.
+        let without_eof = |ends: &Arc<BlockEnds>| ends.without_eof.load(Ordering::Acquire);
+        let without_eof = state.block_ends.as_ref().is_some_and(without_eof);
         external_wait(|| {
-            state.out.write_all(&BGZF_EOF)?;
+            if !without_eof {
+                state.out.write_all(&BGZF_EOF)?;
+            }
             close_buffered(state.out)
         })?;
+        if let Some(ends) = state.block_ends {
+            ends.complete.store(true, Ordering::Release);
+        }
         if let Some(sink) = state.bai {
             let index = sink.bai.build(sink.num_refs).map_err(io::Error::other)?;
             external_wait(|| write_bai_index(&sink.sidecar_path, &index))
@@ -548,6 +609,22 @@ mod tests {
             pending_header: None,
             coffset: 0,
             bai,
+            block_ends: None,
+        }
+    }
+
+    /// A file that is to be rewritten must not look complete.
+    #[test]
+    fn finish_stream_withholds_the_eof_of_a_file_to_be_rewritten() {
+        for rewritten in [false, true] {
+            let probe = CloseProbe::default();
+            let mut state = probe_state(&probe, None);
+            let ends = Arc::new(BlockEnds::new(Arc::new(AtomicBool::new(rewritten))));
+            state.block_ends = Some(Arc::clone(&ends));
+            assert!(!ends.is_complete());
+            WriteBgzfFile::finish_stream(state).unwrap();
+            assert!(ends.is_complete());
+            assert_eq!(probe.bytes().is_empty(), rewritten);
         }
     }
 

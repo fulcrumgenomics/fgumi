@@ -10,6 +10,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
 use noodles::sam::Header;
@@ -110,6 +111,7 @@ pub struct TemplateKeySeed {
     cb_hasher: ahash::RandomState,
     key_types: KeyTypesSpec,
     header_library_varies: bool,
+    half_mapped_seen: Option<Arc<AtomicBool>>,
 }
 
 impl TemplateKeySeed {
@@ -120,7 +122,21 @@ impl TemplateKeySeed {
     pub fn from_header(header: &Header, cell_tag: Option<SamTag>, key_types: KeyTypesSpec) -> Self {
         let lib_lookup = LibraryLookup::from_header(header);
         let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
-        Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types, header_library_varies }
+        Self {
+            lib_lookup,
+            cell_tag,
+            cb_hasher: cb_hasher(),
+            key_types,
+            header_library_varies,
+            half_mapped_seen: None,
+        }
+    }
+
+    /// Set `seen` once the mapped read of a half-mapped pair has been keyed.
+    #[must_use]
+    pub fn with_half_mapped_seen(mut self, seen: Option<Arc<AtomicBool>>) -> Self {
+        self.half_mapped_seen = seen;
+        self
     }
 
     /// The seed's parts: library lookup, cell tag, CB hasher, `--key-types`, and
@@ -168,6 +184,7 @@ impl TemplateKeySeed {
             cell_tag: self.cell_tag,
             cb_hasher: self.cb_hasher.clone(),
             first_key: TemplateKey::default(),
+            half_mapped_seen: None,
             variant: select_template_variant(None, KeyTypesSpec::Full, self.header_library_varies),
         })
     }
@@ -179,6 +196,7 @@ impl TemplateKeySeed {
             self.cell_tag,
             &self.cb_hasher,
         );
+        note_half_mapped(self.half_mapped_seen.as_ref(), first_body);
         let variant = select_first_record_variant(
             &first_key,
             first_body,
@@ -191,7 +209,17 @@ impl TemplateKeySeed {
             cb_hasher: self.cb_hasher.clone(),
             first_key,
             variant,
+            half_mapped_seen: self.half_mapped_seen.clone(),
         })
+    }
+}
+
+#[inline]
+fn note_half_mapped(seen: Option<&Arc<AtomicBool>>, body: &[u8]) {
+    if let Some(seen) = seen
+        && fgumi_raw_bam::RawRecordView::new(body).is_half_mapped()
+    {
+        seen.store(true, Ordering::Relaxed);
     }
 }
 
@@ -205,6 +233,7 @@ pub struct TemplateKeyContext {
     pub first_key: TemplateKey,
     /// The lanes the narrowed key retains.
     pub variant: TemplateKeyVariant,
+    half_mapped_seen: Option<Arc<AtomicBool>>,
 }
 
 /// One batch's refs and its lowest-indexed violation. A batch whose
@@ -276,6 +305,7 @@ impl TemplateKeyContext {
         let full =
             extract_template_key_inline(body, &self.lib_lookup, self.cell_tag, &self.cb_hasher);
         let violation = verify_dropped_lanes(&self.first_key, &full, self.variant);
+        note_half_mapped(self.half_mapped_seen.as_ref(), body);
         (full, violation)
     }
 

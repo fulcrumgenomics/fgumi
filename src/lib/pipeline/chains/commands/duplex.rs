@@ -353,7 +353,8 @@ fn run_duplex_consensus_batch(
     accumulators: &Arc<PerThreadAccumulator<CollectedDuplexMetrics>>,
     progress: &Arc<AtomicU64>,
 ) -> io::Result<(DecompressedBlock, Option<DecompressedBlock>)> {
-    let BatchedMiGroups { batch_serial, groups } = item;
+    let batch_serial = item.batch_serial;
+    let groups = item.into_groups()?;
     let groups_count = groups.len() as u64;
 
     let input_len =

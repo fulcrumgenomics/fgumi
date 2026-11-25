@@ -15,9 +15,11 @@ use anyhow::{Result, bail};
 
 use crate::commands::dedup::{
     BatchedProcessedDedupGroups, CollectedDedupMetrics, DedupCounts, DedupPassthrough,
-    DuplicationLadderRecorder, ProcessedDedupGroup, process_position_group, write_dedup_metrics,
-    write_duplication_ladder, write_family_size_histogram,
+    DuplicationLadderRecorder, ProcessedDedupGroup, mark_half_mapped_copies,
+    process_position_group, write_dedup_metrics, write_duplication_ladder,
+    write_family_size_histogram,
 };
+use crate::half_mapped::pair_ends::{PairEndBuffer, PairEnds};
 use crate::logging::OperationTimer;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::pipeline::chains::FinalizeHook;
@@ -205,7 +207,7 @@ impl FinalizeHook for DedupFinalizeHook {
 
 /// Build the `DedupProcess` step: parallel, `ByItemOrdinal`, processes each
 /// position group through [`process_position_group`] and accumulates per-thread
-/// metrics.
+/// metrics, except those of groups with half-mapped templates left to resolve.
 ///
 /// `pub(crate)` — consumed only by `ChainBuilder::add_dedup`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -236,37 +238,33 @@ pub(crate) fn build_process_step(
             let mut processed_batch: Vec<ProcessedDedupGroup> = Vec::with_capacity(groups.len());
             let assigner =
                 effective_strategy.new_assigner_full(effective_edits, 1, index_threshold);
+            let mut pair_ends = PairEndBuffer::default();
             for group in groups {
                 assigner.reset();
                 let processed = process_position_group(
                     group,
                     &filter_config,
                     assigner.as_ref(),
+                    effective_edits,
                     raw_tag,
                     min_umi_length,
                     no_umi,
                     passthrough,
+                    &mut pair_ends,
                 )?;
-                accumulators.with_slot(|acc| {
-                    // A position group is always single-library, so its counts
-                    // belong entirely to `processed.library_idx`.
-                    acc.dedup_counts_by_library
-                        .entry(processed.library_idx)
-                        .or_default()
-                        .merge(&processed.dedup_counts);
-                    for (size, count) in &processed.family_sizes {
-                        *acc.family_sizes.entry(*size).or_insert(0) += count;
-                    }
-                });
+                if processed.half_mapped.is_empty() {
+                    accumulators.with_slot(|acc| acc.record(&processed));
+                }
                 processed_batch.push(processed);
             }
-            Ok(BatchedProcessedDedupGroups { batch_serial, groups: processed_batch })
+            Ok(BatchedProcessedDedupGroups { batch_serial, groups: processed_batch, pair_ends })
         },
     )
 }
 
 /// Build the `MiAssignDedup` step: serial, `ByItemOrdinal`, assigns
-/// monotonically increasing MI offsets to each batch.
+/// monotonically increasing MI offsets to each batch, and marks the half-mapped
+/// templates that are copies of a fully mapped pair earlier in the input.
 ///
 /// When `ladder_recorder` is `Some`, this step also records the
 /// `--duplication-ladder` — per position group, in this
@@ -280,6 +278,8 @@ pub(crate) fn build_process_step(
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_mi_assign_step(
     limit_bytes: u64,
+    effective_edits: u32,
+    accumulators: Arc<PerThreadAccumulator<CollectedDedupMetrics>>,
     ladder_recorder: Option<Arc<parking_lot::Mutex<DuplicationLadderRecorder>>>,
 ) -> MiAssign<
     BatchedProcessedDedupGroups,
@@ -289,11 +289,16 @@ pub(crate) fn build_mi_assign_step(
     + Sync
     + 'static,
 > {
+    let known = parking_lot::Mutex::new(PairEnds::default());
     mi_assign::<BatchedProcessedDedupGroups, BatchedProcessedDedupGroups, _>(
         "MiAssignDedup",
         limit_bytes,
         move |next_mi: &mut u64, mut item: BatchedProcessedDedupGroups| {
             assign_mi_offsets(next_mi, &mut item)?;
+            mark_half_mapped_copies(&mut item, &mut known.lock(), effective_edits);
+            for processed in item.groups.iter().filter(|group| !group.half_mapped.is_empty()) {
+                accumulators.with_slot(|acc| acc.record(processed));
+            }
             if let Some(recorder) = &ladder_recorder {
                 let mut guard = recorder.lock();
                 for processed in &item.groups {
@@ -375,7 +380,7 @@ pub(crate) fn build_serialize_step(
         move |state: &mut DedupSerializeState,
               item: BatchedProcessedDedupGroups|
               -> std::io::Result<DecompressedBlock> {
-            let BatchedProcessedDedupGroups { batch_serial, groups } = item;
+            let BatchedProcessedDedupGroups { batch_serial, groups, .. } = item;
             let total_records: usize = groups
                 .iter()
                 .map(|g| g.templates.iter().map(|t| t.records().len()).sum::<usize>())
@@ -443,6 +448,7 @@ mod tests {
             library_idx: 0,
             input_record_count: 0,
             distinct_mi_count,
+            half_mapped: Vec::new(),
         }
     }
 
@@ -452,6 +458,7 @@ mod tests {
         let mut item = BatchedProcessedDedupGroups {
             batch_serial: 0,
             groups: vec![make_group(2, &[0, 1]), make_group(3, &[0, 1, 2])],
+            pair_ends: PairEndBuffer::default(),
         };
         let mut next_mi = 10;
 
@@ -473,6 +480,7 @@ mod tests {
         let mut item = BatchedProcessedDedupGroups {
             batch_serial: 0,
             groups: vec![make_group(u64::MAX, &[])],
+            pair_ends: PairEndBuffer::default(),
         };
         let mut next_mi = 1;
 

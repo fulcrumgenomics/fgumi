@@ -33,11 +33,16 @@
 //! drives it stage-by-stage.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use noodles::sam::Header;
 
+use crate::half_mapped::copies::CopyStore;
+use crate::half_mapped::copies::hold::{CopyHold, HoldForCopies};
+#[cfg(feature = "consensus")]
+use crate::half_mapped::copies::hold::{HeldMiGroups, MiGroupRules};
+use crate::half_mapped::copies::splice::{SpliceFinalizeHook, can_rewrite};
 use crate::pipeline::chains::{
     BuiltPipeline, ChainSpec, FinalizeHook, PipelineStatsFinalizeHook, SinkSpec, SourceSpec, Stage,
     StageTimingFinalizeHook, build_pipeline_config_for_chain,
@@ -49,6 +54,7 @@ use crate::pipeline::core::item::HeapSize;
 use crate::pipeline::core::topology::{BranchIdx, StepIdx};
 use crate::pipeline::refill::RefillHint;
 use crate::pipeline::steps::tuning::BamPipelineTuning;
+use fgumi_pipeline_io::sink::write_bgzf::BlockEnds;
 
 /// Where a BAM-record preamble reads from (see `ChainBuilder::append_record_front`).
 enum RecordFront {
@@ -379,8 +385,8 @@ impl HeapSize for FuseState {}
 #[cfg(feature = "consensus")]
 fn templates_to_mi_step(
     limit_bytes: u64,
-    duplex_strip_strand: bool,
-    allow_unmapped: bool,
+    rules: MiGroupRules,
+    hold: CopyHold,
 ) -> impl crate::pipeline::core::step::Step<
     Input = crate::pipeline::steps::group::position::BatchedProcessedPositionGroups,
     Outputs = crate::pipeline::core::outputs::OrderedBytesSingle<
@@ -395,6 +401,8 @@ fn templates_to_mi_step(
     use crate::sam::SamTag;
     use fgumi_raw_bam::RawRecord;
     use std::io;
+
+    let MiGroupRules { strip_strand: duplex_strip_strand, allow_unmapped } = rules;
 
     // The assign tag is always `MI` (== [b'M', b'I']), matching `add_group`.
     let assign_tag_bytes: [u8; 2] = *SamTag::MI;
@@ -487,6 +495,10 @@ fn templates_to_mi_step(
                 {
                     mi_groups.push(MiGroup::new(mi, current_records));
                 }
+            }
+            if hold.is_needed() {
+                let packed = HeldMiGroups::pack(&mi_groups, rules)?;
+                return Ok(BatchedMiGroups::held(batch_serial, packed));
             }
             Ok(BatchedMiGroups::new(batch_serial, mi_groups))
         },
@@ -698,6 +710,11 @@ pub struct ChainBuilder<'a> {
     /// The class table the sort's `ConsolidateRuns` holds (test support).
     #[cfg(test)]
     consolidation_class_table: Option<Arc<fgumi_sort::QnClassTable>>,
+    /// Set by the chain's sort once it has seen the mapped read of a half-mapped pair.
+    half_mapped_seen: Option<Arc<AtomicBool>>,
+    /// The half-mapped templates that `group` takes out of the chain, to be put into the molecules
+    /// of fully mapped pairs.
+    copy_hold: Option<CopyHold>,
     /// A standalone sort's summary-counts slot, handed to [`BuiltPipeline`].
     sort_stats_slot: Option<crate::pipeline::chains::finalize::SortStatsSlot>,
     /// The sort's phase caps, `[phase1, phase2]` (test support).
@@ -1042,6 +1059,8 @@ impl<'a> ChainBuilder<'a> {
             sort_plan: None,
             sort_spill_stats: None,
             created_outputs: CreatedOutputs::default(),
+            half_mapped_seen: None,
+            copy_hold: None,
             fastq_encoding,
             consensus_metrics_captures: None,
             correct_umi_set,
@@ -2763,6 +2782,13 @@ impl<'a> ChainBuilder<'a> {
         let finisher: FinisherSlot = Arc::default();
         let limit = self.tuning.per_step_byte_limit;
         let cap = self.sink_phase_cap.take();
+        let tail = match self.copy_hold.take() {
+            Some(hold) => self.pipeline.append_step(
+                HoldForCopies::<DecompressedBlock>::new(hold, self.tuning.compression_level, limit),
+                tail,
+            ),
+            None => tail,
+        };
 
         let tail = if self.chain_tail_kind == ChainTailKind::SortOutputBlocks {
             // The terminal sort was built without merge-thread compression for
@@ -2788,6 +2814,55 @@ impl<'a> ChainBuilder<'a> {
         };
         let tail = self.pipeline.append_step(write, tail);
         self.current_tail = Some(tail);
+    }
+
+    /// Puts the half-mapped templates that `group` took out of the chain into its output. A file
+    /// is rewritten once it is complete, for which the sink records where its blocks are. Anything
+    /// else is kept back until the templates are known.
+    fn add_copies(
+        &mut self,
+        tail: (StepIdx, BranchIdx),
+        compression_level: u32,
+        limit: u64,
+    ) -> ((StepIdx, BranchIdx), Option<Arc<BlockEnds>>) {
+        use crate::pipeline::steps::types::BgzfBlock;
+
+        let Some(hold) = self.copy_hold.take() else { return (tail, None) };
+        let path = self.spec.sink.output_path();
+        if !can_rewrite(path) {
+            let step = HoldForCopies::<BgzfBlock>::new(hold, compression_level, limit);
+            return (self.pipeline.append_step(step, tail), None);
+        }
+        let ends = Arc::new(BlockEnds::new(hold.store.any()));
+        let hook = SpliceFinalizeHook {
+            store: hold.store,
+            ends: Arc::clone(&ends),
+            path: path.clone(),
+            compression_level,
+            threads: self.spec.threading.num_threads(),
+        };
+        self.finalize.insert(0, Box::new(hook));
+        (tail, Some(ends))
+    }
+
+    /// Bridges an intermediate `add_group` to a consensus stage, whose MI groups include the
+    /// half-mapped templates of the molecules.
+    #[cfg(feature = "consensus")]
+    fn fuse_group(
+        &mut self,
+        rules: MiGroupRules,
+        tail: (StepIdx, BranchIdx),
+    ) -> (StepIdx, BranchIdx) {
+        let limit = self.tuning.per_step_byte_limit;
+        let hold = self.copy_hold.take().expect("add_group called before fuse_group");
+        let step = templates_to_mi_step(limit, rules, hold.clone());
+        let tail = self.pipeline.append_step(step, tail);
+        let step = HoldForCopies::<crate::pipeline::steps::group::mi::BatchedMiGroups>::new(
+            hold,
+            self.tuning.compression_level,
+            limit,
+        );
+        self.pipeline.append_step(step.with_mi_group_rules(rules), tail)
     }
 
     /// Add the output sink step(s) to the pipeline.
@@ -2921,6 +2996,8 @@ impl<'a> ChainBuilder<'a> {
             self.pipeline.append_step(step.with_phase_cap(cap), tail)
         };
 
+        let (tail, block_ends) = self.add_copies(tail, level, limit);
+
         // When Stage::Align is in the chain, the merged output header is
         // resolved at pipeline-run time (the aligner contributes @PG/@RG/@CO
         // lines that aren't known until it emits its SAM/BAM header). The
@@ -2942,6 +3019,7 @@ impl<'a> ChainBuilder<'a> {
         // `want_index` is only ever true on the eager-header branch above (the
         // `ensure!` on `pending_header_handle` guarantees it), so
         // `with_bai_index`'s eager-header requirement always holds here.
+        let write_step = write_step.with_block_ends(block_ends);
         let write_step = if let Some((_, bai_path)) = index {
             let num_refs = self.header.reference_sequences().len();
             // The derived `.bai` sidecar's collision with the BAM or a rejects
@@ -4654,6 +4732,9 @@ impl<'a> ChainBuilder<'a> {
                     Arc::clone(&tail.all_announced),
                 );
             }
+            let half_mapped_seen =
+                (position == StagePosition::Intermediate).then(|| Arc::new(AtomicBool::new(false)));
+            self.half_mapped_seen.clone_from(&half_mapped_seen);
             // Standalone sort gets an end-of-run summary (records processed /
             // written / temporary chunks); the fused runall path does not (the
             // chain-level timing hook covers it). The slot is filled by
@@ -4763,7 +4844,8 @@ impl<'a> ChainBuilder<'a> {
                         &self.header,
                         cell_tag,
                         sort.key_types.unwrap_or_default(),
-                    );
+                    )
+                    .with_half_mapped_seen(half_mapped_seen.clone());
                     let known_width = match sort_order {
                         SortOrder::Coordinate => CoordinateKeys::known_ref_width(&n_ref),
                         SortOrder::Queryname(_) => {
@@ -4851,7 +4933,8 @@ impl<'a> ChainBuilder<'a> {
                     let mut sort_buffer = SortBuffer::new(buffer_config, &self.header, byte_limit)
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
                         .with_affinity(affinity)
-                        .with_queryname_keys(qn_keys.clone());
+                        .with_queryname_keys(qn_keys.clone())
+                        .with_half_mapped_seen(half_mapped_seen.clone());
                     sort_buffer = sort_buffer
                         .with_phase_cap(phase1_cap.clone())
                         .with_range_eligibility(range_eligibility);
@@ -5174,8 +5257,8 @@ impl<'a> ChainBuilder<'a> {
         use crate::logging::OperationTimer;
         use crate::per_thread_accumulator::PerThreadAccumulator;
         use crate::pipeline::chains::commands::group::{
-            GroupFinalizeHook, build_group_mi_assign_step, build_group_process_step,
-            build_group_serialize_step,
+            GroupFinalizeHook, GroupProcessor, build_group_mi_assign_step,
+            build_group_process_step, build_group_serialize_step,
         };
         use crate::pipeline::steps::group::position::GroupByPosition;
         use crate::sam::SamTag;
@@ -5353,24 +5436,36 @@ impl<'a> ChainBuilder<'a> {
         };
 
         // ── Step factories (see chains::commands::group) ──────────────────
-        let process_step = build_group_process_step(
-            self.tuning.per_step_byte_limit,
-            group.effective_strategy,
-            group.effective_edits,
-            group.index_threshold,
+        let processor = Arc::new(GroupProcessor {
+            strategy: group.effective_strategy,
+            effective_edits: group.effective_edits,
+            index_threshold: group.index_threshold,
             raw_tag,
-            group.no_umi,
-            group.allow_unmapped,
-            group.parallel_group_min_templates.clone(),
+            parallel_group_min_templates: group.parallel_group_min_templates.clone(),
             num_threads,
             filter_config,
-            accumulators_for_process,
+            accumulators: accumulators_for_process,
             consensus_metrics,
-            header_arc,
-            library_index_arc,
-            group.realign_window.then(|| Arc::new(self.header.clone())),
+            header: header_arc,
+            library_index: library_index_arc,
+            realign_contigs: group.realign_window.then(|| {
+                Arc::new(crate::realign::window_group::ContigNames::from_header(&self.header))
+            }),
+        });
+        let process_step =
+            build_group_process_step(self.tuning.per_step_byte_limit, Arc::clone(&processor));
+        // Half-mapped templates that share a molecule with a fully mapped pair.
+        let copies = Arc::new(CopyStore::default());
+        let mi_assign_step = build_group_mi_assign_step(
+            self.tuning.per_step_byte_limit,
+            processor,
+            Arc::clone(&copies),
+            assign_tag_bytes,
         );
-        let mi_assign_step = build_group_mi_assign_step(self.tuning.per_step_byte_limit);
+        self.copy_hold = Some(CopyHold {
+            needed: self.half_mapped_seen.take().unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+            store: Arc::clone(&copies),
+        });
 
         // Wire GroupByPosition → ProcessOrdered → MiAssign (always appended).
         // With --verify, the position grouper strictly checks template-coordinate
@@ -5435,6 +5530,7 @@ impl<'a> ChainBuilder<'a> {
             family_size_histogram: group.family_size_histogram.clone(),
             grouping_metrics: group.grouping_metrics.clone(),
             metrics_prefix: group.metrics_prefix.clone(),
+            copies,
             timer,
         }));
 
@@ -5961,10 +6057,7 @@ impl<'a> ChainBuilder<'a> {
         let allow_unmapped = simplex.allow_unmapped.enabled;
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
             // simplex: no `/A` `/B` strand stripping; apply the canonical filter.
-            self.pipeline.append_step(
-                templates_to_mi_step(self.tuning.per_step_byte_limit, false, allow_unmapped),
-                tail,
-            )
+            self.fuse_group(MiGroupRules { strip_strand: false, allow_unmapped }, tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             // The cell-tag partition is defensive/redundant given MI uniqueness
@@ -6343,10 +6436,7 @@ impl<'a> ChainBuilder<'a> {
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
             // duplex: strip `/A` `/B` so both strands group together, and apply
             // the same canonical per-record filter the non-fused path applies.
-            self.pipeline.append_step(
-                templates_to_mi_step(self.tuning.per_step_byte_limit, true, allow_unmapped),
-                tail,
-            )
+            self.fuse_group(MiGroupRules { strip_strand: true, allow_unmapped }, tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             // Record filter: the canonical `consensus_pregroup_keep_raw` shared
@@ -6619,10 +6709,7 @@ impl<'a> ChainBuilder<'a> {
         let allow_unmapped = codec.allow_unmapped.enabled;
         let tail = if self.chain_tail_kind == ChainTailKind::BatchedProcessedPositionGroups {
             // codec: no `/A` `/B` strand stripping; apply the canonical filter.
-            self.pipeline.append_step(
-                templates_to_mi_step(self.tuning.per_step_byte_limit, false, allow_unmapped),
-                tail,
-            )
+            self.fuse_group(MiGroupRules { strip_strand: false, allow_unmapped }, tail)
         } else {
             // Normal path: DecodedRecordBatch → GroupByMi → BatchedMiGroups.
             // Codec: canonical pre-group filter, no MI transform. The cell-tag
@@ -7653,7 +7740,6 @@ impl<'a> ChainBuilder<'a> {
 
         let accumulators =
             PerThreadAccumulator::<crate::commands::dedup::CollectedDedupMetrics>::new(num_threads);
-        let accumulators_for_process = Arc::clone(&accumulators);
 
         // ── Step factories (see chains::commands::dedup) ──────────────────
         let process_step = build_process_step(
@@ -7669,7 +7755,7 @@ impl<'a> ChainBuilder<'a> {
                 include_unmapped: dedup.include_unmapped,
                 include_invalid_umis: dedup.include_invalid_umis,
             },
-            accumulators_for_process,
+            Arc::clone(&accumulators),
         );
         // Duplication ladder recorder (`--duplication-ladder`).
         // `Some` only when the flag is set; shared (via `Arc`) between the serial
@@ -7681,8 +7767,12 @@ impl<'a> ChainBuilder<'a> {
                 crate::commands::dedup::DuplicationLadderRecorder::new(dedup.ladder_interval),
             ))
         });
-        let mi_assign_step =
-            build_mi_assign_step(self.tuning.per_step_byte_limit, ladder_recorder.clone());
+        let mi_assign_step = build_mi_assign_step(
+            self.tuning.per_step_byte_limit,
+            effective_edits,
+            Arc::clone(&accumulators),
+            ladder_recorder.clone(),
+        );
         let serialize_step = build_serialize_step(
             self.tuning.per_step_byte_limit,
             dedup.remove_duplicates,
@@ -8210,6 +8300,8 @@ mod tests {
             sort_plan: None,
             sort_spill_stats: None,
             created_outputs: CreatedOutputs::default(),
+            half_mapped_seen: None,
+            copy_hold: None,
             fastq_encoding: None,
             consensus_metrics_captures: None,
             correct_umi_set: None,

@@ -13,6 +13,7 @@
 
 use std::io;
 
+use crate::half_mapped::copies::hold::HeldMiGroups;
 use crate::mi_group::{MiGroup, MiKey, MiTransform};
 use crate::pipeline::core::Unpushed;
 use crate::pipeline::core::held::HeldSlot;
@@ -57,12 +58,30 @@ const LONG_RUN_WARN_INTERVAL: usize = 100_000;
 pub struct BatchedMiGroups {
     pub batch_serial: u64,
     pub groups: Vec<MiGroup>,
+    /// The groups, if they are still packed.
+    pub(crate) held: Option<Box<HeldMiGroups>>,
 }
 
 impl BatchedMiGroups {
     #[must_use]
     pub fn new(batch_serial: u64, groups: Vec<MiGroup>) -> Self {
-        Self { batch_serial, groups }
+        Self { batch_serial, groups, held: None }
+    }
+
+    pub(crate) fn held(batch_serial: u64, held: HeldMiGroups) -> Self {
+        Self { batch_serial, groups: Vec::new(), held: Some(Box::new(held)) }
+    }
+
+    /// The batch's groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the groups are packed and cannot be unpacked.
+    pub fn into_groups(self) -> io::Result<Vec<MiGroup>> {
+        match self.held {
+            Some(held) => held.unpack(),
+            None => Ok(self.groups),
+        }
     }
 }
 
@@ -70,6 +89,7 @@ impl HeapSize for BatchedMiGroups {
     fn heap_size(&self) -> usize {
         self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
             + self.groups.capacity() * std::mem::size_of::<MiGroup>()
+            + self.held.as_ref().map_or(0, |held| held.heap_size())
     }
 }
 

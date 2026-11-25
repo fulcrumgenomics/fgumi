@@ -101,7 +101,8 @@ impl MetricsSink {
     /// reorder is taken/released inside `submit`, between them), so there is no
     /// lock-order cycle.
     fn record_batch(&mut self, item: BatchedMiGroups) -> io::Result<()> {
-        let BatchedMiGroups { batch_serial, groups } = item;
+        let batch_serial = item.batch_serial;
+        let groups = item.into_groups()?;
 
         // Reject a consensus BAM the same way the serial
         // `process_templates_from_bam` does: on the first qualifying record this
