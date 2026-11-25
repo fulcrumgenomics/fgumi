@@ -423,6 +423,20 @@ pub fn consensus_pregroup_keep_flags(flags: u16, allow_unmapped: bool) -> bool {
     flags & flags::UNMAPPED == 0
 }
 
+/// Removes the unmapped reads of a molecule that has a fully mapped pair.
+///
+/// They are the other ends of half-mapped copies of that pair, admitted by `--allow-unmapped`.
+/// Where no mapped read of the molecule has the same segment and strand, they would otherwise be
+/// consensus called with no alignment supporting them.
+pub(crate) fn drop_unmapped_ends(records: &mut Vec<fgumi_raw_bam::RawRecord>) {
+    let is_pair = |record: &fgumi_raw_bam::RawRecord| {
+        record.is_paired() && !record.is_unmapped() && !record.is_mate_unmapped()
+    };
+    if records.iter().any(|record| record.is_unmapped()) && records.iter().any(is_pair) {
+        records.retain(|record| !record.is_unmapped());
+    }
+}
+
 /// Raw-BAM-bytes wrapper around [`consensus_pregroup_keep_flags`], suitable as
 /// a `MiGrouper` / raw-record-iterator record filter.
 #[must_use]

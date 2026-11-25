@@ -70,6 +70,24 @@ fn depth(record: &RecordBuf, tag: SamTag) -> i64 {
     record.data().get(&tag.to_noodles_tag()).and_then(Value::as_int).unwrap_or(0)
 }
 
+/// The unmapped read of a half-mapped pair adds no depth where the molecule has a mapped one.
+#[rstest]
+fn unmapped_reads_add_nothing_to_a_pair(
+    #[values("true", "false")] allow_unmapped: &str,
+    #[values("simplex", "duplex")] command: &str,
+) {
+    let pairs = [
+        pair("full", "A", "AAAA-CCCC", Ends::Both),
+        pair("half1", "A", "AAAA-CCCC", Ends::Lower),
+        pair("half2", "A", "AAAA-CCCC", Ends::Lower),
+    ];
+    let min_reads = if command == "duplex" { "1,1,0" } else { "1" };
+    let unmapped = format!("--allow-unmapped={allow_unmapped}");
+    let records = call(command, &pairs, &["--min-reads", min_reads, &unmapped]);
+    let depths: Vec<_> = records.iter().map(|r| depth(r, SamTag::CD)).collect();
+    assert_eq!(depths, [3, 1]);
+}
+
 /// The consensus UMI does not use the UMI segment of a read that did not map.
 #[rstest]
 fn the_consensus_umi_is_that_of_the_pairs(#[values("simplex", "duplex")] command: &str) {
@@ -106,6 +124,7 @@ fn half_mapped_pairs_give_one_end_duplex_support(
     #[case] min_reads: &str,
     #[case] expected: Option<[[i64; 2]; 2]>,
     #[values(["A", "B"], ["B", "A"])] strands: [&str; 2],
+    #[values("true", "false")] allow_unmapped: &str,
 ) {
     let umis = strands.map(|strand| if strand == "A" { "AAAA-CCCC" } else { "CCCC-AAAA" });
     let mut pairs: Vec<_> =
@@ -116,7 +135,8 @@ fn half_mapped_pairs_give_one_end_duplex_support(
     if strands[0] == "B" {
         pairs.rotate_left(2);
     }
-    let records = call("duplex", &pairs, &["--min-reads", min_reads]);
+    let unmapped = format!("--allow-unmapped={allow_unmapped}");
+    let records = call("duplex", &pairs, &["--min-reads", min_reads, &unmapped]);
     // The strand with more reads first; the order of the two ends follows from the strands.
     let ordered = |mut values: [i64; 2]| {
         values.sort_unstable_by(|a, b| b.cmp(a));

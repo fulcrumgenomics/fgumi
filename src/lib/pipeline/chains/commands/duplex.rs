@@ -367,6 +367,7 @@ fn run_duplex_consensus_batch(
     let mut total_input_records: u64 = 0;
     for MiGroup { mi, records: mut group_reads } in groups {
         state.caller.clear();
+        crate::commands::common::drop_unmapped_ends(&mut group_reads);
         total_input_records += group_reads.len() as u64;
 
         if let Some(ref mut oc) = state.overlapping
