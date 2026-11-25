@@ -1472,10 +1472,14 @@ impl DuplexConsensusCaller {
         builder.append_float_tag(SamTag::CE, duplex_error_rate);
         builder.append_int_tag(SamTag::CM, duplex_depth_min);
 
-        // 9. Build RX consensus from source reads
+        // 9. Build RX consensus from source reads, or those with a mapped mate if there are any
         let mut all_umis = Vec::new();
+        let mate_mapped = |raw: &RawRecord| raw.flags() & flags::MATE_UNMAPPED == 0;
+        let any_mate_mapped =
+            source_reads_a.iter().chain(source_reads_b).any(|raw| mate_mapped(raw));
+        let has_whole_umi = |raw: &RawRecord| !any_mate_mapped || mate_mapped(raw);
 
-        for raw in source_reads_a {
+        for raw in source_reads_a.iter().filter(|raw| has_whole_umi(raw)) {
             if let Some(rx_bytes) = raw.tags().find_string(SamTag::RX) {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
                 let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;
@@ -1488,7 +1492,7 @@ impl DuplexConsensusCaller {
             }
         }
 
-        for raw in source_reads_b {
+        for raw in source_reads_b.iter().filter(|raw| has_whole_umi(raw)) {
             if let Some(rx_bytes) = raw.tags().find_string(SamTag::RX) {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
                 let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;

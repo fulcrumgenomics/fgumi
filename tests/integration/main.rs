@@ -55,6 +55,8 @@ mod test_group_cutover_parity;
 mod test_group_determinism;
 #[cfg(feature = "consensus")]
 mod test_group_metrics_fused_parity;
+#[cfg(feature = "consensus")]
+mod test_half_mapped_consensus;
 mod test_input_source_matrix;
 mod test_merge_command;
 mod test_merge_ported;
