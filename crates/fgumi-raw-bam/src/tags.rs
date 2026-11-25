@@ -744,6 +744,41 @@ impl TemplateCoordinateTag {
         }
     }
 
+    /// Decodes the `tc` tag of a primary record of a half-mapped pair (one read mapped, its mate
+    /// not) that `fgumi group` gave the molecule of a fully mapped pair: that molecule's coordinate.
+    ///
+    /// Returns `None` for any other record, and when the tag is absent, has fewer than two mapped
+    /// primaries, has the same primary twice, or has no primary where this pair's mapped read is.
+    #[must_use]
+    pub fn from_half_mapped(bam: &[u8]) -> Option<Self> {
+        use crate::fields::flags::{
+            MATE_REVERSE, MATE_UNMAPPED, PAIRED, REVERSE, SECONDARY, SUPPLEMENTARY, UNMAPPED,
+        };
+
+        let record = crate::RawRecordView::new(bam);
+        let flags = record.flags();
+        let is_unmapped = flags & UNMAPPED != 0;
+        if flags & (PAIRED | SECONDARY | SUPPLEMENTARY) != PAIRED
+            || is_unmapped == (flags & MATE_UNMAPPED != 0)
+        {
+            return None;
+        }
+        let aux = crate::aux_data_slice(bam);
+        let tc = Self::from_aux_data(aux)?;
+        let mapped = if is_unmapped {
+            let reverse = flags & MATE_REVERSE != 0;
+            let cigar = find_string_tag(aux, SamTag::MC)?;
+            let pos = crate::mate_unclipped_5prime_1based(record.mate_pos(), reverse, cigar);
+            (record.mate_ref_id(), pos, reverse)
+        } else {
+            let pos = crate::unclipped_5prime_from_raw_bam(bam);
+            (record.ref_id(), pos, flags & REVERSE != 0)
+        };
+        let (lower, upper) = ((tc.tid1, tc.pos1, tc.neg1), (tc.tid2, tc.pos2, tc.neg2));
+        let is_pair = !tc.has_one_primary() && lower != upper;
+        (is_pair && (mapped == lower || mapped == upper)).then_some(tc)
+    }
+
     /// Whether the template had only one mapped primary (see
     /// [`Self::one_primary`]).
     #[must_use]
@@ -5919,6 +5954,60 @@ mod tests {
     // ========================================================================
     // TemplateCoordinateTag
     // ========================================================================
+
+    /// A primary record of a half-mapped pair whose mapped read is at 1001+, with a `tc` tag.
+    fn half_mapped(
+        flags: u16,
+        cigar: Option<u32>,
+        mate_cigar: Option<&[u8]>,
+        tc: &[i32],
+    ) -> Vec<u8> {
+        let mut builder = crate::SamBuilder::new();
+        builder.read_name(b"q").flags(flags).ref_id(0).pos(1000).mate_ref_id(0).mate_pos(1000);
+        builder.sequence(b"ACGT").qualities(&[30; 4]);
+        if let Some(cigar) = cigar {
+            builder.cigar_ops(&[cigar]);
+        }
+        if let Some(mate_cigar) = mate_cigar {
+            builder.add_string_tag(SamTag::MC, mate_cigar);
+        }
+        builder.add_array_i32(SamTag::TC, tc);
+        builder.build().as_ref().to_vec()
+    }
+
+    #[rstest]
+    #[case::mapped_read(0x1 | 0x8 | 0x40, true, &[0, 1001, 0, 0, 1401, 1], true)]
+    #[case::unmapped_mate(0x1 | 0x4 | 0x80, false, &[0, 1001, 0, 0, 1401, 1], true)]
+    #[case::at_the_upper_end(0x1 | 0x8 | 0x40, true, &[0, 601, 1, 0, 1001, 0], true)]
+    #[case::on_neither_end(0x1 | 0x8 | 0x40, true, &[0, 1002, 0, 0, 1401, 1], false)]
+    #[case::other_strand(0x1 | 0x8 | 0x40, true, &[0, 1001, 1, 0, 1401, 0], false)]
+    #[case::one_primary(0x1 | 0x8 | 0x40, true, &[0, 1001, 0, i32::MAX, i32::MAX, 0], false)]
+    #[case::legacy_one_primary(0x1 | 0x8 | 0x40, true, &[0, 1001, 0, 0, 1001, 0], false)]
+    #[case::unpaired(0x0, true, &[0, 1001, 0, 0, 1401, 1], false)]
+    #[case::both_mapped(0x1 | 0x40, true, &[0, 1001, 0, 0, 1401, 1], false)]
+    #[case::both_unmapped(0x1 | 0x4 | 0x8 | 0x40, false, &[0, 1001, 0, 0, 1401, 1], false)]
+    #[case::supplementary(0x1 | 0x8 | 0x40 | 0x800, true, &[0, 1001, 0, 0, 1401, 1], false)]
+    fn test_template_coordinate_tag_from_half_mapped(
+        #[case] flags: u16,
+        #[case] mapped: bool,
+        #[case] tc: &[i32],
+        #[case] expected: bool,
+    ) {
+        let (cigar, mate_cigar) =
+            if mapped { (Some(4 << 4), None) } else { (None, Some(&b"4M"[..])) };
+        let record = half_mapped(flags, cigar, mate_cigar, tc);
+        let read = TemplateCoordinateTag::from_half_mapped(&record);
+        assert_eq!(read.is_some(), expected);
+        if let Some(read) = read {
+            assert_eq!(read.to_values(), tc);
+        }
+    }
+
+    #[test]
+    fn test_template_coordinate_tag_of_an_unmapped_read_needs_the_mate_cigar() {
+        let record = half_mapped(0x1 | 0x4 | 0x80, None, None, &[0, 1001, 0, 0, 1401, 1]);
+        assert_eq!(TemplateCoordinateTag::from_half_mapped(&record), None);
+    }
 
     fn tc_aux(values: &[i32]) -> Vec<u8> {
         let mut aux = Vec::new();

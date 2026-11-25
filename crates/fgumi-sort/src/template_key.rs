@@ -652,6 +652,27 @@ pub fn extract_template_key_inline(
         }
     }
 
+    // A half-mapped pair in the molecule of a fully mapped pair sorts with that pair.
+    if is_paired
+        && is_unmapped != mate_unmapped
+        && let Some(tc) = TemplateCoordinateTag::from_half_mapped(bam_bytes)
+    {
+        let (pos1, pos2) = tc.zero_based_positions();
+        return TemplateKey::new(
+            tc.tid1,
+            pos1,
+            tc.neg1,
+            tc.tid2,
+            pos2,
+            tc.neg2,
+            cb_hash,
+            library,
+            mi,
+            name_hash,
+            is_unmapped,
+        );
+    }
+
     // Handle unmapped reads
     if is_unmapped {
         if is_paired && !mate_unmapped {
