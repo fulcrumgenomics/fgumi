@@ -14,7 +14,7 @@ use std::sync::Arc;
 use fgumi_raw_bam::{MIN_BAM_RECORD_LEN, SamTag};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::arena_pool::PooledSegmentedBuf;
 use crate::inline::{
@@ -109,7 +109,6 @@ pub struct TemplateKeySeed {
     /// Fixed seed — feeds the sort key. Never reseed (byte identity).
     cb_hasher: ahash::RandomState,
     key_types: KeyTypesSpec,
-    header_library_varies: bool,
 }
 
 impl TemplateKeySeed {
@@ -119,16 +118,14 @@ impl TemplateKeySeed {
     #[must_use]
     pub fn from_header(header: &Header, cell_tag: Option<SamTag>, key_types: KeyTypesSpec) -> Self {
         let lib_lookup = LibraryLookup::from_header(header);
-        let header_library_varies = lib_lookup.distinct_header_ordinals() > 1;
-        Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types, header_library_varies }
+        Self { lib_lookup, cell_tag, cb_hasher: cb_hasher(), key_types }
     }
 
-    /// The seed's parts: library lookup, cell tag, CB hasher, `--key-types`, and
-    /// whether the header realizes more than one library.
+    /// The seed's parts: library lookup, cell tag, CB hasher, and `--key-types`.
     pub(crate) fn into_parts(
         self,
-    ) -> (LibraryLookup, Option<SamTag>, ahash::RandomState, KeyTypesSpec, bool) {
-        (self.lib_lookup, self.cell_tag, self.cb_hasher, self.key_types, self.header_library_varies)
+    ) -> (LibraryLookup, Option<SamTag>, ahash::RandomState, KeyTypesSpec) {
+        (self.lib_lookup, self.cell_tag, self.cb_hasher, self.key_types)
     }
 
     /// The lanes `--key-types` fixes before any record is seen; `None` under
@@ -136,7 +133,7 @@ impl TemplateKeySeed {
     #[must_use]
     pub fn known_variant(&self) -> Option<TemplateKeyVariant> {
         (self.key_types != KeyTypesSpec::Auto)
-            .then(|| select_template_variant(None, self.key_types, self.header_library_varies))
+            .then(|| select_template_variant(None, self.key_types))
     }
 
     /// Extract the sort's FIRST record's full key, choose the lane variant from
@@ -168,7 +165,7 @@ impl TemplateKeySeed {
             cell_tag: self.cell_tag,
             cb_hasher: self.cb_hasher.clone(),
             first_key: TemplateKey::default(),
-            variant: select_template_variant(None, KeyTypesSpec::Full, self.header_library_varies),
+            variant: select_template_variant(None, KeyTypesSpec::Full),
         })
     }
 
@@ -179,8 +176,7 @@ impl TemplateKeySeed {
             self.cell_tag,
             &self.cb_hasher,
         );
-        let variant =
-            select_template_variant(Some(&first_key), self.key_types, self.header_library_varies);
+        let variant = select_template_variant(Some(&first_key), self.key_types);
         Arc::new(TemplateKeyContext {
             lib_lookup: self.lib_lookup.clone(),
             cell_tag: self.cell_tag,
@@ -538,18 +534,6 @@ impl LibraryLookup {
     pub fn ordinal_from_rg(&self, rg: Option<&[u8]>) -> u32 {
         rg.and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
     }
-
-    /// Number of distinct library ordinals realized by the header's read groups.
-    ///
-    /// Used to decide whether the template-key `tertiary` library lane can vary:
-    /// `<= 1` means every header read group maps to the same library ordinal, so
-    /// the lane is provisionally constant (decode-time verify still backstops the
-    /// case where a record carries an RG absent from the header → ordinal 0).
-    /// Returns 0 when the header declares no read groups.
-    #[must_use]
-    pub fn distinct_header_ordinals(&self) -> usize {
-        self.rg_to_ordinal.values().copied().collect::<HashSet<u32>>().len()
-    }
 }
 
 /// Extract a packed `TemplateKey` directly from BAM record bytes.
@@ -558,7 +542,7 @@ impl LibraryLookup {
 /// heap allocations for the read name by using a hash instead.
 ///
 /// When `cell_tag` is `Some`, the CB (cellular barcode) tag value is hashed
-/// and included in the sort key between neg2 and MI, matching fgbio's order.
+/// and included in the sort key between library and MI, matching samtools' order.
 #[must_use]
 pub fn extract_template_key_inline(
     bam_bytes: &[u8],
@@ -573,7 +557,12 @@ pub fn extract_template_key_inline(
 
     // Single-pass extraction of all aux tags (MI, RG, cell barcode, MC)
     let aux = fgumi_raw_bam::extract_template_aux_tags(bam_bytes, cell_tag);
-    let mi = aux.mi;
+    // A present MI is stored one higher than its value, so that MI 0 packs to a non-zero lane: an absent MI packs
+    // to zero and sorts first (as samtools' empty MI does), and auto `--key-types` keeps the MI lane whenever the
+    // first record carries any MI.
+    let mi = aux
+        .mi
+        .map_or((0, true), |(value, is_a)| (value.min(TemplateKey::MAX_MI_VALUE - 1) + 1, is_a));
     let library = lib_lookup.ordinal_from_rg(aux.rg);
     let cb_hash = aux.cell.map_or(0u64, |cb_bytes| cb_hasher.hash_one(cb_bytes));
 
@@ -623,7 +612,7 @@ pub fn extract_template_key_inline(
             //
             // `TemplateKey::new`'s final argument is the `is_upper` bit, packed
             // into `name_hash_upper` as the *last* tiebreak (after position,
-            // strand, CB, library, MI, and name). For a mapped read it answers
+            // strand, library, CB, MI, and name). For a mapped read it answers
             // "is this read's own primary the upper (lane-2) end?", derived from
             // this read's position vs. its mate. A secondary/supplementary read
             // cannot recover that: `tc` does not record which segment (R1/R2)
@@ -670,10 +659,9 @@ pub fn extract_template_key_inline(
             );
         }
 
-        // Completely unmapped - sort to end. Still carry the read's library and
-        // MI lanes so a fully-unmapped read realizes the same tertiary as its
-        // mapped, same-library peers (otherwise the dropped-lane verify treats a
-        // single-library file as if the library varied; see #375).
+        // Completely unmapped - sort to end. Still carry the read's library (in
+        // `secondary`) and MI (in `tertiary`) exactly as `TemplateKey::new` does, so
+        // unmapped templates still order by library and MI (#375).
         let is_read2 = (flag & 0x80) != 0; // is_last_segment flag
         return TemplateKey::unmapped(name_hash, cb_hash, library, mi, is_read2);
     }
@@ -720,7 +708,7 @@ pub fn extract_template_key_inline(
 pub struct TemplateKeyVariant {
     /// Retain the `cb_hash` lane.
     pub cb: bool,
-    /// Retain the tertiary (library|mi) lane.
+    /// Retain the tertiary (MI) lane.
     pub tertiary: bool,
 }
 
@@ -761,37 +749,26 @@ pub enum KeyTypesSpec {
     Explicit {
         /// Retain the `cb_hash` lane.
         cb: bool,
-        /// Retain the tertiary (library|mi) lane.
+        /// Retain the tertiary (MI) lane.
         tertiary: bool,
     },
 }
-
-/// Mask for the MI component of the `tertiary` key lane (low 48 bits).
-/// `tertiary` packs `library_ordinal << 48 | (mi_value << 1 | !mi_suffix)`, so the
-/// high 16 bits are the library ordinal and the low 48 bits encode MI. A nonzero
-/// low-48 region means the first record carries an MI tag.
-const TERTIARY_MI_MASK: u64 = (1u64 << 48) - 1;
 
 /// Choose the template-key variant for this sort.
 ///
 /// `first_key` is the full key extracted from the first record (`None` for an
 /// empty input — then the variant is irrelevant; default to lite). `spec` is the
-/// parsed `--key-types` override. `header_library_varies` is `true` when the
-/// header realizes more than one distinct library ordinal (see
-/// [`LibraryLookup::distinct_header_ordinals`]).
+/// parsed `--key-types` override.
 ///
 /// Selection only *provisions* the variant; the decode-time verify (fill loop)
-/// still *guarantees* the dropped lanes are constant. Under `Auto`, the tertiary
-/// library lane is kept only when it can actually vary: the first record carries
-/// an MI tag, or the header realizes more than one library ordinal. A single,
-/// constant library ordinal in the high bits is droppable — the header informs
-/// provisioning, while verify backstops the rare case of a record whose RG is
-/// absent from the header (which realizes ordinal 0).
+/// still *guarantees* the dropped lanes are constant. The library ordinal lives in
+/// the always-retained `secondary` lane, so it never needs a lane of its own.
+/// Under `Auto`, the CB lane is kept when the first record carries a CB tag and
+/// the tertiary (MI) lane when it carries an MI tag.
 #[must_use]
 pub fn select_template_variant(
     first_key: Option<&TemplateKey>,
     spec: KeyTypesSpec,
-    header_library_varies: bool,
 ) -> TemplateKeyVariant {
     match spec {
         KeyTypesSpec::Full => TemplateKeyVariant { cb: true, tertiary: true },
@@ -799,18 +776,7 @@ pub fn select_template_variant(
         KeyTypesSpec::Explicit { cb, tertiary } => TemplateKeyVariant { cb, tertiary },
         KeyTypesSpec::Auto => match first_key {
             None => TemplateKeyVariant { cb: false, tertiary: false },
-            Some(k) => {
-                // Keep the tertiary lane only if it can actually vary: MI present on
-                // the first record (low-48 bits), or the header realizes more than
-                // one library ordinal. A single (constant) library ordinal in the
-                // high bits is droppable — decode-time verify backstops the rare
-                // case of a record whose RG is absent from the header (ordinal 0).
-                let mi_present = (k.tertiary & TERTIARY_MI_MASK) != 0;
-                TemplateKeyVariant {
-                    cb: k.cb_hash != 0,
-                    tertiary: mi_present || header_library_varies,
-                }
-            }
+            Some(k) => TemplateKeyVariant { cb: k.cb_hash != 0, tertiary: k.tertiary != 0 },
         },
     }
 }
@@ -826,8 +792,6 @@ pub enum DroppedLaneViolation {
     Cb,
     /// A record carried an MI value differing from the first record.
     Mi,
-    /// A record's realized library ordinal differed from the first record.
-    Library,
 }
 
 impl DroppedLaneViolation {
@@ -837,7 +801,6 @@ impl DroppedLaneViolation {
         match self {
             DroppedLaneViolation::Cb => "cb",
             DroppedLaneViolation::Mi => "mi",
-            DroppedLaneViolation::Library => "library",
         }
     }
 }
@@ -845,10 +808,6 @@ impl DroppedLaneViolation {
 /// Verify that the lanes the chosen `variant` dropped are constant for `cur`
 /// relative to the sort's `first` full key. Returns the first violation found,
 /// or `None` if all dropped lanes match.
-///
-/// Tertiary sub-fields are decoded only to attribute the violation: the high 16
-/// bits are the library ordinal; the low 48 bits are `(mi_value << 1) | !mi_suffix`
-/// (`mi_value` occupies bits 47..1; `!mi_suffix` is bit 0).
 #[must_use]
 pub fn verify_dropped_lanes(
     first: &TemplateKey,
@@ -859,13 +818,7 @@ pub fn verify_dropped_lanes(
         return Some(DroppedLaneViolation::Cb);
     }
     if !variant.tertiary && cur.tertiary != first.tertiary {
-        // Attribute: library is the high 16 bits, mi the low 48.
-        let lib_changed = (cur.tertiary >> 48) != (first.tertiary >> 48);
-        return Some(if lib_changed {
-            DroppedLaneViolation::Library
-        } else {
-            DroppedLaneViolation::Mi
-        });
+        return Some(DroppedLaneViolation::Mi);
     }
     None
 }
@@ -895,7 +848,6 @@ pub(crate) fn dropped_lane_error(name: &str, v: DroppedLaneViolation) -> anyhow:
     let field = match v {
         DroppedLaneViolation::Cb => "CB",
         DroppedLaneViolation::Mi => "MI",
-        DroppedLaneViolation::Library => "library",
     };
     anyhow::anyhow!(
         "record {name} carries a {field} value absent from the input's first record; \
@@ -1312,71 +1264,6 @@ mod moved_key_tests {
     }
 
     #[test]
-    fn test_distinct_header_ordinals() {
-        // (i) no read groups -> 0.
-        let empty = LibraryLookup::from_header(&Header::builder().build());
-        assert_eq!(empty.distinct_header_ordinals(), 0);
-
-        // (ii) one RG with an LB -> 1.
-        let rg_a = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibA"))
-            .build()
-            .expect("valid");
-        let one = LibraryLookup::from_header(
-            &Header::builder().add_read_group(BString::from("rg1"), rg_a).build(),
-        );
-        assert_eq!(one.distinct_header_ordinals(), 1);
-
-        // (iii) two RGs with two different LBs -> 2.
-        let rg_b = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibA"))
-            .build()
-            .expect("valid");
-        let rg_c = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibB"))
-            .build()
-            .expect("valid");
-        let two = LibraryLookup::from_header(
-            &Header::builder()
-                .add_read_group(BString::from("rg1"), rg_b)
-                .add_read_group(BString::from("rg2"), rg_c)
-                .build(),
-        );
-        assert_eq!(two.distinct_header_ordinals(), 2);
-
-        // (iv) two RGs with the SAME LB -> 1.
-        let rg_d = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibA"))
-            .build()
-            .expect("valid");
-        let rg_e = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibA"))
-            .build()
-            .expect("valid");
-        let same = LibraryLookup::from_header(
-            &Header::builder()
-                .add_read_group(BString::from("rg1"), rg_d)
-                .add_read_group(BString::from("rg2"), rg_e)
-                .build(),
-        );
-        assert_eq!(same.distinct_header_ordinals(), 1);
-
-        // (v) one RG with an LB + one RG WITHOUT an LB -> 2 (ordinals {1, 0}).
-        let rg_f = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, String::from("LibA"))
-            .build()
-            .expect("valid");
-        let rg_no_lb = Map::<ReadGroup>::builder().build().expect("valid");
-        let mixed = LibraryLookup::from_header(
-            &Header::builder()
-                .add_read_group(BString::from("rg1"), rg_f)
-                .add_read_group(BString::from("rg2"), rg_no_lb)
-                .build(),
-        );
-        assert_eq!(mixed.distinct_header_ordinals(), 2);
-    }
-
-    #[test]
     fn test_library_lookup_unknown_rg_returns_zero() {
         let rg = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("LibA"))
@@ -1480,6 +1367,40 @@ mod moved_key_tests {
         aux.extend_from_slice(value);
         aux.push(0); // null terminator
         aux
+    }
+
+    fn mi_key(mi: Option<&str>) -> TemplateKey {
+        let lib_lookup = LibraryLookup::from_header(&Header::builder().build());
+        let aux = mi.map(|v| [b"MIZ".as_slice(), v.as_bytes(), b"\0"].concat()).unwrap_or_default();
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+        extract_template_key_inline(&bam, &lib_lookup, None, &test_cb_hasher())
+    }
+
+    /// The MI lane orders an absent MI first (as samtools' empty MI string does), then
+    /// MI values numerically with `/A` before `/B`. MI 0 must not collide with an
+    /// absent MI.
+    #[rstest]
+    #[case::absent_before_zero(None, Some("0"))]
+    #[case::absent_before_zero_b(None, Some("0/B"))]
+    #[case::zero_before_one(Some("0"), Some("1"))]
+    #[case::a_before_b(Some("5/A"), Some("5/B"))]
+    #[case::numeric_not_lexical(Some("9"), Some("10"))]
+    fn test_extract_template_key_mi_lane_order(
+        #[case] lower: Option<&str>,
+        #[case] higher: Option<&str>,
+    ) {
+        assert!(mi_key(lower).tertiary < mi_key(higher).tertiary, "{lower:?} < {higher:?}");
+    }
+
+    /// Auto `--key-types` keeps the MI lane when the first record carries MI 0, as
+    /// grouped output usually does; dropping it would fail the sort at the next MI.
+    #[rstest]
+    #[case::mi_zero(Some("0"), true)]
+    #[case::mi_zero_a(Some("0/A"), true)]
+    #[case::mi_absent(None, false)]
+    fn test_auto_keeps_mi_lane_for_any_mi(#[case] mi: Option<&str>, #[case] tertiary: bool) {
+        let variant = select_template_variant(Some(&mi_key(mi)), KeyTypesSpec::Auto);
+        assert_eq!(variant.tertiary, tertiary);
     }
 
     #[test]
@@ -1675,7 +1596,7 @@ mod moved_key_tests {
     /// pair and its tc-stamped sec/supp reads, the tc branch must place the
     /// sec/supp read at the *exact same* `TemplateKey` as its primary — not merely
     /// nearby. This is the strong property the reviewer asked for: it pins down the
-    /// full key (position lanes, strand lanes, CB, library, MI, name, **and** the
+    /// full key (position lanes, strand lanes, library, CB, MI, name, **and** the
     /// `is_upper`/`is_read2` tiebreak), verifying tc ordering matches the mapped
     /// path rather than only asserting a coarse `<`/`>` placement.
     ///
@@ -1795,15 +1716,18 @@ mod moved_key_tests {
     #[test]
     fn verify_detects_mi_change() {
         let first = full_key(0, 0);
-        let cur = full_key(0, 0b10); // mi_value bit set, library still 0
+        let cur = full_key(0, 0b10); // mi_value bit set
         assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Mi));
     }
 
+    /// The library ordinal lives in the always-retained `secondary` lane, so a
+    /// change of library is never a dropped-lane violation.
     #[test]
-    fn verify_detects_library_change() {
-        let first = full_key(0, 0);
-        let cur = full_key(0, 1u64 << 48); // library ordinal 1
-        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), Some(DroppedLaneViolation::Library));
+    fn verify_ignores_library_change() {
+        let first = TemplateKey::new(0, 100, false, 0, 200, false, 0, 1, (0, true), 0, false);
+        let cur = TemplateKey::new(0, 100, false, 0, 200, false, 0, 2, (0, true), 0, false);
+        assert_ne!(first.secondary, cur.secondary, "library must be carried by secondary");
+        assert_eq!(verify_dropped_lanes(&first, &cur, LITE), None);
     }
 
     #[test]
@@ -1814,12 +1738,10 @@ mod moved_key_tests {
 
     #[test]
     fn verify_error_message_names_field_and_token() {
-        let e = dropped_lane_error("read42", DroppedLaneViolation::Library);
+        let e = dropped_lane_error("read42", DroppedLaneViolation::Mi);
         let msg = e.to_string();
         assert!(
-            msg.contains("read42")
-                && msg.contains("library")
-                && msg.contains("--key-types library"),
+            msg.contains("read42") && msg.contains("MI") && msg.contains("--key-types mi"),
             "{msg}"
         );
     }
@@ -1832,91 +1754,43 @@ mod moved_key_tests {
         TemplateKey { primary: 1, secondary: 2, cb_hash: cb, tertiary, name_hash_upper: 3 }
     }
 
-    #[test]
-    fn auto_lite_when_no_cb_no_tertiary() {
-        let v = select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
-        assert_eq!(v.lanes(), 3);
-    }
-
-    #[test]
-    fn auto_cb_only_when_first_record_has_cb() {
-        let v = select_template_variant(Some(&key(42, 0)), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: false });
-        assert_eq!(v.lanes(), 4);
-    }
-
-    #[test]
-    fn auto_tertiary_only_when_first_record_has_mi_or_library() {
-        // 0xABCD is in the low-48 bits => MI present => keep tertiary, even though
-        // the header library does not vary.
-        let v = select_template_variant(Some(&key(0, 0xABCD)), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
-        assert_eq!(v.lanes(), 4);
-    }
-
-    #[test]
-    fn auto_full_when_both_present() {
-        let v = select_template_variant(Some(&key(7, 9)), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: true, tertiary: true });
-        assert_eq!(v.lanes(), 5);
-    }
-
-    // tertiary high bits only = a single library ordinal, no MI. With a non-varying
-    // header, the constant library lane is dropped -> lite.
-    #[test]
-    fn auto_drops_constant_single_library_lane() {
-        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
-        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: false });
-        assert_eq!(v.lanes(), 3);
-    }
-
-    #[test]
-    fn auto_keeps_tertiary_when_header_library_varies() {
-        let k = key(0, 1u64 << 48); // library ordinal 1, no MI
-        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, true); // >1 library
-        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
-        assert_eq!(v.lanes(), 4);
-    }
-
-    #[test]
-    fn auto_keeps_tertiary_for_mi_even_with_constant_library() {
-        // MI present (low bits) -> keep tertiary even though header library is constant.
-        let k = key(0, (1u64 << 48) | 0b10); // library ordinal 1 + MI value bit
-        let v = select_template_variant(Some(&k), KeyTypesSpec::Auto, false);
-        assert_eq!(v, TemplateKeyVariant { cb: false, tertiary: true });
-    }
-
-    #[test]
-    fn none_forces_lite() {
-        assert_eq!(
-            select_template_variant(Some(&key(99, 99)), KeyTypesSpec::None, true).lanes(),
-            3
-        );
-    }
-
-    #[test]
-    fn full_forces_all_lanes() {
-        assert_eq!(select_template_variant(Some(&key(0, 0)), KeyTypesSpec::Full, false).lanes(), 5);
-    }
-
-    #[test]
-    fn explicit_spec_passthrough() {
-        assert_eq!(
-            select_template_variant(
-                None,
-                KeyTypesSpec::Explicit { cb: true, tertiary: false },
-                false
-            )
-            .lanes(),
-            4
-        );
-    }
-
-    #[test]
-    fn empty_input_defaults_to_lite() {
-        assert_eq!(select_template_variant(None, KeyTypesSpec::Auto, false).lanes(), 3);
+    /// Lane selection from the first record's key (or none, for an empty input)
+    /// and the `--key-types` spec. The library ordinal is in `secondary`, so a
+    /// multi-library input needs no optional lane.
+    #[rstest]
+    #[case::auto_lite_when_no_cb_no_mi(Some(key(0, 0)), KeyTypesSpec::Auto, false, false)]
+    #[case::auto_cb_when_first_record_has_cb(Some(key(42, 0)), KeyTypesSpec::Auto, true, false)]
+    #[case::auto_tertiary_when_first_record_has_mi(
+        Some(key(0, 0xABCD)),
+        KeyTypesSpec::Auto,
+        false,
+        true
+    )]
+    #[case::auto_full_when_cb_and_mi(Some(key(7, 9)), KeyTypesSpec::Auto, true, true)]
+    #[case::auto_lite_for_any_library(
+        Some(TemplateKey::new(0, 100, false, 0, 200, false, 0, 5, (0, true), 0, false)),
+        KeyTypesSpec::Auto,
+        false,
+        false
+    )]
+    #[case::none_forces_lite(Some(key(99, 99)), KeyTypesSpec::None, false, false)]
+    #[case::full_forces_all_lanes(Some(key(0, 0)), KeyTypesSpec::Full, true, true)]
+    #[case::explicit_spec_passthrough(
+        None,
+        KeyTypesSpec::Explicit { cb: true, tertiary: false },
+        true,
+        false
+    )]
+    #[case::empty_input_defaults_to_lite(None, KeyTypesSpec::Auto, false, false)]
+    fn select_template_variant_chooses_lanes(
+        #[case] first_key: Option<TemplateKey>,
+        #[case] spec: KeyTypesSpec,
+        #[case] cb: bool,
+        #[case] tertiary: bool,
+    ) {
+        let v = select_template_variant(first_key.as_ref(), spec);
+        assert_eq!(v, TemplateKeyVariant { cb, tertiary });
+        assert_eq!(v.lanes(), 3 + usize::from(cb) + usize::from(tertiary));
     }
 
     /// `ref_width` is the bytes one accumulated template ref occupies for the

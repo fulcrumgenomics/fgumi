@@ -562,15 +562,45 @@ fn header_with_read_groups(groups: &[(&str, &str)]) -> noodles::sam::Header {
     builder.build()
 }
 
-/// Twin of `lite_sort_hard_errors_when_{cb_appears,mi_appears,library_differs}`:
-/// under `--key-types none` the first record fixes the dropped lanes, and a
+/// Check every record's library position and preserve both mates of every input
+/// template, without constraining the order within a library.
+fn assert_library_grouped_records(input: &Path, output: &Path, expected_read_groups: &[&str]) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+
+    let (_, output_records) = crate::helpers::read_bam_output(output);
+    let read_groups: Vec<_> = output_records
+        .iter()
+        .map(|record| match record.data().get(&Tag::READ_GROUP) {
+            Some(Value::String(id)) => id.to_string(),
+            other => panic!("expected a string RG tag, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(read_groups, expected_read_groups, "every library's records must be contiguous");
+    assert_records_preserved(input, output);
+}
+
+/// Assert that `output` holds exactly `input`'s records, ignoring order.
+///
+/// Comparing full records catches lost, duplicated, or altered mates even when
+/// the output is still correctly ordered.
+fn assert_records_preserved(input: &Path, output: &Path) {
+    let (_, mut input_records) = crate::helpers::read_bam_output(input);
+    let (_, mut output_records) = crate::helpers::read_bam_output(output);
+    for records in [&mut input_records, &mut output_records] {
+        records.sort_unstable_by_key(|record| {
+            (record.name().expect("named").to_string(), record.flags().bits())
+        });
+    }
+    assert_eq!(output_records, input_records, "the sort must preserve every input record");
+}
+
+/// Under `--key-types none` the first record fixes the dropped lanes, and a
 /// later record with a different value fails the sort with the token that
-/// re-includes the lane. The library case's second record names a read group
-/// absent from the header (library ordinal 0 against the first's 1).
+/// re-includes the lane.
 #[rstest]
 #[case::cb("CB", "AAAACCCC", "--key-types cb")]
 #[case::mi("MI", "7", "--key-types mi")]
-#[case::library("RG", "rgUnknown", "--key-types library")]
 fn a_dropped_lane_that_varies_fails_the_sort(
     #[case] tag: &str,
     #[case] value: &str,
@@ -581,7 +611,7 @@ fn a_dropped_lane_that_varies_fails_the_sort(
     let mut builder = SamBuilder::new();
     builder.header = header_with_read_groups(&[("rgA", "LibAlpha")]);
     let first = builder.add_pair().name("read00000").start1(1).start2(101);
-    let _ = if tag == "RG" { first.attr("RG", "rgA") } else { first }.build();
+    let _ = first.build();
     let _ = builder.add_pair().name("read00001").start1(201).start2(301).attr(tag, value).build();
     let input = dir.path().join("in.bam");
     builder.write_bam(&input).unwrap();
@@ -594,6 +624,131 @@ fn a_dropped_lane_that_varies_fails_the_sort(
     )
     .expect_err("a varying dropped lane must fail the sort");
     assert!(format!("{err:#}").contains(token), "expected {token:?} guidance: {err:#}");
+}
+
+/// Template-coordinate order compares library before the cell barcode and read
+/// name (samtools' field order), so all of one library's templates at a
+/// position are contiguous whatever their `CB` and names. Here the libraries
+/// alternate in name order and in `CB` order (`cb_hash` orders AAAA, CCCC, GGGG,
+/// TTTT under fgumi's fixed-seed hasher), so ordering by either one before
+/// library interleaves them; the output must be grouped by library, `LibAlpha`
+/// first.
+#[rstest]
+fn template_coordinate_groups_each_library_before_cb_and_name(
+    #[values(1, 4)] threads: usize,
+    #[values(None, Some("full"))] key_types: Option<&str>,
+) {
+    let dir = TempDir::new().unwrap();
+    let mut builder = SamBuilder::new();
+    builder.header = header_with_read_groups(&[("rgA", "LibAlpha"), ("rgB", "LibBeta")]);
+    for (name, rg, cb) in
+        [("q1", "rgB", "AAAA"), ("q2", "rgA", "CCCC"), ("q3", "rgB", "GGGG"), ("q4", "rgA", "TTTT")]
+    {
+        let _ = builder
+            .add_pair()
+            .name(name)
+            .start1(100)
+            .start2(300)
+            // Match the default 100M CIGAR so both mates have the same template coordinates.
+            .attr("MC", "100M")
+            .attr("RG", rg)
+            .attr("CB", cb)
+            .build();
+    }
+    let input = dir.path().join("in.bam");
+    builder.write_bam(&input).unwrap();
+    let output = dir.path().join("out.bam");
+    let extra: Vec<&str> = key_types.map(|k| vec!["--key-types", k]).unwrap_or_default();
+    try_sort(&input, &output, "template-coordinate", threads, &extra).expect("sort succeeds");
+
+    assert_library_grouped_records(
+        &input,
+        &output,
+        &["rgA", "rgA", "rgA", "rgA", "rgB", "rgB", "rgB", "rgB"],
+    );
+}
+
+/// Grouped output usually starts at MI 0. Auto `--key-types` must keep the MI lane
+/// for it, with one library or several, rather than taking MI 0 for an absent MI
+/// and then failing at the first record with MI 1.
+#[rstest]
+fn a_grouped_input_starting_at_mi_zero_sorts_under_auto(
+    #[values(&[("rgA", "LibAlpha")][..], &[("rgA", "LibAlpha"), ("rgB", "LibBeta")][..])]
+    read_groups: &[(&str, &str)],
+    #[values("768M", "64K")] max_memory: &str,
+    #[values(1, 4)] threads: usize,
+) {
+    let dir = TempDir::new().unwrap();
+    let mut builder = SamBuilder::new();
+    builder.header = header_with_read_groups(read_groups);
+    for i in 0..200usize {
+        let (rg, _) = read_groups[i % read_groups.len()];
+        let mi = format!("{}/A", i / 2);
+        let _ = builder
+            .add_pair()
+            .name(&format!("read{i:05}"))
+            .start1(1 + (i / 4) * 10)
+            .start2(101 + (i / 4) * 10)
+            .attr("RG", rg)
+            .attr("MI", mi.as_str())
+            .build();
+    }
+    let input = dir.path().join("in.bam");
+    builder.write_bam(&input).unwrap();
+    let output = dir.path().join("out.bam");
+    try_sort(
+        &input,
+        &output,
+        "template-coordinate",
+        threads,
+        &["-m", max_memory, "--memory-per-thread", "false"],
+    )
+    .expect("a grouped input starting at MI 0 must sort under auto");
+    assert!(
+        verify_sorted(&output, "template-coordinate"),
+        "output must be template-coordinate sorted"
+    );
+    assert_records_preserved(&input, &output);
+}
+
+/// The library is part of the always-retained key, never a dropped lane, so a
+/// record whose library differs from the first record's (here a read group
+/// absent from the header, library ordinal 0 against the first's 1) neither fails
+/// a sort that drops every optional lane nor loses its library order: at one
+/// position, the unknown library's template sorts first.
+#[rstest]
+fn a_varying_library_sorts_by_library_under_lite_key_types(
+    #[values(None, Some("none"))] key_types: Option<&str>,
+    #[values(1, 4)] threads: usize,
+) {
+    let dir = TempDir::new().unwrap();
+    let mut builder = SamBuilder::new();
+    builder.header = header_with_read_groups(&[("rgA", "LibAlpha")]);
+    // MC matches each default 100M CIGAR, keeping both mates at the same template coordinates.
+    let _ = builder
+        .add_pair()
+        .name("read00000")
+        .start1(1)
+        .start2(101)
+        .attr("MC", "100M")
+        .attr("RG", "rgA")
+        .build();
+    let _ = builder
+        .add_pair()
+        .name("read00001")
+        .start1(1)
+        .start2(101)
+        .attr("MC", "100M")
+        .attr("RG", "rgUnknown")
+        .build();
+    let input = dir.path().join("in.bam");
+    builder.write_bam(&input).unwrap();
+    let output = dir.path().join("out.bam");
+    let extra: Vec<&str> = key_types.map(|k| vec!["--key-types", k]).unwrap_or_default();
+    try_sort(&input, &output, "template-coordinate", threads, &extra)
+        .expect("a varying library must not fail a lite sort");
+
+    assert_library_grouped_records(&input, &output, &["rgUnknown", "rgUnknown", "rgA", "rgA"]);
 }
 
 /// Twin of `auto_single_library_{multi_readgroup,unmapped_read}_sorts_without_false_violation`

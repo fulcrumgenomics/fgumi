@@ -3816,19 +3816,17 @@ fn sort_default_keytypes(
     sorted
 }
 
-/// Regression for the CB-keying bug: `fgumi sort --order template-coordinate` keys
-/// on the `CB` tag by default (`parse_cell_tag`), and `cb_hash` outranks the
-/// library lane in `TemplateKey::core_cmp`. Two same-position reads whose `CB`
-/// order is the OPPOSITE of their library order are emitted by that sort in `CB`
-/// order; `--verify` must accept it because it keys on `CB` too. A CB-blind
-/// verifier (`cell_tag = None`) would see the library lane out of order and
-/// spuriously reject. `cb_hash(AAAAAAAA) < cb_hash(TTTTTTTT)` under fgumi's
+/// `fgumi sort --order template-coordinate` keys on the `CB` tag by default
+/// (`parse_cell_tag`) and compares library before `cb_hash` (samtools' order).
+/// Two same-position reads whose `CB` order is the OPPOSITE of their library
+/// order are emitted in library order, and `--verify`, which keys on `CB` too,
+/// must accept that. `cb_hash(AAAAAAAA) < cb_hash(TTTTTTTT)` under fgumi's
 /// fixed-seed hasher, so pairing `CB=AAAAAAAA` with the higher library ordinal
-/// (`libB` = `RG2`) makes the CB-sorted order run library-descending — the exact
-/// shape that trips a `None` verifier. (Sorted via `fgumi sort` itself, so the
-/// input is genuinely what the recommended command produces, whatever the hash.)
+/// (`libB` = `RG2`) makes the library-sorted order run CB-descending. (Sorted via
+/// `fgumi sort` itself, so the input is genuinely what the recommended command
+/// produces, whatever the hash.)
 #[test]
-fn test_dedup_verify_accepts_cb_sorted_multi_library() {
+fn test_dedup_verify_accepts_library_sorted_multi_library_cb_input() {
     let temp_dir = TempDir::new().unwrap();
     let header = create_multi_library_header("chr1", 10000);
     let records = [
@@ -3840,6 +3838,45 @@ fn test_dedup_verify_accepts_cb_sorted_multi_library() {
     let out = temp_dir.path().join("out.bam");
     dedup_verify_result(&sorted, &out, &[])
         .expect("--verify must accept the CB-sorted multi-library input `fgumi sort` produced");
+}
+
+/// [`single_end_rg_cb`] with an `MI` tag.
+fn single_end_rg_cb_mi(name: &str, start: i32, rg_id: &str, cb: &str, mi: &str) -> RawRecord {
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(b"ACGTACGT")
+        .qualities(&[30; 8])
+        .flags(0) // unpaired, mapped, forward
+        .ref_id(0)
+        .pos(start - 1)
+        .mapq(60)
+        .cigar_ops(&[8 << 4]) // 8M
+        .add_string_tag(SamTag::RX, b"ACGTACGT")
+        .add_string_tag(SamTag::RG, rg_id.as_bytes())
+        .add_string_tag(SamTag::CB, cb.as_bytes())
+        .add_string_tag(SamTag::MI, mi.as_bytes());
+    b.build()
+}
+
+/// Regression for the CB-keying bug: `--verify` must key on `CB`, as `fgumi sort
+/// --order template-coordinate` does by default. Two same-position reads in one
+/// library whose `CB` order is the OPPOSITE of their MI order are emitted by that
+/// sort in `CB` order (`cb_hash(AAAAAAAA) < cb_hash(TTTTTTTT)` under fgumi's
+/// fixed-seed hasher), so the MI runs descending. A CB-blind verifier
+/// (`cell_tag = None`) would see the MI lane out of order and spuriously reject.
+#[test]
+fn test_dedup_verify_accepts_cb_sorted_input_whose_mi_order_disagrees() {
+    let temp_dir = TempDir::new().unwrap();
+    let header = create_multi_library_header("chr1", 10000);
+    let records = [
+        single_end_rg_cb_mi("readA", 501, "RG1", "TTTTTTTT", "1"), // high cb_hash, low MI
+        single_end_rg_cb_mi("readB", 501, "RG1", "AAAAAAAA", "2"), // low cb_hash, high MI
+    ];
+    let sorted = sort_default_keytypes(temp_dir.path(), &header, &records);
+
+    let out = temp_dir.path().join("out.bam");
+    dedup_verify_result(&sorted, &out, &[])
+        .expect("--verify must accept the CB-sorted input `fgumi sort` produced");
 }
 
 /// A coordinate-ordered (mate-interleaved) paired file is a realistic mislabel:

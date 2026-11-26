@@ -1330,7 +1330,9 @@ pub struct DedupOptions {
     /// the check fails mid-stream. The check is intentionally STRICTER than
     /// deduplication requires (dedup only needs a template's mates adjacent by
     /// position), which is why it is opt-in; for a standalone check with no output
-    /// use `fgumi sort --verify`.
+    /// use `fgumi sort --verify`. Input sorted by samtools can fail the check where
+    /// several cell barcodes or MI values share a position, because samtools compares
+    /// them as strings; sort with `fgumi sort --order template-coordinate` instead.
     #[arg(long = "verify", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
     pub verify: bool,
 

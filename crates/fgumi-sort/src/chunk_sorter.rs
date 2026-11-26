@@ -439,8 +439,6 @@ pub struct TemplateChunkSorter {
     cell_tag: Option<SamTag>,
     /// `--key-types` spec; selects which optional lanes may be dropped.
     key_types: KeyTypesSpec,
-    /// Whether the header realizes >1 library ordinal (informs `Auto` selection).
-    header_library_varies: bool,
     total_records: u64,
 }
 
@@ -458,7 +456,7 @@ impl TemplateChunkSorter {
     ///
     /// Returns an error if the rayon sort pool cannot be built.
     pub fn new(memory_limit: usize, seed: TemplateKeySeed, sort_threads: usize) -> Result<Self> {
-        let (lib_lookup, cell_tag, cb_hasher, key_types, header_library_varies) = seed.into_parts();
+        let (lib_lookup, cell_tag, cb_hasher, key_types) = seed.into_parts();
         let ref_bytes = std::mem::size_of::<crate::inline::TemplateRecordRef<TemplateKey40>>();
         let data_bytes_per_record =
             crate::inline::TEMPLATE_HEADER_SIZE + EST_BAM_BYTES_PER_TEMPLATE_RECORD;
@@ -474,7 +472,6 @@ impl TemplateChunkSorter {
             cb_hasher,
             cell_tag,
             key_types,
-            header_library_varies,
         ))
     }
 
@@ -491,7 +488,6 @@ impl TemplateChunkSorter {
         cb_hasher: ahash::RandomState,
         cell_tag: Option<SamTag>,
         key_types: KeyTypesSpec,
-        header_library_varies: bool,
     ) -> Self {
         Self {
             state: None,
@@ -503,7 +499,6 @@ impl TemplateChunkSorter {
             cb_hasher,
             cell_tag,
             key_types,
-            header_library_varies,
             total_records: 0,
         }
     }
@@ -518,7 +513,7 @@ impl TemplateChunkSorter {
     /// # Errors
     ///
     /// Returns an error if the record cannot be buffered (e.g. truncated), or if
-    /// a record carries a dropped-lane value (CB / MI / library) absent from the
+    /// a record carries a dropped-lane value (CB / MI) absent from the
     /// input's first record.
     pub fn push(&mut self, bam_bytes: &[u8]) -> Result<bool> {
         // The key extractor indexes the 32-byte core: hold the record to it
@@ -549,8 +544,7 @@ impl TemplateChunkSorter {
             // matching narrowed-key buffer. Buffer the record BEFORE committing
             // `self.state`, so a `push_full` error leaves the sorter unprovisioned
             // rather than holding a first_key/variant from a never-buffered record.
-            let variant =
-                select_template_variant(Some(&key), self.key_types, self.header_library_varies);
+            let variant = select_template_variant(Some(&key), self.key_types);
             let mut buffer = TemplateBuffer::from_variant(
                 variant,
                 self.estimated_records,
@@ -938,11 +932,7 @@ mod tests {
         }
 
         let variant = sorter.chosen_variant().expect("variant provisioned on first push");
-        assert_eq!(
-            variant.lanes(),
-            3,
-            "no cb / no MI / single library must narrow to the 3-lane TemplateKey24"
-        );
+        assert_eq!(variant.lanes(), 3, "no cb / no MI must narrow to the 3-lane TemplateKey24");
 
         let chunk = sorter.take_sorted_chunk_owned();
         assert_eq!(chunk.len(), 300, "every record retained");

@@ -273,9 +273,12 @@ pub struct Sort {
     /// `--order template-coordinate`; ignored for other orders.
     ///
     ///   (omitted)            Auto-detect from the first record + verify (default).
-    ///   full                 Keep all lanes (CB + library/MI). Largest key.
+    ///   full                 Keep all lanes (CB + MI). Largest key.
     ///   none                 Drop all optional lanes (smallest, bulk pre-group).
-    ///   cb,library,mi        Comma/space list; keep the named lanes.
+    ///   cb,mi                Comma/space list; keep the named lanes.
+    ///
+    /// The library is always part of the key. The `library` token is still
+    /// accepted for compatibility and has no effect (`library` alone is auto).
     ///
     /// A record carrying a value in a dropped lane aborts the sort with a message
     /// naming the field and the token to re-include it.
@@ -616,9 +619,12 @@ pub struct SortOptions {
     /// `--order template-coordinate`; ignored for other orders.
     ///
     ///   (omitted)            Auto-detect from the first record + verify (default).
-    ///   full                 Keep all lanes (CB + library/MI). Largest key.
+    ///   full                 Keep all lanes (CB + MI). Largest key.
     ///   none                 Drop all optional lanes (smallest, bulk pre-group).
-    ///   cb,library,mi        Comma/space list; keep the named lanes.
+    ///   cb,mi                Comma/space list; keep the named lanes.
+    ///
+    /// The library is always part of the key. The `library` token is still
+    /// accepted for compatibility and has no effect (`library` alone is auto).
     ///
     /// A record carrying a value in a dropped lane aborts the sort with a message
     /// naming the field and the token to re-include it.
@@ -1025,9 +1031,10 @@ pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
 
 /// Parse `--key-types` into a [`KeyTypesSpec`].
 ///
-/// `full` | `none`/`""` | comma/space list of `cb`,`library`,`mi`. Unknown
-/// tokens are rejected. `library`, `mi`, and `library,mi` all map to the shared
-/// `tertiary` lane.
+/// `full` | `none`/`""` | comma/space list of `cb`,`mi`. Unknown tokens are
+/// rejected. `mi` maps to the `tertiary` lane. `library` is accepted and ignored:
+/// the library ordinal is always in the key (the `secondary` lane). A list that
+/// names only `library` is therefore the same as omitting the option (auto).
 pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("full") {
@@ -1038,17 +1045,24 @@ pub(crate) fn parse_key_types(s: &str) -> Result<KeyTypesSpec, String> {
     }
     let mut cb = false;
     let mut tertiary = false;
+    let mut only_library = true;
     for tok in s.split([',', ' ']).filter(|t| !t.is_empty()) {
-        match tok.to_ascii_lowercase().as_str() {
+        let tok = tok.to_ascii_lowercase();
+        only_library &= tok == "library";
+        match tok.as_str() {
             "cb" => cb = true,
-            "library" | "mi" => tertiary = true,
+            "mi" => tertiary = true,
+            "library" => {}
             other => {
                 return Err(format!(
                     "unknown --key-types token '{other}', expected 'full', 'none', \
-                     or a list of 'cb','library','mi'"
+                     or a list of 'cb','mi'"
                 ));
             }
         }
+    }
+    if only_library {
+        return Ok(KeyTypesSpec::Auto);
     }
     Ok(KeyTypesSpec::Explicit { cb, tertiary })
 }
@@ -1434,8 +1448,9 @@ impl Sort {
                 verify_sort_order(
                     raw_reader,
                     |bam| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),
-                    // Use core_cmp to ignore name_hash tie-breaker differences
-                    // This allows both fgumi and samtools sorted files to pass
+                    // Use core_cmp to ignore name_hash tie-breaker differences, so
+                    // samtools-sorted files pass too (except where several CB or MI
+                    // values share a position; see `TemplateKey::core_cmp`)
                     |key, prev| key.core_cmp(prev) == Ordering::Less,
                 )?
             }
@@ -2854,11 +2869,11 @@ mod tests {
     #[case("none", KeyTypesSpec::None)]
     #[case("", KeyTypesSpec::None)]
     #[case("cb", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
-    #[case("library", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
+    #[case("library", KeyTypesSpec::Auto)]
     #[case("mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
     #[case("library,mi", KeyTypesSpec::Explicit { cb: false, tertiary: true })]
     #[case("cb,mi", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
-    #[case("cb library", KeyTypesSpec::Explicit { cb: true, tertiary: true })]
+    #[case("cb library", KeyTypesSpec::Explicit { cb: true, tertiary: false })]
     #[case("FULL", KeyTypesSpec::Full)]
     #[case("None", KeyTypesSpec::None)]
     #[case("CB", KeyTypesSpec::Explicit { cb: true, tertiary: false })]

@@ -259,7 +259,7 @@ impl Command for GroupedReads {
         let mut sort = crate::commands::sort::SortOptions {
             order: crate::commands::sort::SortOrderArg::TemplateCoordinate,
             // grouped-reads always writes MI tags, so include the tertiary
-            // (library|mi) lane in the template-coordinate key rather than
+            // (MI) lane in the template-coordinate key rather than
             // relying on first-record auto-detection (equivalent to
             // `fgumi sort --key-types mi`).
             key_types: Some(KeyTypesSpec::Explicit { cb: false, tertiary: true }),

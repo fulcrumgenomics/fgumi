@@ -611,7 +611,11 @@ pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
 /// Extended key for template-coordinate sorting.
 ///
 /// Template-coordinate requires comparing multiple fields:
-/// tid1, tid2, pos1, pos2, neg1, neg2, CB, library, MI, name, `is_upper`
+/// tid1, tid2, pos1, pos2, neg1, neg2, library, CB, MI, name, `is_upper`
+///
+/// This is the field order of `samtools sort --template-coordinate` (samtools 1.24
+/// or later, which compares CB). Library must precede CB, MI, and name so that all
+/// of one library's templates at a position are contiguous.
 ///
 /// We pack these into 5 u64 values for efficient comparison.
 /// The `name_hash_upper` field packs both `name_hash` and `is_upper`:
@@ -626,14 +630,14 @@ pub struct TemplateKey {
     /// Packed: (tid1 << 48) | (tid2 << 32) | pos1
     /// Comparison order matches samtools: tid1, tid2, pos1
     pub primary: u64,
-    /// Packed: (pos2 << 32) | (!neg1 << 1) | !neg2
-    /// neg flags inverted so reverse (neg=true) sorts before forward (neg=false)
+    /// Packed: (pos2 << 32) | (!neg1 << 17) | (!neg2 << 16) | library
+    /// neg flags inverted so reverse (neg=true) sorts before forward (neg=false);
+    /// the library ordinal occupies the low 16 bits, after the strands.
     pub secondary: u64,
-    /// Hash of the CB (cellular barcode) tag value.
-    /// Inserted between neg2 and MI to match fgbio's sort order.
+    /// Hash of the CB (cellular barcode) tag value, compared after library.
     /// 0 when no cell tag is present or `cell_tag` is disabled.
     pub cb_hash: u64,
-    /// Packed: (library << 48) | (`mi_value` << 1) | `mi_suffix`
+    /// Packed: (`mi_value` << 1) | !`mi_suffix`; zero when the record has no MI.
     pub tertiary: u64,
     /// Packed: (`name_hash` << 1) | `is_upper`
     /// This ensures same-name records group together, with `is_upper` as tie-breaker.
@@ -670,16 +674,8 @@ impl TemplateKey {
         // This ensures comparison order matches samtools: tid1, tid2, pos1
         let p1 = (tid1_packed << 48) | (tid2_packed << 32) | pos1_packed;
 
-        // Pack secondary: pos2 (bits 63-32), neg1 (bit 1), neg2 (bit 0)
-        // Invert neg flags: samtools sorts reverse (neg=true) BEFORE forward (neg=false)
-        // By storing !neg, we get: !true=0 < !false=1, so reverse sorts first
-        let p2 = (pos2_packed << 32) | (u64::from(!neg1) << 1) | u64::from(!neg2);
-
-        // Pack tertiary: library (high 16), mi_value (middle), mi_suffix (bit 0)
-        // Note: /B suffix should sort after /A, so we use !is_a as the bit
-        let p3 = ((u64::from(library) & 0xFFFF) << 48)
-            | ((mi.0 & 0xFFFF_FFFF_FFFF) << 1)
-            | u64::from(!mi.1);
+        let p2 = Self::pack_secondary(pos2_packed, neg1, neg2, library);
+        let p3 = Self::pack_tertiary(mi);
 
         // Pack name_hash and is_upper: hash in upper 63 bits, is_upper in bit 0
         // This ensures same-name records group together, with is_upper=false before is_upper=true
@@ -688,15 +684,39 @@ impl TemplateKey {
         Self { primary: p1, secondary: p2, cb_hash, tertiary: p3, name_hash_upper: p4 }
     }
 
+    /// Pack the `secondary` lane: pos2 (bits 63-32), !neg1 (bit 17), !neg2
+    /// (bit 16), library ordinal (bits 15-0).
+    ///
+    /// The neg flags are inverted because samtools sorts reverse (neg=true) before
+    /// forward (neg=false): storing !neg gives !true=0 < !false=1. The library
+    /// ordinal sits below the strands so it is compared after them and before the
+    /// `cb_hash` lane, matching samtools' library-then-CB order.
+    #[inline]
+    fn pack_secondary(pos2_packed: u64, neg1: bool, neg2: bool, library: u32) -> u64 {
+        (pos2_packed << 32)
+            | (u64::from(!neg1) << 17)
+            | (u64::from(!neg2) << 16)
+            | (u64::from(library) & 0xFFFF)
+    }
+
+    /// The largest `mi_value` the `tertiary` lane holds; larger values are truncated to their low bits.
+    pub const MAX_MI_VALUE: u64 = (1 << 62) - 1;
+
+    /// Pack the `tertiary` lane: `mi_value` (bits 62-1) and !`mi_suffix` (bit 0).
+    ///
+    /// A `/B` suffix sorts after `/A`, so the bit stores `!is_a`.
+    #[inline]
+    fn pack_tertiary(mi: (u64, bool)) -> u64 {
+        ((mi.0 & Self::MAX_MI_VALUE) << 1) | u64::from(!mi.1)
+    }
+
     /// Create a key for completely unmapped records.
     ///
-    /// `library` and `mi` are packed into `tertiary` identically to
-    /// [`TemplateKey::new`] so a fully-unmapped read realizes the same library
-    /// and MI lanes as its mapped, same-template peers. Zeroing `tertiary` here
-    /// (the prior behavior) made an unmapped read carrying a valid RG realize
-    /// library ordinal 0 while its mapped same-library peers realized ordinal N,
-    /// which the auto `--key-types` dropped-lane verify then flagged as a
-    /// spurious "library" violation on single-library inputs (#375).
+    /// `primary` is all ones and `secondary` carries the unmapped-mate sentinel
+    /// (pos2 all ones, forward strands) so these sort after every mapped key.
+    /// `library` and `mi` are packed identically to [`TemplateKey::new`] so a
+    /// fully-unmapped read realizes the same library and MI as its mapped,
+    /// same-template peers (#375).
     #[must_use]
     pub fn unmapped(
         name_hash: u64,
@@ -705,16 +725,11 @@ impl TemplateKey {
         mi: (u64, bool),
         is_read2: bool,
     ) -> Self {
-        // Pack tertiary identically to `new`: library (high 16), mi_value
-        // (middle), mi_suffix (bit 0).
-        let tertiary = ((u64::from(library) & 0xFFFF) << 48)
-            | ((mi.0 & 0xFFFF_FFFF_FFFF) << 1)
-            | u64::from(!mi.1);
         Self {
             primary: u64::MAX,
-            secondary: u64::MAX,
+            secondary: Self::pack_secondary(0xFFFF_FFFF, false, false, library),
             cb_hash,
-            tertiary,
+            tertiary: Self::pack_tertiary(mi),
             name_hash_upper: (name_hash << 1) | u64::from(is_read2),
         }
     }
@@ -790,10 +805,13 @@ impl Ord for TemplateKey {
 }
 
 impl TemplateKey {
-    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, CB, library, MI).
+    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, library, CB, MI).
     ///
     /// This ignores the `name_hash` tie-breaker, allowing verification to accept
-    /// both fgumi and samtools sorted files (which differ only in tie-breaking).
+    /// both fgumi and samtools sorted files, which otherwise differ in how they
+    /// break ties on name. They can also differ where several cell barcodes or MI
+    /// values share a position: fgumi orders CB by hash and MI numerically, while
+    /// samtools compares both as strings.
     #[inline]
     #[must_use]
     pub fn core_cmp(&self, other: &Self) -> Ordering {
@@ -880,7 +898,7 @@ impl RawSortKey for TemplateKey {
 pub struct TemplateKey24 {
     /// Packed coordinate primary lane (tid1<<48 | tid2<<32 | pos1).
     pub primary: u64,
-    /// Packed secondary lane (pos2<<32 | !neg1<<1 | !neg2).
+    /// Packed secondary lane (pos2<<32 | !neg1<<17 | !neg2<<16 | library).
     pub secondary: u64,
     /// Packed (`name_hash`<<1 | `is_upper`).
     pub name_hash_upper: u64,
@@ -961,7 +979,7 @@ impl Ord for TemplateKey24 {
 pub struct TemplateKey32 {
     /// Packed coordinate primary lane (tid1<<48 | tid2<<32 | pos1).
     pub primary: u64,
-    /// Packed secondary lane (pos2<<32 | !neg1<<1 | !neg2).
+    /// Packed secondary lane (pos2<<32 | !neg1<<17 | !neg2<<16 | library).
     pub secondary: u64,
     /// The single retained optional lane (`cb_hash` or tertiary).
     pub opt: u64,
@@ -1015,8 +1033,8 @@ impl TemplateKey32 {
         }
     }
 
-    /// Build a single-optional key keeping `tertiary` (library<<48 | mi) in the
-    /// `opt` lane (post-group / multi-library). Valid only when `cb_hash` is constant.
+    /// Build a single-optional key keeping `tertiary` (mi) in the `opt` lane
+    /// (post-group). Valid only when `cb_hash` is constant.
     #[inline]
     #[must_use]
     pub fn from_full_tertiary(full: &TemplateKey40) -> Self {
@@ -1210,7 +1228,7 @@ impl TemplateLaneKey for TemplateKey40 {
 // Both wrap `TemplateKey32` transparently and have identical byte layout, `Ord`,
 // and radix behavior. They differ only in which optional lane the `opt` word is
 // sourced from at extraction: `CbKey32::from_full` uses `cb_hash`, while
-// `TertKey32::from_full` uses the tertiary (library<<48 | mi) word. Two distinct
+// `TertKey32::from_full` uses the tertiary (mi) word. Two distinct
 // types let the dispatch in `sort_template_coordinate` pick the right source via
 // monomorphization, with zero runtime cost (the inner key is `#[repr(C)]` Pod and
 // the wrapper is `#[repr(transparent)]`, so `bytemuck::Pod` is sound to derive).
@@ -1226,9 +1244,9 @@ impl TemplateLaneKey for TemplateKey40 {
 pub struct CbKey32(pub TemplateKey32);
 
 /// 32-byte single-optional template key whose `opt` lane carries the tertiary
-/// (library<<48 | mi) word.
+/// (mi) word.
 ///
-/// Used when exactly the tertiary lane is non-constant (post-group / multi-library).
+/// Used when exactly the tertiary lane is non-constant (post-group).
 #[repr(transparent)]
 #[derive(
     Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default, bytemuck::Pod, bytemuck::Zeroable,
@@ -2799,7 +2817,7 @@ mod tests {
         let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 0, false);
         let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 20, 0, (0, true), 0, false);
         // k1 has lower cb_hash, so it should sort first regardless of tertiary
-        assert!(k1 < k2, "cb_hash should be compared before tertiary (library/MI)");
+        assert!(k1 < k2, "cb_hash should be compared before tertiary (MI)");
     }
 
     #[test]
@@ -2817,24 +2835,61 @@ mod tests {
     fn test_template_key_unmapped_with_cb_hash() {
         let key = TemplateKey::unmapped(12345, 0xCAFE, 0, (0, true), false);
         assert_eq!(key.primary, u64::MAX);
-        assert_eq!(key.secondary, u64::MAX);
+        assert_eq!(key.secondary, 0xFFFF_FFFF_0003_0000, "sentinel pos2, forward strands");
         assert_eq!(key.cb_hash, 0xCAFE, "unmapped should preserve cb_hash");
-        assert_eq!(key.tertiary, 0, "no library/MI -> zero tertiary");
+        assert_eq!(key.tertiary, 0, "no MI -> zero tertiary");
     }
 
-    /// `TemplateKey::unmapped` must pack the library ordinal (and MI) into
-    /// `tertiary` exactly as `TemplateKey::new` does, so a fully-unmapped read
-    /// realizes the same lanes as its mapped, same-library peers (#375).
+    /// `TemplateKey::unmapped` must pack the library ordinal and MI exactly as
+    /// `TemplateKey::new` does, so a fully-unmapped read realizes the same library
+    /// and MI as its mapped, same-library peers (#375).
     #[test]
     fn test_template_key_unmapped_packs_library_and_mi() {
         let unmapped = TemplateKey::unmapped(1, 0, 3, (7, true), false);
-        assert_eq!(unmapped.tertiary >> 48, 3, "library ordinal occupies tertiary high-16");
-        // Same library + MI fed to `new` must produce the same tertiary.
-        let mapped = TemplateKey::new(0, 100, false, 0, 200, false, 0, 3, (7, true), 1, false);
+        assert_eq!(unmapped.secondary & 0xFFFF, 3, "library ordinal occupies secondary low-16");
+        // Same library + MI fed to `new` (unmapped-mate sentinels, forward
+        // strands) must produce the same secondary and tertiary.
+        let mapped =
+            TemplateKey::new(0, 100, false, i32::MAX, i32::MAX, false, 0, 3, (7, true), 1, false);
         assert_eq!(
-            unmapped.tertiary, mapped.tertiary,
+            (unmapped.secondary, unmapped.tertiary),
+            (mapped.secondary, mapped.tertiary),
             "unmapped must pack library/MI identically to TemplateKey::new"
         );
+    }
+
+    /// Library is compared after the strands and before CB, MI, and name — the
+    /// field order of `samtools sort --template-coordinate`. Each case's `lower`
+    /// key has the smaller library but a larger later field, so it sorts first
+    /// only if library is compared before that field; the strand case checks that
+    /// a reverse strand still wins over a smaller library.
+    #[rstest::rstest]
+    #[case::library_before_cb(
+        TemplateKey::new(0, 100, false, 0, 200, false, 99, 1, (0, true), 0, false),
+        TemplateKey::new(0, 100, false, 0, 200, false, 1, 2, (0, true), 0, false)
+    )]
+    #[case::library_before_mi(
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 1, (99, true), 0, false),
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 2, (1, true), 0, false)
+    )]
+    #[case::library_before_name(
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 1, (0, true), 99, false),
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 2, (0, true), 1, false)
+    )]
+    #[case::neg1_before_library(
+        TemplateKey::new(0, 100, true, 0, 200, false, 0, 2, (0, true), 0, false),
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 1, (0, true), 0, false)
+    )]
+    #[case::neg2_before_library(
+        TemplateKey::new(0, 100, false, 0, 200, true, 0, 2, (0, true), 0, false),
+        TemplateKey::new(0, 100, false, 0, 200, false, 0, 1, (0, true), 0, false)
+    )]
+    fn test_template_key_library_field_order(
+        #[case] lower: TemplateKey,
+        #[case] higher: TemplateKey,
+    ) {
+        assert!(lower < higher, "{lower:?} should sort before {higher:?}");
+        assert_eq!(lower.core_cmp(&higher), std::cmp::Ordering::Less);
     }
 
     #[test]
