@@ -143,15 +143,16 @@ quality is already lower is raised to it:
 Duplex agreement filters
 ------------------------
 
-  --min-duplex-length          minimum overlap, in bases, between the two strands for a fragment to
-                               be emitted (default 1)
-  --max-duplex-disagreement-rate  maximum fraction of overlapping positions where the strands may
+  --min-duplex-length          minimum number of positions at which both single-strand consensuses
+                               make a (non-N) call, disagreements included, for a fragment to be
+                               emitted (default 1); checked before the disagreement limits
+  --max-duplex-disagreement-rate  maximum fraction of those duplex positions where the strands may
                                disagree (default 1.0, i.e. no limit)
   --max-duplex-disagreements   maximum absolute count of such disagreements
-  --legacy-overlap-window      use fgbio's legacy `[neg.start, pos.end]` overlap window, which
-                               rejects dovetailed short-insert pairs as dovetails and matches
-                               fgbio's current-release consensus output (off by default; the
-                               corrected intersection window admits those pairs)
+  --legacy-overlap-window      use fgbio's legacy `[neg.start, pos.end]` overlap window and measure
+                               --min-duplex-length on that reference window, as fgbio did before
+                               fgbio#1174; rejects dovetailed short-insert pairs as dovetails (off
+                               by default; the corrected mode admits those pairs)
 
 Note that `--methylation-mode` is not supported for CODEC data.
 "#
@@ -205,19 +206,24 @@ pub struct Codec {
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 
-    /// Minimum duplex overlap length in bases
+    /// Minimum number of positions with non-N calls in both single-strand consensuses.
+    ///
+    /// Requires aligned R1/R2 overlap and valid phase/consensus length first. Disagreements
+    /// count toward this minimum; disagreement limits apply afterward. SS no-calls do not count.
+    /// With --legacy-overlap-window, uses the historical reference-window length instead.
     #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
     pub min_duplex_length: usize,
 
     /// Use fgbio's legacy `[negative.start, positive.end]` duplex overlap window instead of the
     /// corrected intersection window (fgumi#761).
     ///
-    /// Reproduces fgbio's CODEC consensus *output* for the current fgbio release: dovetailed FR
-    /// pairs — common on short inserts, where each strand's alignment runs past the far end of
-    /// the other — are rejected rather than consensed, so far fewer consensus reads are emitted.
-    /// Those rejections are reported under `raw_reads_rejected_for_dovetail`, whereas fgbio
-    /// buckets them under `indel_error_between_strands`, so the `--stats` breakdown is not
-    /// byte-identical to fgbio's. Off by default (fulcrumgenomics/fgbio#1173).
+    /// Preserves the overlap behavior from before fgbio#1174: the minimum duplex length is
+    /// measured on the reference window, and dovetailed FR pairs — common on short inserts,
+    /// where each strand's alignment runs past the far end of the other — are rejected rather
+    /// than consensed. Reference-window rejections are reported under
+    /// `raw_reads_rejected_for_r1_r2_overlap_too_short`. Dovetail rejections use `raw_reads_rejected_for_dovetail`, whereas older
+    /// fgbio versions bucket them under `indel_error_between_strands`; statistics are therefore
+    /// not byte-identical. Off by default.
     #[arg(long = "legacy-overlap-window")]
     pub legacy_overlap_window: bool,
 
@@ -347,11 +353,12 @@ pub struct CodecOptions {
     /// Cap on reads per consensus.
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
-    /// Minimum duplex overlap length.
+    /// Minimum positions with non-N calls in both SS consensuses, including disagreements.
+    /// Disagreement limits apply separately. Legacy mode uses reference-window length instead.
     #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
     pub min_duplex_length: usize,
-    /// Reproduce fgbio's legacy (pre-fgumi#761) overlap window for dovetailed
-    /// FR pairs. Off by default; see [`Codec::legacy_overlap_window`].
+    /// Preserve the pre-fgbio#1174 reference-window threshold and dovetail rejections.
+    /// Off by default; see [`Codec::legacy_overlap_window`].
     #[arg(long = "legacy-overlap-window")]
     pub legacy_overlap_window: bool,
     /// Quality cap for single-strand positions.

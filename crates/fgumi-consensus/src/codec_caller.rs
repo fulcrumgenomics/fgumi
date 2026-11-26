@@ -24,13 +24,17 @@
 //!
 //! 1. **Clip** read pairs where they extend past mate ends
 //! 2. **Filter** R1s and R2s separately for compatible CIGARs
-//! 3. **Check overlap** - must have sufficient overlap on genome
+//! 3. **Check overlap** - require a nonempty, in-phase aligned R1/R2 overlap on the genome
+//!    (`--legacy-overlap-window` also applies `min_duplex_length` to the reference window here)
 //! 4. **Build single-strand consensus** from R1s separately from R2s
 //! 5. **Reverse complement** one SS read to align orientations
 //! 6. **Pad with Ns** if reads don't fully overlap
 //! 7. **Build duplex consensus** from the two SS consensus reads
-//! 8. **Apply quality masking** based on single-strand vs duplex regions
-//! 9. **Reverse complement** back if original R1s were on negative strand
+//! 8. **Check duplex support** - reject when fewer than `min_duplex_length` positions have
+//!    calls in both SS consensus reads (disagreements included), then apply the
+//!    disagreement count/rate limits
+//! 9. **Apply quality masking** based on single-strand vs duplex regions
+//! 10. **Reverse complement** back if original R1s were on negative strand
 //!
 //! ## Critical Requirements
 //!
@@ -164,18 +168,20 @@ pub struct CodecConsensusOptions {
     /// [`CallerRejectionReason::InsufficientReads`] rather than a panic.
     pub max_reads_per_strand: Option<usize>,
 
-    /// Minimum duplex overlap length (in bases)
+    /// Minimum positions with non-N calls in both oriented, padded SS consensuses, including
+    /// disagreements. Checked after alignment phase/consensus-length validation and before
+    /// disagreement limits. Legacy mode instead thresholds the reference window before SS calling.
     pub min_duplex_length: usize,
 
     /// Use fgbio's legacy `[negative.start, positive.end]` duplex overlap window instead of the
     /// corrected intersection `[max(starts), min(ends)]` (fgumi#761).
     ///
-    /// The legacy window equals the intersection only when one alignment nests within the span
-    /// of the other. On CODEC's short inserts the two strands routinely *dovetail* (each aligns
-    /// past the far end of the other), and the legacy window then overshoots past one read and
+    /// The legacy window equals the intersection only when the positive alignment starts and
+    /// ends no later than the negative alignment. On CODEC's short inserts strands *dovetail*
+    /// (align past the far end of the other), and the legacy window overshoots past one read and
     /// rejects the pair as [`CallerRejectionReason::Dovetail`] even with no indel. `false` (the
-    /// default) admits those pairs; `true` reproduces fgbio's consensus output for the current
-    /// fgbio release (fulcrumgenomics/fgbio#1173).
+    /// default) admits those pairs and thresholds supported SS query positions (fgbio#1174).
+    /// `true` preserves the older reference-window threshold and dovetail rejection behavior.
     pub legacy_overlap_window: bool,
 
     /// Reduce quality of single-strand regions to this value (if set)
@@ -887,40 +893,27 @@ impl CodecConsensusCaller {
             bam_fields::reference_length_from_cigar(&longest_neg.clipped_cigar) as usize;
         let neg_end = neg_start + neg_ref_len.saturating_sub(1);
 
-        // The duplex window is the *intersection* of the two alignments: the reference
-        // positions at which both strands actually have an aligned base, and so the only
-        // positions at which they can be said to agree or disagree.
-        //
-        // fgbio takes it to be `[negative.start, positive.end]`
-        // (`CodecConsensusCaller.scala:211-213`), which is the intersection only while the
-        // positive alignment opens first and closes first. CODEC breaks that: both strands
-        // cover the same insert end to end, so the aligner routinely takes as matching a
-        // terminal base that it soft-clipped on the other strand, leaving the two alignments
-        // *dovetailed* by a base or two. The window then reaches past one read or the other,
-        // and every consumer of it is answered about a position that read never aligned:
-        // `check_overlap_phase_raw` reads the out-of-range boundary as htsjdk's `0` and the
-        // family fails a check about indels with no indel anywhere in it, and
-        // `compute_consensus_length_raw` has no position to anchor on at all
-        // (fulcrumgenomics/fgumi#761). Clamping to the intersection is inert whenever the
-        // alignments do not dovetail, since `max`/`min` then select the same two boundaries.
-        //
-        // `--legacy-overlap-window` opts back into fgbio's `[negative.start, positive.end]`
-        // window to reproduce fgbio's consensus output for its current release; it differs from
-        // the intersection only on dovetailed pairs, which it rejects rather than consenses.
-        //
-        // An empty intersection is not a special case: it can only arise when the two
-        // alignments do not overlap, where these are still the same two boundaries fgbio
-        // computes, and `min_duplex_length` (at least 1, enforced by the command) rejects it
-        // just below.
+        // Phase and length lookups need a nonempty reference intersection (fgumi#761).
+        // This is only an alignment anchor: soft-clipped query bases can also carry duplex
+        // support, so the default minimum is checked after SS calling and padding (fgbio#1174).
+        // Legacy mode preserves the older fgbio window and its reference-length threshold.
         let (inter_start, inter_end) = (neg_start.max(pos_start), pos_end.min(neg_end));
         let (overlap_start, overlap_end) = if self.options.legacy_overlap_window {
             (neg_start, pos_end)
         } else {
             (inter_start, inter_end)
         };
-        let duplex_length = overlap_end as i64 - overlap_start as i64 + 1;
+        let reference_overlap_length = overlap_end as i64 - overlap_start as i64 + 1;
 
-        if duplex_length < self.options.min_duplex_length as i64 {
+        // Legacy mode keeps its historical gate exactly: a family whose longest R1 and R2 come
+        // from different templates can have a nonempty legacy window but no intersection, and
+        // the phase check below then rejects it as IndelErrorBetweenStrands, as before.
+        let insufficient_overlap = if self.options.legacy_overlap_window {
+            reference_overlap_length < self.options.min_duplex_length as i64
+        } else {
+            pos_ref_len == 0 || neg_ref_len == 0 || inter_end < inter_start
+        };
+        if insufficient_overlap {
             self.reject_records_at(
                 Self::strand_raw_indices(&r1_infos, &r2_infos),
                 CallerRejectionReason::InsufficientOverlap,
@@ -928,13 +921,10 @@ impl CodecConsensusCaller {
             return Ok(ConsensusOutput::default());
         }
 
-        // Phase and consensus-length checks on the active window (raw CIGAR ops). A pair that
-        // fails either is rejected; classify why. Under `--legacy-overlap-window`, a pair the
-        // corrected (intersection) window would have accepted is rejected solely because it
-        // dovetails, so label it `Dovetail` rather than the misleading `IndelErrorBetweenStrands`
-        // (which fgbio uses for these). In the default mode the active window *is* the
-        // intersection, so the `legacy_overlap_window &&` guard short-circuits and the reason is
-        // unchanged.
+        // Preserve the legacy Dovetail classifier: its intersection reference-length, phase,
+        // and consensus-length checks describe the historical window-only correction, not the
+        // new supported-base filter. Default mode uses the intersection directly and keeps
+        // genuine phase/length failures under IndelErrorBetweenStrands.
         let phase_ok =
             Self::check_overlap_phase_raw(longest_r1, longest_r2, overlap_start, overlap_end);
         let consensus_length = if phase_ok {
@@ -1022,24 +1012,28 @@ impl CodecConsensusCaller {
         let padded_r1 = Self::pad_consensus(&ss_r1_oriented, consensus_length, r1_is_negative);
         let padded_r2 = Self::pad_consensus(&ss_r2_oriented, consensus_length, r2_is_negative);
 
-        // On a high-duplex-disagreement reject, count the rejected records under
-        // the `HighDuplexDisagreement` reason and bump the dedicated HDD counter
-        // before propagating the (recoverable) error, matching fgbio, which does
-        // `rejectRecords(..., HighDuplexDisagreement)` and
-        // `consensusReadsFilteredHighDisagreement += 1` (CodecConsensusCaller.scala:255-256).
         let (consensus, duplex_tally) =
-            match self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2) {
-                Ok(built) => built,
-                Err(e) if e.is_duplex_disagreement() => {
-                    self.reject_records_at(
-                        Self::strand_raw_indices(&r1_infos, &r2_infos),
-                        CallerRejectionReason::HighDuplexDisagreement,
-                    );
-                    self.stats.consensus_reads_rejected_hdd += 1;
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
-            };
+            Self::build_duplex_consensus_from_padded(&padded_r1, &padded_r2);
+
+        // The builder counts non-N calls on BOTH strands, including disagreements whose
+        // final duplex call is N. Reuse that count before applying disagreement filters.
+        if !self.options.legacy_overlap_window
+            && duplex_tally.bases_emitted < self.options.min_duplex_length as u64
+        {
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
+                CallerRejectionReason::InsufficientOverlap,
+            );
+            return Ok(ConsensusOutput::default());
+        }
+        if let Err(e) = self.check_duplex_disagreement(&duplex_tally) {
+            self.reject_records_at(
+                Self::strand_raw_indices(&r1_infos, &r2_infos),
+                CallerRejectionReason::HighDuplexDisagreement,
+            );
+            self.stats.consensus_reads_rejected_hdd += 1;
+            return Err(e);
+        }
         let consensus = self.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
         let consensus =
             if r1_is_negative { Self::reverse_complement_ss(&consensus) } else { consensus };
@@ -1267,10 +1261,9 @@ impl CodecConsensusCaller {
     /// `ClipOverlapFailed` (fulcrumgenomics/fgumi#749), with the verdicts agreeing
     /// throughout.
     ///
-    /// The caller no longer hands it a boundary that needs the substitution: the window is
-    /// clamped to the intersection of the two alignments, and an empty intersection is
-    /// rejected by `min_duplex_length` (at least 1) before this runs, so both boundaries lie
-    /// inside both reads — where every reference position resolves, deletions included,
+    /// In default mode the caller clamps the window to a nonempty reference intersection,
+    /// independently of `min_duplex_length`, so both boundaries lie inside both reads — where
+    /// every reference position resolves, deletions included,
     /// since the lookups pass `return_last_base_if_deleted`. The substitution is kept
     /// because this is a predicate over two arbitrary boundaries and has no business
     /// panicking on one, and because it is what makes it fgbio's predicate rather than a
@@ -1398,19 +1391,15 @@ impl CodecConsensusCaller {
     /// original qualities from the single-strand consensus, matching fgbio's behavior.
     ///
     /// Returns the consensus together with the [`DuplexBaseTally`] it would
-    /// contribute to `CodecConsensusStats`. The deltas are returned rather than applied
-    /// here so the caller can fold them in only after the output record is emitted (see
+    /// contribute to `CodecConsensusStats`, without filtering disagreements. The deltas are
+    /// returned rather than applied here so the caller can fold them in only after the output
+    /// record is emitted (see
     /// `consensus_reads_raw`) — a molecule that computes a consensus but fails to write
     /// it must not advance the emitted-base counters.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "per-position duplex consensus folds together base-call resolution, quality math, and disagreement bookkeeping; splitting would obscure the per-position state machine"
-    )]
     fn build_duplex_consensus_from_padded(
-        &self,
         ss_a: &SingleStrandConsensus,
         ss_b: &SingleStrandConsensus,
-    ) -> std::result::Result<(SingleStrandConsensus, DuplexBaseTally), CodecConsensusError> {
+    ) -> (SingleStrandConsensus, DuplexBaseTally) {
         let len = ss_a.bases.len();
         assert_eq!(ss_b.bases.len(), len, "Padded consensuses must be the same length");
 
@@ -1547,34 +1536,12 @@ impl CodecConsensusCaller {
             errors[pos_idx] = error;
         }
 
-        // Check duplex disagreement rate
-        let mut tally = DuplexBaseTally::default();
-        if duplex_bases_count > 0 {
-            let duplex_error_rate = duplex_disagreements as f64 / duplex_bases_count as f64;
+        let tally = DuplexBaseTally {
+            bases_emitted: duplex_bases_count as u64,
+            disagreement_bases: duplex_disagreements as u64,
+        };
 
-            if duplex_disagreements > self.options.max_duplex_disagreements {
-                return Err(CodecConsensusError::DuplexDisagreementCount {
-                    disagreements: duplex_disagreements,
-                });
-            }
-            if duplex_error_rate > self.options.max_duplex_disagreement_rate {
-                return Err(CodecConsensusError::DuplexDisagreementRate {
-                    rate: duplex_error_rate,
-                });
-            }
-
-            // Carry the per-molecule duplex tallies back to the caller, which applies them to
-            // `self.stats` only once the consensus record has been serialized. A molecule that
-            // survives both rejection checks here can still fail to emit (an over-long UMI makes
-            // `build_output_record_into` return an error), and a molecule that emits nothing must
-            // contribute no duplex bases. fgbio increments `totalDuplexBases`/`duplexErrorBases`
-            // in the accepted branch only (`CodecConsensusCaller.scala:264-268`); we defer that
-            // increment to the same success point as `consensus_reads_generated`.
-            tally.bases_emitted = duplex_bases_count as u64;
-            tally.disagreement_bases = duplex_disagreements as u64;
-        }
-
-        Ok((
+        (
             SingleStrandConsensus {
                 bases,
                 quals,
@@ -1586,7 +1553,27 @@ impl CodecConsensusCaller {
                 is_negative_strand: ss_a.is_negative_strand,
             },
             tally,
-        ))
+        )
+    }
+
+    /// Checks disagreement limits independently of the minimum supported duplex length.
+    /// Returns the recoverable count/rate error without changing emitted counters.
+    fn check_duplex_disagreement(
+        &self,
+        tally: &DuplexBaseTally,
+    ) -> std::result::Result<(), CodecConsensusError> {
+        if tally.bases_emitted > 0 {
+            if tally.disagreement_bases > self.options.max_duplex_disagreements as u64 {
+                return Err(CodecConsensusError::DuplexDisagreementCount {
+                    disagreements: tally.disagreement_bases as usize,
+                });
+            }
+            let rate = tally.disagreement_bases as f64 / tally.bases_emitted as f64;
+            if rate > self.options.max_duplex_disagreement_rate {
+                return Err(CodecConsensusError::DuplexDisagreementRate { rate });
+            }
+        }
+        Ok(())
     }
 
     /// Masks consensus qualities for query-based consensus, matching fgbio's
@@ -3096,9 +3083,10 @@ mod tests {
     /// `SamPairUtil.getPairOrientation` (`SamPairUtil.java:136`, `<=`) classifies FR, so fgbio's
     /// `isPrimaryFrPair` keeps the pair. It must not be dropped as `NotPrimaryFrPair` in either
     /// overlap-window mode. With the default (intersection) window it yields a consensus; under
-    /// `--legacy-overlap-window` — fgbio's current-release window, in which fgbio's own test runs
+    /// `--legacy-overlap-window` — fgbio's pre-#1174 window, in which the original fgbio test runs
     /// — the window `[49, 148]` reaches past both alignments, so the pair is rejected as a
-    /// `Dovetail` (fgbio buckets it under `IndelErrorBetweenStrands`), not as non-FR.
+    /// `Dovetail` (fgbio before #1174 bucketed it under `IndelErrorBetweenStrands`), not as
+    /// non-FR.
     #[rstest]
     #[case::intersection_window(false, 1)]
     #[case::legacy_window(true, 0)]
@@ -3219,71 +3207,34 @@ mod tests {
         assert_eq!(output.count, 1, "Should emit consensus with minReadsPerStrand=1");
     }
 
-    /// Port of fgbio test: "not emit a consensus when there is insufficient overlap between R1 and R2"
-    #[test]
-    fn test_not_emit_consensus_insufficient_overlap() {
-        // R1 at 1-30, R2 at 11-40 gives 20bp overlap
-        // With minDuplexLength=20, should pass
-        let options20 = CodecConsensusOptions {
-            min_reads_per_strand: 1,
-            min_duplex_length: 20,
+    /// Ordinary 30M pairs have 20 supported positions, matching their reference intersection.
+    #[rstest]
+    #[case::boundary(20, 1)]
+    #[case::above_boundary(21, 0)]
+    fn test_not_emit_consensus_insufficient_overlap(
+        #[case] min_duplex_length: usize,
+        #[case] expected_count: usize,
+        #[values(false, true)] legacy_overlap_window: bool,
+    ) {
+        let options = CodecConsensusOptions {
+            min_duplex_length,
+            legacy_overlap_window,
             ..Default::default()
         };
-        let mut caller20 =
-            CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options20);
-
-        let reads = create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
-        );
-
-        let output = caller20
-            .consensus_reads_from_sam_records(reads)
-            .expect("consensus_reads_from_sam_records should succeed");
-        assert_eq!(
-            output.count, 1,
-            "Should emit consensus with minDuplexLength=20 and 20bp overlap"
-        );
-
-        // With minDuplexLength=21, should fail
-        let options21 = CodecConsensusOptions {
-            min_reads_per_strand: 1,
-            min_duplex_length: 21,
-            ..Default::default()
-        };
-        let mut caller21 =
-            CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options21);
-
-        let reads = create_fr_pair(
-            "read1",
-            1,
-            11,
-            30,
-            35,
-            &[(Kind::Match, 30)],
-            &[(Kind::Match, 30)],
-            "hi",
-            Some("ACC-TGA"),
-            false,
-            true,
-        );
-
-        let output = caller21
-            .consensus_reads_from_sam_records(reads)
-            .expect("consensus_reads_from_sam_records should succeed");
-        assert_eq!(
-            output.count, 0,
-            "Should not emit consensus with minDuplexLength=21 and 20bp overlap"
-        );
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let output = caller.consensus_reads_typed(duplex_disagreement_fixture(0)).unwrap();
+        assert_eq!(output.count, expected_count);
+        if expected_count == 0 {
+            assert_eq!(
+                caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
+                Some(&2)
+            );
+            assert_rejected_whole_family(&caller, &output, 2);
+        } else {
+            assert_eq!(ParsedBamRecord::parse_all(&output.data)[0].bases, REF_BASES[..40]);
+            assert_eq!(caller.stats.consensus_duplex_bases_emitted, 20);
+            assert!(caller.stats.rejection_reasons.is_empty());
+        }
     }
 
     /// A molecule whose output record is rejected must not advance the duplex-base
@@ -4294,7 +4245,7 @@ mod tests {
         (caller, output)
     }
 
-    /// As [`call_codec_family`], but with `--legacy-overlap-window` (fgbio-parity window) on.
+    /// As [`call_codec_family`], but with the pre-fgbio#1174 legacy overlap behavior.
     fn call_codec_family_legacy_window(
         records: Vec<RawRecord>,
     ) -> (CodecConsensusCaller, ConsensusOutput) {
@@ -4360,8 +4311,9 @@ mod tests {
         );
     }
 
-    /// `--legacy-overlap-window` reproduces fgbio's rejection of a dovetailed pair, but labels
-    /// it honestly as [`CallerRejectionReason::Dovetail`] rather than `IndelErrorBetweenStrands`.
+    /// `--legacy-overlap-window` reproduces the rejection of a dovetailed pair by fgbio before
+    /// fgbio#1174, but labels it honestly as [`CallerRejectionReason::Dovetail`] rather than
+    /// `IndelErrorBetweenStrands`.
     ///
     /// [`dovetailed_start_template`] contains no indel, so the corrected default window
     /// consenses it ([`test_dovetailed_starts_without_an_indel_call_a_consensus`]). Under the
@@ -4424,31 +4376,279 @@ mod tests {
         assert_rejected_whole_family(&caller, &output, record_count);
     }
 
-    /// The duplex overlap is measured over the region both strands align, so a threshold
-    /// above that region's length rejects the family for insufficient overlap.
-    ///
-    /// [`dovetailed_start_template`]'s strands align together over `[201, 326]`, 126
-    /// reference positions, while their alignments *span* `[200, 326]`, 127. A threshold of
-    /// 126 must pass and 127 must fail; before fulcrumgenomics/fgumi#761 the span was what
-    /// `--min-duplex-length` was compared against, so 127 passed the check on 126 shared
-    /// positions.
-    #[test]
-    fn test_min_duplex_length_is_measured_over_the_shared_region() {
-        let (_, passing) =
-            call_codec_family_with_min_duplex_length(dovetailed_start_template(), 126);
-        assert_eq!(passing.count, 1, "126 shared positions must satisfy a threshold of 126");
-
-        let records = dovetailed_start_template();
-        let record_count = records.len();
-        let (caller, output) = call_codec_family_with_min_duplex_length(records, 127);
-
-        let stats = caller.statistics();
-        assert_eq!(
-            stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
-            Some(&record_count),
-            "126 shared positions must not satisfy a threshold of 127"
+    /// Both SS consensuses support all 40 query positions despite only 20 aligned reference
+    /// positions in common (fgbio #1174). Legacy mode retains its historical reference gate.
+    #[rstest]
+    #[case::supported_30(false, 30, None)]
+    #[case::supported_40(false, 40, None)]
+    #[case::unsupported_41(false, 41, Some(CallerRejectionReason::InsufficientOverlap))]
+    #[case::legacy_dovetail(true, 1, Some(CallerRejectionReason::Dovetail))]
+    #[case::legacy_indel_classification(
+        true,
+        30,
+        Some(CallerRejectionReason::IndelErrorBetweenStrands)
+    )]
+    #[case::legacy_reference_gate(true, 41, Some(CallerRejectionReason::InsufficientOverlap))]
+    fn test_min_duplex_length_counts_supported_query_positions(
+        #[case] legacy_overlap_window: bool,
+        #[case] min_duplex_length: usize,
+        #[case] rejection: Option<CallerRejectionReason>,
+    ) {
+        let mut records = codec_template(
+            111,
+            &[(Kind::SoftClip, 10), (Kind::Match, 30)],
+            101,
+            &[(Kind::Match, 30), (Kind::SoftClip, 10)],
         );
-        assert_rejected_whole_family(&caller, &output, record_count);
+        for record in &mut records {
+            for (offset, &base) in REF_BASES[100..140].iter().enumerate() {
+                record.view_mut().set_base(offset, base);
+            }
+        }
+        let options = CodecConsensusOptions {
+            min_duplex_length,
+            legacy_overlap_window,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let output = caller.consensus_reads_typed(records).unwrap();
+        if let Some(reason) = rejection {
+            assert_eq!(caller.stats.rejection_reasons.get(&reason), Some(&2));
+            assert_rejected_whole_family(&caller, &output, 2);
+        } else {
+            assert_eq!(output.count, 1);
+            assert_eq!(ParsedBamRecord::parse_all(&output.data)[0].bases, REF_BASES[100..140]);
+            assert!(caller.stats.rejection_reasons.is_empty());
+            assert_eq!(caller.stats.consensus_duplex_bases_emitted, 40);
+        }
+    }
+
+    /// Low-quality inputs must first become SS no-calls; the union of SS no-call positions
+    /// determines supported length, independently of the aligned reference span.
+    #[rstest]
+    #[case::no_calls_at_boundary(false, false, 27, 1)]
+    #[case::no_calls_below_boundary(false, false, 28, 0)]
+    #[case::low_quality_at_boundary(true, false, 27, 1)]
+    #[case::low_quality_below_boundary(true, false, 28, 0)]
+    #[case::legacy_no_calls(false, true, 28, 1)]
+    #[case::legacy_low_quality(true, true, 28, 1)]
+    fn test_min_duplex_length_excludes_ss_no_calls(
+        #[case] low_quality: bool,
+        #[case] legacy_overlap_window: bool,
+        #[case] min_duplex_length: usize,
+        #[case] expected_count: usize,
+    ) {
+        // Two inputs force the SS likelihood caller rather than its single-read fast path.
+        // At Q0 the three unobserved bases tie, producing a genuine SS no-call.
+        let mut records: Vec<_> = (0..2)
+            .flat_map(|i| {
+                create_fr_pair(
+                    &format!("pair{i}"),
+                    1,
+                    1,
+                    30,
+                    35,
+                    &[(Kind::Match, 30)],
+                    &[(Kind::Match, 30)],
+                    "mi",
+                    None,
+                    false,
+                    true,
+                )
+            })
+            .collect();
+        for (record, offsets) in records.iter_mut().zip([[5, 10], [10, 15]].into_iter().cycle()) {
+            for offset in offsets {
+                if low_quality {
+                    record.set_qual(offset, 0);
+                } else {
+                    record.view_mut().set_base(offset, b'N');
+                }
+            }
+        }
+        let options = CodecConsensusOptions {
+            min_duplex_length,
+            legacy_overlap_window,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let output = caller.consensus_reads_typed(records).unwrap();
+        assert_eq!(output.count, expected_count);
+        if expected_count == 0 {
+            assert_eq!(
+                caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
+                Some(&4)
+            );
+            assert_rejected_whole_family(&caller, &output, 4);
+        } else {
+            assert!(caller.stats.rejection_reasons.is_empty());
+            assert_eq!(caller.stats.consensus_duplex_bases_emitted, 27);
+            let mut expected = REF_BASES[..30].to_vec();
+            for offset in [5, 10, 15] {
+                expected[offset] = b'N';
+            }
+            assert_eq!(ParsedBamRecord::parse_all(&output.data)[0].bases, expected);
+        }
+    }
+
+    #[rstest]
+    #[case::missing_strand(true)]
+    #[case::disjoint_support(false)]
+    fn test_min_duplex_length_rejects_zero_supported_positions(#[case] missing_strand: bool) {
+        let mut records = codec_template(1, &[(Kind::Match, 30)], 1, &[(Kind::Match, 30)]);
+        for (strand, record) in records.iter_mut().enumerate() {
+            for offset in 0..30 {
+                if (missing_strand && strand == 0)
+                    || (!missing_strand && (offset < 15) == (strand == 0))
+                {
+                    record.view_mut().set_base(offset, b'N');
+                }
+            }
+        }
+        let (caller, output) = call_codec_family(records);
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
+            Some(&2)
+        );
+        assert_rejected_whole_family(&caller, &output, 2);
+    }
+
+    /// Equal-quality disagreements count as supported even when the duplex call is N.
+    /// Insufficient support takes precedence over both independent disagreement filters.
+    #[rstest]
+    #[case::supported_disagreement(20, 1, 0.05, None)]
+    #[case::count_reject(20, 0, 1.0, Some(CallerRejectionReason::HighDuplexDisagreement))]
+    #[case::rate_reject(20, 1, 0.049, Some(CallerRejectionReason::HighDuplexDisagreement))]
+    #[case::length_before_count(21, 0, 1.0, Some(CallerRejectionReason::InsufficientOverlap))]
+    #[case::length_before_rate(21, 1, 0.0, Some(CallerRejectionReason::InsufficientOverlap))]
+    fn test_min_duplex_length_precedes_disagreement_filters(
+        #[case] min_duplex_length: usize,
+        #[case] max_duplex_disagreements: usize,
+        #[case] max_duplex_disagreement_rate: f64,
+        #[case] rejection: Option<CallerRejectionReason>,
+    ) {
+        let options = CodecConsensusOptions {
+            min_duplex_length,
+            max_duplex_disagreements,
+            max_duplex_disagreement_rate,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let result = caller.consensus_reads_typed(duplex_disagreement_fixture(1));
+        if let Some(reason) = rejection {
+            assert_eq!(caller.stats.rejection_reasons.get(&reason), Some(&2));
+            let high_disagreement = reason == CallerRejectionReason::HighDuplexDisagreement;
+            assert_eq!(caller.stats.consensus_reads_rejected_hdd, u64::from(high_disagreement));
+            if high_disagreement {
+                assert!(result.err().expect("disagreement must reject").is_duplex_disagreement());
+            } else {
+                assert_rejected_whole_family(&caller, &result.unwrap(), 2);
+            }
+            assert_eq!(caller.stats.consensus_duplex_bases_emitted, 0);
+            assert_eq!(caller.stats.duplex_disagreement_base_count, 0);
+        } else {
+            let output = result.unwrap();
+            assert_eq!(output.count, 1);
+            assert_eq!(ParsedBamRecord::parse_all(&output.data)[0].bases[10], b'N');
+            assert_eq!(caller.stats.consensus_duplex_bases_emitted, 20);
+            assert_eq!(caller.stats.duplex_disagreement_base_count, 1);
+        }
+    }
+
+    /// Alignment validation precedes supported-length filtering in corrected mode, while
+    /// legacy mode still applies its historical reference-length gate first.
+    #[rstest]
+    #[case::phase(false, false, CallerRejectionReason::IndelErrorBetweenStrands)]
+    #[case::consensus_length(true, false, CallerRejectionReason::ClipOverlapFailed)]
+    #[case::legacy_phase(false, true, CallerRejectionReason::InsufficientOverlap)]
+    #[case::legacy_consensus_length(true, true, CallerRejectionReason::InsufficientOverlap)]
+    fn test_alignment_checks_precede_supported_duplex_length(
+        #[case] clip_failure: bool,
+        #[case] legacy_overlap_window: bool,
+        #[case] reason: CallerRejectionReason,
+    ) {
+        let records = if clip_failure {
+            window_end_past_r2_fixture()
+        } else {
+            codec_template(
+                201,
+                &[(Kind::SoftClip, 2), (Kind::Match, 60), (Kind::Deletion, 1), (Kind::Match, 67)],
+                200,
+                &[(Kind::SoftClip, 3), (Kind::Match, 124), (Kind::SoftClip, 2)],
+            )
+        };
+        let count = records.len();
+        let options = CodecConsensusOptions {
+            min_duplex_length: 1000,
+            legacy_overlap_window,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let output = caller.consensus_reads_typed(records).unwrap();
+        assert_eq!(caller.stats.rejection_reasons.get(&reason), Some(&count));
+        assert_rejected_whole_family(&caller, &output, count);
+    }
+
+    #[rstest]
+    #[case::adjacent(31)]
+    #[case::separated(40)]
+    fn test_min_duplex_length_zero_still_requires_reference_intersection(#[case] neg_start: usize) {
+        let records = codec_template(1, &[(Kind::Match, 30)], neg_start, &[(Kind::Match, 30)]);
+        let (caller, output) = call_codec_family_with_min_duplex_length(records, 0);
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::InsufficientOverlap),
+            Some(&2)
+        );
+        assert_rejected_whole_family(&caller, &output, 2);
+    }
+
+    /// The longest R1 (`60M` at 100) and longest R2 (`50M` at 1) come from different
+    /// templates, so the legacy window `[1, 159]` is nonempty while the two alignments do not
+    /// intersect. Default mode rejects the empty intersection as insufficient overlap; legacy
+    /// mode keeps the pre-fgbio#1174 outcome, where the window passes its length gate and the
+    /// phase check then rejects the family as `IndelErrorBetweenStrands`.
+    #[rstest]
+    #[case::corrected(false, CallerRejectionReason::InsufficientOverlap)]
+    #[case::legacy(true, CallerRejectionReason::IndelErrorBetweenStrands)]
+    fn test_cross_template_empty_intersection_rejection_reason(
+        #[case] legacy_overlap_window: bool,
+        #[case] reason: CallerRejectionReason,
+    ) {
+        let mut records = create_fr_pair(
+            "tA",
+            1,
+            1,
+            0,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 50)],
+            "mi",
+            None,
+            false,
+            true,
+        );
+        records.extend(create_fr_pair(
+            "tB",
+            100,
+            130,
+            0,
+            35,
+            &[(Kind::Match, 60)],
+            &[(Kind::Match, 30)],
+            "mi",
+            None,
+            false,
+            true,
+        ));
+        let options = CodecConsensusOptions {
+            min_reads_per_strand: 1,
+            legacy_overlap_window,
+            ..Default::default()
+        };
+        let mut caller = CodecConsensusCaller::new("codec".into(), "RG1".into(), options);
+        let output = caller.consensus_reads_typed(records).unwrap();
+        assert_eq!(caller.stats.rejection_reasons.get(&reason), Some(&4));
+        assert_rejected_whole_family(&caller, &output, 4);
     }
 
     /// A deletion outside the region the two strands share must not reject the family.
@@ -5249,9 +5449,6 @@ mod tests {
     /// This matches fgbio's behavior where only uppercase 'N' is considered `NoCall`.
     #[test]
     fn test_nocall_masking_uppercase_n() {
-        let options = CodecConsensusOptions::default();
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
         // Create two single-strand consensuses:
         // Position 0: Both have valid bases (A, A) - should agree
         // Position 1: Strand A has 'N' (uppercase NoCall), strand B has 'T' - should mask to N
@@ -5280,9 +5477,8 @@ mod tests {
             is_negative_strand: true,
         };
 
-        let (duplex, _tally) = caller
-            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
-            .expect("Should build duplex consensus");
+        let (duplex, _tally) =
+            CodecConsensusCaller::build_duplex_consensus_from_padded(&ss_a, &ss_b);
 
         // Position 0: Both have A, should be A
         assert_eq!(duplex.bases[0], b'A', "Position 0: Both have A, should agree");
@@ -5319,9 +5515,6 @@ mod tests {
     /// `40000 + 40000 = 80000 > u16::MAX`, which panicked in debug before the fix.
     #[test]
     fn test_duplex_per_base_depth_caps_each_strand_before_summing() {
-        let options = CodecConsensusOptions::default();
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
         // Both strands agree on both bases (drives the `da + db` agreement branch),
         // with per-base depths at/above the `Short` ceiling.
         let deep = SingleStrandConsensus {
@@ -5337,9 +5530,8 @@ mod tests {
         let ss_a = deep.clone();
         let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
 
-        let (duplex, _tally) = caller
-            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
-            .expect("Should build duplex consensus without overflowing");
+        let (duplex, _tally) =
+            CodecConsensusCaller::build_duplex_consensus_from_padded(&ss_a, &ss_b);
 
         // min(40000,32767)+min(40000,32767) = 32767+32767 = 65534, and
         // min(65535,32767)+min(65535,32767) = 65534 too — both fit u16 (no overflow).
@@ -5361,9 +5553,6 @@ mod tests {
     /// `test_duplex_per_base_depth_caps_each_strand_before_summing` for the error array.
     #[test]
     fn test_duplex_per_base_error_caps_before_summing() {
-        let options = CodecConsensusOptions::default();
-        let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
-
         // Both strands agree on both bases (drives the `ea + eb` agreement branch), each
         // carrying a per-base error above the `Short` ceiling (a contract-level input; the
         // single-strand caller would have capped these to 32767 at push).
@@ -5380,9 +5569,8 @@ mod tests {
         let ss_a = deep.clone();
         let ss_b = SingleStrandConsensus { is_negative_strand: true, ..deep };
 
-        let (duplex, _tally) = caller
-            .build_duplex_consensus_from_padded(&ss_a, &ss_b)
-            .expect("Should build duplex consensus without overflowing the error sum");
+        let (duplex, _tally) =
+            CodecConsensusCaller::build_duplex_consensus_from_padded(&ss_a, &ss_b);
 
         // min(40000+40000, 32767) = 32767 per base — capped at the Short ceiling, not the
         // (overflowing) raw u16 sum. The downstream cE numerator re-clamps to the same value.
