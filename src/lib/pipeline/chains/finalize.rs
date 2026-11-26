@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::pipeline::core::PipelineError;
 use crate::pipeline::core::builder::{Pipeline, PipelineConfig};
 use crate::pipeline::core::runtime::stats::PipelineStats;
+use crate::termination;
 
 // The bare `FinalizeHook` trait lives in `fgumi-pipeline-core` so CLI crates
 // built directly on the pipeline core (e.g. `fgumi-sort-cli`) can implement it
@@ -114,9 +116,25 @@ pub struct BuiltPipeline {
     /// built for (`None` without one; test support).
     #[cfg(test)]
     pub(crate) spill_eligible_clones: Option<usize>,
+    /// Keeps a termination signal cancelling (rather than killing) the process
+    /// while this pipeline, its steps and their temp state exist; its target is
+    /// the pipeline's cancel handle. Declared last so a pipeline dropped unrun
+    /// releases its steps (the aligner, sort temp directories) first.
+    pub(crate) termination_scope: termination::Scope,
 }
 
 impl BuiltPipeline {
+    /// Make `scope` this pipeline's termination scope, attaching the
+    /// pipeline's cancel handle to it (invoked at once if a termination
+    /// request is already pending), and drop the scope it replaces.
+    ///
+    /// Builders open `scope` before creating anything that needs cleanup, so a
+    /// signal during the build is held until the pipeline exists to cancel.
+    pub(crate) fn adopt_termination_scope(&mut self, scope: termination::Scope) {
+        cancel_on_termination(&scope, &self.pipeline);
+        self.termination_scope = scope;
+    }
+
     /// Convenience: run the pipeline and drain finalize hooks in order.
     ///
     /// `finalize` hooks are *always* drained in a finally-style path, even
@@ -150,16 +168,39 @@ impl BuiltPipeline {
                 sort_caps: _,
             #[cfg(test)]
                 spill_eligible_clones: _,
+            termination_scope,
         } = self;
+        // Held until the finalize hooks have drained.
+        let _termination_scope = termination_scope;
 
         // Capture the run result but do not short-circuit: the finalize
         // hooks must still drain on the error path.
         // Format the error with Display (`{e}`), not Debug: `PipelineError`
         // carries hand-written, user-facing Display messages that a `{e:?}`
         // derived-struct dump would discard.
-        let run_result = pipeline.run(config).map_err(|e| anyhow::anyhow!("Pipeline::run: {e}"));
+        let run_result = pipeline.run(config).map_err(run_error);
 
         drain_finalize(run_result, finalize, finalize_on_success)
+    }
+}
+
+/// Make a termination request cancel `pipeline`: attach its cancel handle as
+/// `scope`'s target (invoked at once if a request is already pending).
+pub(crate) fn cancel_on_termination(scope: &termination::Scope, pipeline: &Pipeline) {
+    let cancel = pipeline.cancel_handle();
+    scope.on_cancel(move || cancel.cancel());
+}
+
+/// The command error for a failed `Pipeline::run`: `Pipeline::run: <e>`.
+///
+/// A cancellation keeps a typed [`termination::Cancelled`] source under the
+/// same message, so `termination::conclude` can tell it from a real failure.
+fn run_error(e: PipelineError) -> anyhow::Error {
+    match e {
+        PipelineError::Cancelled => {
+            anyhow::Error::new(termination::Cancelled).context(format!("Pipeline::run: {e}"))
+        }
+        e => anyhow::anyhow!("Pipeline::run: {e}"),
     }
 }
 
@@ -192,7 +233,11 @@ fn drain_finalize(
     // complete. Logged last so it is the final word before the error, for a
     // reader of a log from a shell pipeline without `pipefail` (#1068).
     if let Err(e) = &run_result {
-        log::error!("Run aborted ({e}); its output is incomplete");
+        if termination::is_cancellation(e) {
+            log::warn!("Run cancelled; its output is incomplete");
+        } else {
+            log::error!("Run aborted ({e}); its output is incomplete");
+        }
     }
 
     // The pipeline-run error takes precedence over hook errors. Resolve the
@@ -228,6 +273,26 @@ mod tests {
 
     fn counting_hook(ran: &Arc<AtomicUsize>, fail: bool) -> Box<dyn FinalizeHook> {
         Box::new(CountingHook { ran: Arc::clone(ran), fail })
+    }
+
+    /// A cancelled run keeps its message and is recognisable as a
+    /// cancellation; any other failure is not, and the hooks drain on both.
+    #[rstest::rstest]
+    #[case::cancelled(PipelineError::Cancelled, true)]
+    #[case::step_failure(
+        PipelineError::Io { step: "S", source: std::io::Error::other("boom") },
+        false
+    )]
+    fn run_error_classifies_cancellation(#[case] error: PipelineError, #[case] cancelled: bool) {
+        let message = format!("Pipeline::run: {error}");
+        let err = run_error(error);
+        assert_eq!(err.to_string(), message);
+        assert_eq!(termination::is_cancellation(&err), cancelled);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let result = drain_finalize(Err(err), vec![counting_hook(&ran, false)], vec![]);
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "hooks drain on every error path");
+        assert_eq!(result.map_err(|e| termination::is_cancellation(&e)), Err(cancelled));
     }
 
     #[test]

@@ -2724,6 +2724,9 @@ impl<'a> ChainBuilder<'a> {
         created: &mut CreatedOutputs,
     ) -> Result<()> {
         for (stage, open) in std::mem::take(deferred) {
+            // Each open creates (truncates) its file: stop at a termination
+            // request that arrived during an earlier one.
+            crate::termination::check()?;
             let path = open.path().to_path_buf();
             open.open()
                 .map_err(|e| anyhow!("creating {stage} rejects BAM {}: {e}", path.display()))?;
@@ -3019,6 +3022,9 @@ impl<'a> ChainBuilder<'a> {
         use crate::pipeline::steps::sink::write_raw::WriteRawFile;
         use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
 
+        // `WriteRawFile::new` creates (truncates) `path`: each branch checks
+        // for a pending termination request immediately before it, as an
+        // interrupted build must leave existing outputs alone.
         if path_is_gzip(path) {
             let compressed_leader = if leader.is_empty() {
                 Vec::new()
@@ -3031,11 +3037,13 @@ impl<'a> ChainBuilder<'a> {
                 false,
             );
             let compress_tail = self.pipeline.append_step(compress, tail);
+            crate::termination::check()?;
             let writer = WriteRawFile::<BgzfBlock>::new(path, &fgumi_bgzf::BGZF_EOF)
                 .map(|w| w.with_leader(&compressed_leader))
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
             self.pipeline.append_step(writer, compress_tail);
         } else {
+            crate::termination::check()?;
             let writer = WriteRawFile::<DecompressedBlock>::new(path, b"")
                 .map(|w| w.with_leader(leader))
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
@@ -3256,10 +3264,15 @@ impl<'a> ChainBuilder<'a> {
         self.finalize.insert(0, Box::new(StageTimingFinalizeHook::new_with_label(chain_label)));
 
         // Every fallible construction step is done: only now create the
-        // rejects files, then keep everything this build created.
+        // rejects files, then keep everything this build created. Not if a
+        // termination request arrived during the build: creating them would
+        // truncate an existing file the interrupted run must leave alone.
+        crate::termination::check()?;
         Self::open_deferred_outputs(&mut self.deferred_outputs, &mut self.created_outputs)?;
         self.created_outputs.keep();
 
+        let termination_scope = crate::termination::scope();
+        super::finalize::cancel_on_termination(&termination_scope, &pipeline);
         Ok(BuiltPipeline {
             pipeline,
             config,
@@ -3274,6 +3287,7 @@ impl<'a> ChainBuilder<'a> {
             sort_caps: self.sort_caps,
             #[cfg(test)]
             spill_eligible_clones: self.spill_eligible_clones,
+            termination_scope,
         })
     }
 

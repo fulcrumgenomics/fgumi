@@ -162,6 +162,7 @@ pub mod system;
 pub mod tag_reversal;
 pub mod template;
 pub mod template_filter;
+pub mod termination;
 pub mod umi;
 pub mod validation;
 pub mod variant_review;

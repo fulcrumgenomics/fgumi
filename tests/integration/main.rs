@@ -68,6 +68,7 @@ mod test_runall_chain_transitions;
 mod test_runall_command;
 mod test_runall_star_preset;
 mod test_sam_input;
+mod test_signal_termination;
 #[cfg(feature = "consensus")]
 mod test_simplex_command;
 #[cfg(feature = "consensus")]

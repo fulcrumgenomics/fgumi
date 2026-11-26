@@ -78,12 +78,30 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Per-flag help advertises only `[<true|false>]`: `BoolishValueParser` takes
 /// twelve literals, and naming all of them on every boolean flag would be
 /// unreadable, so the complete set is stated once here instead.
-const BOOL_FLAG_HELP: &str = "Boolean flags shown as [<true|false>] take an optional value, and \
-                              mean true when given with none. They accept true, t, yes, y, on, 1 \
-                              and false, f, no, n, off, 0, in any capitalization.";
+macro_rules! bool_flag_help {
+    () => {
+        "Boolean flags shown as [<true|false>] take an optional value, and mean true when given \
+         with none. They accept true, t, yes, y, on, 1 and false, f, no, n, off, 0, in any \
+         capitalization."
+    };
+}
+const BOOL_FLAG_HELP: &str = bool_flag_help!();
+
+/// `fgumi --help`'s footer: the boolean-flag note plus how fgumi handles
+/// termination signals (`fgumi_lib::termination`). `-h` shows only the former.
+const LONG_AFTER_HELP: &str = concat!(
+    bool_flag_help!(),
+    "\n\n",
+    "On Linux and macOS, Ctrl-C (SIGINT), SIGTERM and SIGHUP stop the running command, stop a \
+     subprocess aligner, and remove temporary and unpublished output files; fgumi then exits by \
+     that signal. A second signal at least 0.5s later, or 8s without finishing \
+     (FGUMI_SIGNAL_GRACE_SECS; 0 turns this handling off), stops fgumi at once without cleanup. \
+     Signals ignored at startup (nohup) stay ignored. Ctrl-Z is not forwarded to the aligner, \
+     and SIGKILL cannot be caught.",
+);
 
 #[derive(Parser, Debug)]
-#[command(styles = STYLES, after_help = BOOL_FLAG_HELP)]
+#[command(styles = STYLES, after_help = BOOL_FLAG_HELP, after_long_help = LONG_AFTER_HELP)]
 struct Args {
     /// Enable verbose (debug-level) logging. Equivalent to setting `RUST_LOG=debug`.
     #[arg(short, long, global = true)]
@@ -351,6 +369,15 @@ fn main() -> Result<()> {
     let default_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
+    // SIGINT/SIGTERM/SIGHUP now cancel the running command and clean up, then
+    // kill the process by that signal (see `fgumi_lib::termination`).
+    if let Err(e) = fgumi_lib::termination::install() {
+        log::warn!(
+            "could not install signal handlers ({e}); a termination signal will stop fgumi \
+             without cleanup"
+        );
+    }
+
     #[cfg(feature = "cram")]
     {
         if let Some(reference) = &reference {
@@ -372,7 +399,9 @@ fn main() -> Result<()> {
 
     info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
 
-    let result = args.subcommand.execute(&command_line);
+    // Dies here, by the signal, if a termination request was accepted; every
+    // destructor inside `execute` has run by then.
+    let result = fgumi_lib::termination::conclude(args.subcommand.execute(&command_line));
 
     #[cfg(feature = "compare")]
     if let Err(ref e) = result
@@ -559,7 +588,16 @@ mod tests {
         }
         assert!(
             Args::command().render_help().to_string().contains("Boolean flags shown as"),
+            "`fgumi -h` does not carry the boolean-flag note",
+        );
+        let long_help = Args::command().render_long_help().to_string();
+        assert!(
+            long_help.contains("Boolean flags shown as"),
             "`fgumi --help` does not carry the boolean-flag note",
+        );
+        assert!(
+            long_help.contains("FGUMI_SIGNAL_GRACE_SECS"),
+            "`fgumi --help` does not describe termination signals",
         );
     }
 

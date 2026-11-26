@@ -403,7 +403,7 @@ fn realign_failure_kills_the_aligner_process_group() {
 
 /// Whether a descendant is still running; probe failures must not hide survivors.
 #[cfg(unix)]
-fn process_is_running(pid: rustix::process::Pid, ps: &Path) -> bool {
+pub(crate) fn process_is_running(pid: rustix::process::Pid, ps: &Path) -> bool {
     if let Ok(output) =
         Command::new(ps).args(["-o", "stat=", "-p", &pid.as_raw_pid().to_string()]).output()
         && output.status.success()

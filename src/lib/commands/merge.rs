@@ -291,7 +291,10 @@ impl Command for Merge {
         let output_header = fgumi_sort::create_output_header(order, &header);
 
         // Stage the output; it replaces the destination only once the merge
-        // has succeeded, so a failed merge leaves no partial output.
+        // has succeeded, so a failed merge leaves no partial output. The
+        // termination scope, opened first and so dropped after the staged
+        // file, lets a termination signal remove it rather than leave it.
+        let _termination_scope = crate::termination::scope();
         let target = fgumi_sort::MergeOutputTarget::create(&self.output)?;
         let stats_slot = std::sync::Arc::new(parking_lot::Mutex::new(None));
         let built = crate::pipeline::chains::build_merge(crate::pipeline::chains::MergeSpec {
@@ -309,6 +312,8 @@ impl Command for Merge {
             stats_slot: std::sync::Arc::clone(&stats_slot),
         })?;
         built.run()?;
+        // A request that landed after the run finished: publish nothing.
+        crate::termination::check()?;
         target.persist()?;
         rewriter.lock().log_undeclared_summary();
         let records_merged = stats_slot.lock().as_ref().map_or(0, |s| s.output_records);
