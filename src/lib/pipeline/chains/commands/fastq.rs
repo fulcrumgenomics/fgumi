@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use log::info;
 
-use crate::commands::fastq::{FastqOptions, Segment, classify_segment, write_fastq_record};
+use crate::commands::fastq::{
+    FastqOptions, Segment, UnalignedReadFormat, classify_segment, write_fastq_record,
+    write_unaligned_sam_record,
+};
 use crate::logging::OperationTimer;
 use crate::pipeline::chains::FinalizeHook;
 use crate::pipeline::steps::process::{
@@ -29,13 +32,15 @@ use crate::pipeline::steps::types::{DecodedRecordBatch, DecompressedBlock};
 pub(crate) struct FastqFinalizeHook {
     pub(crate) records_written: Arc<AtomicU64>,
     pub(crate) timer: OperationTimer,
+    /// The output format, named in the record-count log line.
+    pub(crate) format: UnalignedReadFormat,
 }
 
 impl FinalizeHook for FastqFinalizeHook {
     fn finalize(self: Box<Self>) -> Result<()> {
-        let FastqFinalizeHook { records_written, timer } = *self;
+        let FastqFinalizeHook { records_written, timer, format } = *self;
         let n = records_written.load(Ordering::Relaxed);
-        info!("Fastq: completed ({n} FASTQ records written)");
+        info!("Fastq: completed ({n} {} records written)", format.label());
         timer.log_completion(n);
         Ok(())
     }
@@ -64,8 +69,10 @@ fn bump_progress(counter: &AtomicU64, written: u64) {
     }
 }
 
-/// Interleaved FASTQ encode step: [`DecodedRecordBatch`] → one
-/// [`DecompressedBlock`] of FASTQ text (all passing records, in input order).
+/// Interleaved encode step: [`DecodedRecordBatch`] → one [`DecompressedBlock`]
+/// of FASTQ or unaligned SAM text (all passing records, in input order), per
+/// [`FastqOptions::format`]. The SAM `@HD` line is not written here but by the
+/// sink, so an input with no records still gets it.
 pub(crate) fn build_fastq_encode_step(
     opts: Arc<FastqOptions>,
     per_step_byte_limit: u64,
@@ -96,15 +103,25 @@ pub(crate) fn build_fastq_encode_step(
                 if !opts.passes_filters(flags) {
                     continue;
                 }
-                write_fastq_record(
-                    &mut out,
-                    record.record(),
-                    flags,
-                    opts.no_suffix,
-                    &mut state.buffers,
-                    opts.umi_header.as_ref(),
-                )
-                .map_err(|e| io::Error::other(format!("fastq encode: {e:#}")))?;
+                let result = match opts.format {
+                    UnalignedReadFormat::Fastq => write_fastq_record(
+                        &mut out,
+                        record.record(),
+                        flags,
+                        opts.no_suffix,
+                        &mut state.buffers,
+                        opts.umi_header.as_ref(),
+                    ),
+                    UnalignedReadFormat::Sam => write_unaligned_sam_record(
+                        &mut out,
+                        record.record(),
+                        flags,
+                        &mut state.buffers,
+                    ),
+                };
+                result.map_err(|e| {
+                    io::Error::other(format!("{} encode: {e:#}", opts.format.label()))
+                })?;
                 written += 1;
             }
             bump_progress(&records_written, written);
@@ -160,7 +177,7 @@ fn encode_paired_batch(
             &mut state.buffers,
             opts.umi_header.as_ref(),
         )
-        .map_err(|e| io::Error::other(format!("fastq encode: {e:#}")))?;
+        .map_err(|e| io::Error::other(format!("FASTQ encode: {e:#}")))?;
         written += 1;
     }
     bump_progress(records_written, written);
@@ -234,6 +251,7 @@ mod tests {
             require_flags: 0,
             no_suffix: true,
             umi_header: None,
+            format: crate::commands::fastq::UnalignedReadFormat::Fastq,
         });
         let step = build_fastq_paired_encode_step(opts, 1 << 20, Arc::new(AtomicU64::new(0)));
         let profile = step.profile();
@@ -263,7 +281,13 @@ mod tests {
     }
 
     fn no_filter_opts() -> FastqOptions {
-        FastqOptions { exclude_flags: 0, require_flags: 0, no_suffix: true, umi_header: None }
+        FastqOptions {
+            exclude_flags: 0,
+            require_flags: 0,
+            no_suffix: true,
+            umi_header: None,
+            format: crate::commands::fastq::UnalignedReadFormat::Fastq,
+        }
     }
 
     /// Direct, deterministic regression test for the no-ordinal-gaps rule

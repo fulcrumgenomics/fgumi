@@ -309,6 +309,27 @@ impl InlineBgzfCompressor {
     }
 }
 
+/// Compress `data` into complete BGZF blocks at `compression_level`, returned as
+/// one byte vector: a one-shot form of [`InlineBgzfCompressor`] for a small
+/// payload written ahead of a stream (a BAM or SAM header). No EOF marker.
+///
+/// # Errors
+///
+/// Returns an I/O error if compression fails.
+///
+/// # Panics
+///
+/// Panics if `compression_level` is outside `0..=12`, as
+/// [`InlineBgzfCompressor::new`] does.
+pub fn compress_to_vec(data: &[u8], compression_level: u32) -> io::Result<Vec<u8>> {
+    let mut compressor = InlineBgzfCompressor::new(compression_level);
+    compressor.write_all(data)?;
+    compressor.flush()?;
+    let mut blocks = Vec::new();
+    compressor.write_blocks_to(&mut blocks)?;
+    Ok(blocks)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

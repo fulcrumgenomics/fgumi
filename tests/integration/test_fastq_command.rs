@@ -1422,3 +1422,152 @@ fn test_fastq_survives_a_reader_slower_than_the_deadlock_timeout() {
         names.iter().flat_map(|n| [format!("@{n}/1"), format!("@{n}/2")]).collect();
     assert_eq!(headers, expected, "every FASTQ record reaches the reader, in order");
 }
+
+// ============================================================================
+// `--format sam`: unaligned SAM for aligners that read paired SAM input.
+// ============================================================================
+
+/// Runs `fgumi fastq` over `input` with `extra` args, writing to `output`.
+fn run_fastq(input: &Path, output: &Path, extra: &[&str]) {
+    let mut argv = vec!["fastq", "-i", input.to_str().unwrap(), "-o", output.to_str().unwrap()];
+    argv.extend_from_slice(extra);
+    let cmd = Fastq::try_parse_from(argv).expect("failed to parse fastq args");
+    cmd.execute("fgumi fastq").expect("fastq command failed");
+}
+
+/// `--format sam` writes the `@HD` line, then one 11-column unmapped record per
+/// read: FLAG 77/141/4 by segment, QNAME without a mate suffix, SEQ/QUAL in the
+/// original read orientation, no tags. Filtered (secondary) reads are skipped as
+/// in the FASTQ path, and each record's SEQ/QUAL equal the FASTQ path's.
+#[test]
+fn test_fastq_format_sam_writes_unaligned_sam() {
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("in.bam");
+    create_bam_with_records(
+        &input,
+        &[
+            ("p1", flags::PAIRED | flags::FIRST_SEGMENT, "ACGTACGT", "IIIIIIII", Some("AAAA")),
+            (
+                "p1",
+                flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE,
+                "AAAACCCG",
+                "ABCDEFGH",
+                Some("AAAA"),
+            ),
+            // Secondary: excluded by the default -F 0x900.
+            ("p1", flags::PAIRED | flags::FIRST_SEGMENT | flags::SECONDARY, "GGGG", "IIII", None),
+            ("solo", 0, "CCCCTTTT", "MMMMMMMM", None),
+        ],
+    );
+
+    let sam = dir.path().join("out.sam");
+    run_fastq(&input, &sam, &["--format", "sam"]);
+    let text = fs::read_to_string(&sam).expect("read SAM output");
+    let expected = "@HD\tVN:1.6\tSO:unsorted\n\
+        p1\t77\t*\t0\t0\t*\t*\t0\t0\tACGTACGT\tIIIIIIII\n\
+        p1\t141\t*\t0\t0\t*\t*\t0\t0\tCGGGTTTT\tHGFEDCBA\n\
+        solo\t4\t*\t0\t0\t*\t*\t0\t0\tCCCCTTTT\tMMMMMMMM\n";
+    assert_eq!(text, expected);
+
+    // SEQ/QUAL parity with the FASTQ path over the same input.
+    let fq = dir.path().join("out.fq");
+    run_fastq(&input, &fq, &["--no-read-suffix"]);
+    let fastq: Vec<(String, String, String)> = parse_fastq_records(&fq);
+    let sam_records: Vec<(String, String, String)> = text
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            (cols[0].to_string(), cols[9].to_string(), cols[10].to_string())
+        })
+        .collect();
+    assert_eq!(sam_records, fastq, "SAM QNAME/SEQ/QUAL must equal the FASTQ path's");
+
+    // noodles parses it as SAM: unmapped records, no tags.
+    let mut reader = noodles::sam::io::Reader::new(BufReader::new(
+        fs::File::open(&sam).expect("open SAM output"),
+    ));
+    let header = reader.read_header().expect("read SAM header");
+    let records: Vec<_> =
+        reader.record_bufs(&header).collect::<Result<_, _>>().expect("parse SAM records");
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().all(|r| r.flags().is_unmapped() && r.data().is_empty()));
+}
+
+/// The SAM header is written even when the input has no records or no read
+/// passes the filters, so the output is a valid (empty) SAM file.
+#[rstest::rstest]
+#[case::empty_input(&[])]
+#[case::all_filtered(&[("p1", flags::SECONDARY, "ACGT", "IIII", None)])]
+fn test_fastq_format_sam_with_no_reads_writes_header_only(
+    #[case] records: &[(&str, u16, &str, &str, Option<&str>)],
+) {
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("in.bam");
+    create_bam_with_records(&input, records);
+    let sam = dir.path().join("out.sam");
+    run_fastq(&input, &sam, &["--format", "sam"]);
+    assert_eq!(fs::read_to_string(&sam).expect("read SAM"), "@HD\tVN:1.6\tSO:unsorted\n");
+}
+
+/// The unaligned SAM `fgumi fastq --format sam` writes for the single pair
+/// `create_paired_bam` builds from `("r1", "ACGT", "IIII", "TTGG", "IIII", true)`:
+/// the header, then R1 and R2 in their original orientation (R2 is stored
+/// reverse-complemented, so it is written as `CCAA`).
+const ONE_PAIR_SAM: &str = "@HD\tVN:1.6\tSO:unsorted\n\
+    r1\t77\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n\
+    r1\t141\t*\t0\t0\t*\t*\t0\t0\tCCAA\tIIII\n";
+
+/// A `.gz` output path with `--format sam` is BGZF-compressed SAM that decompresses
+/// to the plain-path bytes.
+#[test]
+fn test_fastq_format_sam_gz_output_matches_plain() {
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("in.bam");
+    create_paired_bam(&input, vec![("r1", "ACGT", "IIII", "TTGG", "IIII", true)]);
+    let plain = dir.path().join("out.sam");
+    let gz = dir.path().join("out.sam.gz");
+    run_fastq(&input, &plain, &["--format", "sam"]);
+    run_fastq(&input, &gz, &["--format", "sam"]);
+    let expected = fs::read(&plain).expect("read plain SAM");
+    assert_eq!(String::from_utf8(expected.clone()).expect("UTF-8 SAM"), ONE_PAIR_SAM);
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(fs::File::open(&gz).expect("open gz")),
+        &mut decoded,
+    )
+    .expect("decompress");
+    assert_eq!(decoded, expected);
+}
+
+/// `--format sam` with no `--output` writes the same SAM, header first, to stdout.
+#[test]
+fn test_fastq_format_sam_to_stdout_matches_output_file() {
+    let dir = TempDir::new().expect("temp dir");
+    let input = dir.path().join("in.bam");
+    create_paired_bam(&input, vec![("r1", "ACGT", "IIII", "TTGG", "IIII", true)]);
+    let file = dir.path().join("out.sam");
+    run_fastq(&input, &file, &["--format", "sam"]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(["fastq", "-i", input.to_str().unwrap(), "--format", "sam"])
+        .output()
+        .expect("run fgumi fastq");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8(output.stdout).expect("UTF-8 SAM"), ONE_PAIR_SAM);
+    assert_eq!(fs::read_to_string(&file).expect("read SAM file"), ONE_PAIR_SAM);
+}
+
+/// `--format sam` is rejected with paired split outputs and with
+/// `--annotate-read-names`, naming the conflicting option.
+#[rstest::rstest]
+#[case::out1_out2(&["-1", "r1.fq", "-2", "r2.fq"], "--out1/--out2/--out0")]
+#[case::out1_out2_out0(&["-1", "r1.fq", "-2", "r2.fq", "-0", "r0.fq"], "--out1/--out2/--out0")]
+#[case::annotate_read_names(&["--annotate-read-names"], "--annotate-read-names")]
+fn test_fastq_format_sam_rejects_unsupported_options(#[case] extra: &[&str], #[case] needle: &str) {
+    let mut argv = vec!["fastq", "-i", "in.bam", "--format", "sam"];
+    argv.extend_from_slice(extra);
+    let cmd = Fastq::try_parse_from(argv).expect("clap accepts the combination");
+    let err = cmd.execute("fgumi fastq").expect_err("--format sam combination must be rejected");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--format sam") && msg.contains(needle), "got: {msg}");
+}

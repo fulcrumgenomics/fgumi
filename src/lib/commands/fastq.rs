@@ -2,7 +2,8 @@
 //!
 //! Reads a BAM file and writes FASTQ, either interleaved to stdout (the default,
 //! for piping to `bwa mem -p`) or split into per-read files (`--out1`/`--out2`,
-//! plus optional `--out0`). Input should be queryname-sorted or
+//! plus optional `--out0`). `--format sam` writes the interleaved stream as
+//! unaligned SAM instead. Input should be queryname-sorted or
 //! template-coordinate sorted. The conversion runs on the typed-step pipeline.
 
 use crate::commands::common::{
@@ -68,6 +69,14 @@ to aligners. Input should be queryname-sorted or template-coordinate sorted. Any
 stdout is always plain text. The conversion runs on the typed-step pipeline, so
 `--threads` parallelizes both BAM decompression and BGZF output compression.
 
+For STAR's paired SAM input (`--readFilesType SAM PE`), use `--format sam`
+instead of FASTQ. This exports reads for alignment, not a SAM copy of the input:
+reads are restored to their original orientation, marked unmapped, and written
+without alignment fields or tags, with only a minimal header. Unlike
+`samtools view -h`, it does not preserve the input's alignments, tags or header.
+With `fgumi runall`, use `--aligner::input-format sam` with a custom STAR command;
+there is no need to run this command separately.
+
 EXAMPLES:
 
   # Pipe interleaved FASTQ to bwa mem for alignment
@@ -84,6 +93,12 @@ EXAMPLES:
   # Exclude secondary and supplementary alignments (default)
   fgumi fastq -i aligned.bam -F 0x900 | bwa mem ...
 
+  # Export paired reads directly to STAR without a samtools conversion
+  fgumi fastq -i unmapped.bam --format sam | \
+    STAR --genomeDir star-index --readFilesType SAM PE --readFilesIn /dev/stdin \
+      --outStd SAM --outSAMtype SAM --outSAMorder PairedKeepInputOrder \
+      --outSAMunmapped Within > aligned.sam
+
 NOTES:
 
   Read-name suffixes (/1, /2): appended from the FLAG unless --no-read-suffix,
@@ -96,6 +111,12 @@ NOTES:
   Missing base qualities: a read with no stored quality (all 0xFF, the SAM
   no-quality sentinel) is emitted with a fixed Q33 ('B') per base, matching
   `samtools fastq` -- not Q93, which would falsely claim near-perfect quality.
+
+  Unaligned SAM (--format sam): an `@HD VN:1.6 SO:unsorted` line, then one
+  record per read, `QNAME FLAG * 0 0 * * 0 0 SEQ QUAL`, with FLAG 77 (R1), 141
+  (R2) or 4 (other) and no tags. SEQ/QUAL are as in the FASTQ output, and QNAME
+  never has a /1 /2 suffix. Only for the interleaved stream (stdout or --output),
+  and not with --annotate-read-names.
 
   Interleaved pairing: for `bwa mem -p` the input must be queryname or
   template-coordinate sorted with both mates present; a lone mate (its pair
@@ -135,6 +156,19 @@ pub struct Fastq {
     /// is always plain text.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Output format for the interleaved stream: `fastq` (the default) or
+    /// unaligned `sam` for aligner input, such as STAR's `--readFilesType SAM PE`.
+    ///
+    /// `sam` writes an `@HD` line, then one 11-column record per read
+    /// (`QNAME FLAG * 0 0 * * 0 0 SEQ QUAL`) with FLAG 77 for R1, 141 for R2 and
+    /// 4 otherwise, and no tags, for aligners that read paired SAM input. QNAME
+    /// never has a /1 /2 suffix. Not valid with `--out1`/`--out2`/`--out0` or
+    /// `--annotate-read-names`. This exports reads in their original orientation,
+    /// not the input's alignments, tags or header; it is not a substitute for
+    /// `samtools view -h` when those must be preserved.
+    #[arg(long = "format", value_enum, default_value_t = UnalignedReadFormat::Fastq)]
+    pub format: UnalignedReadFormat,
 
     /// Don't append /1 and /2 to read names.
     #[arg(short = 'n', long = "no-read-suffix", value_name = "true|false", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), hide_possible_values = true)]
@@ -240,14 +274,40 @@ impl Fastq {
         info!("Threads: {}", self.threads);
         info!("Exclude flags: 0x{:X}", self.exclude_flags);
         info!("Require flags: 0x{:X}", self.require_flags);
+        info!("Output format: {}", self.format.name());
         let suffix = if self.out1.is_some() {
             "omitted (paired split)"
+        } else if self.format == UnalignedReadFormat::Sam {
+            "omitted (SAM)"
         } else if self.no_suffix {
             "disabled"
         } else {
             "enabled"
         };
         info!("Read name suffix: {suffix}");
+    }
+
+    /// Reject option combinations `--format sam` does not support: SAM is
+    /// written only as one interleaved stream, and its QNAME is left as is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for `--format sam` with `--out1`/`--out2`/`--out0` or
+    /// with `--annotate-read-names`.
+    fn validate_format(&self) -> Result<()> {
+        if self.format != UnalignedReadFormat::Sam {
+            return Ok(());
+        }
+        if self.out1.is_some() || self.out2.is_some() || self.out0.is_some() {
+            anyhow::bail!(
+                "--format sam writes a single interleaved stream (stdout or --output); \
+                 it cannot be used with --out1/--out2/--out0"
+            );
+        }
+        if self.annotate_read_names {
+            anyhow::bail!("--format sam cannot be used with --annotate-read-names");
+        }
+        Ok(())
     }
 
     /// Build the per-stage [`FastqOptions`] — the single source of truth for the
@@ -259,6 +319,7 @@ impl Fastq {
             require_flags: self.require_flags,
             no_suffix: self.no_suffix,
             umi_header: self.build_umi_header()?,
+            format: self.format,
         })
     }
 
@@ -347,6 +408,7 @@ impl Fastq {
 
 impl Command for Fastq {
     fn execute(&self, command_line: &str) -> Result<()> {
+        self.validate_format()?;
         validate_input_exists(&self.input, "Input BAM")?;
 
         if self.bwa_chunk_size != DEFAULT_BWA_CHUNK_SIZE {
@@ -633,6 +695,122 @@ pub(crate) fn write_fastq_record<W: Write>(
     Ok(())
 }
 
+/// Text format for unaligned reads written for an aligner: `fgumi fastq --format`
+/// and `runall --aligner::input-format`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum UnalignedReadFormat {
+    /// Four-line FASTQ records.
+    #[default]
+    Fastq,
+    /// Unaligned SAM: an `@HD` line, then one 11-column record per read, with
+    /// FLAG 77 (R1), 141 (R2) or 4 (other) and no tags. For aligners that read
+    /// paired SAM input.
+    Sam,
+}
+
+impl UnalignedReadFormat {
+    /// The format's CLI spelling (`fastq` or `sam`), for logs and messages.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fastq => "fastq",
+            Self::Sam => "sam",
+        }
+    }
+
+    /// The format's display name (`FASTQ` or `SAM`), for log lines and errors.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fastq => "FASTQ",
+            Self::Sam => "SAM",
+        }
+    }
+}
+
+/// The header written before the first unaligned SAM record. No `@SQ` lines:
+/// every record is unmapped.
+pub(crate) const UNALIGNED_SAM_HEADER: &[u8] = b"@HD\tVN:1.6\tSO:unsorted\n";
+
+/// FLAG for an unaligned SAM record of the first segment: paired, unmapped,
+/// mate unmapped, first segment (77).
+const UNALIGNED_SAM_FLAG_R1: u16 = fgumi_raw_bam::flags::PAIRED
+    | fgumi_raw_bam::flags::UNMAPPED
+    | fgumi_raw_bam::flags::MATE_UNMAPPED
+    | fgumi_raw_bam::flags::FIRST_SEGMENT;
+/// FLAG for an unaligned SAM record of the last segment: paired, unmapped,
+/// mate unmapped, last segment (141).
+const UNALIGNED_SAM_FLAG_R2: u16 = fgumi_raw_bam::flags::PAIRED
+    | fgumi_raw_bam::flags::UNMAPPED
+    | fgumi_raw_bam::flags::MATE_UNMAPPED
+    | fgumi_raw_bam::flags::LAST_SEGMENT;
+/// FLAG for an unaligned SAM record that is not one segment of a pair: an
+/// unpaired read, or one whose segment bits are both set or both clear (4).
+const UNALIGNED_SAM_FLAG_OTHER: u16 = fgumi_raw_bam::flags::UNMAPPED;
+
+/// Write a single unaligned SAM record to the writer:
+/// `QNAME FLAG * 0 0 * * 0 0 SEQ QUAL`, tab-separated, with no tags.
+///
+/// SEQ and QUAL are the bytes [`write_fastq_record`] writes ([`decode_fastq_seq_qual`]):
+/// in the read's original orientation, with a missing quality written as Q33.
+/// QNAME never carries a `/1` `/2` suffix; FLAG carries the segment instead:
+/// 77 or 141 only for a record flagged PAIRED with exactly one segment bit (see
+/// [`classify_segment`]), 4 otherwise, since SAM gives the segment bits no
+/// meaning without PAIRED. The `@HD` line ([`UNALIGNED_SAM_HEADER`]) is the
+/// caller's to write once, before the first record.
+///
+/// Degenerate fields are written so the line stays valid SAM: an empty read as
+/// `*` for SEQ and QUAL, an empty name as `*`, and a one-base read of quality 9
+/// (whose QUAL would be the single character `*`, which SAM reads as "no
+/// quality") with quality 10 instead.
+///
+/// # Errors
+///
+/// Returns an error for a read name starting with `@`, which SAM does not allow
+/// (the line would read as a header line), and for write failures.
+#[inline]
+pub(crate) fn write_unaligned_sam_record<W: Write>(
+    writer: &mut W,
+    record: &RawRecord,
+    flags: u16,
+    buffers: &mut FastqRecordBuffers,
+) -> Result<()> {
+    let paired = flags & fgumi_raw_bam::flags::PAIRED != 0;
+    let flag = match classify_segment(flags) {
+        Segment::Read1 if paired => UNALIGNED_SAM_FLAG_R1,
+        Segment::Read2 if paired => UNALIGNED_SAM_FLAG_R2,
+        _ => UNALIGNED_SAM_FLAG_OTHER,
+    };
+
+    let name = raw_read_name(record);
+    if name.first() == Some(&b'@') {
+        anyhow::bail!(
+            "read name '{}' starts with '@', which an unaligned SAM record cannot carry (the \
+             line would read as a header line)",
+            String::from_utf8_lossy(name)
+        );
+    }
+
+    decode_fastq_seq_qual(record, flags, &mut buffers.seq, &mut buffers.qual);
+    if buffers.qual.as_slice() == b"*" {
+        // Q9 is `*` in Phred+33; a lone `*` means "no quality" in SAM.
+        buffers.qual[0] = b'+';
+    }
+
+    writer.write_all(if name.is_empty() { b"*" } else { name })?;
+    write!(writer, "\t{flag}\t*\t0\t0\t*\t*\t0\t0\t")?;
+    if buffers.seq.is_empty() {
+        writer.write_all(b"*\t*\n")?;
+    } else {
+        writer.write_all(&buffers.seq)?;
+        writer.write_all(b"\t")?;
+        writer.write_all(&buffers.qual)?;
+        writer.write_all(b"\n")?;
+    }
+
+    Ok(())
+}
+
 // ==== ported from feat-runall for the chain builder (R2) ====
 /// Which FASTQ stream a record belongs to, based on its segment flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,6 +867,9 @@ pub struct FastqOptions {
     pub no_suffix: bool,
     /// When `Some`, append the UMI (from the configured tag) to the read name.
     pub umi_header: Option<UmiNameAnnotation>,
+    /// Record format of the interleaved stream. Paired split output is always
+    /// FASTQ (`fgumi fastq` rejects `--format sam` there).
+    pub format: UnalignedReadFormat,
 }
 
 // ==== impls ported from feat-runall for the chain builder (R2) ====
@@ -1008,9 +1189,165 @@ mod tests {
         #[case] flags: u16,
         #[case] expected: bool,
     ) {
-        let opts =
-            FastqOptions { exclude_flags, require_flags, no_suffix: false, umi_header: None };
+        let opts = FastqOptions {
+            exclude_flags,
+            require_flags,
+            no_suffix: false,
+            umi_header: None,
+            format: UnalignedReadFormat::Fastq,
+        };
         assert_eq!(opts.passes_filters(flags), expected);
+    }
+
+    /// `write_unaligned_sam_record` writes one tab-separated 11-column line with
+    /// the segment's FLAG (77 R1, 141 R2, 4 otherwise), no mate suffix and no
+    /// tags; SEQ/QUAL match the FASTQ path (reverse-complemented for a REVERSE
+    /// record, Q33 for a missing quality, `*` for an empty read).
+    #[rstest]
+    #[case::read1(
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+        "ACGTN",
+        &[0, 30, 40, 93, 2],
+        "q1\t77\t*\t0\t0\t*\t*\t0\t0\tACGTN\t!?I~#\n"
+    )]
+    #[case::read2(
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT,
+        "GGCA",
+        &[30, 30, 30, 20],
+        "q1\t141\t*\t0\t0\t*\t*\t0\t0\tGGCA\t???5\n"
+    )]
+    #[case::single_end(0, "ACGT", &[30; 4], "q1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t????\n")]
+    #[case::unpaired_first_segment(
+        fgumi_raw_bam::flags::FIRST_SEGMENT,
+        "ACGT",
+        &[30; 4],
+        "q1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t????\n"
+    )]
+    #[case::single_base_q9(
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+        "A",
+        &[9],
+        "q1\t77\t*\t0\t0\t*\t*\t0\t0\tA\t+\n"
+    )]
+    #[case::both_segment_bits(
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::LAST_SEGMENT,
+        "ACGT",
+        &[30; 4],
+        "q1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t????\n"
+    )]
+    #[case::reverse_strand(
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::LAST_SEGMENT
+            | fgumi_raw_bam::flags::REVERSE,
+        "AACGT",
+        &[10, 20, 30, 40, 0],
+        "q1\t141\t*\t0\t0\t*\t*\t0\t0\tACGTT\t!I?5+\n"
+    )]
+    #[case::missing_quality(
+        fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT,
+        "ACGT",
+        &[0xFF; 4],
+        "q1\t77\t*\t0\t0\t*\t*\t0\t0\tACGT\tBBBB\n"
+    )]
+    #[case::empty_read(0, "", &[], "q1\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\n")]
+    fn write_unaligned_sam_record_writes_eleven_columns(
+        #[case] flags: u16,
+        #[case] seq: &str,
+        #[case] quals: &[u8],
+        #[case] expected: &str,
+    ) {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(b"q1").flags(flags).sequence(seq.as_bytes()).qualities(quals);
+        // A tag on the input must not be carried into the SAM line.
+        b.add_string_tag(SamTag::RX, b"ACGT");
+        let record = b.build();
+
+        let mut out = Vec::new();
+        let mut buffers = FastqRecordBuffers::with_capacity(16);
+        write_unaligned_sam_record(&mut out, &record, flags, &mut buffers).expect("write");
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    /// An empty read name is written as `*`; a name starting with `@` is
+    /// rejected, since the line would read as a header line.
+    #[rstest]
+    #[case::empty_name(b"", Some("*\t77\t"))]
+    #[case::at_sign_name(b"@q1", None)]
+    fn write_unaligned_sam_record_guards_the_name(
+        #[case] name: &[u8],
+        #[case] expected_prefix: Option<&str>,
+    ) {
+        let flags = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(name).flags(flags).sequence(b"ACGT").qualities(&[30; 4]);
+        let record = b.build();
+        let mut out = Vec::new();
+        let mut buffers = FastqRecordBuffers::with_capacity(16);
+        let result = write_unaligned_sam_record(&mut out, &record, flags, &mut buffers);
+        if let Some(prefix) = expected_prefix {
+            result.expect("write");
+            let line = String::from_utf8(out).unwrap();
+            assert!(line.starts_with(prefix), "got: {line:?}");
+        } else {
+            let err = result.expect_err("an '@' name must be rejected").to_string();
+            assert!(err.contains("starts with '@'"), "got: {err}");
+        }
+    }
+
+    /// SEQ and QUAL in the SAM line are the bytes the FASTQ path writes for the
+    /// same record, and QNAME is the FASTQ name without its suffix.
+    #[rstest]
+    #[case::forward_r1(fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT)]
+    #[case::reverse_r2(
+        fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::LAST_SEGMENT
+            | fgumi_raw_bam::flags::REVERSE
+    )]
+    fn unaligned_sam_seq_qual_match_fastq(#[case] flags: u16) {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(b"read7")
+            .flags(flags)
+            .sequence(b"ACGRTNacg")
+            .qualities(&[5, 10, 15, 20, 25, 30, 35, 40, 45]);
+        let record = b.build();
+        let mut buffers = FastqRecordBuffers::with_capacity(16);
+
+        let mut fastq = Vec::new();
+        write_fastq_record(&mut fastq, &record, flags, true, &mut buffers, None).expect("fastq");
+        let fastq = String::from_utf8(fastq).unwrap();
+        let fastq_lines: Vec<&str> = fastq.lines().collect();
+
+        let mut sam = Vec::new();
+        write_unaligned_sam_record(&mut sam, &record, flags, &mut buffers).expect("sam");
+        let sam = String::from_utf8(sam).unwrap();
+        let columns: Vec<&str> = sam.trim_end_matches('\n').split('\t').collect();
+
+        assert_eq!(columns.len(), 11);
+        assert_eq!(format!("@{}", columns[0]), fastq_lines[0]);
+        assert_eq!(columns[9], fastq_lines[1]);
+        assert_eq!(columns[10], fastq_lines[3]);
+    }
+
+    /// `--format sam` is valid only for the single interleaved stream and
+    /// without `--annotate-read-names`; `fastq` accepts every combination.
+    #[rstest]
+    #[case::sam_stdout(&["--format", "sam"], true)]
+    #[case::sam_output(&["--format", "sam", "-o", "out.sam"], true)]
+    #[case::sam_with_paired_split(&["--format", "sam", "-1", "r1", "-2", "r2"], false)]
+    #[case::sam_with_out1_out2_out0(&["--format", "sam", "-1", "r1", "-2", "r2", "-0", "r0"], false)]
+    #[case::sam_with_annotate(&["--format", "sam", "--annotate-read-names"], false)]
+    #[case::fastq_with_paired_split(&["--format", "fastq", "-1", "r1", "-2", "r2"], true)]
+    #[case::fastq_with_annotate(&["--annotate-read-names"], true)]
+    fn validate_format_rejects_unsupported_sam_combinations(
+        #[case] extra: &[&str],
+        #[case] ok: bool,
+    ) {
+        let mut argv = vec!["fastq", "-i", "in.bam"];
+        argv.extend_from_slice(extra);
+        let fastq = Fastq::try_parse_from(argv).expect("parse fastq args");
+        assert_eq!(fastq.validate_format().is_ok(), ok);
     }
 
     /// `path_is_gzip` matches `gz`/`bgz`/`bgzf` as the final extension,

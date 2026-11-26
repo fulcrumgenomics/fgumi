@@ -2642,6 +2642,7 @@ impl<'a> ChainBuilder<'a> {
     fn add_fastq(&mut self, position: StagePosition) -> Result<()> {
         use std::sync::atomic::AtomicU64;
 
+        use crate::commands::fastq::UnalignedReadFormat;
         use crate::logging::OperationTimer;
         use crate::pipeline::chains::commands::fastq::{
             FastqFinalizeHook, build_fastq_encode_step, build_fastq_paired_encode_step,
@@ -2658,7 +2659,12 @@ impl<'a> ChainBuilder<'a> {
             .ok_or_else(|| anyhow!("Stage::Fastq options missing from StageOptionsBag"))?;
 
         let tail = self.current_tail.expect("add_fastq called before add_source");
-        let timer = OperationTimer::new("Converting BAM to FASTQ");
+        if matches!(self.spec.sink, SinkSpec::FastqPaired { .. })
+            && opts.format == UnalignedReadFormat::Sam
+        {
+            bail!("unaligned SAM output does not support split R1/R2/other outputs");
+        }
+        let timer = OperationTimer::new(&format!("Converting BAM to {}", opts.format.label()));
         let records_written = Arc::new(AtomicU64::new(0));
 
         if let SinkSpec::FastqPaired { out2, out0, .. } = &self.spec.sink {
@@ -2686,7 +2692,8 @@ impl<'a> ChainBuilder<'a> {
         }
         self.chain_tail_kind = ChainTailKind::SerializedBytes;
 
-        self.finalize.push(Box::new(FastqFinalizeHook { records_written, timer }));
+        let format = opts.format;
+        self.finalize.push(Box::new(FastqFinalizeHook { records_written, timer, format }));
         Ok(())
     }
 
@@ -2970,8 +2977,16 @@ impl<'a> ChainBuilder<'a> {
 
     /// Route the FASTQ byte tail to a single (interleaved) raw writer.
     fn add_fastq_sink(&mut self, path: &std::path::Path) -> Result<()> {
+        use crate::commands::fastq::{UNALIGNED_SAM_HEADER, UnalignedReadFormat};
+
         let tail = self.current_tail.expect("add_sink called before add_source");
-        self.wire_fastq_output(tail, path)?;
+        // Unaligned SAM opens with its `@HD` line, written by the sink so it
+        // appears even when no record reaches the output.
+        let leader: &[u8] = match self.spec.stage_opts.fastq.as_ref().map(|o| o.format) {
+            Some(UnalignedReadFormat::Sam) => UNALIGNED_SAM_HEADER,
+            Some(UnalignedReadFormat::Fastq) | None => b"",
+        };
+        self.wire_fastq_output_with_leader(tail, path, leader)?;
         // add_fastq_sink terminates the chain; no downstream tail.
         Ok(())
     }
@@ -2985,12 +3000,29 @@ impl<'a> ChainBuilder<'a> {
         tail: (StepIdx, BranchIdx),
         path: &std::path::Path,
     ) -> Result<()> {
+        self.wire_fastq_output_with_leader(tail, path, b"")
+    }
+
+    /// [`Self::wire_fastq_output`], writing `leader` (uncompressed text) to the
+    /// output before any block: as is for plain output, as its own BGZF block
+    /// for a `.gz`/`.bgz` path. An empty `leader` writes nothing.
+    fn wire_fastq_output_with_leader(
+        &mut self,
+        tail: (StepIdx, BranchIdx),
+        path: &std::path::Path,
+        leader: &[u8],
+    ) -> Result<()> {
         use crate::commands::fastq::path_is_gzip;
         use crate::pipeline::steps::bgzf::compress::BgzfCompress;
         use crate::pipeline::steps::sink::write_raw::WriteRawFile;
         use crate::pipeline::steps::types::{BgzfBlock, DecompressedBlock};
 
         if path_is_gzip(path) {
+            let compressed_leader = if leader.is_empty() {
+                Vec::new()
+            } else {
+                fgumi_bgzf::compress_to_vec(leader, self.tuning.compression_level)?
+            };
             let compress = BgzfCompress::new(
                 self.tuning.compression_level,
                 self.tuning.per_step_byte_limit,
@@ -2998,10 +3030,12 @@ impl<'a> ChainBuilder<'a> {
             );
             let compress_tail = self.pipeline.append_step(compress, tail);
             let writer = WriteRawFile::<BgzfBlock>::new(path, &fgumi_bgzf::BGZF_EOF)
+                .map(|w| w.with_leader(&compressed_leader))
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
             self.pipeline.append_step(writer, compress_tail);
         } else {
             let writer = WriteRawFile::<DecompressedBlock>::new(path, b"")
+                .map(|w| w.with_leader(leader))
                 .map_err(|e| anyhow!("WriteRawFile: {e}"))?;
             self.pipeline.append_step(writer, tail);
         }

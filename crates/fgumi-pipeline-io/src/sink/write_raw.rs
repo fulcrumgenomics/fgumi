@@ -51,12 +51,15 @@ pub struct WriteRawFile<B> {
     /// plain output; the 28-byte BGZF EOF marker for BGZF output so the `.gz`
     /// stream is a complete, non-truncated BGZF file.
     trailer: &'static [u8],
+    /// Bytes written once, before anything else, when the sink first runs (see
+    /// [`Self::with_leader`]). Empty once written, or when there is none.
+    leader: Vec<u8>,
     _marker: std::marker::PhantomData<fn(B)>,
 }
 
 impl<B> WriteRawFile<B> {
     /// Open `path` for writing, appending `trailer` once after the final block
-    /// on clean completion. No header is written.
+    /// on clean completion. No header is written (see [`Self::with_leader`]).
     ///
     /// Opens through [`open_output_sink`], as `WriteBgzfFile` does through
     /// `open_output_writer`: `-` and `/dev/stdout` select a block-buffered
@@ -74,8 +77,20 @@ impl<B> WriteRawFile<B> {
         Ok(Self {
             state: Mutex::new(Some(BufWriter::with_capacity(256 * 1024, inner))),
             trailer,
+            leader: Vec::new(),
             _marker: std::marker::PhantomData,
         })
+    }
+
+    /// Write `leader` to the output before any block, e.g. a text header that
+    /// must appear even when no block carries a byte. `leader` must already be
+    /// in the stream's encoding (BGZF-compressed for a BGZF stream). It is
+    /// written when the sink first runs, not here, so a pipeline that fails to
+    /// build never writes it.
+    #[must_use]
+    pub fn with_leader(mut self, leader: &[u8]) -> Self {
+        self.leader = leader.to_vec();
+        self
     }
 }
 
@@ -102,6 +117,12 @@ impl<B: RawBytesBlock> Step for WriteRawFile<B> {
         let Some(out) = guard.as_mut() else {
             return Ok(StepOutcome::Finished);
         };
+        // The leader goes first, whatever follows (blocks, or only the end of
+        // the stream).
+        if !self.leader.is_empty() {
+            let leader = std::mem::take(&mut self.leader);
+            external_wait(|| out.write_all(&leader))?;
+        }
 
         if let Some(block) = ctx.input.pop() {
             // A write to a full pipe blocks until the reader drains it: an
@@ -191,6 +212,21 @@ mod tests {
         out.write_all(b"@r\nACGT\n+\nIIII\n").unwrap();
         finish_stream(out, b"").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"@r\nACGT\n+\nIIII\n");
+    }
+
+    /// The leader is held until the sink runs: building a sink (here, then
+    /// dropping it unrun, as a failed pipeline build would) writes nothing.
+    /// That it precedes every block, and is written with no block at all, is
+    /// covered end to end by the `fgumi fastq --format sam` tests.
+    #[test]
+    fn with_leader_defers_the_leader_until_the_sink_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.sam");
+        let sink =
+            WriteRawFile::<DecompressedBlock>::new(&path, b"").unwrap().with_leader(b"@HD\n");
+        assert_eq!(sink.leader, b"@HD\n");
+        drop(sink);
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "an unrun sink writes no leader");
     }
 
     #[test]

@@ -34,6 +34,7 @@ use fgumi_cli_macros::multi_options;
 use fgumi_consensus::MethylationMode;
 
 use crate::commands::common::{EM_SEQ_MODE_NAME, TAPS_MODE_NAME};
+use crate::commands::fastq::UnalignedReadFormat;
 
 mod scoring;
 pub(crate) use scoring::{BwaScoring, command_passes_meth};
@@ -1157,7 +1158,8 @@ pub struct AlignerOptions {
 
     /// Free-form aligner command template. Supports `{ref}` and
     /// `{threads}` placeholders. Mutually exclusive with
-    /// `--aligner::preset` and every other `--aligner::*` flag.
+    /// `--aligner::preset` and every other `--aligner::*` flag except
+    /// `--aligner::chunk-size` and `--aligner::input-format`.
     #[arg(long = "command")]
     pub command: Option<String>,
 
@@ -1190,6 +1192,14 @@ pub struct AlignerOptions {
     #[arg(long = "dedup-reads", value_enum)]
     pub dedup_reads: Option<DedupReads>,
 
+    /// Format of the unaligned reads written to the aligner's stdin: `fastq`
+    /// (interleaved FASTQ) or `sam` (unaligned SAM: an `@HD` line, then one
+    /// record per read with FLAG 77 for R1, 141 for R2 and 4 for an unpaired
+    /// read, no tags), for aligners that read SAM input. Only valid with
+    /// `--aligner::command`; the presets read FASTQ and reject
+    /// `--aligner::input-format sam`. [default: fastq]
+    #[arg(long = "input-format", value_enum)]
+    pub input_format: Option<UnalignedReadFormat>,
     /// Most memory the unmapped reads sent to the aligner but not yet returned
     /// by it may take, for an aligner that reads further ahead before its first
     /// output than `--aligner::chunk-size` provides for. fgumi then admits more
@@ -1228,6 +1238,7 @@ impl Default for AlignerOptions {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            input_format: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         }
@@ -1263,6 +1274,9 @@ pub(crate) enum ResolvedBackend {
         /// instead, because the same shape from an aligner that never pairs
         /// would otherwise split every pair silently.
         accept_mid_pair_split: bool,
+        /// Format of the reads written to the aligner's stdin
+        /// (`--aligner::input-format`). Always FASTQ for the presets.
+        input_format: UnalignedReadFormat,
         /// `--aligner::max-read-ahead`: the ceiling the in-flight budget may
         /// grow to, or `None` for the default. An explicit value below the
         /// budget `--aligner::chunk-size` derives also lowers the budget.
@@ -1453,6 +1467,17 @@ impl AlignerOptions {
                  it bounds the input fgumi holds for a subprocess aligner"
             );
         }
+        // `--aligner::input-format sam` changes what is written to an aligner
+        // subprocess's stdin; every preset aligns FASTQ (bwa/bwa-mem3 `mem -p`,
+        // or in process), so only command mode may ask for SAM.
+        if self.input_format == Some(UnalignedReadFormat::Sam)
+            && let Some(preset) = self.preset
+        {
+            bail!(
+                "--aligner::input-format sam is only valid with --aligner::command; \
+                 --aligner::preset {preset} reads FASTQ"
+            );
+        }
         Ok(())
     }
 
@@ -1478,6 +1503,7 @@ impl AlignerOptions {
     ///   `MAX_SUB_BATCH_TEMPLATES`.
     /// - `--aligner::dedup-reads` set with any preset other than
     ///   `bwa-mem3-inproc`, or with command mode.
+    /// - `--aligner::input-format sam` with any preset.
     /// - `--aligner::max-read-ahead` set with `bwa-mem3-inproc`.
     /// - Command mode + a preset-only flag (`--aligner-bin` or
     ///   `--aligner::threads`).
@@ -1567,6 +1593,7 @@ impl AlignerOptions {
                     backend: ResolvedBackend::Subprocess {
                         command,
                         accept_mid_pair_split: true,
+                        input_format: UnalignedReadFormat::Fastq,
                         max_read_ahead: self.max_read_ahead,
                     },
                     chunk_size: self.chunk_size,
@@ -1606,6 +1633,7 @@ impl AlignerOptions {
                     backend: ResolvedBackend::Subprocess {
                         command,
                         accept_mid_pair_split: false,
+                        input_format: self.input_format.unwrap_or_default(),
                         max_read_ahead: self.max_read_ahead,
                     },
                     chunk_size: self.chunk_size,
@@ -2079,6 +2107,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            input_format: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2089,6 +2118,79 @@ mod tests {
         assert!(command.contains(&ref_path.display().to_string()));
         assert!(command.contains("-t 4"));
         assert!(matches!(resolved.mode, ResolvedAlignerMode::Command));
+    }
+
+    /// `--aligner::input-format` reaches the subprocess backend in command mode,
+    /// defaulting to FASTQ.
+    #[rstest]
+    #[case::unset(None, UnalignedReadFormat::Fastq)]
+    #[case::fastq(Some(UnalignedReadFormat::Fastq), UnalignedReadFormat::Fastq)]
+    #[case::sam(Some(UnalignedReadFormat::Sam), UnalignedReadFormat::Sam)]
+    fn test_resolve_command_mode_carries_input_format(
+        #[case] input_format: Option<UnalignedReadFormat>,
+        #[case] expected: UnalignedReadFormat,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions {
+            command: Some("aligner {ref}".to_string()),
+            input_format,
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, None).unwrap();
+        let ResolvedBackend::Subprocess { input_format, .. } = resolved.backend else {
+            panic!("command mode must resolve to ResolvedBackend::Subprocess");
+        };
+        assert_eq!(input_format, expected);
+    }
+
+    /// `--aligner::input-format sam` is rejected with every preset (they read
+    /// FASTQ), before the preset's index or binary is looked for.
+    #[rstest]
+    #[case::bwa(AlignerPreset::Bwa)]
+    #[case::bwa_mem3(AlignerPreset::BwaMem3)]
+    #[case::bwa_mem3_inproc(AlignerPreset::BwaMem3InProc)]
+    fn test_resolve_rejects_sam_input_format_with_preset(#[case] preset: AlignerPreset) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        let opts = AlignerOptions {
+            preset: Some(preset),
+            input_format: Some(UnalignedReadFormat::Sam),
+            ..AlignerOptions::default()
+        };
+        let msg = opts.resolve(&ref_path, 4, None).unwrap_err().to_string();
+        assert!(
+            msg.contains("--aligner::input-format sam is only valid with --aligner::command")
+                && msg.contains(&format!("--aligner::preset {preset}")),
+            "got: {msg}"
+        );
+    }
+
+    /// An explicit `--aligner::input-format fastq` is accepted with every
+    /// subprocess preset: it names the format the presets already read.
+    #[rstest]
+    #[case::bwa(AlignerPreset::Bwa)]
+    #[case::bwa_mem3(AlignerPreset::BwaMem3)]
+    fn test_resolve_accepts_fastq_input_format_with_preset(#[case] preset: AlignerPreset) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ref_path = tmp.path().join("ref.fa");
+        std::fs::write(&ref_path, b">chr1\nACGT\n").unwrap();
+        for ext in preset.index_extensions() {
+            std::fs::write(append_extension(&ref_path, ext), b"x").unwrap();
+        }
+        let bin = make_existing_binary(tmp.path());
+        let opts = AlignerOptions {
+            preset: Some(preset),
+            input_format: Some(UnalignedReadFormat::Fastq),
+            ..AlignerOptions::default()
+        };
+        let resolved = opts.resolve(&ref_path, 4, Some(&bin)).unwrap();
+        let ResolvedBackend::Subprocess { input_format, .. } = resolved.backend else {
+            panic!("expected the subprocess backend");
+        };
+        assert_eq!(input_format, UnalignedReadFormat::Fastq);
     }
 
     /// `resolve` rejects `--aligner-bin` with command mode.
@@ -2106,6 +2208,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            input_format: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2450,12 +2553,14 @@ mod tests {
         let ResolvedBackend::Subprocess {
             command,
             accept_mid_pair_split,
+            input_format,
             max_read_ahead: resolved_max,
         } = resolved.backend
         else {
             panic!("a subprocess preset must resolve to ResolvedBackend::Subprocess");
         };
         assert!(accept_mid_pair_split, "preset mode must accept bwa's mid-pair split");
+        assert_eq!(input_format, UnalignedReadFormat::Fastq, "presets read FASTQ");
         assert_eq!(resolved_max, max_read_ahead, "--aligner::max-read-ahead reaches the preset");
         assert!(command.starts_with(&bin.display().to_string()), "got: {command}");
     }
@@ -2495,6 +2600,7 @@ mod tests {
             backend: ResolvedBackend::Subprocess {
                 command: command.to_string(),
                 accept_mid_pair_split: true,
+                input_format: UnalignedReadFormat::Fastq,
                 max_read_ahead: None,
             },
             chunk_size: 10,
@@ -2745,6 +2851,7 @@ mod tests {
             chunk_size: 0,
             sub_batch_templates: None,
             dedup_reads: None,
+            input_format: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2772,6 +2879,7 @@ mod tests {
             chunk_size: DEFAULT_ALIGNER_CHUNK_SIZE,
             sub_batch_templates: None,
             dedup_reads: None,
+            input_format: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };

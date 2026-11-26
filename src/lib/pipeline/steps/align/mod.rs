@@ -290,14 +290,18 @@ pub(crate) trait AlignBackend: Send + 'static {
 /// `aligner` module does not depend on the pipeline's align stage.
 pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
     match resolved.backend {
-        ResolvedBackend::Subprocess { command, accept_mid_pair_split, max_read_ahead } => {
-            Box::new(subprocess::SubprocessBackend {
-                command,
-                chunk_size: resolved.chunk_size,
-                accept_mid_pair_split,
-                max_read_ahead,
-            })
-        }
+        ResolvedBackend::Subprocess {
+            command,
+            accept_mid_pair_split,
+            input_format,
+            max_read_ahead,
+        } => Box::new(subprocess::SubprocessBackend {
+            command,
+            chunk_size: resolved.chunk_size,
+            accept_mid_pair_split,
+            input_format,
+            max_read_ahead,
+        }),
         #[cfg(feature = "aligner-bwa-mem3")]
         ResolvedBackend::InProcessBwaMem3 {
             reference,
@@ -628,6 +632,7 @@ mod tests {
         ResolvedBackend::Subprocess {
             command: command.to_string(),
             accept_mid_pair_split: true,
+            input_format: crate::commands::fastq::UnalignedReadFormat::Fastq,
             max_read_ahead: None,
         }
     }
