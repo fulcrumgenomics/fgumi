@@ -1555,14 +1555,21 @@ fn extract_to_zipper_writes_correct_rejects_like_self_pair() {
 /// Writes a *mapped* replay BAM for an `extract→correct→align` chain over
 /// `(r1, r2)`, plus the standalone `extract | correct` kept BAM it pairs with.
 ///
-/// Every template becomes R1 forward at `100 + 40·t`, R2 reverse at `2000 +
-/// 40·t`, and a supplementary copy of R1 at `3000`, each with SEQ copied from
-/// `sequence` so the replay is valid aligner output. This gives every
-/// `--zipper::*` merge rule something to change: tags on a reverse-strand read
-/// for reverse/revcomp and a supplementary read for `tc`. Returns
-/// `(kept, replay)`.
+/// Template `t` is placed at slot `s = slot_of(t)`: R1 forward at `100 + 40·s`,
+/// R2 reverse at `2000 + 40·s`, and a supplementary copy of R1 at `3000`, each
+/// with SEQ copied from `sequence` so the replay is valid aligner output. This
+/// gives every `--zipper::*` merge rule something to change: tags on a
+/// reverse-strand read for reverse/revcomp and a supplementary read for `tc`.
+/// A `slot_of` that maps several templates to one slot places them at the same
+/// coordinates, giving dedup duplicates to mark. Returns `(kept, replay)`.
 #[cfg(feature = "simulate")]
-fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> (PathBuf, PathBuf) {
+fn write_mapped_replay_bam(
+    dir: &Path,
+    r1: &Path,
+    r2: &Path,
+    sequence: &str,
+    slot_of: fn(usize) -> usize,
+) -> (PathBuf, PathBuf) {
     use noodles::core::Position;
     use noodles::sam::alignment::io::Write as _;
     use noodles::sam::alignment::record::Flags;
@@ -1601,8 +1608,9 @@ fn write_mapped_replay_bam(dir: &Path, r1: &Path, r2: &Path, sequence: &str) -> 
     writer.write_header(&header).unwrap();
     for (t, pair) in records.chunks(2).enumerate() {
         let [first, second] = pair else { panic!("kept BAM must hold R1/R2 pairs") };
-        let r1_pos = 100 + 40 * t;
-        let r2_pos = 2000 + 40 * t;
+        let slot = slot_of(t);
+        let r1_pos = 100 + 40 * slot;
+        let r2_pos = 2000 + 40 * slot;
         let paired = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
         let r1_flags = paired | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED;
         let r2_flags = paired | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
@@ -1639,6 +1647,12 @@ struct MappedReplay {
 #[cfg(feature = "simulate")]
 impl MappedReplay {
     fn new(dir: &Path) -> Self {
+        Self::with_slots(dir, |t| t)
+    }
+
+    /// [`Self::new`], placing template `t` at slot `slot_of(t)` (see
+    /// [`write_mapped_replay_bam`]).
+    fn with_slots(dir: &Path, slot_of: fn(usize) -> usize) -> Self {
         const REFERENCE_LEN: usize = 4000;
         let (reference, sequence) = write_unique_reference(dir, REFERENCE_LEN);
         let (r1, r2) = write_duplex_umi_fastq(
@@ -1646,7 +1660,7 @@ impl MappedReplay {
             &sequence,
             &[(500, "AAAA", "CCCC"), (2000, "GGGG", "TTTT")],
         );
-        let (kept, replay) = write_mapped_replay_bam(dir, &r1, &r2, &sequence);
+        let (kept, replay) = write_mapped_replay_bam(dir, &r1, &r2, &sequence, slot_of);
         let aligner_cmd = format!(
             "{} simulate aligner --replay-bam {} {{ref}}",
             env!("CARGO_BIN_EXE_fgumi"),
@@ -1826,6 +1840,496 @@ fn fused_chain_warns_exclude_missing_reads_is_inert() {
     let stderr = fixture.run_chain(false, &with, &["--exclude-missing-reads"]);
     assert!(stderr.contains(WARNING), "expected the inert-flag warning, got:\n{stderr}");
     assert_bams_record_equivalent_nonempty(&with, &without);
+}
+
+// ══════════════════════════ dedup stage ══════════════════════════
+
+/// The dedup metrics outputs a run writes into `dir` under `tag`, in the order
+/// [`dedup_metrics_flags`] names them.
+fn dedup_metrics_paths(dir: &Path, tag: &str) -> [PathBuf; 3] {
+    [
+        dir.join(format!("{tag}.dedup_metrics.txt")),
+        dir.join(format!("{tag}.family_sizes.txt")),
+        dir.join(format!("{tag}.ladder.txt")),
+    ]
+}
+
+/// The metrics flags (in standalone `fgumi dedup` spelling, `prefix` empty, or
+/// runall's `--dedup::` spelling) writing [`dedup_metrics_paths`].
+fn dedup_metrics_flags(prefix: &str, paths: &[PathBuf; 3]) -> Vec<String> {
+    let [metrics, histogram, ladder] = paths;
+    [
+        ("metrics", p(metrics)),
+        ("family-size-histogram", p(histogram)),
+        ("duplication-ladder", p(ladder)),
+        // A one-template interval snapshots after every template, so the ladder
+        // records the whole coordinate-order stream.
+        ("ladder-interval", "1"),
+    ]
+    .into_iter()
+    .flat_map(|(flag, value)| [format!("--{prefix}{flag}"), value.to_string()])
+    .collect()
+}
+
+/// Asserts each runall dedup metrics file is byte-identical to the standalone one.
+fn assert_dedup_metrics_identical(runall: &[PathBuf; 3], staged: &[PathBuf; 3]) {
+    for (runall, staged) in runall.iter().zip(staged) {
+        let runall_text = std::fs::read_to_string(runall).expect("read runall dedup metrics");
+        assert!(!runall_text.trim().is_empty(), "{} is empty", runall.display());
+        assert_eq!(
+            runall_text,
+            std::fs::read_to_string(staged).expect("read standalone dedup metrics"),
+            "dedup metrics differ between {} and {}",
+            runall.display(),
+            staged.display()
+        );
+    }
+}
+
+/// Asserts a dedup output marked (0x400) at least one record, so a parity check
+/// cannot pass on a fixture with nothing to deduplicate.
+fn assert_marks_duplicates(path: &Path) {
+    let (_, records) = read_bam_output(path);
+    assert!(
+        records.iter().any(|r| r.flags().is_duplicate()),
+        "{} marks no duplicates; the fixture must give dedup work to do",
+        path.display()
+    );
+}
+
+/// `runall --start-from <X> --stop-after dedup` must be record-identical (and
+/// header-identical, `@PG` aside) to the standalone chain ending in `fgumi
+/// dedup`, with byte-identical metrics, family-size histogram and duplication
+/// ladder, for every start that can reach dedup: from `extract`, `correct` and
+/// `align` (through the replay aligner and the fused merge), `zipper`, `sort`
+/// (each fusing sort → dedup in memory), and `dedup` itself.
+///
+/// Every start is compared against the same staged oracle, `fgumi zipper` over
+/// the replayed aligner output → `fgumi sort` → `fgumi dedup`: the fused align
+/// stage's merge is already pinned to standalone zipper by
+/// `fused_chain_honors_zipper_merge_flags`. The replay places pairs of templates
+/// at the same coordinates, so dedup has duplicates to mark.
+#[cfg(feature = "simulate")]
+#[rstest::rstest]
+#[case::extract("extract")]
+#[case::correct("correct")]
+#[case::align("align")]
+#[case::zipper("zipper")]
+#[case::sort("sort")]
+#[case::dedup("dedup")]
+fn dedup_stop_matches_staged_chain(#[case] start_from: &str) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let fixture = MappedReplay::with_slots(dir, |t| t % 2);
+    let (reference, _, _, aligner_cmd) = &fixture.chain;
+
+    // The staged oracle: zipper → sort → dedup.
+    let zipped = dir.join("staged_zipped.bam");
+    fixture.run_standalone(&zipped, &[]);
+    let sorted = dir.join("staged_sorted.bam");
+    run_ok(["sort", "-i", p(&zipped), "-o", p(&sorted)], "staged sort");
+    let staged_out = dir.join("staged.bam");
+    let staged_metrics = dedup_metrics_paths(dir, "staged");
+    let mut staged_args: Vec<String> =
+        ["dedup", "-i", p(&sorted), "-o", p(&staged_out)].map(str::to_string).into();
+    staged_args.extend(dedup_metrics_flags("", &staged_metrics));
+    run_ok(&staged_args, "staged dedup");
+    assert_marks_duplicates(&staged_out);
+
+    // The fused run, reading the input its start stage expects.
+    let extracted = dir.join("replay_extracted.bam");
+    let mut args: Vec<&str> = match start_from {
+        "extract" => correct_chain_args("dedup", &fixture.chain),
+        "correct" => vec![
+            "runall",
+            "--start-from",
+            "correct",
+            "--stop-after",
+            "dedup",
+            "-i",
+            p(&extracted),
+            "--correct::umis",
+            "AAAA",
+            "--correct::umis",
+            "CCCC",
+            "--correct::min-distance",
+            "1",
+            "--ref",
+            p(reference),
+            "--aligner::command",
+            aligner_cmd,
+        ],
+        "align" => vec![
+            "runall",
+            "--start-from",
+            "align",
+            "--stop-after",
+            "dedup",
+            "-i",
+            p(&fixture.kept),
+            "--ref",
+            p(reference),
+            "--aligner::command",
+            aligner_cmd,
+        ],
+        "zipper" => vec![
+            "runall",
+            "--start-from",
+            "zipper",
+            "--stop-after",
+            "dedup",
+            "-i",
+            p(&fixture.replay),
+            "--unmapped",
+            p(&fixture.kept),
+            "--ref",
+            p(reference),
+        ],
+        "sort" => vec!["runall", "--start-from", "sort", "--stop-after", "dedup", "-i", p(&zipped)],
+        "dedup" => {
+            vec!["runall", "--start-from", "dedup", "--stop-after", "dedup", "-i", p(&sorted)]
+        }
+        other => panic!("no dedup chain for --start-from {other}"),
+    };
+    let runall_out = dir.join("runall.bam");
+    let runall_metrics = dedup_metrics_paths(dir, "runall");
+    let metrics_flags = dedup_metrics_flags("dedup::", &runall_metrics);
+    args.extend(metrics_flags.iter().map(String::as_str));
+    args.extend(["-o", p(&runall_out)]);
+    run_ok(&args, &format!("runall --start-from {start_from} --stop-after dedup"));
+
+    assert_bams_record_equivalent_nonempty(&runall_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&runall_out, &staged_out);
+    assert_dedup_metrics_identical(&runall_metrics, &staged_metrics);
+}
+
+/// An unsorted single-end fixture for the `--dedup::*` option tests: at one
+/// position, a 3-read `ACGT` family, a 2-read `ACGA` family one edit away
+/// (merged by the default adjacency strategy, kept apart by identity or
+/// `--edits 0`), and a 2-read `TTAA` family no UMI strategy merges with them
+/// (merged only by `--no-umi`); plus a 2-read `GGCC` family elsewhere and one
+/// unmapped read (dropped unless `--include-unmapped`) — written out of
+/// template-coordinate order so the fused sort has work to do.
+fn dedup_options_bam(dir: &Path) -> PathBuf {
+    let header = create_minimal_header("chr1", 10_000);
+    let mut records = Vec::new();
+    records.push({
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(b"unmapped_0")
+            .flags(fgumi_raw_bam::flags::UNMAPPED)
+            .sequence(b"ACGTACGTACGT")
+            .qualities(&[30; 12]);
+        b.add_string_tag(fgumi_lib::sam::SamTag::RX, b"CCGG");
+        b.build()
+    });
+    records.extend(create_umi_family_at_pos("GGCC", 2, "fam_c", "GGCCGGCCGGCC", 30, 800));
+    records.extend(create_umi_family_at_pos("ACGT", 3, "fam_a", "ACGTACGTACGT", 30, 200));
+    records.extend(create_umi_family_at_pos("ACGA", 2, "fam_b", "ACGTACGTACGT", 25, 200));
+    records.extend(create_umi_family_at_pos("TTAA", 2, "fam_d", "ACGTACGTACGT", 20, 200));
+    let path = dir.join("dedup_options.bam");
+    write_bam(&path, &header, &records);
+    path
+}
+
+/// Runtime-added libraries must participate in sort order and position grouping.
+/// An unmapped RG, when present, must still win over the aligner's RG.
+#[cfg(feature = "simulate")]
+#[rstest::rstest]
+#[case::dedup_runtime_libraries("dedup", false)]
+#[case::dedup_mixed_libraries("dedup", true)]
+#[case::group_runtime_libraries("group", false)]
+#[case::group_mixed_libraries("group", true)]
+#[case::sort_runtime_libraries("sort", false)]
+fn align_runtime_libraries_match_standalone(#[case] stop: &str, #[case] known_library: bool) {
+    use fgumi_raw_bam::{SamBuilder, SamTag};
+    use noodles::sam::header::record::value::map::read_group::tag;
+    use noodles::sam::header::record::value::{Map, map::ReadGroup};
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let (reference, _) = write_unique_reference(dir, 4000);
+    // Header insertion order intentionally differs from lexical library order.
+    let mut mapped_header = create_minimal_header("chr1", 4000);
+    mapped_header.read_groups_mut().clear();
+    for (id, library) in [("B", "Zlib"), ("A", "Alib")] {
+        mapped_header.read_groups_mut().insert(
+            id.into(),
+            Map::<ReadGroup>::builder()
+                .insert(tag::LIBRARY, library)
+                .insert(tag::SAMPLE, "sample")
+                .build()
+                .unwrap(),
+        );
+    }
+    let mut unmapped_header = noodles::sam::Header::default();
+    if known_library {
+        unmapped_header
+            .read_groups_mut()
+            .insert("B".into(), mapped_header.read_groups()[&bstr::BString::from("B")].clone());
+    }
+    let mut unmapped_records = Vec::new();
+    let mut mapped_records = Vec::new();
+    for t in 0..6u8 {
+        for second in [false, true] {
+            let name = format!("template_{t}");
+            let mut unmapped = SamBuilder::new();
+            unmapped
+                .read_name(name.as_bytes())
+                .flags(if second { 141 } else { 77 })
+                .sequence(b"ACGTACGTACGT")
+                .qualities(&[40 - t; 12]);
+            unmapped.add_string_tag(SamTag::RX, b"AAAA");
+            if known_library && t % 2 == 0 {
+                unmapped.add_string_tag(SamTag::RG, b"B");
+            }
+            unmapped_records.push(unmapped.build());
+            let mut mapped = SamBuilder::new();
+            mapped
+                .read_name(name.as_bytes())
+                .flags(if second { 147 } else { 99 })
+                .ref_id(0)
+                .pos(if second { 200 } else { 100 })
+                .mate_ref_id(0)
+                .mate_pos(if second { 100 } else { 200 })
+                .cigar_ops(&[12 << 4])
+                .mapq(60)
+                .sequence(b"ACGTACGTACGT")
+                .qualities(&[40 - t; 12]);
+            mapped
+                .add_string_tag(SamTag::RG, if !known_library && t % 2 == 0 { b"B" } else { b"A" });
+            mapped_records.push(mapped.build());
+        }
+    }
+    let unmapped = dir.join("unmapped.bam");
+    let replay = dir.join("replay.bam");
+    write_bam(&unmapped, &unmapped_header, &unmapped_records);
+    write_bam(&replay, &mapped_header, &mapped_records);
+    let zipped = dir.join("zipped.bam");
+    run_ok(
+        ["zipper", "-i", p(&replay), "-u", p(&unmapped), "-r", p(&reference), "-o", p(&zipped)],
+        "standalone zipper",
+    );
+    let sorted = dir.join("sorted.bam");
+    run_ok(["sort", "-i", p(&zipped), "-o", p(&sorted)], "standalone sort");
+    let staged = dir.join("staged.bam");
+    let fused = dir.join("fused.bam");
+    let staged_metrics = dedup_metrics_paths(dir, "staged");
+    let fused_metrics = dedup_metrics_paths(dir, "fused");
+    if stop != "sort" {
+        let mut args: Vec<String> =
+            [stop, "-i", p(&sorted), "-o", p(&staged), "--verify"].map(str::to_string).into();
+        if stop == "dedup" {
+            args.push("--remove-duplicates".into());
+            args.extend(dedup_metrics_flags("", &staged_metrics));
+        }
+        if stop == "group" {
+            args.extend(["--strategy".into(), "identity".into()]);
+        }
+        run_ok(args, "standalone grouping");
+    }
+    let command = format!(
+        "{} simulate aligner --replay-bam {} {{ref}}",
+        env!("CARGO_BIN_EXE_fgumi"),
+        replay.display()
+    );
+    let mut args: Vec<String> = [
+        "runall",
+        "--start-from",
+        "align",
+        "--stop-after",
+        stop,
+        "-i",
+        p(&unmapped),
+        "--ref",
+        p(&reference),
+        "--aligner::command",
+        &command,
+        "-o",
+        p(&fused),
+    ]
+    .map(str::to_string)
+    .into();
+    if stop == "dedup" {
+        args.extend(["--dedup::remove-duplicates".into(), "--dedup::verify".into()]);
+        args.extend(dedup_metrics_flags("dedup::", &fused_metrics));
+    } else if stop == "group" {
+        args.extend(["--group::verify".into(), "--group::strategy".into(), "identity".into()]);
+    }
+    run_ok(args, "fused align with runtime libraries");
+    assert_bams_record_equivalent_nonempty(&fused, if stop == "sort" { &sorted } else { &staged });
+    if stop == "dedup" {
+        let (_, records) = read_bam_output(&fused);
+        let names: std::collections::BTreeSet<_> =
+            records.iter().map(|r| r.name().unwrap().to_string()).collect();
+        assert_eq!(records.len(), 4, "one pair must survive in each library");
+        assert_eq!(names, ["template_0".to_string(), "template_1".to_string()].into());
+        assert_dedup_metrics_identical(&fused_metrics, &staged_metrics);
+    }
+}
+
+/// Each `--dedup::<flag>` must reach the fused dedup stage and change its output
+/// exactly as `fgumi dedup <flag>` does: `runall --start-from sort --stop-after
+/// dedup` with the flag is record-identical (with identical metrics) to `fgumi
+/// sort` → `fgumi dedup` with it, and (unless the flag cannot change the
+/// output, as `--verify` cannot) differs from the same run without it, so no
+/// such case can pass with the flag silently dropped.
+#[rstest::rstest]
+#[case::remove_duplicates(&["--remove-duplicates"], true)]
+#[case::strategy_identity(&["--strategy", "identity"], true)]
+#[case::no_umi(&["--no-umi"], true)]
+#[case::edits_zero(&["--edits", "0"], true)]
+#[case::include_unmapped(&["--include-unmapped"], true)]
+#[case::verify(&["--verify"], false)]
+fn dedup_options_reach_the_fused_stage(#[case] flags: &[&str], #[case] changes_output: bool) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let fixture = dedup_options_bam(dir);
+    let sorted = dir.join("sorted.bam");
+    run_ok(["sort", "-i", p(&fixture), "-o", p(&sorted)], "staged sort");
+
+    let run_runall = |tag: &str, flags: &[&str]| {
+        let out = dir.join(format!("runall_{tag}.bam"));
+        let metrics = dir.join(format!("runall_{tag}.metrics.txt"));
+        let mut args = vec![
+            "runall".to_string(),
+            "--start-from".to_string(),
+            "sort".to_string(),
+            "--stop-after".to_string(),
+            "dedup".to_string(),
+            "-i".to_string(),
+            p(&fixture).to_string(),
+            "-o".to_string(),
+            p(&out).to_string(),
+            "--dedup::metrics".to_string(),
+            p(&metrics).to_string(),
+        ];
+        args.extend(flags.iter().map(|a| {
+            a.strip_prefix("--").map_or_else(|| (*a).to_string(), |f| format!("--dedup::{f}"))
+        }));
+        run_ok(&args, &format!("runall sort->dedup {flags:?}"));
+        (out, metrics)
+    };
+    let run_staged = |flags: &[&str]| {
+        let out = dir.join("staged.bam");
+        let metrics = dir.join("staged.metrics.txt");
+        let mut args = vec!["dedup", "-i", p(&sorted), "-o", p(&out), "--metrics", p(&metrics)];
+        args.extend_from_slice(flags);
+        run_ok(args, &format!("standalone dedup {flags:?}"));
+        (out, metrics)
+    };
+
+    let (default_out, _) = run_runall("default", &[]);
+    assert_marks_duplicates(&default_out);
+    let (flagged_out, flagged_metrics) = run_runall("flagged", flags);
+    let (staged_out, staged_metrics) = run_staged(flags);
+
+    assert_bams_record_equivalent_nonempty(&flagged_out, &staged_out);
+    assert_bam_headers_equivalent_ignoring_pg(&flagged_out, &staged_out);
+    assert_eq!(
+        std::fs::read_to_string(&flagged_metrics).unwrap(),
+        std::fs::read_to_string(&staged_metrics).unwrap(),
+        "dedup metrics differ for {flags:?}"
+    );
+    let (_, default_records) = read_bam_output(&default_out);
+    let (_, flagged_records) = read_bam_output(&flagged_out);
+    if changes_output {
+        assert_ne!(
+            default_records, flagged_records,
+            "{flags:?} must change the fused dedup stage's output on this fixture"
+        );
+    } else {
+        assert_eq!(default_records, flagged_records, "{flags:?} must not change the output");
+    }
+}
+
+/// `--consensus` on a dedup chain is ignored with a warning: the run succeeds
+/// and writes exactly what it writes without `--consensus`.
+#[test]
+fn dedup_chain_ignores_consensus_with_a_warning() {
+    let tmp = TempDir::new().unwrap();
+    let input = sorted_bam(tmp.path());
+    let run = |tag: &str, extra: &[&str]| {
+        let out = tmp.path().join(format!("{tag}.bam"));
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args(["runall", "--start-from", "dedup", "--stop-after", "dedup"])
+            .args(["-i", p(&input), "-o", p(&out)])
+            .args(extra)
+            .output()
+            .expect("spawn fgumi");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "runall {tag} failed:\n{stderr}");
+        (out, stderr)
+    };
+    let (plain_out, plain_stderr) = run("plain", &[]);
+    let (consensus_out, consensus_stderr) = run("consensus", &["--consensus", "simplex"]);
+    assert!(
+        consensus_stderr.contains("--consensus simplex has no effect with --stop-after dedup"),
+        "{consensus_stderr}"
+    );
+    assert!(!plain_stderr.contains("has no effect"), "{plain_stderr}");
+    assert_bams_record_equivalent_nonempty(&consensus_out, &plain_out);
+}
+
+/// Chains that cross from the dedup branch to the group → consensus → filter
+/// branch (or the reverse), or that pair dedup with consensus-only options,
+/// are rejected before any input is read, naming the rule.
+#[rstest::rstest]
+#[case::group_to_dedup(&["--start-from", "group", "--stop-after", "dedup"], "dedup is an alternative")]
+#[case::consensus_to_dedup(
+    &["--start-from", "consensus", "--stop-after", "dedup", "--consensus", "simplex"],
+    "dedup is an alternative"
+)]
+#[case::filter_to_dedup(&["--start-from", "filter", "--stop-after", "dedup"], "dedup is an alternative")]
+#[case::dedup_to_group(&["--start-from", "dedup", "--stop-after", "group"], "dedup is an alternative")]
+#[case::dedup_to_consensus(
+    &["--start-from", "dedup", "--stop-after", "consensus", "--consensus", "simplex"],
+    "dedup is an alternative"
+)]
+#[case::dedup_to_filter(&["--start-from", "dedup", "--stop-after", "filter"], "dedup is an alternative")]
+#[case::dedup_to_sort(&["--start-from", "dedup", "--stop-after", "sort"], "--start-from dedup comes after")]
+#[case::realign(
+    &["--start-from", "sort", "--stop-after", "dedup", "--realign"],
+    "requires a run that ends at consensus or filter"
+)]
+#[case::no_umi_with_paired(
+    &["--start-from", "sort", "--stop-after", "dedup", "--dedup::no-umi", "--dedup::strategy", "paired"],
+    "--no-umi cannot be used with --strategy paired"
+)]
+fn invalid_dedup_chains_are_rejected(#[case] chain: &[&str], #[case] needle: &str) {
+    let tmp = TempDir::new().unwrap();
+    let input = sorted_bam(tmp.path());
+    let output = tmp.path().join("out.bam");
+    let mut args = vec!["runall"];
+    args.extend_from_slice(chain);
+    args.extend(["-i", p(&input), "-o", p(&output)]);
+    assert_rejected_with(args, needle, &format!("{chain:?}"));
+    assert!(!output.exists(), "{chain:?} must fail before writing {}", output.display());
+}
+
+/// A runall dedup output must not collide with a `--dedup::*` metrics path.
+#[test]
+fn dedup_metrics_colliding_with_output_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let input = sorted_bam(tmp.path());
+    let output = tmp.path().join("out.bam");
+    assert_rejected_with(
+        [
+            "runall",
+            "--start-from",
+            "dedup",
+            "--stop-after",
+            "dedup",
+            "-i",
+            p(&input),
+            "-o",
+            p(&output),
+            "--dedup::metrics",
+            p(&output),
+        ],
+        "--output and --dedup::metrics both write to",
+        "dedup metrics colliding with --output",
+    );
+    assert!(!output.exists(), "a refused run must not create the output");
 }
 
 /// `--zipper::restore-unconverted-bases` (v0.7.0 and earlier) was removed: a chain that

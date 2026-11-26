@@ -1879,7 +1879,9 @@ impl<'a> ChainBuilder<'a> {
     /// calls it before any stage replaces the header; the consensus stages call
     /// it *after* `self.header` has been replaced with the consensus output
     /// header (the records being decoded are consensus output records). Do not
-    /// hoist a call above a `self.header = …` reassignment.
+    /// hoist a call above a `self.header = …` reassignment. After a fused align,
+    /// this is only a build-time fallback: the sort's `DecodeFromRecords` must
+    /// resolve its library index from `pending_header_handle` at runtime.
     ///
     /// [`GroupKeyConfig`]: fgumi_bam_io::GroupKeyConfig
     fn bam_group_key_config(&self) -> Result<fgumi_bam_io::GroupKeyConfig> {
@@ -1921,8 +1923,8 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// Used only to gate the UMI-position cache in [`Self::bam_group_key_config`]
     /// (see its doc comment); a chain has at most one of `Group`/`Dedup` in
-    /// practice (`Dedup` is currently always a standalone single-stage chain),
-    /// but checking both keeps this correct if that ever changes.
+    /// practice (runall's dedup branch replaces group), but checking both keeps
+    /// this correct if that ever changes.
     fn stage_no_umi(&self) -> bool {
         self.spec.stage_opts.group.as_ref().is_some_and(|g| g.no_umi)
             || self.spec.stage_opts.dedup.as_ref().is_some_and(|d| d.no_umi)
@@ -4886,6 +4888,10 @@ impl<'a> ChainBuilder<'a> {
                         .map_err(|e| anyhow!("SortBuffer::new: {e}"))?
                         .with_affinity(affinity)
                         .with_queryname_keys(qn_keys.clone());
+                    if let Some(header) = &self.pending_header_handle {
+                        sort_buffer =
+                            sort_buffer.with_runtime_header(header.clone(), buffer_config);
+                    }
                     sort_buffer = sort_buffer
                         .with_phase_cap(phase1_cap.clone())
                         .with_range_eligibility(range_eligibility);
@@ -5145,10 +5151,12 @@ impl<'a> ChainBuilder<'a> {
                 // Branch 1: the gather jobs (see the terminal branch).
                 self.pipeline.append_step(merge_work, (merge_tail.0, BranchIdx(1)));
                 let group_key_config = self.bam_group_key_config()?;
-                let tail = self.pipeline.append_step(
-                    DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit),
-                    merge_tail,
-                );
+                let mut decode =
+                    DecodeFromRecords::new(group_key_config, self.tuning.per_step_byte_limit);
+                if let Some(header) = &self.pending_header_handle {
+                    decode = decode.with_runtime_header(header.clone());
+                }
+                let tail = self.pipeline.append_step(decode, merge_tail);
                 self.current_tail = Some(tail);
                 self.chain_tail_kind =
                     ChainTailKind::DecodedRecordBatch { closed_under_queryname: false };
@@ -5411,7 +5419,10 @@ impl<'a> ChainBuilder<'a> {
         // order as records stream through the serial step.
         let mut group_by_position = GroupByPosition::new(self.tuning.per_step_byte_limit);
         if group.verify {
-            group_by_position = group_by_position.verifying(&self.header);
+            group_by_position = match &self.pending_header_handle {
+                Some(header) => group_by_position.verifying_runtime(header.clone()),
+                None => group_by_position.verifying(&self.header),
+            };
         }
         let tail = self.pipeline.append_step(group_by_position, tail);
         let tail = self.pipeline.append_step(process_step, tail);
@@ -7548,9 +7559,11 @@ impl<'a> ChainBuilder<'a> {
     ///
     /// For [`StagePosition::Intermediate`], only the first three steps are
     /// appended; the chain tail stays as [`BatchedProcessedDedupGroups`] for
-    /// the next stage to consume. Intermediate dedup is not yet needed by any
-    /// Phase 3 runall combination; calling `add_dedup` with `Intermediate`
-    /// returns `Err` as a guard until a concrete fused path requires it.
+    /// the next stage to consume. Dedup is always terminal (standalone `fgumi
+    /// dedup`, or runall's `… → sort → dedup`, where it consumes the
+    /// intermediate sort's decoded records); calling `add_dedup` with
+    /// `Intermediate` returns `Err` as a guard until a concrete fused path
+    /// requires it.
     ///
     /// Registers a `DedupFinalizeHook` for metrics reduction + summary banner.
     /// The chain-level [`StageTimingFinalizeHook`] is registered by
@@ -7632,25 +7645,15 @@ impl<'a> ChainBuilder<'a> {
         info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
 
-        // Handle --no-umi mode: force identity strategy.
-        let (effective_strategy, no_umi_edits_override) = if dedup.no_umi {
-            if !matches!(dedup.strategy, Strategy::Identity) {
-                info!("--no-umi mode: overriding strategy to identity");
-            }
-            (Strategy::Identity, true)
-        } else {
-            (dedup.strategy, false)
-        };
+        // Handle --no-umi mode: force identity strategy (and identity forces zero edits).
+        if dedup.no_umi && !matches!(dedup.strategy, Strategy::Identity) {
+            info!("--no-umi mode: overriding strategy to identity");
+        }
+        let (effective_strategy, effective_edits) = dedup.effective_strategy_and_edits();
 
         info!("Strategy: {effective_strategy:?}");
 
         let min_mapq: u8 = dedup.min_map_q;
-        let effective_edits =
-            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
-                0
-            } else {
-                dedup.edits
-            };
 
         info!("Edits: {effective_edits}");
         info!("Remove duplicates: {}", dedup.remove_duplicates);
@@ -7730,7 +7733,10 @@ impl<'a> ChainBuilder<'a> {
         let mut group_by_position =
             GroupByPosition::with_secondary_supplementary(self.tuning.per_step_byte_limit);
         if dedup.verify {
-            group_by_position = group_by_position.verifying(&self.header);
+            group_by_position = match &self.pending_header_handle {
+                Some(header) => group_by_position.verifying_runtime(header.clone()),
+                None => group_by_position.verifying(&self.header),
+            };
         }
         let tail = self.pipeline.append_step(group_by_position, tail);
         let tail = self.pipeline.append_step(process_step, tail);
@@ -7761,6 +7767,12 @@ impl<'a> ChainBuilder<'a> {
             duplication_ladder: dedup.duplication_ladder.clone().zip(ladder_recorder),
             library_index: fgumi_bam_io::LibraryIndex::from_header(&self.header)?,
             sample: crate::commands::dedup::resolve_sample(&self.header, dedup.sample.as_deref()),
+            runtime_header: self.pending_header_handle.clone().map(|handle| {
+                crate::pipeline::chains::commands::dedup::RuntimeHeader {
+                    handle,
+                    sample_override: dedup.sample.clone(),
+                }
+            }),
             timer,
         }));
 
@@ -8449,18 +8461,15 @@ mod tests {
             stages_want_umi_cache(&[Stage::Dedup]),
             "a Dedup-only chain must enable the UMI-position cache"
         );
-        // [Sort, Dedup] is not a combination `validate_stage_progression` (and every
-        // real command's `ChainSpec`) ever produces: `Dedup` is currently always the
-        // sole stage of a standalone `fgumi dedup` chain (`ChainSpec::single_stage`),
-        // and `add_dedup` itself rejects an intermediate position. [Sort, Group] is
-        // the reachable multi-stage combination instead — `stage_ord(Sort) = 4 <=
-        // stage_ord(Group) = 5` passes `validate_stage_progression`, and `add_group`
-        // has no positional restriction — so it exercises the `.any()` finding its
-        // trigger stage past the first position on an input the validator actually
-        // permits.
+        // [Sort, Group] and runall's [Sort, Dedup] exercise the `.any()` finding its
+        // trigger stage past the first position.
         assert!(
             stages_want_umi_cache(&[Stage::Sort, Stage::Group]),
             "Group anywhere in the chain must enable the UMI-position cache"
+        );
+        assert!(
+            stages_want_umi_cache(&[Stage::Sort, Stage::Dedup]),
+            "Dedup after a fused sort must enable the UMI-position cache"
         );
         assert!(
             !stages_want_umi_cache(&[Stage::Sort]),
@@ -9912,7 +9921,7 @@ mod tests {
         let dedup = crate::commands::dedup::MarkDuplicates::try_parse_from(args)
             .expect("failed to parse dedup args");
         let mut spec = empty_spec(vec![Stage::Dedup]);
-        spec.stage_opts.dedup = Some(dedup);
+        spec.stage_opts.dedup = Some(dedup.opts);
         let builder = chain_builder_for_stages(&spec);
         assert_eq!(builder.bam_group_key_config().expect("builds").umi_tag, expected_umi_tag);
     }

@@ -33,7 +33,7 @@ pub enum Stage {
     /// records, so it does not count against the one-`Align`-per-chain rule.
     Realign,
     /// Rewrite SAM aux tags (copy/move/delete) — a pure per-record transform,
-    /// standalone-only (like `Clip`/`Dedup`/`Downsample`).
+    /// standalone-only (like `Clip`/`Downsample`).
     Retag,
     Downsample,
     /// Terminal BAM → FASTQ encode (interleaved or paired split output).
@@ -52,6 +52,14 @@ impl Stage {
     #[must_use]
     pub fn is_consensus(self) -> bool {
         matches!(self, Stage::Simplex | Stage::Duplex | Stage::Codec)
+    }
+
+    /// Returns `true` for a stage of the group → consensus → filter branch
+    /// (`Group`, a consensus stage, or `Filter`), the alternative to `Dedup`
+    /// after `Sort`.
+    #[must_use]
+    pub fn is_consensus_branch(self) -> bool {
+        matches!(self, Stage::Group | Stage::Filter) || self.is_consensus()
     }
 
     /// Returns `true` if this stage produces `BamTemplateBatch` from

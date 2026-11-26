@@ -1,10 +1,10 @@
 //! Fused multi-stage `runall` pipeline command.
 //!
 //! `runall` fuses a contiguous slice of the fgumi pipeline (extract, UMI
-//! correction, alignment + zipper-merge, sort, group, and consensus calling,
-//! optionally followed by filter) into a single in-memory chain, so every
-//! intermediate BAM a sequential run of the standalone commands would write
-//! is elided.
+//! correction, alignment + zipper-merge, sort, and then either group and
+//! consensus calling, optionally followed by filter, or UMI-aware duplicate
+//! marking with dedup) into a single in-memory chain, so every intermediate BAM
+//! a sequential run of the standalone commands would write is elided.
 //!
 //! This module currently defines the stage-selection vocabulary shared by the
 //! rest of the command: [`RunAllMode`] (which consensus algorithm to run),
@@ -57,7 +57,9 @@ impl std::fmt::Display for RunAllMode {
 /// Pipeline stage marker for the `--start-from` / `--stop-after`
 /// runall stage flags. Stages are linearly ordered:
 /// `Extract < Correct < AlignAndMerge < Zipper < Sort < Group <
-/// Consensus < Filter` (see [`RunAllStage::ord`]).
+/// Consensus < Filter` (see [`RunAllStage::ord`]), with `Dedup` an
+/// alternative terminal branch after `Sort`: a chain ends at either `Dedup`
+/// or the `Group < Consensus < Filter` branch, never both.
 ///
 /// **Stage semantics — "the input is positioned AT this stage's
 /// entry":**
@@ -156,6 +158,17 @@ pub enum RunAllStage {
     /// pipeline (`… → consensus → filter`), where the consensus output is
     /// decoded in-memory and streamed straight into filter.
     Filter,
+    /// UMI-aware duplicate marking, an alternative terminal stage after `Sort`
+    /// (a chain ends at either `dedup` or the group → consensus → filter
+    /// branch, never both). `--start-from dedup` accepts a
+    /// template-coordinate-sorted BAM (output of `fgumi sort`) via `--input`;
+    /// `--stop-after dedup` runs dedup and writes the duplicate-marked (or, with
+    /// `--dedup::remove-duplicates`, duplicate-removed) BAM, record-identical to
+    /// standalone `fgumi dedup` (with matching `@HD` `SO`/`GO`/`SS`, `@SQ`, and
+    /// `@RG`; runall's `@PG` provenance differs, and `@HD` `VN` / `@CO` are not
+    /// compared). From any upstream start (`extract`, `correct`, `align`,
+    /// `zipper`, `sort`) the sort feeds dedup in memory. Tunable via `--dedup::*`.
+    Dedup,
 }
 
 /// The subset of [`RunAllStage`] values that are valid as `--stop-after`.
@@ -192,6 +205,10 @@ pub enum StopAfter {
     /// `--stop-after filter` — post-consensus filtered BAM (same output
     /// as `fgumi filter`). Tunable via `--filter::*`.
     Filter,
+    /// `--stop-after dedup` — duplicate-marked BAM (same output as `fgumi
+    /// dedup`); the alternative to the group → consensus → filter branch.
+    /// Tunable via `--dedup::*`.
+    Dedup,
 }
 
 impl From<StopAfter> for RunAllStage {
@@ -204,6 +221,7 @@ impl From<StopAfter> for RunAllStage {
             StopAfter::Group => Self::Group,
             StopAfter::Consensus => Self::Consensus,
             StopAfter::Filter => Self::Filter,
+            StopAfter::Dedup => Self::Dedup,
         }
     }
 }
@@ -213,6 +231,11 @@ impl RunAllStage {
     /// `Correct = 1`, `AlignAndMerge = 2`, `Zipper = 3`, `Sort = 4`,
     /// `Group = 5`, `Consensus = 6`, `Filter = 7`. Used to validate that
     /// `start_from <= stop_after` and that the chain is buildable.
+    ///
+    /// `Dedup = 5` shares `Group`'s rank: it is the first (and only) stage of
+    /// the branch that replaces group → consensus → filter after `Sort`. The
+    /// ordinal check alone would therefore accept a cross-branch pair such as
+    /// `group → dedup`; `validate_stages_for` rejects those explicitly.
     #[must_use]
     pub fn ord(self) -> usize {
         match self {
@@ -224,7 +247,15 @@ impl RunAllStage {
             Self::Group => 5,
             Self::Consensus => 6,
             Self::Filter => 7,
+            Self::Dedup => 5,
         }
+    }
+
+    /// `true` if this stage is on the group → consensus → filter branch, the
+    /// alternative to [`RunAllStage::Dedup`] after `Sort`.
+    #[must_use]
+    pub fn is_consensus_branch(self) -> bool {
+        matches!(self, Self::Group | Self::Consensus | Self::Filter)
     }
 
     /// `true` if this stage is the consensus stage. Used by the Group
@@ -238,19 +269,35 @@ impl RunAllStage {
     /// Validate that `self` (as `--start-from`) and `stop_after` form
     /// a buildable pipeline range.
     ///
-    /// This is the sole ordinal-ordering check for the `--start-from` /
-    /// `--stop-after` pair: it enforces `self.ord() <= stop_after.ord()`,
-    /// i.e. that the pipeline does not start later than it stops.
+    /// This is the sole ordering check for the `--start-from` /
+    /// `--stop-after` pair. It rejects a pair that crosses from `dedup` to the
+    /// group → consensus → filter branch or back (the two are alternatives
+    /// after `sort`, and `dedup` shares `group`'s rank, so the ordinal alone
+    /// would accept `group → dedup`), then enforces `self.ord() <=
+    /// stop_after.ord()`, i.e. that the pipeline does not start later than it
+    /// stops.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `self.ord() > stop_after.ord()`.
+    /// Returns `Err` for a cross-branch pair, or if `self.ord() >
+    /// stop_after.ord()`.
     pub fn validate_with(self, stop_after: Self) -> Result<()> {
+        let crosses_branches = (stop_after == Self::Dedup && self.is_consensus_branch())
+            || (self == Self::Dedup && stop_after.is_consensus_branch());
+        if crosses_branches {
+            bail!(
+                "--start-from {self} --stop-after {stop_after} is not a valid chain: dedup is \
+                 an alternative to the group → consensus → filter branch after sort, so a chain \
+                 ends at either dedup or that branch, never both. Use --start-from \
+                 extract|correct|align|zipper|sort|dedup with --stop-after dedup."
+            );
+        }
         if self.ord() > stop_after.ord() {
             bail!(
                 "--start-from {self} comes after --stop-after {stop_after}; \
                  stop-after must be at or after start-from in the pipeline order \
-                 (extract < correct < align < zipper < sort < group < consensus < filter)"
+                 (extract < correct < align < zipper < sort < group < consensus < filter, \
+                 or sort < dedup)"
             );
         }
         Ok(())
@@ -271,6 +318,7 @@ impl std::fmt::Display for RunAllStage {
             Self::Group => "group",
             Self::Consensus => "consensus",
             Self::Filter => "filter",
+            Self::Dedup => "dedup",
         };
         f.write_str(name)
     }
@@ -314,6 +362,8 @@ fn validate_strategy_for_mode(mode: RunAllMode, strategy: Strategy) -> Result<()
 ///
 /// `RunAll::validate_stages` is the thin wrapper that calls this.
 fn validate_stages_for(start_from: RunAllStage, stop_after: RunAllStage) -> Result<()> {
+    // Rejects a pair crossing from dedup to the group → consensus → filter
+    // branch, and a backwards pair.
     start_from.validate_with(stop_after)?;
     // `--stop-after align-and-merge` would mean "stop after the
     // alignment but before zipper-merge". The design dropped that
@@ -508,6 +558,10 @@ fn sort_order_override_warning(
 /// 6. **Simplex / Duplex / Codec**: one of the three is appended when
 ///    `stop_after` names that consensus stage (terminal, mutually exclusive).
 ///
+/// 7. **Dedup**: appended (as the terminal stage) when `stop_after == Dedup`,
+///    in place of rules 5–6. The sort-forcing rule of rule 4 applies to it as
+///    to Group, since dedup also needs template-coordinate order.
+///
 /// # Errors
 ///
 /// Returns `Err` for any `(start, stop)` pair that `validate_stages` would
@@ -527,7 +581,7 @@ fn derive_stages_for(
     // `validate_stages` must have been called before this; the assert
     // catches misuse in tests or future refactors.
     debug_assert!(
-        start_from.ord() <= stop_after.ord() && stop_after != RunAllStage::AlignAndMerge,
+        validate_stages_for(start_from, stop_after).is_ok(),
         "derive_stages_for called with invalid (start={start_from}, stop={stop_after}); \
          validate_stages must run first"
     );
@@ -638,6 +692,15 @@ fn derive_stages_for(
         return Ok(stages);
     }
 
+    // ── Step 5 (dedup branch): Dedup (terminal) ──────────────────────────
+    // Dedup replaces the group → consensus → filter branch. Its input is the
+    // template-coordinate-sorted BAM `sort` produces (in memory when the chain
+    // includes the sort above, or the `--start-from dedup` input itself).
+    if stop_after == RunAllStage::Dedup {
+        stages.push(Stage::Dedup);
+        return Ok(stages);
+    }
+
     // ── Step 5: Group ─────────────────────────────────────────────────────
     // Included when stop_after >= Group AND start_from is NOT a consensus
     // stage. The consensus-self-pair exception: when start_from is already
@@ -694,25 +757,55 @@ fn derive_stages_for(
     Ok(stages)
 }
 
+/// The warning for `--consensus` on a dedup chain, which has no consensus stage:
+/// dedup's grouping is set by `--dedup::*` (strategy, edits, …), not by
+/// `--consensus` or `--group::*`.
+fn dedup_ignores_consensus_warning(consensus: Option<RunAllMode>) -> Option<String> {
+    consensus.map(|mode| {
+        format!(
+            "--consensus {mode} has no effect with --stop-after dedup, which calls no \
+             consensus; dedup is configured by --dedup::* (e.g. --dedup::strategy), not by \
+             --consensus or --group::*"
+        )
+    })
+}
+
+/// The warning for `--group::strategy` on a dedup chain, which runs no group
+/// stage. `--group::strategy` is the one `--group::*` option a group stage
+/// requires, so its presence is how a user configuring grouping through
+/// `--group::*` is recognized.
+fn dedup_ignores_group_warning(group_strategy: Option<Strategy>) -> Option<String> {
+    group_strategy.map(|_| {
+        "--group::strategy has no effect with --stop-after dedup, which runs no group stage; \
+         set dedup's grouping with --dedup::* (e.g. --dedup::strategy), since --group::* \
+         options do not configure it"
+            .to_string()
+    })
+}
+
 /// Fused runall command. Stages are selected by `--start-from` and
 /// `--stop-after`; the accepted starts are
 /// `{Extract, Correct, AlignAndMerge, Zipper, Sort, Group, Consensus,
-/// Filter}` (the consensus algorithm is chosen by `--consensus`, not by a
+/// Filter, Dedup}` (the consensus algorithm is chosen by `--consensus`, not by a
 /// per-algorithm start value — `simplex`/`duplex`/`codec` are NOT accepted
 /// start values) and the accepted stops are
-/// `{Extract, Correct, Zipper, Sort, Group, Consensus, Filter}`
+/// `{Extract, Correct, Zipper, Sort, Group, Consensus, Filter, Dedup}`
 /// (no `--stop-after align` — raw aligner output without zipper-merge
-/// would lose every original tag).
+/// would lose every original tag). `Dedup` is an alternative terminal branch
+/// after `Sort`, never combined with group/consensus/filter.
 #[derive(Debug, Parser)]
 #[command(
     name = "runall",
-    about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mFused multi-stage pipeline (correct + align + zipper + sort + group + consensus, no intermediate BAM)\x1b[0m",
+    about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mFused multi-stage pipeline (correct + align + zipper + sort + group + consensus or dedup, no intermediate BAM)\x1b[0m",
     long_about = "\
-Fuses extract, UMI correction, alignment + zipper-merge, sort, group, and \
-consensus calling (optionally followed by filter) into a single in-memory \
-pipeline. Select the slice to run with `--start-from` and `--stop-after` (both \
-required); the stages run in the fixed order extract < correct < align < zipper \
-< sort < group < consensus < filter. Records flow directly between stages in \
+Fuses extract, UMI correction, alignment + zipper-merge, sort, and either group \
+and consensus calling (optionally followed by filter) or UMI-aware duplicate \
+marking (dedup) into a single in-memory pipeline. Select the slice to run with \
+`--start-from` and `--stop-after` (both required); the stages run in the fixed \
+order extract < correct < align < zipper < sort < group < consensus < filter, \
+or extract < correct < align < zipper < sort < dedup: dedup is an alternative \
+to the group → consensus → filter branch, and a chain ends at one or the other, \
+never both. Records flow directly between stages in \
 memory, so every intermediate BAM a sequential run would write is elided. The \
 record stream matches running the equivalent standalone commands in turn, as do \
 the `@HD` `SO`/`GO`/`SS` fields, the `@SQ` dictionary, and the `@RG` records. The \
@@ -735,6 +828,12 @@ record while the staged run writes one `@PG` per command, and `@HD` `VN` and \
 * `group` reads a template-coordinate-sorted BAM via `--input`.
 * `consensus` reads a grouped (MI-tagged) BAM via `--input`.
 * `filter` reads a consensus BAM via `--input`.
+* `dedup` reads a template-coordinate-sorted BAM via `--input`.
+
+`--stop-after dedup` produces the same BAM as `fgumi dedup` (tunable via \
+`--dedup::*`), and from any start before it (`extract`, `correct`, `align`, \
+`zipper`, `sort`) the sorted reads stream straight into dedup, with no \
+intermediate sorted BAM.
 
 The consensus algorithm is chosen by `--consensus {simplex,duplex,codec}`, not \
 by a stage name; `--stop-after consensus` produces the same BAM as the matching \
@@ -742,7 +841,7 @@ by a stage name; `--stop-after consensus` produces the same BAM as the matching 
 post-consensus `fgumi filter` pass (tunable via `--filter::*`) into the same \
 pipeline, so no intermediate consensus BAM is written. Tune any stage with its \
 prefixed flags: `--sort::max-memory`, `--group::strategy`, `--duplex::min-reads`, \
-and so on.
+`--dedup::remove-duplicates`, and so on.
 
 `--stop-after align` is not allowed: raw aligner output before the zipper-merge \
 has lost every original tag, so the earliest stop after `--start-from align` is \
@@ -964,14 +1063,14 @@ pub struct RunAll {
 
     // ───────── pipeline stage control ─────────
     /// Pipeline stage to start from: extract, correct, align, zipper, sort,
-    /// group, consensus, or filter (required, case-insensitive).
+    /// group, consensus, filter, or dedup (required, case-insensitive).
     ///
     /// Declares the state of the input and selects the upstream work
     /// runall performs before the terminal `--stop-after` stage. See the
     /// command description for what each start stage reads (FASTQ for
     /// `extract`; `--input` plus, for `zipper`, `--unmapped`; a
-    /// template-coordinate-sorted BAM for `group`; a grouped MI-tagged
-    /// BAM for `consensus`; and so on).
+    /// template-coordinate-sorted BAM for `group` or `dedup`; a grouped
+    /// MI-tagged BAM for `consensus`; and so on).
     ///
     /// **Consensus-start chain:** `--start-from consensus` (with
     /// `--consensus {simplex,duplex,codec}`) runs the standalone consensus
@@ -986,12 +1085,14 @@ pub struct RunAll {
     pub start_from: RunAllStage,
 
     /// Pipeline stage to stop after: extract, correct, zipper, sort, group,
-    /// consensus, or filter (required, case-insensitive).
+    /// consensus, filter, or dedup (required, case-insensitive).
     ///
     /// Determines the terminal stage of the chain. `--stop-after
     /// consensus` writes the consensus BAM produced by the caller chosen
     /// with `--consensus`; `--stop-after filter` fuses a post-consensus
-    /// filter pass into the same pipeline.
+    /// filter pass into the same pipeline; `--stop-after dedup` marks (or
+    /// removes) duplicates instead of grouping and calling consensus, and
+    /// cannot be combined with `--start-from group|consensus|filter`.
     ///
     /// `align` is intentionally not a valid stop: raw aligner output
     /// before the zipper-merge has lost every original tag, so the
@@ -1041,6 +1142,18 @@ pub struct RunAll {
     /// `commands::filter` for the field list.
     #[command(flatten)]
     pub filter_opts: crate::commands::filter::MultiFilterOptions,
+
+    /// Per-stage dedup tuning, exposed as `--dedup::strategy`,
+    /// `--dedup::edits`, `--dedup::remove-duplicates`, `--dedup::metrics`, …
+    /// Used when the chain reaches the dedup stage (`--stop-after dedup`);
+    /// otherwise ignored. A dedup chain has no group stage, so `--group::*`
+    /// options do not configure it (a `--group::strategy` there is warned
+    /// about). The full standalone option set of `fgumi dedup` (all but its
+    /// input/output and engine options) is mirrored here via the
+    /// `#[multi_options]` macro — see `DedupOptions` in `commands::dedup` for
+    /// the field list.
+    #[command(flatten)]
+    pub dedup_opts: crate::commands::dedup::MultiDedupOptions,
 
     /// Re-align the consensus reads at the end of the run, preferring each
     /// molecule's raw-read window: appends `realign` and a coordinate `sort`
@@ -1107,8 +1220,9 @@ pub struct RunAll {
     pub realign_keep_aligner_qc_fail: bool,
 
     /// Convenience: fills in every applicable metrics-output option (group's
-    /// `--metrics` prefix, correct's metrics, filter's stats, and each
-    /// present consensus stage's metrics) for every stage in this run, under
+    /// `--metrics` prefix, correct's metrics, filter's stats, each present
+    /// consensus stage's metrics, and dedup's metrics and family-size
+    /// histogram) for every stage in this run, under
     /// `<PREFIX>.<stage>[.<suffix>]`, for any option the user did not already
     /// set explicitly. For group specifically, only `--metrics` (the prefix)
     /// is derived — its own fan-out already writes the complete canonical
@@ -1282,7 +1396,7 @@ impl RunAll {
     /// | `correct`          | `Bam(self.require_input()?)` — unmapped BAM feeding correct       |
     /// | `align`            | `Bam(self.require_input()?)` — unmapped BAM feeding AAM           |
     /// | `zipper`           | `PairedBams { unmapped, mapped: input, reference }`               |
-    /// | `sort` / `group` / consensus / `filter` | `Bam(self.require_input()?)` — aligned BAM |
+    /// | `sort` / `group` / consensus / `filter` / `dedup` | `Bam(self.require_input()?)` — aligned BAM |
     ///
     /// # Errors
     ///
@@ -1348,7 +1462,8 @@ impl RunAll {
             | RunAllStage::Sort
             | RunAllStage::Group
             | RunAllStage::Consensus
-            | RunAllStage::Filter => Ok(SourceSpec::Bam(self.require_input()?)),
+            | RunAllStage::Filter
+            | RunAllStage::Dedup => Ok(SourceSpec::Bam(self.require_input()?)),
 
             RunAllStage::Zipper => {
                 let unmapped = self.unmapped.clone().ok_or_else(|| {
@@ -1750,6 +1865,12 @@ impl RunAll {
     /// * **Filter** — validates `MultiFilterOptions`. No cross-stage
     ///   rewiring is needed: filter is always terminal in a runall chain.
     ///
+    /// * **Dedup** — validates `MultiDedupOptions`, runs the same flag-combination
+    ///   checks as standalone `fgumi dedup`
+    ///   ([`crate::commands::dedup::DedupOptions::validate_combinations`]), and
+    ///   derives the metrics and family-size-histogram paths from `--all-metrics`
+    ///   when they were not set. Dedup is always terminal in a runall chain.
+    ///
     /// # Errors
     ///
     /// Returns `Err` if any per-stage `validate()` call fails (e.g. missing
@@ -2082,9 +2203,36 @@ impl RunAll {
                     });
                 }
 
+                Stage::Dedup => {
+                    if let Some(warning) = dedup_ignores_consensus_warning(self.consensus_mode) {
+                        log::warn!("{warning}");
+                    }
+                    if let Some(warning) =
+                        dedup_ignores_group_warning(self.group_opts.group_strategy)
+                    {
+                        log::warn!("{warning}");
+                    }
+                    let mut dedup_opts = self.dedup_opts.clone().validate()?;
+                    // The same pre-flight checks standalone `fgumi dedup` runs
+                    // (min-umi-length, --no-umi with paired, --index-threshold
+                    // always), so runall accepts exactly the flags it does.
+                    dedup_opts.validate_combinations()?;
+                    // `--all-metrics <PREFIX>` derives the metrics file and the
+                    // family-size histogram when not set explicitly. The
+                    // duplication ladder is an opt-in diagnostic with its own
+                    // recorder cost, so it is left to `--dedup::duplication-ladder`.
+                    if dedup_opts.metrics.is_none() {
+                        dedup_opts.metrics = self.derived_metrics_path("dedup", "metrics.txt")?;
+                    }
+                    if dedup_opts.family_size_histogram.is_none() {
+                        dedup_opts.family_size_histogram =
+                            self.derived_metrics_path("dedup", "family_sizes.txt")?;
+                    }
+                    bag.dedup = Some(dedup_opts);
+                }
+
                 // Stages runall never derives — a programming error if they appear.
                 Stage::Clip
-                | Stage::Dedup
                 | Stage::Downsample
                 | Stage::Fastq
                 | Stage::CopyUmi
@@ -2320,9 +2468,10 @@ impl Command for RunAll {
                 );
             }
             if stages.contains(&Stage::Sort) && self.start_from != RunAllStage::Sort {
+                let next = if stages.contains(&Stage::Dedup) { "Dedup" } else { "Group" };
                 log::info!(
-                    "Including Stage::Sort between Align and Group \
-                     (template-coordinate sort precedes Group)"
+                    "Including Stage::Sort between Align and {next} \
+                     (template-coordinate sort precedes {next})"
                 );
             }
         }
@@ -2627,6 +2776,11 @@ fn metrics_write_targets(
     let mut targets: Vec<(PathBuf, &'static str)> = Vec::new();
     if let Some(metrics) = stage_opts.correct.as_ref().and_then(|c| c.metrics.as_ref()) {
         targets.push((metrics.clone(), "--correct::metrics"));
+    }
+    if let Some(dedup) = stage_opts.dedup.as_ref() {
+        for output in dedup.metrics_outputs() {
+            targets.push((output.path.to_path_buf(), output.runall_flag));
+        }
     }
     if let Some(group) = stage_opts.group.as_ref() {
         if let Some(path) = group.family_size_histogram.as_ref() {
@@ -3115,6 +3269,24 @@ mod derive_tests {
         vec![Stage::Simplex])]
     // ── zipper start ──
     #[case::zipper_to_sort(Zipper, Sort, false, None, vec![Stage::Zipper, Stage::Sort])]
+    // ── dedup branch: sort feeds dedup, never group/consensus ──
+    #[case::dedup_only(Dedup, Dedup, false, None, vec![Stage::Dedup])]
+    #[case::sort_to_dedup(Sort, Dedup, false, None, vec![Stage::Sort, Stage::Dedup])]
+    #[case::zipper_to_dedup(
+        Zipper, Dedup, false, None, vec![Stage::Zipper, Stage::Sort, Stage::Dedup])]
+    #[case::align_to_dedup(
+        AlignAndMerge, Dedup, false, None, vec![Stage::Align, Stage::Sort, Stage::Dedup])]
+    #[case::correct_to_dedup(
+        Correct, Dedup, false, None,
+        vec![Stage::Correct, Stage::Align, Stage::Sort, Stage::Dedup])]
+    #[case::extract_to_dedup_no_umi(
+        Extract, Dedup, false, None,
+        vec![Stage::Extract, Stage::Align, Stage::Sort, Stage::Dedup])]
+    #[case::extract_to_dedup_with_umi(
+        Extract, Dedup, true, None,
+        vec![Stage::Extract, Stage::Correct, Stage::Align, Stage::Sort, Stage::Dedup])]
+    #[case::dedup_ignores_consensus_mode(
+        Sort, Dedup, false, Some(RunAllMode::Simplex), vec![Stage::Sort, Stage::Dedup])]
     fn derive_stages_matches_spec(
         #[case] start: RunAllStage,
         #[case] stop: RunAllStage,
@@ -3140,8 +3312,74 @@ mod derive_tests {
 
     #[rstest]
     #[case::backwards(Group, Sort)]
+    #[case::dedup_backwards_to_sort(Dedup, Sort)]
+    #[case::dedup_backwards_to_extract(Dedup, Extract)]
     fn validate_stages_rejects_backwards(#[case] start: RunAllStage, #[case] stop: RunAllStage) {
-        assert!(validate_stages_for(start, stop).is_err());
+        let err = validate_stages_for(start, stop).unwrap_err().to_string();
+        assert!(err.contains(&format!("--start-from {start} comes after")), "got: {err}");
+    }
+
+    /// `dedup` is an alternative to the group → consensus → filter branch: a
+    /// chain that starts on one branch and stops on the other is rejected with
+    /// a message naming the rule, even where the shared ordinal would allow it.
+    #[rstest]
+    #[case::group_to_dedup(Group, Dedup)]
+    #[case::consensus_to_dedup(Consensus, Dedup)]
+    #[case::filter_to_dedup(Filter, Dedup)]
+    #[case::dedup_to_group(Dedup, Group)]
+    #[case::dedup_to_consensus(Dedup, Consensus)]
+    #[case::dedup_to_filter(Dedup, Filter)]
+    fn validate_stages_rejects_crossing_the_dedup_branch(
+        #[case] start: RunAllStage,
+        #[case] stop: RunAllStage,
+    ) {
+        let err = validate_stages_for(start, stop).unwrap_err().to_string();
+        assert!(
+            err.contains("dedup is an alternative to the group → consensus → filter branch"),
+            "got: {err}"
+        );
+    }
+
+    /// `--group::strategy` on a dedup chain is warned about (it has no effect);
+    /// without it, no warning.
+    #[rstest]
+    #[case::none(None, None)]
+    #[case::edit(Some(Strategy::Edit), Some("--group::strategy has no effect"))]
+    fn dedup_ignores_group_warning_names_the_flag(
+        #[case] strategy: Option<Strategy>,
+        #[case] expected: Option<&str>,
+    ) {
+        let got = dedup_ignores_group_warning(strategy);
+        match expected {
+            None => assert!(got.is_none(), "got: {got:?}"),
+            Some(needle) => {
+                let got = got.expect("a warning");
+                assert!(got.contains(needle) && got.contains("--dedup::strategy"), "got: {got}");
+            }
+        }
+    }
+
+    /// `--consensus` on a dedup chain is warned about (it has no effect); no
+    /// `--consensus`, no warning.
+    #[rstest]
+    #[case::none(None, None)]
+    #[case::simplex(Some(RunAllMode::Simplex), Some("--consensus simplex has no effect"))]
+    fn dedup_ignores_consensus_warning_names_the_flag(
+        #[case] consensus: Option<RunAllMode>,
+        #[case] expected: Option<&str>,
+    ) {
+        let got = dedup_ignores_consensus_warning(consensus);
+        match expected {
+            Some(needle) => assert!(got.as_deref().is_some_and(|w| w.contains(needle)), "{got:?}"),
+            None => assert_eq!(got, None),
+        }
+    }
+
+    #[rstest]
+    fn validate_stages_accepts_every_dedup_start(
+        #[values(Extract, Correct, AlignAndMerge, Zipper, Sort, Dedup)] start: RunAllStage,
+    ) {
+        validate_stages_for(start, Dedup).expect("a dedup chain from an upstream start is valid");
     }
 
     #[rstest]
@@ -3668,6 +3906,182 @@ mod bag_tests {
         assert_eq!(bag.filter.unwrap().stats, Some(PathBuf::from("all.filter.stats.txt")));
     }
 
+    /// The `runall` arguments of a `--start-from dedup --stop-after dedup` run, plus `extra`.
+    fn dedup_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut args =
+            vec!["--start-from", "dedup", "--stop-after", "dedup", "-i", "in.bam", "-o", "out.bam"];
+        args.extend_from_slice(extra);
+        args
+    }
+
+    /// Every `--dedup::*` flag reaches the bag's dedup options, and an omitted one
+    /// keeps standalone `fgumi dedup`'s default.
+    #[test]
+    fn dedup_flags_reach_the_stage_options() {
+        use fgumi_umi::IndexThreshold;
+        let defaults = parse(&dedup_args(&[])).build_stage_options_bag(&[Stage::Dedup]).unwrap();
+        let defaults = defaults.dedup.expect("dedup slot filled");
+        assert_eq!(defaults.strategy, Strategy::Adjacency);
+        assert_eq!(defaults.edits, 1);
+        assert_eq!(defaults.min_map_q, 0);
+        assert!(!defaults.remove_duplicates);
+        assert_eq!(defaults.ladder_interval, 1_000_000);
+        assert!(defaults.metrics.is_none());
+
+        let r = parse(&dedup_args(&[
+            "--dedup::strategy",
+            "edit",
+            "--dedup::edits",
+            "2",
+            "--dedup::min-umi-length",
+            "3",
+            "--dedup::min-map-q",
+            "20",
+            "--dedup::remove-duplicates",
+            "--dedup::include-unmapped",
+            "--dedup::include-invalid-umis",
+            "--dedup::include-non-pf-reads",
+            "--dedup::index-threshold",
+            "never",
+            "--dedup::metrics",
+            "m.txt",
+            "--dedup::family-size-histogram",
+            "h.txt",
+            "--dedup::duplication-ladder",
+            "l.txt",
+            "--dedup::ladder-interval",
+            "7",
+            "--dedup::sample",
+            "s1",
+        ]));
+        let dedup = r.build_stage_options_bag(&[Stage::Dedup]).unwrap().dedup.unwrap();
+        assert_eq!(dedup.strategy, Strategy::Edit);
+        assert_eq!(dedup.edits, 2);
+        assert_eq!(dedup.min_umi_length, Some(3));
+        assert_eq!(dedup.min_map_q, 20);
+        assert!(dedup.remove_duplicates);
+        assert!(dedup.include_unmapped);
+        assert!(dedup.include_invalid_umis);
+        assert!(dedup.include_non_pf_reads);
+        assert_eq!(dedup.index_threshold, IndexThreshold::Never);
+        assert_eq!(dedup.metrics, Some(PathBuf::from("m.txt")));
+        assert_eq!(dedup.family_size_histogram, Some(PathBuf::from("h.txt")));
+        assert_eq!(dedup.duplication_ladder, Some(PathBuf::from("l.txt")));
+        assert_eq!(dedup.ladder_interval, 7);
+        assert_eq!(dedup.sample.as_deref(), Some("s1"));
+
+        let no_umi = parse(&dedup_args(&["--dedup::no-umi"]));
+        assert!(no_umi.build_stage_options_bag(&[Stage::Dedup]).unwrap().dedup.unwrap().no_umi);
+    }
+
+    /// runall's dedup options equal standalone `fgumi dedup`'s for the same
+    /// flags, field for field (compared through `Debug`), with every flag set and
+    /// with none: a generated mapping that drops, renames or hard-codes a field
+    /// fails here, including fields added later.
+    #[rstest::rstest]
+    #[case::none(&[])]
+    #[case::all(&[
+        "strategy", "edit", "edits", "2", "min-umi-length", "3", "min-map-q", "20",
+        "remove-duplicates", "true", "include-unmapped", "true", "include-invalid-umis", "true",
+        "include-non-pf-reads", "true", "index-threshold", "never", "metrics", "m.txt",
+        "family-size-histogram", "h.txt", "duplication-ladder", "l.txt", "ladder-interval", "7",
+        "sample", "s1", "verify", "true",
+    ])]
+    #[case::no_umi(&["no-umi", "true"])]
+    fn dedup_options_match_standalone_dedup(#[case] flag_values: &[&str]) {
+        use clap::Parser as _;
+        let pairs: Vec<(&str, &str)> =
+            flag_values.chunks(2).map(|pair| (pair[0], pair[1])).collect();
+        let runall_flags: Vec<String> =
+            pairs.iter().flat_map(|(f, v)| [format!("--dedup::{f}"), (*v).to_string()]).collect();
+        let standalone_flags: Vec<String> =
+            pairs.iter().flat_map(|(f, v)| [format!("--{f}"), (*v).to_string()]).collect();
+
+        let runall_args: Vec<&str> = runall_flags.iter().map(String::as_str).collect();
+        let bag_dedup =
+            parse(&dedup_args(&runall_args)).build_stage_options_bag(&[Stage::Dedup]).unwrap();
+        let standalone = crate::commands::dedup::MarkDuplicates::try_parse_from(
+            ["dedup", "-i", "in.bam", "-o", "out.bam"]
+                .into_iter()
+                .chain(standalone_flags.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert_eq!(format!("{:?}", bag_dedup.dedup.unwrap()), format!("{:?}", standalone.opts));
+    }
+
+    /// runall's dedup stage rejects the same flag combinations standalone
+    /// `fgumi dedup` does, before any file is opened.
+    #[rstest::rstest]
+    #[case::no_umi_with_paired(
+        &["--dedup::no-umi", "--dedup::strategy", "paired"],
+        "--no-umi cannot be used with --strategy paired"
+    )]
+    #[case::index_threshold_always_with_identity(
+        &["--dedup::strategy", "identity", "--dedup::index-threshold", "always"],
+        "--index-threshold always cannot be honoured with --strategy identity"
+    )]
+    #[case::zero_min_umi_length(
+        &["--dedup::min-umi-length", "0"],
+        "--min-umi-length must be at least 1"
+    )]
+    fn dedup_rejects_the_standalone_invalid_combinations(
+        #[case] extra: &[&str],
+        #[case] needle: &str,
+    ) {
+        let r = parse(&dedup_args(extra));
+        let Err(err) = r.build_stage_options_bag(&[Stage::Dedup]) else {
+            panic!("{extra:?} must be rejected");
+        };
+        let err = format!("{err:#}");
+        assert!(err.contains(needle), "expected {needle:?} in: {err}");
+    }
+
+    /// `--all-metrics` derives dedup's metrics file and family-size histogram,
+    /// never overrides an explicit flag, and leaves the opt-in ladder alone.
+    #[rstest::rstest]
+    #[case::derived(&[], "all.dedup.metrics.txt", "all.dedup.family_sizes.txt")]
+    #[case::explicit_wins(&["--dedup::metrics", "mine.txt"], "mine.txt",
+        "all.dedup.family_sizes.txt")]
+    fn all_metrics_fills_dedup_metrics(
+        #[case] extra: &[&str],
+        #[case] metrics: &str,
+        #[case] histogram: &str,
+    ) {
+        let mut args = dedup_args(extra);
+        args.extend(["--all-metrics", "all"]);
+        let dedup = parse(&args).build_stage_options_bag(&[Stage::Dedup]).unwrap().dedup.unwrap();
+        assert_eq!(dedup.metrics, Some(PathBuf::from(metrics)));
+        assert_eq!(dedup.family_size_histogram, Some(PathBuf::from(histogram)));
+        assert!(dedup.duplication_ladder.is_none());
+    }
+
+    /// Dedup's metrics outputs are registered for the `--output` collision guard.
+    #[test]
+    fn metrics_write_targets_registers_dedup_outputs() {
+        let r = parse(&dedup_args(&[
+            "--dedup::metrics",
+            "m.txt",
+            "--dedup::family-size-histogram",
+            "h.txt",
+            "--dedup::duplication-ladder",
+            "l.txt",
+        ]));
+        let bag = r.build_stage_options_bag(&[Stage::Dedup]).unwrap();
+        let targets: Vec<(String, &str)> = metrics_write_targets(&bag)
+            .unwrap()
+            .into_iter()
+            .map(|(path, label)| (path.display().to_string(), label))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                ("m.txt".to_string(), "--dedup::metrics"),
+                ("h.txt".to_string(), "--dedup::family-size-histogram"),
+                ("l.txt".to_string(), "--dedup::duplication-ladder"),
+            ]
+        );
+    }
+
     #[cfg(feature = "consensus")]
     #[test]
     fn all_metrics_fills_each_consensus_stages_metrics_prefix() {
@@ -3954,6 +4368,9 @@ mod tests {
         assert!(RunAllStage::Sort.ord() < RunAllStage::Group.ord());
         assert!(RunAllStage::Group.ord() < RunAllStage::Consensus.ord());
         assert!(RunAllStage::Consensus.ord() < RunAllStage::Filter.ord());
+        // Dedup branches off after sort, sharing group's rank.
+        assert!(RunAllStage::Sort.ord() < RunAllStage::Dedup.ord());
+        assert_eq!(RunAllStage::Dedup.ord(), RunAllStage::Group.ord());
     }
 
     #[test]
@@ -3968,6 +4385,7 @@ mod tests {
             StopAfter::Group,
             StopAfter::Consensus,
             StopAfter::Filter,
+            StopAfter::Dedup,
         ] {
             let s: RunAllStage = stop.into();
             assert_ne!(s, RunAllStage::AlignAndMerge);
@@ -3994,6 +4412,7 @@ mod tests {
             RunAllStage::Group,
             RunAllStage::Consensus,
             RunAllStage::Filter,
+            RunAllStage::Dedup,
         ];
         for stage in variants {
             let stop_after: Option<StopAfter> = match stage {
@@ -4005,6 +4424,7 @@ mod tests {
                 RunAllStage::Group => Some(StopAfter::Group),
                 RunAllStage::Consensus => Some(StopAfter::Consensus),
                 RunAllStage::Filter => Some(StopAfter::Filter),
+                RunAllStage::Dedup => Some(StopAfter::Dedup),
             };
             match stop_after {
                 Some(stop) => {
@@ -4050,6 +4470,7 @@ mod tests {
             RunAllStage::Group,
             RunAllStage::Consensus,
             RunAllStage::Filter,
+            RunAllStage::Dedup,
         ] {
             let clap_name = stage.to_possible_value().expect("stage is a real value-enum variant");
             assert_eq!(

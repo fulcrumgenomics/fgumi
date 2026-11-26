@@ -761,12 +761,39 @@ impl Default for GroupOptions {
 /// the chain builder, and `execute` cannot disagree about what was
 /// configured — both methods delegate here rather than each re-implementing
 /// the same two rules.
-fn resolve_strategy_and_edits(no_umi: bool, strategy: Strategy, edits: u32) -> (Strategy, u32) {
+pub(crate) fn resolve_strategy_and_edits(
+    no_umi: bool,
+    strategy: Strategy,
+    edits: u32,
+) -> (Strategy, u32) {
     if no_umi {
         return (Strategy::Identity, 0);
     }
     let edits = if matches!(strategy, Strategy::Identity) { 0 } else { edits };
     (strategy, edits)
+}
+
+/// The UMI-grouping flag checks `fgumi group`, `fgumi dedup` and runall's
+/// dedup stage share, run before any reader or writer opens: a bad
+/// `--min-umi-length`, `--no-umi` with the paired strategy, and an
+/// `--index-threshold always` the resolved strategy/edits can never honor.
+///
+/// # Errors
+///
+/// Returns an error naming the offending flag(s).
+pub(crate) fn validate_umi_grouping_flags(
+    no_umi: bool,
+    strategy: Strategy,
+    edits: u32,
+    min_umi_length: Option<usize>,
+    index_threshold: IndexThreshold,
+) -> Result<()> {
+    crate::umi::validate_min_umi_length(min_umi_length, strategy)?;
+    if no_umi && matches!(strategy, Strategy::Paired) {
+        bail!("--no-umi cannot be used with --strategy paired");
+    }
+    let (strategy, edits) = resolve_strategy_and_edits(no_umi, strategy, edits);
+    crate::commands::common::validate_index_threshold(index_threshold, strategy, edits)
 }
 
 impl GroupOptions {
@@ -892,13 +919,14 @@ impl Command for GroupReadsByUmi {
         }
         crate::commands::common::reject_output_collisions(&outputs)?;
 
-        // Validate inputs
-        crate::umi::validate_min_umi_length(self.min_umi_length, self.strategy)?;
-
-        // Validate --no-umi is not used with paired strategy
-        if self.no_umi && matches!(self.strategy, Strategy::Paired) {
-            bail!("--no-umi cannot be used with --strategy paired");
-        }
+        // --min-umi-length, --no-umi with paired, --index-threshold always.
+        validate_umi_grouping_flags(
+            self.no_umi,
+            self.strategy,
+            self.edits,
+            self.min_umi_length,
+            self.index_threshold,
+        )?;
 
         // Handle --no-umi mode: force identity strategy. Logged here rather than
         // in `add_group`: `execute_chain` passes the chain only the already-
@@ -907,15 +935,6 @@ impl Command for GroupReadsByUmi {
         if self.no_umi && !matches!(self.strategy, Strategy::Identity) {
             info!("--no-umi mode: overriding strategy to identity");
         }
-        let (effective_strategy, effective_edits) = self.resolve_strategy_and_edits();
-
-        // `--index-threshold always` asserts that indexing will happen; reject it when
-        // the resolved strategy/edits can never index rather than ignoring the flag.
-        crate::commands::common::validate_index_threshold(
-            self.index_threshold,
-            effective_strategy,
-            effective_edits,
-        )?;
 
         // Validate the input exists (stdin paths are exempt).
         self.io.validate()?;

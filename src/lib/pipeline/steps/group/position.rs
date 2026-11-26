@@ -157,6 +157,7 @@ impl Ordered for BatchedProcessedPositionGroups {
 /// state stays buffered until the held slot drains.
 pub struct GroupByPosition {
     grouper: RecordPositionGrouper,
+    verification_header: Option<crate::pipeline::core::header::HeaderHandle>,
     /// Self-managed monotonic ordinal — each emitted *batch* gets the
     /// next value. Required for `BranchOrdering::ByItemOrdinal`'s
     /// `ReorderStage` to see contiguous serials.
@@ -220,6 +221,17 @@ impl GroupByPosition {
         self
     }
 
+    /// Enable verification using the aligner's completed library ordering.
+    /// The handle is probed at runtime before any records are grouped.
+    #[must_use]
+    pub fn verifying_runtime(
+        mut self,
+        header: crate::pipeline::core::header::HeaderHandle,
+    ) -> Self {
+        self.verification_header = Some(header);
+        self
+    }
+
     fn with_grouper(
         grouper: RecordPositionGrouper,
         output_byte_limit: u64,
@@ -227,6 +239,7 @@ impl GroupByPosition {
     ) -> Self {
         Self {
             grouper,
+            verification_header: None,
             next_ordinal: 0,
             accumulator: Vec::with_capacity(target_batch_count),
             held: HeldSlot::new(),
@@ -258,6 +271,17 @@ impl Step for GroupByPosition {
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        if let Some(handle) = &self.verification_header {
+            let Some(header) = handle.try_get() else {
+                if ctx.input.is_drained() {
+                    return Err(io::Error::other("group input drained before its header resolved"));
+                }
+                return Ok(StepOutcome::NoProgress);
+            };
+            self.grouper.enable_verify(header?);
+            self.verification_header = None;
+        }
+
         // Batch total for this call, accumulated across every input batch
         // consumed in the loop below; bumped exactly once regardless of which
         // of `try_run_inner`'s several exit paths fires.
@@ -385,6 +409,34 @@ impl GroupByPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::waiting(false, false, None)]
+    #[case::drained_without_header(true, false, Some("group input drained"))]
+    #[case::poisoned_header(false, true, Some("aligner failed"))]
+    fn runtime_verification_header_readiness(
+        #[case] drained: bool,
+        #[case] poisoned: bool,
+        #[case] error: Option<&str>,
+    ) {
+        let handle = crate::pipeline::core::header::HeaderHandle::new();
+        let mut step = GroupByPosition::new(1024).verifying_runtime(handle.clone());
+        let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
+        if drained {
+            probe.close_input();
+        }
+        if poisoned {
+            handle.poison(io::Error::other("aligner failed")).unwrap();
+        }
+        if let Some(message) = error {
+            assert!(probe.try_run(&mut step).unwrap_err().to_string().contains(message));
+        } else {
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
+            handle.set(noodles::sam::Header::default()).unwrap();
+            probe.close_input();
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Finished);
+        }
+    }
 
     #[test]
     fn profile_advertises_serial_byordinal() {

@@ -11,7 +11,7 @@ pub use crate::commands::clip::Clip;
 pub use crate::commands::codec::CodecOptions;
 pub use crate::commands::copy_umi::CopyUmiOptions;
 pub use crate::commands::correct::CorrectOptions;
-pub use crate::commands::dedup::MarkDuplicates;
+pub use crate::commands::dedup::DedupOptions;
 #[cfg(feature = "consensus")]
 pub use crate::commands::duplex::DuplexOptions;
 #[cfg(feature = "consensus")]
@@ -63,12 +63,11 @@ pub struct AlignOptions {
 /// present before constructing any chain steps.
 ///
 /// Fifteen fields are wired: `CopyUmi`, `Correct`, `Zipper`, `Sort`, `Group`,
-/// `Duplex`, `Codec`, `Filter`, `Retag`, `Simplex`, `Align`, `Extract`, and
-/// `Fastq` hold free-standing `<Command>Options` structs, while `Dedup` and
-/// `Clip` hold the command struct directly (`MarkDuplicates` / `Clip`) — no
-/// separate `DedupOptions`/`ClipOptions` is extracted, because test code
-/// constructs those via `clap::Parser::parse_from` and extracting a sub-struct
-/// would destabilise that surface. The remaining stage (`Downsample`) has no
+/// `Duplex`, `Codec`, `Dedup`, `Filter`, `Retag`, `Simplex`, `Align`, `Extract`,
+/// and `Fastq` hold free-standing `<Command>Options` structs, while `Clip` holds
+/// the command struct directly (`Clip`) — no separate `ClipOptions` is
+/// extracted, because test code constructs it via `clap::Parser::parse_from`
+/// and extracting a sub-struct would destabilise that surface. The remaining stage (`Downsample`) has no
 /// slot yet; it is added incrementally in T2.19–T2.22.
 #[derive(Default)]
 pub struct StageOptionsBag {
@@ -84,14 +83,15 @@ pub struct StageOptionsBag {
     pub duplex: Option<DuplexOptions>,
     #[cfg(feature = "consensus")]
     pub codec: Option<CodecOptions>,
-    /// Dedup options. Holds `MarkDuplicates` directly (approach 2 from
-    /// the T2.12 design note) to keep the test surface stable.
-    pub dedup: Option<MarkDuplicates>,
+    /// Dedup options. Holds the free-standing `DedupOptions` struct, which
+    /// `MarkDuplicates` flattens, so runall can re-expose the tuning knobs via
+    /// `--dedup::*` through `MultiDedupOptions`.
+    pub dedup: Option<DedupOptions>,
     /// Filter options. Holds the free-standing `FilterOptions` struct
     /// (same approach as Sort/Group/Correct), so runall can re-expose
     /// the tuning knobs via `--filter::*` through `MultiFilterOptions`.
     pub filter: Option<FilterOptions>,
-    /// Clip options. Holds `Clip` directly (same approach as Dedup/Filter).
+    /// Clip options. Holds `Clip` directly.
     pub clip: Option<Clip>,
     /// Retag options. Holds the free-standing `RetagOptions` struct (operations
     /// + metrics path) — a pure per-record tag rewriter, un-feature-gated.

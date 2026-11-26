@@ -511,6 +511,8 @@ pub struct SortBuffer {
     /// In-memory buffering sorter. `Some` while ingesting; `None` after the
     /// residual has been taken (finalized).
     sorter: Option<ChunkSorter>,
+    /// Rebuild the template-library lookup before ingesting any records from an aligner.
+    runtime_header: Option<(fgumi_pipeline_core::header::HeaderHandle, SortBufferConfig)>,
     /// Sorted chunks awaiting output (spill chunks during ingest; the residual +
     /// `AllAnnounced` after finalize). Drained before the next batch is ingested.
     pending: VecDeque<SortChunkEvent>,
@@ -554,6 +556,7 @@ impl SortBuffer {
         let chunk_sorter = ChunkSorter::new(config, header)?;
         Ok(Self {
             sorter: Some(chunk_sorter),
+            runtime_header: None,
             pending: VecDeque::new(),
             next_seq: 0,
             failed: None,
@@ -565,6 +568,22 @@ impl SortBuffer {
             policy: RunIndexPolicy::new(None),
             spilled: SpilledTotals::default(),
         })
+    }
+
+    /// Resolve template-coordinate library ordering from the aligner's completed
+    /// header on the first runtime dispatch, never during pipeline construction.
+    /// Other orders do not depend on read groups and retain their eager sorter.
+    /// Call before the step runs, with the same config passed to `new`.
+    #[must_use]
+    pub fn with_runtime_header(
+        mut self,
+        header: fgumi_pipeline_core::header::HeaderHandle,
+        config: SortBufferConfig,
+    ) -> Self {
+        if config.sort_order == SortOrder::TemplateCoordinate {
+            self.runtime_header = Some((header, config));
+        }
+        self
     }
 
     /// Make each run that sorts in parallel take the whole phase-1 cap the
@@ -815,6 +834,19 @@ impl Step for SortBuffer {
         // that is structurally indistinguishable from a complete one.
         self.check_not_failed()?;
 
+        if let Some((handle, config)) = &self.runtime_header {
+            let Some(header) = handle.try_get() else {
+                if ctx.input.is_drained() {
+                    return Err(io::Error::other("sort input drained before its header resolved"));
+                }
+                return Ok(StepOutcome::NoProgress);
+            };
+            let mut sorter = ChunkSorter::new(*config, header?).map_err(io::Error::other)?;
+            sorter.set_phase_cap(self.cap.clone());
+            self.sorter = Some(sorter);
+            self.runtime_header = None;
+        }
+
         if !self.flush_held(ctx) {
             return Ok(StepOutcome::Contention);
         }
@@ -894,6 +926,43 @@ mod tests {
         #[case] expected_len: usize,
     ) {
         assert_eq!(residual_chunks_for(chunk, had_spills).len(), expected_len);
+    }
+
+    #[rstest]
+    #[case::waiting(false, false, None)]
+    #[case::drained_without_header(true, false, Some("sort input drained"))]
+    #[case::poisoned_header(false, true, Some("aligner failed"))]
+    fn runtime_template_header_readiness(
+        #[case] drained: bool,
+        #[case] poisoned: bool,
+        #[case] error: Option<&str>,
+    ) {
+        let handle = fgumi_pipeline_core::header::HeaderHandle::new();
+        let config = SortBufferConfig {
+            sort_order: SortOrder::TemplateCoordinate,
+            memory_limit: 1024,
+            sort_threads: 1,
+            cell_tag: None,
+            key_types: KeyTypesSpec::Auto,
+        };
+        let mut step = SortBuffer::new(config, &Header::default(), 1024)
+            .unwrap()
+            .with_runtime_header(handle.clone(), config);
+        let probe = fgumi_pipeline_core::testing::StepProbe::new(&step);
+        if drained {
+            probe.close_input();
+        }
+        if poisoned {
+            handle.poison(io::Error::other("aligner failed")).unwrap();
+        }
+        if let Some(message) = error {
+            assert!(probe.try_run(&mut step).unwrap_err().to_string().contains(message));
+        } else {
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::NoProgress);
+            handle.set(Header::default()).unwrap();
+            probe.close_input();
+            assert_eq!(probe.try_run(&mut step).unwrap(), StepOutcome::Progress);
+        }
     }
 
     /// A coordinate run is charged each record's bytes plus its 24-byte ref:

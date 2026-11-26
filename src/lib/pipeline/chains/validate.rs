@@ -24,7 +24,9 @@ use crate::pipeline::chains::{ChainSpec, Stage};
 /// - `Zipper` = 3 (was 2)
 /// - `Sort` = 4 (was 3)
 /// - `Group` = 5 (was 4)
-/// - `CopyUmi`, `Clip`, `Dedup`, `Downsample` = 6 (post-group standalone-only)
+/// - `CopyUmi`, `Clip`, `Dedup`, `Downsample` = 6 (post-group standalone-only,
+///   except `Dedup`, which runall also fuses after `Sort` — see
+///   [`validate_dedup_placement`])
 /// - `Simplex`, `Duplex`, `Codec` = 7 (terminal consensus, was 5)
 /// - `Filter` = 8 (post-consensus filtering; follows the consensus caller
 ///   in a runall `consensus → filter` chain, so it sorts after the
@@ -85,6 +87,38 @@ fn validate_realign_placement(stages: &[Stage]) -> Result<()> {
                  got {tail:?} after it"
             );
         }
+    }
+    Ok(())
+}
+
+/// `Dedup` marks duplicates on a template-coordinate-sorted record stream: it is
+/// always the last stage, preceded by nothing or by runall's upstream stages
+/// ending in `Sort`, and never shares a chain with the group → consensus →
+/// filter branch it replaces (`[Group, Dedup]` would pass the ordinal rule, ord
+/// 5 <= 6, but group's grouped templates are not a record stream).
+fn validate_dedup_placement(stages: &[Stage]) -> Result<()> {
+    let Some(pos) = stages.iter().position(|s| *s == Stage::Dedup) else {
+        return Ok(());
+    };
+    if pos + 1 != stages.len() {
+        bail!("Stage::Dedup must be the last stage of a chain; got {stages:?}");
+    }
+    // Every chain this rejects also fails the "directly follow Sort" rule, the
+    // ordinal check or `validate_realign_placement`; it is here for the message,
+    // which names the branch rule rather than a symptom of it.
+    if let Some(other) =
+        stages[..pos].iter().find(|s| s.is_consensus_branch() || **s == Stage::Realign)
+    {
+        bail!(
+            "Stage::Dedup replaces the group → consensus → filter branch, so it cannot share a \
+             chain with {other:?}; got {stages:?}"
+        );
+    }
+    if pos > 0 && stages[pos - 1] != Stage::Sort {
+        bail!(
+            "Stage::Dedup needs template-coordinate-sorted input, so in a multi-stage chain it \
+             must directly follow Stage::Sort; got {stages:?}"
+        );
     }
     Ok(())
 }
@@ -172,6 +206,7 @@ pub fn validate_stage_progression(spec: &ChainSpec) -> Result<()> {
     }
 
     validate_realign_placement(stages)?;
+    validate_dedup_placement(stages)?;
 
     // Non-decreasing ord (allowing equality for stages that share an ord bucket,
     // e.g. multiple post-group standalone-only stages). The one exception is the
@@ -905,6 +940,34 @@ mod tests {
     #[case::consensus_sort(vec![Stage::Simplex, Stage::Sort], Some("canonical pipeline order"))]
     #[case::consensus_realign_filter(vec![Stage::Simplex, Stage::Realign, Stage::Filter], Some("may be followed only by a single trailing Stage::Sort"))]
     fn realign_progression(#[case] stages: Vec<Stage>, #[case] rejected_by: Option<&str>) {
+        let result = validate_stage_progression(&empty_spec(stages));
+        match rejected_by {
+            None => assert!(result.is_ok(), "{result:?}"),
+            Some(rule) => {
+                let err = result.expect_err("rejected").to_string();
+                assert!(err.contains(rule), "rejected by another rule: {err}");
+            }
+        }
+    }
+
+    /// Dedup is terminal and follows only Sort (runall's dedup branch) or nothing
+    /// (standalone `fgumi dedup`); it never shares a chain with group/consensus.
+    #[rstest]
+    #[case::dedup_alone(vec![Stage::Dedup], None)]
+    #[case::sort_dedup(vec![Stage::Sort, Stage::Dedup], None)]
+    #[case::extract_align_sort_dedup(
+        vec![Stage::Extract, Stage::Correct, Stage::Align, Stage::Sort, Stage::Dedup],
+        None
+    )]
+    #[case::zipper_sort_dedup(vec![Stage::Zipper, Stage::Sort, Stage::Dedup], None)]
+    #[case::group_dedup(vec![Stage::Group, Stage::Dedup], Some("cannot share a chain with Group"))]
+    #[case::sort_group_dedup(
+        vec![Stage::Sort, Stage::Group, Stage::Dedup],
+        Some("cannot share a chain with Group")
+    )]
+    #[case::align_dedup(vec![Stage::Align, Stage::Dedup], Some("must directly follow Stage::Sort"))]
+    #[case::dedup_then_clip(vec![Stage::Dedup, Stage::Clip], Some("must be the last stage"))]
+    fn dedup_progression(#[case] stages: Vec<Stage>, #[case] rejected_by: Option<&str>) {
         let result = validate_stage_progression(&empty_spec(stages));
         match rejected_by {
             None => assert!(result.is_ok(), "{result:?}"),
