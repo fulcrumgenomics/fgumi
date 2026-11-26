@@ -66,6 +66,7 @@ mod test_retag_cutover_parity;
 mod test_review_command;
 mod test_runall_chain_transitions;
 mod test_runall_command;
+mod test_runall_star_preset;
 mod test_sam_input;
 #[cfg(feature = "consensus")]
 mod test_simplex_command;

@@ -1616,6 +1616,15 @@ impl RunAll {
             );
         }
         let top_threads = self.threading.num_threads();
+        // Reject incompatible realignment before resolving either stage: raw
+        // STAR resolution would otherwise validate an index and create scratch.
+        let realign_aligner = stages
+            .contains(&Stage::Realign)
+            .then(|| self.realign_align_options(stages).map(|options| options.aligner))
+            .transpose()?;
+        if let Some(aligner) = &realign_aligner {
+            aligner.check_realign_support()?;
+        }
         // Resolve each align-like stage's aligner as the stage bag will: the
         // raw-read align stage's, and the realign stage's (plain for duplex).
         if stages.contains(&Stage::Align) {
@@ -1625,12 +1634,8 @@ impl RunAll {
                 self.aligner_bin.as_deref(),
             )?;
         }
-        if stages.contains(&Stage::Realign) {
-            let _resolved = self.realign_align_options(stages)?.aligner.resolve(
-                reference,
-                top_threads,
-                self.aligner_bin.as_deref(),
-            )?;
+        if let Some(aligner) = realign_aligner {
+            let _resolved = aligner.resolve(reference, top_threads, self.aligner_bin.as_deref())?;
         }
         Ok(())
     }

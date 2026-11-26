@@ -295,12 +295,14 @@ pub(crate) fn backend_for(resolved: ResolvedAligner) -> Box<dyn AlignBackend> {
             accept_mid_pair_split,
             input_format,
             max_read_ahead,
+            runtime,
         } => Box::new(subprocess::SubprocessBackend {
             command,
             chunk_size: resolved.chunk_size,
             accept_mid_pair_split,
             input_format,
             max_read_ahead,
+            runtime,
         }),
         #[cfg(feature = "aligner-bwa-mem3")]
         ResolvedBackend::InProcessBwaMem3 {
@@ -634,6 +636,7 @@ mod tests {
             accept_mid_pair_split: true,
             input_format: crate::commands::fastq::UnalignedReadFormat::Fastq,
             max_read_ahead: None,
+            runtime: crate::aligner::SubprocessRuntime::default(),
         }
     }
 

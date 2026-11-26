@@ -289,7 +289,7 @@ impl InFlightGate {
             }
             let quiet = now.duration_since(quiet_since.unwrap_or(now));
             if wanted <= self.ceiling {
-                if g.stalled || quiet >= self.stall_grace {
+                if !g.downstream_blocked && (g.stalled || quiet >= self.stall_grace) {
                     let from = g.budget;
                     g.budget = wanted.max(from.saturating_mul(2)).min(self.ceiling);
                     g.stalled = true;
@@ -322,7 +322,7 @@ impl InFlightGate {
             }
             let base = quiet_since.unwrap_or(now);
             let wake = if quiet < self.stall_grace {
-                base + self.stall_grace
+                base + self.stall_grace.min(self.fail_after)
             } else {
                 base + self.fail_after
             };
@@ -602,6 +602,41 @@ mod tests {
         assert_eq!(gate.budget(), 200);
     }
 
+    #[test]
+    fn in_flight_gate_does_not_continue_growing_while_downstream_is_blocked() {
+        let gate = Arc::new(InFlightGate::new(100, 1000, Duration::ZERO, Duration::ZERO));
+        assert!(gate.acquire(100).unwrap());
+        assert!(gate.acquire(100).unwrap(), "enter the stalled state");
+        let downstream = gate.downstream_wait();
+        let writer = Arc::clone(&gate);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || tx.send(writer.acquire(100)).unwrap());
+        let premature = rx.recv_timeout(Duration::from_millis(100));
+        gate.mark_consumer_gone();
+        h.join().unwrap();
+        drop(downstream);
+        assert!(premature.is_err(), "must not grow while downstream is blocked");
+        assert_eq!(gate.budget(), 200);
+    }
+
+    #[test]
+    fn in_flight_gate_honors_a_failure_deadline_shorter_than_the_grace() {
+        let gate = Arc::new(InFlightGate::new(
+            100,
+            100,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        ));
+        assert!(gate.acquire(100).unwrap());
+        let writer = Arc::clone(&gate);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || tx.send(writer.acquire(1)).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        gate.mark_consumer_gone();
+        h.join().unwrap();
+        assert!(result.expect("must wake at failure deadline, not growth grace").is_err());
+    }
+
     /// A release while the writer waits restarts the grace period: an aligner
     /// that is producing output is streaming, not stalled, so the gate does not
     /// grow until it has been quiet for a whole grace period.
@@ -611,20 +646,21 @@ mod tests {
         let gate = Arc::new(InFlightGate::new(100, 1000, grace, grace));
         assert!(gate.acquire(100).unwrap(), "fill the budget");
 
+        let downstream = gate.downstream_wait();
         let g2 = Arc::clone(&gate);
-        let start = Instant::now();
         let h = std::thread::spawn(move || {
             // Needs 100 + 50 - 10 = 140 > 100 even after the release below.
             assert!(g2.acquire(50).unwrap());
-            start.elapsed()
+            Instant::now()
         });
         std::thread::sleep(grace / 2);
-        let released_at = start.elapsed();
         gate.release(10);
-        let waited = h.join().unwrap();
+        let resumed_at = Instant::now();
+        drop(downstream);
+        let admitted_at = h.join().unwrap();
         assert!(
-            waited >= released_at + grace,
-            "grew {waited:?} after the start, within a grace of the release at {released_at:?}"
+            admitted_at.duration_since(resumed_at) >= grace,
+            "growth must wait a whole grace after the reader resumes"
         );
         assert_eq!(gate.budget(), 200);
     }
@@ -640,12 +676,9 @@ mod tests {
         assert!(gate.acquire(100).unwrap(), "first stall: grows to 200 after the grace");
         assert_eq!(gate.budget(), 200);
 
-        // Still stalled (no release): 200 + 150 > 200 grows without waiting a
-        // grace period. The bound is loose (half a grace), but a gate that
-        // waited a whole grace per batch would fail it.
-        let start = Instant::now();
+        // An active stall admits further batches; the separate long-grace
+        // regression checks this without a scheduler-sensitive upper bound.
         assert!(gate.acquire(150).unwrap());
-        assert!(start.elapsed() < grace / 2, "a stalled gate admits at once");
         assert_eq!(gate.budget(), 400);
 
         // A release ends the stall; the grown budget stays.
@@ -675,6 +708,23 @@ mod tests {
         assert!(start.elapsed() >= grace, "record progress must restart the growth grace");
         assert_eq!(gate.budget(), 400);
         assert_eq!(gate.in_flight(), 250);
+    }
+
+    #[test]
+    fn in_flight_gate_continuing_stall_does_not_wait_another_grace() {
+        let mut gate = InFlightGate::new(100, 1000, Duration::ZERO, Duration::from_hours(1));
+        assert!(gate.acquire(100).unwrap());
+        assert!(gate.acquire(100).unwrap());
+        gate.stall_grace = Duration::from_hours(1);
+        let gate = Arc::new(gate);
+        let writer = Arc::clone(&gate);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || tx.send(writer.acquire(150)).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        gate.mark_consumer_gone();
+        h.join().unwrap();
+        assert!(result.expect("continuing stall must not wait another hour").unwrap());
+        assert_eq!(gate.budget(), 400);
     }
 
     /// A batch that would take in-flight past the ceiling waits for a release
@@ -747,18 +797,47 @@ mod tests {
             let downstream = reader.downstream_wait();
             blocked_tx.send(()).unwrap();
             std::thread::sleep(blocked_for);
+            let resumed_at = Instant::now();
             drop(downstream);
-            if ceiling == 100 {
+            let released_at = if ceiling == 100 {
                 // At the ceiling the batch can only be admitted by a release.
                 std::thread::sleep(grace);
+                let released_at = Instant::now();
                 reader.release(100);
-            }
+                Some(released_at)
+            } else {
+                None
+            };
+            (resumed_at, released_at)
         });
         blocked_rx.recv().unwrap();
-        let start = Instant::now();
         assert!(gate.acquire(50).unwrap(), "admitted, not failed");
-        assert!(start.elapsed() >= blocked_for, "no growth while the reader is blocked downstream");
+        let admitted_at = Instant::now();
+        let (resumed_at, released_at) = h.join().unwrap();
+        let earliest = released_at.unwrap_or(resumed_at + grace);
+        assert!(admitted_at >= earliest, "admission must follow the reader's transition");
+    }
+
+    #[rstest::rstest]
+    #[case::ceiling(100)]
+    #[case::growth(1000)]
+    fn in_flight_gate_record_progress_does_not_release_bytes(#[case] ceiling: u64) {
+        let quiet_timeout = Duration::from_millis(400);
+        let gate = Arc::new(InFlightGate::new(100, ceiling, quiet_timeout, quiet_timeout));
+        assert!(gate.acquire(100).unwrap());
+        let writer = Arc::clone(&gate);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || tx.send(writer.acquire(50)).unwrap());
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.record_progress();
+            assert_eq!(gate.in_flight(), 100, "progress must not release a token's bytes");
+        }
+        let premature = rx.try_recv();
+        gate.release(100);
         h.join().unwrap();
+        assert!(premature.is_err(), "productive output must prevent growth or failure");
+        assert!(rx.recv().unwrap().unwrap());
     }
 
     /// The configured budget never exceeds the ceiling.

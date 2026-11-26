@@ -37,8 +37,14 @@ use crate::commands::common::{EM_SEQ_MODE_NAME, TAPS_MODE_NAME};
 use crate::commands::fastq::UnalignedReadFormat;
 
 mod scoring;
+mod star;
 pub(crate) use scoring::{BwaScoring, command_passes_meth};
 use scoring::{mem_option_words, mem_word_end};
+
+/// A scratch directory an aligner subprocess writes into (`star`'s logs and
+/// per-chunk files), kept until the aligner has exited and then removed when
+/// the last holder drops it.
+pub(crate) type AlignerScratchDir = std::sync::Arc<tempfile::TempDir>;
 
 // ============================================================================
 // AlignerProcess
@@ -471,13 +477,16 @@ fn relay_stderr(stderr: impl std::io::Read, ring_size: usize) -> Vec<String> {
 
 /// Preset aligner configurations with command-building and index validation.
 ///
-/// Three presets at landing — `bwa-mem3` (the project's primary
-/// subprocess aligner), `bwa` (legacy reference), and `bwa-mem3-inproc`
-/// (bwa-mem3 linked directly into fgumi, gated by the `aligner-bwa-mem3`
-/// build feature; see `AlignerOptions::resolve`). Under runall's
-/// `--methylation-mode`, both bwa-mem3 presets align conversion-aware with
-/// `bwa-mem3 mem --meth` (EM-seq) or `--meth=taps` (TAPS; see
+/// Four presets — `bwa-mem3` (the project's primary subprocess aligner),
+/// `bwa` (legacy reference), `bwa-mem3-inproc` (bwa-mem3 linked directly into
+/// fgumi, gated by the `aligner-bwa-mem3` build feature; see
+/// `AlignerOptions::resolve`), and `star` (the splice-aware STAR aligner for
+/// RNA-seq, which takes its own index directory; see the `star` module). Under
+/// runall's `--methylation-mode`, both bwa-mem3 presets align conversion-aware
+/// with `bwa-mem3 mem --meth` (EM-seq) or `--meth=taps` (TAPS; see
 /// `bwa_mem3_meth_flags` and `AlignerPreset::validate_with_methylation`);
+/// `bwa` and `star` have no such mode, so they are rejected under EM-seq and
+/// align TAPS reads plain;
 /// other bisulfite aligners (e.g. bwameth) go through `--aligner::command`.
 ///
 /// The CLI value for each subprocess variant matches the on-disk binary
@@ -510,24 +519,47 @@ pub enum AlignerPreset {
     /// `bwa-mem3-in-proc`, not `bwa-mem3-inproc`.
     #[value(name = "bwa-mem3-inproc")]
     BwaMem3InProc,
+    /// STAR, the splice-aware RNA-seq aligner (`STAR --runMode alignReads`).
+    /// CLI value: `star`. Needs `--aligner::index <DIR>` (the STAR genome
+    /// directory); `--ref` stays the FASTA whose `.dict` names the output's
+    /// sequences. Reads are fed as unaligned SAM and returned in input order;
+    /// the input must be paired-end (STAR reads it with `--readFilesType SAM
+    /// PE`). The wait for STAR's genome load is reported, never failed, by the
+    /// deadlock watchdog. `runall` only: `fgumi realign` and `runall --realign`
+    /// reject it. STAR's MAPQ is kept: 255 for a unique read (`--outSAMmapqUnique` in
+    /// `--aligner::extra-args` changes it), 3 for two loci, 1 for three or
+    /// four, 0 for more.
+    Star,
 }
 
 impl std::fmt::Display for AlignerPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.binary_name())
+        f.write_str(self.cli_name())
     }
 }
 
 impl AlignerPreset {
-    /// Default binary name (without path) for this preset. Also the
-    /// kebab-case CLI value (`bwa`, `bwa-mem3`). Internal helper —
-    /// callers outside this module should use [`Display`](std::fmt::Display) instead.
+    /// Default binary name (without path) for this preset: the kebab-case CLI
+    /// value (`bwa`, `bwa-mem3`) except for `star`, whose binary is `STAR`.
+    /// Internal helper — callers outside this module should use
+    /// [`Display`](std::fmt::Display) for the preset's name.
     #[must_use]
     pub(crate) fn binary_name(self) -> &'static str {
+        match self {
+            Self::Star => "STAR",
+            other => other.cli_name(),
+        }
+    }
+
+    /// The kebab-case CLI value (`bwa`, `bwa-mem3`, `bwa-mem3-inproc`, `star`),
+    /// as the user typed it.
+    #[must_use]
+    fn cli_name(self) -> &'static str {
         match self {
             Self::Bwa => "bwa",
             Self::BwaMem3 => "bwa-mem3",
             Self::BwaMem3InProc => "bwa-mem3-inproc",
+            Self::Star => "star",
         }
     }
 
@@ -571,6 +603,9 @@ impl AlignerPreset {
             // index sentinel. Indexes built by older bwa-mem3 still carry these
             // four files, so dropping `.0123` is backward-compatible.
             Self::BwaMem3 | Self::BwaMem3InProc => &[".amb", ".ann", ".bwt.2bit.64", ".pac"],
+            // STAR's index is a directory of its own (`--aligner::index`),
+            // checked by `star::check_index`, not files beside the FASTA.
+            Self::Star => &[],
         }
     }
 
@@ -582,18 +617,18 @@ impl AlignerPreset {
     pub(crate) fn meth_flags(self, methylation: MethylationMode) -> Option<&'static str> {
         match self {
             Self::BwaMem3 | Self::BwaMem3InProc => bwa_mem3_meth_flags(methylation),
-            Self::Bwa => None,
+            Self::Bwa | Self::Star => None,
         }
     }
 
     /// Whether this preset consumes `methylation` (`--methylation-mode`): it
     /// aligns conversion-aware ([`Self::meth_flags`]), or is rejected by
-    /// [`Self::validate_methylation`] (`bwa` under EM-seq). `bwa` under TAPS
-    /// aligns plain, so does not consume it.
+    /// [`Self::validate_methylation`] (`bwa` or `star` under EM-seq). Under
+    /// TAPS they align plain, so do not consume it.
     #[must_use]
     pub(crate) fn consumes_methylation(self, methylation: MethylationMode) -> bool {
         self.meth_flags(methylation).is_some()
-            || (self == Self::Bwa && methylation == MethylationMode::EmSeq)
+            || (matches!(self, Self::Bwa | Self::Star) && methylation == MethylationMode::EmSeq)
     }
 
     /// Build the aligner shell command for this preset.
@@ -635,6 +670,10 @@ impl AlignerPreset {
         binary_override: Option<&Path>,
         methylation: MethylationMode,
     ) -> String {
+        debug_assert!(
+            self != Self::Star,
+            "star builds its command with star::build_star_command, not build_command"
+        );
         let binary = match binary_override {
             Some(path) => path.display().to_string(),
             None => self.binary_name().to_string(),
@@ -642,7 +681,8 @@ impl AlignerPreset {
         let ref_str = reference.display();
         let output = match self {
             Self::BwaMem3 | Self::BwaMem3InProc => " --bam=0",
-            Self::Bwa => "",
+            // `star` builds its command with `star::build_star_command`.
+            Self::Bwa | Self::Star => "",
         };
         let meth = self.meth_flags(methylation).map(|flag| format!(" {flag}")).unwrap_or_default();
         format!("{binary} mem{output}{meth} -p -K {chunk_size} -t {threads} {ref_str} /dev/stdin")
@@ -671,10 +711,20 @@ impl AlignerPreset {
     ///    links bwa-mem3 in-process, so there is no binary to find).
     /// 4. All expected index file(s) exist alongside the reference.
     ///
+    /// `star` is rejected: its index is a separate directory, which only
+    /// `AlignerOptions::resolve` (given `--aligner::index`) can check.
+    ///
     /// # Errors
     ///
-    /// Returns an error with a fix-it hint if any of the above fail.
+    /// Returns an error with a fix-it hint if any of the above fail, or for
+    /// `star`.
     pub fn validate(self, reference: &Path, binary_override: Option<&Path>) -> Result<()> {
+        if self == Self::Star {
+            bail!(
+                "AlignerPreset::validate cannot check a star index (a separate directory); \
+                 resolve the options with AlignerOptions::resolve and --aligner::index"
+            );
+        }
         self.validate_with_methylation(reference, binary_override, MethylationMode::Disabled)
     }
 
@@ -726,7 +776,7 @@ impl AlignerPreset {
         if !reference.is_file() {
             bail!(
                 "reference FASTA not found or not a regular file: {} \
-                 (preset `{binary_name}` requires the FASTA + its index files)",
+                 (preset `{self}` requires the FASTA + its index files)",
                 reference.display()
             );
         }
@@ -735,10 +785,12 @@ impl AlignerPreset {
         //    /bin/bash -c, so paths with spaces, quotes, or shell metas
         //    silently break). The in-process backend loads the index
         //    through the library, so only the `@PG CL:` line constrains it.
-        if self.requires_binary() {
-            check_shell_safe_path(reference, "--ref")?;
-        } else {
-            check_header_safe_path(reference, "--ref")?;
+        match self {
+            Self::Bwa | Self::BwaMem3 => check_shell_safe_path(reference, "--ref")?,
+            Self::BwaMem3InProc => check_header_safe_path(reference, "--ref")?,
+            // STAR aligns against `--aligner::index`; `--ref` only names the
+            // dictionary and never reaches a command line or `@PG`.
+            Self::Star => {}
         }
 
         // 3. Binary discovery — skipped for presets that don't need one.
@@ -749,7 +801,7 @@ impl AlignerPreset {
                     if !path.is_file() {
                         bail!(
                             "--aligner-bin path is not a regular file: {} \
-                             (preset `{binary_name}` requires the binary)",
+                             (preset `{self}` requires the binary)",
                             path.display()
                         );
                     }
@@ -771,7 +823,7 @@ impl AlignerPreset {
                         if mode & 0o111 == 0 {
                             bail!(
                                 "--aligner-bin path is not executable: {} \
-                                 (preset `{binary_name}` requires an executable binary; \
+                                 (preset `{self}` requires an executable binary; \
                                  `chmod +x` it or pass a different path)",
                                 path.display()
                             );
@@ -782,7 +834,7 @@ impl AlignerPreset {
                     which::which(binary_name).with_context(|| {
                         format!(
                             "aligner binary `{binary_name}` not found on PATH \
-                             (preset `{binary_name}`; pass --aligner-bin <path> to override)"
+                             (preset `{self}`; pass --aligner-bin <path> to override)"
                         )
                     })?;
                 }
@@ -809,12 +861,12 @@ impl AlignerPreset {
         Ok(())
     }
 
-    /// Reject `bwa` under EM-seq: it has no bisulfite mode. (It aligns TAPS
-    /// plain, since TAPS converts only the methylated cytosines.)
+    /// Reject `bwa` and `star` under EM-seq: neither has a bisulfite mode. (They
+    /// align TAPS plain, since TAPS converts only the methylated cytosines.)
     fn reject_without_bisulfite_mode(self, methylation: MethylationMode) -> Result<()> {
-        if self == Self::Bwa && methylation == MethylationMode::EmSeq {
+        if matches!(self, Self::Bwa | Self::Star) && methylation == MethylationMode::EmSeq {
             bail!(
-                "--methylation-mode {EM_SEQ_MODE_NAME} needs a bisulfite-aware aligner, and `bwa` has \
+                "--methylation-mode {EM_SEQ_MODE_NAME} needs a bisulfite-aware aligner, and `{self}` has \
                  none; use --aligner::preset bwa-mem3 or bwa-mem3-inproc (which align with \
                  bwa-mem3's --meth), or --aligner::command"
             );
@@ -843,9 +895,9 @@ impl AlignerPreset {
     fn meth_original_index_extensions(self) -> &'static [&'static str] {
         match self {
             Self::BwaMem3 => &[".amb", ".ann", ".pac"],
-            // `Bwa` is unreachable here: it has no `--meth` flags
-            // (`meth_flags`), so no dual index is ever checked for it.
-            Self::BwaMem3InProc | Self::Bwa => self.index_extensions(),
+            // `Bwa` and `Star` are unreachable here: they have no `--meth` flags
+            // (`meth_flags`), so no dual index is ever checked for them.
+            Self::BwaMem3InProc | Self::Bwa | Self::Star => self.index_extensions(),
         }
     }
 
@@ -882,9 +934,9 @@ impl AlignerPreset {
                  backend needs the full dual index, including the plain \
                  `{reference}.bwt.2bit.64`; {run}{plain_fallback}"
             ),
-            // `Bwa` is unreachable here: it has no `--meth` flags
-            // (`meth_flags`), so no dual index is ever checked for it.
-            Self::BwaMem3 | Self::Bwa => format!(
+            // `Bwa` and `Star` are unreachable here: they have no `--meth` flags
+            // (`meth_flags`), so no dual index is ever checked for them.
+            Self::BwaMem3 | Self::Bwa | Self::Star => format!(
                 "--methylation-mode {mode} aligns with bwa-mem3 {flag}, which needs the dual \
                  index; {run}{plain_fallback}"
             ),
@@ -1149,6 +1201,9 @@ pub(crate) fn default_sub_batch_templates() -> usize {
 /// - `max_read_ahead` — `Option<u64>` bytes; `None` means the default ceiling,
 ///   which depends on the host's memory (resolved when the align stage is wired).
 ///   Subprocess aligners only (preset or command).
+/// - `index` / `extra_args` — `--aligner::preset star` only (its genome
+///   directory and extra STAR parameters); `Self::resolve` rejects them
+///   otherwise.
 #[multi_options("aligner", "Aligner Options")]
 #[derive(Args, Debug, Clone)]
 pub struct AlignerOptions {
@@ -1163,7 +1218,8 @@ pub struct AlignerOptions {
     #[arg(long = "command")]
     pub command: Option<String>,
 
-    /// Thread count passed to the aligner via `-t` (preset mode only).
+    /// Thread count passed to the aligner via `-t` (`--runThreadN` for `star`;
+    /// preset mode only).
     /// Defaults to runall's top-level `--threads` value when unset.
     /// The aligner uses these threads concurrently with the rest of
     /// the AAM pipeline; oversubscription is the OS scheduler's
@@ -1171,8 +1227,9 @@ pub struct AlignerOptions {
     #[arg(long = "threads")]
     pub threads: Option<usize>,
 
-    /// Bases per aligner batch (preset mode `-K` flag; also drives the
-    /// Step-1 batch size in both modes).
+    /// Bases per aligner batch (the bwa presets' `-K` flag; also sizes the
+    /// in-flight budget in every subprocess mode, which `star` raises to cover
+    /// STAR's read-ahead).
     #[arg(long = "chunk-size", default_value_t = DEFAULT_ALIGNER_CHUNK_SIZE)]
     pub chunk_size: u64,
 
@@ -1196,10 +1253,47 @@ pub struct AlignerOptions {
     /// (interleaved FASTQ) or `sam` (unaligned SAM: an `@HD` line, then one
     /// record per read with FLAG 77 for R1, 141 for R2 and 4 for an unpaired
     /// read, no tags), for aligners that read SAM input. Only valid with
-    /// `--aligner::command`; the presets read FASTQ and reject
-    /// `--aligner::input-format sam`. [default: fastq]
+    /// `--aligner::command`; the bwa presets read FASTQ and reject
+    /// `--aligner::input-format sam`, and `star` reads SAM. [default: fastq]
     #[arg(long = "input-format", value_enum)]
     pub input_format: Option<UnalignedReadFormat>,
+
+    /// The aligner's index directory, for an aligner that does not index
+    /// beside the `--ref` FASTA. Required with `--aligner::preset star`, and
+    /// only valid with it: the STAR genome directory, built by `STAR --runMode
+    /// genomeGenerate` from the same FASTA as `--ref`. Its `chrName.txt` and
+    /// `chrLength.txt`, and the combined `chrNameLength.txt`, must match the
+    /// `--ref` `.dict`; mandatory index files are checked before STAR starts.
+    /// Index and scratch paths must be UTF-8 (spaces are supported).
+    /// Not supported by `fgumi realign`.
+    #[arg(long = "index", value_name = "DIR")]
+    pub index: Option<PathBuf>,
+
+    /// Extra parameters appended to the STAR command line, as one
+    /// whitespace-separated string, e.g. `--outSAMmapqUnique 60
+    /// --outSAMattributes NH HI AS nM NM MD`. Only valid with `--aligner::preset
+    /// star`. Rejected: the parameters the preset sets itself, `--twopassMode`
+    /// (two-pass re-reads the input), `--outFilterType BySJout`,
+    /// `--outSAMprimaryFlag AllBestScore`, `--outSAMfilter`, `--readMapNumber`,
+    /// `--parametersFiles`, `--outSAMreadID` other than `Standard`,
+    /// `--outSAMmode` other than `Full`, `--genomeLoad` other than `NoSharedMemory`,
+    /// `--outSAMmultNmax` other than -1 or a
+    /// positive limit, flag masks that change pairing, mapping, strand or
+    /// alignment-classification bits, and the parameters that write side
+    /// files (`--quantMode`, `--outReadsUnmapped`, chimeric output, `--soloType`,
+    /// `--sjdbInsertSave All`). Both `--name value` and `--name=value` are
+    /// accepted and normalized. Words are split on whitespace: quotes are
+    /// rejected and a value cannot contain a space. A
+    /// `--limitIObufferSize` here also sizes the in-flight budget. Not supported
+    /// by `fgumi realign`.
+    #[arg(long = "extra-args", value_name = "ARGS", allow_hyphen_values = true)]
+    pub extra_args: Option<String>,
+
+    /// Maximum seconds from spawning STAR to its first output (1 or greater).
+    /// Only valid with `--aligner::preset star`. Expiry fails the run and kills
+    /// the subprocess. Increase this for a slow genome load. [default: 900]
+    #[arg(long = "startup-timeout", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub startup_timeout: Option<u64>,
     /// Most memory the unmapped reads sent to the aligner but not yet returned
     /// by it may take, for an aligner that reads further ahead before its first
     /// output than `--aligner::chunk-size` provides for. fgumi then admits more
@@ -1239,6 +1333,9 @@ impl Default for AlignerOptions {
             sub_batch_templates: None,
             dedup_reads: None,
             input_format: None,
+            index: None,
+            extra_args: None,
+            startup_timeout: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         }
@@ -1275,12 +1372,15 @@ pub(crate) enum ResolvedBackend {
         /// would otherwise split every pair silently.
         accept_mid_pair_split: bool,
         /// Format of the reads written to the aligner's stdin
-        /// (`--aligner::input-format`). Always FASTQ for the presets.
+        /// (`--aligner::input-format`). FASTQ for the bwa presets, SAM for
+        /// `star`.
         input_format: UnalignedReadFormat,
         /// `--aligner::max-read-ahead`: the ceiling the in-flight budget may
         /// grow to, or `None` for the default. An explicit value below the
         /// budget `--aligner::chunk-size` derives also lowers the budget.
         max_read_ahead: Option<u64>,
+        /// What a preset knows about running its aligner beyond the command.
+        runtime: SubprocessRuntime,
     },
     /// `--aligner::preset bwa-mem3-inproc`. Constructed only when
     /// `resolve` runs under the `aligner-bwa-mem3` feature (it bails
@@ -1300,6 +1400,28 @@ pub(crate) enum ResolvedBackend {
         /// [`ResolvedAligner::with_xa_max_hits`].
         xa_max_hits: Option<(u32, u32)>,
     },
+}
+
+/// What a subprocess preset knows about running its aligner beyond the command
+/// line. The default (every field off) is what the bwa presets and
+/// `--aligner::command` run with.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SubprocessRuntime {
+    /// STAR's paired SAM input requires a primary R1 and R2 on every template.
+    /// Off for bwa and free-form commands, which may accept single reads.
+    pub require_complete_pairs: bool,
+    /// A scratch directory the command writes into, kept until the aligner has
+    /// exited and then removed (`star`'s logs and per-chunk files).
+    pub work_dir: Option<AlignerScratchDir>,
+    /// A floor for the in-flight unmapped budget, in fgumi heap bytes: the
+    /// aligner's known read-ahead before its first output (`star`, sized by
+    /// `star::star_in_flight_budget`). The budget is the larger of this and the
+    /// `--aligner::chunk-size`-derived one.
+    pub min_in_flight_budget: u64,
+    /// Maximum startup wait for a known slow-starting aligner (`star`). Until
+    /// its first output, the wait is external to the deadlock watchdog, but
+    /// exceeding this deadline fails the run. `None` uses the normal watchdog.
+    pub startup_timeout: Option<std::time::Duration>,
 }
 
 /// Result of [`AlignerOptions::resolve`] — a ready-to-construct aligner
@@ -1467,15 +1589,54 @@ impl AlignerOptions {
                  it bounds the input fgumi holds for a subprocess aligner"
             );
         }
-        // `--aligner::input-format sam` changes what is written to an aligner
-        // subprocess's stdin; every preset aligns FASTQ (bwa/bwa-mem3 `mem -p`,
-        // or in process), so only command mode may ask for SAM.
-        if self.input_format == Some(UnalignedReadFormat::Sam)
-            && let Some(preset) = self.preset
-        {
-            bail!(
+        // `--aligner::input-format` changes what is written to an aligner
+        // subprocess's stdin. The bwa presets align FASTQ (`mem -p`, or in
+        // process) and `star` reads SAM, so only command mode may choose.
+        let star = self.preset == Some(AlignerPreset::Star);
+        match (self.input_format, self.preset) {
+            (Some(UnalignedReadFormat::Sam), Some(preset)) if !star => bail!(
                 "--aligner::input-format sam is only valid with --aligner::command; \
                  --aligner::preset {preset} reads FASTQ"
+            ),
+            (Some(UnalignedReadFormat::Fastq), Some(preset)) if star => bail!(
+                "--aligner::input-format fastq is not valid with --aligner::preset {preset}, \
+                 which reads unaligned SAM"
+            ),
+            _ => {}
+        }
+        // `--aligner::index` and `--aligner::extra-args` configure the STAR
+        // command; the bwa presets index beside `--ref` and a command carries
+        // its own arguments.
+        if !star {
+            for (set, flag) in [
+                (self.index.is_some(), "--aligner::index"),
+                (self.extra_args.is_some(), "--aligner::extra-args"),
+                (self.startup_timeout.is_some(), "--aligner::startup-timeout"),
+            ] {
+                if set {
+                    bail!(
+                        "{flag} is only valid with --aligner::preset star (bwa presets read \
+                         the index beside --ref; --aligner::command carries its own arguments)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject an aligner the realign stage cannot use: `star`. Realign chooses
+    /// each read's primary among bwa's `XA` alternatives and rescores a
+    /// promoted alignment with bwa scoring, and STAR emits neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for `--aligner::preset star`.
+    pub(crate) fn check_realign_support(&self) -> Result<()> {
+        if self.preset == Some(AlignerPreset::Star) {
+            bail!(
+                "--aligner::preset star cannot realign: realign picks alternatives from bwa's \
+                 XA tag and rescores them with bwa scoring, which STAR does not emit; use a \
+                 bwa-mem3 preset"
             );
         }
         Ok(())
@@ -1503,7 +1664,12 @@ impl AlignerOptions {
     ///   `MAX_SUB_BATCH_TEMPLATES`.
     /// - `--aligner::dedup-reads` set with any preset other than
     ///   `bwa-mem3-inproc`, or with command mode.
-    /// - `--aligner::input-format sam` with any preset.
+    /// - `--aligner::input-format sam` with a bwa preset, or `fastq` with `star`.
+    /// - `--aligner::index` or `--aligner::extra-args` with anything but `star`.
+    /// - `star` without `--aligner::index`, with an index whose
+    ///   chromosome metadata disagrees with the `--ref` `.dict`, or with an
+    ///   extra STAR parameter the streaming preset cannot run with (see
+    ///   `star::StarExtraArgs::parse`).
     /// - `--aligner::max-read-ahead` set with `bwa-mem3-inproc`.
     /// - Command mode + a preset-only flag (`--aligner-bin` or
     ///   `--aligner::threads`).
@@ -1542,7 +1708,9 @@ impl AlignerOptions {
         // batching while the in-process cutter used the exact value — the two
         // backends would cut cohorts differently. Command mode sets its own
         // `-K` (this flag only sizes its in-flight budget), so it is exempt.
-        if self.preset.is_some() && self.chunk_size > MAX_PRESET_CHUNK_SIZE {
+        if self.preset.is_some_and(|p| p != AlignerPreset::Star)
+            && self.chunk_size > MAX_PRESET_CHUNK_SIZE
+        {
             bail!(
                 "--aligner::chunk-size must be at most {MAX_PRESET_CHUNK_SIZE} (got {}) with \
                  --aligner::preset: bwa parses -K as a 32-bit int",
@@ -1550,7 +1718,7 @@ impl AlignerOptions {
             );
         }
         self.check_backend_specific_flags()?;
-        match (self.preset, self.command) {
+        match (self.preset, self.command.clone()) {
             (None, None) => bail!(
                 "aligning requires one of `--aligner::preset` \
                  (e.g. bwa-mem3, bwa) or `--aligner::command \"...\"`"
@@ -1559,6 +1727,9 @@ impl AlignerOptions {
                 "--aligner::preset and --aligner::command are mutually exclusive; \
                  pass only one"
             ),
+            (Some(AlignerPreset::Star), None) => {
+                star::resolve_star(&self, reference, top_threads, aligner_bin)
+            }
             (Some(AlignerPreset::BwaMem3InProc), None) => resolve_inproc(
                 reference,
                 self.threads,
@@ -1595,6 +1766,7 @@ impl AlignerOptions {
                         accept_mid_pair_split: true,
                         input_format: UnalignedReadFormat::Fastq,
                         max_read_ahead: self.max_read_ahead,
+                        runtime: SubprocessRuntime::default(),
                     },
                     chunk_size: self.chunk_size,
                     threads: Some(threads),
@@ -1635,6 +1807,7 @@ impl AlignerOptions {
                         accept_mid_pair_split: false,
                         input_format: self.input_format.unwrap_or_default(),
                         max_read_ahead: self.max_read_ahead,
+                        runtime: SubprocessRuntime::default(),
                     },
                     chunk_size: self.chunk_size,
                     threads: None,
@@ -2108,6 +2281,9 @@ mod tests {
             sub_batch_templates: None,
             dedup_reads: None,
             input_format: None,
+            index: None,
+            extra_args: None,
+            startup_timeout: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2168,8 +2344,8 @@ mod tests {
         );
     }
 
-    /// An explicit `--aligner::input-format fastq` is accepted with every
-    /// subprocess preset: it names the format the presets already read.
+    /// An explicit `--aligner::input-format fastq` is accepted with every bwa
+    /// subprocess preset: it names the format those presets already read.
     #[rstest]
     #[case::bwa(AlignerPreset::Bwa)]
     #[case::bwa_mem3(AlignerPreset::BwaMem3)]
@@ -2209,6 +2385,9 @@ mod tests {
             sub_batch_templates: None,
             dedup_reads: None,
             input_format: None,
+            index: None,
+            extra_args: None,
+            startup_timeout: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2555,6 +2734,7 @@ mod tests {
             accept_mid_pair_split,
             input_format,
             max_read_ahead: resolved_max,
+            ..
         } = resolved.backend
         else {
             panic!("a subprocess preset must resolve to ResolvedBackend::Subprocess");
@@ -2602,6 +2782,7 @@ mod tests {
                 accept_mid_pair_split: true,
                 input_format: UnalignedReadFormat::Fastq,
                 max_read_ahead: None,
+                runtime: SubprocessRuntime::default(),
             },
             chunk_size: 10,
             threads: Some(4),
@@ -2852,6 +3033,9 @@ mod tests {
             sub_batch_templates: None,
             dedup_reads: None,
             input_format: None,
+            index: None,
+            extra_args: None,
+            startup_timeout: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -2880,6 +3064,9 @@ mod tests {
             sub_batch_templates: None,
             dedup_reads: None,
             input_format: None,
+            index: None,
+            extra_args: None,
+            startup_timeout: None,
             max_read_ahead: None,
             methylation_mode: MethylationMode::Disabled,
         };
@@ -3006,7 +3193,8 @@ mod tests {
     }
 
     /// A preset consumes `--methylation-mode` when it aligns conversion-aware or
-    /// validation rejects it (`bwa` under EM-seq); `bwa` aligns TAPS plain.
+    /// validation rejects it (`bwa` or `star` under EM-seq); `bwa` and `star`
+    /// align TAPS plain.
     #[rstest]
     #[case::bwa_mem3_emseq(AlignerPreset::BwaMem3, MethylationMode::EmSeq, true)]
     #[case::bwa_mem3_taps(AlignerPreset::BwaMem3, MethylationMode::Taps, true)]
@@ -3015,6 +3203,9 @@ mod tests {
     #[case::bwa_emseq_rejected(AlignerPreset::Bwa, MethylationMode::EmSeq, true)]
     #[case::bwa_taps_plain(AlignerPreset::Bwa, MethylationMode::Taps, false)]
     #[case::bwa_disabled(AlignerPreset::Bwa, MethylationMode::Disabled, false)]
+    #[case::star_emseq_rejected(AlignerPreset::Star, MethylationMode::EmSeq, true)]
+    #[case::star_taps_plain(AlignerPreset::Star, MethylationMode::Taps, false)]
+    #[case::star_disabled(AlignerPreset::Star, MethylationMode::Disabled, false)]
     fn consumes_methylation_cases(
         #[case] preset: AlignerPreset,
         #[case] methylation: MethylationMode,
