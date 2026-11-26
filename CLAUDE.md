@@ -142,6 +142,30 @@ clippy lints that flag them.
 
 Uses `mimalloc` as global allocator for performance.
 
+## Signal Handling
+
+`main` calls `fgumi_lib::termination::install()`, which turns SIGINT, SIGTERM
+and SIGHUP into cancellation (`src/lib/termination.rs`; user-facing behaviour
+in `docs/src/guide/troubleshooting.md`). Two rules keep it working:
+
+- **Scope rule.** Code that creates state needing cleanup on interruption (a
+  spawned process, temp directories, a staged output) opens a
+  `termination::scope()` *before* creating it, declared so it drops *after*
+  that state, and attaches a cancel target (`Scope::on_cancel`) or polls
+  `termination::check()`. `build_for`/`build_merge` (attaching the pipeline's
+  `CancelHandle`), `StagedSortOutput`, `merge` and `review` do. With no scope
+  open, a signal kills fgumi at once, as it would without the handler. Call
+  `termination::check()?` before creating (truncating) or publishing a
+  user-visible output while a scope is open (the chain build does so before
+  `add_sink` and the rejects files; staged outputs before `persist`), and end
+  a scope once nothing it covers needs cleanup, so a later signal is not
+  accepted for work that will never notice it.
+- **Signal-thread invariant.** After accepting a request the `fgumi-signal`
+  thread only sleeps, reads signal-hook's pipe, takes the coordinator's leaf
+  mutex and stores atomics: no logging, joins or cancel targets (those run on
+  a one-shot thread), so a blocked stderr or wedged worker cannot disable the
+  second-signal and watchdog escape hatches.
+
 ## Unsafe Code
 
 `#![deny(unsafe_code)]` is set at the crate root of every workspace member except
