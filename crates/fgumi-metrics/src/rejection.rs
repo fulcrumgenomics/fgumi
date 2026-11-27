@@ -55,8 +55,8 @@ pub enum RejectionReason {
     ZeroBasesPostTrimming,
     /// Template did not have a single primary FR pair of reads (codec)
     NotPrimaryFrPair,
-    /// Overlap between R1s and R2s too short for CODEC calling (fgbio
-    /// `r1_r2_overlap_too_short`; used by codec)
+    /// No aligned R1/R2 overlap or too few duplex-supported consensus bases for CODEC
+    /// (fgbio `r1_r2_overlap_too_short`; used by codec)
     R1R2OverlapTooShort,
     /// Indel error between the top/bottom strands (fgbio
     /// `indel_error_between_strands`; used by codec)
@@ -73,11 +73,12 @@ pub enum RejectionReason {
     Downsampled,
     /// The two strands' alignments dovetail — each runs past the far end of the other rather
     /// than one nesting within the span of the other — and the legacy `[neg.start, pos.end]`
-    /// overlap window (fgbio parity, `--legacy-overlap-window`) therefore rejects them even
-    /// though neither CIGAR contains an indel. fgumi-specific: the corrected default window
-    /// admits these pairs, so this reason is only produced under `--legacy-overlap-window`,
-    /// where it is reported in place of the `indel_error_between_strands` bucket fgbio
-    /// mislabels them under (fulcrumgenomics/fgbio#1173, fgumi#761).
+    /// overlap window (`--legacy-overlap-window`, matching fgbio before fgbio#1174) therefore
+    /// rejects them even though neither CIGAR contains an indel. fgumi-specific: the corrected
+    /// default mode never rejects a pair for dovetailing, so this reason is only produced under
+    /// `--legacy-overlap-window`, where it is reported in place of the
+    /// `indel_error_between_strands` bucket that fgbio before fgbio#1174 used for them
+    /// (fulcrumgenomics/fgbio#1173, fgumi#761).
     Dovetail,
 }
 
@@ -107,7 +108,9 @@ impl RejectionReason {
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
-            Self::R1R2OverlapTooShort => "Overlap between R1s and R2s too short for CODEC calling",
+            Self::R1R2OverlapTooShort => {
+                "No aligned R1/R2 overlap or too few duplex-supported consensus bases for CODEC calling"
+            }
             Self::IndelErrorBetweenStrands => "Indel error between top/bottom strands",
             // fgbio's exact string (note the "top/bottoms" typo), matched for parity.
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
@@ -175,7 +178,9 @@ impl RejectionReason {
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::ZeroBasesPostTrimming => "Read or mate had zero bases post trimming",
             Self::NotPrimaryFrPair => "Template did not have a single primary FR pair of reads",
-            Self::R1R2OverlapTooShort => "Overlap between R1s and R2s too short for CODEC calling",
+            Self::R1R2OverlapTooShort => {
+                "No aligned R1/R2 overlap or too few duplex-supported consensus bases for CODEC calling"
+            }
             Self::IndelErrorBetweenStrands => "Indel error between top/bottom strands",
             Self::HighDuplexDisagreement => "Too many errors between top/bottoms strands",
             Self::ClipOverlapFailed => "See https://github.com/fulcrumgenomics/fgbio/issues/1090",
@@ -241,7 +246,7 @@ mod tests {
     #[rstest::rstest]
     #[case::r1_r2_overlap_too_short(
         RejectionReason::R1R2OverlapTooShort,
-        "Overlap between R1s and R2s too short for CODEC calling",
+        "No aligned R1/R2 overlap or too few duplex-supported consensus bases for CODEC calling",
         "raw_reads_rejected_for_r1_r2_overlap_too_short"
     )]
     #[case::indel_error_between_strands(

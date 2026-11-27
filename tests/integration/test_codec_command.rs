@@ -162,6 +162,116 @@ fn test_codec_command_basic_consensus() {
     assert!(consensus_count > 0, "Should have produced at least one consensus read");
 }
 
+/// Returns the integer value of the `key` row in a `--stats` file's contents.
+fn stat_value(stats: &str, key: &str) -> usize {
+    stats
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+        .and_then(|rest| rest.split('\t').next())
+        .unwrap_or_else(|| panic!("stats must contain a {key} row"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} must be an integer"))
+}
+
+/// The command and pipeline count supported SS query positions, not the reference overlap.
+/// Rejects and statistics must agree in both execution paths, including legacy mode.
+#[rstest]
+#[case::supported_30("30", false, 1, None)]
+#[case::supported_40("40", false, 1, None)]
+#[case::unsupported_41("41", false, 0, Some("raw_reads_rejected_for_r1_r2_overlap_too_short"))]
+#[case::legacy_dovetail("1", true, 0, Some("raw_reads_rejected_for_dovetail"))]
+fn test_codec_command_supported_duplex_length(
+    #[case] minimum: &str,
+    #[case] legacy: bool,
+    #[case] expected_count: usize,
+    #[case] rejection_key: Option<&str>,
+    #[values(None, Some("2"))] threads: Option<&str>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let input = temp_dir.path().join("input.bam");
+    let output = temp_dir.path().join("output.bam");
+    let rejects = temp_dir.path().join("rejects.bam");
+    let stats_file = temp_dir.path().join("stats.tsv");
+    let mut r1 = SamBuilder::new();
+    r1.read_name(b"dovetail")
+        .sequence(&[b'A'; 40])
+        .qualities(&[35; 40])
+        .cigar_ops(&[(10 << 4) | 4, 30 << 4])
+        .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(110)
+        .mate_ref_id(0)
+        .mate_pos(100)
+        .template_length(40)
+        .mapq(60)
+        .add_string_tag(SamTag::MI, b"molecule1")
+        .add_string_tag(SamTag::MC, b"30M10S");
+    let mut r2 = SamBuilder::new();
+    r2.read_name(b"dovetail")
+        .sequence(&[b'A'; 40])
+        .qualities(&[35; 40])
+        .cigar_ops(&[30 << 4, (10 << 4) | 4])
+        .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+        .ref_id(0)
+        .pos(100)
+        .mate_ref_id(0)
+        .mate_pos(110)
+        .template_length(-40)
+        .mapq(60)
+        .add_string_tag(SamTag::MI, b"molecule1")
+        .add_string_tag(SamTag::MC, b"10S30M");
+    let (r1, r2) = (r1.build(), r2.build());
+    let expected_rejects = if expected_count == 0 {
+        vec![r1.as_ref().to_vec(), r2.as_ref().to_vec()]
+    } else {
+        Vec::new()
+    };
+    create_codec_test_bam(&input, vec![(r1, r2)]);
+    let mut args = vec![
+        "codec",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--rejects",
+        rejects.to_str().unwrap(),
+        "--stats",
+        stats_file.to_str().unwrap(),
+        "--min-duplex-length",
+        minimum,
+    ];
+    if legacy {
+        args.push("--legacy-overlap-window");
+    }
+    if let Some(threads) = threads {
+        args.extend(["--threads", threads]);
+    }
+    Codec::try_parse_from(args).unwrap().execute("fgumi codec").unwrap();
+    let (_, records) = read_bam_output(&output);
+    assert_eq!(records.len(), expected_count);
+    if expected_count == 1 {
+        assert_eq!(records[0].sequence().as_ref(), &[b'A'; 40]);
+    }
+    let (mut rejects_reader, _) = fgumi_bam_io::create_raw_bam_reader(&rejects, 1).unwrap();
+    let mut rejected = Vec::new();
+    let mut record = RawRecord::new();
+    while rejects_reader.read_record(&mut record).unwrap() != 0 {
+        rejected.push(record.as_ref().to_vec());
+    }
+    assert_eq!(
+        rejected, expected_rejects,
+        "rejects must preserve every input record byte-for-byte and in input order"
+    );
+    let stats = fs::read_to_string(stats_file).unwrap();
+    let stat = |key: &str| stat_value(&stats, key);
+    assert_eq!(stat("consensus_reads_emitted"), expected_count);
+    assert_eq!(stat("consensus_duplex_bases_emitted"), expected_count * 40);
+    assert_eq!(stat("consensus_reads_rejected_hdd"), 0);
+    if let Some(key) = rejection_key {
+        assert_eq!(stat(key), 2);
+    }
+}
+
 /// CODEC3-05 (end-to-end): `--single-strand-qual` must mask the single-strand tails, which are
 /// padded with lowercase `n`. The offset molecule spans ref[0..40) with 10 single-strand
 /// positions on each end. Asserts the *complete* emitted output — record count, all consensus
@@ -439,13 +549,7 @@ fn test_codec_stats_consensus_reads_matches_records_written(#[case] threads: Opt
     let records_written = records.len();
 
     let stats = fs::read_to_string(&stats_file).expect("Failed to read stats");
-    let emitted: usize = stats
-        .lines()
-        .find_map(|line| line.strip_prefix("consensus_reads_emitted\t"))
-        .and_then(|rest| rest.split('\t').next())
-        .expect("stats must contain a consensus_reads_emitted row")
-        .parse()
-        .expect("consensus_reads_emitted must be an integer");
+    let emitted = stat_value(&stats, "consensus_reads_emitted");
 
     assert_eq!(
         emitted, records_written,
@@ -833,15 +937,7 @@ fn test_codec_rejects_bam_reconciles_with_stats(#[case] threads: Option<&str>) {
     );
 
     let stats = fs::read_to_string(&stats_file).expect("Failed to read stats");
-    let stat = |key: &str| -> usize {
-        stats
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
-            .and_then(|rest| rest.split('\t').next())
-            .unwrap_or_else(|| panic!("stats must contain a {key} row"))
-            .parse()
-            .unwrap_or_else(|_| panic!("{key} must be an integer"))
-    };
+    let stat = |key: &str| stat_value(&stats, key);
     assert_eq!(
         stat("raw_reads_rejected_for_minority_alignment"),
         2,

@@ -419,7 +419,7 @@ pub enum RejectionReason {
     QualityTrimmed,
     /// Read has zero length after masking low quality bases (all bases became N)
     ZeroLengthAfterTrimming,
-    /// Insufficient overlap between reads (e.g., R1/R2 overlap for duplex)
+    /// No aligned R1/R2 overlap or too few positions supported by both SS consensuses (CODEC)
     InsufficientOverlap,
     /// Only one of R1/R2 consensus was generated (orphan)
     OrphanConsensus,
@@ -444,8 +444,9 @@ pub enum RejectionReason {
     /// The two strands' alignments dovetail (each runs past the far end of the other), so the
     /// legacy `[neg.start, pos.end]` overlap window rejects them with no indel present. Only
     /// produced by the codec caller under `--legacy-overlap-window`; the corrected default
-    /// window admits these pairs. Replaces the misleading `IndelErrorBetweenStrands` label
-    /// fgbio uses for the same pairs (fgumi#761, fulcrumgenomics/fgbio#1173).
+    /// mode never rejects a pair for dovetailing. Replaces the misleading `IndelErrorBetweenStrands` label
+    /// that fgbio before fgbio#1174 used for the same pairs (fgumi#761,
+    /// fulcrumgenomics/fgbio#1173).
     Dovetail,
     /// Other unspecified reason
     Other,
@@ -497,7 +498,9 @@ impl RejectionReason {
             Self::QualityTrimmed => "Quality-trimmed below acceptable length",
             Self::ZeroLengthAfterTrimming => "Zero length after masking low quality bases",
             Self::MissingUmi => "Missing UMI tag",
-            Self::InsufficientOverlap => "Insufficient overlap between reads",
+            Self::InsufficientOverlap => {
+                "No aligned R1/R2 overlap or too few duplex-supported consensus bases"
+            }
             Self::OrphanConsensus => "Only one of R1 or R2 consensus generated",
             Self::IndelErrorBetweenStrands => "Overlap boundary lands in indel between strands",
             Self::ClipOverlapFailed => "Overlap clipping failed (consensus shorter than a strand)",
@@ -548,9 +551,10 @@ impl RejectionReason {
             // fgumi-specific: fgbio has no downsampled rejection metric yet
             // (fulcrumgenomics/fgbio#1166, #1167), so this diverges from fgbio under a cap.
             Self::Downsampled => CentralReason::Downsampled,
-            // fgumi-specific: only produced under `--legacy-overlap-window`. fgbio buckets
-            // these dovetail rejections under `indel_error_between_strands`; fgumi labels them
-            // honestly instead, so the legacy-window stats diverge from fgbio here (fgumi#761).
+            // fgumi-specific: only produced under `--legacy-overlap-window`. fgbio before
+            // fgbio#1174 bucketed these dovetail rejections under `indel_error_between_strands`;
+            // fgumi labels them honestly instead, so the legacy-window stats diverge from that
+            // fgbio here (fgumi#761).
             Self::Dovetail => CentralReason::Dovetail,
         }
     }
@@ -1452,7 +1456,7 @@ mod tests {
         );
         assert_eq!(
             RejectionReason::InsufficientOverlap.description(),
-            "Insufficient overlap between reads"
+            "No aligned R1/R2 overlap or too few duplex-supported consensus bases"
         );
         assert_eq!(
             RejectionReason::OrphanConsensus.description(),

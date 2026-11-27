@@ -130,8 +130,8 @@ pub struct ConsensusMetrics {
     /// Reads rejected because the template was not a single primary FR pair (codec)
     pub rejected_not_primary_fr_pair: u64,
 
-    /// Reads rejected because the R1/R2 overlap was too short for CODEC (fgbio
-    /// `r1_r2_overlap_too_short`; codec)
+    /// Reads rejected because R1/R2 lack aligned overlap or have too few duplex-supported
+    /// consensus bases for CODEC (fgbio `r1_r2_overlap_too_short`; codec)
     pub rejected_r1_r2_overlap_too_short: u64,
 
     /// Reads rejected due to an indel error between the top/bottom strands (fgbio
@@ -152,8 +152,8 @@ pub struct ConsensusMetrics {
     pub rejected_downsampled: u64,
 
     /// Reads rejected because their alignments dovetail, under the legacy overlap window
-    /// (`--legacy-overlap-window`). fgumi-specific: the corrected default window admits
-    /// these, so this row is emitted only when non-zero (fgumi#761).
+    /// (`--legacy-overlap-window`). fgumi-specific: the corrected default mode never rejects
+    /// a pair for dovetailing, so this row is emitted only when non-zero (fgumi#761).
     pub rejected_dovetail: u64,
 
     /// Consensus reads rejected for high duplex disagreement (fgbio

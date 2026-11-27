@@ -309,6 +309,15 @@ throws an `ArrayIndexOutOfBoundsException` for every simplex read and for every 
 at least one non-N base; a duplex read whose bases are all N skips masking and is kept or rejected
 by the no-call check alone.
 
+### CODEC Minimum Duplex Length
+
+`codec --min-duplex-length` counts the positions at which both single-strand consensus reads
+make a (non-N) call, disagreements included, as fgbio does from
+[fgbio#1174](https://github.com/fulcrumgenomics/fgbio/pull/1174). Earlier fgbio releases
+compared the threshold to the length of the reference window between the two alignments.
+`--legacy-overlap-window` restores that reference-window threshold together with the legacy
+window's rejection of dovetailed pairs.
+
 ### Removed Options
 
 The `--sort-order` flag has been removed from `simplex` and `codec`. Output sort order for
