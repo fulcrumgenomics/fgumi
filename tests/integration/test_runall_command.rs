@@ -4304,7 +4304,7 @@ const FASTQ_ECHO_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\"; print \"@HD\", \"V
 /// SAM `@HD` line first, then 11-column records with FLAG 77 or 141, and echoes
 /// each read back unmapped under the reference's `@SQ`. A malformed stream makes
 /// it exit non-zero, failing the run.
-const SAM_ECHO_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\" } \
+pub(crate) const SAM_ECHO_ALIGNER: &str = "awk 'BEGIN { OFS = \"\\t\" } \
     NR == 1 { if ($0 != \"@HD\\tVN:1.6\\tSO:unsorted\") exit 3; \
               print \"@HD\", \"VN:1.6\"; print \"@SQ\", \"SN:chr1\", \"LN:10000\"; next } \
     NF != 11 || ($2 != 77 && $2 != 141) { exit 4 } \

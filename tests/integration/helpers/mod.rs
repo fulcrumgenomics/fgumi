@@ -109,6 +109,33 @@ pub fn read_bam_output(
     (header, records)
 }
 
+/// Waits for `child` to exit and returns its status, or kills and reaps it and
+/// returns `None` if it is still running after `timeout`: a watchdog for a
+/// test whose failure mode is a hung subprocess. Unlike [`run_with_timeout`],
+/// it leaves nothing running. The caller drains any piped output (on another
+/// thread, so a full pipe cannot stall the child).
+///
+/// # Panics
+///
+/// If the child cannot be polled.
+pub fn wait_or_kill(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Runs `f` on a detached thread and returns its result, or panics if `f`
 /// does not finish within `timeout`: a liveness watchdog for tests whose
 /// failure mode is a hang.

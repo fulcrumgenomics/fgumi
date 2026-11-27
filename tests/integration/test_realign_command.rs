@@ -197,9 +197,8 @@ fn realign_bounds_a_broken_pipe_drain(#[case] templates: usize) {
     let tmp = TempDir::new().expect("tempdir");
     let dir = tmp.path();
     let input = if templates == 1 {
-        // Keep the final flush larger than the OS pipe but smaller than the
-        // FASTQ writer buffer. Even if the writer runs before stdin closes,
-        // the flush cannot succeed by fitting entirely into the pipe.
+        // Keep the batch larger than the OS pipe. Even if the writer runs
+        // before stdin closes, the write cannot fit entirely into the pipe.
         let mut records = [
             consensus_read("cons:0", flags::FIRST_SEGMENT, Some("chr1:1-100:+")),
             consensus_read("cons:0", flags::LAST_SEGMENT, None),
@@ -267,6 +266,56 @@ fn realign_reports_out_of_order_aligner_output_not_the_broken_pipe() {
             && !error_head.to_ascii_lowercase().contains("broken pipe"),
         "neither the aligner's exit nor a broken pipe may be reported as the cause:\n{stderr}"
     );
+}
+
+/// A streaming aligner must not hang the FASTQ or SAM input path on an input
+/// much larger than the pipe buffers. The stage used to send a batch's
+/// pairing token to its reader only after writing the whole batch, so once the
+/// aligner's stdout pipe filled, the aligner stopped reading, the writer
+/// blocked on its stdin, and the reader waited for the token forever. A
+/// regression is caught by fgumi's deadlock detector; the test's timeout is a backstop.
+#[rstest::rstest]
+#[case::fastq("fastq", UNMAPPED_ALIGNER)]
+#[case::sam("sam", crate::test_runall_command::SAM_ECHO_ALIGNER)]
+fn realign_with_a_streaming_aligner_does_not_hang(
+    #[case] input_format: &str,
+    #[case] aligner: &str,
+) {
+    use std::time::Duration;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let pairs = 50_000;
+    let input = write_consensus(dir, pairs, |_| (Some("chr1:1-100:+"), None));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let mut child = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", aligner, "--aligner::input-format", input_format])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fgumi realign");
+    let mut fgumi_stderr = child.stderr.take().expect("stderr piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut fgumi_stderr, &mut text);
+        text
+    });
+    let status = crate::helpers::wait_or_kill(&mut child, Duration::from_mins(2));
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = status.unwrap_or_else(|| panic!("realign hung on a streaming aligner:\n{stderr}"));
+    assert!(status.success(), "realign failed:\n{stderr}");
+    // Every consensus end comes back once, R1 and R2 of each pair, with no read
+    // lost, duplicated or renamed by the streaming exchange.
+    let got: Vec<(String, bool)> =
+        primary_ends(&output).into_iter().map(|(name, r1, _, _)| (name, r1)).collect();
+    let mut want: Vec<(String, bool)> = (0..pairs)
+        .flat_map(|i| [(format!("cons:{i}"), true), (format!("cons:{i}"), false)])
+        .collect();
+    want.sort(); // `primary_ends` returns its ends sorted.
+    assert_eq!(got.len(), 2 * pairs, "every read is written");
+    assert_eq!(got, want, "every consensus end must come back exactly once");
 }
 
 /// A window-grouped input whose consensus ends lack `rw` where the raw reads
