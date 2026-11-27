@@ -88,7 +88,7 @@ rand = "0.10"
 # `libc::getrlimit` is `unsafe` and the crate root is `#![deny(unsafe_code)]`,
 # and `nix` is scoped to `cfg(target_os = "linux")` there (its uses are
 # Linux-only APIs). `rustix` is already compiled on every platform via `fs4` and
-# `tempfile`, so it costs nothing new. Declared here so the one member that calls it directly
+# `tempfile`, so it costs nothing new. Declared here so the members that call it directly
 # cannot drift onto a different major version than those crates pull in. `std`
 # is named explicitly rather than inherited: it is on today only because `fs4`
 # and `tempfile` enable rustix's defaults, and a transitive change that stopped
@@ -180,6 +180,13 @@ fgumi-pipeline-core = { workspace = true }
 fgumi-pipeline-io = { workspace = true }
 fgumi-cli-macros = { workspace = true }
 which = { workspace = true }
+
+# `process` gives `aligner.rs` a safe `killpg` (`kill_process_group`) to tear
+# down the aligner's whole process group. `fgumi-sort` already builds rustix
+# with `process` on every Unix target, so it costs nothing new; `nix` would need
+# its `signal` feature and is scoped to Linux in this crate.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = { workspace = true }

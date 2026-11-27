@@ -269,6 +269,109 @@ fn realign_reports_out_of_order_aligner_output_not_the_broken_pipe() {
     );
 }
 
+/// When the align stage fails, fgumi exits promptly and takes the aligner's own
+/// processes with it. The stand-in aligner backgrounds a long-lived grandchild
+/// that inherits its stdout and stderr (as the real aligner under a
+/// `/bin/bash -c` wrapper does), records its PID, then writes output that is not
+/// SAM. Teardown that killed only the wrapper left the grandchild holding the
+/// pipes, and fgumi logged the failure but never exited.
+#[cfg(unix)]
+#[test]
+fn realign_failure_kills_the_aligner_process_group() {
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = write_consensus(dir, 2, |_| (Some("chr1:1-100:+"), None));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let pid_file = dir.join("grandchild.pid");
+    let aligner = format!(
+        "sleep 600 & echo $! > '{}'; echo 'this line is not a SAM header or record'; wait # {{ref}}",
+        pid_file.display()
+    );
+    let mut child = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", &aligner])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fgumi realign");
+    // Drain fgumi's stderr on a thread, so a chatty run cannot block on it.
+    let mut fgumi_stderr = child.stderr.take().expect("stderr piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut fgumi_stderr, &mut text);
+        text
+    });
+
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll fgumi") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let grandchild_pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw);
+    // A hung run (the regression) is killed here, with the grandchild, so the
+    // failure does not leave either behind.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let alive = |pid: rustix::process::Pid| {
+        if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+            return false;
+        }
+        let state = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.as_raw_pid().to_string()])
+            .output()
+            .expect("probe helper state");
+        if !state.status.success() {
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "ps failed without confirming PID absence: {state:?}"
+            );
+            return false;
+        }
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(!state.trim().is_empty(), "ps returned no state");
+        !state.trim_start().starts_with('Z')
+    };
+    // A zombie is terminated and holds no pipes, even if init never reaps it.
+    let grandchild_survived = grandchild_pid.is_some_and(|pid| {
+        let gone_by = Instant::now() + Duration::from_secs(10);
+        while alive(pid) {
+            if Instant::now() >= gone_by {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    });
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    let status =
+        status.unwrap_or_else(|| panic!("fgumi hung after the align stage failed:\n{stderr}"));
+    assert!(!status.success(), "realign must fail on output that is not SAM:\n{stderr}");
+    // The reader rejected the stand-in's output (it has no `@SQ` header), not
+    // some earlier step of the run.
+    assert!(
+        stderr.contains("aligner @SQ count (0) does not match"),
+        "the run must fail on the aligner's output:\n{stderr}"
+    );
+    assert!(grandchild_pid.is_some(), "the stand-in aligner never ran:\n{stderr}");
+    assert!(!grandchild_survived, "the aligner's grandchild survived teardown:\n{stderr}");
+}
+
 /// A window-grouped input whose consensus ends lack `rw` where the raw reads
 /// never mapped (here: every R2, and one whole pair) realigns; those ends are
 /// counted as without a window.
