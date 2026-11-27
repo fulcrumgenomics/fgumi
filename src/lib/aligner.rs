@@ -50,6 +50,17 @@ pub(crate) type AlignerScratchDir = std::sync::Arc<tempfile::TempDir>;
 // AlignerProcess
 // ============================================================================
 
+/// How a child that exited without a code died: `signal N` on Unix, where
+/// that is the only other way to exit, else a bare `signal`.
+fn killed_by(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return format!("signal {signal}");
+    }
+    let _ = status;
+    "signal".to_string()
+}
+
 /// A running aligner subprocess with managed stdin, stdout, and stderr.
 ///
 /// The aligner is spawned via `/bin/bash -c`, allowing the command string
@@ -231,6 +242,17 @@ impl AlignerProcess {
         self.stdout.take()
     }
 
+    /// Check without blocking whether both the child and its stderr relay
+    /// have finished, so [`Self::wait`] can collect their results immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying the child's exit status fails.
+    pub(crate) fn is_finished(&mut self) -> std::io::Result<bool> {
+        Ok(self.child.try_wait()?.is_some()
+            && self.stderr_thread.as_ref().is_none_or(JoinHandle::is_finished))
+    }
+
     /// Wait for the aligner process to finish.
     ///
     /// Drops any not-yet-taken stdin/stdout handle before waiting — most
@@ -275,7 +297,7 @@ impl AlignerProcess {
         };
 
         if !status.success() {
-            let code = status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+            let code = status.code().map_or_else(|| killed_by(status), |c| c.to_string());
             let tail = if last_lines.is_empty() {
                 "(no stderr captured)".to_string()
             } else {
@@ -2116,6 +2138,48 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("status"), "error message should mention status: {msg}");
         assert!(msg.contains("oh-no"), "error should include stderr ring: {msg}");
+    }
+
+    /// Child exit is insufficient while the stderr relay still has work.
+    #[rstest]
+    #[case::relay_pending(false)]
+    #[case::relay_finished(true)]
+    fn completion_probe_does_not_wait_for_stderr(#[case] release_relay: bool) {
+        let mut process =
+            AlignerProcess::spawn("printf 'failure-detail\\n' >&2; exit 42", 10).expect("spawn");
+        process.child.wait().expect("child exit");
+        let captured = process.stderr_thread.take().expect("relay").join().expect("stderr capture");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        process.stderr_thread = Some(thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            captured
+        }));
+        if release_relay {
+            release_tx.send(()).expect("release relay");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !process.stderr_thread.as_ref().expect("relay").is_finished() {
+                assert!(std::time::Instant::now() < deadline, "relay must finish");
+                thread::yield_now();
+            }
+        }
+        let start = std::time::Instant::now();
+        let finished = process.is_finished().expect("nonblocking completion probe");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "probe must not join stderr");
+        assert_eq!(finished, release_relay);
+        drop(release_tx);
+        let error = process.wait().expect_err("collect the failed child's result").to_string();
+        assert!(error.contains("exited with status 42."), "{error}");
+        assert!(error.contains("failure-detail"), "{error}");
+    }
+
+    /// An aligner killed by a signal is reported with the signal's number, so
+    /// e.g. an OOM kill (9) is not mistaken for any other death.
+    #[cfg(unix)]
+    #[test]
+    fn test_killed_aligner_names_the_signal() {
+        let proc = AlignerProcess::spawn("kill -KILL $$", 10).expect("spawn ok");
+        let msg = proc.wait().expect_err("a killed aligner fails").to_string();
+        assert!(msg.contains("exited with status signal 9."), "error should name SIGKILL: {msg}");
     }
 
     /// Verify that stdin can be written to and the subprocess reads it.

@@ -64,6 +64,7 @@ use std::process::ChildStdout;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use noodles::sam::Header;
@@ -96,6 +97,11 @@ use crate::template::Template;
 
 /// Number of aligner stderr lines retained for failure diagnostics.
 const ALIGNER_STDERR_RING_SIZE: usize = 50;
+
+/// Grace period for the reader to publish a root cause after a writer cascade.
+/// A failed stdin pipe does not guarantee stdout EOF, so only this failure path
+/// is bounded; healthy alignment can take as long as it needs.
+const CASCADE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Bound for `in_chan` (dispatcher → writer thread). Two batches in
 /// flight match bwa's `kt_pipeline` `p_nt=2` double-buffer: one batch
@@ -235,10 +241,16 @@ struct BatchToken {
 ///
 /// The error slot is set-once: the first thread to fail wins; later
 /// thread errors are dropped because they're likely cascading
-/// consequences of the first (e.g., closed pipe → writer error
-/// downstream of a crashed reader).
+/// consequences of the first. The one exception is a *cascade* error (see
+/// [`Self::record_cascade_error`]): the writer stopping because the other end
+/// went away, either a broken pipe to the aligner's stdin or the reader no
+/// longer taking batch tokens. That is a symptom, never a cause, and the reader
+/// that stopped the aligner (by closing its stdout on bad output) records its
+/// error only after its stdout and token receiver have dropped, so a cascade
+/// error is held aside and a root-cause error recorded during the bounded drain
+/// still wins.
 struct SharedState {
-    error_slot: Mutex<Option<io::Error>>,
+    error_slot: Mutex<ErrorSlot>,
     /// The aligner's start-up wait, for a [`SubprocessConfig::startup_timeout`]
     /// aligner.
     startup: Mutex<StartupWait>,
@@ -257,9 +269,25 @@ struct StartupWait {
     claim: Option<ExternalWaitClaim>,
 }
 
+/// See [`SharedState`].
+#[derive(Default)]
+struct ErrorSlot {
+    /// The first root-cause error.
+    error: Option<io::Error>,
+    /// When the first cascade was recorded and its error. The deadline starts
+    /// here, even if dispatch has already closed input or is backpressured.
+    cascade: Option<(Instant, io::Error)>,
+    /// The first returned dispatch error, retained before the Serial guard is
+    /// released so another worker cannot enter a successful or blocking drain.
+    reported_error: Option<(io::ErrorKind, String)>,
+}
+
 impl SharedState {
     fn new() -> Self {
-        Self { error_slot: Mutex::new(None), startup: Mutex::new(StartupWait::default()) }
+        Self {
+            error_slot: Mutex::new(ErrorSlot::default()),
+            startup: Mutex::new(StartupWait::default()),
+        }
     }
 
     /// From a pipeline worker: count the aligner's start-up as an external
@@ -307,18 +335,82 @@ impl SharedState {
         startup.claim = None;
     }
 
-    /// Record an error if none has been recorded yet. First writer wins.
+    /// Reconstruct the failure already returned by a previous dispatch.
+    fn reported_dispatch_error(&self) -> Option<io::Error> {
+        self.error_slot
+            .lock()
+            .reported_error
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+
+    /// Retain the selected failure before the dispatcher releases its Serial
+    /// guard, preserving its kind and message if another worker publishes first.
+    fn record_dispatch_error(&self, error: &io::Error) {
+        self.error_slot
+            .lock()
+            .reported_error
+            .get_or_insert_with(|| (error.kind(), error.to_string()));
+    }
+
+    /// Record a root-cause error if none has been recorded yet. First writer
+    /// wins.
     fn record_error(&self, err: io::Error) {
         let mut guard = self.error_slot.lock();
-        if guard.is_none() {
-            *guard = Some(err);
+        if guard.error.is_none() {
+            guard.error = Some(err);
         }
     }
 
-    /// Take any recorded error.
-    fn take_error(&self) -> Option<io::Error> {
-        self.error_slot.lock().take()
+    /// Record a cascade error: the writer stopped because the aligner stopped
+    /// reading its stdin or the reader stopped taking tokens. It is reported
+    /// only if no root-cause error arrives before the drain deadline.
+    fn record_cascade_error(&self, err: io::Error) {
+        let mut guard = self.error_slot.lock();
+        if guard.cascade.is_none() {
+            guard.cascade = Some((Instant::now(), err));
+        }
     }
+
+    /// Take the recorded root-cause error, if any, leaving a cascade error.
+    fn take_root_cause(&self) -> Option<io::Error> {
+        self.error_slot.lock().error.take()
+    }
+
+    /// Whether a cascade error has been recorded.
+    fn has_cascade(&self) -> bool {
+        self.error_slot.lock().cascade.is_some()
+    }
+
+    /// Take a root cause immediately, or a cascade once its reader grace period
+    /// expires. One lock makes a root cause published by the deadline win.
+    fn take_dispatch_error(&self, now: Instant) -> Option<io::Error> {
+        let mut guard = self.error_slot.lock();
+        if let Some(error) = guard.error.take() {
+            return Some(error);
+        }
+        if guard.cascade.as_ref().is_some_and(|(recorded_at, _)| {
+            now.saturating_duration_since(*recorded_at) >= CASCADE_DRAIN_TIMEOUT
+        }) {
+            return guard.cascade.take().map(|(_, error)| error);
+        }
+        None
+    }
+
+    /// Take the recorded root-cause error, else the cascade error.
+    fn take_error(&self) -> Option<io::Error> {
+        let mut guard = self.error_slot.lock();
+        guard.error.take().or_else(|| guard.cascade.take().map(|(_, error)| error))
+    }
+}
+
+/// Whether a writer error is a broken pipe to the aligner's stdin: the aligner
+/// stopped reading (it exited, or was killed because its output was rejected),
+/// so the writer's failure is a consequence, not a cause.
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -536,8 +628,7 @@ fn writer_loop(
         // costs at most one extra write per batch.
         if let Err(e) = writer.flush() {
             let msg = format!("align-and-merge writer: flush: {e}");
-            shared.record_error(io::Error::other(msg.clone()));
-            return Err(io::Error::other(msg));
+            return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
         }
         match gate.acquire(batch_bytes) {
             Ok(true) => {}
@@ -611,8 +702,7 @@ fn writer_loop(
                         "align-and-merge writer: writing {format} for template '{name}': {e:#}",
                         name = String::from_utf8_lossy(template.name()),
                     );
-                    shared.record_error(io::Error::other(msg.clone()));
-                    return Err(io::Error::other(msg));
+                    return Err(record_writer_error(&shared, is_broken_pipe(&e), msg));
                 }
                 wrote_any = true;
             }
@@ -656,9 +746,15 @@ fn writer_loop(
         // makes room. If the reader has died, the channel disconnect
         // surfaces here and we exit.
         if token_tx.send(token).is_err() {
-            // Reader thread is gone — we cannot make progress.
-            // Don't record an error: the reader's own error (if any)
-            // is the root cause; we just shut down quietly.
+            // Reader thread is gone — we cannot make progress. Its own error
+            // (if any) is the root cause, but it records that only after
+            // dropping the token receiver, so record a cascade error: the step
+            // then drains and waits for the reader rather than failing at once
+            // with a generic "writer is gone". If the reader records nothing,
+            // the drain deadline reports that input was left unaligned.
+            shared.record_cascade_error(io::Error::other(
+                "align-and-merge writer: the reader stopped while input remained",
+            ));
             return Ok(());
         }
     }
@@ -670,11 +766,24 @@ fn writer_loop(
         // and the error_slot fallback both see the actionable text (matching the
         // write_fastq_record / no-primary paths above).
         let msg = format!("align-and-merge writer: flush: {e}");
-        shared.record_error(io::Error::other(msg.clone()));
-        return Err(io::Error::other(msg));
+        return Err(record_writer_error(&shared, e.kind() == io::ErrorKind::BrokenPipe, msg));
     }
     drop(writer);
     Ok(())
+}
+
+/// Record a writer I/O failure in `shared` and return it. A broken pipe to the
+/// aligner's stdin is a cascade error (see [`SharedState::record_cascade_error`])
+/// and keeps its [`io::ErrorKind::BrokenPipe`] kind, so `finalize` can rank it
+/// below the error that stopped the aligner; anything else is a root cause.
+fn record_writer_error(shared: &SharedState, broken_pipe: bool, msg: String) -> io::Error {
+    if broken_pipe {
+        shared.record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, msg.clone()));
+        io::Error::new(io::ErrorKind::BrokenPipe, msg)
+    } else {
+        shared.record_error(io::Error::other(msg.clone()));
+        io::Error::other(msg)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1371,9 +1480,41 @@ impl Step for SubprocessAlignStep {
     }
 
     fn try_run(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
-        // 1. Fast-fail on any async error from the threads.
-        if let Some(e) = self.shared.take_error() {
-            return Err(e);
+        if let Some(error) = self.shared.reported_dispatch_error() {
+            return Err(error);
+        }
+        let result = self.try_run_inner(ctx);
+        if let Err(error) = &result {
+            self.shared.record_dispatch_error(error);
+        }
+        result
+    }
+}
+
+impl SubprocessAlignStep {
+    /// Run one dispatch, with the outer entry point retaining any returned error.
+    fn try_run_inner(&mut self, ctx: &mut StepCtx<'_, Self>) -> io::Result<StepOutcome> {
+        // 1. Fast-fail on a root-cause error from the threads. This is how a
+        //    reader error is normally reported: the reader records it as it
+        //    exits, before the step reaches `finalize`. A writer cascade error
+        //    alone gets a bounded grace period for the reader's error to arrive.
+        //    Check before all backpressure returns, even after input was closed.
+        if let Some(err) = self.shared.take_root_cause() {
+            return Err(err);
+        }
+        // An already-finished aligner can supply the cause of a writer cascade.
+        // Collect it before returning the cascade, but never wait on a live child,
+        // an I/O thread, or its stderr relay from this failure path.
+        if self.shared.has_cascade()
+            && self.reader_thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && self.writer_thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(aligner) = self.aligner.as_mut()
+            && aligner.is_finished()?
+        {
+            return self.finalize();
+        }
+        if let Some(err) = self.shared.take_dispatch_error(Instant::now()) {
+            return Err(err);
         }
         if let Some(timeout) = self.cfg.startup_timeout {
             self.shared.claim_startup_wait(self.started_at, timeout)?;
@@ -1446,18 +1587,7 @@ impl Step for SubprocessAlignStep {
                         self.held_in.put(b);
                         return Ok(outcome(did_work));
                     }
-                    Err(TrySendError::Disconnected(_)) => {
-                        // Prefer the writer's own recorded error (the root cause)
-                        // over a generic disconnect message; the writer records
-                        // to `error_slot` before dropping its channel end, so a
-                        // disconnect here usually means it already failed for a
-                        // specific, actionable reason.
-                        return Err(self.shared.take_error().unwrap_or_else(|| {
-                            io::Error::other(
-                                "align-and-merge: writer thread is gone (channel disconnected)",
-                            )
-                        }));
-                    }
+                    Err(TrySendError::Disconnected(_)) => return self.writer_gone(),
                 }
             }
             // 4b. Pump from ctx.input → in_chan until either side stalls.
@@ -1468,18 +1598,7 @@ impl Step for SubprocessAlignStep {
                         self.held_in.put(b);
                         return Ok(outcome(did_work));
                     }
-                    Err(TrySendError::Disconnected(_)) => {
-                        // Prefer the writer's own recorded error (the root cause)
-                        // over a generic disconnect message; the writer records
-                        // to `error_slot` before dropping its channel end, so a
-                        // disconnect here usually means it already failed for a
-                        // specific, actionable reason.
-                        return Err(self.shared.take_error().unwrap_or_else(|| {
-                            io::Error::other(
-                                "align-and-merge: writer thread is gone (channel disconnected)",
-                            )
-                        }));
-                    }
+                    Err(TrySendError::Disconnected(_)) => return self.writer_gone(),
                 }
             }
             // 4c-guard: ready to close once input is drained and `held_in` is
@@ -1504,7 +1623,22 @@ impl Step for SubprocessAlignStep {
         //    the reader is finished and the receiver is drained), wait on the
         //    subprocess, and surface errors.
         let reader_finished = self.reader_thread.as_ref().is_none_or(JoinHandle::is_finished);
-        if !self.held_out.is_held() && reader_finished {
+        let writer_finished = self.writer_thread.as_ref().is_none_or(JoinHandle::is_finished);
+        // A finished reader does not imply a finished writer or child. In the
+        // cascade case, keep dispatching until step 1 reports the reader's root
+        // cause or the expired cascade; never enter finalize's blocking waits.
+        // Check the slot AFTER writer completion so its final flush cannot race
+        // this gate and publish a cascade after we have committed to finalize.
+        if !self.held_out.is_held()
+            && reader_finished
+            && writer_finished
+            && !self.shared.has_cascade()
+        {
+            // Both threads are now finished, so no later root cause can race
+            // this final check or leave us waiting on the child after a failure.
+            if let Some(err) = self.shared.take_root_cause() {
+                return Err(err);
+            }
             // The reader has exited, so it will send no more batches — but it
             // may have buffered a final batch in `out_rx` in the window between
             // step 3's last `try_recv` (which saw `Empty`) and `is_finished()`
@@ -1530,14 +1664,42 @@ impl Step for SubprocessAlignStep {
 }
 
 impl SubprocessAlignStep {
-    /// Completion barrier, reached from `try_run` once the reader has exited,
-    /// `out_rx` is empty, and `held_out` is empty (so no aligner output can be
-    /// lost). Joins the writer + reader daemons, waits for the aligner
-    /// subprocess, and surfaces any error in the documented order
-    /// (aligner-exit → reader → writer → `error_slot` fallback). Returns
-    /// `StepOutcome::Finished`. The joins cannot deadlock here: the gate
-    /// guarantees the reader returned (so the bounded `out_chan` is closed) and
-    /// the writer has already seen `in_tx` disconnect.
+    /// The writer thread exited while input remained. A root-cause error it (or
+    /// the reader) recorded is returned at once. A cascade error alone (a
+    /// broken pipe to the aligner's stdin, or the reader no longer taking
+    /// tokens) usually follows the reader rejecting the aligner's output and
+    /// closing its stdout, an error the reader may still be recording; so the
+    /// step stops feeding the aligner and enters the drain phase. The reader's
+    /// error then surfaces at `try_run`'s step 1, and the cascade error only
+    /// if no root cause arrives before the grace period expires.
+    ///
+    /// Unlike a successful drain, this waits at most [`CASCADE_DRAIN_TIMEOUT`]
+    /// from the first recorded cascade. If stdout stays open, `try_run` reports
+    /// the cascade and Drop kills the aligner rather than waiting for EOF.
+    fn writer_gone(&mut self) -> io::Result<StepOutcome> {
+        if let Some(err) = self.shared.take_root_cause() {
+            return Err(err);
+        }
+        if self.shared.has_cascade() {
+            drop(self.in_tx.take());
+            drop(self.held_in.take());
+            return Ok(StepOutcome::Progress);
+        }
+        Err(io::Error::other("align-and-merge: writer thread is gone (channel disconnected)"))
+    }
+
+    /// Completion barrier after a successful output drain, or after a cascade
+    /// once both I/O threads, child, and stderr relay have finished. A successful
+    /// drain requires `out_rx` and `held_out` to be empty; the cascade path always
+    /// fails, so any buffered output is discarded.
+    /// Joins the writer + reader daemons, waits for the aligner
+    /// subprocess, and surfaces the error [`rank_align_errors`] puts first (the
+    /// reader's, with the aligner's exit after it; else the aligner's exit;
+    /// else the writer's), with the `error_slot` as fallback. A reader error
+    /// usually never gets here: `try_run` returns it as soon as it is recorded.
+    /// Returns
+    /// `StepOutcome::Finished`. Both callers guarantee that the I/O threads have
+    /// finished, so these joins cannot wait on live pipes or channels.
     fn finalize(&mut self) -> io::Result<StepOutcome> {
         let writer_handle =
             self.writer_thread.take().expect("writer_thread is Some until finalize");
@@ -1546,47 +1708,66 @@ impl SubprocessAlignStep {
         // Drop the receiver; the reader has already exited.
         let _ = self.out_rx.take();
 
-        // Join threads. Both have exited by now — the writer when in_rx
-        // disconnected (we dropped in_tx), the reader when aligner stdout
-        // reached EOF (observed via `is_finished()` in the gate).
+        // Both I/O threads have exited: after input/output EOF on a successful
+        // drain, or after a cascade has stopped the writer and reader.
         let writer_result = writer_handle.join();
         let reader_result = reader_handle.join();
 
         // Wait for the subprocess to exit. `AlignerProcess::wait` consumes it.
         let aligner_result = self.aligner.take().expect("aligner is Some until finalize").wait();
 
-        // Surface errors. Order: aligner exit first because its stderr ring is
-        // the most actionable diagnostic in the common failure mode
-        // (aligner-crash). Reader / writer errors typically cascade from an
-        // aligner failure (broken pipes, mismatched template counts).
-        aligner_result
-            .map_err(|e| io::Error::other(format!("aligner subprocess failed: {e:#}")))?;
-
-        // Then reader: it observes aligner stdout, so its errors (header parse,
-        // mismatched template count, etc.) describe aligner output shape.
-        match reader_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_panic) => return Err(io::Error::other("align-and-merge reader thread panicked")),
-        }
-
-        // Writer last: its only failure mode (modulo pipe-broken from an
-        // aligner crash, already covered above) is a write_fastq_record bug.
-        match writer_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_panic) => return Err(io::Error::other("align-and-merge writer thread panicked")),
+        let reader_result = match reader_result {
+            Ok(result) => result,
+            Err(_panic) => Err(io::Error::other("align-and-merge reader thread panicked")),
+        };
+        let writer_result = match writer_result {
+            Ok(result) => result,
+            Err(_panic) => Err(io::Error::other("align-and-merge writer thread panicked")),
+        };
+        if let Some(err) = rank_align_errors(aligner_result, reader_result, writer_result) {
+            return Err(err);
         }
 
         // Fallback: surface any error recorded in `shared.error_slot` that
-        // didn't come through a thread's `Result`. Both threads return Err
-        // when they record to the slot, so a non-empty slot here indicates a
-        // future bug — surface it loudly rather than swallow.
+        // didn't come through a thread's `Result`. The writer returns `Ok`
+        // after recording a cascade error when the reader stopped taking
+        // tokens, so a cascade here means input was left unaligned; anything
+        // else would be a future bug. Surface it rather than swallow it.
         if let Some(e) = self.shared.take_error() {
             return Err(e);
         }
 
         Ok(StepOutcome::Finished)
+    }
+}
+
+/// The error `finalize` reports for the aligner's exit, the reader and the
+/// writer, or `None` if all three succeeded.
+///
+/// A reader error is reported first, as `try_run` reports it when it arrives
+/// before `finalize`: when the reader rejected the aligner's output (out of
+/// input order, a missing template, a malformed record) it is the cause, and
+/// when the aligner crashed it already says the aligner's output ended early.
+/// The aligner's exit status and stderr tail follow it when the aligner also
+/// failed. How the aligner died cannot tell these apart: an aligner that
+/// ignores SIGPIPE exits with its own status when its stdout is closed. Then
+/// the aligner's failure on its own, and last the writer's error (a broken
+/// pipe included).
+fn rank_align_errors(
+    aligner: anyhow::Result<()>,
+    reader: io::Result<()>,
+    writer: io::Result<()>,
+) -> Option<io::Error> {
+    match (aligner, reader) {
+        (Err(aligner), Err(reader)) => Some(io::Error::new(
+            reader.kind(),
+            format!("{reader}; the aligner exited: {aligner:#}"),
+        )),
+        (Ok(()), Err(reader)) => Some(reader),
+        (Err(aligner), Ok(())) => {
+            Some(io::Error::other(format!("aligner subprocess failed: {aligner:#}")))
+        }
+        (Ok(()), Ok(())) => writer.err(),
     }
 }
 
@@ -1874,6 +2055,590 @@ mod tests {
             assert!(startup.over);
             assert!(startup.claim.is_none(), "expiry releases the watchdog claim");
         }
+    }
+
+    /// `finalize` reports the reader's error first (with the aligner's exit
+    /// after it when the aligner also failed), else the aligner's failure, and
+    /// the writer's error only when nothing else failed.
+    #[rstest::rstest]
+    #[case::reader_and_aligner(
+        Some("exited with status 1"),
+        Some("bad order"),
+        Some(Pipe::Broken),
+        Some("bad order; the aligner exited: exited with status 1")
+    )]
+    #[case::reader_only(None, Some("bad order"), Some(Pipe::Broken), Some("bad order"))]
+    #[case::aligner_only(
+        Some("exited with status 1"),
+        None,
+        Some(Pipe::Broken),
+        Some("aligner subprocess failed: exited with status 1")
+    )]
+    #[case::writer_broken_pipe_only(None, None, Some(Pipe::Broken), Some("broken pipe"))]
+    #[case::writer_only(None, None, Some(Pipe::Other), Some("writer failed"))]
+    #[case::all_ok(None, None, None, None)]
+    fn rank_align_errors_puts_the_cause_first(
+        #[case] aligner: Option<&str>,
+        #[case] reader: Option<&str>,
+        #[case] writer: Option<Pipe>,
+        #[case] expected: Option<&str>,
+    ) {
+        let aligner = aligner.map_or(Ok(()), |msg| Err(anyhow!("{msg}")));
+        let reader =
+            reader.map_or(Ok(()), |msg| Err(io::Error::new(io::ErrorKind::InvalidData, msg)));
+        let writer = writer.map_or(Ok(()), |pipe| match pipe {
+            Pipe::Broken => Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
+            Pipe::Other => Err(io::Error::other("writer failed")),
+        });
+        let reader_failed = reader.is_err();
+        let ranked = rank_align_errors(aligner, reader, writer);
+        if reader_failed {
+            let kind = ranked.as_ref().map(io::Error::kind);
+            assert_eq!(kind, Some(io::ErrorKind::InvalidData), "the reader's kind is kept");
+        }
+        assert_eq!(ranked.map(|e| e.to_string()).as_deref(), expected);
+    }
+
+    /// How the stdin writer failed.
+    #[derive(Debug, Clone, Copy)]
+    enum Pipe {
+        Broken,
+        Other,
+    }
+
+    /// A cascade error recorded before the reader's error does not mask it: the
+    /// root cause wins whichever thread records first, and the cascade is
+    /// reported only when nothing else is.
+    #[rstest::rstest]
+    #[case::cascade_first(true)]
+    #[case::cause_first(false)]
+    fn shared_state_prefers_the_root_cause(#[case] cascade_first: bool) {
+        let shared = SharedState::new();
+        let cascade = || io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe");
+        if cascade_first {
+            shared.record_cascade_error(cascade());
+            assert!(shared.has_cascade(), "the cascade is recorded");
+            shared.record_error(io::Error::other("queryname mismatch"));
+        } else {
+            shared.record_error(io::Error::other("queryname mismatch"));
+            shared.record_cascade_error(cascade());
+        }
+        assert_eq!(shared.take_error().expect("an error").to_string(), "queryname mismatch");
+
+        let only_cascade = SharedState::new();
+        only_cascade.record_cascade_error(cascade());
+        assert!(only_cascade.take_root_cause().is_none(), "a cascade is not a root cause");
+        assert_eq!(only_cascade.take_error().expect("the cascade").to_string(), "broken pipe");
+    }
+
+    /// Only cascade errors expire; a root cause wins even at the deadline.
+    #[rstest::rstest]
+    #[case::healthy(false, None, 10_000, None)]
+    #[case::root_only(false, Some("reader failed"), 0, Some(("reader failed", io::ErrorKind::InvalidData)))]
+    #[case::before_deadline(true, None, 999, None)]
+    #[case::at_deadline(true, None, 1000, Some(("broken pipe", io::ErrorKind::BrokenPipe)))]
+    #[case::after_deadline(true, None, 1001, Some(("broken pipe", io::ErrorKind::BrokenPipe)))]
+    #[case::reader_before_deadline(true, Some("reader failed"), 999, Some(("reader failed", io::ErrorKind::InvalidData)))]
+    #[case::reader_at_deadline(true, Some("reader failed"), 1000, Some(("reader failed", io::ErrorKind::InvalidData)))]
+    #[case::reader_after_deadline(true, Some("reader failed"), 1001, Some(("reader failed", io::ErrorKind::InvalidData)))]
+    fn shared_state_bounds_only_cascade_errors(
+        #[case] cascade: bool,
+        #[case] root: Option<&str>,
+        #[case] elapsed_ms: u64,
+        #[case] expected: Option<(&str, io::ErrorKind)>,
+    ) {
+        let shared = SharedState::new();
+        if cascade {
+            shared.record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+        }
+        let recorded_at = shared
+            .error_slot
+            .lock()
+            .cascade
+            .as_ref()
+            .map_or_else(Instant::now, |(recorded_at, _)| *recorded_at);
+        if let Some(msg) = root {
+            shared.record_error(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+        let error = shared.take_dispatch_error(recorded_at + Duration::from_millis(elapsed_ms));
+        assert_eq!(
+            error.map(|error| (error.to_string(), error.kind())),
+            expected.map(|(msg, kind)| (msg.to_string(), kind))
+        );
+    }
+
+    /// A writer broken pipe is recorded as a cascade error and keeps its kind;
+    /// any other writer failure is a root cause.
+    #[rstest::rstest]
+    #[case::broken_pipe(true, io::ErrorKind::BrokenPipe)]
+    #[case::other(false, io::ErrorKind::Other)]
+    fn record_writer_error_routes_a_broken_pipe_to_the_cascade(
+        #[case] broken_pipe: bool,
+        #[case] expected_kind: io::ErrorKind,
+    ) {
+        let shared = SharedState::new();
+        let returned = record_writer_error(&shared, broken_pipe, "writer failed".to_string());
+        assert_eq!(returned.kind(), expected_kind);
+        assert_eq!(shared.has_cascade(), broken_pipe);
+        assert_eq!(shared.take_root_cause().is_some(), !broken_pipe);
+    }
+
+    /// The writer's broken-pipe check sees through `anyhow` context.
+    #[test]
+    fn is_broken_pipe_finds_a_wrapped_io_error() {
+        let wrapped = anyhow::Error::from(io::Error::new(io::ErrorKind::BrokenPipe, "pipe"))
+            .context("writing a record");
+        assert!(is_broken_pipe(&wrapped));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("no primary records")));
+    }
+
+    /// What the slot holds when the writer thread is found gone.
+    #[derive(Debug, Clone, Copy)]
+    enum Recorded {
+        RootCause,
+        Cascade,
+        Nothing,
+    }
+
+    /// `writer_gone` returns a recorded root cause at once, drains on a cascade
+    /// alone (closing the aligner's stdin and dropping held input), and fails
+    /// with a generic error when nothing was recorded.
+    #[rstest::rstest]
+    #[case::root_cause(Recorded::RootCause, Err("queryname mismatch"))]
+    #[case::cascade_only(Recorded::Cascade, Ok(()))]
+    #[case::nothing(Recorded::Nothing, Err("writer thread is gone"))]
+    fn writer_gone_drains_only_on_a_cascade(
+        #[case] recorded: Recorded,
+        #[case] expected: Result<(), &str>,
+    ) {
+        let mut step = SubprocessAlignStep::new(make_test_cfg(), "cat").expect("spawn cat");
+        step.held_in.put(BamTemplateBatch::new(0, vec![make_paired_primary_template(b"q")]));
+        match recorded {
+            Recorded::RootCause => step.shared.record_error(io::Error::other("queryname mismatch")),
+            Recorded::Cascade => step
+                .shared
+                .record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
+            Recorded::Nothing => {}
+        }
+        match (step.writer_gone(), expected) {
+            (Ok(outcome), Ok(())) => {
+                assert!(matches!(outcome, StepOutcome::Progress), "drains: {outcome:?}");
+                assert!(step.in_tx.is_none(), "the aligner's stdin is closed");
+                assert!(!step.held_in.is_held(), "held input is dropped");
+                assert!(step.shared.has_cascade(), "the cascade stays for the bounded drain");
+            }
+            (Err(err), Err(needle)) => {
+                assert!(err.to_string().contains(needle), "expected {needle:?}, got: {err}");
+            }
+            (got, want) => panic!("expected {want:?}, got {got:?}"),
+        }
+    }
+
+    /// A published root cause or expired cascade wins over a startup timeout.
+    #[rstest::rstest]
+    #[case::root_cause(false, io::ErrorKind::InvalidData, "reader rejected output")]
+    #[case::expired_cascade(true, io::ErrorKind::BrokenPipe, "broken pipe")]
+    fn dispatch_error_precedes_startup_timeout(
+        #[case] cascade: bool,
+        #[case] expected_kind: io::ErrorKind,
+        #[case] expected_message: &str,
+    ) {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut cfg = make_test_cfg();
+        cfg.startup_timeout = Some(Duration::ZERO);
+        let mut step = SubprocessAlignStep::new(cfg, "exec sleep 8").expect("spawn sleep");
+        if cascade {
+            step.shared
+                .record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+            step.shared.error_slot.lock().cascade.as_mut().expect("cascade").0 =
+                Instant::now().checked_sub(CASCADE_DRAIN_TIMEOUT).expect("backdate cascade");
+        } else {
+            step.shared
+                .record_error(io::Error::new(io::ErrorKind::InvalidData, "reader rejected output"));
+        }
+        let probe = StepProbe::new(&step);
+        let error = probe.try_run(&mut step).expect_err("the recorded failure must win");
+        assert_eq!(error.kind(), expected_kind);
+        assert_eq!(error.to_string(), expected_message);
+    }
+
+    /// An expired cascade must beat a held-output retry that downstream refuses.
+    #[test]
+    fn cascade_deadline_precedes_output_backpressure() {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut cfg = make_test_cfg();
+        cfg.output_byte_limit = 1;
+        let mut step = SubprocessAlignStep::new(cfg, "exec sleep 8").expect("spawn sleep");
+        let (out_tx, out_rx) = sync_channel(OUT_CHAN_DEPTH);
+        step.out_rx = Some(out_rx);
+        for serial in 0..2 {
+            out_tx
+                .send(ZipperBatch {
+                    serial,
+                    mapped: Vec::new(),
+                    unmapped: BamTemplateBatch::new(
+                        serial,
+                        vec![make_paired_primary_template(b"q")],
+                    ),
+                })
+                .expect("queue output");
+        }
+        drop(out_tx);
+        let probe = StepProbe::new(&step);
+        assert_eq!(probe.try_run(&mut step).expect("fill downstream"), StepOutcome::Progress);
+        assert!(step.held_out.is_held(), "the second batch must be held");
+        assert_eq!(probe.try_run(&mut step).expect("refused retry"), StepOutcome::NoProgress);
+
+        step.shared.record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+        step.shared.error_slot.lock().cascade.as_mut().expect("cascade").0 =
+            Instant::now().checked_sub(CASCADE_DRAIN_TIMEOUT).expect("backdate cascade");
+        let error = probe.try_run(&mut step).expect_err("deadline must beat backpressure");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "broken pipe");
+    }
+
+    /// An exited aligner's status and stderr must beat a cascade, even after
+    /// its deadline, when the writer failed before sending any batch token.
+    #[rstest::rstest]
+    #[case::before_deadline(0)]
+    #[case::after_deadline(1100)]
+    fn cascade_preserves_an_exited_aligners_failure(
+        #[case] elapsed_ms: u64,
+        #[values(UnalignedReadFormat::Fastq, UnalignedReadFormat::Sam)]
+        input_format: UnalignedReadFormat,
+    ) {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut cfg = make_test_cfg();
+        cfg.input_format = input_format;
+        cfg.require_complete_pairs = true;
+        let mut step = SubprocessAlignStep::new(
+            cfg,
+            "exec 0<&-; printf '@HD\\tVN:1.6\\n'; printf 'startup-failed\\n' >&2; exit 42",
+        )
+        .expect("spawn failing aligner");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !step.shared.startup.lock().over {
+            assert!(Instant::now() < deadline, "the aligner must close stdin and write its header");
+            thread::sleep(Duration::from_millis(1));
+        }
+        while !step.aligner.as_mut().expect("aligner").is_finished().expect("completion probe") {
+            assert!(Instant::now() < deadline, "the failing aligner and stderr relay must finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Force a write before token publication rather than fitting into the
+        // buffer and letting a token turn the reader's clean EOF into an error.
+        let sequence = vec![b'A'; FASTQ_WRITER_BUF_BYTES];
+        let qualities = vec![b'I'; FASTQ_WRITER_BUF_BYTES];
+        let records = [FIRST_SEGMENT, LAST_SEGMENT]
+            .into_iter()
+            .map(|mate| {
+                let mut builder = fgumi_raw_bam::SamBuilder::new();
+                builder
+                    .read_name(b"early_exit")
+                    .flags(PAIRED | mate)
+                    .sequence(&sequence)
+                    .qualities(&qualities);
+                builder.build()
+            })
+            .collect();
+        let template = Template::from_records(records).expect("complete primary pair");
+        step.in_tx
+            .take()
+            .expect("writer input")
+            .send(BamTemplateBatch::new(0, vec![template]))
+            .expect("queue input and close it");
+        while !step.reader_thread.as_ref().expect("reader").is_finished()
+            || !step.writer_thread.as_ref().expect("writer").is_finished()
+        {
+            assert!(Instant::now() < deadline, "I/O threads must finish after the failed write");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(step.shared.take_root_cause().is_none(), "no token reached the reader");
+        step.shared.error_slot.lock().cascade.as_mut().expect("writer cascade").0 = Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .expect("backdate cascade");
+        let probe = StepProbe::new(&step);
+        probe.close_input();
+        let error = probe.try_run(&mut step).expect_err("dispatch must report the exited child");
+        let message = error.to_string();
+        assert!(
+            message.contains("aligner subprocess failed: aligner process exited with status 42."),
+            "{message}"
+        );
+        assert!(message.contains("startup-failed"), "the stderr tail must survive: {message}");
+    }
+
+    /// A second worker may enter after the Serial guard is released but before
+    /// the first worker publishes its error to the pipeline signal.
+    #[rstest::rstest]
+    #[case::expired_cascade(false, io::ErrorKind::BrokenPipe, "Broken pipe")]
+    #[case::reader_root(true, io::ErrorKind::InvalidData, "reader rejected output")]
+    fn dispatch_failure_survives_redispatch(
+        #[case] reader_root: bool,
+        #[case] expected_kind: io::ErrorKind,
+        #[case] expected_message: &str,
+        #[values(UnalignedReadFormat::Fastq, UnalignedReadFormat::Sam)]
+        input_format: UnalignedReadFormat,
+    ) {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut cfg = make_test_cfg();
+        cfg.input_format = input_format;
+        cfg.require_complete_pairs = true;
+        let mut step = SubprocessAlignStep::new(
+            cfg,
+            "exec 0<&-; printf '@HD\\tVN:1.6\\n'; exec 1>&-; exec sleep 4",
+        )
+        .expect("spawn live closed-pipe aligner");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !step.shared.startup.lock().over {
+            assert!(Instant::now() < deadline, "the aligner must close stdin and write its header");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let sequence = vec![b'A'; FASTQ_WRITER_BUF_BYTES];
+        let qualities = vec![b'I'; FASTQ_WRITER_BUF_BYTES];
+        let records = [FIRST_SEGMENT, LAST_SEGMENT]
+            .into_iter()
+            .map(|mate| {
+                let mut builder = fgumi_raw_bam::SamBuilder::new();
+                builder
+                    .read_name(b"closed_pipes")
+                    .flags(PAIRED | mate)
+                    .sequence(&sequence)
+                    .qualities(&qualities);
+                builder.build()
+            })
+            .collect();
+        step.in_tx
+            .take()
+            .expect("writer input")
+            .send(BamTemplateBatch::new(
+                0,
+                vec![Template::from_records(records).expect("complete primary pair")],
+            ))
+            .expect("queue input and close it");
+        while !step.reader_thread.as_ref().expect("reader").is_finished()
+            || !step.writer_thread.as_ref().expect("writer").is_finished()
+        {
+            assert!(Instant::now() < deadline, "I/O threads must finish while the child is live");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(step.shared.take_root_cause().is_none(), "the real write failed before a token");
+        step.shared.error_slot.lock().cascade.as_mut().expect("writer cascade").0 =
+            Instant::now().checked_sub(CASCADE_DRAIN_TIMEOUT).expect("backdate cascade");
+        if reader_root {
+            step.shared
+                .record_error(io::Error::new(io::ErrorKind::InvalidData, "reader rejected output"));
+        }
+        let probe = StepProbe::new(&step);
+        probe.close_input();
+        let first = probe.try_run(&mut step).expect_err("first worker observes the failure");
+        assert_eq!(first.kind(), expected_kind);
+        let first_message = first.to_string();
+        assert!(first_message.contains(expected_message), "{first_message}");
+        for _ in 0..3 {
+            let start = Instant::now();
+            let error = probe.try_run(&mut step).expect_err("redispatch must stay failed");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "redispatch must not wait on the child"
+            );
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(
+                error.to_string(),
+                first_message,
+                "the original failure must win publication"
+            );
+            assert!(step.aligner.is_some(), "a failed step must not enter finalize");
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::healthy(0, None)]
+    #[case::aligner_failure(
+        42,
+        Some("aligner subprocess failed: aligner process exited with status 42.")
+    )]
+    fn completed_drain_reentry_preserves_its_outcome(
+        #[case] exit_code: u8,
+        #[case] expected_error: Option<&str>,
+    ) {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut step = SubprocessAlignStep::new(
+            make_test_cfg(),
+            &format!("printf '@HD\\tVN:1.6\\n'; exit {exit_code}"),
+        )
+        .expect("spawn header-only aligner");
+        drop(step.in_tx.take());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !step.reader_thread.as_ref().expect("reader").is_finished()
+            || !step.writer_thread.as_ref().expect("writer").is_finished()
+            || !step.aligner.as_mut().expect("aligner").is_finished().expect("completion probe")
+        {
+            assert!(Instant::now() < deadline, "the aligner and all I/O threads must finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let probe = StepProbe::new(&step);
+        probe.close_input();
+        for _ in 0..3 {
+            let result = probe.try_run(&mut step);
+            if let Some(expected_error) = expected_error {
+                let error = result.expect_err("a failed drain must stay failed");
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert!(error.to_string().starts_with(expected_error), "{error}");
+            } else {
+                assert_eq!(result.expect("successful drain"), StepOutcome::Finished);
+            }
+        }
+    }
+
+    /// A successful reader can finish while the child stays alive. A fresh
+    /// cascade must not enter finalize's wait; an expired one must fail dispatch.
+    #[rstest::rstest]
+    #[case::before_deadline(false)]
+    #[case::at_deadline(true)]
+    fn cascade_drain_does_not_finalize_a_live_child(#[case] expired: bool) {
+        use crate::pipeline::core::testing::StepProbe;
+
+        let mut step = SubprocessAlignStep::new(
+            make_test_cfg(),
+            "printf '@HD\\tVN:1.6\\n'; exec 1>&-; exec sleep 8",
+        )
+        .expect("spawn header-only aligner");
+        drop(step.in_tx.take());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !step.reader_thread.as_ref().expect("reader").is_finished()
+            || !step.writer_thread.as_ref().expect("writer").is_finished()
+        {
+            assert!(Instant::now() < deadline, "I/O threads must finish before the child exits");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(step.shared.take_error().is_none(), "both I/O threads must succeed");
+        step.shared.record_cascade_error(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
+        if expired {
+            step.shared.error_slot.lock().cascade.as_mut().expect("cascade").0 =
+                Instant::now().checked_sub(CASCADE_DRAIN_TIMEOUT).expect("backdate cascade");
+        }
+        let probe = StepProbe::new(&step);
+        probe.close_input();
+        let start = Instant::now();
+        let result = probe.try_run(&mut step);
+        assert!(start.elapsed() < Duration::from_secs(1), "dispatch must not wait on the child");
+        if expired {
+            let error = result.expect_err("expired cascade must fail");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "broken pipe");
+        } else {
+            assert_eq!(result.expect("bounded drain"), StepOutcome::NoProgress);
+        }
+    }
+
+    /// A flush before gate acquisition keeps a broken pipe as a cascade, so a
+    /// reader error published afterward still wins. FASTQ fails flushing batch
+    /// one before batch two; SAM fails flushing its buffered header before batch one.
+    #[rstest::rstest]
+    #[case::fastq(UnalignedReadFormat::Fastq, 1)]
+    #[case::sam(UnalignedReadFormat::Sam, 0)]
+    fn writer_pre_batch_flush_keeps_a_broken_pipe_as_a_cascade(
+        #[case] input_format: UnalignedReadFormat,
+        #[case] expected_tokens: usize,
+        #[values(false, true)] require_complete_pairs: bool,
+    ) {
+        use std::io::BufRead;
+
+        let mut aligner = AlignerProcess::spawn(
+            "exec 0<&-; printf 'ready\\n'; exec sleep 8",
+            ALIGNER_STDERR_RING_SIZE,
+        )
+        .expect("spawn closed-stdin aligner");
+        let mut stdout = BufReader::new(aligner.take_stdout().expect("stdout"));
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).expect("wait for stdin closure");
+        assert_eq!(ready, "ready\n");
+
+        let (in_tx, in_rx) = sync_channel(2);
+        for serial in 0..2 {
+            in_tx
+                .send(BamTemplateBatch::new(serial, vec![make_paired_primary_template(b"q")]))
+                .expect("queue batch");
+        }
+        drop(in_tx);
+        let (token_tx, token_rx) = channel();
+        let shared = Arc::new(SharedState::new());
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
+        let result = writer_loop(
+            in_rx,
+            token_tx,
+            aligner.take_stdin().expect("stdin"),
+            Arc::clone(&shared),
+            &gate,
+            input_format,
+            require_complete_pairs,
+        );
+        let cascade_recorded = shared.has_cascade();
+        shared.record_error(io::Error::new(io::ErrorKind::InvalidData, "reader rejected output"));
+        let reported = shared.take_error().expect("recorded failure");
+        drop(stdout);
+        drop(aligner);
+
+        let writer_error = result.expect_err("the pre-batch flush must fail");
+        assert_eq!(writer_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(writer_error.to_string().starts_with("align-and-merge writer: flush:"));
+        assert_eq!(token_rx.try_iter().count(), expected_tokens, "the intended flush must fail");
+        assert!(cascade_recorded, "the broken pipe must not occupy the root slot");
+        assert_eq!(reported.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reported.to_string(), "reader rejected output");
+    }
+
+    /// When the reader has stopped taking tokens, the writer exits `Ok` but
+    /// records a cascade error, so the step waits for the reader's own error
+    /// and the drain deadline still reports unaligned input if there is none.
+    #[test]
+    fn writer_loop_records_a_cascade_when_the_reader_is_gone() {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::sync_channel;
+
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let cat_stdin = cat.stdin.take().expect("cat stdin");
+
+        let (in_tx, in_rx) = sync_channel::<BamTemplateBatch>(1);
+        let (token_tx, token_rx) = channel::<BatchToken>();
+        drop(token_rx);
+        let shared = Arc::new(SharedState::new());
+        in_tx
+            .send(BamTemplateBatch::new(0, vec![make_paired_primary_template(b"q")]))
+            .expect("send batch");
+        drop(in_tx);
+
+        let gate =
+            InFlightGate::new(u64::MAX, u64::MAX, IN_FLIGHT_STALL_GRACE, IN_FLIGHT_CEILING_TIMEOUT);
+        let result = writer_loop(
+            in_rx,
+            token_tx,
+            cat_stdin,
+            Arc::clone(&shared),
+            &gate,
+            UnalignedReadFormat::Fastq,
+            false,
+        );
+
+        assert!(result.is_ok(), "the reader's error, not the writer's, is the cause: {result:?}");
+        assert!(shared.take_root_cause().is_none(), "no root cause is recorded");
+        let cascade = shared.take_error().expect("a cascade is recorded");
+        assert!(cascade.to_string().contains("the reader stopped"), "got: {cascade}");
+
+        let _ = cat.kill();
+        let _ = cat.wait();
     }
 
     fn make_test_cfg() -> SubprocessConfig {
