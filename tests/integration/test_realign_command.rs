@@ -318,6 +318,172 @@ fn realign_with_a_streaming_aligner_does_not_hang(
     assert_eq!(got, want, "every consensus end must come back exactly once");
 }
 
+/// When the align stage fails, fgumi exits promptly and takes the aligner's own
+/// processes with it. The stand-in aligner backgrounds a long-lived grandchild
+/// that inherits its stdout and stderr (as the real aligner under a
+/// `/bin/bash -c` wrapper does), records its PID, then writes output that is not
+/// SAM. Teardown that killed only the wrapper left the grandchild holding the
+/// pipes, and fgumi logged the failure but never exited.
+#[cfg(unix)]
+#[test]
+fn realign_failure_kills_the_aligner_process_group() {
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    let input = write_consensus(dir, 2, |_| (Some("chr1:1-100:+"), None));
+    let reference = create_test_reference(dir);
+    let output = dir.join("out.bam");
+    let pid_file = dir.join("grandchild.pid");
+    let aligner = format!(
+        "sleep 600 & echo $! > '{}'; echo 'this line is not a SAM header or record'; wait # {{ref}}",
+        pid_file.display()
+    );
+    let mut child = fgumi()
+        .args(["realign", "-i", p(&input), "-o", p(&output), "-r", p(&reference)])
+        .args(["--aligner::command", &aligner])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fgumi realign");
+    // Drain fgumi's stderr on a thread, so a chatty run cannot block on it.
+    let mut fgumi_stderr = child.stderr.take().expect("stderr piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut fgumi_stderr, &mut text);
+        text
+    });
+
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll fgumi") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let grandchild_pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw);
+    // A hung run (the regression) is killed here, with the grandchild, so the
+    // failure does not leave either behind.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // A terminated descendant may remain a zombie when init does not reap orphans.
+    let grandchild_survived = grandchild_pid.is_some_and(|pid| {
+        let gone_by = Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid, Path::new("/bin/ps")) {
+            if Instant::now() >= gone_by {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    });
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    let status =
+        status.unwrap_or_else(|| panic!("fgumi hung after the align stage failed:\n{stderr}"));
+    assert!(!status.success(), "realign must fail on output that is not SAM:\n{stderr}");
+    // The reader rejected the stand-in's output (it has no `@SQ` header), not
+    // some earlier step of the run.
+    assert!(
+        stderr.contains("aligner @SQ count (0) does not match"),
+        "the run must fail on the aligner's output:\n{stderr}"
+    );
+    assert!(grandchild_pid.is_some(), "the stand-in aligner never ran:\n{stderr}");
+    assert!(!grandchild_survived, "the aligner's grandchild survived teardown:\n{stderr}");
+}
+
+/// Whether a descendant is still running; probe failures must not hide survivors.
+#[cfg(unix)]
+fn process_is_running(pid: rustix::process::Pid, ps: &Path) -> bool {
+    if let Ok(output) =
+        Command::new(ps).args(["-o", "stat=", "-p", &pid.as_raw_pid().to_string()]).output()
+        && output.status.success()
+    {
+        let state = String::from_utf8_lossy(&output.stdout);
+        if !state.trim().is_empty() {
+            return !state.trim_start().starts_with('Z');
+        }
+    }
+    // An unavailable, failed, or empty ps probe cannot establish termination.
+    rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH)
+}
+
+/// Exercise the oracle with owned processes so zombies do not depend on init's reaping policy.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::running("running", "normal", true)]
+#[case::zombie("zombie", "normal", false)]
+#[case::reaped("reaped", "normal", false)]
+#[case::missing_probe_live("running", "missing", true)]
+#[case::missing_probe_zombie("zombie", "missing", true)]
+#[case::missing_probe_absent("reaped", "missing", false)]
+#[case::empty_probe_live("running", "empty", true)]
+#[case::empty_probe_absent("reaped", "empty", false)]
+#[case::failed_probe_live("running", "failed", true)]
+#[case::failed_probe_absent("reaped", "failed", false)]
+fn descendant_liveness_probe(
+    #[case] state: &str,
+    #[case] probe: &str,
+    #[case] expected_running: bool,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().expect("probe fixture directory");
+    let ps = if probe == "normal" {
+        std::path::PathBuf::from("/bin/ps")
+    } else {
+        let path = dir.path().join("ps");
+        if probe != "missing" {
+            let exit_code = u8::from(probe == "failed");
+            std::fs::write(&path, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    };
+    let mut child = Command::new("/bin/sleep").arg("60").spawn().expect("spawn owned fixture");
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let mut zombie_ready = state == "running";
+    let mut reaped = false;
+    if state != "running" {
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            // Observe the fixture independently of the oracle being tested.
+            if let Ok(output) = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &child.id().to_string()])
+                .output()
+                && output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim_start().starts_with('Z')
+            {
+                zombie_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if state == "reaped" && zombie_ready {
+            child.wait().expect("reap fixture before probing absence");
+            reaped = true;
+        }
+    }
+    let running = process_is_running(pid, &ps);
+    if !reaped {
+        let _ = child.kill();
+    }
+    child.wait().expect("reap owned fixture before assertions");
+    assert!(zombie_ready, "owned child never reached the requested fixture state");
+    assert_eq!(running, expected_running);
+}
+
 /// A window-grouped input whose consensus ends lack `rw` where the raw reads
 /// never mapped (here: every R2, and one whole pair) realigns; those ends are
 /// counted as without a window.

@@ -91,12 +91,85 @@ fn killed_by(status: std::process::ExitStatus) -> String {
 /// as a fast subprocess exit rather than a hang.
 pub struct AlignerProcess {
     child: Child,
+    /// Exit status observed before teardown could have caused it.
+    exit_before_teardown: Option<std::process::ExitStatus>,
+    /// Once signalling begins, later statuses must not mask the reader's error.
+    teardown_started: bool,
     /// The child's stdin pipe, available until [`Self::take_stdin`] is called.
     stdin: Option<ChildStdin>,
     /// The child's stdout pipe, available until [`Self::take_stdout`] is called.
     stdout: Option<ChildStdout>,
     /// Background thread that relays child stderr; returns the captured ring buffer.
     stderr_thread: Option<JoinHandle<Vec<String>>>,
+    /// The aligner's process group (its id is the wrapper shell's PID), which
+    /// [`Self::kill`] signals so the aligner's own processes die with the
+    /// wrapper. `None` once the group has been torn down or the wrapper exited
+    /// through [`Self::wait`]: after that the id may name unrelated processes,
+    /// so it is never signalled again.
+    #[cfg(unix)]
+    process_group: Option<rustix::process::Pid>,
+    /// What the group teardown in [`Self::kill`] concluded: `Some(false)` when
+    /// the wrapper or another group member could not be confirmed gone, so
+    /// something may still hold the stderr pipe. Later `kill` calls return it
+    /// and `Drop` uses it to gate the stderr-relay join, instead of re-deriving
+    /// exit from the (reaped) wrapper alone.
+    #[cfg(unix)]
+    group_teardown_confirmed: Option<bool>,
+    /// Observe the actual result after normal teardown, without pre-killing
+    /// the aligner in tests that exercise its owner's Drop path.
+    #[cfg(all(test, unix))]
+    pub(crate) teardown_result_tx: Option<std::sync::mpsc::Sender<Option<bool>>>,
+    /// Observe Drop's first poll while the late-exit fixture is still blocked.
+    #[cfg(all(test, unix))]
+    drop_poll_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::KillOnDrop;
+
+/// How long [`AlignerProcess::kill`] waits after SIGTERM to the aligner's
+/// process group before escalating to SIGKILL.
+#[cfg(unix)]
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(500);
+
+/// How long [`AlignerProcess::kill`] waits for the wrapper to be reaped after
+/// SIGKILL.
+const KILL_REAP_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Interval at which [`AlignerProcess::kill`] polls for exit.
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum time failure cleanup spends waiting for pipe workers to finish.
+pub(crate) const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Join a worker only once finished, detaching it if the shared deadline passes.
+pub(crate) fn join_until<T>(
+    handle: JoinHandle<T>,
+    deadline: std::time::Instant,
+) -> Option<thread::Result<T>> {
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            log::warn!("aligner worker did not finish before teardown deadline; detaching");
+            return None;
+        }
+        thread::sleep(remaining.min(KILL_POLL_INTERVAL));
+    }
+    Some(handle.join())
+}
+
+/// Convert an exit status and available stderr into the aligner's diagnostic.
+fn exit_result(status: std::process::ExitStatus, last_lines: &[String]) -> Result<()> {
+    if !status.success() {
+        let code = status.code().map_or_else(|| killed_by(status), |c| c.to_string());
+        let tail = if last_lines.is_empty() {
+            "(no stderr captured)".to_string()
+        } else {
+            last_lines.join("\n")
+        };
+        bail!("aligner process exited with status {code}. Last stderr lines:\n{tail}");
+    }
+    Ok(())
 }
 
 /// The mimalloc option environment variables (`MIMALLOC_PURGE_DELAY` and its
@@ -208,8 +281,35 @@ impl AlignerProcess {
         if !user_set_mimalloc_purge() {
             cmd.env("MIMALLOC_PURGE_DELAY", fgumi_sort::RETAINED_PURGE_DELAY_MS.to_string());
         }
+        // Run the aligner in its own process group, so teardown can signal
+        // every process the shell started (`kill()`). Killing only the
+        // `/bin/bash -c` wrapper leaves the real aligner, a grandchild, holding
+        // the pipes open, and fgumi never exits after a failure.
+        //
+        // The cost is that no signal sent to fgumi's process group reaches the
+        // aligner any more: not the terminal's SIGINT (Ctrl-C) or SIGTSTP
+        // (Ctrl-Z), and not a group-directed kill from GNU `timeout`, a shell's
+        // `kill %job`, or a supervisor that signals the whole group. fgumi
+        // installs no handler for these, so such a signal kills fgumi by the
+        // default action without running any teardown; the aligner then sees
+        // EOF on stdin, and EPIPE/SIGPIPE when it next writes to stdout, which
+        // can be a whole batch later for a preset. A custom command need not
+        // touch either pipe again, so its remaining runtime is unbounded.
+        // fgumi's own failure and cancellation paths kill the group through `kill()`.
+        //
+        // As a background group in fgumi's session, the aligner is also stopped
+        // (SIGTTIN/SIGTTOU) if it reads or configures the controlling terminal
+        // itself, by opening `/dev/tty` as an ssh passphrase or sudo password
+        // prompt does; pipes cover only its standard streams. An
+        // `--aligner::command` must therefore not prompt on the terminal (use
+        // e.g. `ssh -o BatchMode=yes`, `sudo -n`).
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child =
             cmd.spawn().with_context(|| format!("failed to spawn aligner command: {command}"))?;
+        // `process_group(0)` makes the group id the child's PID.
+        #[cfg(unix)]
+        let process_group = Some(rustix::process::Pid::from_child(&child));
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -217,7 +317,22 @@ impl AlignerProcess {
 
         let stderr_thread = thread::spawn(move || relay_stderr(child_stderr, ring_size));
 
-        Ok(Self { child, stdin, stdout, stderr_thread: Some(stderr_thread) })
+        Ok(Self {
+            child,
+            exit_before_teardown: None,
+            teardown_started: false,
+            stdin,
+            stdout,
+            stderr_thread: Some(stderr_thread),
+            #[cfg(unix)]
+            process_group,
+            #[cfg(unix)]
+            group_teardown_confirmed: None,
+            #[cfg(all(test, unix))]
+            teardown_result_tx: None,
+            #[cfg(all(test, unix))]
+            drop_poll_tx: None,
+        })
     }
 
     /// Take the stdin pipe for writing FASTQ data.
@@ -263,7 +378,10 @@ impl AlignerProcess {
     ///
     /// Joins the stderr relay thread and includes the last captured
     /// stderr lines in the error message if the process exits with a
-    /// non-zero status.
+    /// non-zero status. A failed exit or prior teardown bounds the relay join;
+    /// only a successful, non-teardown wait joins without a deadline. A helper
+    /// holding stderr after that clean exit can block until it exits, since a
+    /// clean wait never signals the process group.
     ///
     /// # Errors
     ///
@@ -281,52 +399,230 @@ impl AlignerProcess {
         drop(self.stdin.take());
         drop(self.stdout.take());
 
-        let status = self.child.wait().context("failed to wait for aligner process")?;
+        let status = match self.child.wait() {
+            Ok(status) => status,
+            Err(err) => {
+                // `ECHILD`: the wrapper was reaped elsewhere, so its PID (the
+                // group id) may already be reused; never signal the group
+                // again, including from `Drop`. Any other error leaves the
+                // wrapper possibly alive, so `Drop` still tears the group down.
+                #[cfg(unix)]
+                if is_already_reaped(&err) {
+                    self.process_group = None;
+                    // ECHILD says nothing about descendants holding stderr.
+                    // Without a safe group id, Drop must skip the relay join.
+                    self.group_teardown_confirmed = Some(false);
+                }
+                return Err(err).context("failed to wait for aligner process");
+            }
+        };
+        #[cfg(unix)]
+        let prior_teardown = self.group_teardown_confirmed.is_some();
+        #[cfg(not(unix))]
+        let prior_teardown = self.teardown_started;
+        if !status.success() || prior_teardown {
+            // A failed wrapper can leave helpers holding stderr. Tear down the
+            // group before collecting diagnostics, and bound even that join:
+            // a custom command may have moved a helper into another group.
+            self.kill();
+            let lines = self.join_stderr(Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT));
+            return exit_result(status, &lines);
+        }
+        // A successful wait releases the group id without signalling it again.
+        #[cfg(unix)]
+        {
+            self.process_group = None;
+        }
+        self.join_stderr(None);
+        Ok(())
+    }
 
-        // Join the stderr relay thread so its resources are cleaned up.
-        // A panic in the relay thread is logged (not silently dropped)
-        // so operators can tell apart "child produced no stderr" from
-        // "our relay died" in the error message.
-        let last_lines = match self.stderr_thread.take().map(JoinHandle::join) {
+    /// Complete bounded failure cleanup, reporting only a wrapper failure
+    /// observed before teardown began. A teardown-caused signal must not hide
+    /// the original reader error, even when group teardown was unconfirmed.
+    pub(crate) fn finish_teardown(&mut self) -> Result<()> {
+        self.kill();
+        let lines = self.join_stderr(Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT));
+        self.exit_before_teardown.map_or(Ok(()), |status| exit_result(status, &lines))
+    }
+
+    /// Collect a completed stderr ring, optionally detaching at a deadline.
+    fn join_stderr(&mut self, deadline: Option<std::time::Instant>) -> Vec<String> {
+        let result = self.stderr_thread.take().and_then(|handle| match deadline {
+            Some(deadline) => join_until(handle, deadline),
+            None => Some(handle.join()),
+        });
+        match result {
             Some(Ok(lines)) => lines,
             Some(Err(_)) => {
                 log::warn!("aligner stderr relay thread panicked; captured ring may be incomplete");
                 Vec::new()
             }
             None => Vec::new(),
-        };
-
-        if !status.success() {
-            let code = status.code().map_or_else(|| killed_by(status), |c| c.to_string());
-            let tail = if last_lines.is_empty() {
-                "(no stderr captured)".to_string()
-            } else {
-                last_lines.join("\n")
-            };
-            bail!("aligner process exited with status {code}. Last stderr lines:\n{tail}");
         }
-
-        Ok(())
     }
 
     /// Kill the aligner process.
     ///
-    /// Sends SIGKILL immediately (`Child::kill()` always sends SIGKILL
-    /// on Unix). Waits up to 1 second for the process to exit.
+    /// On Unix the whole process group is killed, not just the `/bin/bash -c`
+    /// wrapper: the real aligner is usually the wrapper's child, and while it
+    /// lives it holds the stdin/stdout/stderr pipes open, so the I/O threads
+    /// and the stderr relay never finish. The group gets SIGTERM first, so an
+    /// aligner (or a wrapper script) that cleans up on SIGTERM, e.g. removes
+    /// its scratch files or flushes its log, gets the chance; whatever is still
+    /// alive after a 500 ms grace (`PROCESS_GROUP_TERM_GRACE`) gets SIGKILL. Only the first
+    /// call signals the group, and a call after [`Self::wait`] reaped the
+    /// wrapper, or after the wrapper was reaped elsewhere (`ECHILD`), never does
+    /// (the group id may have been reused). Later calls return the recorded
+    /// group teardown result: a reaped wrapper alone cannot confirm the rest
+    /// of the group exited. On other platforms only the wrapper is killed
+    /// (SIGKILL).
     ///
-    /// Returns `true` if the child was reaped within the 1s deadline (or was
-    /// already gone), and `false` if it was still running when the deadline
-    /// expired (i.e. stuck, e.g. in uninterruptible I/O). Callers MUST honor a
-    /// `false` return by NOT issuing a subsequent unbounded [`wait`](Self::wait)
-    /// on the child, which would re-introduce the very teardown hang this
-    /// bounded kill exists to prevent.
+    /// Then waits up to 1 s (`KILL_REAP_DEADLINE`) for the wrapper to be reaped
+    /// and, on Unix, for the rest of the group to be gone. Returns `true` if
+    /// both are confirmed (or were already the case), and `false` otherwise:
+    /// the wrapper was still running at the deadline (e.g. stuck in
+    /// uninterruptible I/O), or another group member was, which may still hold
+    /// the pipes. Where the OS still reports zombie group members (including
+    /// Linux and macOS), a group with unreaped orphans also reports `false`
+    /// and waits out the grace, even though zombies hold no pipes. Callers MUST
+    /// honor a `false` return by NOT issuing a subsequent unbounded
+    /// [`wait`](Self::wait) on the child, which would re-introduce the very
+    /// teardown hang this bounded kill exists to prevent.
     pub fn kill(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            if let Some(confirmed) = self.group_teardown_confirmed {
+                return confirmed;
+            }
+            if let Some(group) = self.process_group.take() {
+                let confirmed = self.kill_process_group(group).unwrap_or(false);
+                self.group_teardown_confirmed = Some(confirmed);
+                return confirmed;
+            }
+        }
+        self.kill_wrapper(std::time::Instant::now() + KILL_REAP_DEADLINE)
+    }
+
+    /// SIGTERM `group`, give it [`PROCESS_GROUP_TERM_GRACE`] to exit, then
+    /// SIGKILL whatever is left, reap the wrapper, and confirm the group is
+    /// gone. Returns the confirmation status, or `ReapedElsewhere` if an
+    /// external reap made the group id unsafe to signal.
+    ///
+    /// The group's id is the wrapper's PID. While the wrapper is unreaped that
+    /// PID cannot be reused, and once it is reaped (here) the id still cannot
+    /// be handed out as a new PID while the group has members, so after the
+    /// reap the group is signalled only after a probe found it non-empty. The
+    /// window between that probe and the signal is at most one poll interval.
+    /// A wrapper reaped elsewhere (`ECHILD`) gives no such guarantee, so its
+    /// group is never signalled.
+    #[cfg(unix)]
+    fn kill_process_group(&mut self, group: rustix::process::Pid) -> Result<bool, WrapperState> {
+        use rustix::process::Signal;
+
+        if self.wait_for_group(group, Duration::ZERO)? {
+            return Ok(true);
+        }
+        self.teardown_started = true;
+        signal_process_group(group, Signal::TERM);
+        if self.wait_for_group(group, PROCESS_GROUP_TERM_GRACE)? {
+            return Ok(true);
+        }
+        log::debug!(
+            "aligner process group {} still alive {PROCESS_GROUP_TERM_GRACE:?} after SIGTERM; \
+             sending SIGKILL",
+            group.as_raw_pid()
+        );
+        if self.wait_for_group(group, Duration::ZERO)? {
+            return Ok(true);
+        }
+        let deadline = std::time::Instant::now() + KILL_REAP_DEADLINE;
+        signal_process_group(group, Signal::KILL);
+        self.reap_killed_group(group, deadline)
+    }
+
+    /// Reap a killed wrapper and confirm group exit within the escalation deadline.
+    #[cfg(unix)]
+    fn reap_killed_group(
+        &mut self,
+        group: rustix::process::Pid,
+        deadline: std::time::Instant,
+    ) -> Result<bool, WrapperState> {
+        if !self.kill_wrapper(deadline) {
+            return Ok(false);
+        }
+        // The wrapper is reaped; confirm no other member (the real aligner)
+        // survived the SIGKILL, within the same reap deadline.
+        if self
+            .wait_for_group(group, deadline.saturating_duration_since(std::time::Instant::now()))?
+        {
+            return Ok(true);
+        }
+        log::warn!(
+            "aligner process group {} still has members {KILL_REAP_DEADLINE:?} after SIGKILL; \
+             a process may be stuck (e.g. uninterruptible I/O) or unreaped",
+            group.as_raw_pid()
+        );
+        Ok(false)
+    }
+
+    /// Poll for up to `timeout` until the wrapper has exited (reaping it) and
+    /// `group` is empty. Returns whether both were seen. An external reap
+    /// returns `ReapedElsewhere`: group absence is unknown, and callers must
+    /// neither signal the group nor join threads waiting on its pipes.
+    #[cfg(unix)]
+    fn wait_for_group(
+        &mut self,
+        group: rustix::process::Pid,
+        timeout: Duration,
+    ) -> Result<bool, WrapperState> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // Probe the group only once the wrapper is reaped: an unreaped
+            // (zombie) wrapper is still a member, so the probe would succeed.
+            match self.wrapper_state() {
+                WrapperState::ReapedElsewhere => return Err(WrapperState::ReapedElsewhere),
+                WrapperState::Exited if process_group_is_empty(group) => return Ok(true),
+                WrapperState::Exited | WrapperState::Running | WrapperState::Unknown => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(KILL_POLL_INTERVAL);
+        }
+    }
+
+    /// The wrapper's state, reaping it if it has exited.
+    #[cfg(unix)]
+    fn wrapper_state(&mut self) -> WrapperState {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                if !self.teardown_started {
+                    self.exit_before_teardown = Some(status);
+                }
+                WrapperState::Exited
+            }
+            Ok(None) => WrapperState::Running,
+            Err(err) if is_already_reaped(&err) => WrapperState::ReapedElsewhere,
+            Err(_) => WrapperState::Unknown,
+        }
+    }
+
+    /// SIGKILL the wrapper only and wait until `deadline` for it to be reaped.
+    /// Returns as [`Self::kill`] does.
+    fn kill_wrapper(&mut self, deadline: std::time::Instant) -> bool {
         let pid = self.child.id();
+        if !self.teardown_started {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit_before_teardown = Some(status);
+                return true;
+            }
+            self.teardown_started = true;
+        }
         let _ = self.child.kill();
 
-        // Wait for the process to actually exit so its resources are cleaned up.
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        // Tracks whether the loop gave up because the 1s deadline elapsed while
+        // Use the caller's deadline so group confirmation cannot restart the budget.
+        // Tracks whether the loop gave up because the reap deadline elapsed while
         // the process was still alive. Only that case warrants the leak warning.
         let mut deadline_exceeded = false;
         // Set only when exit is *positively confirmed*: a clean reap
@@ -348,7 +644,7 @@ impl AlignerProcess {
                         deadline_exceeded = true;
                         break;
                     }
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(KILL_POLL_INTERVAL);
                 }
                 // `try_wait` failed. `ECHILD` (the child was already reaped,
                 // e.g. by a SIGCHLD handler) is a benign non-leak that confirms
@@ -374,8 +670,8 @@ impl AlignerProcess {
         }
         if deadline_exceeded {
             log::warn!(
-                "aligner process (pid {pid}) did not exit within 1s of SIGKILL; it may be \
-                 stuck (e.g. uninterruptible I/O) and left unreaped"
+                "aligner process (pid {pid}) did not exit before the SIGKILL reap deadline; \
+                 it may be stuck (e.g. uninterruptible I/O) and left unreaped"
             );
         }
         // Report reaped only when exit was positively confirmed (clean reap or
@@ -383,6 +679,64 @@ impl AlignerProcess {
         // `try_wait` errno reports `false` so the caller avoids a follow-up
         // unbounded `wait()`.
         reaped
+    }
+
+    /// Whether the aligner's process group has not yet been torn down by
+    /// [`Self::kill`] or released by a clean [`Self::wait`].
+    fn process_group_pending(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.process_group.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// For `Drop`: whether the wrapper's exit is confirmed, killing it (bounded)
+    /// if it is still running or its state cannot be read.
+    fn kill_unless_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            // Already exited: stderr fd is closed, relay will finish.
+            Ok(Some(_)) => true,
+            // Still running: kill() reports `true` only on a confirmed reap
+            // (clean exit or ECHILD); `false` means it may still be alive.
+            Ok(None) => self.kill(),
+            // `try_wait` errored. ECHILD (already reaped) confirms exit. For any
+            // other errno the child may still be alive, so fall back to the
+            // bounded `kill()` — returning `is_already_reaped` alone here would
+            // drop the handle without ever attempting SIGKILL and leak the
+            // subprocess. `kill()` re-classifies ECHILD as a confirmed reap.
+            Err(err) => {
+                if is_already_reaped(&err) {
+                    true
+                } else {
+                    log::warn!(
+                        "aligner process (pid {}) try_wait failed in Drop: {err}; \
+                         attempting bounded kill",
+                        self.child.id()
+                    );
+                    self.kill()
+                }
+            }
+        }
+    }
+
+    /// Whether the aligner's `/bin/bash -c` wrapper has exited, reaping it if
+    /// so. A wrapper reaped elsewhere (`ECHILD`) counts as exited; any other
+    /// `try_wait` error does not.
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                if !self.teardown_started {
+                    self.exit_before_teardown = Some(status);
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(err) => is_already_reaped(&err),
+        }
     }
 
     /// Return the process ID of the aligner child process.
@@ -408,6 +762,23 @@ fn is_already_reaped(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(ECHILD)
 }
 
+/// The `/bin/bash -c` wrapper's state as [`AlignerProcess::kill`]'s group
+/// teardown sees it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrapperState {
+    /// Still running.
+    Running,
+    /// Exited and reaped by this process: its PID stays reserved while the
+    /// group has members, so the group may be probed and signalled.
+    Exited,
+    /// Reaped elsewhere (`ECHILD`): its PID may already be reused, so the
+    /// group must never be signalled.
+    ReapedElsewhere,
+    /// `try_wait` failed for another reason; treated as possibly running.
+    Unknown,
+}
+
 impl Drop for AlignerProcess {
     fn drop(&mut self) {
         // Determine whether the child's exit is *confirmed*. Only then is it
@@ -415,40 +786,71 @@ impl Drop for AlignerProcess {
         // child's stderr fd, which stays open while the child lives, so joining
         // a still-alive child would hang teardown forever — the very hang the
         // bounded `kill()` exists to prevent.
-        let exit_confirmed = match self.child.try_wait() {
-            // Already exited: stderr fd is closed, relay will finish.
-            Ok(Some(_)) => true,
-            // Still running: kill() reports `true` only on a confirmed reap
-            // (clean exit or ECHILD); `false` means it may still be alive.
-            Ok(None) => self.kill(),
-            // `try_wait` errored. ECHILD (already reaped) confirms exit. For any
-            // other errno the child may still be alive, so fall back to the
-            // bounded `kill()` — returning `is_already_reaped` alone here would
-            // drop the handle without ever attempting SIGKILL and leak the
-            // subprocess. `kill()` re-classifies ECHILD as a confirmed reap.
-            Err(err) => {
-                if is_already_reaped(&err) {
-                    true
-                } else {
-                    log::warn!(
-                        "aligner process (pid {}) try_wait failed in Drop: {err}; \
-                         attempting bounded kill",
-                        self.child.id()
-                    );
-                    self.kill()
+        //
+        // Without a clean `wait()`, the aligner's process group is killed even
+        // if the wrapper itself has exited: an orphaned grandchild holding the
+        // stderr pipe would otherwise hang the join below.
+        //
+        // A group teardown that already ran in `kill()` is authoritative:
+        // reaping the wrapper alone cannot confirm that other group members
+        // closed the pipe. Still reap a wrapper that exits after kill's deadline.
+        #[cfg(unix)]
+        let recorded = self.group_teardown_confirmed;
+        #[cfg(not(unix))]
+        let recorded: Option<bool> = None;
+        let exit_confirmed = match recorded {
+            Some(false) => {
+                let deadline = std::time::Instant::now() + KILL_REAP_DEADLINE;
+                while matches!(self.child.try_wait(), Ok(None)) {
+                    #[cfg(all(test, unix))]
+                    if let Some(tx) = self.drop_poll_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(KILL_POLL_INTERVAL);
                 }
+                false
             }
+            Some(true) => true,
+            None if self.process_group_pending() => self.kill(),
+            None => self.kill_unless_exited(),
         };
         // Join the stderr relay only when exit is confirmed. If the child could
         // not be confirmed dead (kill timed out / unclassified errno), skip the
         // join: leaking a detached relay thread is the lesser evil versus
         // hanging Drop indefinitely on a still-open stderr fd.
-        if let Some(handle) = self.stderr_thread.take()
-            && exit_confirmed
-        {
-            let _ = handle.join();
+        if exit_confirmed {
+            self.join_stderr(Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT));
+        }
+        #[cfg(all(test, unix))]
+        if let Some(tx) = self.teardown_result_tx.take() {
+            let _ = tx.send(self.group_teardown_confirmed);
         }
     }
+}
+
+/// Send `signal` to every process in `group`. A group that no longer exists
+/// (`ESRCH`) is the goal, not an error; any other failure is logged, since
+/// teardown has nowhere to surface it.
+#[cfg(unix)]
+fn signal_process_group(group: rustix::process::Pid, signal: rustix::process::Signal) {
+    match rustix::process::kill_process_group(group, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+        Err(err) => log::warn!(
+            "failed to send {signal:?} to aligner process group {}: {err}",
+            group.as_raw_pid()
+        ),
+    }
+}
+
+/// Whether `group` has no processes left (`kill(-group, 0)` reports `ESRCH`).
+/// Zombie visibility is OS-dependent; on Linux and macOS an unreaped zombie
+/// prevents this confirmation, even though its file descriptors are closed.
+#[cfg(unix)]
+fn process_group_is_empty(group: rustix::process::Pid) -> bool {
+    rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH)
 }
 
 /// Read lines from `stderr`, print each to fgumi's stderr, and retain
@@ -1230,13 +1632,23 @@ pub(crate) fn default_sub_batch_templates() -> usize {
 #[derive(Args, Debug, Clone)]
 pub struct AlignerOptions {
     /// Named aligner preset. Mutually exclusive with `--aligner::command`.
+    /// Every preset but `bwa-mem3-inproc` runs the aligner as a subprocess in
+    /// its own process group, which a Ctrl-C or `timeout` sent to fgumi does
+    /// not reach: after one stops fgumi, the aligner may continue processing
+    /// buffered input before it exits.
     #[arg(long = "preset", value_enum)]
     pub preset: Option<AlignerPreset>,
 
     /// Free-form aligner command template. Supports `{ref}` and
     /// `{threads}` placeholders. Mutually exclusive with
     /// `--aligner::preset` and every other `--aligner::*` flag except
-    /// `--aligner::chunk-size` and `--aligner::input-format`.
+    /// `--aligner::chunk-size`, `--aligner::input-format`, and
+    /// `--aligner::max-read-ahead`. The command
+    /// runs in its own process group, so it must not prompt on the terminal
+    /// (e.g. use `ssh -o BatchMode=yes`, `sudo -n`): a terminal read from it
+    /// stops the aligner and stalls the run. A Ctrl-C or `timeout` sent to
+    /// fgumi does not reach it either: the command may outlive fgumi after an
+    /// outer timeout, and its remaining runtime is not bounded by batch size.
     #[arg(long = "command")]
     pub command: Option<String>,
 
@@ -2201,33 +2613,666 @@ mod tests {
 
     /// `kill()` reports `true` when the child is reaped within the deadline.
     /// A plain `sleep` responds to SIGKILL immediately, so the bounded kill
-    /// reaps it well inside the 1s window — and a `true` return is what lets
+    /// reaps it well inside the reap deadline — and a `true` return is what lets
     /// `SubprocessAlignStep::drop` safely issue its follow-up `wait()` without
     /// risking a teardown hang.
-    #[test]
-    fn test_kill_reports_reaped_for_killable_child() {
+    #[rstest]
+    #[case::default_teardown(false)]
+    #[case::wrapper_fallback(true)]
+    fn test_kill_reports_reaped_for_killable_child(#[case] wrapper_only: bool) {
         let mut proc = AlignerProcess::spawn("sleep 30", 10).expect("spawn should succeed");
+        #[cfg(unix)]
+        if wrapper_only {
+            proc.process_group = None;
+        }
+        #[cfg(not(unix))]
+        let _ = wrapper_only;
         assert!(proc.kill(), "a killable child must be reaped within the deadline");
         // A second kill on an already-gone child still reports reaped, never
         // a spurious timeout.
         assert!(proc.kill(), "killing an already-reaped child must still report reaped");
     }
 
+    /// Reaping and the final group probe must share the post-SIGKILL budget,
+    /// including a final probe when wrapper reaping consumed the whole budget.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::empty_group_after_budget_elapsed(false, Duration::ZERO, true)]
+    #[case::unreaped_member_after_budget_elapsed(true, Duration::ZERO, false)]
+    #[case::unreaped_member_with_short_budget(true, Duration::from_millis(100), false)]
+    fn test_post_kill_reaping_shares_one_deadline(
+        #[case] retain_member: bool,
+        #[case] remaining: Duration,
+        #[case] expected_empty: bool,
+    ) {
+        use std::os::unix::process::CommandExt;
+
+        let mut proc = AlignerProcess::spawn("exec sleep 30", 0).expect("spawn wrapper");
+        let group = proc.process_group.expect("wrapper process group");
+        let mut member = retain_member.then(|| {
+            let mut child = Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(group.as_raw_pid())
+                .spawn()
+                .expect("spawn owned group member");
+            child.kill().expect("kill member without reaping it");
+            child
+        });
+        proc.child.kill().expect("kill wrapper");
+        proc.child.wait().expect("reap wrapper");
+
+        let start = std::time::Instant::now();
+        let result = proc.reap_killed_group(group, start + remaining);
+        let elapsed = start.elapsed();
+        if let Some(member) = &mut member {
+            member.wait().expect("reap group member before assertions");
+        }
+        proc.process_group = None;
+        assert_eq!(result, Ok(expected_empty));
+        assert!(elapsed < Duration::from_millis(500), "reap budget restarted: {elapsed:?}");
+        if retain_member {
+            assert!(elapsed >= remaining, "unreaped group confirmed too soon: {elapsed:?}");
+        }
+    }
+
+    /// An unreaped member keeps the group nonempty even after the wrapper is
+    /// reaped. Retrying must not turn that unconfirmed teardown into success.
+    #[cfg(unix)]
+    #[test]
+    fn test_kill_retry_preserves_unconfirmed_group_teardown() {
+        use std::os::unix::process::CommandExt;
+
+        let mut proc = AlignerProcess::spawn("exec sleep 60", 10).expect("spawn aligner");
+        let group = as_pid(proc.pid());
+        let mut member = Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(group.as_raw_pid())
+            .spawn()
+            .expect("spawn member owned by this test, not init");
+        let first = proc.kill();
+        let member_status = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &member.id().to_string()])
+            .output()
+            .expect("probe member independently of teardown");
+        let retry = proc.kill();
+        let _ = member.kill();
+        member.wait().expect("reap member before assertions");
+
+        assert!(!first, "an unreaped member must prevent confirmation");
+        assert!(
+            String::from_utf8_lossy(&member_status.stdout).trim().starts_with('Z'),
+            "member must remain an unreaped zombie: {member_status:?}"
+        );
+        assert!(!retry, "a reaped wrapper alone must not confirm group teardown");
+    }
+
+    /// An unconfirmed teardown may leave a wrapper that exits later. Drop
+    /// must reap it without signalling it or treating that reap as group exit.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::late_exit(false, true)]
+    #[case::outlives_deadline(true, false)]
+    fn test_drop_reaps_late_wrapper_after_unconfirmed_teardown(
+        #[case] outlives_deadline: bool,
+        #[case] expected_reaped: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let completed = dir.path().join("wrapper-completed");
+        let release = dir.path().join("wrapper-release");
+        assert!(Command::new("mkfifo").arg(&release).status().unwrap().success());
+        let mut release_pipe =
+            std::fs::OpenOptions::new().read(true).write(true).open(&release).unwrap();
+        let command = format!(
+            "read -r -t 60 < '{}'; : > '{}'; exit 7",
+            release.display(),
+            completed.display()
+        );
+        let mut proc = AlignerProcess::spawn(&command, 10).unwrap();
+        let wrapper_pid = proc.pid();
+        let pid = as_pid(wrapper_pid);
+        // Model a wrapper that outlived kill's deadline, without requiring
+        // uninterruptible kernel I/O in the fixture.
+        proc.process_group = None;
+        proc.group_teardown_confirmed = Some(false);
+        proc.teardown_started = true;
+        let (poll_tx, poll_rx) = std::sync::mpsc::channel();
+        proc.drop_poll_tx = Some(poll_tx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            drop(proc);
+            let _ = tx.send(());
+        });
+        let first_poll = poll_rx.recv_timeout(Duration::from_secs(3));
+        if !outlives_deadline {
+            // Only let the wrapper exit after Drop observed it still running.
+            release_pipe.write_all(b"\n").expect("release wrapper after first poll");
+        }
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        let reap = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+        let still_running = matches!(reap, Ok(None)) && process_is_running(wrapper_pid);
+        // Drop may reap between this probe and cleanup, so release through
+        // the independent FIFO rather than signalling the saved PID. Its
+        // retained read end makes this single-byte write nonblocking even
+        // after the shell exited.
+        if matches!(reap, Ok(None)) {
+            release_pipe.write_all(b"\n").expect("release wrapper even after reaping");
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while matches!(
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+                Ok(None)
+            ) {
+                assert!(std::time::Instant::now() < deadline, "wrapper did not exit after release");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        join_until(worker, std::time::Instant::now() + Duration::from_secs(3))
+            .expect("emergency cleanup did not release Drop")
+            .expect("Drop worker panicked");
+        first_poll.expect("Drop must poll the still-running wrapper before its release");
+        result.expect("Drop waited for the wrapper without a deadline");
+        assert_eq!(
+            matches!(reap, Err(rustix::io::Errno::CHILD)),
+            expected_reaped,
+            "Drop must reap only a wrapper that exits within its deadline: {reap:?}"
+        );
+        if outlives_deadline {
+            assert!(still_running, "cached teardown must not signal the still-running wrapper");
+        } else {
+            assert!(completed.exists(), "Drop must not signal the wrapper after cached teardown");
+        }
+    }
+
+    /// A PID probe must distinguish a running holder from an unreaped zombie;
+    /// both survival and termination assertions depend on this distinction.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::running("running", true)]
+    #[case::zombie("zombie", false)]
+    #[case::reaped("reaped", false)]
+    fn test_process_liveness_probe(#[case] state: &str, #[case] expected: bool) {
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        if state != "running" {
+            child.kill().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = Command::new("/bin/ps")
+                    .args(["-o", "stat=", "-p", &child.id().to_string()])
+                    .output()
+                    .unwrap();
+                if String::from_utf8_lossy(&status.stdout).trim().starts_with('Z') {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "child did not become a zombie");
+                thread::sleep(Duration::from_millis(10));
+            }
+            if state == "reaped" {
+                child.wait().unwrap();
+            }
+        }
+        let running = process_is_running(child.id());
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(running, expected);
+    }
+
+    /// `pid` as a rustix [`Pid`](rustix::process::Pid). Panics on 0 or a value
+    /// past `i32::MAX`, neither of which a test's child process can have.
+    #[cfg(unix)]
+    fn as_pid(pid: u32) -> rustix::process::Pid {
+        i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw).expect("a valid pid")
+    }
+
+    /// Whether `pid` is still running, excluding zombies, which hold no pipes.
+    /// Use ps on both Linux and macOS; signal-0 alone also accepts zombies.
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        let status = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("probe process state");
+        if !status.status.success() {
+            assert_eq!(
+                rustix::process::test_kill_process(as_pid(pid)),
+                Err(rustix::io::Errno::SRCH),
+                "ps failed without confirming PID absence: {status:?}"
+            );
+            return false;
+        }
+        let state = String::from_utf8_lossy(&status.stdout);
+        assert!(!state.trim().is_empty(), "ps returned no process state: {status:?}");
+        !state.trim_start().starts_with('Z')
+    }
+
+    /// Poll until `pid` is absent or a zombie, for at most `timeout`.
+    #[cfg(unix)]
+    fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while process_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// Read the PID a test aligner command wrote to `path`, polling until the
+    /// shell has written it.
+    #[cfg(unix)]
+    fn read_pid_file(path: &Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid written to {}", path.display());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// SIGKILLs a test's stray process on drop, so a failing assertion does not
+    /// leave a long `sleep` behind.
+    #[cfg(unix)]
+    pub(crate) struct KillOnDrop(pub(crate) Option<u32>);
+
+    #[cfg(unix)]
+    impl KillOnDrop {
+        /// Disarm cleanup once termination is confirmed, before PID reuse.
+        pub(crate) fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+            if self.0.is_some_and(|pid| wait_for_exit(pid, timeout)) {
+                self.0 = None;
+            }
+            self.0.is_none()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = rustix::process::kill_process(as_pid(pid), rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    /// Teardown must kill the aligner's whole process group, not only the
+    /// `/bin/bash -c` wrapper. The command backgrounds a long-lived grandchild
+    /// that inherits the stdout and stderr pipes; with only the wrapper killed,
+    /// the grandchild keeps both pipes open, so the stdout reader never sees EOF
+    /// and `wait()` never finishes joining the stderr relay. The teardown here
+    /// is the one `SubprocessAlignStep::drop` runs (`kill()` then `wait()`),
+    /// bounded by a timeout so a regression fails instead of hanging. The
+    /// `ignores_sigterm` case needs the SIGKILL that follows the SIGTERM grace.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::exits_on_sigterm(true)]
+    #[case::ignores_sigterm(false)]
+    fn test_kill_terminates_grandchild_holding_pipes(
+        #[case] expect_sigterm: bool,
+        #[values(false, true)] zombie_member: bool,
+    ) {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let ready_file = dir.path().join("grandchild.ready");
+        let sigterm_file = dir.path().join("grandchild.sigterm");
+        let sleeper_pid_file = dir.path().join("sleeper.pid");
+        let term_handler = if expect_sigterm {
+            format!("': > \"{}\"; exit 0'", sigterm_file.display())
+        } else {
+            "''".to_owned()
+        };
+        // Keep the shell alive to run its trap: exec would discard the handler.
+        // Bash 3 has no BASHPID, so each parent publishes its child's PID.
+        let command = format!(
+            "(trap {term_handler} TERM; sleep 600 & echo $! > '{}'; \
+             : > '{}'; wait) & echo $! > '{}'; wait",
+            sleeper_pid_file.display(),
+            ready_file.display(),
+            pid_file.display(),
+        );
+        let mut proc = AlignerProcess::spawn(&command, 10).expect("spawn should succeed");
+        let mut stdout = proc.take_stdout().expect("stdout should be available");
+        let grandchild_pid = read_pid_file(&pid_file);
+        let mut cleanup = KillOnDrop(Some(grandchild_pid));
+        let sleeper_pid = read_pid_file(&sleeper_pid_file);
+        let mut sleeper_cleanup = KillOnDrop(Some(sleeper_pid));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready_file.exists() {
+            assert!(std::time::Instant::now() < deadline, "descendant handler was not installed");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // An owned member remains unreaped until this test collects it, so
+        // correct termination need not imply a confirmed empty group.
+        let mut member = zombie_member.then(|| {
+            Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(i32::try_from(proc.pid()).unwrap())
+                .spawn()
+                .unwrap()
+        });
+
+        // As in the pipeline, one thread blocks reading stdout while another
+        // tears the aligner down.
+        let reader = thread::spawn(move || {
+            let mut sink = Vec::new();
+            stdout.read_to_end(&mut sink).is_ok()
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let group_confirmed = proc.kill();
+            let wrapper_reaped = matches!(
+                rustix::process::waitpid(
+                    Some(as_pid(proc.pid())),
+                    rustix::process::WaitOptions::NOHANG,
+                ),
+                Err(rustix::io::Errno::CHILD)
+            );
+            let _ = proc.wait();
+            let stdout_closed = reader.join().unwrap_or(false);
+            let _ = done_tx.send((group_confirmed, wrapper_reaped, stdout_closed));
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(30));
+        if let Some(member) = member.as_mut() {
+            let _ = member.kill();
+            member.wait().unwrap();
+        }
+        let (group_confirmed, wrapper_reaped, stdout_closed) =
+            result.expect("teardown hung: the grandchild kept the aligner's pipes open");
+        assert!(wrapper_reaped, "kill() must reap the owned wrapper");
+        assert!(
+            !zombie_member || !group_confirmed,
+            "an unreaped group member must prevent group confirmation"
+        );
+        assert!(stdout_closed, "stdout must reach EOF once the group is killed");
+        assert!(
+            cleanup.wait_for_exit(Duration::from_secs(10)),
+            "grandchild (pid {grandchild_pid}) survived teardown"
+        );
+        assert!(
+            sleeper_cleanup.wait_for_exit(Duration::from_secs(10)),
+            "descendant's child (pid {sleeper_pid}) survived teardown"
+        );
+        assert_eq!(
+            sigterm_file.exists(),
+            expect_sigterm,
+            "the cooperative descendant must run its SIGTERM handler before exiting"
+        );
+    }
+
+    /// Preserve natural failures both at the first teardown probe and when a
+    /// later group probe cannot confirm teardown. Never report our own signal
+    /// as the cause of an earlier reader failure.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::pre_signal_probe(true, false, Some("status 7"))]
+    #[case::unconfirmed_group(true, true, Some("status 7"))]
+    #[case::teardown_signal(false, false, None)]
+    fn test_teardown_reports_only_independent_wrapper_failure(
+        #[case] natural_failure: bool,
+        #[case] unconfirmed: bool,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let command =
+            if natural_failure { "echo 'wrapper diagnostic' >&2; exit 7" } else { "exec sleep 60" };
+        let mut proc = AlignerProcess::spawn(command, 10).unwrap();
+        if natural_failure {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Cache only in Child, not AlignerProcess: kill's initial probe
+            // must be what observes this independently exiting wrapper.
+            while proc.child.try_wait().unwrap().is_none() {
+                assert!(std::time::Instant::now() < deadline, "wrapper did not exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        proc.kill();
+        if unconfirmed {
+            proc.group_teardown_confirmed = Some(false);
+        }
+        let result = proc.finish_teardown();
+        match expected_error {
+            None => result.expect("our teardown signal must not mask the reader's error"),
+            Some(expected) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected), "independent exit status lost: {error}");
+                assert!(error.contains("wrapper diagnostic"), "available stderr lost: {error}");
+            }
+        }
+    }
+
+    /// A helper outside the original group can retain stderr after the wrapper
+    /// exits. Failure and Drop must not wait for that helper's EOF.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::failed_wait("wait", true, 7)]
+    #[case::failed_wait_same_group("wait", false, 7)]
+    #[case::drop("drop", true, 0)]
+    #[case::kill_then_wait("kill_wait", true, 7)]
+    #[case::kill_then_successful_wait("kill_wait", true, 0)]
+    fn test_stderr_holder_does_not_block_failure_cleanup(
+        #[case] operation: &'static str,
+        #[case] separate_group: bool,
+        #[case] exit_code: u8,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("stderr-holder.pid");
+        let command = format!(
+            "{} sleep 60 </dev/null >/dev/null & echo $! > '{}'; \
+             echo 'wrapper diagnostic' >&2; exit {exit_code}",
+            if separate_group { "set -m;" } else { "" },
+            pid_file.display(),
+        );
+        let mut proc = AlignerProcess::spawn(&command, 10).unwrap();
+        let holder = read_pid_file(&pid_file);
+        let mut cleanup = KillOnDrop(Some(holder));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !proc.has_exited() {
+            assert!(std::time::Instant::now() < deadline, "wrapper did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = match operation {
+                "wait" => proc.wait(),
+                "kill_wait" => {
+                    assert!(proc.kill());
+                    proc.wait()
+                }
+                _ => {
+                    drop(proc);
+                    Ok(())
+                }
+            };
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        let holder_exited = cleanup.wait_for_exit(if separate_group {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1)
+        });
+        drop(cleanup);
+        if result.is_err() {
+            let _ = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("emergency cleanup did not release worker");
+        }
+        worker.join().unwrap();
+        let result = result.expect("cleanup waited for a stderr holder's EOF");
+        if !separate_group {
+            assert!(holder_exited, "same-group stderr holder survived normal teardown");
+        }
+        if exit_code != 0 {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("status 7"), "wrapper status lost: {error}");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    /// Dropping an `AlignerProcess` whose wrapper has exited but was never
+    /// `wait()`ed still kills its process group: a grandchild left holding the
+    /// stdout and stderr pipes would otherwise hang `Drop`'s stderr-relay join.
+    #[cfg(unix)]
+    #[test]
+    fn test_drop_kills_group_after_wrapper_exits_without_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let command = format!("sleep 600 & echo $! > '{}'", pid_file.display());
+        let mut proc = AlignerProcess::spawn(&command, 10).expect("spawn should succeed");
+        let grandchild_pid = read_pid_file(&pid_file);
+        let mut cleanup = KillOnDrop(Some(grandchild_pid));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while proc.child.try_wait().expect("try_wait").is_none() {
+            assert!(std::time::Instant::now() < deadline, "the wrapper never exited");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(proc);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("Drop hung: the grandchild kept the stderr pipe open");
+        assert!(
+            cleanup.wait_for_exit(Duration::from_secs(10)),
+            "grandchild (pid {grandchild_pid}) survived Drop"
+        );
+    }
+
+    /// A clean exit never signals the process group: by then the group's id
+    /// may belong to unrelated processes. A grandchild that detached from the
+    /// pipes and outlives a successful `wait()` is left running.
+    #[cfg(unix)]
+    #[test]
+    fn test_clean_wait_does_not_signal_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let command = format!(
+            "(exec sleep 600 </dev/null >/dev/null 2>&1) & echo $! > '{}'",
+            pid_file.display()
+        );
+        let proc = AlignerProcess::spawn(&command, 10).expect("spawn should succeed");
+        let grandchild_pid = read_pid_file(&pid_file);
+        let _cleanup = KillOnDrop(Some(grandchild_pid));
+
+        proc.wait().expect("the wrapper should exit successfully");
+        thread::sleep(Duration::from_millis(200));
+        assert!(process_is_running(grandchild_pid), "a clean exit must not kill the process group");
+    }
+
+    /// A separate reaper invalidates the wrapper PID as a signalling target.
+    /// A live member is an independent oracle that teardown did not signal it.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::kill("kill", false)]
+    #[case::wait("wait", true)]
+    #[case::drop("drop", true)]
+    #[case::wrapper_only("wrapper", true)]
+    #[case::drop_without_group("without_group", true)]
+    fn test_external_reaper_never_signals_group(#[case] operation: &str, #[case] expected: bool) {
+        use std::os::unix::process::CommandExt;
+
+        let mut proc = AlignerProcess::spawn("exit 0", 10).unwrap();
+        let mut member = Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(i32::try_from(proc.pid()).unwrap())
+            .spawn()
+            .unwrap();
+        rustix::process::waitpid(Some(as_pid(proc.pid())), rustix::process::WaitOptions::empty())
+            .expect("reap outside std::process::Child");
+        let confirmed = match operation {
+            "kill" => proc.kill(),
+            "wait" => proc.wait().is_err(),
+            "drop" => {
+                drop(proc);
+                true
+            }
+            "wrapper" => proc.kill_wrapper(std::time::Instant::now() + KILL_REAP_DEADLINE),
+            _ => {
+                proc.process_group = None;
+                drop(proc);
+                true
+            }
+        };
+        let member_survived = member.try_wait().unwrap().is_none();
+        let _ = member.kill();
+        member.wait().unwrap();
+        assert_eq!(confirmed, expected, "external reap cannot confirm group teardown");
+        assert!(member_survived, "never signal a group after an external reap");
+    }
+
+    /// ECHILD confirms only the wrapper's reap, not that its descendants
+    /// closed stderr. Teardown must return without signalling a recycled PGID
+    /// or joining that pipe's relay. The PID oracle and cleanup are independent
+    /// of `AlignerProcess` so a regression fails within the test's deadline.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::kill("kill", Some(false))]
+    #[case::wait("wait", Some(true))]
+    #[case::drop("drop", None)]
+    fn test_external_reaper_with_pipe_holder_is_bounded(
+        #[case] operation: &'static str,
+        #[case] expected: Option<bool>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let proc =
+            AlignerProcess::spawn(&format!("sleep 60 & echo $! > '{}'", pid_file.display()), 10)
+                .unwrap();
+        let descendant = read_pid_file(&pid_file);
+        let cleanup = KillOnDrop(Some(descendant));
+        rustix::process::waitpid(Some(as_pid(proc.pid())), rustix::process::WaitOptions::empty())
+            .expect("reap wrapper outside Child");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut proc = proc;
+            let result = match operation {
+                "kill" => {
+                    let confirmed = proc.kill();
+                    drop(proc);
+                    Some(confirmed)
+                }
+                "wait" => Some(proc.wait().is_err()),
+                _ => {
+                    drop(proc);
+                    None
+                }
+            };
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        let descendant_survived = process_is_running(descendant);
+        // Close the inherited pipe even when the old teardown hangs on it.
+        drop(cleanup);
+        if result.is_err() {
+            rx.recv_timeout(Duration::from_secs(5)).expect("emergency cleanup must unblock relay");
+        }
+        worker.join().unwrap();
+        assert_eq!(result.expect("teardown joined stderr after an external reap"), expected);
+        assert!(descendant_survived, "an externally reaped PGID must never be signalled");
+        assert!(wait_for_exit(descendant, Duration::from_secs(5)), "descendant cleanup failed");
+    }
+
     /// `is_already_reaped` confirms exit only for `ECHILD`. An unrelated errno
     /// (e.g. `EINVAL`) must NOT be treated as a confirmed reap, so `kill()`
     /// reports `false` and the caller avoids a follow-up unbounded `wait()`.
-    #[test]
-    fn test_is_already_reaped_only_for_echild() {
-        let echild = std::io::Error::from_raw_os_error(ECHILD);
-        assert!(is_already_reaped(&echild), "ECHILD must count as already reaped");
-
-        // EINVAL (22) stands in for any unrelated errno: it must NOT count.
-        let einval = std::io::Error::from_raw_os_error(22);
-        assert!(!is_already_reaped(&einval), "an unrelated errno must not count as reaped");
-
-        // A non-OS error (no errno at all) is likewise not a confirmed reap.
-        let not_os = std::io::Error::other("synthetic non-os error");
-        assert!(!is_already_reaped(&not_os), "a non-OS error must not count as reaped");
+    #[rstest]
+    #[case::already_reaped(Some(ECHILD), true)]
+    #[case::unrelated_errno(Some(22), false)]
+    #[case::non_os_error(None, false)]
+    fn test_is_already_reaped_only_for_echild(#[case] errno: Option<i32>, #[case] expected: bool) {
+        let error = errno.map_or_else(
+            || std::io::Error::other("synthetic non-os error"),
+            std::io::Error::from_raw_os_error,
+        );
+        assert_eq!(is_already_reaped(&error), expected);
     }
 
     /// Preset command strings with the default-PATH binary (bare binary name,

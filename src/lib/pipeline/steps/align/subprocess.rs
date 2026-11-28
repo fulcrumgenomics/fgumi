@@ -1632,9 +1632,9 @@ impl SubprocessAlignStep {
         // 5. Drain phase: `in_tx` is closed; the aligner is flushing its tail
         //    through the reader. Reaching here means step 3 drained `out_rx`
         //    empty this call. Complete only once the reader has also exited AND
-        //    nothing is held — then join the threads (which cannot block, since
-        //    the reader is finished and the receiver is drained), wait on the
-        //    subprocess, and surface errors.
+        //    nothing is held — then delegate to finalize, which tears down the
+        //    aligner before joining a writer left blocked by reader failure,
+        //    and surfaces errors in diagnostic priority order.
         let reader_finished = self.reader_thread.as_ref().is_none_or(JoinHandle::is_finished);
         let writer_finished = self.writer_thread.as_ref().is_none_or(JoinHandle::is_finished);
         // A finished reader does not imply a finished writer or child. In the
@@ -1712,7 +1712,8 @@ impl SubprocessAlignStep {
     /// usually never gets here: `try_run` returns it as soon as it is recorded.
     /// Returns
     /// `StepOutcome::Finished`. Both callers guarantee that the I/O threads have
-    /// finished, so these joins cannot wait on live pipes or channels.
+    /// finished. Direct failure cleanup also tears down the aligner before
+    /// joining a potentially blocked writer, bounding or skipping that join.
     fn finalize(&mut self) -> io::Result<StepOutcome> {
         let writer_handle =
             self.writer_thread.take().expect("writer_thread is Some until finalize");
@@ -1721,21 +1722,54 @@ impl SubprocessAlignStep {
         // Drop the receiver; the reader has already exited.
         let _ = self.out_rx.take();
 
-        // Both I/O threads have exited: after input/output EOF on a successful
-        // drain, or after a cascade has stopped the writer and reader.
-        let writer_result = writer_handle.join();
+        // The reader is finished (observed via `is_finished()` in the gate).
+        // The writer may still be blocked on the aligner's stdin pipe.
         let reader_result = reader_handle.join();
 
         // Wait for the subprocess to exit. `AlignerProcess::wait` consumes it.
-        let aligner_result = self.aligner.take().expect("aligner is Some until finalize").wait();
+        //
+        // If the reader failed (an error, or a panic), nothing reads the
+        // aligner's output any more and the aligner may not exit on its own:
+        // tear its process group down (bounded) instead of waiting without
+        // bound. An aligner that had already exited keeps its own exit status,
+        // appended to the reader error below; one this kill ended reports a signal,
+        // which would mask the reader's diagnostic, so its status is dropped.
+        let mut aligner = self.aligner.take().expect("aligner is Some until finalize");
+        let reader_failed = !matches!(reader_result, Ok(Ok(())));
+        let (aligner_result, writer_result) = if reader_failed {
+            let teardown_confirmed = aligner.kill();
+            let writer_result = if teardown_confirmed {
+                crate::aligner::join_until(
+                    writer_handle,
+                    std::time::Instant::now() + crate::aligner::WORKER_JOIN_TIMEOUT,
+                )
+            } else {
+                None
+            };
+            // This reads the status cached by the pre-signal probe even when
+            // group teardown was unconfirmed, without an unbounded wait().
+            (aligner.finish_teardown(), writer_result)
+        } else {
+            let result = aligner.wait();
+            let writer_result = if result.is_err() {
+                crate::aligner::join_until(
+                    writer_handle,
+                    std::time::Instant::now() + crate::aligner::WORKER_JOIN_TIMEOUT,
+                )
+            } else {
+                Some(writer_handle.join())
+            };
+            (result, writer_result)
+        };
 
         let reader_result = match reader_result {
             Ok(result) => result,
             Err(_panic) => Err(io::Error::other("align-and-merge reader thread panicked")),
         };
         let writer_result = match writer_result {
-            Ok(result) => result,
-            Err(_panic) => Err(io::Error::other("align-and-merge writer thread panicked")),
+            Some(Ok(result)) => result,
+            Some(Err(_panic)) => Err(io::Error::other("align-and-merge writer thread panicked")),
+            None => Ok(()),
         };
         if let Some(err) = rank_align_errors(aligner_result, reader_result, writer_result) {
             return Err(err);
@@ -1795,9 +1829,10 @@ impl Drop for SubprocessAlignStep {
     /// `PipelineSignal::cancel` fires, workers exit at their next
     /// loop iteration, `Pipeline::run` returns, the step's
     /// `Arc` refcount hits zero, and `Drop` runs. `aligner.kill()`
-    /// here SIGKILLs bwa; its pipes close immediately so the reader
-    /// thread's stdout `read` unblocks within microseconds and the
-    /// daemon cascade completes.
+    /// here kills the aligner's whole process group (SIGTERM, then
+    /// SIGKILL after a short grace), not just its `/bin/bash -c`
+    /// wrapper, so every process holding the pipes exits, the reader
+    /// thread's stdout `read` unblocks, and the daemon cascade completes.
     ///
     /// Order is **disconnect-channels-then-kill-then-join** — the
     /// opposite of the clean `finalize` path. Two distinct blocking points
@@ -1821,8 +1856,10 @@ impl Drop for SubprocessAlignStep {
     /// Steps:
     /// 1. Drop `in_tx` (unblocks writer's `recv`).
     /// 2. Drop `out_rx` (unblocks reader's `send`).
-    /// 3. Kill + wait subprocess (unblocks reader's stdout `read`).
-    /// 4. Join both threads.
+    /// 3. Kill subprocess (unblocks reader's stdout `read` if confirmed gone).
+    /// 4. Join both threads until a shared deadline only if teardown was
+    ///    confirmed; otherwise detach them. Even a confirmed group teardown
+    ///    cannot close pipes held by a helper that moved to another group.
     ///
     /// All errors are silently ignored — we're already on a teardown
     /// path with nowhere to surface them.
@@ -1841,22 +1878,25 @@ impl Drop for SubprocessAlignStep {
         drop(self.in_tx.take());
         drop(self.out_rx.take());
 
+        let mut teardown_confirmed = true;
         if let Some(mut aligner) = self.aligner.take() {
-            // Bounded teardown: only issue the unbounded `wait()` once the child
-            // has actually been reaped. If `kill()` timed out (stuck child, e.g.
-            // uninterruptible I/O), calling `wait()` would block teardown
-            // forever — defeating the 1s kill deadline. In that case we skip
-            // `wait()` and let `AlignerProcess::Drop` (itself bounded) clean up.
-            if aligner.kill() {
-                let _ = aligner.wait();
-            }
+            teardown_confirmed = aligner.kill();
+            // Drop bounds the stderr join even if a helper left the group.
+            drop(aligner);
         }
 
-        if let Some(h) = self.writer_thread.take() {
-            let _ = h.join();
+        // A surviving process may still hold either pipe. Detach the workers
+        // rather than defeating bounded kill with an unbounded join.
+        let deadline = std::time::Instant::now() + crate::aligner::WORKER_JOIN_TIMEOUT;
+        if let Some(h) = self.writer_thread.take()
+            && teardown_confirmed
+        {
+            let _ = crate::aligner::join_until(h, deadline);
         }
-        if let Some(h) = self.reader_thread.take() {
-            let _ = h.join();
+        if let Some(h) = self.reader_thread.take()
+            && teardown_confirmed
+        {
+            let _ = crate::aligner::join_until(h, deadline);
         }
     }
 }
@@ -2694,6 +2734,362 @@ mod tests {
         }
     }
 
+    /// Join after completion, allowing a bounded second receive after emergency
+    /// cleanup. A stalled worker must not prevent a timeout from being reported.
+    fn join_test_worker<T>(
+        worker: thread::JoinHandle<()>,
+        completed: bool,
+        rx: &Receiver<T>,
+        timeout: std::time::Duration,
+    ) {
+        if !completed {
+            assert!(
+                rx.recv_timeout(timeout).is_ok(),
+                "test worker stalled after emergency cleanup"
+            );
+        }
+        worker.join().expect("test worker panicked");
+    }
+
+    /// Emergency cleanup may not release a finalizer; the timeout must still
+    /// be reported without waiting for that finalizer's eventual completion.
+    #[test]
+    fn test_emergency_cleanup_does_not_join_stalled_worker() {
+        use std::time::Duration;
+
+        let (release_tx, release_rx) = channel();
+        let (tx, rx) = channel();
+        let worker = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            let _ = tx.send(());
+        });
+        let (done_tx, done_rx) = channel();
+        let supervisor = thread::spawn(move || {
+            let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                join_test_worker(worker, false, &rx, Duration::from_millis(20));
+            }))
+            .is_err();
+            let _ = done_tx.send(timed_out);
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        // Release even on the red path, so the regression cannot hang its test.
+        release_tx.send(()).unwrap();
+        supervisor.join().unwrap();
+        assert!(result.expect("cleanup joined a stalled worker"), "cleanup must report timeout");
+    }
+
+    /// The first input byte releases malformed output while the writer is
+    /// still feeding a record larger than a pipe. Joining that writer before
+    /// killing the non-reading aligner would deadlock finalization.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_kills_before_joining_pipe_blocked_writer() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("holder-ready");
+        let release = dir.path().join("holder-release");
+        assert!(std::process::Command::new("mkfifo").arg(&release).status().unwrap().success());
+        // Keep both ends open so emergency release never waits for a reader,
+        // including when finalization has already killed and reaped the shell.
+        let mut release_pipe =
+            std::fs::OpenOptions::new().read(true).write(true).open(&release).unwrap();
+        // EOF terminates the malformed header without a trailing stdout write
+        // that could SIGPIPE after the reader rejects it. The marker confirms
+        // the mock reached its non-reading, stdin-holding phase.
+        let command = format!(
+            "dd bs=1 count=1 >/dev/null 2>&1; printf '@SQ\\tSN:chr1\\tLN:invalid\\n'; \
+             exec 1>&-; : > '{}'; read -r -t 60 < '{}'",
+            ready.display(),
+            release.display(),
+        );
+        let mut step =
+            SubprocessAlignStep::new(make_test_cfg(), &command).expect("spawn stalled aligner");
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(step.aligner.as_ref().unwrap().pid()).unwrap(),
+        )
+        .unwrap();
+        let mut builder = fgumi_raw_bam::SamBuilder::new();
+        builder
+            .read_name(b"large")
+            .sequence(&vec![b'A'; 2 * 1024 * 1024])
+            .qualities(&vec![b'I'; 2 * 1024 * 1024]);
+        let template = Template::from_records(vec![builder.build()]).unwrap();
+        step.in_tx.take().unwrap().send(BamTemplateBatch::new(0, vec![template])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !step.reader_thread.as_ref().unwrap().is_finished() || !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "reader rejection or pipe-holder readiness timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_ok(),
+            "pipe holder exited before finalization"
+        );
+        assert!(
+            !step.writer_thread.as_ref().unwrap().is_finished(),
+            "fixture must have a blocked writer"
+        );
+        let (tx, rx) = channel();
+        let worker = thread::spawn(move || {
+            let result = step.finalize();
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        // Independent emergency cleanup makes the red test fail, not hang.
+        if result.is_err() {
+            release_pipe.write_all(b"\n").expect("release pipe holder even after reaping");
+        }
+        join_test_worker(worker, result.is_ok(), &rx, Duration::from_secs(5));
+        let error = result.expect("finalize hung joining the blocked writer").unwrap_err();
+        assert!(error.to_string().contains("header"), "reader diagnostic must win: {error}");
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "finalization must terminate and reap the pipe holder"
+        );
+    }
+
+    /// Exercise unfinished workers with both confirmed and unconfirmed group
+    /// teardown. An owned, unreaped member supplies the latter on Linux/macOS.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::finalize_failed_reader(false, false, false, "reader failure")]
+    #[case::finalize_successful_reader(false, false, true, "status 7")]
+    #[case::drop_blocked_writer(true, false, false, "")]
+    #[case::drop_blocked_reader(true, true, false, "")]
+    fn teardown_bounds_unfinished_workers(
+        #[case] dropping: bool,
+        #[case] blocked_reader: bool,
+        #[case] reader_succeeded: bool,
+        #[case] expected_error: &str,
+        #[values(false, true)] zombie_member: bool,
+    ) {
+        use std::os::unix::process::CommandExt;
+        use std::time::Duration;
+
+        let command = if reader_succeeded { "exit 7" } else { "exec sleep 60" };
+        let mut aligner = AlignerProcess::spawn(command, 10).unwrap();
+        let (group_tx, group_rx) = channel();
+        aligner.teardown_result_tx = Some(group_tx);
+        let mut member = zombie_member.then(|| {
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(i32::try_from(aligner.pid()).unwrap())
+                .spawn()
+                .unwrap()
+        });
+        let (release_tx, release_rx) = channel();
+        let (writer_release, reader_release) =
+            if blocked_reader { (None, Some(release_rx)) } else { (Some(release_rx), None) };
+        let writer = thread::spawn(move || {
+            if let Some(release) = writer_release {
+                release.recv().unwrap();
+            }
+            Err(io::Error::other("writer failure"))
+        });
+        let reader = thread::spawn(move || {
+            if let Some(release) = reader_release {
+                release.recv().unwrap();
+            }
+            if reader_succeeded { Ok(()) } else { Err(io::Error::other("reader failure")) }
+        });
+        let mut step = SubprocessAlignStep {
+            cfg: make_test_cfg(),
+            aligner: Some(aligner),
+            in_tx: None,
+            out_rx: None,
+            writer_thread: Some(writer),
+            reader_thread: Some(reader),
+            shared: Arc::new(SharedState::new()),
+            started_at: std::time::Instant::now(),
+            held_in: HeldSlot::new(),
+            held_out: HeldSlot::new(),
+            name: "SubprocessAlign",
+        };
+        let (done_tx, done_rx) = channel();
+        let worker = thread::spawn(move || {
+            let error = if dropping {
+                drop(step);
+                None
+            } else {
+                step.finalize().err()
+            };
+            let _ = done_tx.send(error);
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release worker even on failure");
+        // Check the result while the owned member is still unreaped. Retain
+        // emergency cleanup even when the assertion detects a regression.
+        let group_assertion = std::panic::catch_unwind(|| {
+            assert_eq!(
+                group_rx.recv_timeout(Duration::ZERO),
+                Ok(Some(!zombie_member)),
+                "teardown must record whether the whole group was confirmed gone"
+            );
+        });
+        if let Some(member) = member.as_mut() {
+            let _ = member.kill();
+            member.wait().expect("reap member even on failure");
+        }
+        join_test_worker(worker, result.is_ok(), &done_rx, Duration::from_secs(5));
+        if let Err(panic) = group_assertion {
+            std::panic::resume_unwind(panic);
+        }
+        let error = result.expect("teardown joined an unfinished worker without a deadline");
+        if !dropping {
+            let error = error.unwrap().to_string();
+            assert!(error.contains(expected_error), "expected {expected_error}: {error}");
+        }
+    }
+
+    /// A custom command can put a pipe holder outside the original group.
+    /// Neither Drop nor failed finalization may join its blocked workers forever.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::finalize_failed_reader(false, false)]
+    #[case::finalize_successful_reader(false, true)]
+    #[case::drop(true, false)]
+    fn teardown_bounds_workers_outside_original_group(
+        #[case] dropping: bool,
+        #[case] reader_succeeded: bool,
+    ) {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("holder.pid");
+        let command = format!(
+            "set -m; sleep 60 & echo $! > '{}'; echo 'wrapper diagnostic' >&2; exit 7",
+            pid_file.display(),
+        );
+        let mut step = SubprocessAlignStep::new(make_test_cfg(), &command).unwrap();
+        drop(step.in_tx.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let holder = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break rustix::process::Pid::from_raw(pid).unwrap();
+            }
+            assert!(Instant::now() < deadline, "holder PID not published");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut cleanup =
+            crate::aligner::KillOnDrop(Some(u32::try_from(holder.as_raw_pid()).unwrap()));
+        while !step.aligner.as_mut().unwrap().has_exited() {
+            assert!(Instant::now() < deadline, "wrapper did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Emulate a completed reader while the original reader remains blocked
+        // on the escaped holder's stdout pipe.
+        let old_reader = if dropping {
+            None
+        } else {
+            step.reader_thread.replace(thread::spawn(move || {
+                if reader_succeeded { Ok(()) } else { Err(io::Error::other("reader failure")) }
+            }))
+        };
+        let (tx, rx) = channel();
+        let worker = thread::spawn(move || {
+            let result = if dropping {
+                drop(step);
+                Ok(StepOutcome::Finished)
+            } else {
+                step.finalize()
+            };
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        cleanup.wait_for_exit(Duration::ZERO);
+        drop(cleanup);
+        join_test_worker(worker, result.is_ok(), &rx, Duration::from_secs(5));
+        if let Some(reader) = old_reader {
+            let _ = crate::aligner::join_until(reader, Instant::now() + Duration::from_secs(5))
+                .expect("emergency cleanup did not release the escaped holder's reader")
+                .expect("reader thread panicked");
+        }
+        let result = result.expect("teardown waited for escaped pipe holder");
+        if dropping {
+            result.unwrap();
+        } else {
+            assert!(result.unwrap_err().to_string().contains("status 7"));
+        }
+    }
+
+    /// Preserve diagnostic priority while changing teardown order.
+    #[rstest::rstest]
+    #[case::success(0, 0, 0, None, None)]
+    #[case::reader_with_natural_aligner_exit(
+        7,
+        1,
+        1,
+        None,
+        Some("reader diagnostic; the aligner exited: aligner process exited with status 7.")
+    )]
+    #[case::reader_panic_with_natural_aligner_exit(
+        7,
+        2,
+        1,
+        None,
+        Some(
+            "align-and-merge reader thread panicked; the aligner exited: aligner process exited with status 7."
+        )
+    )]
+    #[case::reader_before_writer(0, 1, 1, None, Some("reader diagnostic"))]
+    #[case::reader_panic(0, 2, 1, None, Some("reader thread panicked"))]
+    #[case::writer_error(0, 0, 1, None, Some("writer diagnostic"))]
+    #[case::writer_panic(0, 0, 2, None, Some("writer thread panicked"))]
+    #[case::fallback(0, 0, 0, Some("fallback diagnostic"), Some("fallback diagnostic"))]
+    fn finalize_preserves_diagnostic_priority(
+        #[case] exit_code: u8,
+        #[case] reader: u8,
+        #[case] writer: u8,
+        #[case] fallback: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut aligner =
+            AlignerProcess::spawn(&format!("echo 'aligner diagnostic' >&2; exit {exit_code}"), 10)
+                .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !aligner.has_exited() {
+            assert!(std::time::Instant::now() < deadline, "aligner did not exit");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let daemon = |outcome, label| {
+            thread::spawn(move || match outcome {
+                0 => Ok(()),
+                1 => Err(io::Error::other(format!("{label} diagnostic"))),
+                _ => panic!("{label} panic"),
+            })
+        };
+        let mut step = SubprocessAlignStep {
+            cfg: make_test_cfg(),
+            aligner: Some(aligner),
+            in_tx: None,
+            out_rx: None,
+            writer_thread: Some(daemon(writer, "writer")),
+            reader_thread: Some(daemon(reader, "reader")),
+            shared: Arc::new(SharedState::new()),
+            started_at: std::time::Instant::now(),
+            held_in: HeldSlot::new(),
+            held_out: HeldSlot::new(),
+            name: "SubprocessAlign",
+        };
+        if let Some(fallback) = fallback {
+            step.shared.record_error(io::Error::other(fallback));
+        }
+        match expected {
+            Some(text) => {
+                let error = step.finalize().unwrap_err();
+                assert!(error.to_string().contains(text), "expected {text}: {error}");
+            }
+            None => assert!(matches!(step.finalize().unwrap(), StepOutcome::Finished)),
+        }
+    }
+
     /// `bash -c 'true'` is a stand-in for a subprocess that exits
     /// cleanly. Lets us verify the spawn path doesn't panic and that
     /// Drop tears down without leaking.
@@ -2723,21 +3119,68 @@ mod tests {
         assert_eq!(p.output_queues.len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn drop_kills_long_running_subprocess() {
-        // Spawn a "sleep" subprocess; Drop should kill it within
-        // AlignerProcess::Drop's 1-second deadline.
-        let cfg = make_test_cfg();
-        let start = std::time::Instant::now();
-        {
-            let _step = SubprocessAlignStep::new(cfg, "sleep 60").expect("spawn sleep");
-        } // Drop runs here.
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("holder-ready");
+        let release = dir.path().join("holder-release");
+        assert!(std::process::Command::new("mkfifo").arg(&release).status().unwrap().success());
+        // Retain both ends so release cannot block, even after Drop reaped the holder.
+        let mut release_pipe =
+            std::fs::OpenOptions::new().read(true).write(true).open(&release).unwrap();
+        let command = format!(": > '{}'; read -r -t 60 < '{}'", ready.display(), release.display());
+        let step = SubprocessAlignStep::new(make_test_cfg(), &command).expect("spawn pipe holder");
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(step.aligner.as_ref().unwrap().pid()).unwrap(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let holder_ready = ready.exists();
+        let start = Instant::now();
+        let (tx, rx) = channel();
+        let worker = thread::spawn(move || {
+            drop(step);
+            let _ = tx.send(());
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
         let elapsed = start.elapsed();
-        // AlignerProcess::kill waits up to 1s; thread joins should
-        // be near-instant once channels close. Generous bound.
+        // Capture Drop's result before emergency release can terminate the holder.
+        let drop_reap = result
+            .as_ref()
+            .ok()
+            .map(|()| rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG));
+        release_pipe.write_all(b"\n").expect("release holder even after reaping");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut cleanup_reap =
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+        while matches!(cleanup_reap, Ok(None)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            cleanup_reap =
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+        }
+        join_test_worker(worker, result.is_ok(), &rx, Duration::from_secs(5));
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "Drop took {elapsed:?}; expected <5s — long-running subprocess not killed?"
+            matches!(cleanup_reap, Ok(Some(_)) | Err(rustix::io::Errno::CHILD)),
+            "holder did not exit after FIFO release: {cleanup_reap:?}"
+        );
+        assert!(holder_ready, "pipe-holder readiness timed out");
+        result.expect("Drop waited for the holder without a deadline");
+        assert!(
+            matches!(drop_reap, Some(Err(rustix::io::Errno::CHILD))),
+            "pipe holder was not reaped by Drop before emergency release: {drop_reap:?}"
+        );
+        // SIGTERM grace and the shared reap deadline total about 1.5 s;
+        // thread joins should be near-instant once channels close.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Drop took {elapsed:?}; expected <5s - long-running subprocess not killed?"
         );
     }
 
