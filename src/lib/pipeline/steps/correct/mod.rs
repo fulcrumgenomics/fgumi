@@ -34,8 +34,9 @@
 use std::io;
 use std::num::NonZero;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use log::warn;
 use lru::LruCache;
 
 use crate::commands::correct::{
@@ -82,7 +83,9 @@ impl HeapSize for CorrectWorkerState {
 /// cross the crate boundary.
 pub(crate) struct CorrectStepConfig {
     pub(crate) encoded_umi_set: Arc<EncodedUmiSet>,
-    pub(crate) umi_length: usize,
+    /// Set once the first wrong-length template has been warned about, so the
+    /// warning is logged once per run (as fgbio does) across all workers.
+    pub(crate) warned_wrong_length: AtomicBool,
     pub(crate) umi_tag: [u8; 2],
     /// Tag the pre-correction sequence is stashed in when original storage
     /// is enabled. Derived from [`crate::commands::correct::Target::original_tag`]
@@ -92,7 +95,6 @@ pub(crate) struct CorrectStepConfig {
     pub(crate) metrics: Arc<PerThreadAccumulator<CollectedCorrectMetrics>>,
     pub(crate) records_emitted: Arc<AtomicU64>,
     pub(crate) output_byte_limit: u64,
-    pub(crate) unmatched_umi: String,
 }
 
 /// Build the 2-output `CorrectStep`. Used when `--rejects` is set; kept
@@ -235,7 +237,6 @@ fn run_batch(
 
         let correction = correct::CorrectUmis::compute_template_correction(
             &umi,
-            cfg.umi_length,
             cfg.opts.revcomp,
             cfg.opts.max_mismatches,
             cfg.opts.min_distance_diff,
@@ -248,7 +249,7 @@ fn run_batch(
         correct::CorrectUmis::credit_umi_metrics(
             &correction.matches,
             num_records,
-            &cfg.unmatched_umi,
+            &cfg.encoded_umi_set,
             &mut local_metrics.umi_matches,
         );
 
@@ -268,7 +269,12 @@ fn run_batch(
             kept_templates.push(corrected);
         } else {
             match correction.rejection_reason {
-                RejectionReason::WrongLength => local_metrics.wrong_length += num_records,
+                RejectionReason::WrongLength => {
+                    if !cfg.warned_wrong_length.swap(true, Ordering::Relaxed) {
+                        warn_wrong_length(&records, &umi, cfg);
+                    }
+                    local_metrics.wrong_length += num_records;
+                }
                 RejectionReason::Mismatched => local_metrics.mismatched += num_records,
                 RejectionReason::None => {}
             }
@@ -284,6 +290,24 @@ fn run_batch(
     cfg.records_emitted.fetch_add(kept_record_count, Ordering::Relaxed);
 
     Ok(BamTemplateBatch::new(batch_serial, kept_templates))
+}
+
+/// Logs the wrong-length warning for the first template whose UMI has a
+/// segment matching no fixed-UMI length, naming the read, the UMI segments that
+/// were length-checked (split on `-` and, with `--revcomp`, reverse-complemented
+/// in reverse order, as they were matched), separated by a space, and the
+/// fixed-UMI lengths that were expected. fgbio `CorrectUmis` logs the same pair
+/// of lines.
+fn warn_wrong_length(records: &[RawRecord], umi: &str, cfg: &CorrectStepConfig) {
+    let name = records.first().map_or_else(String::new, |rec| {
+        String::from_utf8_lossy(fgumi_raw_bam::read_name(rec)).into_owned()
+    });
+    let segments = correct::CorrectUmis::umi_segments(umi, cfg.opts.revcomp);
+    warn!("Read ({name}) detected with unexpected length UMI(s): {}.", segments.join(" "));
+    warn!(
+        "Expected UMI length(s): {}",
+        correct::format_umi_lengths(&cfg.encoded_umi_set.umi_lengths())
+    );
 }
 
 /// Append one raw BAM record to `dst` using the standard BAM framing:

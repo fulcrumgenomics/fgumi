@@ -3496,13 +3496,15 @@ impl<'a> ChainBuilder<'a> {
         info!("Input: {}", input_path.display());
         info!("Output: {}", output_path.display());
 
-        let umi_length = umi_set.umi_length();
-        info!("Loaded {} UMI sequences of length {}", umi_set.sequences().len(), umi_length);
         let encoded_umi_set = Arc::new(EncodedUmiSet::new(umi_set.sequences()));
+        info!(
+            "Loaded {} UMI sequences of length(s) {}",
+            umi_set.sequences().len(),
+            crate::commands::correct::format_umi_lengths(&encoded_umi_set.umi_lengths())
+        );
         correct_opts.check_umi_distances(umi_set.sequences());
         // The encoded set is all the run needs; free the sequences now.
         drop(umi_set);
-        let unmatched_umi = "N".repeat(umi_length);
 
         let num_threads = self.spec.threading.num_threads();
 
@@ -3521,14 +3523,13 @@ impl<'a> ChainBuilder<'a> {
         let original_tag_bytes: [u8; 2] = correct_opts.target.original_tag().into();
         let cfg = CorrectStepConfig {
             encoded_umi_set: Arc::clone(&encoded_umi_set),
-            umi_length,
+            warned_wrong_length: std::sync::atomic::AtomicBool::new(false),
             umi_tag: umi_tag_bytes,
             original_tag: original_tag_bytes,
             opts: correct_opts.clone(),
             metrics: Arc::clone(&metrics),
             records_emitted: Arc::clone(&records_emitted),
             output_byte_limit: self.tuning.per_step_byte_limit,
-            unmatched_umi: unmatched_umi.clone(),
         };
 
         let track_rejects = correct_opts.rejects_path.is_some();
@@ -3617,7 +3618,6 @@ impl<'a> ChainBuilder<'a> {
             metrics: Arc::clone(&metrics),
             records_emitted: Arc::clone(&records_emitted),
             encoded_umi_set,
-            unmatched_umi,
             correct: correct_opts.clone(),
         }));
         // Always-run: summary + warn banners + timer completion. No longer
