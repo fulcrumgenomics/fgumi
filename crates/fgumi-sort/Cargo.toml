@@ -45,7 +45,7 @@ log = { workspace = true }
 # crates shared by two or more members.
 smallvec = { version = "1.15", features = ["const_generics"] }
 zstd = "0.14"
-voracious_radix_sort = { version = "1", features = ["voracious_multithread"] }
+voracious_radix_sort = { version = "2", features = ["voracious_multithread"] }
 
 [target.'cfg(unix)'.dependencies]
 # `process` adds `getrlimit`, used by `fd_limit`. See the workspace entry.
