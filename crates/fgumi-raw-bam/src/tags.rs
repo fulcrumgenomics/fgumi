@@ -441,8 +441,9 @@ pub fn extract_aux_string_tags(
 /// Result of a single-pass extraction of all tags needed for template-coordinate sorting.
 /// Extracts MI (integer or string), RG, cell barcode, and MC in one scan of aux data.
 pub struct TemplateAuxTags<'a> {
-    /// MI tag value: (`molecular_id`, `is_A_suffix`). Defaults to `(0, true)` if not found.
-    pub mi: (u64, bool),
+    /// MI tag value: (`molecular_id`, `is_A_suffix`), or `None` when the record has no MI tag (or one that is
+    /// not a non-negative integer, optionally with an `/A` or `/B` suffix).
+    pub mi: Option<(u64, bool)>,
     /// RG (read group) tag value.
     pub rg: Option<&'a [u8]>,
     /// Cell barcode tag value.
@@ -458,7 +459,7 @@ pub struct TemplateAuxTags<'a> {
 #[must_use]
 pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> TemplateAuxTags<'_> {
     let aux_data = aux_data_slice(bam);
-    let mut result = TemplateAuxTags { mi: (0, true), rg: None, cell: None, mc: None };
+    let mut result = TemplateAuxTags { mi: None, rg: None, cell: None, mc: None };
     // Bits: 0=MI, 1=RG, 2=cell, 3=MC
     let target_bits: u8 = if cell_tag.is_some() { 0xF } else { 0b1011 };
     let mut found = 0u8;
@@ -472,7 +473,7 @@ pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> Templa
             if val_type == b'Z' {
                 let start = p + 3;
                 if let Some(end) = nul_offset(&aux_data[start..]) {
-                    result.mi = parse_mi_bytes(&aux_data[start..start + end]).unwrap_or((0, true));
+                    result.mi = parse_mi_bytes(&aux_data[start..start + end]);
                     p = start + end + 1;
                 } else {
                     break;
@@ -481,7 +482,7 @@ pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> Templa
                 if v >= 0 {
                     #[expect(clippy::cast_sign_loss, reason = "guarded by v >= 0")]
                     {
-                        result.mi = (v as u64, true);
+                        result.mi = Some((v as u64, true));
                     }
                 }
                 if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
@@ -4231,7 +4232,7 @@ mod tests {
         let rec = make_bam_bytes(0, 100, 0, b"read1", &[], 4, -1, -1, &aux);
 
         let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
-        assert_eq!(result.mi, (42, true));
+        assert_eq!(result.mi, Some((42, true)));
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell99".as_ref()));
         assert_eq!(result.mc, Some(b"10M5S".as_slice()));
@@ -4246,7 +4247,7 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
         let result = extract_template_aux_tags(&rec, None);
-        assert_eq!(result.mi, (7, false));
+        assert_eq!(result.mi, Some((7, false)));
         assert_eq!(result.rg, Some(b"lib1".as_ref()));
         assert!(result.cell.is_none());
         assert_eq!(result.mc, Some(b"20M".as_slice()));
@@ -4261,7 +4262,7 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
         let result = extract_template_aux_tags(&rec, None);
-        assert_eq!(result.mi, (99, true));
+        assert_eq!(result.mi, Some((99, true)));
         assert_eq!(result.rg, Some(b"rg0".as_ref()));
     }
 
@@ -4272,7 +4273,7 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, aux);
 
         let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
-        assert_eq!(result.mi, (0, true)); // default
+        assert_eq!(result.mi, None);
         assert_eq!(result.rg, Some(b"sample".as_ref()));
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -4283,7 +4284,7 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
 
         let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
-        assert_eq!(result.mi, (0, true));
+        assert_eq!(result.mi, None);
         assert!(result.rg.is_none());
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -4301,7 +4302,7 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
         let result = extract_template_aux_tags(&rec, None);
-        assert_eq!(result.mi, (100, true));
+        assert_eq!(result.mi, Some((100, true)));
         assert_eq!(result.rg, Some(b"lib2".as_ref()));
         assert_eq!(result.mc, Some(b"5M".as_slice()));
     }

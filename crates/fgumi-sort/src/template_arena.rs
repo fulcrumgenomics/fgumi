@@ -63,7 +63,7 @@ pub enum TemplateMemChunk {
     K24(InMemoryChunk<TemplateKey24>),
     /// 32-byte lane whose optional word carries `cb_hash`.
     Cb32(InMemoryChunk<CbKey32>),
-    /// 32-byte lane whose optional word carries the tertiary (library<<48 | mi).
+    /// 32-byte lane whose optional word carries the tertiary (MI).
     Tert32(InMemoryChunk<TertKey32>),
     /// Full 40-byte key (all lanes) — the legacy owned path and full variant.
     K40(InMemoryChunk<TemplateKey>),
@@ -427,7 +427,7 @@ impl TemplateArenaAccumulator {
     ///
     /// Returns an error if `body` is shorter than the 32 fixed BAM bytes (it
     /// cannot be a record, and the key extractor indexes those fields), or if a
-    /// record carries a dropped-lane value (CB / MI / library) absent from the
+    /// record carries a dropped-lane value (CB / MI) absent from the
     /// first record — the same rejection the owned `TemplateChunkSorter::push`
     /// performs.
     pub fn push(&mut self, body: &[u8], body_off: u64, len: u32) -> Result<()> {

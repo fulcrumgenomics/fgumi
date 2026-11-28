@@ -367,8 +367,11 @@ impl MemoryEstimate for RawPositionGroup {
 /// emits ([`extract_template_key_inline`]) and the same tolerant comparison
 /// `fgumi sort --verify` uses ([`TemplateKey::core_cmp`], which ignores the
 /// `name_hash`/`is_upper` tie-breaker so both fgumi- and samtools-sorted inputs
-/// pass). A record whose key sorts strictly before its predecessor is a
-/// violation and aborts the run.
+/// pass). The exception: fgumi orders cell barcodes by `cb_hash` and MI values
+/// numerically, while samtools compares both as strings, so samtools-sorted input
+/// with several cell barcodes or MI values at one position can fail this check.
+/// A record whose key sorts strictly before its predecessor is a violation and
+/// aborts the run.
 ///
 /// It is deliberately **stricter than grouping requires**: grouping only needs a
 /// template's mates adjacent by position, whereas this asserts the whole file is
@@ -381,7 +384,7 @@ impl MemoryEstimate for RawPositionGroup {
 /// bit-identical to what the sort produced for the same `CB` bytes; a record
 /// without a `CB` tag hashes to `0` on both sides. Keying with `None` here would
 /// force every `cb_hash` to `0` and spuriously reject a correctly-sorted
-/// pooled/single-cell input whose `CB` order disagrees with its library order.
+/// single-cell input whose `CB` order disagrees with its MI order.
 struct OrderVerifier {
     /// Read-group -> library-ordinal lookup, built once from the BAM header.
     lib_lookup: LibraryLookup,
