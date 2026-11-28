@@ -36,6 +36,10 @@ pub(crate) struct StagedSortOutput {
     /// The staged index the sink writes (`.bai` or `.crai`), removed unless
     /// published; `None` when not indexing.
     staged_index: RemoveOnDrop,
+    /// Keeps a termination signal from killing the process while the staged
+    /// files exist, so they are removed as the cancelled command unwinds.
+    /// Declared last: it is released after the files are.
+    _termination_scope: crate::termination::Scope,
 }
 
 /// A file (if any) removed on drop unless disarmed.
@@ -64,6 +68,7 @@ impl StagedSortOutput {
     ///
     /// An index requested for stdout, or a destination that cannot be staged.
     pub(crate) fn create(output: &Path, write_index: bool, command: &str) -> Result<Self> {
+        let termination_scope = crate::termination::scope();
         if write_index && fgumi_bam_io::is_stdout_path(output) {
             let kind = IndexKind::for_path(output).name();
             bail!("a {kind} index needs a file output, not stdout");
@@ -71,7 +76,12 @@ impl StagedSortOutput {
         let target = fgumi_sort::MergeOutputTarget::create_for(output, command)?;
         let staged_index =
             RemoveOnDrop(write_index.then(|| IndexKind::for_path(output).sidecar(target.path())));
-        Ok(Self { target, output: output.to_path_buf(), staged_index })
+        Ok(Self {
+            target,
+            output: output.to_path_buf(),
+            staged_index,
+            _termination_scope: termination_scope,
+        })
     }
 
     /// Protect the input from the final sidecar, not just the staged one.
@@ -108,6 +118,9 @@ impl StagedSortOutput {
     /// publishing the BAM or its index failed (see the module docs for what
     /// each failure leaves behind).
     pub(crate) fn finish(mut self, stats: &fgumi_sort::SortStats) -> Result<()> {
+        // A termination request that landed after the run finished: leave the
+        // destination alone (dropping `self` removes the staged files).
+        crate::termination::check()?;
         ensure_all_written(stats, &self.output)?;
         // The staged index stays armed in `self` (removed on any early return)
         // until it is renamed into place.

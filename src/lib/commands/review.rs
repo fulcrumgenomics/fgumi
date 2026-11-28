@@ -243,6 +243,13 @@ impl Command for Review {
         let consensus_out_path = self.output_path("consensus.bam")?;
         let grouped_out_path = self.output_path("grouped.bam")?;
 
+        // While the staged outputs below exist, a termination signal cancels
+        // the extraction (polled per record) rather than killing the process
+        // with them left on disk. Opened first, so it is released after them,
+        // and ended once they are published: nothing after that is staged or
+        // polls, so a later signal should stop the command at once.
+        let termination_scope = crate::termination::scope();
+
         // Extract consensus reads with variants
         info!("Extracting consensus reads with variants...");
         let (mi_set, consensus_staged) =
@@ -254,22 +261,26 @@ impl Command for Review {
         let grouped_staged =
             self.extract_grouped_reads(&variants, &mi_set, &grouped_out_path, command_line)?;
 
-        // Both BAMs are complete: move them into place. An error in either extraction
-        // returns above, dropping (deleting) the staged files, so a failed run never
-        // leaves a truncated BAM at an output path. The renames and index writes below
-        // are not atomic as a set: a failure part-way can leave a new BAM beside an
-        // older run's grouped BAM or index.
-        consensus_staged.persist(&consensus_out_path)?;
-        grouped_staged.persist(&grouped_out_path)?;
-
-        // Create BAM indexes for output files
-        info!("Creating BAM indexes...");
-
+        // Both BAMs are complete: move each into place and index it. An error in
+        // either extraction returns above, dropping (deleting) the staged files, so a
+        // failed run never leaves a truncated BAM at an output path. The renames and
+        // index writes below are not atomic as a set: a failure part-way can leave a
+        // new BAM beside an older run's grouped BAM or index. A termination request
+        // is honoured only before each BAM is renamed, never between a BAM and its
+        // index, so cancellation cannot leave a new BAM beside its old index.
+        //
         // Both paths are built with a `.bam` suffix above, so the sidecar naming
         // is unchanged here; going through the shared helper keeps every writer
         // on one convention rather than re-deriving it per call site.
-        fgumi_bam_io::write_bai_sidecar(&consensus_out_path)?;
-        fgumi_bam_io::write_bai_sidecar(&grouped_out_path)?;
+        info!("Publishing and indexing output BAMs...");
+        for (staged, path) in
+            [(consensus_staged, &consensus_out_path), (grouped_staged, &grouped_out_path)]
+        {
+            crate::termination::check()?;
+            staged.persist(path)?;
+            fgumi_bam_io::write_bai_sidecar(path)?;
+        }
+        drop(termination_scope);
 
         // Generate detailed review file
         info!("Generating detailed review file...");
@@ -901,6 +912,9 @@ impl Review {
         let regions = variants.iter().map(Self::variant_region).collect::<Result<Vec<_>>>()?;
         let mut keep = make_keep(&header);
         for result in reader.query_intervals(&header, &regions)? {
+            // Stop at a termination signal; the staged file is removed as the
+            // error unwinds (see the scope in `execute`).
+            crate::termination::check()?;
             let record = result?;
             if keep(&record).with_context(|| format!("reviewing reads from {}", input.display()))? {
                 write_raw_record(writer.get_mut(), &record)?;
@@ -2855,6 +2869,101 @@ chr1\t5\t.\tA\tC\t.\tPASS\t.\n";
             rows[1..].iter().map(|r| r[COL_CONSENSUS_READ].as_str()).collect();
         metric_reads.sort_unstable();
         assert_eq!(metric_reads, vec!["A/1", "B/1", "E/1", "F/1", "H/1", "H/2"]);
+    }
+
+    /// A termination request during extraction stops `review` with a cancellation, and the
+    /// staged BAMs are removed as it unwinds: no output (BAM, index or review file) and no
+    /// `.fgumi-review-*` staging file is left behind.
+    #[test]
+    fn test_review_cancelled_during_extraction_leaves_no_output() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+        let (raw_path, consensus_path) = test_utils::create_fgbio_fixture_bams(&temp_dir);
+        let vcf_path = test_utils::create_test_vcf(&temp_dir);
+        let out_dir = temp_dir.path().join("out");
+        std::fs::create_dir(&out_dir).expect("create output dir");
+        let output_path = out_dir.join("review_consensus_out");
+
+        crate::termination::set_test_request_on_this_thread(true);
+        let result = Review {
+            input: vcf_path,
+            consensus_bam: consensus_path,
+            grouped_bam: raw_path,
+            reference: ref_path,
+            output: output_path,
+            sample: Some("tumor".to_string()),
+            ignore_ns: false,
+            maf: 0.05,
+        }
+        .execute("test");
+        crate::termination::set_test_request_on_this_thread(false);
+
+        let err = result.expect_err("a cancelled review must fail");
+        assert!(crate::termination::is_cancellation(&err), "not a cancellation: {err:?}");
+        let left: Vec<_> = std::fs::read_dir(&out_dir)
+            .expect("read output dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "a cancelled review left files behind: {left:?}");
+    }
+
+    /// Extraction polls for a termination request per record: with one pending it
+    /// returns a cancellation before filtering any record and removes its staging
+    /// file; without one it filters the fixture's records and returns the staged BAM.
+    #[rstest]
+    #[case::cancelled(true)]
+    #[case::not_cancelled(false)]
+    fn test_extract_variant_reads_polls_for_termination(#[case] pending: bool) {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let ref_path = test_utils::create_test_reference(&temp_dir);
+        let (raw_path, consensus_path) = test_utils::create_fgbio_fixture_bams(&temp_dir);
+        let vcf_path = test_utils::create_test_vcf(&temp_dir);
+        let out_dir = temp_dir.path().join("out");
+        std::fs::create_dir(&out_dir).expect("create output dir");
+        let review = Review {
+            input: vcf_path,
+            consensus_bam: consensus_path.clone(),
+            grouped_bam: raw_path,
+            reference: ref_path,
+            output: out_dir.join("review_consensus_out"),
+            sample: Some("tumor".to_string()),
+            ignore_ns: false,
+            maf: 0.05,
+        };
+        let variants = review.load_variants_from_vcf().expect("load variants");
+
+        let filtered = std::cell::Cell::new(0usize);
+        let counter = &filtered;
+        crate::termination::set_test_request_on_this_thread(pending);
+        let result = Review::extract_variant_reads(
+            &consensus_path,
+            &out_dir.join("consensus.bam"),
+            &variants,
+            "test",
+            move |_| {
+                move |_: &RawRecord| {
+                    counter.set(counter.get() + 1);
+                    Ok(true)
+                }
+            },
+        );
+        let filtered = filtered.get();
+        crate::termination::set_test_request_on_this_thread(false);
+
+        if pending {
+            let err = result.expect_err("a pending request must cancel extraction");
+            assert!(crate::termination::is_cancellation(&err), "not a cancellation: {err:?}");
+            assert_eq!(filtered, 0, "a cancelled extraction filtered records");
+            let left: Vec<_> = std::fs::read_dir(&out_dir)
+                .expect("read output dir")
+                .map(|entry| entry.expect("dir entry").file_name())
+                .collect();
+            assert!(left.is_empty(), "a cancelled extraction left files behind: {left:?}");
+        } else {
+            let staged = result.expect("extraction without a request succeeds");
+            assert!(filtered > 0, "the fixture must yield records to filter");
+            drop(staged);
+        }
     }
 
     /// Builds a `Review` for a single chr1:10 `A>T` variant over a one-read consensus BAM

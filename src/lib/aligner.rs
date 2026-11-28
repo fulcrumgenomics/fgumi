@@ -290,12 +290,14 @@ impl AlignerProcess {
         // aligner any more: not the terminal's SIGINT (Ctrl-C) or SIGTSTP
         // (Ctrl-Z), and not a group-directed kill from GNU `timeout`, a shell's
         // `kill %job`, or a supervisor that signals the whole group. fgumi
-        // installs no handler for these, so such a signal kills fgumi by the
-        // default action without running any teardown; the aligner then sees
+        // handles SIGINT, SIGTERM and SIGHUP itself (`crate::termination`): the
+        // first one cancels the pipeline, whose teardown kills the group through
+        // `kill()`, as fgumi's failure paths do. Only when fgumi dies without
+        // teardown (SIGKILL, a forced second signal or the grace watchdog, or
+        // `FGUMI_SIGNAL_GRACE_SECS=0`) is the aligner left running: it then sees
         // EOF on stdin, and EPIPE/SIGPIPE when it next writes to stdout, which
         // can be a whole batch later for a preset. A custom command need not
         // touch either pipe again, so its remaining runtime is unbounded.
-        // fgumi's own failure and cancellation paths kill the group through `kill()`.
         //
         // As a background group in fgumi's session, the aligner is also stopped
         // (SIGTTIN/SIGTTOU) if it reads or configures the controlling terminal
@@ -1634,8 +1636,10 @@ pub struct AlignerOptions {
     /// Named aligner preset. Mutually exclusive with `--aligner::command`.
     /// Every preset but `bwa-mem3-inproc` runs the aligner as a subprocess in
     /// its own process group, which a Ctrl-C or `timeout` sent to fgumi does
-    /// not reach: after one stops fgumi, the aligner may continue processing
-    /// buffered input before it exits.
+    /// not reach directly; fgumi handles the signal by cancelling the pipeline
+    /// and stopping that group. If fgumi is killed without cleanup (SIGKILL, a
+    /// second signal, the grace bound expiring, or `FGUMI_SIGNAL_GRACE_SECS=0`),
+    /// the aligner may continue processing buffered input before it exits.
     #[arg(long = "preset", value_enum)]
     pub preset: Option<AlignerPreset>,
 
@@ -1647,8 +1651,11 @@ pub struct AlignerOptions {
     /// runs in its own process group, so it must not prompt on the terminal
     /// (e.g. use `ssh -o BatchMode=yes`, `sudo -n`): a terminal read from it
     /// stops the aligner and stalls the run. A Ctrl-C or `timeout` sent to
-    /// fgumi does not reach it either: the command may outlive fgumi after an
-    /// outer timeout, and its remaining runtime is not bounded by batch size.
+    /// fgumi does not reach it directly either; fgumi handles the signal by
+    /// cancelling the pipeline and stopping the command's process group. If
+    /// fgumi is killed without cleanup (SIGKILL, a second signal, the grace
+    /// bound expiring, or `FGUMI_SIGNAL_GRACE_SECS=0`), the command may outlive
+    /// fgumi, and its remaining runtime is not bounded by batch size.
     #[arg(long = "command")]
     pub command: Option<String>,
 

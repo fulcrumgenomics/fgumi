@@ -57,6 +57,18 @@ fgumi sort -i input.bam -o sorted.bam --order template-coordinate
 
 **Fix.** On a fixed-RAM host, use `--max-memory auto` (self-throttles to the host) or set a fixed total budget with `--max-memory <N> --memory-per-thread false`; reduce `--threads`. See the [Performance Tuning](performance-tuning.md) memory section for the full model.
 
+## Stopping fgumi (Ctrl-C, SIGTERM, SIGHUP)
+
+On Linux and macOS, on the first SIGINT (Ctrl-C), SIGTERM or SIGHUP, fgumi logs `Received <signal>: stopping and cleaning up`, stops the running pipeline, terminates a subprocess aligner's process group, and removes sort temporary directories and staged (unpublished) outputs; a staged output's existing destination file is left untouched (an output written directly can be left truncated, see below). It then exits *by that signal*, so a shell or workflow manager sees an interrupted job, not an ordinary failure (a shell loop over files stops on Ctrl-C).
+
+- **Stopping at once.** A second signal sent at least 0.5 s after the first, or cleanup still running 8 s after the first signal, stops fgumi immediately without further cleanup. Set `FGUMI_SIGNAL_GRACE_SECS` to change the 8 s bound (decimal seconds); `FGUMI_SIGNAL_GRACE_SECS=0` turns this handling off, so every signal stops fgumi at once as before.
+- **`nohup`.** A signal fgumi was started with ignored (SIGHUP under `nohup`, SIGINT for a background job of a non-interactive shell) stays ignored.
+- **Ctrl-Z (SIGTSTP)** suspends fgumi but is not forwarded to the aligner, which runs in its own process group; it stalls on its full output pipe until fgumi resumes (`fg`).
+- **SIGKILL** (`kill -9`, an out-of-memory kill) cannot be caught: temporary files remain, and the aligner exits when it next reads or writes its closed pipes.
+- **Input that never ends.** fgumi notices the request between reads. A command blocked reading a pipe or FIFO whose writer stays open (for example `kill` sent to fgumi alone in `producer | fgumi sort -i - ...`) cannot finish cleaning up, and the 8 s bound stops it without cleanup, leaving staged files behind. A Ctrl-C in a terminal also stops the producer, which closes the pipe.
+- **Metrics files.** Metrics and histograms that a command writes even when a run fails are also written for an interrupted run, and count only the records processed before the interrupt.
+- **Commands that write their output directly** (for example `group`, `dedup` and `runall`) leave a truncated output file when interrupted, as on any failure. `sort` and `merge` stage their output, and `review` its two BAMs, publishing them only on success; `review`'s `.txt` file, like other metrics files, replaces an existing regular file atomically, so an interrupted run leaves the old one unchanged.
+
 ## `fgumi runall` produces wrong or empty output (input doesn't match `--start-from`)
 
 **Cause.** `runall` cannot verify that your input file is actually in the state `--start-from` claims. If the input is in a different state — e.g. a raw unsorted BAM passed to `--start-from group`, or an ungrouped BAM passed to `--start-from consensus` — the pipeline runs on whatever it finds. Depending on the mismatch, a downstream stage may reject the input and fail partway through (for example, stages that require template-coordinate order error if the header does not advertise it), or the run may complete but silently produce wrong (or empty) results.

@@ -44,6 +44,31 @@ jobs:
       - name: Doctests
         run: cargo ci-doctest
 
+  # Termination-signal handling (`src/lib/termination.rs`) differs by platform
+  # where it matters: the inherited-SIG_IGN probe (`/proc` on Linux, a `/bin/sh`
+  # child elsewhere) and re-raising a default-action signal from a non-main
+  # thread. The `test` job covers Linux; this runs the same regressions on macOS.
+  signals-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: ./.github/actions/setup-sccache
+      - name: Install nextest
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: nextest
+      - name: Signal regressions
+        run: |
+          cargo nextest run -p fgumi --locked --lib -E 'test(/termination/)'
+          cargo nextest run -p fgumi --locked --test integration -E 'test(/signal_termination/)'
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 20

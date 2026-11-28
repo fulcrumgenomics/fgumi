@@ -88,6 +88,11 @@ pub(crate) fn build_for_with_source_validation<F>(
 where
     F: FnOnce(bool) -> Result<()>,
 {
+    // Opened before anything needing cleanup is created (the aligner is
+    // spawned and sort temp directories are made while the chain is built), so
+    // a termination signal during the build cancels the pipeline once it
+    // exists instead of killing the process with that state left behind.
+    let termination_scope = crate::termination::scope();
     validate_stage_progression(&spec)?;
     validate_stage_opts_present(&spec)?;
     validate_cross_stage_constraints(&spec)?;
@@ -107,6 +112,11 @@ where
 
     let mut chain = ChainBuilder::new(&spec)?;
     validate_source(chain.source_is_cram())?;
+    // A request accepted while the chain is being built has no pipeline to
+    // cancel yet, so the build polls for it between steps: above all before
+    // `add_sink` creates (truncating) the output and `build` opens the rejects
+    // files, so an interrupted build never clobbers an existing output.
+    crate::termination::check()?;
 
     // NOTE: `--threads 1` whole-chain fusion is NOT wired here. It is applied
     // generically by the runtime (`Pipeline::run` → `run_fused_single_thread`)
@@ -126,11 +136,14 @@ where
         let position =
             if i == last_idx { StagePosition::Terminal } else { StagePosition::Intermediate };
         chain.add_stage(stage, position)?;
+        crate::termination::check()?;
     }
 
     chain.add_sink()?;
 
-    chain.build()
+    let mut built = chain.build()?;
+    built.adopt_termination_scope(termination_scope);
+    Ok(built)
 }
 
 /// What [`build_merge`] builds: a k-way merge of sorted BAM inputs
@@ -296,6 +309,8 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         SortSpillDecompress, SpillReadPlanner, SpillSupply, serial_merge_output,
     };
 
+    // See `build_for_with_source_validation`.
+    let termination_scope = crate::termination::scope();
     let MergeSpec {
         inputs,
         header,
@@ -382,6 +397,7 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
          inputs = {pool_threads} pool workers",
         pool_threads - threads
     );
+    super::finalize::cancel_on_termination(&termination_scope, &pipeline);
     Ok(BuiltPipeline {
         pipeline,
         config,
@@ -396,6 +412,7 @@ pub fn build_merge(spec: MergeSpec) -> Result<BuiltPipeline> {
         sort_caps: [None, None],
         #[cfg(test)]
         spill_eligible_clones: Some(eligible),
+        termination_scope,
     })
 }
 

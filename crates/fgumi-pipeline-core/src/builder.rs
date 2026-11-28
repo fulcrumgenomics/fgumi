@@ -5538,8 +5538,15 @@ mod tests {
         assert_eq!(received.load(AtomicOrd::Relaxed), 5);
     }
 
-    #[test]
-    fn pipeline_run_responds_to_cancellation() {
+    /// A run cancelled mid-flight, or before `run` is even called (a
+    /// termination signal that lands while the chain is still being built),
+    /// returns `Cancelled` promptly on both the fused (`threads = 1`) and the
+    /// pooled driver.
+    #[rstest]
+    fn pipeline_run_responds_to_cancellation(
+        #[values(1, 4)] threads: usize,
+        #[values(false, true)] cancel_before_run: bool,
+    ) {
         /// Source that emits forever (never returns `Finished`) until cancelled.
         #[derive(Clone)]
         struct InfiniteSource;
@@ -5594,13 +5601,19 @@ mod tests {
         let pipeline = builder.build().unwrap();
         let cancel = pipeline.cancel_handle();
 
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if cancel_before_run {
             cancel.cancel();
-        });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                cancel.cancel();
+            });
+        }
 
-        let result = pipeline.run(PipelineConfig { threads: 4, ..Default::default() });
-        assert!(matches!(result, Err(PipelineError::Cancelled)));
+        let start = std::time::Instant::now();
+        let result = pipeline.run(PipelineConfig { threads, ..Default::default() });
+        assert!(matches!(result, Err(PipelineError::Cancelled)), "got {result:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "cancel was not prompt");
     }
 
     /// A step parked in `PhaseCap::acquire_whole` (an off-pool sort waiting for

@@ -846,7 +846,12 @@ prefixed flags: `--sort::max-memory`, `--group::strategy`, `--duplex::min-reads`
 `--stop-after align` is not allowed: raw aligner output before the zipper-merge \
 has lost every original tag, so the earliest stop after `--start-from align` is \
 `zipper`. The validator checks the requested stage range but cannot verify that \
-the on-disk input actually matches `--start-from` — make sure it does."
+the on-disk input actually matches `--start-from` — make sure it does.
+
+A subprocess aligner runs in its own process group. On Linux and macOS, \
+Ctrl-C, SIGTERM or SIGHUP sent to fgumi stops the run, terminates the \
+aligner's group and removes temporary files before fgumi exits by that signal \
+(see `fgumi --help`)."
 )]
 #[allow(clippy::struct_excessive_bools)] // CLI flags: each bool is a distinct user-facing option
 pub struct RunAll {
