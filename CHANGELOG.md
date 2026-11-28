@@ -4,6 +4,77 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-28
+
+### Bug Fixes
+
+- Key tc-tagged secondary and supplementary reads with their primaries ([#1091](https://github.com/fulcrumgenomics/fgumi/pull/1091))
+- Key one-primary templates' tc-tagged reads with their primary ([#1092](https://github.com/fulcrumgenomics/fgumi/pull/1092))
+- Determine FR pair orientation from both records' alignments ([#1104](https://github.com/fulcrumgenomics/fgumi/pull/1104))
+- Fully clip the reverse read when overlapping reads share a 5' end ([#1106](https://github.com/fulcrumgenomics/fgumi/pull/1106))
+- Accept a bwa-mem3 --meth-only index under --methylation-mode em-seq ([#1122](https://github.com/fulcrumgenomics/fgumi/pull/1122))
+- Never block the align stage indefinitely on a full in-flight budget ([#1138](https://github.com/fulcrumgenomics/fgumi/pull/1138))
+- Report the aligner-output error, not the broken pipe it causes ([#1143](https://github.com/fulcrumgenomics/fgumi/pull/1143))
+- Send each batch's pairing token before writing it to the aligner ([#1144](https://github.com/fulcrumgenomics/fgumi/pull/1144))
+- [**breaking**] Filter by duplex-supported consensus bases ([#1147](https://github.com/fulcrumgenomics/fgumi/pull/1147))
+  - in the default overlap mode, --min-duplex-length now counts positions called by both single-strand consensuses instead of the length of the aligned reference intersection. Pairs whose soft-clipped bases are called by both strands can now pass a higher threshold, while pairs with single-strand no-calls can now fail it. Phase and consensus-length checks now run before this threshold, so some rejections move from raw_reads_rejected_for_r1_r2_overlap_too_short to the indel-error or clip-overlap-failed rows in --stats. --legacy-overlap-window keeps the previous behavior.
+- Kill the aligner's process group on teardown ([#1140](https://github.com/fulcrumgenomics/fgumi/pull/1140))
+- [**breaking**] Compare library before cell barcode in template-coordinate order ([#1149](https://github.com/fulcrumgenomics/fgumi/pull/1149))
+  - Template-coordinate sort order changed for input carrying both cell barcodes and multiple libraries at the same position, which now sorts by library before cell barcode (matching samtools). Such BAMs sorted by an earlier fgumi must be re-sorted before fgumi merge or --verify. Under auto key types, multi-library input whose first record has no MI no longer keeps the MI lane, so a later record with an MI fails the sort; pass --key-types mi for such input. The --key-types library token no longer keeps a lane. The fgumi-sort crate drops DroppedLaneViolation::Library and LibraryLookup::distinct_header_ordinals, select_template_variant no longer takes a header_library_varies argument, and the fgumi-raw-bam TemplateAuxTags mi field is now an Option.
+
+### Documentation
+
+- Fix extract --inputs examples and adjacency count-rule wording ([#1137](https://github.com/fulcrumgenomics/fgumi/pull/1137))
+- Note adjacency's fgbio count rule and fix runall extract flag names ([#1145](https://github.com/fulcrumgenomics/fgumi/pull/1145))
+
+### Features
+
+- Keep reading piped input while a run is sealed (--read-buffer) ([#1096](https://github.com/fulcrumgenomics/fgumi/pull/1096))
+- Add --keep-aligner-qc-fail to keep an aligner-set QC-fail flag ([#1123](https://github.com/fulcrumgenomics/fgumi/pull/1123))
+- Add --include-invalid-umis to pass through templates with unusable UMIs ([#1124](https://github.com/fulcrumgenomics/fgumi/pull/1124))
+- [**breaking**] Link bwa-mem3 v0.18.0 and follow its genomic EM-seq scoring ([#1127](https://github.com/fulcrumgenomics/fgumi/pull/1127))
+  - With --methylation-mode em-seq, the bwa-mem3 and bwa-mem3-inproc presets align with genomic scoring (-B 4) instead of collapsed (-B 2), whatever the bwa-mem3 version, which changes AS, MAPQ, NM and some placements; realign rescores promoted hits accordingly, and reads a bare --meth in an --aligner::command as genomic. Pass `--aligner::command` with `bwa-mem3 mem --meth --meth-scoring collapsed ...` to keep the previous scoring.
+- [**breaking**] Add opt-in CRAM input and output ([#1121](https://github.com/fulcrumgenomics/fgumi/pull/1121))
+  - Outputs named *.cram now require a build with --features cram instead of silently containing BAM. CRAM input older than version 2.1 is refused because truncation cannot be detected reliably.
+- [**breaking**] Align TAPS reads with bwa-mem3 --meth=taps ([#1126](https://github.com/fulcrumgenomics/fgumi/pull/1126))
+  - With --methylation-mode taps, the bwa-mem3 and bwa-mem3-inproc presets of runall and realign align with bwa-mem3 mem --meth=taps instead of plain bwa-mem3 mem (the presets pass --meth=taps --meth-scoring neutral), which changes alignments (and the aligner emits XR, XG and XM tags), and they now require the index built by bwa-mem3 index --meth beside the reference. Build it once with that command, or use --aligner::command to keep plain alignment. A subprocess aligner command that passes --meth and whose bwa-mem3 @PG reports a release before 0.8.0 now fails instead of writing NM (and realign scores) that count conversions as mismatches.
+- Add unaligned SAM output for SAM-input aligners ([#1139](https://github.com/fulcrumgenomics/fgumi/pull/1139))
+- Add a dedup stage ([#1141](https://github.com/fulcrumgenomics/fgumi/pull/1141))
+- Add a star aligner preset ([#1142](https://github.com/fulcrumgenomics/fgumi/pull/1142))
+
+### Miscellaneous Tasks
+
+- Bump the all-actions group across 1 directory with 2 updates ([#1025](https://github.com/fulcrumgenomics/fgumi/pull/1025))
+- Raise MSRV to 1.95 and bump parking_lot to 0.13 and sysinfo to 0.40 ([#1114](https://github.com/fulcrumgenomics/fgumi/pull/1114))
+- Bump taiki-e/install-action ([#1128](https://github.com/fulcrumgenomics/fgumi/pull/1128))
+- Open nightly bwa-mem3-rs updates with matching aligner pins ([#1120](https://github.com/fulcrumgenomics/fgumi/pull/1120))
+- Pin sccache to v0.19.0 and build uncached if its server cannot start ([#1135](https://github.com/fulcrumgenomics/fgumi/pull/1135))
+
+### Performance
+
+- Time default pipeline stats on a coarse clock ([#1095](https://github.com/fulcrumgenomics/fgumi/pull/1095))
+- Cut serial work in a spilled coordinate sort's final merge ([#1094](https://github.com/fulcrumgenomics/fgumi/pull/1094))
+- Run the in-memory parallel gather on the pipeline pool, not a private thread pool ([#1098](https://github.com/fulcrumgenomics/fgumi/pull/1098))
+- Merge spilled coordinate and template-coordinate sorts by key range in parallel ([#1099](https://github.com/fulcrumgenomics/fgumi/pull/1099))
+- Cap CRAM record parsing with the sort's phase-1 counter ([#1134](https://github.com/fulcrumgenomics/fgumi/pull/1134))
+
+### Refactor
+
+- Give --min-map-q a clap default in group and dedup ([#1125](https://github.com/fulcrumgenomics/fgumi/pull/1125))
+
+### Security
+
+- Bump libz-sys to 1.1.33 for RUSTSEC-2026-0544 ([#1110](https://github.com/fulcrumgenomics/fgumi/pull/1110))
+
+### Build
+
+- Bump read-structure to 0.3 ([#1111](https://github.com/fulcrumgenomics/fgumi/pull/1111))
+- Bump noodles to 0.119 ([#1116](https://github.com/fulcrumgenomics/fgumi/pull/1116))
+- Bump syn to 3 in fgumi-cli-macros ([#1113](https://github.com/fulcrumgenomics/fgumi/pull/1113))
+- Bump fgoxide, itertools, rstest, statrs, lru and mach2 ([#1112](https://github.com/fulcrumgenomics/fgumi/pull/1112))
+
+<!-- generated by git-cliff -->
+
 ## [0.9.0] - 2026-10-27
 
 ### Bug Fixes
